@@ -1,0 +1,108 @@
+{
+    "test_configurations": [
+        {
+            "file": "test_nn.py",
+            "class": "TestNNDeviceType",
+            "class_name_suffix": "PRIVATEUSE1",
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestNNDeviceType.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_tensor_creation_ops.py",
+            "class": "TestLikeTensorCreation",
+            "class_name_suffix": "NEURON",
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestLikeTensorCreation.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_tensor_creation_ops.py",
+            "class": "TestRandomTensorCreation",
+            "class_name_suffix": "NEURON",
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestRandomTensorCreation.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_tensor_creation_ops.py",
+            "class": "TestTensorCreation",
+            "class_name_suffix": "NEURON",
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestTensorCreation.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_view_ops.py",
+            "class": "TestViewOps",
+            "class_name_suffix": "PRIVATEUSE1",
+            "skip_tests":
+            [
+                {"complex": {"reason": "Segfault - Requires further investigation"} },
+                {"conj": {"reason": "Segfault - Requires further investigation"} }
+            ],
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestViewOps.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_scatter_gather_ops.py",
+            "class": "TestScatterGather",
+            "class_name_suffix": "PRIVATEUSE1",
+            "xfail": [
+                {
+                    "test_list_filename": "failing_test_methods/TestScatterGather.json",
+                    "reason": "XFail all failing tests"
+                }
+            ]
+        },
+        {
+            "file": "test_binary_ufuncs.py",
+            "class": "TestBinaryUfuncs",
+            "class_name_suffix": "PRIVATEUSE1",
+            "methods": [
+                "test_lerp_lowp_cpu_neuron_bfloat16",
+                "test_lerp_lowp_cpu_neuron_float16",
+                "test_lerp_lowp_neuron_bfloat16",
+                "test_lerp_lowp_neuron_float16",
+                "test_lerp_neuron_complex128",
+                "test_lerp_neuron_complex64",
+                "test_lerp_neuron_float32",
+                "test_lerp_neuron_float64",
+                "test_lerp_weight_scalar_tensor_promotion_neuron_complex128",
+                "test_lerp_weight_scalar_tensor_promotion_neuron_complex64",
+                "test_lerp_weight_scalar_tensor_promotion_neuron_float32",
+                "test_lerp_weight_scalar_tensor_promotion_neuron_float64",
+                "test_lerp_weight_tensor_promotion_error_neuron_complex128",
+                "test_lerp_weight_tensor_promotion_error_neuron_complex64",
+                "test_lerp_weight_tensor_promotion_error_neuron_float64"
+            ],
+            "xfail": [
+                {"test_lerp_neuron_complex128": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_neuron_complex64": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_weight_scalar_tensor_promotion_neuron_complex128": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_weight_scalar_tensor_promotion_neuron_complex64": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_weight_tensor_promotion_error_neuron_complex128": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_weight_tensor_promotion_error_neuron_complex64": {"reason": "Complex data types are not supported on Neuron"}},
+                {"test_lerp_weight_scalar_tensor_promotion_neuron_float64": {"reason": "Float64 data type Issues"}},
+                {"test_lerp_neuron_float64": {"reason": "Float64 data type is not supported on Neuron"}},
+                {"test_lerp_neuron_float32": {"reason": "The test is trying to copy tensors of different sizes that is not supported on Neuron."}}
+            ]
+        }
+    ]
+}

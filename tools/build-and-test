@@ -1,0 +1,30 @@
+#!/bin/bash
+# Build and test torch-neuron
+
+set -e
+
+# Get the script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Change to project root
+cd "$PROJECT_ROOT"
+
+echo "Building torch-neuron..."
+# Decide how to run python (prefer uv if available)
+if command -v uv >/dev/null 2>&1; then
+    RUNNER=(uv run python)
+else
+    RUNNER=(python)
+fi
+
+# Run build quietly and suppress stdout (but keep stderr for errors)
+if ! "${RUNNER[@]}" setup.py build_ext --inplace --quiet > /dev/null; then
+    echo "Build failed! Running verbose build to show errors..."
+    "${RUNNER[@]}" setup.py build_ext --inplace
+    exit 1
+fi
+
+echo -e "\nRunning tests..."
+# Pass all arguments to run-test
+"$SCRIPT_DIR/run-test" "$@"

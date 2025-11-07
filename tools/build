@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Build torch-neuron extension
+echo "Building torch-neuron..."
+
+# Decide how to run python (prefer uv if available)
+if command -v uv >/dev/null 2>&1; then
+    RUNNER=(uv run python)
+else
+    RUNNER=(python)
+fi
+
+# Run build quietly and suppress stdout (but keep stderr for errors)
+if ! USE_CMAKE=1 "${RUNNER[@]}" setup.py build_ext --inplace --quiet > /dev/null; then
+    echo "Build failed! Running verbose build to show errors..."
+    USE_CMAKE=1 "${RUNNER[@]}" setup.py build_ext --inplace
+    exit 1
+fi

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# Run pre-commit via python, preferring uv if available
+if command -v uv >/dev/null 2>&1; then
+    exec uv run python -m pre_commit run --all-files
+else
+    exec python -m pre_commit run --all-files
+fi

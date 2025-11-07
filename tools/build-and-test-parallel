@@ -1,0 +1,25 @@
+#!/bin/bash
+# Build and test torch-neuron with parallel test execution
+
+set -e
+
+# Get the script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Change to project root
+cd "$PROJECT_ROOT"
+
+echo "Building torch-neuron..."
+# Decide how to run python (prefer uv if available)
+if command -v uv >/dev/null 2>&1; then
+    RUNNER=(uv run python)
+else
+    RUNNER=(python)
+fi
+
+"${RUNNER[@]}" setup.py build_ext --inplace
+
+echo -e "\nRunning tests in parallel..."
+# Pass all arguments to run-test-parallel
+"$SCRIPT_DIR/run-test-parallel" "$@"

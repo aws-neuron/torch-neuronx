@@ -1,0 +1,189 @@
+{
+    "test_configurations": [
+        {
+            "file": "distributed/test_c10d_object_collectives.py",
+            "sanity_methods": [
+                "test_broadcast_object_list",
+                "test_scatter_object_list",
+                "test_subpg_all_gather_object",
+                "test_subpg_gather_object",
+                "test_subpg_broadcast_object"
+            ],
+            "xfail": [
+                {"test_send_recv_object_list_neuron": {"reason": "Pending investigation - neuron not support"}},
+                {"test_subpg_scatter_object_neuron": {"reason": "Pending investigation - Error type - serialization related - Ran out of input"}}
+            ]
+        },
+        {
+            "file": "distributed/test_c10d_functional_native.py",
+            "class": "TestWithNCCL",
+            "sanity_methods": [
+                "test_broadcast",
+                "test_all_reduce_single",
+                "test_all_reduce_single_",
+                "test_reduce_scatter_tensor_single"
+            ],
+            "xfail": [
+                {"test_all_gather_into_tensor_coalesced": {"reason": "Pending investigation - error type - Operation all_gather is not implemented for Neuron and CPU fallback"}},
+                {"test_all_to_all_single": {"reason": "Pending investigation - error type - Operation all to all base is not implemented"}},
+                {"test_all_gather_into_tensor_single": {"reason": "Pending investigation - error type - Functional API contract not align with PT tests"}},
+                {"test_unwaited": {"reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"}},
+                {"test_reduce_scatter_tensor_coalesced": {"reason": "Pending investigation - error type - No backend type associated with device type neuron"}},
+                {"test_all_reduce_coalesced": {"reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"}},
+                {"test_wait_tensor": {"reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"}},
+                {"test_all_reduce_coalesced_": {"reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"}}
+            ]
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "DeviceMeshSetDeviceTest",
+            "xfail": [
+                {"test_manual_set_device": {"reason": "Pending investigation - manual set_device to a different than self.rank id not supported"}},
+                {"test_auto_set_device_from_heuristic": {"reason": "Pending investigation - User warning message not match "}},
+                {"test_auto_set_device_from_local_rank": {"reason": "Pending investigation - DeviceMesh not able to set rank id to a different than self.rank id"}}
+            ]
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "DeviceMeshTest"
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "DeviceMeshTestNDim"
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "InitDeviceMeshTest"
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "TestDeviceMeshGetItem"
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "TestMeshEnv"
+        },
+        {
+            "file": "distributed/test_device_mesh.py",
+            "class": "DeviceMeshCollectiveTest",
+            "xfail": [
+                {"test_all_gather_uneven": {"reason": "Pending investigation - ERROR  TDRV:build_enc_op_list_args_with_tensor_id   TALG recv_displ 0, recv_count 0"}},
+                {"test_reduce_scatter_uneven": {"reason": "Pending investigation - jax.errors.NonConcreteBooleanIndexError"}},
+                {"test_scatter_nd": {"reason": "Pending investigation - collectives error - ERROR  TDRV:build_enc_op_list_args_with_tensor_id   TALG recv_displ 0, recv_count 0"}}
+            ]
+        },
+           {
+            "file": "distributed/test_c10d_nccl.py",
+            "class": "CommTest",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_intra_node_comm_all_reduce"
+                    ],
+                    "reason": "Pending Investigation - set_device() to peer rank not supported, PT test error -  raise ValueError(Invalid device id: {device}. Valid range is 0 to {device_count() - 1})"
+                },
+                {
+                    "tests": [
+                        "test_nccl_barrier",
+                        "test_pass_nccl_options_config",
+                        "test_pass_nccl_options_high_priority_stream",
+                        "test_pass_nccl_options_config"
+                    ],
+                    "reason": "Need Fix -  ProcessGroupNeuron.allreduce() requires default option set for: 'all_reduce_options'; PyTorch test expects default value set"
+                },
+                {"test_all_reduce_coalesced_manager_nccl": {"reason": "No Implemenation - torch.distributed._coalescing_manager() is not supported at neuron. This manager merges multiple all reduce ops to a single all redcue op for performance"}},
+                {
+                    "tests": [
+                        "test_nccl_warn_not_in_group_debug_detail",
+                        "test_nccl_warn_not_in_group_debug_info",
+                        "test_nccl_warn_not_in_group_debug_off"
+                    ],
+                    "reason": "Pending investigation - No Implementation - Barrier is only implemented for default group, while not supported on pg by dist.new_group() "
+                },
+                {"test_reduce_scatter_tensor_coalesced": {"reason": "No Implemenation - Neuron not support reduce_scatter_tensor_coalesced()"}},
+                {"test_reduce_scatter_base_k": {"reason": "Need to fix: reduce scatter validation defect, output shape doesn't need to match input"}},
+                {
+                    "tests": [
+                        "test_sequence_num_incremented_nccl_default",
+                        "test_sequence_num_set_default_pg_nccl",
+                        "test_sequence_num_set_nccl_new_group"
+                    ],
+                    "reason": "Need Fix/Investigate - 1. PT test have set_device on peer ranks before init pg, e.g set_device(1) before init pg, which not supported in neuron 2. neuron process group not support sequenc numbers"
+                },
+                {"test_time_estimate_nccl": {"reason": "_time_estimator not implemented in neuron backend"}},
+                {
+                    "tests": [
+                        "test_wait_tensor",
+                        "test_unwaited"
+                    ],
+                    "reason": "Pending Investigation - Async work all_reduce does not register in work registry"
+                },
+                {"test_broadcast_coalesced_nccl": {"reason": "Output tensor has dtype float64 which is not supported on Neuron"}}
+
+            ]
+        },
+        {
+            "file": "distributed/test_c10d_nccl.py",
+            "class": "NcclProcessGroupWithDispatchedCollectivesTests",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_all_to_all_single",
+                        "test_collectives"
+                    ],
+                    "reason": "Pending Investigation - No implementeation - Neuron not support replica_group out of list [4, 8, 16 and 32 divisible]"
+                },
+                {
+                    "tests": [
+                        "test_allgather_float8_float8_e5m2",
+                        "test_allgather_float8_float8_e4m3fn"
+                    ],
+                    "reason": "No implementation - Neuron not support dtype float8_e4m3fn / float8_e5m2"
+                },
+                {"test_init_process_group_for_all_backends": {"reason": "Ignore and no need to fix; IntentioNot worth the patch effort for this PT test, which only covers init_pg() that is fully covered by other tests. " }}
+            ]
+        },
+        {
+            "file": "distributed/test_c10d_nccl.py",
+            "class": "LargeCommTest",
+            "sanity_methods": [
+                "test_gather_subgroup_group_rank_True",
+                "test_gather_object_subgroup_group_rank_True",
+                "test_reduce_subgroup_group_rank_True",
+                "test_broadcast_subgroup_group_rank_True",
+                "test_broadcast_object_list_subgroup_set_device1_group_rank_True"
+            ],
+            "xfail": [
+                {
+                    "tests": [
+                        "test_batch_send_recv_subgroup_group_rank_False",
+                        "test_batch_send_recv_subgroup_group_rank_True",
+                        "test_send_recv_object_list_subgroup_set_device0_group_rank_True",
+                        "test_send_recv_object_list_subgroup_set_device1_group_rank_False",
+                        "test_send_recv_object_list_subgroup_set_device1_group_rank_True",
+                        "test_send_recv_subgroup_group_rank_False_async_op_False",
+                        "test_send_recv_subgroup_group_rank_True_async_op_True",
+                        "test_send_recv_subgroup_group_rank_True_async_op_False",
+                        "test_send_recv_object_list_subgroup_set_device0_group_rank_False",
+                        "test_send_recv_subgroup_group_rank_False_async_op_True"
+                    ],
+                    "reason": "Temporarily not supported send_recv. Error type - No backend type associated with device type neuron"
+                },
+                {
+                    "tests": [
+                        "test_scatter_object_list_subgroup_group_rank_False",
+                        "test_scatter_object_list_subgroup_group_rank_True"
+                    ],
+                    "reason": "Pending investigation - serialization related - Error type - EOFError: Ran out of input"
+                },
+                {
+                    "tests": [
+                        "test_scatter_subgroup_group_rank_False",
+                        "test_scatter_subgroup_group_rank_True"
+                    ],
+                    "reason": "Pending fix - Boolean mask indexing not supportted on Neuron"
+                }
+            ]
+        }
+    ]
+}

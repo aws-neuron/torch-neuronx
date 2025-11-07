@@ -1,0 +1,22 @@
+{
+    "test_configurations": [
+        {
+            "file": "distributed/test_c10d_common.py",
+            "class": "CommonDistributedDataParallelTest",
+            "xfail": [
+                {"test_dataclass_output": {"reason": "Needs handling for cases where we have runtime intialzied before init_process_group and later when we call init_process_group, we run into errors."} },
+                {"test_dataclass_output_unused_param" : {"reason": "Needs handling for cases where we have runtime intialzied before init_process_group and later when we call init_process_group, we run into errors."} },
+                {"test_sync_batch_norm_empty_input": {"reason": "Operation all_gather is not implemented for Neuron for Args: [arg0: Tensor(shape=torch.Size([5]), dtype=torch.float32, device=neuron:0), arg1: list=[[0, 1]]]. Kwargs: [out=Tensor(shape=torch.Size([1, 10]), dtype=torch.float32, device=neuron:0)]"} },
+                {"test_sync_batch_norm_only_empty_input": {"reason": "Could not run 'aten::batch_norm_stats' with arguments from the 'CPU' backend. This could be because the operator doesn't exist for this backend, or was omitted during the selective/custom build process "} }
+            ]
+        },
+        {
+            "folder": "distributed/algorithms/ddp_comm_hooks",
+            "sanity_methods":[
+                "test_ddp_comm_hook_allreduce_hook"
+            ],
+            "xfail": [{"test_ddp_comm_hook_quantize_per_channel_hook": {"reason": "Pending Investigation - quantization_per_channel not supported at neuron backend"}}]
+
+        }
+    ]
+}

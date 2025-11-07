@@ -1,0 +1,92 @@
+#!/bin/bash
+# Run C++ unit tests for torch-neuron
+
+set -e
+
+# Get the script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Change to project root
+cd "$PROJECT_ROOT"
+
+# Build directory
+BUILD_DIR="${BUILD_DIR:-build}"
+
+# Parse arguments
+VERBOSE=false
+REBUILD=false
+TEST_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -r|--rebuild)
+            REBUILD=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS] [TEST_NAME]"
+            echo ""
+            echo "Options:"
+            echo "  -v, --verbose    Show verbose test output"
+            echo "  -r, --rebuild    Clean and rebuild before testing"
+            echo "  -h, --help       Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0                           # Run all C++ tests"
+            echo "  $0 KernelExecutionTest       # Run specific test"
+            echo "  $0 -v                        # Run all tests with verbose output"
+            echo "  $0 -r KernelExecutionTest    # Rebuild and run specific test"
+            exit 0
+            ;;
+        *)
+            TEST_FILTER="$1"
+            shift
+            ;;
+    esac
+done
+
+# Rebuild if requested
+if [ "$REBUILD" = true ]; then
+    echo "Cleaning and rebuilding..."
+    rm -rf "$BUILD_DIR"
+fi
+
+# Configure if build directory doesn't exist
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "Configuring CMake..."
+    cmake -S . -B "$BUILD_DIR" -DBUILD_TESTS=ON
+fi
+
+# Build tests
+echo "Building C++ tests..."
+if [ -n "$TEST_FILTER" ]; then
+    cmake --build "$BUILD_DIR" --target "$TEST_FILTER" -j$(nproc)
+else
+    cmake --build "$BUILD_DIR" -j$(nproc)
+fi
+
+# Run tests
+echo ""
+echo "Running C++ tests..."
+echo "===================="
+
+if [ -n "$TEST_FILTER" ]; then
+    # Run specific test executable
+    if [ "$VERBOSE" = true ]; then
+        "./$BUILD_DIR/$TEST_FILTER" --gtest_color=yes
+    else
+        "./$BUILD_DIR/$TEST_FILTER" --gtest_color=yes --gtest_brief=1
+    fi
+else
+    # Run all tests via CTest
+    if [ "$VERBOSE" = true ]; then
+        ctest --test-dir "$BUILD_DIR" --output-on-failure --verbose
+    else
+        ctest --test-dir "$BUILD_DIR" --output-on-failure
+    fi
+fi

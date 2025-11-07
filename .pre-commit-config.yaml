@@ -1,0 +1,26 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+        exclude: ^torch_neuron/python_ops/jax/jax_impl\.py$|
+                 ^torch_neuron/protos/
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.0
+    hooks:
+      - id: clang-format
+        files: \.(cpp|h|hpp|cc|cxx)$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^torch_neuron/python_ops/jax/jax_impl\.py$|
+                 ^torch_neuron/protos/
+      - id: end-of-file-fixer
+        exclude: ^torch_neuron/python_ops/jax/jax_impl\.py$|
+                 ^torch_neuron/protos/
+      - id: check-yaml
+      - id: check-added-large-files

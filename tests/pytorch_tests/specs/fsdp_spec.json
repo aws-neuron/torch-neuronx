@@ -1,0 +1,249 @@
+{
+    "test_configurations": [
+        {
+            "file": "distributed/fsdp/test_fsdp_core.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_true_none_neuron",
+                        "test_delayed_optim_step_offload_true_none_neuron",
+                        "test_mixture_of_experts_offload_true_none_neuron",
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_false_no_shard_neuron",
+                        "test_nested_always_wrap_model_offload_true_none_neuron",
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_true_shard_grad_op_neuron",
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_false_none_neuron",
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_false_shard_grad_op_neuron",
+                        "test_nested_wrapped_model_single_iteration_mixed_precision_offload_true_no_shard_neuron",
+                        "test_mixture_of_experts_offload_true_shard_grad_op_neuron",
+                        "test_delayed_optim_step_offload_true_shard_grad_op_neuron",
+                        "test_nested_always_wrap_model_offload_true_shard_grad_op_neuron",
+                        "test_mixture_of_experts_with_delay_before_free_offload_true_no_shard_neuron",
+                        "test_delayed_reduce_scatter_offload_true_no_shard_neuron",
+                        "test_nested_wrapped_model_offload_true_no_shard_neuron",
+                        "test_mixture_of_experts_with_delay_before_free_offload_true_none_neuron",
+                        "test_delayed_reduce_scatter_offload_true_none_neuron",
+                        "test_nested_wrapped_model_offload_true_none_neuron",
+                        "test_transformer_offload_true_no_shard_neuron",
+                        "test_mixture_of_experts_with_delay_before_free_offload_true_shard_grad_op_neuron",
+                        "test_delayed_reduce_scatter_offload_true_shard_grad_op_neuron",
+                        "test_nested_wrapped_model_offload_true_shard_grad_op_neuron",
+                        "test_transformer_offload_true_none_neuron",
+                        "test_mixture_of_experts_offload_true_no_shard_neuron",
+                        "test_delayed_optim_step_offload_true_no_shard_neuron",
+                        "test_nested_always_wrap_model_offload_true_no_shard_neuron",
+                        "test_transformer_offload_true_shard_grad_op_neuron",
+                        "test_unshard_params_as_tensors_neuron",
+                        "test_unshard_params_as_tensors_neuron",
+                        "test_param_change_after_init_mixed_precision_False_neuron",
+                        "test_param_change_after_init_mixed_precision_True_neuron"
+
+                    ],
+                    "reason": "Multiple issues - Dtype mismatch (Half/Float): 6, RuntimeError SegFault Pin_memory: 21"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_checkpoint_wrapper.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_apply.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_transformer_module_apply_neuron",
+                        "test_nested_module_apply_neuron"
+                    ],
+                    "reason": "NotImplementedError: Boolean mask indexing not supported on Neuron, falling back to CPU"
+                }
+            ]
+
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_checkpoint.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_basic_checkpoint_end_to_end_cpu_offload0_offload_activations_False_use_orig_params_False",
+                        "test_basic_checkpoint_end_to_end_cpu_offload0_offload_activations_False_use_orig_params_True",
+                        "test_basic_checkpoint_end_to_end_cpu_offload0_offload_activations_True_use_orig_params_False",
+                        "test_basic_checkpoint_end_to_end_cpu_offload0_offload_activations_True_use_orig_params_True",
+                        "test_checkpoint_fsdp_wrapping_cpu_offload0_offload_activations_False_use_orig_params_False",
+                        "test_checkpoint_fsdp_wrapping_cpu_offload0_offload_activations_False_use_orig_params_True",
+                        "test_checkpoint_fsdp_wrapping_cpu_offload0_offload_activations_True_use_orig_params_False",
+                        "test_checkpoint_fsdp_wrapping_cpu_offload0_offload_activations_True_use_orig_params_True"
+                    ],
+                    "reason": "RuntimeError SegFault Pin_memory"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_clip_grad_norm.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_comm.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_comm_hooks.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_registering_hook_hybrid_strategy"
+                    ],
+                    "reason": "Device index out of range"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_flatten_params.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_input.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_grad_acc.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_grad_acc_cpu_offload_use_orig_params_True",
+                        "test_grad_acc_cpu_offload_use_orig_params_False",
+                        "test_grad_acc_configs0_use_orig_params_False",
+                        "test_grad_acc_configs0_use_orig_params_True",
+                        "test_grad_acc_configs1_use_orig_params_False",
+                        "test_grad_acc_configs1_use_orig_params_True"
+                    ],
+                    "reason": "RuntimeError: SegFault pin memory, Operation index failed to execute on Neuron"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_sharded_grad_scaler.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_none_none_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_shard_grad_op_none_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_shard_grad_op_mixed_precision_none",
+                        "test_sharded_grad_scaler_found_inf",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_shard_grad_op_mixed_precision_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_shard_grad_op_none_none",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_mixed_precision_none",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_mixed_precision_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_mixed_precision_none",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_mixed_precision_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_none_mixed_precision_none",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_none_mixed_precision_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_true_none_none_none",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_none_use_orig_params",
+                        "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_none_use_orig_params"
+
+                    ],
+                    "reason": "Multiple issues - Dtype mismatch (Half/Float): 8, RuntimeError SegFault Pin_memory: 5"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_distributed_checkpoint.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_mixed_precision.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_grads_reduced_precision",
+                        "test_input_grads_with_param_mixed_precision",
+                        "test_buffer_dtype_no_root_handle",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_false_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_false_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_true_fp32_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_true_fp32_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_true_fp32_none",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_true_fp32_none",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_true_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_true_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_false_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_fp16_offload_true_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_true_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_true_fp32_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_true_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_true_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_true_fp32_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_false_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_false_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_true_fp32_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_true_fp32_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_true_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_true_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_no_reshard_after_forward",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_false_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_diff_buffer_reduce_offload_false_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_false_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_true_fp32_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_false_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_true_fp64_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard_mp_only_param_and_buf_offload_true_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_false_fp64_none",
+                        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_true_fp32_enable_sharded_grad_scaler",
+                        "test_mixed_precision_e2e_full_shard",
+                        "test_mp_batchnorm_convert_sync_bn_True"
+                    ],
+                    "reason": "Multiple issues - Device index out of range: 1, Float64 not supported on Neuron: 22, RuntimeError SegFault Pin_memory: 12"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_optim_state.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_no_grad",
+                        "test_interface_arguments",
+                        "test_optim_state_without_param_groups",
+                        "test_compatible_with_trec",
+                        "test_flatten_sharded_optim_state_dict_transformer",
+                        "test_scatter_full_optim_state_dict_transformer",
+                        "test_shard_full_optim_state_dict_transformer",
+                        "test_state_dict_with_none_tensor_state",
+                        "test_with_no_shard",
+                        "test_full_optim_state_dict_nested_invalid"
+                    ],
+                    "reason": "RuntimeError SegFault Pin_memory"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_shard_utils.py"
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_use_orig_params.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_diff_trainability",
+                        "test_diff_hyperparams_cpu_offload_sharding_strategy_str_full_shard",
+                        "test_diff_hyperparams_cpu_offload_sharding_strategy_str_no_shard",
+                        "test_multiple_optimizers",
+                        "test_diff_hyperparams_cpu_offload_sharding_strategy_str_shard_grad_op",
+                        "test_multiple_forward_offload_params_True",
+                        "test_summon_between_two_forwards_offload_params_False",
+                        "test_create_chunk_dtensor"
+                    ],
+                    "reason": "RuntimeError SegFault Pin_memory"
+                }
+            ]
+        },
+        {
+            "file": "distributed/fsdp/test_fsdp_unshard_params.py",
+            "xfail": [
+                {
+                    "tests": [
+                        "test_unshard_params_param_data_no_shard",
+                        "test_unshard_params_writeback_no_shard",
+                        "test_unshard_params_writeback",
+                        "test_unshard_params_param_data"
+                    ],
+                    "reason": "RuntimeError SegFault Pin_memory"
+                }
+            ]
+        }
+    ]
+}
