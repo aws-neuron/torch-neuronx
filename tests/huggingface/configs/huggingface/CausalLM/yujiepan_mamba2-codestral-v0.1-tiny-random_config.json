@@ -1,0 +1,43 @@
+{
+  "architectures": [
+    "Mamba2ForCausalLM"
+  ],
+  "bos_token_id": 0,
+  "chunk_size": 256,
+  "conv_kernel": 4,
+  "eos_token_id": 0,
+  "expand": 4,
+  "head_dim": 4,
+  "hidden_act": "silu",
+  "hidden_size": 8,
+  "initializer_range": 0.1,
+  "intermediate_size": 32,
+  "layer_norm_epsilon": 1e-05,
+  "model_type": "mamba2",
+  "n_groups": 2,
+  "norm_before_gate": true,
+  "num_heads": 8,
+  "num_hidden_layers": 2,
+  "pad_token_id": 0,
+  "rescale_prenorm_residual": false,
+  "residual_in_fp32": true,
+  "rms_norm": true,
+  "state_size": 8,
+  "tie_word_embeddings": false,
+  "time_step_floor": 0.0001,
+  "time_step_init_scheme": "random",
+  "time_step_limit": [
+    0.0,
+    Infinity
+  ],
+  "time_step_max": 0.1,
+  "time_step_min": 0.001,
+  "time_step_rank": 256,
+  "time_step_scale": 1.0,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.55.2",
+  "use_bias": false,
+  "use_cache": true,
+  "use_conv_bias": true,
+  "vocab_size": 32768
+}

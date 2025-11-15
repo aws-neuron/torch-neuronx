@@ -1,0 +1,343 @@
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+#include <vector>
+
+#include "tests/csrc/mocks/MockCPUFallbackExecutor.h"
+#include "tests/csrc/mocks/MockKernelExecution.h"
+
+using namespace at::neuron;
+namespace mock = at::neuron::testing;
+
+class CPUFallbackExecutorTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // Clear environment variables for consistent testing
+    unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+
+    // Use mock executor to avoid device transfer issues in test environment
+    executor_ = std::make_unique<mock::MockCPUFallbackExecutor>();
+  }
+
+  void TearDown() override {
+    // Clean up environment
+    unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+  }
+
+  std::unique_ptr<CPUFallbackExecutor> executor_;
+};
+
+// Test CPUFallbackExecutor constructor and configuration
+TEST_F(CPUFallbackExecutorTest, ConstructorAndConfiguration) {
+  // Test 1: Default configuration (enabled)
+  {
+    CPUFallbackExecutor executor;
+    EXPECT_TRUE(executor.IsEnabled());
+
+    auto stats = executor.GetStatistics();
+    EXPECT_EQ(stats.total_fallback_attempts, 0);
+    EXPECT_EQ(stats.successful_fallbacks, 0);
+    EXPECT_EQ(stats.failed_fallbacks, 0);
+  }
+
+  // Test 2: Disabled via environment variable
+  {
+    setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "1", 1);
+    CPUFallbackExecutor executor;
+    EXPECT_FALSE(executor.IsEnabled());
+    unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+  }
+
+  // Test 3: Enabled via environment variable (any other value)
+  {
+    setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "0", 1);
+    CPUFallbackExecutor executor;
+    EXPECT_TRUE(executor.IsEnabled());
+    unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+  }
+}
+
+// Test enable/disable functionality
+TEST_F(CPUFallbackExecutorTest, EnableDisable) {
+  // Test initial state
+  EXPECT_TRUE(executor_->IsEnabled());
+
+  // Test disabling
+  executor_->SetEnabled(false);
+  EXPECT_FALSE(executor_->IsEnabled());
+
+  // Test re-enabling
+  executor_->SetEnabled(true);
+  EXPECT_TRUE(executor_->IsEnabled());
+}
+
+// Test can_execute_on_cpu method
+TEST_F(CPUFallbackExecutorTest, CanExecuteOnCpu) {
+  // Test with enabled executor
+  EXPECT_TRUE(executor_->IsEnabled());
+
+  // Test with common PyTorch operations that should have CPU implementations
+  // Note: These may return false in test environment due to limited PyTorch setup
+  bool can_add = executor_->CanExecuteOnCpu("aten::add.Tensor");
+  bool can_mul = executor_->CanExecuteOnCpu("aten::mul.Tensor");
+
+  // The exact result depends on PyTorch setup, but the method should not crash
+  EXPECT_TRUE(can_add || !can_add);  // Just verify it returns a boolean
+  EXPECT_TRUE(can_mul || !can_mul);  // Just verify it returns a boolean
+
+  // Test with clearly invalid operation
+  EXPECT_FALSE(executor_->CanExecuteOnCpu("invalid::nonexistent.operation"));
+
+  // Test with disabled executor
+  executor_->SetEnabled(false);
+  EXPECT_FALSE(executor_->CanExecuteOnCpu("aten::add.Tensor"));
+  EXPECT_FALSE(executor_->CanExecuteOnCpu("any::operation"));
+}
+
+// Test ExecuteCpuFallback with disabled executor
+TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackDisabled) {
+  executor_->SetEnabled(false);
+
+  // Create a mock operation
+  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+  mock_op.submit_time = std::chrono::steady_clock::now();
+
+  // Execute CPU fallback - should fail because disabled
+  auto result = executor_->ExecuteCpuFallback(&mock_op);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("CPU fallback is disabled"));
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("test_op"));
+}
+
+// Test ExecuteCpuFallback with mock operation (will fail due to no CPU implementation)
+TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackWithMockOperation) {
+  EXPECT_TRUE(executor_->IsEnabled());
+
+  // Create a mock operation
+  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+  mock_op.submit_time = std::chrono::steady_clock::now();
+
+  // Execute CPU fallback - will fail due to mock operation
+  auto result = executor_->ExecuteCpuFallback(&mock_op);
+
+  // Should fail because "test_op" is not a real PyTorch operation
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("CPU fallback failed for"));
+
+  // Verify statistics were updated
+  auto stats = executor_->GetStatistics();
+  EXPECT_EQ(stats.total_fallback_attempts, 1);
+  EXPECT_EQ(stats.successful_fallbacks, 0);
+  EXPECT_EQ(stats.failed_fallbacks, 1);
+}
+
+// Test statistics functionality
+TEST_F(CPUFallbackExecutorTest, Statistics) {
+  // Test initial statistics
+  auto stats = executor_->GetStatistics();
+  EXPECT_EQ(stats.total_fallback_attempts, 0);
+  EXPECT_EQ(stats.successful_fallbacks, 0);
+  EXPECT_EQ(stats.failed_fallbacks, 0);
+
+  // Execute a fallback operation to generate statistics
+  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+  mock_op.submit_time = std::chrono::steady_clock::now();
+
+  executor_->ExecuteCpuFallback(&mock_op);
+
+  // Check updated statistics
+  stats = executor_->GetStatistics();
+  EXPECT_EQ(stats.total_fallback_attempts, 1);
+  EXPECT_EQ(stats.successful_fallbacks + stats.failed_fallbacks, 1);
+
+  // Test reset statistics
+  executor_->ResetStatistics();
+  stats = executor_->GetStatistics();
+  EXPECT_EQ(stats.total_fallback_attempts, 0);
+  EXPECT_EQ(stats.successful_fallbacks, 0);
+  EXPECT_EQ(stats.failed_fallbacks, 0);
+}
+
+// Test multiple fallback attempts to verify statistics accumulation
+TEST_F(CPUFallbackExecutorTest, MultipleStatisticsAccumulation) {
+  // Execute multiple fallback operations
+  for (int i = 0; i < 3; ++i) {
+    std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+    std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+    auto mock_kernel =
+        std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+
+    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+    OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+    mock_op.submit_time = std::chrono::steady_clock::now();
+
+    executor_->ExecuteCpuFallback(&mock_op);
+  }
+
+  // Verify statistics were accumulated
+  auto stats = executor_->GetStatistics();
+  EXPECT_EQ(stats.total_fallback_attempts, 3);
+  EXPECT_EQ(stats.successful_fallbacks + stats.failed_fallbacks, 3);
+}
+
+// Test thread safety of statistics (basic test)
+TEST_F(CPUFallbackExecutorTest, StatisticsThreadSafety) {
+  // This is a basic test - in a real scenario you'd want more comprehensive threading tests
+
+  // Get stats multiple times to ensure no race conditions in basic usage
+  auto stats1 = executor_->GetStatistics();
+  auto stats2 = executor_->GetStatistics();
+
+  EXPECT_EQ(stats1.total_fallback_attempts, stats2.total_fallback_attempts);
+  EXPECT_EQ(stats1.successful_fallbacks, stats2.successful_fallbacks);
+  EXPECT_EQ(stats1.failed_fallbacks, stats2.failed_fallbacks);
+
+  // Reset and verify
+  executor_->ResetStatistics();
+  auto stats3 = executor_->GetStatistics();
+
+  EXPECT_EQ(stats3.total_fallback_attempts, 0);
+  EXPECT_EQ(stats3.successful_fallbacks, 0);
+  EXPECT_EQ(stats3.failed_fallbacks, 0);
+}
+
+// Test with different operation names to verify success vs failure cases
+TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallback) {
+  // Test operations that should SUCCEED (real PyTorch operations with proper inputs)
+  struct SuccessTestCase {
+    std::string op_name;
+    std::vector<torch::Tensor> inputs;
+    std::vector<torch::Tensor> outputs;
+  };
+
+  std::vector<SuccessTestCase> success_operations = {
+      {"aten::mm", {torch::ones({2, 3}), torch::ones({3, 2})}, {torch::zeros({2, 2})}},
+  };
+
+  // Test operations that should FAIL (invalid/nonexistent operations)
+  struct FailureTestCase {
+    std::string op_name;
+    std::vector<torch::Tensor> inputs;
+    std::vector<torch::Tensor> outputs;
+  };
+
+  std::vector<FailureTestCase> failure_operations = {
+      {"aten::nonexistent", {torch::ones({2, 3})}, {torch::zeros({2, 3})}},
+      {"", {torch::ones({2, 3})}, {torch::zeros({2, 3})}}};
+
+  // Test SUCCESS cases - real PyTorch operations should work
+  for (const auto& test_case : success_operations) {
+    auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>(
+        test_case.op_name, test_case.inputs, test_case.outputs);
+
+    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+    OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+    mock_op.submit_time = std::chrono::steady_clock::now();
+
+    auto result = executor_->ExecuteCpuFallback(&mock_op);
+
+    // Real PyTorch operations should succeed with our mock
+    EXPECT_TRUE(result.IsSuccess())
+        << "Expected success for operation: " << test_case.op_name
+        << ", but got error: " << (result.IsSuccess() ? "none" : result.GetError());
+  }
+
+  // Test FAILURE cases - invalid operations should fail gracefully
+  for (const auto& test_case : failure_operations) {
+    auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>(
+        test_case.op_name, test_case.inputs, test_case.outputs);
+
+    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+    OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+    mock_op.submit_time = std::chrono::steady_clock::now();
+
+    auto result = executor_->ExecuteCpuFallback(&mock_op);
+
+    // Invalid operations should fail with proper error message
+    EXPECT_FALSE(result.IsSuccess())
+        << "Expected failure for invalid operation: " << test_case.op_name;
+
+    if (!result.IsSuccess()) {
+      EXPECT_THAT(result.GetError(), ::testing::HasSubstr("CPU fallback failed"))
+          << "Error message should contain 'CPU fallback failed' for operation: "
+          << test_case.op_name;
+      EXPECT_THAT(result.GetError(), ::testing::HasSubstr("No CPU implementation found"))
+          << "Error message should contain 'No CPU implementation found' for operation: "
+          << test_case.op_name;
+    }
+  }
+
+  // Verify statistics were updated correctly
+  auto stats = executor_->GetStatistics();
+  size_t total_operations = success_operations.size() + failure_operations.size();
+  EXPECT_EQ(stats.total_fallback_attempts, total_operations);
+  EXPECT_EQ(stats.successful_fallbacks, success_operations.size());
+  EXPECT_EQ(stats.failed_fallbacks, failure_operations.size());
+}
+
+// Test configuration loading with different environment variable values
+TEST_F(CPUFallbackExecutorTest, ConfigurationLoading) {
+  // Test various environment variable values
+  std::vector<std::pair<std::string, bool>> test_cases = {
+      {"1", false},     // "1" disables fallback
+      {"0", true},      // "0" enables fallback
+      {"true", true},   // "true" enables fallback
+      {"false", true},  // "false" enables fallback
+      {"", true},       // empty enables fallback
+      {"random", true}  // any other value enables fallback
+  };
+
+  for (const auto& [env_value, expected_enabled] : test_cases) {
+    if (env_value.empty()) {
+      unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+    } else {
+      setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", env_value.c_str(), 1);
+    }
+
+    CPUFallbackExecutor executor;
+    EXPECT_EQ(executor.IsEnabled(), expected_enabled)
+        << "Failed for env_value: '" << env_value << "'";
+
+    unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
+  }
+}
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

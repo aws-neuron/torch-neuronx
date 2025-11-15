@@ -1,0 +1,197 @@
+"""slice-based implementation for contiguous operation."""
+
+import torch
+
+from torch_neuronx.python_ops.jax.kernel import JaxKernel
+
+from .auto_registration import neuron_op
+from .base import ExecutionResult, OperationImplementation
+
+
+def _row_major_strides(shape: list[int]) -> tuple[int, ...]:
+    """Compute row-major (contiguous) strides for a given shape."""
+    if not shape:
+        return ()
+
+    strides = []
+    running_stride = 1
+
+    # Build strides from right to left
+    for i in range(len(shape) - 1, -1, -1):
+        strides.insert(0, running_stride)
+        running_stride *= shape[i]
+
+    return tuple(strides)
+
+
+def detect_slice_pattern(
+    shape: list[int], strides: list[int], storage_offset: int
+) -> tuple[int, int, int] | None:
+    """Detect if tensor is a slice of a single axis.
+
+    Returns (axis, original_size, start_offset) or None if not a simple single-axis slice.
+    """
+    # For slice, we need to find which axis has the "wrong" stride relationship
+    # Check stride relationships: stride[i] should equal shape[i+1] * stride[i+1]
+
+    for axis in range(len(shape)):
+        if axis == len(shape) - 1:
+            # Last dimension: stride must be 1 (element size) - can't be sliced further
+            if strides[axis] != 1:
+                return None
+        else:
+            expected_stride = shape[axis + 1] * strides[axis + 1]
+            if strides[axis + 1] == 0:
+                return None
+
+            if strides[axis] != expected_stride:
+                # This dimension has wrong stride - check if it's due to slice
+                # The stride should be based on a larger size for the next dimension
+                if strides[axis] % strides[axis + 1] == 0:
+                    implied_next_size = strides[axis] // strides[axis + 1]
+                    if implied_next_size > shape[axis + 1] and _verify_single_slice_at_axis(
+                        shape, strides, axis + 1, implied_next_size
+                    ):
+                        # Calculate start offset in the sliced dimension
+                        start_offset = storage_offset // strides[axis + 1]
+                        return axis + 1, implied_next_size, start_offset
+                return None
+
+    return None
+
+
+def _verify_single_slice_at_axis(
+    shape: list[int], strides: list[int], slice_axis: int, original_size: int
+) -> bool:
+    """Verify that only the given axis was sliced from original_size to current size."""
+    # Reconstruct what the original shape would have been
+    original_shape = list(shape)
+    original_shape[slice_axis] = original_size
+
+    # Check if current strides match what they would be for the original shape
+    expected_original_strides = _row_major_strides(original_shape)
+
+    return list(strides) == list(expected_original_strides)
+
+
+@neuron_op("aten::contiguous", priority=90)  # lower priority than ContiguousBroadcastImpl
+class ContiguousSliceImpl(OperationImplementation):
+    """slice-based implementation for contiguous operation."""
+
+    def __init__(self):
+        super().__init__()
+        self._kernel: JaxKernel | None = None
+
+    def _get_kernel(self):
+        """Get or create kernel for slice copy."""
+        if self._kernel is not None:
+            return self._kernel
+
+        def slice_fn(x, axis, start_idx, end_idx):
+            slices = [slice(None)] * x.ndim
+            slices[axis] = slice(start_idx, end_idx)
+            return x[tuple(slices)]
+
+        self._kernel = JaxKernel(slice_fn, op_name="aten::contiguous", static_argnums=(1, 2, 3))
+
+        return self._kernel
+
+    def can_handle(self, self_tensor, memory_format=None) -> bool:
+        """Check if this implementation can handle the tensor."""
+        if not super().can_handle(self_tensor, memory_format=memory_format):
+            return False
+
+        if memory_format is not None and (
+            memory_format != torch.contiguous_format and memory_format != torch.preserve_format
+        ):
+            return False
+
+        if self_tensor.is_contiguous(memory_format=torch.contiguous_format):
+            return False
+
+        if self_tensor.numel() == 0 or len(self_tensor.shape) == 0:
+            return False
+
+        # Check for slice pattern
+        shape = list(self_tensor.shape)
+        strides = list(self_tensor.stride())
+        slice_info = detect_slice_pattern(shape, strides, self_tensor.storage_offset())
+
+        return slice_info is not None
+
+    def _execute_impl_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Internal execution of contiguous operation using copy kernel."""
+        shape = list(self_tensor.shape)
+        strides = list(self_tensor.stride())
+        slice_info = detect_slice_pattern(shape, strides, self_tensor.storage_offset())
+
+        if slice_info is None:
+            return ExecutionResult(success=False, error_msg="No valid slice pattern detected")
+
+        slice_axis, original_size, start_offset = slice_info
+
+        # Create base view with original shape and contiguous strides
+        implied_shape = list(shape)
+        implied_shape[slice_axis] = original_size
+        base_strides = _row_major_strides(implied_shape)
+
+        # Calculate the base storage offset (start of the original tensor)
+        base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+
+        base_view = self_tensor.as_strided(
+            size=tuple(implied_shape),
+            stride=tuple(base_strides),
+            storage_offset=base_storage_offset,
+        )
+
+        end_offset = start_offset + shape[slice_axis]
+        kernel = self._get_kernel()
+
+        from .jax.context import ExecutionContext
+
+        exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
+        return kernel(base_view, slice_axis, start_offset, end_offset, context=exec_ctx)
+
+    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute the operation without autograd support"""
+        try:
+            output = self._execute_impl_internal(self_tensor, memory_format=None)
+            if not output.is_contiguous():
+                return ExecutionResult(
+                    success=False,
+                    error_msg="Slice output not contiguous",
+                )
+
+            return ExecutionResult(success=True, output=output)
+
+        except Exception as e:
+            return ExecutionResult(success=False, error_msg=f"slice implementation failed: {e}")
+
+    def execute(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute the operation with autograd support"""
+        if self_tensor.numel() == 0:
+            return ExecutionResult(success=True, output=self_tensor)
+
+        if self_tensor.requires_grad:
+            try:
+                output = ContiguousSliceFunction.apply(self_tensor, memory_format, self)
+                return ExecutionResult(success=True, output=output)
+            except Exception as e:
+                return ExecutionResult(
+                    success=False,
+                    error_msg=f"Autograd path failed for contiguous slice: {e}",
+                )
+
+        return self._execute_impl(self_tensor, memory_format)
+
+
+class ContiguousSliceFunction(torch.autograd.Function):
+    """Autograd function for slice-based contiguous implementation."""
+
+    @staticmethod
+    def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousSliceImpl):
+        return impl._execute_impl_internal(self_tensor, memory_format)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
