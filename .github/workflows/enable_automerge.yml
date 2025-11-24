@@ -1,0 +1,15 @@
+name: No-op action to allow automerge on PRs
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+# Automerge on PRs requires that some workflow blocker runs
+# this is a no-op action that allows us to enable automerge
+jobs:
+  sleep-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sleep for 30 seconds
+        run: sleep 30
