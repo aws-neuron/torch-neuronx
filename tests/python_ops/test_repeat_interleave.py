@@ -1,0 +1,162 @@
+"""Tests for repeat_interleave operation."""
+
+import pytest
+import torch
+
+import torch_neuronx
+from tests.utils.neuron_test_utils import (
+    assert_op_runs_on_neuron,
+    track_neuron_ops,
+)
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+class TestRepeatInterleave:
+    """Test suite for repeat_interleave operation."""
+
+    @pytest.fixture
+    def device(self):
+        """Get the neuron device."""
+        return torch.device("neuron")
+
+    @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
+    def test_repeat_interleave_basic_shapes(self, device, shape):
+        """Test repeat_interleave with various tensor shapes."""
+        with track_neuron_ops():
+            x = torch.randn(shape, device=device)
+            neuron_result = torch.repeat_interleave(x, 3)
+            cpu_result = torch.repeat_interleave(x.cpu(), 3)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    @pytest.mark.parametrize("repeats", [1, 2, 3, 5])
+    def test_repeat_interleave_different_repeats(self, device, repeats):
+        """Test repeat_interleave with different repeat counts."""
+        with track_neuron_ops():
+            x = torch.randn(4, device=device)
+            neuron_result = torch.repeat_interleave(x, repeats)
+            cpu_result = torch.repeat_interleave(x.cpu(), repeats)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    @pytest.mark.parametrize("dim", [0, 1, -1])
+    def test_repeat_interleave_with_dim(self, device, dim):
+        """Test repeat_interleave with specified dimension."""
+        with track_neuron_ops():
+            x = torch.randn(3, 4, device=device)
+            neuron_result = torch.repeat_interleave(x, 2, dim=dim)
+            cpu_result = torch.repeat_interleave(x.cpu(), 2, dim=dim)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32, torch.int64])
+    def test_repeat_interleave_different_dtypes(self, device, dtype):
+        """Test repeat_interleave with different data types."""
+        with track_neuron_ops():
+            x = torch.tensor([1, 2, 3], dtype=dtype, device=device)
+            neuron_result = torch.repeat_interleave(x, 2)
+            cpu_result = torch.repeat_interleave(x.cpu(), 2)
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.dtype == dtype
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_tensor_repeats(self, device):
+        """Test repeat_interleave with tensor repeats."""
+        with track_neuron_ops():
+            x = torch.randn(3, device=device)
+            repeats = torch.tensor([1, 2, 3], device=device)
+            neuron_result = torch.repeat_interleave(x, repeats)
+            cpu_result = torch.repeat_interleave(x.cpu(), repeats.cpu())
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_empty_tensor(self, device):
+        """Test repeat_interleave with empty tensor."""
+        with track_neuron_ops():
+            x = torch.tensor([], device=device)
+            neuron_result = torch.repeat_interleave(x, 3)
+            cpu_result = torch.repeat_interleave(x.cpu(), 3)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_single_element(self, device):
+        """Test repeat_interleave with single element tensor."""
+        with track_neuron_ops():
+            x = torch.tensor([5.0], device=device)
+            neuron_result = torch.repeat_interleave(x, 4)
+            cpu_result = torch.repeat_interleave(x.cpu(), 4)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_with_output_size(self, device):
+        """Test repeat_interleave with output_size parameter."""
+        with track_neuron_ops():
+            x = torch.randn(3, device=device)
+            repeats = torch.tensor([2, 3, 4], device=device)  # sum = 9
+            neuron_result = torch.repeat_interleave(x, repeats, output_size=9)
+            cpu_result = torch.repeat_interleave(x.cpu(), repeats.cpu(), output_size=9)
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.shape[0] == 9
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_method(self, device):
+        """Test x.repeat_interleave method."""
+        with track_neuron_ops():
+            x = torch.randn(4, device=device)
+            neuron_result = x.repeat_interleave(3)
+            cpu_result = x.cpu().repeat_interleave(3)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_method_with_dim(self, device):
+        """Test x.repeat_interleave method with dimension."""
+        with track_neuron_ops():
+            x = torch.randn(3, 4, device=device)
+            neuron_result = x.repeat_interleave(2, dim=1)
+            cpu_result = x.cpu().repeat_interleave(2, dim=1)
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_method_tensor_repeats(self, device):
+        """Test x.repeat_interleave method with tensor repeats."""
+        with track_neuron_ops():
+            x = torch.randn(3, device=device)
+            repeats = torch.tensor([1, 3, 2], device=device)
+            neuron_result = x.repeat_interleave(repeats)
+            cpu_result = x.cpu().repeat_interleave(repeats.cpu())
+
+            assert neuron_result.device.type == "neuron"
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::repeat_interleave")
+
+    def test_repeat_interleave_incorrect_output_size(self, device):
+        """Test repeat_interleave with incorrect output_size raises RuntimeError."""
+        x = torch.randn(3, device=device)
+        repeats = torch.tensor([2, 3, 4], device=device)  # sum = 9
+
+        with pytest.raises(RuntimeError, match="allocated size does not match required size"):
+            torch.repeat_interleave(x, repeats, output_size=5)  # incorrect size
+
+        # Verify same behavior on CPU
+        with pytest.raises(RuntimeError, match="allocated size does not match required size"):
+            torch.repeat_interleave(x.cpu(), repeats.cpu(), output_size=5)

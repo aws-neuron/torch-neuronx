@@ -1,0 +1,215 @@
+{
+  "test_configurations": [
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_training.py",
+      "sanity_methods": [
+        "test_train_parity_single_group_shard_dim0",
+        "test_explicit_prefetching",
+        "test_2d_mlp_with_nd_mesh"
+      ],
+      "xfail": [
+        {
+          "reason": "Multiple failures - CUDA driver missing, tensor comparison mismatches, device assignment errors, unsupported operations",
+          "tests": [
+            "test_train_mixed_requires_grad_across_groups",
+            "test_train_mixed_requires_grad_per_group",
+            "test_3d_mlp_with_nd_mesh",
+            "test_gradient_accumulation",
+            "test_to_float64_after_init",
+            "test_register_fsdp_forward_method",
+            "test_param_registration_after_backward",
+            "test_param_registration_after_forward",
+            "test_root_move_forward_input_to_device",
+            "test_train_parity_hsdp"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_state.py",
+      "sanity_methods": [
+        "test_fully_shard_deepcopy",
+        "test_fully_shard_state",
+        "test_fully_shard_reapply"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_state_dict.py",
+      "sanity_methods": [
+        "test_dp_state_dict_save_load",
+        "test_rank0_offload_full_state_dict"
+      ],
+      "xfail": [
+        {
+          "reason": "State dict correctness failures and tensor comparison mismatches",
+          "tests": [
+            "test_2d_state_dict_correctness",
+            "test_hsdp_tp_state_dict_save_load"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py",
+      "xfail": [
+        {
+          "reason": "Overlap functionality failures",
+          "tests": [
+            "test_fully_shard_post_optim_event_overlap"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_mixed_precision.py",
+      "xfail": [
+        {
+          "reason": "Mixed precision and dtype handling failures",
+          "tests": [
+            "test_norm_modules_bf16",
+            "test_norm_modules_fp16"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_memory.py",
+      "xfail": [
+        {
+          "reason": "Memory management failures",
+          "tests": [
+            "test_fully_shard_del_memory",
+            "test_fully_shard_training_memory"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_logging.py",
+      "xfail": [
+        {
+          "reason": "Logging functionality failure",
+          "tests": [
+            "test_fsdp_logging"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_init.py",
+      "skip_tests": [
+        {
+          "reason": "Runnning tests separately in test_fully_shard_meta_device_init.py",
+          "tests": [
+            "test_1d_process_group_init",
+            "test_2d_process_group_init"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Initialization failures with various sharding configurations",
+          "tests": [
+            "test_rank0_broadcast_meta_device_init",
+            "test_mixed_dtypes_no_grad_param",
+            "test_raise_noncontiguous_parameter",
+            "test_move_states_to_device_dtensor_invalid"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_ignore_params.py",
+      "sanity_methods": [
+        "test_ddp_A_fsdp_B_ddp_C"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_grad_scaler.py",
+      "sanity_methods": [
+        "test_1f1b_microbatching"
+      ],
+      "xfail": [
+        {
+          "reason": "in linear_backward_strategy assert grad_input_spec is not None",
+          "tests": [
+            "test_gradient_scaler"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_frozen.py",
+      "sanity_methods": [
+        "test_multi_forward_mixed_requires_grad"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_extensions.py",
+      "xfail": [
+        {
+          "reason": "Extension functionality failures",
+          "tests": [
+            "test_all_gather_extension_hsdp_mesh",
+            "test_all_gather_extensions_monkey_patch",
+            "test_all_gather_extensions_train_parity"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_comm.py",
+      "skip_tests": [
+        {
+          "reason": "NCCL log comparision does not apply to Neuron",
+          "tests": [
+            "test_fully_shard_force_sum_both_reductions",
+            "test_fully_shard_force_sum_reduce_scatter"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Communication and reduction operation failures",
+          "tests": [
+            "test_fully_shard_communication_count",
+            "test_set_reduce_scatter_divide_factor",
+            "test_all_gather_fp32",
+            "test_manual_reshard_with_reshard_after_forward_false",
+            "test_set_reshard_after_forward",
+            "test_unshard_without_lazy_init",
+            "test_fully_shard_alloc_from_pg"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py",
+      "xfail": [
+        {
+          "reason": "Gradient clipping failure",
+          "tests": [
+            "test_clip_grad_norm_2d"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_autograd.py",
+      "sanity_methods": [
+        "test_nontensor_activations",
+        "test_unused_forward_module"
+      ],
+      "xfail": [
+        {
+          "reason": "Autograd and parameter management failures",
+          "tests": [
+            "test_manual_reshard_with_reshard_after_forward_false",
+            "test_set_reshard_after_forward",
+            "test_unshard_without_lazy_init"
+          ]
+        }
+      ]
+    }
+  ]
+}

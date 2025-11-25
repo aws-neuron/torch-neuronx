@@ -1,0 +1,45 @@
+[project]
+name = "torch-neuronx"
+version = "0.1.0"
+description = "Neuron Backend for PyTorch"
+authors = [{name = "AWS Neuron Team"}]
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch~=2.8.0",
+    "jax",
+    "numpy<2", # neuronx-cc requires numpy 1.x
+    "grpcio-tools",
+]
+
+[build-system]
+requires = ["setuptools", "wheel", "torch", "grpcio-tools"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "expecttest>=0.3.0",
+    "hypothesis",
+    "ninja>=1.11.1.4",
+    "pytest",
+    "pytest-xdist",
+    "pytest-html",
+    "pytest-cov",
+    "pytest-json-report",
+    "ruff>=0.8.0",
+    "pyzstd",
+    "pytest-forked",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build", "dist", ".eggs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "E402"]
+"tests/*" = ["S101", "F401"]  # Allow assert and unused imports in tests (torch_neuronx needs to be imported for side effects)
+"tests/python_ops/jax_plumbing/*" = ["E402"]  # Allow delayed imports in jax tests
+"examples/**/*" = ["F401"]  # Allow unused imports in examples for side effects

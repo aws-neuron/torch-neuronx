@@ -1,0 +1,15 @@
+{
+  "failed_tests": [
+    "test_normal_neuron_float32",
+    "test_normal_neuron_float64",
+    "test_rand_neuron_complex128",
+    "test_rand_neuron_complex32",
+    "test_rand_neuron_complex64",
+    "test_randint_distribution_neuron",
+    "test_randn_neuron_complex128",
+    "test_randn_neuron_complex32",
+    "test_randn_neuron_complex64",
+    "test_randperm_neuron",
+    "test_uniform_from_to_neuron_float64"
+  ]
+}
