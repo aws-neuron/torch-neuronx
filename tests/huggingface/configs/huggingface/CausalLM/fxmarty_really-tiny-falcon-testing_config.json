@@ -1,0 +1,41 @@
+{
+  "activation": "gelu",
+  "alibi": false,
+  "apply_residual_connection_post_layernorm": false,
+  "architectures": [
+    "FalconForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "auto_map": {
+    "AutoConfig": "tiiuae/falcon-7b--configuration_falcon.FalconConfig",
+    "AutoModel": "tiiuae/falcon-7b--modeling_falcon.FalconModel",
+    "AutoModelForCausalLM": "tiiuae/falcon-7b--modeling_falcon.FalconForCausalLM",
+    "AutoModelForQuestionAnswering": "tiiuae/falcon-7b--modeling_falcon.FalconForQuestionAnswering",
+    "AutoModelForSequenceClassification": "tiiuae/falcon-7b--modeling_falcon.FalconForSequenceClassification",
+    "AutoModelForTokenClassification": "tiiuae/falcon-7b--modeling_falcon.FalconForTokenClassification"
+  },
+  "bias": false,
+  "bos_token_id": 11,
+  "eos_token_id": 11,
+  "ffn_hidden_size": 128,
+  "hidden_dropout": 0.0,
+  "hidden_size": 32,
+  "initializer_range": 0.02,
+  "layer_norm_epsilon": 1e-05,
+  "max_position_embeddings": 2048,
+  "model_type": "falcon",
+  "multi_query": true,
+  "new_decoder_architecture": false,
+  "nm_kv_hears": 2,
+  "num_attention_heads": 2,
+  "num_hidden_layers": 2,
+  "num_kv_heads": 71,
+  "num_ln_in_parallel_attn": null,
+  "parallel_attn": true,
+  "rope_scaling": null,
+  "rope_theta": 10000.0,
+  "torch_dtype": "float32",
+  "transformers_version": "4.55.2",
+  "use_cache": true,
+  "vocab_size": 65024
+}

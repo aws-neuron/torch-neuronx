@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""
+Print all implemented aten operations in torch-neuronx
+"""
+
+import torch
+import torch._C
+
+import torch_neuronx  # noqa: F401
+
+# Get all registrations for PrivateUse1 (Neuron backend)
+registrations = torch._C._dispatch_get_registrations_for_dispatch_key("PrivateUse1")
+
+# Extract unique aten operations
+aten_ops = set()
+for reg in registrations:
+    if reg.startswith("aten::"):
+        # Extract base operation name (before any dots/overloads)
+        op_name = reg[6:]  # Remove "aten::" prefix
+        base_op = op_name.split(".")[0]
+        aten_ops.add(base_op)
+
+# Sort and print
+print(f"Total implemented aten operations: {len(aten_ops)}\n")
+for op in sorted(aten_ops):
+    print(f"  {op}")

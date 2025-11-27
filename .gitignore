@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+*.egg
+dist/
+build/
+neuron_artifacts/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.attach_pid*
+.eggs/
+# Ruff
+.ruff_cache/
+.uv.lock
+
+# C++ build artifacts
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+
+# Bazel
+bazel-*
+
+# cmake
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+Makefile
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pre-commit
+.pre-commit-config.yaml.lock
+
+# Neuron compiler auto-generated folders
+neuronxcc-*/
+log-neuron-cc.txt
+global_metric_store.json
+file.neff
+.torch_neuronx/
+
+# Ignore dump folders
+**/torch_neuronx_dump/
+
+# Ignore python files generated from proto
+torch_neuronx/protos/*.py
+torch_neuronx/protos/xla/*.py
+
+# Ignore the pytorch test directory
+tests/pytorch_tests/test/

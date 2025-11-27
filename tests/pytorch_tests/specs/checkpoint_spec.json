@@ -1,0 +1,46 @@
+{
+  "test_configurations": [
+    {
+      "folder": "distributed/checkpoint",
+      "sanity_methods": [
+        "test_default_metadata",
+        "test_dummy_writer_works",
+        "test_dummy_reader_works",
+        "test_save_error_handling_no_dist",
+        "test_load_error_handling_no_dist",
+        "test_metadata",
+        "test_traverse_nested_dict",
+        "test_single_gpu",
+        "test_ddp",
+        "test_fsdp",
+        "test_optim_state_dict_param_matching",
+        "test_torch_save_to_dcp"
+      ],
+      "xfail": [
+        {
+          "reason": "Checkpointing tests failing - requires investigation and fixes",
+          "tests": [
+            "test_switch_between_sharded_tensor_to_tensor_thread_count_2",
+            "test_load_with_different_shard_plan_thread_count_1",
+            "test_tp_checkpoint",
+            "test_hsdp_checkpoint_is_even_sharded_model_True",
+            "test_dtensor",
+            "test_load_with_different_shard_plan_thread_count_2",
+            "test_switch_between_sharded_tensor_to_tensor_thread_count_1",
+            "test_load_rowwise_to_colwise_thread_count_1",
+            "test_load_rowwise_to_colwise_thread_count_2",
+            "test_hsdp_checkpoint_is_even_sharded_model_False",
+            "test_distributed_tensor_planner",
+            "test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type1",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type0",
+            "test_e2e_compile_True_model_type1",
+            "test_e2e_compile_True_model_type0",
+            "test_e2e_compile_True_model_type2",
+            "test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type3",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type2"
+          ]
+        }
+      ]
+    }
+  ]
+}

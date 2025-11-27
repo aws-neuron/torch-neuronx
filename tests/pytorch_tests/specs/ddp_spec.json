@@ -1,0 +1,105 @@
+{
+  "test_configurations": [
+    {
+      "class": "DistributedDataParallelTest",
+      "file": "distributed/test_c10d_nccl.py",
+      "sanity_methods": [
+        "test_ddp_checkpointing_weight_sharing_use_reentrant_True",
+        "test_ddp_checkpointing_once_use_reentrant_False",
+        "test_ddp_checkpointing_twice_weight_sharing"
+      ],
+      "skip_tests": [
+        {
+          "reason": "torch_neuronx.set_device(device) before dist.init_process_group, inverting torch_neuronx.set_device(device) and dist.init_process_group fixes locally, Skipping as fixing it is not P0.",
+          "tests": [
+            "test_find_unused_parameters_kwarg_grad_is_view_debug_detail",
+            "test_find_unused_parameters_kwarg_grad_is_view_debug_info",
+            "test_find_unused_parameters_kwarg_grad_is_view_debug_off",
+            "test_find_unused_parameters_kwarg_debug_off",
+            "test_find_unused_parameters_kwarg_debug_info",
+            "test_find_unused_parameters_kwarg_debug_detail"
+          ]
+        },
+        {
+          "reason": "Greater than 1 device per process, Skipping as its not P0.",
+          "tests": [
+            "test_nccl_backend_2gpu_module",
+            "test_nccl_backend_multi_device_module_device_ids_None",
+            "test_nccl_backend_4gpu_module",
+            "test_ddp_multi_device_module_config",
+            "test_grad_layout_2devicemodule"
+          ]
+        },
+        {
+          "test_ddp_complex_params": {
+            "reason": "Having Complex params in weights, skipping as its not P0."
+          }
+        },
+        {
+          "test_dataclass_output_unused_param": {
+            "reason": "Converting tensor to neuron before initialziation of process group, skipping as it is not P0."
+          }
+        },
+        {
+          "reason": "Process assigned neuron:0 trying to access/convert tensor assigned to neuron:1 and viceversa, skipping as its not P0.",
+          "tests": [
+            "test_dataclass_output",
+            "test_nccl_backend_multi_device_ids_not_allowed"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "test_nccl_propagate_error_reason": {
+            "reason": "Pending Investigation -  ProcessGroupNCCL is only supported with GPUs, no GPUs found."
+          }
+        },
+        {
+          "reason": "Pending Investigation -  IndexError: list index out of range, Setup Issue.",
+          "tests": [
+            "test_grad_layout_1devicemodule_1replicaperprocess"
+          ]
+        },
+        {
+          "reason": "RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation linear_backward failed to execute on Neuron.",
+          "tests": [
+            "test_nccl_backend_1gpu_module_device_ids_integer_list",
+            "test_nccl_backend_1gpu_module_device_ids_torch_device_list"
+          ]
+        },
+        {
+          "reason": "Seg fault - RuntimeError: result.isTensorList() INTERNAL ASSERT FAILED at /pytorch/torch/csrc/distributed/c10d/default_comm_hooks.cpp",
+          "tests": [
+            "test_builtin_ddp_comm_hooks_nccl",
+            "test_builtin_ddp_comm_hooks_nccl_grad_is_view"
+          ]
+        },
+        {
+          "reason": "aten::_to_copy - RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1.",
+          "tests": [
+            "test_channels_last_contig",
+            "test_param_layout_mismatch_error"
+          ]
+        },
+        {
+          "test_ddp_packed_sequence": {
+            "reason": " Could not run 'aten::_thnn_fused_lstm_cell' with arguments from the 'CPU' backend."
+          }
+        }
+      ]
+    },
+    {
+      "file": "distributed/algorithms/ddp_comm_hooks/test_ddp_hooks.py",
+      "sanity_methods": [
+        "test_ddp_comm_hook_allreduce_hook"
+      ],
+      "skip_tests": [
+        {
+          "test_ddp_comm_hook_quantize_per_channel_hook": {
+            "reason": "quantization_per_channel not supported at neuron backend, skipping as its not P0."
+          }
+        }
+      ]
+    }
+  ]
+}
