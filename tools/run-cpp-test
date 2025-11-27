@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# Script to run NeuronDevice C++ unit tests with Bazel and dynamic LD_LIBRARY_PATH
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+echo -e "${BOLD}${YELLOW}Running torch_neuronx C++ unit tests with Bazel...${NC}"
+
+# Function to print a header
+print_header() {
+    local message="$1"
+    echo ""
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}  $message${NC}"
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Function to generate dynamic LD_LIBRARY_PATH
+generate_ld_library_path() {
+    local workspace_dir="$1"
+    local pytorch_path="${2:-${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}}"
+
+    # Build the library paths
+    if [[ "$pytorch_path" = /* ]]; then
+        # Absolute path
+        torch_lib_path="$pytorch_path/lib"
+    else
+        # Relative path - make it relative to workspace
+        torch_lib_path="$workspace_dir/$pytorch_path/lib"
+    fi
+
+    # Additional library paths relative to workspace
+    cuda_runtime_path="$workspace_dir/.venv/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
+    cuda_cupti_path="$workspace_dir/.venv/lib/python3.10/site-packages/nvidia/cuda_cupti/lib"
+
+    # Construct the full LD_LIBRARY_PATH
+    echo "$torch_lib_path:$cuda_runtime_path:$cuda_cupti_path:${LD_LIBRARY_PATH:-}"
+}
+
+# Function to print test results summary
+print_test_summary() {
+    local exit_code=$1
+    echo ""
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${BOLD}${GREEN}  ALL TESTS PASSED!${NC}"
+        echo -e "${GREEN}  Test execution completed successfully!${NC}"
+    else
+        echo -e "${BOLD}${RED}  SOME TESTS FAILED!${NC}"
+        echo -e "${RED}  Please check the output above for details.${NC}"
+    fi
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Parse arguments
+VERBOSE=false
+CLEAN=false
+TEST_TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -c|--clean)
+            CLEAN=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS] [TEST_TARGET]"
+            echo ""
+            echo "Options:"
+            echo "  -v, --verbose    Show verbose test output"
+            echo "  -c, --clean      Clean before testing"
+            echo "  -h, --help       Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0                                    # Run all C++ tests"
+            echo "  $0 //tests/csrc:NeuronDeviceTest      # Run specific test"
+            echo "  $0 -v                                 # Run all tests with verbose output"
+            echo "  $0 -c //tests/csrc:all                # Clean and run all tests"
+            echo ""
+            echo "Environment Variables:"
+            echo "  PYTORCH_LOCAL_PATH    Path to PyTorch installation (default: .venv/lib/python3.10/site-packages/torch)"
+            exit 0
+            ;;
+        *)
+            TEST_TARGET="$1"
+            shift
+            ;;
+    esac
+done
+
+# Set default test target if none provided
+if [ -z "$TEST_TARGET" ]; then
+    TEST_TARGET="//:cpp_unit_tests"
+fi
+
+# Generate dynamic LD_LIBRARY_PATH
+DYNAMIC_LD_LIBRARY_PATH=$(generate_ld_library_path "$PROJECT_ROOT")
+
+print_header "Configuration"
+echo -e "${YELLOW}Project root:${NC} $PROJECT_ROOT"
+echo -e "${YELLOW}Test target:${NC} $TEST_TARGET"
+echo -e "${YELLOW}PyTorch path:${NC} ${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}"
+echo -e "${YELLOW}Generated LD_LIBRARY_PATH:${NC}"
+echo -e "  ${DYNAMIC_LD_LIBRARY_PATH}"
+
+# Clean if requested
+if [ "$CLEAN" = true ]; then
+    print_header "Cleaning"
+    echo -e "${YELLOW}Cleaning Bazel cache...${NC}"
+    bazel clean
+fi
+
+# Set up environment variables for PyTorch
+export PYTORCH_LOCAL_PATH="${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}"
+
+print_header "Running Tests"
+
+# Build Bazel command
+BAZEL_CMD="bazel test"
+
+# Add verbose flag if requested
+if [ "$VERBOSE" = true ]; then
+    BAZEL_CMD="$BAZEL_CMD --test_output=all --verbose_failures"
+else
+    BAZEL_CMD="$BAZEL_CMD --test_output=errors"
+fi
+
+# Add the dynamic LD_LIBRARY_PATH to the test environment
+BAZEL_CMD="$BAZEL_CMD --test_env=LD_LIBRARY_PATH=\"$DYNAMIC_LD_LIBRARY_PATH\""
+
+# Add the test target
+BAZEL_CMD="$BAZEL_CMD $TEST_TARGET"
+
+echo -e "${YELLOW}Executing:${NC} $BAZEL_CMD"
+echo ""
+
+# Store test result for summary
+TEST_EXIT_CODE=0
+
+# Run the Bazel test command
+eval $BAZEL_CMD || TEST_EXIT_CODE=$?
+
+# Print test summary
+print_test_summary $TEST_EXIT_CODE
+
+# Exit with the test result code
+exit $TEST_EXIT_CODE

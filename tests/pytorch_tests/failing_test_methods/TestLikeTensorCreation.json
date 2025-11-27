@@ -1,0 +1,5 @@
+{
+  "failed_tests": [
+    "test_full_like_inference_neuron"
+  ]
+}

@@ -1,0 +1,158 @@
+"""Centralized copy/cast policy helpers.
+
+This module consolidates rules for when to bounce through CPU (only for 64-bit
+types) and how to perform raw transfers without re-dispatch recursion. It
+provides small, well-scoped helpers that ops like `aten::copy_` and
+`aten::_to_copy` can use consistently.
+
+Key policy:
+- No CPU bounce for dtype casting except when casting to or from 64-bit dtypes
+  (torch.float64 or torch.int64).
+- Avoid calling `.to(...)` on device tensors for casting. Use device-side
+  kernels for <=32-bit casts or explicit CPU bounce helpers for 64-bit.
+- Prefer `_C._nrt_copy_*` helpers for raw transfers instead of `.copy_` or `.to`.
+- Enforce memory format rules: allow contiguous and preserve only.
+
+Imports of heavy or circular modules are local to functions.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def is_64bit(dtype: torch.dtype | None) -> bool:
+    """Return True if dtype is a 64-bit type needing CPU bounce on Neuron.
+
+    Args:
+        dtype: torch dtype or None
+
+    Returns:
+        bool: True for torch.float64 or torch.int64
+    """
+    return dtype in (torch.float64, torch.int64)
+
+
+def validate_neuron_memory_format(memory_format: torch.memory_format | None, op_name: str) -> None:
+    """Validate memory format constraints for Neuron tensors.
+
+    Only contiguous or preserve formats are supported for now.
+    Raise a clear error otherwise.
+    """
+    if memory_format is None:
+        return
+    if memory_format in (torch.contiguous_format, torch.preserve_format):
+        return
+    raise RuntimeError(
+        f"{op_name}: Neuron tensors only support contiguous or preserve memory format"
+    )
+
+
+def ensure_contiguous_on_device(t: torch.Tensor) -> torch.Tensor:
+    """Ensure tensor is contiguous, using device-appropriate path.
+
+    For Neuron tensors, use the internal contiguous op to avoid redispatch
+    recursion; for CPU tensors, use the standard `.contiguous()`.
+    """
+    if t.is_contiguous():
+        return t
+    if t.device.type == "neuron":
+        # Local import to avoid cycles
+        from torch_neuronx.python_ops.contiguous import contiguous_internal
+
+        return contiguous_internal(t, torch.contiguous_format)
+    return t.contiguous()
+
+
+def copy_cpu_to_neuron(
+    cpu_src: torch.Tensor,
+    target_device: torch.device,
+    target_dtype: torch.dtype,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    """Copy CPU tensor to Neuron, casting on CPU first if needed.
+
+    Ensures the CPU tensor is contiguous and in the target dtype, then allocates
+    a Neuron tensor and performs a raw transfer via NRT copy.
+    """
+    import torch_neuronx._C as _C  # local import
+
+    tmp = cpu_src
+    if tmp.dtype != target_dtype:
+        # CPU cast is allowed (including 64-bit)
+        tmp = tmp.to(target_dtype)
+    if not tmp.is_contiguous():
+        tmp = tmp.contiguous()
+    dst = torch.empty(cpu_src.shape, dtype=tmp.dtype, device=target_device)
+    _C._nrt_copy_cpu_to_neuron_tensor(tmp, dst, non_blocking=non_blocking)
+    return dst
+
+
+def copy_neuron_to_cpu(
+    neuron_src: torch.Tensor, target_dtype: torch.dtype | None = None, non_blocking: bool = False
+) -> torch.Tensor:
+    """Copy Neuron tensor to CPU; optionally cast on CPU after copy.
+
+    The initial copy is a raw byte transfer preserving the source dtype.
+    If `target_dtype` is provided and differs, the CPU cast is performed.
+    """
+    import torch_neuronx._C as _C  # local import
+
+    cpu_tmp = torch.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
+    _C._nrt_copy_neuron_to_cpu_tensor(neuron_src, cpu_tmp, non_blocking=non_blocking)
+    if target_dtype is not None and target_dtype != cpu_tmp.dtype:
+        cpu_tmp = cpu_tmp.to(target_dtype)
+    return cpu_tmp
+
+
+def prepare_src_for_neuron_to_neuron_copy(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    """Prepare source for Neuron->Neuron copy following layout policy.
+
+    - Shapes must match.
+    - If both are contiguous: return src.
+    - If dst is contiguous but src is not: make src contiguous on device.
+    - Otherwise: raise a layout-change error.
+    """
+    if tuple(src.shape) != tuple(dst.shape):
+        raise RuntimeError("Neuron->Neuron copy with size mismatch is not supported")
+    if src.is_contiguous() and dst.is_contiguous():
+        return src
+    if dst.is_contiguous() and not src.is_contiguous():
+        return ensure_contiguous_on_device(src)
+    raise RuntimeError(
+        "Neuron->Neuron copy with layout change is not supported yet. "
+        "Please make tensors contiguous first."
+    )
+
+
+def write_neuron_to_neuron(
+    dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False
+) -> None:
+    """In-place copy/cast from Neuron tensor `src` to Neuron tensor `dst`.
+
+    - If dtypes match: direct NRT device copy.
+    - If 64-bit is involved (src or dst): CPU bounce for cast (Neuron lacks 64-bit).
+    - Else: device-side cast kernel for <=32-bit dtypes.
+    """
+    import torch_neuronx._C as _C  # local import
+
+    if dst.device.type != "neuron" or src.device.type != "neuron":
+        raise RuntimeError("write_neuron_to_neuron expects both tensors on Neuron device")
+
+    if dst.dtype == src.dtype:
+        # Enforce contiguity/layout policy even for same-dtype copies
+        src_prepared = prepare_src_for_neuron_to_neuron_copy(src, dst)
+        _C._nrt_copy_neuron_to_neuron_tensor(src_prepared, dst, non_blocking=non_blocking)
+        return
+
+    if is_64bit(dst.dtype) or is_64bit(src.dtype):
+        cpu_tmp = copy_neuron_to_cpu(src, target_dtype=dst.dtype, non_blocking=non_blocking)
+        _C._nrt_copy_cpu_to_neuron_tensor(cpu_tmp, dst, non_blocking=non_blocking)
+        return
+
+    # <=32-bit on-device cast
+    src_prepared = prepare_src_for_neuron_to_neuron_copy(src, dst)
+    # Local import to avoid cycles and heavy deps
+    from torch_neuronx.python_ops.device_cast import device_cast_neuron_to_neuron
+
+    device_cast_neuron_to_neuron(src_prepared, dst, non_blocking=non_blocking)

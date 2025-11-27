@@ -1,0 +1,61 @@
+# Enable Bzlmod for every Bazel command
+common --enable_bzlmod
+common --enable_workspace
+
+common --repo_env=HERMETIC_PYTHON_VERSION=3.10
+
+# Make Bazel print out all options from rc files
+build --announce_rc
+
+# Allow Bazel to pick up host-OS-specific config lines
+build --enable_platform_specific_config
+
+# Enable rule attributes and Starlark API methods needed for the rule cc_shared_library
+build --experimental_cc_shared_library
+
+# Keep conda in PATH for Python but use system GCC
+build --action_env=PATH
+build --action_env=LD_LIBRARY_PATH
+
+# Use system compiler
+build --action_env=CC=gcc
+build --action_env=CXX=g++
+
+# Disable sandbox for system library access
+build --spawn_strategy=local
+build --genrule_strategy=local
+
+# Link system libraries
+build --linkopt=-lz
+
+# Compiler flags
+build --copt=-O2
+build --copt=-DNDEBUG
+build:posix --copt=-Wno-sign-compare
+build:posix --copt=-Wall
+build:posix --copt=-Wno-error=attributes
+build:posix --cxxopt=-std=c++17
+build:posix --host_cxxopt=-std=c++17
+build:linux --config=posix
+
+# Environment variables
+
+# Local python version.
+build --action_env=PYTHON_VERSION="3.10"
+
+## Pytorch variables.
+# Pytorch version, when local is not available.
+build --action_env=PYTORCH_VERSION="2.8.0"
+
+# Default to use local Pytorch installation.
+# Set to "1" to download from source.
+build --action_env=PYTORCH_USE_EXTERNAL="0"
+
+# Path to local Pytorch installation.
+# Only necessary when building csrc directly - setup.py will automatically set this variable.
+#build --action_env=PYTORCH_LOCAL_PATH=.venv/lib/python3.10/site-packages/torch
+
+# Path to local Neuron Runtime installation.
+build --action_env=NRT_LOCAL_PATH=/opt/aws/neuron
+
+test --test_env=LD_LIBRARY_PATH
