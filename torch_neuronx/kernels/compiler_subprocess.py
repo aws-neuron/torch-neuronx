@@ -77,13 +77,18 @@ class CompilerSubprocess:
         config: CompilerConfig,
         lnc_override: str | None = None,
         ir_type: str = "XLA",
+        workdir: str | None = None,
     ) -> bytes:
         """Two-tier cache lookup and compilation."""
 
         # Skip caching if disabled
         if is_caching_disabled():
             return CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                hlo_protobuf, config, lnc_override, ir_type
+                hlo_protobuf,
+                config,
+                lnc_override,
+                ir_type,
+                workdir,
             )
 
         import neuronxcc
@@ -122,7 +127,7 @@ class CompilerSubprocess:
 
             # Compile and cache
             neff_bytes = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                hlo_protobuf, config, lnc_override, ir_type
+                hlo_protobuf, config, lnc_override, ir_type, workdir
             )
 
             # Write to NFS cache atomically (this is basically writing to user provided disk)
@@ -148,19 +153,16 @@ class CompilerSubprocess:
 
     @staticmethod
     def run_neuronx_cc(
-        input_file: Path,
-        output_file: Path,
         config: CompilerConfig,
         lnc_override: str | None = None,
-        work_dir: str | None = None,
+        workdir: str | None = None,
     ) -> None:
         """Compile HLO protobuf to NEFF.
 
         Args:
-            input_file: Path to HLO protobuf file
-            output_file: Path to output NEFF file
             config: Compiler configuration
             lnc_override: Optional override for logical neuron cores
+            workdir: Compilation working directory
 
         Raises:
             NEFFCompilationError: If compilation fails
@@ -168,10 +170,10 @@ class CompilerSubprocess:
         neuronx_cc = CompilerSubprocess.find_neuronx_cc()
         cmd = [
             neuronx_cc,
-            *config.get_neuronx_cc_args(str(input_file), str(output_file), lnc_override),
+            *config.get_neuronx_cc_args(lnc_override),
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=work_dir)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
         if result.returncode != 0:
             raise NEFFCompilationError(
                 f"NEFF compilation failed with return code {result.returncode}\n"
@@ -185,6 +187,7 @@ class CompilerSubprocess:
         config: CompilerConfig,
         lnc_override: str | None = None,
         ir_type: str = "XLA",
+        workdir: str | None = None,
     ) -> bytes:
         """Compile HLO protobuf or MLIR directly to NEFF.
 
@@ -193,6 +196,7 @@ class CompilerSubprocess:
             config: Compiler configuration
             lnc_override: Optional override for logical neuron cores
             ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+            workdir: Compilation working directory
 
         Returns:
             Compiled NEFF bytes
@@ -200,6 +204,15 @@ class CompilerSubprocess:
         Raises:
             NEFFCompilationError: If NEFF compilation fails
         """
+        # Async mode sets workdir, input, and output
+        if workdir is not None:
+            assert config.input is not None, "Input file must be provided"
+            assert config.output is not None, "Output file must be provided"
+            CompilerSubprocess.run_neuronx_cc(config, lnc_override, workdir)
+            # Read and return compiled NEFF
+            return Path(config.output).read_bytes()
+
+        # Create temp dir if workdir if not set
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
@@ -208,18 +221,18 @@ class CompilerSubprocess:
             hlo_file = (
                 tmpdir / "module.mlir" if ir_type == "StableHLO" else tmpdir / "module.hlo.pb"
             )
-
             hlo_file.write_bytes(hlo_protobuf)
+            config.input = str(hlo_file)
 
             # Compile to NEFF
-            neff_file = tmpdir / "module.neff"
-            # Passing work_dir is important when we run multi-worker
+            config.output = str(tmpdir / "module.neff")
+
+            # Passing workdir is important when we run multi-worker
             # Seeing a race condition where the artifacts get mangled
             # causing runtime errors. Passing the workdir keeps all
             # artifacts contained in their respective folder.
-            CompilerSubprocess.run_neuronx_cc(
-                hlo_file, neff_file, config, lnc_override, work_dir=tmpdir
-            )
+            # Need to pass explicity here, to recognize tempdir context.
+            CompilerSubprocess.run_neuronx_cc(config, lnc_override, tmpdir)
 
             # Read and return compiled NEFF
-            return neff_file.read_bytes()
+            return Path(config.output).read_bytes()

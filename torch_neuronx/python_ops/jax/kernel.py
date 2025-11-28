@@ -91,7 +91,6 @@ class JaxKernel(BaseNeuronKernel):
         inputs: tuple,
         kwargs: dict,
         context: ExecutionContext | None = None,
-        cache_key: str | None = None,
     ) -> tuple:
         """Get cached output specs or compute and cache them.
 
@@ -104,13 +103,11 @@ class JaxKernel(BaseNeuronKernel):
         Returns:
             Tuple of (output_specs, is_single, expected_dtypes, none_mask)
         """
-        # Use provided cache key or generate one
-        if cache_key is None:
-            cache_key = self._generate_unified_cache_key(
-                inputs,
-                kwargs,
-                context,
-            )
+        cache_key = self._generate_unified_cache_key(
+            context.original_inputs if context and context.has_original_inputs() else inputs,
+            kwargs,
+            context,
+        )
 
         # Check cache first
         if cache_key in self._output_spec_cache:
@@ -294,7 +291,7 @@ class JaxKernel(BaseNeuronKernel):
 
         # Get cached output specs to detect zero-sized, none outputs and short-circuit
         output_specs, is_single, expected_dtypes, none_mask = self._get_cached_output_specs(
-            processed_inputs, kwargs, context, cache_key=cache_key
+            processed_inputs, kwargs, context
         )
 
         # Handle all None outputs early

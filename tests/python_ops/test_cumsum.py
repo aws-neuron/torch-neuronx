@@ -166,6 +166,29 @@ class TestCumsum:
             torch.testing.assert_close(output_neuron.cpu(), output_cpu)
             assert_op_runs_on_neuron("aten::cumsum")
 
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+        ],
+        ids=["float32", "float64", "int32", "int64", "float16", "bfloat16"],
+    )
+    def test_cumsum_input_dtype(self, dtype):
+        """Test cumsum with explicit dtype"""
+        with track_neuron_ops():
+            input_cpu = torch.tensor([1, 2, 3, 4], dtype=dtype)
+            input_neuron = input_cpu.to("neuron")
+
+            output_cpu = torch.cumsum(input_cpu, dim=0)
+            output_neuron = torch.cumsum(input_neuron, dim=0)
+
+            torch.testing.assert_close(output_neuron.cpu(), output_cpu)
+
     def test_cumsum_inplace(self):
         """Test that cumsum_ (in-place) runs on Neuron without CPU fallback"""
         with track_neuron_ops():

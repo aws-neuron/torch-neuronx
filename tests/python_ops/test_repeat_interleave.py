@@ -11,6 +11,7 @@ from tests.utils.neuron_test_utils import (
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.xfail(reason="de-register the op for now as cumsum is causing high constant HBM usage")
 class TestRepeatInterleave:
     """Test suite for repeat_interleave operation."""
 

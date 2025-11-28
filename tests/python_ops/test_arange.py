@@ -34,7 +34,9 @@ class TestArange:
             torch.testing.assert_close(input.cpu(), input_cpu)
             assert_op_runs_on_neuron("aten::arange")
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32])
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.float64, torch.float16, torch.int32, torch.int64]
+    )
     def test_arange_different_dtypes(self, dtype):
         """Test arange with different dtypes"""
         device = "neuron"
@@ -79,7 +81,6 @@ class TestArange:
             assert input.device.type == device
             assert_op_runs_on_neuron("aten::arange.start_out")
 
-    @pytest.mark.xfail(reason="Compiler has limitations with compiling 0-d output tensors")
     def test_arange_equal_bounds(self):
         """Test arange with equal start and stop values"""
         device = "neuron"

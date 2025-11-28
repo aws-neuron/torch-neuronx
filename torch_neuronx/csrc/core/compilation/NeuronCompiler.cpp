@@ -23,8 +23,10 @@ constexpr const char* kHloFilename = "module.hlo.pb";
 constexpr const char* kMlirFilename = "module.mlir";
 constexpr const char* kNeffFilename = "module.neff";
 
-// Compiler executable constant.
-constexpr const char* kNeuronxCCBinary = "neuronx-cc";
+// Compiler executable and module constants.
+constexpr const char* kPythonExecutable = "python";
+constexpr const char* kModuleFlag = "-m";
+constexpr const char* kNeuronxCCWrapperModule = "torch_neuronx.kernels.neuronx_cc_wrapper";
 
 // Command line arguments for neuronx-cc.
 constexpr const char* kCompileCommand = "compile";
@@ -32,6 +34,7 @@ constexpr const char* kFrameworkFlag = "--framework";
 constexpr const char* kTargetFlag = "--target";
 constexpr const char* kLogicalNeuronCoresFlag = "--lnc";
 constexpr const char* kOutputFlag = "--output";
+constexpr const char* kWorkingDirFlag = "--workdir";
 
 // Process exit codes for child process failures.
 constexpr int kExitDup2Failed = 126;
@@ -274,16 +277,21 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
   hlo_output_stream.write(reinterpret_cast<const char*>(hlo_bytes.data()), hlo_bytes.size());
   hlo_output_stream.close();
 
-  // Build neuronx-cc command arguments using config
-  // execvp will search PATH automatically, so just use the binary name
-  std::vector<std::string> compiler_args = {kNeuronxCCBinary,
+  // Build neuronx-cc wrapper command arguments using config
+  // execvp will search PATH automatically, so just use python executable
+  std::vector<std::string> compiler_args = {kPythonExecutable,
+                                            kModuleFlag,
+                                            kNeuronxCCWrapperModule,
                                             kCompileCommand,
+                                            hlo_input_file,
                                             kFrameworkFlag,
                                             config.framework,
                                             kTargetFlag,
                                             config.platform_target,
                                             kLogicalNeuronCoresFlag,
                                             config.logical_neuron_cores,
+                                            kWorkingDirFlag,
+                                            temp_compilation_dir.path(),
                                             config.optimization_level};
 
   // Parse and add additional compiler arguments
@@ -293,13 +301,12 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
     compiler_args.push_back(single_arg);
   }
 
-  // Add input file and output specification
-  compiler_args.push_back(hlo_input_file);
+  // Add output specification
   compiler_args.push_back(kOutputFlag);
   compiler_args.push_back(neff_output_file);
 
-  // Execute neuronx-cc compiler in the temporary directory
-  ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCBinary) + " compilation",
+  // Execute neuronx-cc wrapper in the temporary directory
+  ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCWrapperModule) + " compilation",
                            temp_compilation_dir.path());
 
   // Read compiled NEFF file

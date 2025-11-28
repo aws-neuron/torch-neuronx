@@ -83,11 +83,13 @@ def sample_neff():
 class MockCompilerConfig:
     """Mock compiler configuration for testing."""
 
-    def __init__(self, config_id="default"):
+    def __init__(self, config_id="default", input=None, output=None):
         self.config_id = config_id
+        self.input = input
+        self.output = output
 
-    def get_neuronx_cc_args(self, input_file, output_file, lnc_override=None):
-        return ["--input", input_file, "--output", output_file]
+    def get_neuronx_cc_args(self, lnc_override=None):
+        return ["compile", self.input, "--output", self.output]
 
     def __str__(self):
         return f"MockConfig({self.config_id})"
@@ -285,10 +287,12 @@ class TestCompilerSubprocess:
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
 
-        result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+        result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"])
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "XLA")
+        mock_compile.assert_called_once_with(
+            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
+        )
 
     @patch(
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
@@ -325,10 +329,14 @@ class TestCompilerSubprocess:
         )
 
         with patch("neuronxcc.__version__", "v1.0"):
-            result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+            result = compiler.get_or_compile(
+                sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
+            )
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "XLA")
+        mock_compile.assert_called_once_with(
+            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
+        )
 
         # Verify NFS cache was populated
         key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
@@ -484,10 +492,9 @@ class TestErrorHandling:
             tempfile.TemporaryDirectory() as tmpdir,
             pytest.raises(NEFFCompilationError, match="NEFF compilation failed"),
         ):
-            input_file = Path(tmpdir) / "input.hlo.pb"
-            output_file = Path(tmpdir) / "output.neff"
-            input_file.write_bytes(b"test")
-            CompilerSubprocess.run_neuronx_cc(input_file, output_file, mock_config)
+            mock_config.input = str(Path(tmpdir) / "input.hlo.pb")
+            mock_config.output = str(Path(tmpdir) / "output.neff")
+            CompilerSubprocess.run_neuronx_cc(mock_config)
 
 
 class TestIntegration:
@@ -495,26 +502,33 @@ class TestIntegration:
 
     @patch("subprocess.run")
     @patch("shutil.which")
-    def test_end_to_end_compilation(
-        self, mock_which, mock_run, temp_dirs, mock_config, sample_hlo, sample_neff
-    ):
-        """Test end-to-end compilation flow."""
+    def test_end_to_end_compilation(self, mock_which, mock_run, temp_dirs, sample_hlo, sample_neff):
+        """Test end-to-end compilation flow with explicit input_file, output_file, and workdir."""
         mock_which.return_value = "/usr/bin/neuronx-cc"
         mock_run.return_value = Mock(returncode=0, stderr="")
 
-        # Mock the file operations in compile_hlo_protobuf_to_neff
-        with (
-            patch("tempfile.TemporaryDirectory") as mock_tmpdir,
-            patch("pathlib.Path.write_bytes"),
-            patch("pathlib.Path.read_bytes", return_value=sample_neff),
-        ):
-            mock_tmpdir.return_value.__enter__.return_value = "/tmp/test"
-            result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                sample_hlo, mock_config, "lnc1"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            input_file = tmpdir_path / "input.hlo.pb"
+            output_file = tmpdir_path / "output.neff"
+
+            # Create config with explicit files and workdir
+            config_with_paths = MockCompilerConfig(
+                config_id="with_paths",
+                input=str(input_file),
+                output=str(output_file),
             )
 
-        assert result == sample_neff
-        mock_run.assert_called_once()
+            # Mock file operations
+            with (
+                patch("pathlib.Path.read_bytes", return_value=sample_neff),
+            ):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, config_with_paths, "lnc1", "XLA", tmpdir_path
+                )
+
+            assert result == sample_neff
+            mock_run.assert_called_once()
 
 
 class TestRaceConditions:

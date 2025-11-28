@@ -12,8 +12,6 @@ from jax._src.numpy.array import array, asarray
 from jax._src.typing import Array, ArrayLike, DimSize
 from jax._src.util import canonicalize_axis as _canonicalize_axis
 
-from torch_neuronx.python_ops.jax.operation_registry import register_aten
-
 
 def _custom_repeat(
     a: ArrayLike,
@@ -125,16 +123,16 @@ def _custom_repeat(
 jax._src.numpy.lax_numpy._repeat = _custom_repeat
 
 
-@register_aten(
-    [
-        "aten::repeat_interleave.Tensor",
-        "aten::repeat_interleave.self_Tensor",
-        "aten::repeat_interleave.self_int",
-    ],
-    static_argnums=(2,),
-    static_argnames=("output_size",),
-    uses_preprocessing=True,
-)
+# @register_aten(
+#     [
+#         "aten::repeat_interleave.Tensor",
+#         "aten::repeat_interleave.self_Tensor",
+#         "aten::repeat_interleave.self_int",
+#     ],
+#     static_argnums=(2,),
+#     static_argnames=("output_size",),
+#     uses_preprocessing=True,
+# )
 def _aten_repeat_interleave(self, repeats, dim=None, output_size=None):
     """Jax implementation for torch.repeat_interleave operation.
 

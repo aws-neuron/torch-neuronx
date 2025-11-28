@@ -24,7 +24,7 @@ try:
     from ._build_config import DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED, DEFAULT_SYNC_MODE
 except ImportError:
     # Fallback if _build_config.py doesn't exist (e.g., editable install)
-    DEFAULT_SYNC_MODE = "0"  # Dev default
+    DEFAULT_SYNC_MODE = "1"  # Dev default
     DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED = "1"
 
 # For some reason log level is being set to TRACE without this

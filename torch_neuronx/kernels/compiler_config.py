@@ -28,15 +28,22 @@ class CompilerConfig:
     # Framework
     framework: str = "XLA"
 
+    # Input HLO file
+    input: str | None = None
+
+    # Output NEFF file
+    output: str | None = None
+
+    # Compilation working directory
+    workdir: str | None = None
+
     # Logical Neuron Cores (LNC)
     lnc: str = field(default_factory=get_logical_neuron_cores)
 
     # Additional compiler flags
     extra_flags: list[str] = field(default_factory=list)
 
-    def get_neuronx_cc_args(
-        self, hlo_pb_file: str, output_file: str, lnc_value: str | None = None
-    ) -> list[str]:
+    def get_neuronx_cc_args(self, lnc_value: str | None = None) -> list[str]:
         """Generate neuronx-cc command line arguments.
 
         Args:
@@ -49,6 +56,7 @@ class CompilerConfig:
         """
         args = [
             "compile",
+            self.input,
             "--framework",
             self.framework,
             "--target",
@@ -59,9 +67,8 @@ class CompilerConfig:
             lnc_value or self.lnc,
             self.optimization_level,
             f"--auto-cast={self.auto_cast}",
-            str(hlo_pb_file),
             "--output",
-            str(output_file),
+            self.output,
         ]
 
         # Add any extra flags
