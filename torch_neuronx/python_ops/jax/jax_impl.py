@@ -2205,7 +2205,7 @@ def _aten_scatter_src(input, dim, index, src, out=None, reduce=None):
         "aten::scatter.value_reduce_out",
     ],
     operation_type="indexing",
-    static_argnums=(1, 3),
+    static_argnums=(1,),
     static_argnames=("reduce",),
     uses_preprocessing=True,
 )
@@ -2797,33 +2797,6 @@ def _aten_fmod(input, other):
 # aten.frexp
 def _aten_frexp(input):
     return jnp.frexp(input)
-
-
-# aten.gather
-@register_aten(
-    ["aten::gather.out"],
-    operation_type="indexing",
-    static_argnums=(1,),
-    static_argnames=("sparse_grad",),
-    uses_preprocessing=True,
-)
-def _aten_gather(input, dim, index, sparse_grad=False, out=None):
-    def jax_gather(input, dim, index, sparse_grad=False, out=None):
-        if input.ndim == 0:
-            return jnp.broadcast_to(input, index.shape)
-        # return empty tensor in shape of index
-        if not all(index.shape):
-            return jnp.zeros(index.shape, dtype=input.dtype)
-        if dim < 0:
-            dim += input.ndim
-        input_indexes, source_indexes = _scatter_index(dim, index)
-        return input[input_indexes]
-
-    assert not sparse_grad, "sparse_grad=True is not supported on neuron"
-    processed_kwargs = {"sparse_grad": False}
-    if out is not None:
-        processed_kwargs["out"] = out
-    return jax_gather, (input, dim, index), processed_kwargs
 
 
 # aten.ge

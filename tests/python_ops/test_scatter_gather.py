@@ -64,9 +64,9 @@ class TestScatterGatherRegistration:
         with track_neuron_ops():
             result = torch.scatter(input_tensor, dim, index_tensor, src_tensor)
             if isinstance(src_shape_or_value, tuple):
-                assert_op_runs_on_neuron("aten::scatter")
+                assert_op_runs_on_neuron("scatter")
             else:
-                assert_op_runs_on_neuron("aten::scatter.value")
+                assert_op_runs_on_neuron("scatter.value")
 
         # Verify operation ran by comparing with CPU equivalent
         input_cpu = torch.zeros(input_shape, dtype=dtype)

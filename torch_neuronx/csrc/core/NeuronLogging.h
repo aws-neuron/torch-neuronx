@@ -173,7 +173,7 @@ class NeuronLogger {
     executed_ops_file_.open(executed_filename, std::ios::app);
   }
 
-  inline static LogLevel log_level_ = LogLevel::INFO;
+  inline static LogLevel log_level_ = LogLevel::WARNING;
   bool log_to_file_ = false;
   std::ofstream log_file_;
   std::ofstream fallback_file_;
