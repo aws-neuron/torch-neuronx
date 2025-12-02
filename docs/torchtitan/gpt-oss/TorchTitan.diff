@@ -1,0 +1,438 @@
+diff --git a/torchtitan/experiments/gpt_oss/__init__.py b/torchtitan/experiments/gpt_oss/__init__.py
+index c12ad13a..856cc253 100644
+--- a/torchtitan/experiments/gpt_oss/__init__.py
++++ b/torchtitan/experiments/gpt_oss/__init__.py
+@@ -27,10 +27,9 @@ __all__ = [
+
+ gptoss_configs = {
+     "debugmodel": GptOssModelArgs(
+-        dim=256,
+-        n_layers=4,
++        n_layers=1,
+         moe_args=MoEArgs(
+-            num_experts=8,
++            num_experts=32,
+             num_shared_experts=0,
+             score_func="softmax",
+             route_norm=False,
+@@ -41,6 +40,11 @@ gptoss_configs = {
+             load_balance_coeff=1e-3,
+         ),
+         attn_mask_type="causal",
++        vocab_size=8192,
++        # n_heads=64//4,
++        # n_kv_heads=8//4,
++        # moe_inter_dim=2880//4,
++        use_flex_attn=False,
+     ),
+     "20b": GptOssModelArgs(
+         n_layers=24,
+diff --git a/torchtitan/experiments/gpt_oss/model/args.py b/torchtitan/experiments/gpt_oss/model/args.py
+index e78eac4d..d6afb2e0 100644
+--- a/torchtitan/experiments/gpt_oss/model/args.py
++++ b/torchtitan/experiments/gpt_oss/model/args.py
+@@ -80,11 +80,11 @@ class GptOssModelArgs(BaseModelArgs):
+             )
+         self.max_seq_len = seq_len
+
+-        if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0):
+-            logger.warning(
+-                "Failed to use grouped mm, which is only supported on SM90 or later",
+-            )
+-            self.moe_args.use_grouped_mm = False
++        # if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0):
++        #     logger.warning(
++        #         "Failed to use grouped mm, which is only supported on SM90 or later",
++        #     )
++        #     self.moe_args.use_grouped_mm = False
+
+         if job_config.parallelism.context_parallel_degree > 1:
+             raise NotImplementedError(
+diff --git a/torchtitan/experiments/gpt_oss/model/model.py b/torchtitan/experiments/gpt_oss/model/model.py
+index 1fcd12ea..776ce50b 100644
+--- a/torchtitan/experiments/gpt_oss/model/model.py
++++ b/torchtitan/experiments/gpt_oss/model/model.py
+@@ -14,10 +14,14 @@ from torchtitan.models.attention import (
+     get_causal_mask_mod,
+     get_document_mask_mod,
+     get_sliding_window_mask_mod,
++    ScaledDotProductAttentionWrapper,
+ )
+ from torchtitan.protocols.model import AttentionMasksType
+ from torchtitan.protocols.train_spec import ModelProtocol
+
++# RoPE nki kernel
++from torchtitan.tools.neuron_kernels import apply_rope_kernel
++
+ from .args import GptOssModelArgs
+ from .moe import GptOssMoE
+
+@@ -141,7 +145,7 @@ class Attention(nn.Module):
+             bias=True,
+         )
+         self.sinks = nn.Parameter(torch.empty(model_args.n_heads))
+-        self.inner_attention = FlexAttentionWrapper()
++        self.inner_attention = ScaledDotProductAttentionWrapper()
+
+     def init_weights(self, init_std: float):
+         linear_list = [
+@@ -180,7 +184,8 @@ class Attention(nn.Module):
+         k = self.wk(x).view(hidden_shape)
+         v = self.wv(x).view(hidden_shape)
+
+-        q, k = apply_rotary_emb(q, k, rope_cache)
++        # q, k = apply_rotary_emb(q, k, rope_cache)
++        q, k = apply_rope_kernel(apply_rotary_emb, q, k, rope_cache)
+
+         # repeat k/v heads if n_kv_heads < n_heads
+         keys = repeat_kv(k, self.n_rep)
+@@ -190,15 +195,15 @@ class Attention(nn.Module):
+         xk = keys.transpose(1, 2).contiguous()
+         xv = values.transpose(1, 2).contiguous()
+
+-        assert isinstance(attention_masks, BlockMask), attention_masks
+-        output, lse = self.inner_attention(
+-            xq, xk, xv, block_mask=attention_masks, scale=None, return_lse=True
++        # assert isinstance(attention_masks, BlockMask), attention_masks
++        output = self.inner_attention(
++            xq, xk, xv
+         )
+
+         # Apply attention sink rescaling: rescale by σ(lse - w[h])
+         # This is mathematically equivalent to concatenating learnable sink weights
+-        sink_scale = torch.sigmoid(lse - self.sinks.view(1, -1, 1)).unsqueeze(-1)
+-        output = output * sink_scale.to(output.dtype)
++        # sink_scale = torch.sigmoid(lse - self.sinks.view(1, -1, 1)).unsqueeze(-1)
++        # output = output * sink_scale.to(output.dtype)
+
+         output = output.transpose(1, 2).contiguous()  # (B, H, T, D) -> (B, T, H, D)
+
+@@ -249,13 +254,13 @@ class TransformerBlock(nn.Module):
+             torch.Tensor: Output tensor with the same shape as the input.
+         """
+         # Extract the appropriate mask for this layer
+-        if self.use_sliding_attention:
+-            layer_mask = attention_masks.get("sliding_window_mask", None)
+-        else:
+-            layer_mask = attention_masks.get("basic_mask", None)
+-        assert layer_mask is not None
++        # if self.use_sliding_attention:
++        #     layer_mask = attention_masks.get("sliding_window_mask", None)
++        # else:
++        #     layer_mask = attention_masks.get("basic_mask", None)
++        # assert layer_mask is not None
+
+-        x = x + self.attention(self.attention_norm(x), rope_cache, layer_mask)
++        x = x + self.attention(self.attention_norm(x), rope_cache, None)
+         x = x + self.moe(self.ffn_norm(x))
+         return x
+
+@@ -373,7 +378,7 @@ class GptOssModel(nn.Module, ModelProtocol):
+     def forward(
+         self,
+         tokens: torch.Tensor,
+-        attention_masks: AttentionMasksType,
++        attention_masks: AttentionMasksType = None,
+     ):
+         """
+         Forward pass for the Transformer model.
+diff --git a/torchtitan/experiments/gpt_oss/model/moe.py b/torchtitan/experiments/gpt_oss/model/moe.py
+index 94cd2667..e400916b 100644
+--- a/torchtitan/experiments/gpt_oss/model/moe.py
++++ b/torchtitan/experiments/gpt_oss/model/moe.py
+@@ -81,7 +81,8 @@ def indices_padding_wrapper(func: Callable) -> Callable:
+
+
+ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
+-    x_glu, x_linear = x[..., ::2], x[..., 1::2]
++    dim = x.shape[-1] // 2
++    x_glu, x_linear = x.split(dim, -1)
+     # Clamp the input values
+     x_glu = x_glu.clamp(min=None, max=limit)
+     x_linear = x_linear.clamp(min=-limit, max=limit)
+diff --git a/torchtitan/experiments/gpt_oss/train_configs/debug_model.toml b/torchtitan/experiments/gpt_oss/train_configs/debug_model.toml
+index 82b9d0e2..937ae16d 100644
+--- a/torchtitan/experiments/gpt_oss/train_configs/debug_model.toml
++++ b/torchtitan/experiments/gpt_oss/train_configs/debug_model.toml
+@@ -4,9 +4,11 @@ description = "Gpt-oss debug training"
+ print_config = false
+
+ [profiling]
+-enable_profiling = false
++enable_profiling = true
+ save_traces_folder = "profile_trace"
+-profile_freq = 10
++profile_freq = 5
++profiler_active = 1
++profiler_warmup = 1
+ enable_memory_snapshot = false
+ save_memory_snapshot_folder = "memory_snapshot"
+
+@@ -36,10 +38,11 @@ decay_type = "linear"
+ min_lr_factor = 0.0
+
+ [training]
+-local_batch_size = 8
++local_batch_size = 1
+ seq_len = 2048
++# seq_len = 4096
+ max_norm = 1.0  # grad norm clipping
+-steps = 10
++steps = 200
+ dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
+
+ [parallelism]
+diff --git a/torchtitan/models/attention.py b/torchtitan/models/attention.py
+index 85115fef..4946e0e5 100644
+--- a/torchtitan/models/attention.py
++++ b/torchtitan/models/attention.py
+@@ -46,7 +46,7 @@ class FlexAttentionWrapper(torch.nn.Module):
+     """
+
+     _compiled_flex_attn: ClassVar[Callable] = torch.compile(
+-        flex_attention, mode="max-autotune-no-cudagraphs"
++        flex_attention, mode="max-autotune-no-cudagraphs", backend='eager'
+     )
+
+     def forward(
+@@ -215,7 +215,7 @@ def get_sliding_window_mask_mod(window_size: int) -> _mask_mod_signature:
+     return sliding_window_mod
+
+
+-_compiled_create_block_mask = torch.compile(create_block_mask)
++_compiled_create_block_mask = torch.compile(create_block_mask, backend='eager')
+
+
+ @functools.lru_cache(4)
+diff --git a/torchtitan/models/moe/kernels.py b/torchtitan/models/moe/kernels.py
+index 7aac7b3a..7f9cfa22 100644
+--- a/torchtitan/models/moe/kernels.py
++++ b/torchtitan/models/moe/kernels.py
+@@ -109,7 +109,7 @@ def fill_indices_cpu(
+     max_len: int,
+ ):
+     # We need to preallocate the output - we ignore device and force it on cpu
+-    # device = tokens_per_expert_group.device
++    device = tokens_per_expert_group.device
+     permuted_indices = torch.full(
+         (max_len,),
+         -1,
+@@ -134,7 +134,7 @@ def fill_indices_cpu(
+                     # device=device,
+                 )
+             write_start += length
+-    return permuted_indices
++    return permuted_indices.to(device)
+
+
+ def generate_permute_indices(
+diff --git a/torchtitan/models/moe/moe.py b/torchtitan/models/moe/moe.py
+index 295e2193..06c1c898 100644
+--- a/torchtitan/models/moe/moe.py
++++ b/torchtitan/models/moe/moe.py
+@@ -346,6 +346,7 @@ class TokenReorderer(nn.Module):
+
+         top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
+         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
++        token_indices_experts_sorted = token_indices_experts_sorted.to(torch.int32)
+
+         return (
+             top_scores_experts_sorted,
+diff --git a/torchtitan/models/moe/utils.py b/torchtitan/models/moe/utils.py
+index fd9df3bb..84ec8bad 100644
+--- a/torchtitan/models/moe/utils.py
++++ b/torchtitan/models/moe/utils.py
+@@ -50,6 +50,7 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+             ep_degree,
+             padded_max_len,
+             TOKEN_GROUP_ALIGN_SIZE_M,
++            use_cpu=True,
+         )
+
+     x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+@@ -62,7 +63,7 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+ def _unpermute(out, input_shape, permuted_indices):
+     out_unpermuted = out.new_empty(input_shape)
+     out_unpermuted[permuted_indices, :] = out
+-    out = out_unpermuted[:-1]
++    out = out_unpermuted.split(out_unpermuted.shape[0] - 1)[0]
+     return out
+
+
+diff --git a/torchtitan/models/qwen3/model/model.py b/torchtitan/models/qwen3/model/model.py
+index a4f0a598..87554feb 100644
+--- a/torchtitan/models/qwen3/model/model.py
++++ b/torchtitan/models/qwen3/model/model.py
+@@ -24,6 +24,9 @@ from torchtitan.models.moe import MoE
+ from torchtitan.protocols.model import AttentionMasksType
+ from torchtitan.protocols.train_spec import ModelProtocol
+
++# RoPE nki kernel
++from torchtitan.tools.neuron_kernels import apply_rope_kernel
++
+ from .args import Qwen3ModelArgs
+
+
+@@ -216,7 +219,8 @@ class Attention(nn.Module):
+             xk = self.k_norm(xk)
+
+         # Apply rotary embedding
+-        xq, xk = apply_rotary_emb(xq, xk, rope_cache)
++        # xq, xk = apply_rotary_emb(xq, xk, rope_cache)
++        xq, xk = apply_rope_kernel(apply_rotary_emb, xq, xk, rope_cache)
+
+         # repeat k/v heads if n_kv_heads < n_heads
+         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+diff --git a/torchtitan/tools/neuron_kernels.py b/torchtitan/tools/neuron_kernels.py
+new file mode 100644
+index 00000000..78edb9f4
+--- /dev/null
++++ b/torchtitan/tools/neuron_kernels.py
+@@ -0,0 +1,106 @@
++import logging
++import os
++import torch
++from torch_neuronx import TorchNeuronNKIKernel
++from torch_neuronx.utils import get_logical_neuron_cores
++
++import neuronxcc.nki.language as nl
++
++from .logging import warn_once
++
++logger = logging.getLogger()
++
++
++# check for kernel in compiler package
++try:
++    from neuronxcc.nki._pre_prod_kernels.experimental.misc.apply_rope_nki import (
++        nki_apply_rotary_embedding_with_cache
++    )
++except ImportError as e:
++    nki_apply_rotary_embedding_with_cache = None
++
++
++def get_rope_grid_size(vnc_degree, seq_len):
++    grid_size = ()
++    if (
++        vnc_degree > 1
++        and seq_len >= vnc_degree
++        and seq_len % vnc_degree == 0
++        and seq_len > nl.tile_size.pmax
++    ):
++        grid_size = (nl.nc(vnc_degree),)
++
++    return grid_size
++
++
++class RoPEFunctionNKI(torch.autograd.Function):
++    """
++    NKI-accelerated autograd function for Rotary Position Embedding (RoPE).
++    """
++
++    @staticmethod
++    def forward(ctx, xq, xk, rope_cache):
++        ctx.save_for_backward(rope_cache)
++        xq_out = torch.empty(
++            xq.shape, dtype=xq.dtype, device=xq.device, requires_grad=xq.requires_grad
++        )
++        xk_out = torch.empty(
++            xk.shape, dtype=xk.dtype, device=xk.device, requires_grad=xk.requires_grad
++        )
++        seq_len = xq.shape[2]
++        vnc_degree = int(get_logical_neuron_cores())
++        grid = get_rope_grid_size(vnc_degree, seq_len)
++
++        kernel = TorchNeuronNKIKernel(
++            func=getattr(nki_apply_rotary_embedding_with_cache, "func", nki_apply_rotary_embedding_with_cache),
++            grid=grid,
++            kernel_return=True,
++        )
++        kernel(xq, xk, rope_cache, xq_out, xk_out, backward=False)
++        return xq_out, xk_out
++
++    @staticmethod
++    def backward(ctx, grad_xq, grad_xk):
++        rope_cache, = ctx.saved_tensors
++        grad_xq_out = torch.empty(
++            grad_xq.shape,
++            dtype=grad_xq.dtype,
++            device=grad_xq.device,
++            requires_grad=grad_xq.requires_grad,
++        )
++        grad_xk_out = torch.empty(
++            grad_xk.shape,
++            dtype=grad_xk.dtype,
++            device=grad_xk.device,
++            requires_grad=grad_xk.requires_grad,
++        )
++        seq_len = grad_xq.shape[2]
++        vnc_degree = int(get_logical_neuron_cores())
++        grid = get_rope_grid_size(vnc_degree, seq_len)
++
++        kernel = TorchNeuronNKIKernel(
++            func=getattr(nki_apply_rotary_embedding_with_cache, "func", nki_apply_rotary_embedding_with_cache),
++            grid=grid,
++            kernel_return=True,
++        )
++        kernel(grad_xq, grad_xk, rope_cache, grad_xq_out, grad_xk_out, backward=True)
++        return grad_xq_out, grad_xk_out, None, None
++
++
++def apply_rope_kernel(original_rope, xq, xk, rope_cache):
++    """
++    xq: b, s, h_q, d
++    xk: b, s, h_k, d
++    rope_cache: s, d*2
++    """
++    if nki_apply_rotary_embedding_with_cache is not None and not os.getenv('DISABLE_ROPE_KERNEL', False):
++        try:
++            # transpose to B, H, S, D
++            xq_out, xk_out = RoPEFunctionNKI.apply(xq.transpose(1, 2), xk.transpose(1, 2), rope_cache)
++            return xq_out.transpose(1, 2).contiguous(), xk_out.transpose(1, 2).contiguous()
++        except Exception as e:
++            warn_once(logger, "Failed to use NKI-accelerated RoPE kernel. Falling back to original RoPE kernel.")
++            warn_once(logger, f"failed with {e}")
++    else:
++        warn_once(logger, "NKI-accelerated RoPE kernel not available")
++    return original_rope(xq, xk, rope_cache)
+diff --git a/torchtitan/tools/profiling.py b/torchtitan/tools/profiling.py
+index f398dba9..35898be4 100644
+--- a/torchtitan/tools/profiling.py
++++ b/torchtitan/tools/profiling.py
+@@ -76,6 +76,7 @@ def maybe_enable_profiling(
+             schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+             on_trace_ready=trace_handler,
+             record_shapes=True,
++            with_stack=True,
+         ) as torch_profiler:
+             torch_profiler.step_num = global_step
+             yield torch_profiler
+diff --git a/torchtitan/tools/utils.py b/torchtitan/tools/utils.py
+index 0b1c78d0..31dbaecf 100644
+--- a/torchtitan/tools/utils.py
++++ b/torchtitan/tools/utils.py
+@@ -16,6 +16,8 @@ from torch._utils import _get_available_device_type, _get_device_module
+
+ from torchtitan.tools.logging import logger
+
++import torch_neuronx
++
+
+ def has_cuda_capability(major: int, minor: int) -> bool:
+     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
+@@ -120,6 +122,15 @@ def get_peak_flops(device_name: str) -> int:
+     elif "l40s" in device_name:
+         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
+         return 362e12
++    elif "neuron" in device_name:
++        # we assume lnc2 here
++        systolic_array_size = 128 * 128  # 16,384 processing units
++        flops_per_cycle = 2  # BF16 operations
++        clock_rate_ghz = 2.4
++
++        # Calculate theoretical peak in FLOPS
++        theoretical_peak_flops = systolic_array_size * flops_per_cycle * clock_rate_ghz * 1e9 * 2 # lnc2
++        return theoretical_peak_flops
+
+     else:  # for other GPU types, assume A100
+         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
