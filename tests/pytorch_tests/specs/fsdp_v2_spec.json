@@ -164,7 +164,8 @@
           "reason": "NCCL log comparision does not apply to Neuron",
           "tests": [
             "test_fully_shard_force_sum_both_reductions",
-            "test_fully_shard_force_sum_reduce_scatter"
+            "test_fully_shard_force_sum_reduce_scatter",
+            "test_fully_shard_alloc_from_pg"
           ]
         }
       ],
@@ -177,8 +178,7 @@
             "test_all_gather_fp32",
             "test_manual_reshard_with_reshard_after_forward_false",
             "test_set_reshard_after_forward",
-            "test_unshard_without_lazy_init",
-            "test_fully_shard_alloc_from_pg"
+            "test_unshard_without_lazy_init"
           ]
         }
       ]

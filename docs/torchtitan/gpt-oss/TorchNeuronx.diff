@@ -1,0 +1,53 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+index 364f02c..f11aebc 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -224,6 +224,7 @@ cc_library(
+         "-I.",
+         "-isystemexternal/torch",
+         "-fvisibility=default",  # Force symbol visibility
++        "--param=destructive-interference-size=64",
+     ],
+     visibility = ["//visibility:public"],
+     alwayslink = True,  # Prevent dead code elimination - equivalent to --whole-archive
+@@ -273,6 +274,7 @@ cc_binary(
+         "-DTORCH_EXTENSION_NAME=_C",
+         "-fPIC",
+         "-fwrapv",
++        "--param=destructive-interference-size=64",
+     ],
+     linkopts = [
+         "-Wl,--no-as-needed",
+diff --git a/pyproject.toml b/pyproject.toml
+index 8f663e3..3eb9673 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,7 +5,7 @@ description = "Neuron Backend for PyTorch"
+ authors = [{name = "AWS Neuron Team"}]
+ requires-python = ">=3.10,<3.11"
+ dependencies = [
+-    "torch~=2.8.0",
++    "torch",
+     "jax",
+     "numpy<2", # neuronx-cc requires numpy 1.x
+     "grpcio-tools",
+@@ -34,6 +34,19 @@ dev = [
+     "pytest-forked",
+ ]
+
++[tool.uv]
++required-environments = [
++    "sys_platform == 'linux' and platform_machine == 'x86_64'",
++]
++
++[[tool.uv.index]]
++name = "pytorch-cpu"
++url = "https://download.pytorch.org/whl/nightly/cpu"
++explicit = true
++
++[tool.uv.sources]
++torch = { index = "pytorch-cpu" }
++
+ [tool.ruff]
+ line-length = 100
+ target-version = "py310"
