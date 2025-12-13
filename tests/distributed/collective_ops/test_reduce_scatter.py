@@ -196,6 +196,70 @@ def run_reduce_scatter_avg_distributed_test(rank, world_size, kwargs):
     ), f"Expected {expected}, got {output.cpu()}"
 
 
+def run_premul_sum_scalar_reduce_scatter_test(rank, world_size, kwargs):
+    """Test reduce_scatter with PREMUL_SUM operation using scalar factor."""
+    # rank 0: [1, 2, 3, 4], rank 1: [3, 4, 5, 6]
+    input_list = [
+        torch.tensor(
+            [rank * 2 + 1.0, rank * 2 + 2.0, rank * 2 + 3.0, rank * 2 + 4.0], dtype=torch.float32
+        ).to("neuron")
+    ]
+    output = torch.zeros(2, dtype=torch.float32).to("neuron")
+
+    # Create PREMUL_SUM operation with scalar factor 2.5
+    premul_factor = 2.5
+    reduce_op = dist._make_nccl_premul_sum(premul_factor)
+
+    # For PREMUL_SUM with factor 2.5:
+    # rank 0: [1, 2, 3, 4] * 2.5 = [2.5, 5.0, 7.5, 10.0]
+    # rank 1: [3, 4, 5, 6] * 2.5 = [7.5, 10.0, 12.5, 15.0]
+    # After SUM:
+    #   rank 0 gets sum([2.5, 7.5], [5.0, 10.0]) = [10.0, 15.0]
+    #   rank 1 gets sum([7.5, 12.5], [10.0, 15.0]) = [20.0, 25.0]
+    expected = (
+        torch.tensor([10.0, 15.0], dtype=torch.float32)
+        if rank == 0
+        else torch.tensor([20.0, 25.0], dtype=torch.float32)
+    )
+
+    dist.reduce_scatter(output=output, input_list=input_list, op=reduce_op)
+    assert torch.allclose(
+        output.cpu(), expected, rtol=1e-5
+    ), f"Rank {rank}: Expected {expected}, got {output.cpu()}"
+
+
+def run_premul_sum_tensor_reduce_scatter_test(rank, world_size, kwargs):
+    """Test reduce_scatter with PREMUL_SUM operation using tensor factor."""
+    # rank 0: [1, 2, 3, 4], rank 1: [3, 4, 5, 6]
+    input_list = [
+        torch.tensor(
+            [rank * 2 + 1.0, rank * 2 + 2.0, rank * 2 + 3.0, rank * 2 + 4.0], dtype=torch.float32
+        ).to("neuron")
+    ]
+    output = torch.zeros(2, dtype=torch.float32).to("neuron")
+
+    # Create PREMUL_SUM operation with tensor factor 2.5
+    tensor_factor = torch.tensor([2.5], dtype=torch.float32).to("neuron")
+    reduce_op = dist._make_nccl_premul_sum(tensor_factor)
+
+    # For PREMUL_SUM with factor 2.5:
+    # rank 0: [1, 2, 3, 4] * 2.5 = [2.5, 5.0, 7.5, 10.0]
+    # rank 1: [3, 4, 5, 6] * 2.5 = [7.5, 10.0, 12.5, 15.0]
+    # After SUM:
+    #   rank 0 gets sum([2.5, 7.5], [5.0, 10.0]) = [10.0, 15.0]
+    #   rank 1 gets sum([7.5, 12.5], [10.0, 15.0]) = [20.0, 25.0]
+    expected = (
+        torch.tensor([10.0, 15.0], dtype=torch.float32)
+        if rank == 0
+        else torch.tensor([20.0, 25.0], dtype=torch.float32)
+    )
+
+    dist.reduce_scatter(output=output, input_list=input_list, op=reduce_op)
+    assert torch.allclose(
+        output.cpu(), expected, rtol=1e-5
+    ), f"Rank {rank}: Expected {expected}, got {output.cpu()}"
+
+
 def unary_op_execute(tensor_a, tensor_b, op):
     """Execute unary operation on two tensors.
 
@@ -1011,6 +1075,14 @@ class TestReduceScatter(BaseCollectiveOpTest):
     def test_reduce_scatter_avg_distributed(self):
         """Test reduce_scatter AVG distributed coordination."""
         self.distributed_tester.run_test(run_reduce_scatter_avg_distributed_test)
+
+    def test_reduce_scatter_premul_sum_scalar(self):
+        """Test reduce_scatter with PREMUL_SUM operation using scalar factor."""
+        self.distributed_tester.run_test(run_premul_sum_scalar_reduce_scatter_test)
+
+    def test_reduce_scatter_premul_sum_tensor(self):
+        """Test reduce_scatter with PREMUL_SUM operation using tensor factor."""
+        self.distributed_tester.run_test(run_premul_sum_tensor_reduce_scatter_test)
 
     @pytest.mark.parametrize(
         ",".join(generate_test_params(dtype_test_variables)[0]),

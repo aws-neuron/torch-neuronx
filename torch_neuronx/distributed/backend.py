@@ -22,7 +22,12 @@ import torch_neuronx
 
 from .ops import all_gather_op, all_reduce_op, all_to_all_op, reduce_scatter_op
 from .ops.functional_collectives import register_neuron_collectives
-from .utils import create_global_replica_group, get_free_port, get_reduce_type
+from .utils import (
+    create_global_replica_group,
+    get_free_port,
+    get_reduce_type,
+    parse_and_update_inputs,
+)
 
 _WORLD_SIZE = None
 
@@ -297,10 +302,13 @@ class ProcessGroupNeuron(ProcessGroup):
             all_reduce_options = AllreduceOptions()
 
         replica_groups = [dist.get_process_group_ranks(self)]
+        processed_tensors, reduce_type = parse_and_update_inputs(
+            tensors, all_reduce_options.reduceOp
+        )
         all_reduce_op(
-            tensors,
+            processed_tensors,
             replica_groups,
-            get_reduce_type(all_reduce_options.reduceOp),
+            reduce_type,
             out=tuple(tensors),
         )
         return _ret_work(tensors)
@@ -557,10 +565,13 @@ class ProcessGroupNeuron(ProcessGroup):
         # Passing [0] to both input and output as the c10d inside torch wraps both
         # customer inputs and outputs with one more level of list
         replica_groups = [dist.get_process_group_ranks(self)]
+        processed_input_tensors_list, reduce_type = parse_and_update_inputs(
+            input_tensors_list, reduce_scatter_options.reduceOp
+        )
         reduce_scatter_op(
-            input_tensors_list[0],  # passing input as a list of tensors to PG backend
+            processed_input_tensors_list[0],  # passing input as a list of tensors to PG backend
             replica_groups,
-            get_reduce_type(reduce_scatter_options.reduceOp),
+            reduce_type,
             out=output_tensors[0],  # passing output as a tensor to PG backend
         )
         return _ret_work(output_tensors)
@@ -587,10 +598,13 @@ class ProcessGroupNeuron(ProcessGroup):
         if reduce_scatter_options is None:
             reduce_scatter_options = ReduceScatterOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
+        processed_input_tensor, reduce_type = parse_and_update_inputs(
+            input_tensor, reduce_scatter_options.reduceOp
+        )
         reduce_scatter_op(
-            [input_tensor],
+            [processed_input_tensor],
             replica_groups,
-            get_reduce_type(reduce_scatter_options.reduceOp),
+            reduce_type,
             out=output_tensor,
         )
         return _ret_work(output_tensor)

@@ -174,7 +174,6 @@
           "reason": "Communication and reduction operation failures",
           "tests": [
             "test_fully_shard_communication_count",
-            "test_set_reduce_scatter_divide_factor",
             "test_all_gather_fp32",
             "test_manual_reshard_with_reshard_after_forward_false",
             "test_set_reshard_after_forward",
