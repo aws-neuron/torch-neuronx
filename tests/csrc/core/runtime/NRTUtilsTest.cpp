@@ -113,7 +113,8 @@ TEST_F(NRTUtilsTest, ModelLoadFailure) {
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _)).WillOnce(Return(NRT_FAILURE));
 
   Model model;
-  EXPECT_THROW(model.Load(neff_bytes, 0, 1), std::runtime_error);
+  NRT_STATUS status = model.Load(neff_bytes, 0, 1);
+  EXPECT_EQ(status, NRT_FAILURE);
   EXPECT_FALSE(model.IsValid());
 }
 
@@ -179,7 +180,8 @@ TEST_F(NRTUtilsTest, ModelExecuteFailure) {
 
   Model model;
   model.Load(neff_bytes, 0, 1);
-  EXPECT_THROW(model.Execute(fake_input, fake_output), std::runtime_error);
+  NRT_STATUS status = model.Execute(fake_input, fake_output);
+  EXPECT_EQ(status, NRT_FAILURE);
 }
 
 TEST_F(NRTUtilsTest, ModelExecuteWithoutLoad) {

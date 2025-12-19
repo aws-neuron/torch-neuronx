@@ -103,10 +103,12 @@ class XLABuilderKernel(BaseNeuronKernel):
 
         cache_key = self._generate_cache_key(self.op_name, processed_inputs, kwargs)
         device = self.arg_processor.extract_device(inputs)
-        input_dict, list_arg_positions, list_arg_lengths = (
-            self.arg_processor.prepare_execution_inputs(processed_inputs, device)
-        )
-
+        input_dict = self.arg_processor.prepare_execution_inputs(processed_inputs, device)
+        # Get CPU fallback context stored directly on kernel
+        cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
+        # need to handle the case where the kernel is created after impl.execute call
+        if cpu_fallback_context is None:
+            cpu_fallback_context = {"original_inputs": list(inputs), "original_kwargs": {}}
         #  TODO (kvshbg) - remove sync flow once async CRs are merged
         if is_sync_mode_enabled():
             self._execute_sync(cache_key, processed_inputs, input_dict, kwargs, output_tensors)
@@ -117,8 +119,7 @@ class XLABuilderKernel(BaseNeuronKernel):
                 tuple(input_dict.values()),
                 kwargs,
                 output_tensors,
-                list_arg_positions,
-                list_arg_lengths,
+                cpu_fallback_context,
             )
 
         # Apply dtype corrections and return
@@ -178,8 +179,7 @@ class XLABuilderKernel(BaseNeuronKernel):
         non_static_inputs: tuple,
         kwargs: dict,
         output_tensors: tuple,
-        list_arg_positions: list,
-        list_arg_lengths: list,
+        cpu_fallback_context,
     ) -> None:
         """Execute kernel in async mode."""
         hlo = self.xla_builder_compiler.get_or_compile_hlo(
@@ -191,13 +191,6 @@ class XLABuilderKernel(BaseNeuronKernel):
             stack_trace = "".join(traceback.format_list(traceback.extract_stack()[:-2]))
         else:
             stack_trace = ""
-
-        # Create CPU fallback context using ArgumentProcessor
-        cpu_fallback_context = self.arg_processor.create_cpu_fallback_context(
-            processed_inputs,
-            list_arg_positions or [],
-            list_arg_lengths or [],
-        )
 
         try:
             _C._submit_xla_task_to_pipeline(

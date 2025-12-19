@@ -115,7 +115,7 @@ def create_config(preset_name, batch_size, seq_len):
     }
 
 
-def create_block(config, device, dtype=None, tp_mesh=None):
+def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     """Create block from config dictionary."""
     return create_qwen3_block(
         config["head_dim"],

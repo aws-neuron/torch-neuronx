@@ -45,7 +45,7 @@ build --action_env=PYTHON_VERSION="3.10"
 
 ## Pytorch variables.
 # Pytorch version, when local is not available.
-build --action_env=PYTORCH_VERSION="2.8.0"
+build --action_env=PYTORCH_VERSION="2.9.0"
 
 # Default to use local Pytorch installation.
 # Set to "1" to download from source.

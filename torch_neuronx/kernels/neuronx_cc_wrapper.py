@@ -16,12 +16,24 @@ import logging
 import os
 import shlex
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .compiler_config import CompilerConfig
 from .compiler_subprocess import CompilerSubprocess, NEFFCompilationError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ParsedArgs:
+    """Parsed command-line arguments for neuronx-cc wrapper."""
+
+    config: CompilerConfig
+    lnc_override: str | None
+    input_file: str | None
+    output_file: str | None
+    workdir: str | None
 
 
 class NeuronxCCWrapper:
@@ -41,39 +53,41 @@ class NeuronxCCWrapper:
             Exit code (0 for success, non-zero for failure)
         """
         try:
-            config, lnc_override, workdir = self._parse_neuronx_cc_args(args)
+            parsed = self._parse_neuronx_cc_args(args)
 
-            if not config.input:
+            if not parsed.input_file:
                 logger.error("Could not parse input file from arguments")
                 return 1
-            if not config.output:
+            if not parsed.output_file:
                 logger.error("Could not parse output file from arguments")
                 return 1
-            if not workdir:
+            if not parsed.workdir:
                 logger.error("Could not parse working directory from arguments")
                 return 1
 
             # Read input file
             try:
-                with open(config.input, "rb") as f:
+                with open(parsed.input_file, "rb") as f:
                     hlo_protobuf = f.read()
             except Exception as e:
-                logger.error(f"Error reading input file {config.input}: {e}")
+                logger.error(f"Error reading input file {parsed.input_file}: {e}")
                 return 1
 
             # Determine IR type based on file extension
-            ir_type = "StableHLO" if Path(config.input).suffix == ".mlir" else "XLA"
+            ir_type = "StableHLO" if Path(parsed.input_file).suffix == ".mlir" else "XLA"
 
             # Get cached neff or compile
             self.compiler.get_or_compile(
                 hlo_protobuf=hlo_protobuf,
-                config=config,
-                lnc_override=lnc_override,
+                config=parsed.config,
+                lnc_override=parsed.lnc_override,
                 ir_type=ir_type,
-                workdir=workdir,
+                workdir=parsed.workdir,
+                input_file=parsed.input_file,
+                output_file=parsed.output_file,
             )
 
-            logger.info(f"Successfully compiled {config.input} -> {config.output}")
+            logger.info(f"Successfully compiled {parsed.input_file} -> {parsed.output_file}")
             return 0
 
         except NEFFCompilationError as e:
@@ -83,16 +97,14 @@ class NeuronxCCWrapper:
             logger.error(f"Error occurred during compilation/cached neff retrieval: {e}")
             return 1
 
-    def _parse_neuronx_cc_args(
-        self, args: list[str]
-    ) -> tuple[CompilerConfig, str | None, str | None]:
+    def _parse_neuronx_cc_args(self, args: list[str]) -> ParsedArgs:
         """Parse neuronx-cc arguments using argparse.
 
         Args:
             args: List of neuronx-cc command line arguments
 
         Returns:
-            Tuple of (config, lnc_override)
+            ParsedArgs containing config and runtime parameters
         """
         # Create parser for neuronx-cc arguments
         parser = argparse.ArgumentParser(add_help=False)
@@ -137,19 +149,20 @@ class NeuronxCCWrapper:
             config_kwargs["optimization_level"] = parsed_args.optimization
         if parsed_args.auto_cast:
             config_kwargs["auto_cast"] = parsed_args.auto_cast
-        if parsed_args.input:
-            config_kwargs["input"] = parsed_args.input
-        if parsed_args.output:
-            config_kwargs["output"] = parsed_args.output
 
         # Add any extra flags
         if extra_args:
             config_kwargs["extra_flags"] = extra_args
 
         config = CompilerConfig(**config_kwargs)
-        lnc_override = parsed_args.lnc
 
-        return config, lnc_override, parsed_args.workdir
+        return ParsedArgs(
+            config=config,
+            lnc_override=parsed_args.lnc,
+            input_file=parsed_args.input,
+            output_file=parsed_args.output,
+            workdir=parsed_args.workdir,
+        )
 
 
 def main(args=None):

@@ -159,8 +159,9 @@ class CopyNeuronImpl(OperationImplementation):
                         from .cast_policy import ensure_contiguous_on_device
 
                         src_prepared = ensure_contiguous_on_device(src)
+                        # In case of D2D without CPU bounces, copies are not blocking.
                         return self._copy_neuron_to_neuron(
-                            self_tensor, src_prepared, non_blocking=non_blocking
+                            self_tensor, src_prepared, non_blocking=True
                         )
                     except Exception as e:
                         return ExecutionResult(
@@ -223,7 +224,8 @@ class CopyNeuronImpl(OperationImplementation):
         try:
             from .cast_policy import write_neuron_to_neuron
 
-            write_neuron_to_neuron(dst, src, non_blocking=non_blocking)
+            # In case of D2D without CPU bounces, copies are not blocking.
+            write_neuron_to_neuron(dst, src, non_blocking=True)
             return ExecutionResult(success=True, output=dst)
         except Exception as e:
             return ExecutionResult(success=False, error_msg=str(e))

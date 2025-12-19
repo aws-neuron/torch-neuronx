@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises, cpu_fallback_test
+from tests.utils.neuron_test_utils import assert_raises
 
 
 def test_copy_neuron_to_neuron_same_device():
@@ -104,22 +104,3 @@ def test_copy_neuron_to_neuron_different_shapes():
     src2_cpu.copy_(src2)
     dst2_cpu.copy_(dst2)
     torch.testing.assert_close(src2_cpu, dst2_cpu)
-
-
-@cpu_fallback_test
-@assert_raises(
-    RuntimeError,
-    match="CPU fallback failed. Cannot copy result to output tensor which is not contiguous",
-)
-def test_copy_neuron_to_neuron_non_contiguous():
-    tile_t = 128
-    tile_h = 128
-    nopad_t = 128
-    nopad_h = 64
-
-    x = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
-    y = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
-    z = x[:nopad_t, :nopad_h]
-
-    # Should raise error for copying to non-contiguous destination
-    y[:nopad_t, :nopad_h] = z

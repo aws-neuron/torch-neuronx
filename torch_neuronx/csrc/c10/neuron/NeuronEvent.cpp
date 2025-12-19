@@ -21,12 +21,19 @@ void NeuronEvent::record(const NeuronStream& stream) {
     mark_completed();
     impl_->sync_cv.notify_all();
   } else {
-    // Stream has work - register event to complete after current operations
-    stream.register_event_after_current_operations(this);
+    // Stream has work - submit event signal primitive
+    stream.SubmitEventSignal(*this);
   }
 }
 
-void NeuronEvent::block(const NeuronStream& stream) { stream.wait_event(*this); }
+void NeuronEvent::block(const NeuronStream& stream) {
+  if (query()) {
+    // Event already completed, no need to wait
+    return;
+  }
+  // Submit event wait primitive
+  stream.SubmitEventWait(*this);
+}
 
 bool NeuronEvent::query() const { return !is_recorded() || is_completed(); }
 

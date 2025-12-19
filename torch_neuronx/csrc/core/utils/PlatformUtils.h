@@ -38,6 +38,15 @@ std::string GetPlatformTarget();
 //   std::runtime_error if the instance type is unknown or unsupported
 std::string GetLogicalNeuronCores();
 
+// TODO(Runtime): Remove once it is defaulted.
+// Checks if synchronous execution mode is enabled.
+// When enabled, operations execute synchronously instead of being queued asynchronously.
+// Controlled by the TORCH_NEURONX_SYNC_MODE environment variable.
+//
+// Returns:
+//   true if TORCH_NEURONX_SYNC_MODE is set to "1", false otherwise
+bool IsSyncModeEnabled();
+
 }  // namespace utils
 
 }  // namespace at::neuron

@@ -1,0 +1,32 @@
+{
+  "test_configurations": [
+    {
+      "class": "TestFullyShard2DStateDict",
+      "file": "distributed/_composable/test_composability/test_2d_composability.py",
+      "xfail": []
+    },
+    {
+      "class": "Test2dFSDP1ParallelIntegration",
+      "file": "distributed/_composable/test_composability/test_2d_composability.py",
+      "xfail": []
+    },
+    {
+      "class": "TestNew2dParallelTraining",
+      "file": "distributed/_composable/test_composability/test_2d_composability.py",
+      "xfail": []
+    },
+    {
+      "class": "TestNew2dParallelStateDict",
+      "file": "distributed/_composable/test_composability/test_2d_composability.py",
+      "xfail": [
+        {
+          "reason": "ValueError: Invalid device specification: neuron:2",
+          "tests": [
+            "test_2d_load_state_dict_is_even_sharded_model_True",
+            "test_2d_load_state_dict_is_even_sharded_model_False"
+          ]
+        }
+      ]
+    }
+  ]
+}

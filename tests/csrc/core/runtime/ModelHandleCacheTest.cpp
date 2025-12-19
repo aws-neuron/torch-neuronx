@@ -30,6 +30,8 @@ class ModelHandleCacheTest : public ::testing::Test {
     output_tensor_ = create_test_tensor({2, 3});
     inputs_ = {input_tensor_};
     outputs_ = {output_tensor_};
+    input_ptrs_ = get_tensor_data_ptrs(inputs_);
+    output_ptrs_ = get_tensor_data_ptrs(outputs_);
 
     // Create test NEFF bytes
     neff_bytes_ = {0x4E, 0x45, 0x46, 0x46, 0x01, 0x02, 0x03, 0x04};
@@ -47,20 +49,18 @@ class ModelHandleCacheTest : public ::testing::Test {
   torch::Tensor output_tensor_;
   std::vector<torch::Tensor> inputs_;
   std::vector<torch::Tensor> outputs_;
+  std::vector<void*> input_ptrs_;
+  std::vector<void*> output_ptrs_;
   std::vector<uint8_t> neff_bytes_;
 };
-
-TEST_F(ModelHandleCacheTest, InitialState) {
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 0);
-}
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelFirstTime) {
   nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
 
   // Create a compilable kernel with cached NEFF
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   // Set cached NEFF
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
@@ -77,16 +77,14 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelFirstTime) {
   EXPECT_TRUE(model);
   EXPECT_TRUE(model->IsValid());
   EXPECT_EQ(model->get(), fake_model);
-
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelCacheHit) {
   nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -105,9 +103,6 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelCacheHit) {
   auto model2 = cache_->GetOrLoadModel(kernel, 0, 1);
   EXPECT_TRUE(model2);
   EXPECT_EQ(model1, model2);  // Should be the same shared_ptr
-
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
@@ -115,7 +110,8 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
   nrt_model_t* fake_model2 = reinterpret_cast<nrt_model_t*>(0xDCBA);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -137,9 +133,6 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
   EXPECT_TRUE(model1);
   EXPECT_TRUE(model2);
   EXPECT_NE(model1, model2);  // Different devices = different models
-
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 2);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelWithCollectives) {
@@ -149,8 +142,8 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelWithCollectives) {
   c10_neuron::set_world_size(2);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes,
-                                      true);  // has_collectives = true
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      true, 0);  // has_collectives = true, device_id = 0
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -169,25 +162,24 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelWithCollectives) {
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelLoadFailure) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
   kernel.SetCachedNeff(std::move(neff_ptr));
 
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _)).WillOnce(Return(NRT_FAILURE));
-
-  EXPECT_THROW(cache_->GetOrLoadModel(kernel, 0, 1), std::runtime_error);
-
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 0);  // Failed load shouldn't cache
+  auto model = cache_->GetOrLoadModel(kernel, 0, 1);
+  EXPECT_FALSE(model->IsValid());
 }
 
 TEST_F(ModelHandleCacheTest, ClearCache) {
   nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -201,13 +193,15 @@ TEST_F(ModelHandleCacheTest, ClearCache) {
   auto model = cache_->GetOrLoadModel(kernel, 0, 1);
   EXPECT_TRUE(model);
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
+  // Verify cache has entries by checking we can retrieve cached models
+  auto entries_before = cache_->GetCacheEntries();
+  EXPECT_FALSE(entries_before.empty());
 
   cache_->Clear();
 
-  stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 0);
+  // Verify cache is empty after clear
+  auto entries_after = cache_->GetCacheEntries();
+  EXPECT_TRUE(entries_after.empty());
 }
 
 TEST_F(ModelHandleCacheTest, GetCacheEntries) {
@@ -215,7 +209,8 @@ TEST_F(ModelHandleCacheTest, GetCacheEntries) {
   nrt_model_t* fake_model2 = reinterpret_cast<nrt_model_t*>(0xDCBA);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -247,7 +242,8 @@ TEST_F(ModelHandleCacheTest, GetAllCacheKeys) {
   nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
 
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   auto neff_data = new std::vector<uint8_t>(neff_bytes_);
   NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
@@ -272,10 +268,10 @@ TEST_F(ModelHandleCacheTest, MultipleNeffBytes) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   // Create two kernels with different NEFF bytes (different sizes to distinguish in mock)
-  XLACompilableKernelExecution kernel1("test_op1", inputs_, outputs_, "cache_key1", hlo_bytes,
-                                       false);
-  XLACompilableKernelExecution kernel2("test_op2", inputs_, outputs_, "cache_key2", hlo_bytes,
-                                       false);
+  XLACompilableKernelExecution kernel1("test_op1", input_ptrs_, output_ptrs_, "cache_key1",
+                                       hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel2("test_op2", input_ptrs_, output_ptrs_, "cache_key2",
+                                       hlo_bytes, false, 0);
 
   std::vector<uint8_t> neff_bytes1 = {0x4E, 0x45, 0x46, 0x46, 0x01};
   std::vector<uint8_t> neff_bytes2 = {0x4E, 0x45, 0x46, 0x46, 0x02, 0x03};  // Different size
@@ -303,8 +299,9 @@ TEST_F(ModelHandleCacheTest, MultipleNeffBytes) {
   EXPECT_TRUE(model2);
   EXPECT_NE(model1, model2);  // Different NEFF = different models
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 2);
+  // Verify we have multiple cache entries by checking GetCacheEntries
+  auto entries = cache_->GetCacheEntries();
+  EXPECT_EQ(entries.size(), 2);
 }
 
 int main(int argc, char** argv) {

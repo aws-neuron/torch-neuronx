@@ -27,44 +27,6 @@ nrt_tensor_t* findTensor(void* ptr);
 
 namespace at::neuron::nrt {
 
-// RAII wrapper for slice tensors to ensure automatic cleanup
-class SliceTensorGuard {
- public:
-  explicit SliceTensorGuard(nrt_tensor_t* tensor) : tensor_(tensor), released_(false) {}
-
-  ~SliceTensorGuard() {
-    if (!released_ && tensor_) {
-      nrt_tensor_free(&tensor_);
-    }
-  }
-
-  // Non-copyable, movable
-  SliceTensorGuard(const SliceTensorGuard&) = delete;
-  SliceTensorGuard& operator=(const SliceTensorGuard&) = delete;
-
-  SliceTensorGuard(SliceTensorGuard&& other) noexcept
-      : tensor_(std::exchange(other.tensor_, nullptr)),
-        released_(std::exchange(other.released_, true)) {}
-
-  SliceTensorGuard& operator=(SliceTensorGuard&& other) noexcept {
-    if (this != &other) {
-      if (!released_ && tensor_) {
-        nrt_tensor_free(&tensor_);
-      }
-      tensor_ = std::exchange(other.tensor_, nullptr);
-      released_ = std::exchange(other.released_, true);
-    }
-    return *this;
-  }
-
-  void release() noexcept { released_ = true; }
-  nrt_tensor_t* get() const noexcept { return tensor_; }
-
- private:
-  nrt_tensor_t* tensor_;
-  bool released_;
-};
-
 // Provides automatic resource management for NRT tensor sets with
 // exception-safe operations and move semantics. Automatically allocates
 // the tensor set on construction and destroys it on destruction.
@@ -83,22 +45,16 @@ class TensorSet {
   // Get the underlying NRT tensor set pointer
   nrt_tensor_set_t* get() const noexcept { return tensor_set_; }
 
-  void AddTensor(std::string_view name, const at::Tensor& tensor);
+  NRT_STATUS AddTensor(std::string_view name, nrt_tensor_t* data_ptr);
 
   bool IsValid() const noexcept { return tensor_set_ != nullptr; }
 
   explicit operator bool() const noexcept { return IsValid(); }
 
-  // Get number of tracked slice tensors (for debugging/monitoring)
-  size_t SliceTensorCount() const noexcept;
-
  private:
   nrt_tensor_set_t* tensor_set_;
-  std::vector<nrt_tensor_t*> slice_tensors_;
-  mutable std::mutex slice_tensors_mutex_;
 
   void validate() const;
-  void cleanup_slice_tensors() noexcept;
   void reset() noexcept;
 };
 
@@ -110,11 +66,11 @@ class Model {
   ~Model() noexcept;
 
   // Load NEFF data into the model
-  void Load(const std::vector<uint8_t>& neff_bytes, int device_id = 0, int num_cores = 1);
+  NRT_STATUS Load(const std::vector<uint8_t>& neff_bytes, int device_id = 0, int num_cores = 1);
 
   // Load NEFF data with collective operations
-  void LoadCollectives(const std::vector<uint8_t>& neff_bytes, int device_id = 0,
-                       int num_cores = 1);
+  NRT_STATUS LoadCollectives(const std::vector<uint8_t>& neff_bytes, int device_id = 0,
+                             int num_cores = 1);
 
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
@@ -125,7 +81,7 @@ class Model {
   nrt_model_t* get() const noexcept { return model_; }
 
   // Execute the model
-  void Execute(nrt_tensor_set_t* input_set, nrt_tensor_set_t* output_set);
+  NRT_STATUS Execute(nrt_tensor_set_t* input_set, nrt_tensor_set_t* output_set);
 
   bool IsValid() const noexcept { return model_ != nullptr; }
   explicit operator bool() const noexcept { return IsValid(); }
@@ -139,5 +95,87 @@ class Model {
   void validate() const;
   void reset() noexcept;
 };
+
+// Standalone NRT tensor allocation/deallocation functions
+// These provide direct access to NRT tensor operations
+
+/**
+ * Allocate an NRT tensor
+ * @param placement Tensor placement (device or host)
+ * @param vnc_id Virtual NeuronCore ID
+ * @param size_bytes Size in bytes
+ * @param name Tensor name for debugging
+ * @param tensor Output pointer to allocated tensor
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS AllocateTensor(nrt_tensor_placement_t placement, int vnc_id, size_t size_bytes,
+                                 const char* name, nrt_tensor_t** tensor) {
+  return nrt_tensor_allocate(placement, vnc_id, size_bytes, name, tensor);
+}
+
+/**
+ * Free an NRT tensor
+ * @param tensor Pointer to tensor pointer (will be set to nullptr)
+ */
+inline void FreeTensor(nrt_tensor_t** tensor) { nrt_tensor_free(tensor); }
+
+/**
+ * Copy data between NRT tensors
+ * @param src Source tensor
+ * @param src_offset Offset in source tensor
+ * @param dst Destination tensor
+ * @param dst_offset Offset in destination tensor
+ * @param size_bytes Number of bytes to copy
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS CopyTensor(nrt_tensor_t* src, size_t src_offset, nrt_tensor_t* dst,
+                             size_t dst_offset, size_t size_bytes) {
+  return nrt_tensor_copy(src, src_offset, dst, dst_offset, size_bytes);
+}
+
+/**
+ * Write data from CPU memory to NRT tensor
+ * @param dst Destination NRT tensor
+ * @param src Source CPU memory pointer
+ * @param dst_offset Offset in destination tensor
+ * @param size_bytes Number of bytes to write
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS WriteTensor(nrt_tensor_t* dst, void* src, size_t dst_offset, size_t size_bytes) {
+  return nrt_tensor_write(dst, src, dst_offset, size_bytes);
+}
+
+/**
+ * Read data from NRT tensor to CPU memory
+ * @param src Source NRT tensor
+ * @param dst Destination CPU memory pointer
+ * @param src_offset Offset in source tensor
+ * @param size_bytes Number of bytes to read
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS ReadTensor(nrt_tensor_t* src, void* dst, size_t src_offset, size_t size_bytes) {
+  return nrt_tensor_read(src, dst, src_offset, size_bytes);
+}
+
+/**
+ * Get the size of an NRT tensor
+ * @param tensor Tensor to query
+ * @return Size in bytes
+ */
+inline size_t GetTensorSize(nrt_tensor_t* tensor) { return nrt_tensor_get_size(tensor); }
+
+/**
+ * Allocate a slice of an existing NRT tensor
+ * @param base_tensor Base tensor to slice from
+ * @param offset Offset in base tensor
+ * @param size Size of slice
+ * @param name Name for the slice tensor
+ * @param slice_tensor Output pointer to slice tensor
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS AllocateSliceTensor(nrt_tensor_t* base_tensor, size_t offset, size_t size,
+                                      const char* name, nrt_tensor_t** slice_tensor) {
+  return nrt_tensor_allocate_slice(base_tensor, offset, size, name, slice_tensor);
+}
 
 }  // namespace at::neuron::nrt

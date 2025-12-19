@@ -50,17 +50,25 @@ void NeuronHooksInterface::resizePrivateUse1Bytes(const c10::Storage& storage,
     return;
   }
 
+  c10::StorageImpl* storage_impl = storage.unsafeGetStorageImpl();
+
+  // If new_bytes is 0, do not need to allocate
+  if (new_bytes == 0) {
+    storage_impl->set_data_ptr_noswap(at::DataPtr(nullptr, storage.device()));
+    storage_impl->set_nbytes(0);
+    return;
+  }
+
   // Allocate new memory using the storage's allocator
   c10::Allocator* allocator = storage.allocator();
   TORCH_CHECK(allocator != nullptr, "Storage allocator is null");
 
   at::DataPtr new_data = allocator->allocate(new_bytes);
 
-  // Synchronize to ensure all pending operations complete before freeing old storage
-  at::neuron::synchronize(storage.device().index());
+  int device_id = storage.device().index();
 
-  // Swap the data pointers (this returns the old data pointer)
-  at::DataPtr old_data = storage.unsafeGetStorageImpl()->set_data_ptr(std::move(new_data));
+  // Get reference to the old data
+  const at::DataPtr& old_data = storage_impl->data_ptr();
 
   // Copy old data to new allocation if there was data
   if (old_data.get() != nullptr && new_bytes > 0 && old_bytes > 0) {
@@ -68,12 +76,15 @@ void NeuronHooksInterface::resizePrivateUse1Bytes(const c10::Storage& storage,
 
     // Use NeuronCachingAllocator's copy function for device-to-device copy
     bool copy_success = c10_neuron::NeuronCachingAllocator::copyTensorData(
-        new_data.get(), old_data.get(), copy_bytes);
+        new_data.get(), old_data.get(), copy_bytes, device_id);
     TORCH_CHECK(copy_success, "Failed to copy data during storage resize");
   }
 
+  // Use PyTorch's noswap approach to avoid replacing the storage address
+  storage_impl->set_data_ptr_noswap(std::move(new_data));
+
   // Update storage size
-  storage.unsafeGetStorageImpl()->set_nbytes(new_bytes);
+  storage_impl->set_nbytes(new_bytes);
 }
 
 // Check if Neuron runtime is available

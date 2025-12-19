@@ -83,13 +83,45 @@ def sample_neff():
 class MockCompilerConfig:
     """Mock compiler configuration for testing."""
 
-    def __init__(self, config_id="default", input=None, output=None):
+    def __init__(
+        self,
+        config_id="default",
+        target="trn1",
+        model_type="transformer",
+        optimization_level="-O1",
+        auto_cast="none",
+        framework="XLA",
+        lnc="1",
+        extra_flags=None,
+    ):
         self.config_id = config_id
-        self.input = input
-        self.output = output
+        self.target = target
+        self.model_type = model_type
+        self.optimization_level = optimization_level
+        self.auto_cast = auto_cast
+        self.framework = framework
+        self.lnc = lnc
+        self.extra_flags = extra_flags or []
 
-    def get_neuronx_cc_args(self, lnc_override=None):
-        return ["compile", self.input, "--output", self.output]
+    def get_neuronx_cc_args(self, input_file, output_file, lnc_override=None):
+        """Generate neuronx-cc command line arguments."""
+        return [
+            "compile",
+            input_file,
+            "--framework",
+            self.framework,
+            "--target",
+            self.target,
+            "--model-type",
+            self.model_type,
+            "--lnc",
+            lnc_override or self.lnc,
+            self.optimization_level,
+            f"--auto-cast={self.auto_cast}",
+            "--output",
+            output_file,
+            *self.extra_flags,
+        ]
 
     def __str__(self):
         return f"MockConfig({self.config_id})"
@@ -208,15 +240,86 @@ class TestNEFFCacheKey:
         assert hash(key1) == hash(key2)
         assert hash(key1) != hash(key3)
 
-    def test_cache_key_string_representation(self, mock_config, sample_hlo):
-        """Test cache key string representation."""
-        key = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
-        key_str = str(key)
+    def test_cache_key_hash_property(self, mock_config, sample_hlo):
+        """Test cache key hash property returns consistent values."""
+        key1 = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
+        key3 = NEFFCacheKey(sample_hlo, mock_config, "lnc2", "v1.0")
 
-        assert "mock_hlo_protobuf_data" in key_str
-        assert "MockConfig(default)" in key_str
-        assert "lnc1" in key_str
-        assert "v1.0" in key_str
+        # Hash property should return string
+        assert isinstance(key1.hash, str)
+        assert len(key1.hash) == 64  # SHA256 hex digest length
+
+        # Same inputs should produce same hash
+        assert key1.hash == key2.hash
+
+        # Different inputs should produce different hash
+        assert key1.hash != key3.hash
+
+    def test_cache_key_deterministic(self, mock_config, sample_hlo):
+        """Test that cache key hash is deterministic."""
+        # Create multiple keys with same inputs
+        keys = [NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0") for _ in range(10)]
+
+        # All hashes should be identical
+        hashes = [k.hash for k in keys]
+        assert len(set(hashes)) == 1
+
+    def test_cache_key_different_hlo_different_hash(self, mock_config):
+        """Test that different HLO produces different hash."""
+        key1 = NEFFCacheKey(b"hlo_data_1", mock_config, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(b"hlo_data_2", mock_config, "lnc1", "v1.0")
+
+        assert key1.hash != key2.hash
+        assert key1 != key2
+
+    def test_cache_key_different_config_different_hash(self, sample_hlo):
+        """Test that different config produces different hash."""
+        config1 = MockCompilerConfig(config_id="config1", optimization_level="-O1")
+        config2 = MockCompilerConfig(config_id="config2", optimization_level="-O2")
+
+        key1 = NEFFCacheKey(sample_hlo, config1, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, config2, "lnc1", "v1.0")
+
+        assert key1.hash != key2.hash
+        assert key1 != key2
+
+    def test_cache_key_different_lnc_different_hash(self, mock_config, sample_hlo):
+        """Test that different LNC override produces different hash."""
+        key1 = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, mock_config, "lnc2", "v1.0")
+
+        assert key1.hash != key2.hash
+        assert key1 != key2
+
+    def test_cache_key_different_version_different_hash(self, mock_config, sample_hlo):
+        """Test that different compiler version produces different hash."""
+        key1 = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v2.0")
+
+        assert key1.hash != key2.hash
+        assert key1 != key2
+
+    def test_cache_key_none_lnc_override(self, mock_config, sample_hlo):
+        """Test cache key with None lnc_override uses config.lnc."""
+        key1 = NEFFCacheKey(sample_hlo, mock_config, None, "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, mock_config, mock_config.lnc, "v1.0")
+
+        # Should be equal since None falls back to config.lnc
+        assert key1.hash == key2.hash
+        assert key1 == key2
+
+    def test_cache_key_extra_flags_sorted(self, sample_hlo):
+        """Test that extra flags are sorted for deterministic hashing."""
+        config1 = MockCompilerConfig(extra_flags=["--flag-a", "--flag-b"])
+        config2 = MockCompilerConfig(extra_flags=["--flag-b", "--flag-a"])
+
+        key1 = NEFFCacheKey(sample_hlo, config1, "lnc1", "v1.0")
+        key2 = NEFFCacheKey(sample_hlo, config2, "lnc1", "v1.0")
+
+        # Sorted flags should produce same hash
+        assert key1.hash == key2.hash
+        assert key1 == key2
 
 
 class TestCompilerSubprocess:
@@ -254,13 +357,12 @@ class TestCompilerSubprocess:
         key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
 
         assert isinstance(key, NEFFCacheKey)
-        assert key.hlo_protobuf == sample_hlo
-        assert key.config == mock_config
-        assert key.lnc_override == "lnc1"
-        assert key.compiler_version == "v1.0"
+        # New NEFFCacheKey uses .hash property, not individual attributes
+        assert isinstance(key.hash, str)
+        assert len(key.hash) == 64  # SHA256 hex digest
 
     def test_nfs_cache_path(self, temp_dirs, mock_config, sample_hlo):
-        """Test NFS cache path generation."""
+        """Test NFS cache path generation uses pre-computed hash."""
         compiler = CompilerSubprocess(
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
@@ -268,8 +370,8 @@ class TestCompilerSubprocess:
         key = NEFFCacheKey(sample_hlo, mock_config, "lnc1", "v1.0")
         path = compiler._nfs_cache_path(key)
 
-        key_hash = hashlib.sha256(str(key).encode()).hexdigest()
-        expected_path = Path(temp_dirs["nfs"]) / key_hash / f"{key_hash}.neff"
+        # Path should use the key's .hash property
+        expected_path = Path(temp_dirs["nfs"]) / key.hash / f"{key.hash}.neff"
 
         assert path == expected_path
 
@@ -291,7 +393,7 @@ class TestCompilerSubprocess:
 
         assert result == sample_neff
         mock_compile.assert_called_once_with(
-            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
+            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"], None, None
         )
 
     @patch(
@@ -318,6 +420,52 @@ class TestCompilerSubprocess:
     @patch(
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
+    def test_nfs_cache_hit_with_output(
+        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+    ):
+        """Test cache hit writes to output file (async mode)."""
+        compiler = CompilerSubprocess(
+            nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
+        )
+
+        # Pre-populate NFS cache to force cache hit
+        with patch("neuronxcc.__version__", "v1.0"):
+            key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
+        nfs_path = compiler._nfs_cache_path(key)
+        nfs_path.parent.mkdir(parents=True, exist_ok=True)
+        nfs_path.write_bytes(sample_neff)
+
+        # Setup async mode directories/files
+        workdir = temp_dirs["local"] / "workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        input_file = workdir / "input.hlo.pb"
+        output_file = workdir / "output.neff"
+        input_file.write_bytes(sample_hlo)
+
+        with patch("neuronxcc.__version__", "v1.0"):
+            # Call with all async mode parameters
+            result = compiler.get_or_compile(
+                sample_hlo,
+                mock_config,
+                "lnc1",
+                workdir=str(workdir),
+                input_file=str(input_file),
+                output_file=str(output_file),
+            )
+
+        # Should return cached NEFF
+        assert result == sample_neff
+
+        # Output file should be written with cached NEFF
+        assert output_file.exists()
+        assert output_file.read_bytes() == sample_neff
+
+        # No compilation because of cache hit
+        mock_compile.assert_not_called()
+
+    @patch(
+        "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
+    )
     def test_nfs_cache_miss_compilation(
         self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
     ):
@@ -335,11 +483,54 @@ class TestCompilerSubprocess:
 
         assert result == sample_neff
         mock_compile.assert_called_once_with(
-            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
+            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"], None, None
         )
 
         # Verify NFS cache was populated
         key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
+        nfs_path = compiler._nfs_cache_path(key)
+        assert nfs_path.exists()
+        assert nfs_path.read_bytes() == sample_neff
+
+    @patch(
+        "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
+    )
+    def test_cache_miss_with_output_file_triggers_compilation(
+        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+    ):
+        """Test cache miss with output_file triggers compilation."""
+        mock_compile.return_value = sample_neff
+
+        compiler = CompilerSubprocess(
+            nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
+        )
+
+        # Setup async mode directories/files
+        workdir = temp_dirs["local"] / "workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        input_file = workdir / "input.hlo.pb"
+        output_file = workdir / "output.neff"
+        input_file.write_bytes(sample_hlo)
+
+        with patch("neuronxcc.__version__", "v1.0"):
+            # Call with all async mode parameters
+            result = compiler.get_or_compile(
+                sample_hlo,
+                mock_config,
+                "lnc1",
+                workdir=str(workdir),
+                input_file=str(input_file),
+                output_file=str(output_file),
+            )
+
+        assert result == sample_neff
+
+        # Compilation should have been called
+        mock_compile.assert_called_once()
+
+        # NFS cache should be populated
+        with patch("neuronxcc.__version__", "v1.0"):
+            key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
         nfs_path = compiler._nfs_cache_path(key)
         assert nfs_path.exists()
         assert nfs_path.read_bytes() == sample_neff
@@ -492,9 +683,9 @@ class TestErrorHandling:
             tempfile.TemporaryDirectory() as tmpdir,
             pytest.raises(NEFFCompilationError, match="NEFF compilation failed"),
         ):
-            mock_config.input = str(Path(tmpdir) / "input.hlo.pb")
-            mock_config.output = str(Path(tmpdir) / "output.neff")
-            CompilerSubprocess.run_neuronx_cc(mock_config)
+            input_file = str(Path(tmpdir) / "input.hlo.pb")
+            output_file = str(Path(tmpdir) / "output.neff")
+            CompilerSubprocess.run_neuronx_cc(mock_config, input_file, output_file)
 
 
 class TestIntegration:
@@ -502,33 +693,56 @@ class TestIntegration:
 
     @patch("subprocess.run")
     @patch("shutil.which")
-    def test_end_to_end_compilation(self, mock_which, mock_run, temp_dirs, sample_hlo, sample_neff):
-        """Test end-to-end compilation flow with explicit input_file, output_file, and workdir."""
+    def test_end_to_end_compilation_sync(
+        self, mock_which, mock_run, temp_dirs, mock_config, sample_hlo, sample_neff
+    ):
+        """Test end-to-end compilation flow (sync mode)."""
         mock_which.return_value = "/usr/bin/neuronx-cc"
         mock_run.return_value = Mock(returncode=0, stderr="")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            input_file = tmpdir_path / "input.hlo.pb"
-            output_file = tmpdir_path / "output.neff"
-
-            # Create config with explicit files and workdir
-            config_with_paths = MockCompilerConfig(
-                config_id="with_paths",
-                input=str(input_file),
-                output=str(output_file),
+        # Mock the file operations in compile_hlo_protobuf_to_neff
+        with (
+            patch("tempfile.TemporaryDirectory") as mock_tmpdir,
+            patch("pathlib.Path.write_bytes"),
+            patch("pathlib.Path.read_bytes", return_value=sample_neff),
+        ):
+            mock_tmpdir.return_value.__enter__.return_value = "/tmp/test"
+            result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                sample_hlo, mock_config, "lnc1"
             )
 
-            # Mock file operations
-            with (
-                patch("pathlib.Path.read_bytes", return_value=sample_neff),
-            ):
-                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                    sample_hlo, config_with_paths, "lnc1", "XLA", tmpdir_path
-                )
+        assert result == sample_neff
+        mock_run.assert_called_once()
 
-            assert result == sample_neff
-            mock_run.assert_called_once()
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_end_to_end_compilation_async(
+        self, mock_which, mock_run, temp_dirs, mock_config, sample_hlo, sample_neff
+    ):
+        """Test end-to-end compilation flow (async mode)."""
+        # Setup async mode directories/files
+        workdir = temp_dirs["local"] / "workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        input_file = workdir / "input.hlo.pb"
+        output_file = workdir / "output.neff"
+        input_file.write_bytes(sample_hlo)
+
+        # Setup mocks
+        def mock_side_effect(*args, **kwargs):
+            output_file.write_bytes(sample_neff)
+            return Mock(returncode=0, stderr="")
+
+        mock_which.return_value = "/usr/bin/neuronx-cc"
+        mock_run.side_effect = mock_side_effect
+
+        result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+            sample_hlo, mock_config, "lnc1", "XLA", workdir, input_file, output_file
+        )
+
+        assert output_file.exists()
+        assert output_file.read_bytes() == sample_neff
+        assert result == sample_neff
+        mock_run.assert_called_once()
 
 
 class TestRaceConditions:
@@ -574,7 +788,11 @@ class TestRaceConditions:
             (b"hlo_data_1", MockCompilerConfig("config1"), "lnc1"),
             (b"hlo_data_1", MockCompilerConfig("config1"), "lnc1"),  # Exact duplicate
             (b"hlo_data_2", MockCompilerConfig("config1"), "lnc1"),  # Different HLO
-            (b"hlo_data_1", MockCompilerConfig("config2"), "lnc1"),  # Different config
+            (
+                b"hlo_data_1",
+                MockCompilerConfig("config2", optimization_level="-O2"),
+                "lnc1",
+            ),  # Different config (id not relevant)
         ]
 
         def compile_task(hlo_data, config, lnc_override):
@@ -678,6 +896,9 @@ class TestRaceConditions:
 
         cancelled_writer()
 
+        sample_hlo_data = b"mock_hlo_protobuf_data"
+        mock_cfg = MockCompilerConfig()
+
         with (
             patch(
                 "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff",
@@ -685,7 +906,7 @@ class TestRaceConditions:
             ),
             patch("neuronxcc.__version__", "v1.0"),
         ):
-            result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+            result = compiler.get_or_compile(sample_hlo_data, mock_cfg, "lnc1")
 
         # File should contain complete atomic data, not partial data
         assert result == sample_neff

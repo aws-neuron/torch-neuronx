@@ -1,12 +1,13 @@
 import jax
 import jax.numpy as jnp
 
+from torch_neuronx.python_ops.jax.operation_registry import register_aten
 
-# TODO: add DTensor sharding support for rms_norm
-# @register_aten(
-#     ["aten::_fused_rms_norm"],
-#     static_argnums=(1, 3),
-# )
+
+@register_aten(
+    ["aten::_fused_rms_norm"],
+    static_argnums=(1, 3),
+)
 def _aten_fused_rms_norm(input, normalized_shape, weight=None, eps=1e-5):
     original_dtype = input.dtype
     input = input.astype(jnp.float32)
@@ -22,8 +23,7 @@ def _aten_fused_rms_norm(input, normalized_shape, weight=None, eps=1e-5):
     return result.astype(original_dtype), rstd
 
 
-# TODO: add DTensor sharding support for rms_norm
-# @register_aten(["aten::_fused_rms_norm_backward"], static_argnums=(2, 5))
+@register_aten(["aten::_fused_rms_norm_backward"], static_argnums=(2, 5))
 def _aten_fused_rms_norm_backward(
     grad_out,
     input,

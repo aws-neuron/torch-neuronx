@@ -153,6 +153,27 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     assert torch.allclose(output.cpu(), expected)
 
 
+def run_group_scatter_world_size_4_test(rank, world_size, kwargs):
+    """Test scatter within group [2,3] where rank 3 scatters data to group members."""
+    group: dist.ProcessGroup = dist.new_group([2, 3])
+
+    if rank in [2, 3]:
+        # Root process (rank 3) creates input tensors for group processes
+        input_tensors = [torch.ones(10, device="neuron") * i for i in [2, 3]] if rank == 3 else None
+
+        # Output tensor for receiving scattered data
+        output = torch.zeros(10, device="neuron")
+
+        # Scatter from rank 3 (group_src=1 since rank 3 is index 1 in group [2,3])
+        dist.scatter(output, input_tensors, group_src=1, group=group)
+
+        # Each rank should receive its corresponding tensor
+        expected = torch.ones(10) * rank
+        assert torch.allclose(output.cpu(), expected)
+
+    dist.destroy_process_group(group)
+
+
 class TestScatter(BaseCollectiveOpTest):
     """Test cases for torch.distributed.scatter."""
 
@@ -204,3 +225,13 @@ class TestScatter(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test scatter with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+
+class TestScatterTensorWorldSize4(BaseCollectiveOpTest):
+    """Test cases for torch.distributed.scatter with a world size of 4."""
+
+    world_size = 4  # Set at class level instead of in setup_method
+
+    def test_group_scatter_with_rank_data(self):
+        """Test scatter within group [2,3] with group_src=1 (global rank 3)."""
+        self.distributed_tester.run_test(run_group_scatter_world_size_4_test)

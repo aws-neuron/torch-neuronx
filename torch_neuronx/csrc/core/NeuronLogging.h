@@ -53,7 +53,8 @@ class NeuronLogger {
 
   static bool shouldLog(LogLevel level) { return level <= log_level_; }
 
-  void log(LogLevel level, LogCategory category, const std::string& message) {
+  void log(LogLevel level, LogCategory category, const std::string& message,
+           const char* file = nullptr, int line = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // OPERATOR_FALLBACK always goes to the fallback file (bypass log level check)
@@ -101,7 +102,15 @@ class NeuronLogger {
         break;
     }
 
-    std::string full_message = "[Neuron] " + level_str + " " + message;
+    std::ostringstream full_message_stream;
+    full_message_stream << "[Neuron] " << level_str;
+
+    if (file != nullptr && line > 0) {
+      full_message_stream << " [" << file << ":" << line << "]";
+    }
+
+    full_message_stream << " " << message;
+    std::string full_message = full_message_stream.str();
 
     if (log_to_file_ && log_file_.is_open()) {
       log_file_ << full_message << std::endl;
@@ -182,19 +191,20 @@ class NeuronLogger {
 };
 
 template <typename... Args>
-void log_variadic(LogLevel level, LogCategory category, Args&&... args) {
+void log_variadic(LogLevel level, LogCategory category, const char* file, int line,
+                  Args&&... args) {
   auto& logger = NeuronLogger::getInstance();
   std::ostringstream oss;
   ((oss << args << " "), ...);
-  logger.log(level, category, oss.str());
+  logger.log(level, category, oss.str(), file, line);
 }
 
 // Convenience macros
-#define TORCH_NEURONX_LOG(level, category, ...)                  \
-  do {                                                           \
-    if (torch_neuronx::NeuronLogger::shouldLog(level)) {         \
-      torch_neuronx::log_variadic(level, category, __VA_ARGS__); \
-    }                                                            \
+#define TORCH_NEURONX_LOG(level, category, ...)                                      \
+  do {                                                                               \
+    if (torch_neuronx::NeuronLogger::shouldLog(level)) {                             \
+      torch_neuronx::log_variadic(level, category, __FILE__, __LINE__, __VA_ARGS__); \
+    }                                                                                \
   } while (0)
 
 // General logging macros (default to GENERAL category) - support variadic arguments

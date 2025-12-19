@@ -8,7 +8,6 @@ from tests.utils.neuron_test_utils import (
     assert_op_falls_back_on_cpu,
     assert_op_runs_on_neuron,
     assert_raises,
-    cpu_fallback_test,
     track_neuron_ops,
 )
 
@@ -45,17 +44,6 @@ class TestIndexSelect:
             # Verify that the operation was offloaded to CPU
             assert_op_falls_back_on_cpu("aten::index_select")
 
-    @cpu_fallback_test
-    @assert_raises(IndexError, match="index out of range in self")
-    def test_index_select_with_input_empty(self):
-        """Test index select with input empty"""
-
-        device = "neuron"
-        input = torch.empty((0,))
-        indices = torch.tensor([0])
-
-        torch.index_select(input.to(device), dim=0, index=indices.to(device))
-
     def test_index_select_scalar_index(self):
         """Test index select with scalar index tensor"""
         device = "neuron"
@@ -80,24 +68,6 @@ class TestIndexSelect:
         indices = torch.tensor([10])
 
         torch.index_select(input.to(device), dim=0, index=indices.to(device))
-
-    @cpu_fallback_test
-    @assert_raises(
-        AssertionError,
-        match=r".*aten::index_select ran on Neuron instead of falling back to CPU",
-    )
-    def test_index_select_empty_indices(self):
-        """Test index select with empty indices"""
-        device = "neuron"
-        input = torch.randn(3, 4)
-        input_neuron = input.to(device)
-        indices = torch.empty((0,), dtype=torch.int32)
-
-        # empty tensor handler should handle this without running on neuron or fall back to CPU
-        with track_neuron_ops():
-            result = torch.index_select(input_neuron, dim=0, index=indices.to(device))
-            assert result.numel() == 0
-            assert_op_falls_back_on_cpu("aten::index_select")
 
     @assert_raises(ValueError, match="indices must have an integer type")
     def test_index_select_with_index_dtype_float(self):

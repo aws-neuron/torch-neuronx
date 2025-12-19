@@ -1,10 +1,11 @@
 import functools
 import inspect
 from functools import partial, wraps
+from typing import Any
 from unittest.mock import patch
 
 import torch
-from torch.testing._internal.distributed._shard import sharded_tensor
+import torch.distributed as dist
 
 try:
     import torch_neuronx
@@ -26,6 +27,38 @@ def _create_noop_decorator():
 NEURON_DIST_TIMEOUT_DEFAULT = 7200
 
 
+def override_world_size(
+    globals_dict: dict[str, Any],
+    world_size: int = 2,
+    include_test_classes: list[str] | None = None,
+    exclude_test_classes: list[str] | None = None,
+) -> None:
+    """
+    Override world_size property for test classes based on include/exclude lists.
+
+    Args:
+        globals_dict: Dictionary containing global variables
+        world_size: The world_size value to set
+        include_test_classes: List of class names to include (if specified, exclude is ignored)
+        exclude_test_classes: List of class names to exclude (ignored if include is specified)
+    """
+
+    def should_override(name: str) -> bool:
+        if include_test_classes is not None:
+            target_classes = {"TestNeuron" + class_name for class_name in include_test_classes}
+            return name in target_classes
+        elif exclude_test_classes is not None:
+            excluded_classes = {"TestNeuron" + class_name for class_name in exclude_test_classes}
+            return name not in excluded_classes
+        else:
+            return True
+
+    for name, obj in list(globals_dict.items()):
+        # __bases__ is to ensure that we only overide when this is a TestClass
+        if hasattr(obj, "world_size") and hasattr(obj, "__bases__") and should_override(name):
+            obj.world_size = property(lambda self, ws=world_size: ws)
+
+
 def patch_module_function_from_cuda_to_neuron(module_path, func_name):
     """
     Template to patch PyTorch functions that redirect CUDA device requests to Neuron.
@@ -34,14 +67,17 @@ def patch_module_function_from_cuda_to_neuron(module_path, func_name):
         module_path: Module containing the function (e.g., torch, torch.distributed)
         func_name: Function name to patch (e.g., "get_device_module")
     """
-    original_func = getattr(module_path, func_name)
 
     def patched_func(device_type):
         if device_type == "cuda" or (
             isinstance(device_type, torch.device) and device_type.type == "cuda"
         ):
-            return original_func("neuron")
-        return original_func(device_type)
+            return torch.neuron
+        return torch.neuron
+
+    # Preserve __wrapped__ for dynamo compatibility
+    original_func = getattr(module_path, func_name)
+    patched_func.__wrapped__ = getattr(original_func, "__wrapped__", original_func)
 
     setattr(module_path, func_name, patched_func)
 
@@ -68,19 +104,41 @@ def patch_skip_decorator_early():
     def patch_skip_but_pass_in_sandcastle_if(condition, reason):
         return _create_noop_decorator()
 
-    # Patch with_comms to use neuron backend by default
-    def patch_with_comms(func=None, init_rpc=True, backend="neuron"):
+    # Patch with_comms for sharded_tensor (func, init_rpc, backend)
+    def patch_with_comms_sharded(func=None, init_rpc=True, backend="neuron"):
         if func is None:
-            return partial(patch_with_comms, init_rpc=init_rpc, backend=backend)
+            return partial(patch_with_comms_sharded, init_rpc=init_rpc, backend=backend)
 
         @wraps(func)
         def wrapper(self, *args, **kwargs):
-            # Skip the device count check for neuron backend
             self.init_comms(init_rpc=init_rpc, backend=backend)
             func(self, *args, **kwargs)
             self.destroy_comms(destroy_rpc=init_rpc)
 
         return wrapper
+
+    # Patch with_comms for dtensor (eager_init, backend)
+    def patch_with_comms_dtensor(eager_init=False, backend="neuron"):
+        def decorator(func, eager_init=False, backend="neuron"):
+            @wraps(func)
+            def wrapper(self, *args, **kwargs):
+                self.init_pg(eager_init, backend)
+
+                try:
+                    func(self, *args, **kwargs)
+                except Exception as e:
+                    dist.destroy_process_group()
+                    raise e
+
+                self.destroy_pg()
+
+            return wrapper
+
+        return (
+            decorator(func=eager_init)
+            if callable(eager_init)
+            else partial(decorator, eager_init=eager_init, backend=backend)
+        )
 
     torch.testing._internal.common_distributed.skip_if_lt_x_gpu = neuron_skip_if_lt_x_gpu
     torch.testing._internal.common_distributed.requires_nccl = patch_requires_nccl
@@ -91,7 +149,16 @@ def patch_skip_decorator_early():
     torch.testing._internal.common_utils.skip_but_pass_in_sandcastle_if = (
         patch_skip_but_pass_in_sandcastle_if
     )
-    sharded_tensor.with_comms = patch_with_comms
+
+    from torch.testing._internal.distributed._shard import sharded_tensor
+
+    sharded_tensor.with_comms = patch_with_comms_sharded
+
+    from torch.testing._internal.distributed._tensor import common_dtensor
+
+    common_dtensor.with_comms = patch_with_comms_dtensor
+    common_dtensor.DEVICE_TYPE = "neuron"
+    common_dtensor.PG_BACKEND = "neuron"
 
 
 def patch_test_cuda_flags():
@@ -128,7 +195,7 @@ def patch_requires_cuda_early():
 
 
 def patch_requires_accelerator_backend_early():
-    def neuron_requires_accelerator_dist_backend(backends):
+    def neuron_requires_accelerator_dist_backend(backends=None):
         def decorator(func):
             return func
 
@@ -185,6 +252,7 @@ def patch_common_fsdp():
 
     common_fsdp.DEVICE_TYPE = "neuron"
     common_fsdp.DISTRIBUTED_BACKEND = "neuron"
+    common_fsdp.DEVICE_COUNT = 2
 
 
 def patch_amp_not_available():
@@ -264,6 +332,9 @@ def pre_run_patches():
     patch_requires_cuda_early()
     patch_decorator_to_return_obj_noop()
     patch_get_cycles_per_ms()
+
+    # Patch torch.cuda.device_count for test class creation
+    torch.cuda.device_count = lambda: torch_neuronx.device_count() if HAS_NEURON else 0
 
 
 # Store reference to original torch.device for use in PatchDevice
@@ -584,6 +655,7 @@ class NeuronPatcher:
             "tensor",
             "rand",
             "randn",
+            "randint",
             "full",
         ]:
             if hasattr(torch, func_name):

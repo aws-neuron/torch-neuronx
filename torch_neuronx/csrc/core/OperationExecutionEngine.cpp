@@ -7,11 +7,16 @@
 #include <utility>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
+#include "torch_neuronx/csrc/core/streams/StreamManager.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 namespace at::neuron {
 
@@ -26,60 +31,48 @@ size_t PriorityQueue<T>::size() const {
 }
 
 template <typename T>
-void PriorityQueue<T>::push_back(T task) {
-  switch (task.priority) {
-    case TaskPriority::HIGH:
-      high_.push_back(std::move(task));
-      break;
-    case TaskPriority::DEFAULT:
-      default_.push_back(std::move(task));
-      break;
-    case TaskPriority::LOW:
-      low_.push_back(std::move(task));
-      break;
+std::deque<T>& PriorityQueue<T>::GetQueueForPriority(int priority) {
+  if (priority < 0) {
+    return high_;
+  } else if (priority > 0) {
+    return low_;
+  } else {
+    return default_;
   }
 }
 
 template <typename T>
-void PriorityQueue<T>::push_front(T task) {
-  switch (task.priority) {
-    case TaskPriority::HIGH:
-      high_.push_front(std::move(task));
-      break;
-    case TaskPriority::DEFAULT:
-      default_.push_front(std::move(task));
-      break;
-    case TaskPriority::LOW:
-      low_.push_front(std::move(task));
-      break;
-  }
+void PriorityQueue<T>::push_back(T operation) {
+  GetQueueForPriority(operation->stream->priority).push_back(operation);
+}
+
+template <typename T>
+void PriorityQueue<T>::push_front(T operation) {
+  GetQueueForPriority(operation->stream->priority).push_front(operation);
 }
 
 template <typename T>
 T PriorityQueue<T>::pop_front() {
   if (!high_.empty()) {
-    auto task = std::move(high_.front());
+    auto operation = high_.front();
     high_.pop_front();
-    return task;
+    return operation;
   }
   if (!default_.empty()) {
-    auto task = std::move(default_.front());
+    auto operation = default_.front();
     default_.pop_front();
-    return task;
+    return operation;
   }
-  auto task = std::move(low_.front());
+  auto operation = low_.front();
   low_.pop_front();
-  return task;
+  return operation;
 }
 
-// Explicit template instantiation for OperationExecutionTask
-template class PriorityQueue<OperationExecutionTask>;
+template class PriorityQueue<OperationContext*>;
 
 OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation_cache,
                                                    ModelHandleCache* model_handle_cache)
-    : compilation_cache_(compilation_cache),
-      model_handle_cache_(model_handle_cache),
-      creation_time_(std::chrono::steady_clock::now()) {
+    : compilation_cache_(compilation_cache), model_handle_cache_(model_handle_cache) {
   // Start worker threads
   compilation_thread_ = std::thread(&OperationExecutionEngine::CompilationWorker, this);
   execution_thread_ = std::thread(&OperationExecutionEngine::ExecutionWorker, this);
@@ -91,22 +84,12 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
 
 OperationExecutionEngine::~OperationExecutionEngine() { Shutdown(); }
 
-void OperationExecutionEngine::SubmitTask(OperationExecutionTask task) {
-  // Route task to the appropriate thread based on task type
-  if (task.type == TaskType::COMPILATION) {
-    SubmitCompilationTask(std::move(task));
-  } else if (task.type == TaskType::EXECUTION) {
-    SubmitExecutionTask(std::move(task));
-  } else {
-    TORCH_CHECK(false, "Unknown task type: ", task.type);
-  }
-}
-
 void OperationExecutionEngine::Shutdown() {
+  bool expected = false;
+  if (!shutdown_requested_.compare_exchange_strong(expected, true, std::memory_order_release)) {
+    return;
+  }
   TORCH_NEURONX_DEBUG("Shutting down OperationExecutionEngine");
-
-  // Signal shutdown to worker threads
-  shutdown_requested_.store(true, std::memory_order_release);
 
   // Wake up all worker threads
   compilation_cv_.notify_all();
@@ -124,7 +107,7 @@ void OperationExecutionEngine::Shutdown() {
 void OperationExecutionEngine::CompilationWorker() {
   TORCH_NEURONX_DEBUG("Compilation worker thread started");
 
-  while (!shutdown_requested_.load(std::memory_order_acquire)) {
+  while (true) {
     // Wait for a task or shutdown signal
     std::unique_lock<std::mutex> lock(compilation_mutex_);
     compilation_cv_.wait(lock, [this] {
@@ -136,226 +119,155 @@ void OperationExecutionEngine::CompilationWorker() {
     }
 
     if (!compilation_queue_.empty()) {
-      OperationExecutionTask task = compilation_queue_.pop_front();
+      OperationContext* operation = compilation_queue_.pop_front();
       lock.unlock();
 
-      if (!task.RequiresCompilation() || ProcessCompilationTask(task)) {
-        task.type = TaskType::EXECUTION;
-        SubmitExecutionTask(std::move(task));
+      if (!ProcessPreprocessingTask(operation)) {
+        continue;  // Error already handled
       }
+
+      ProcessCompilationTask(operation);
+      NotifyExecutionReady();
     }
   }
   TORCH_NEURONX_DEBUG("Compilation worker thread terminated");
 }
 
-bool OperationExecutionEngine::ProcessCompilationTask(OperationExecutionTask& task) noexcept {
-  auto* stream = task.stream;
-  auto* op = task.operation;
+void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operation) noexcept {
+  auto* stream = operation->stream;
+  // Set compilation start time
+  // TODO(rpsilva): Introduce a global metric collection
+  operation->compile_start = std::chrono::steady_clock::now();
+  // Get the compilable kernel
+  auto& kernel = operation->GetCompilableKernel();
+  const std::string& op_name = operation->GetOpName();
   try {
-    // Set compilation start time
-    // TODO(rpsilva): Introduce a global metric collection
-    op->compile_start = std::chrono::steady_clock::now();
-
-    // Get the compilable kernel
-    auto& compilable_kernel = op->GetCompilableKernel();
-
+    int stream_id = stream->stream_id;
+    TORCH_NEURONX_DEBUG("Processing compilation task", "stream_id=", stream_id, "op=", op_name);
     // Compile NEFF through shared compilation cache
-    compilation_cache_->GetOrCompileNeff(compilable_kernel, stream->stream_id);
+    compilation_cache_->GetOrCompileNeff(kernel, stream_id);
 
-    if (!compilable_kernel.HasCachedNeff()) {
-      throw std::runtime_error("NEFF creation failed for operation: " + op->GetOpName());
+    if (!kernel.HasCachedNeff()) {
+      throw torch_neuronx::CompilationRuntimeException("NEFF creation failed for operation: " +
+                                                       op_name);
     }
 
     // Set compilation end time
-    op->compile_end = std::chrono::steady_clock::now();
+    operation->compile_end = std::chrono::steady_clock::now();
 
-    TORCH_NEURONX_DEBUG("Compilation task completed successfully", "op=", op->GetOpName(),
-                        "compilation_time_us=", op->GetCompilationTime().count());
+    operation->MarkExecutionReady();
+    TORCH_NEURONX_DEBUG("Compilation task completed successfully", "stream_id=", stream_id,
+                        "op=", op_name);
+  } catch (const torch_neuronx::CompilationRuntimeException& e) {
+    stream->HandleErrorWithCleanup(operation, e);
   } catch (const std::exception& e) {
-    stream->HandleErrorWithCleanup(op, e.what(), ErrorContext::Stage::COMPILATION);
-    return false;
+    stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(e.what()));
   }
-  total_compilation_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
-  return true;
 }
 
 void OperationExecutionEngine::ExecutionWorker() {
   TORCH_NEURONX_DEBUG("Execution worker thread started");
 
-  while (!shutdown_requested_.load(std::memory_order_acquire)) {
-    // Wait for a task or shutdown signal
-    std::unique_lock<std::mutex> lock(execution_mutex_);
-    execution_cv_.wait(lock, [this] {
-      return !execution_queue_.empty() || shutdown_requested_.load(std::memory_order_acquire);
-    });
+  c10::DeviceIndex num_devices = c10_neuron::device_count();
+  auto& stream_manager = NeuronResourceManager::Instance().GetStreamManager();
+  while (true) {
+    bool work_found;
+    do {
+      work_found = false;
+      for (c10::DeviceIndex device = 0; device < num_devices; device++) {
+        stream_manager.ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
+          OperationContext* operation = stream_impl->GetNextReadyOperation();
+          if (operation != nullptr) {
+            ProcessExecutionTask(operation);
+            work_found = true;
+          }
+          // Return false to continue iterating through all streams
+          // We want to check all streams for ready operations
+          return false;
+        });
+      }
+    } while (work_found);
 
-    if (shutdown_requested_.load(std::memory_order_acquire) && execution_queue_.empty()) {
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
       break;
     }
 
-    // Process a task from the main execution queue if available
-    if (!execution_queue_.empty()) {
-      OperationExecutionTask task = execution_queue_.pop_front();
-
-      // Check if event dependencies are satisfied before processing
-      // If not, defer the task to avoid blocking other streams
-      if (!AreEventDependenciesSatisfied(task.operation)) {
-        TORCH_NEURONX_DEBUG("Event dependencies not yet satisfied, deferring task",
-                            "stream_id=", task.stream->stream_id,
-                            "op=", task.operation->GetOpName(),
-                            "num_events=", task.operation->events_to_wait_for.size());
-        deferred_execution_tasks_.push_back(std::move(task));
-        continue;
-      } else {
-        lock.unlock();
-        ProcessExecutionTask(task);
-        PromoteReadyDeferredTasks();
-      }
+    {
+      std::unique_lock<std::mutex> lock(execution_mutex_);
+      execution_cv_.wait(lock, [this] {
+        return execution_pending_ || shutdown_requested_.load(std::memory_order_acquire);
+      });
+      execution_pending_ = false;
     }
   }
-
   TORCH_NEURONX_DEBUG("Execution worker thread terminated");
 }
 
-void OperationExecutionEngine::ProcessExecutionTask(OperationExecutionTask& task) noexcept {
-  auto* stream = task.stream;
-  auto* op = task.operation;
-  const std::string op_name = op->GetOpName();
+void OperationExecutionEngine::NotifyExecutionReady() {
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    execution_pending_ = true;
+  }
+  execution_cv_.notify_one();
+}
+
+void OperationExecutionEngine::ProcessExecutionTask(OperationContext* operation) noexcept {
+  auto* stream = operation->stream;
+  const std::string operation_name = operation->GetOpName();
   try {
     TORCH_NEURONX_DEBUG("Processing execution task", "stream_id=", stream->stream_id,
-                        "op=", op_name);
-
-    // Set execution start time
+                        "operation_name=", operation_name);
     // TODO(rpsilva): Introduce a global metric collection
-    op->execute_start = std::chrono::steady_clock::now();
-    op->Execute();
-
-    if (torch_neuronx::shouldLogExecuted(op_name)) {
+    operation->execute_start = std::chrono::steady_clock::now();
+    operation->Execute();
+    if (torch_neuronx::shouldLogExecuted(operation_name)) {
       torch_neuronx::NeuronLogger::getInstance().log(
           torch_neuronx::LogLevel::INFO, torch_neuronx::LogCategory::OPERATOR_EXECUTED,
-          "Operator '" + op_name + "' executed on Neuron");
-      torch_neuronx::markExecutedLogged(op_name);
+          "Operator '" + operation_name + "' executed on Neuron");
+      torch_neuronx::markExecutedLogged(operation_name);
     }
-    stream->CompleteOperation(op);
-    TORCH_NEURONX_DEBUG("Execution task completed successfully", "op=", op_name);
+    stream->CompleteOperation(operation);
+    TORCH_NEURONX_DEBUG("Execution task completed successfully", "operation_name=", operation_name);
+  } catch (const torch_neuronx::ExecutionRuntimeException& e) {
+    stream->HandleErrorWithCleanup(operation, e);
   } catch (const std::exception& e) {
-    stream->HandleErrorWithCleanup(op, e.what(), ErrorContext::Stage::EXECUTION);
+    stream->HandleErrorWithCleanup(operation, torch_neuronx::ExecutionRuntimeException(e.what()));
   }
-  total_execution_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool OperationExecutionEngine::AreEventDependenciesSatisfied(
-    const OperationContext* op) const noexcept {
-  if (op->events_to_wait_for.empty()) {
+bool OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operation) noexcept {
+  auto* stream = operation->stream;
+
+  try {
+    TORCH_NEURONX_DEBUG("Processing preprocessing task", "op=", operation->GetOpName());
+
+    c10_neuron::lazy::LazyTransformationManager::ProcessOperationInputs(operation);
+
+    // Transformations were applied if needed, kernel has been updated via MLIR merge
     return true;
-  }
 
-  for (const NeuronEvent& event : op->events_to_wait_for) {
-    if (!event.query()) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-void OperationExecutionEngine::PromoteReadyDeferredTasks() noexcept {
-  std::lock_guard<std::mutex> lock(execution_mutex_);
-
-  // Collect ready tasks in order
-  std::vector<OperationExecutionTask> ready_tasks;
-  for (auto it = deferred_execution_tasks_.begin(); it != deferred_execution_tasks_.end();) {
-    if (AreEventDependenciesSatisfied(it->operation)) {
-      ready_tasks.push_back(std::move(*it));
-      it = deferred_execution_tasks_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // Push to front in reverse order to maintain submission order
-  for (auto it = ready_tasks.rbegin(); it != ready_tasks.rend(); ++it) {
-    execution_queue_.push_front(std::move(*it));
+  } catch (const torch_neuronx::CompilationRuntimeException& e) {
+    stream->HandleErrorWithCleanup(operation, e);
+    return false;
+  } catch (const std::exception& e) {
+    TORCH_NEURONX_DEBUG("preprocessing failed with=", e.what());
+    stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(e.what()));
+    return false;
   }
 }
 
-void OperationExecutionEngine::SubmitCompilationTask(OperationExecutionTask task) {
+void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation) {
   if (shutdown_requested_.load()) {
     TORCH_NEURONX_DEBUG("Rejecting compilation task submission during shutdown",
-                        "op=", task.operation->GetOpName());
+                        "op=", operation->GetOpName());
     return;
   }
 
   {
     std::lock_guard<std::mutex> lock(compilation_mutex_);
-    compilation_queue_.push_back(std::move(task));
-
-    // Update metrics atomically
-    total_compilation_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
+    compilation_queue_.push_back(operation);
   }
   compilation_cv_.notify_one();
-}
-
-void OperationExecutionEngine::SubmitExecutionTask(OperationExecutionTask task) {
-  if (shutdown_requested_.load()) {
-    TORCH_NEURONX_DEBUG("Rejecting execution task submission during shutdown",
-                        "op=", task.operation->GetOpName());
-    return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    execution_queue_.push_back(std::move(task));
-
-    // Update metrics atomically
-    total_execution_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
-  }
-  execution_cv_.notify_one();
-}
-
-OperationExecutionEngine::GlobalPerformanceStats OperationExecutionEngine::GetPerformanceStats()
-    const {
-  GlobalPerformanceStats stats;
-
-  stats.compilation_tasks_submitted = total_compilation_tasks_submitted_.load();
-  stats.compilation_tasks_completed = total_compilation_tasks_completed_.load();
-  stats.execution_tasks_submitted = total_execution_tasks_submitted_.load();
-  stats.execution_tasks_completed = total_execution_tasks_completed_.load();
-
-  // Get current queue sizes (requires locking)
-  {
-    std::lock_guard<std::mutex> comp_lock(const_cast<std::mutex&>(compilation_mutex_));
-    stats.compilation_queue_current_size = compilation_queue_.size();
-  }
-  {
-    std::lock_guard<std::mutex> exec_lock(const_cast<std::mutex&>(execution_mutex_));
-    stats.execution_queue_current_size = execution_queue_.size();
-  }
-
-  // Calculate uptime
-  // TODO(rpsilva): Introduce a global metric collection
-  auto now = std::chrono::steady_clock::now();
-  stats.uptime = std::chrono::duration_cast<std::chrono::seconds>(now - creation_time_);
-
-  stats.is_active = !shutdown_requested_.load();
-
-  return stats;
-}
-
-OperationExecutionEngine::Statistics OperationExecutionEngine::GetStatistics() const {
-  Statistics stats;
-
-  // Get total queue size (compilation + execution)
-  {
-    std::lock_guard<std::mutex> comp_lock(const_cast<std::mutex&>(compilation_mutex_));
-    std::lock_guard<std::mutex> exec_lock(const_cast<std::mutex&>(execution_mutex_));
-    stats.queue_size = compilation_queue_.size() + execution_queue_.size();
-  }
-
-  // Worker is active if not shutdown requested
-  stats.worker_active = !shutdown_requested_.load(std::memory_order_acquire);
-
-  return stats;
 }
 
 }  // namespace at::neuron

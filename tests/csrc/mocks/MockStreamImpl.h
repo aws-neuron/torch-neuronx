@@ -19,6 +19,8 @@ class MockStreamImpl {
 
   MOCK_METHOD(void, complete_operation, (OperationContext * op), ());
 
+  MOCK_METHOD(void, WaitForPriorOperationsToComplete, (const OperationContext* op), ());
+
   // For tests that don't need mocking, provide simple implementations
   void SetDefaultBehavior() {
     ON_CALL(*this,
@@ -32,6 +34,9 @@ class MockStreamImpl {
 
     ON_CALL(*this, complete_operation(::testing::_))
         .WillByDefault(::testing::Invoke([this](OperationContext* op) { complete_called = true; }));
+
+    ON_CALL(*this, WaitForPriorOperationsToComplete(::testing::_))
+        .WillByDefault(::testing::Return());
   }
 
   // Test state tracking

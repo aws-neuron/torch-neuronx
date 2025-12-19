@@ -25,7 +25,7 @@ chmod +x ./tools/*
 ./tools/build
 
 ## Install neuron compiler from neuron repo
-uv pip install neuronx-cc==2.* --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
+uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
 # Install development dependencies including Ruff
 uv pip install ruff

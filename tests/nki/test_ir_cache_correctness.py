@@ -1,5 +1,6 @@
 """Correctness tests for IR cache functionality."""
 
+import neuronxcc.nki.typing as nt
 import pytest
 import torch
 
@@ -17,12 +18,13 @@ class TestIRCacheCorrectness:
         """Verify cached IR produces identical results to fresh trace."""
 
         @TorchNeuronNKIKernel.trace
-        def numerical_kernel(x, y):
+        def numerical_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             result = x_tile * 2.5 + 1.0
             nl.store(y, value=result)
+            return y
 
         # First call - populate caches
         x1 = torch.randn(64, device="neuron")
@@ -47,12 +49,13 @@ class TestIRCacheCorrectness:
         """Test that IR cache works with different tensor values (same shape)."""
 
         @TorchNeuronNKIKernel.trace
-        def value_kernel(x, y):
+        def value_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             result = x_tile * 3.0
             nl.store(y, value=result)
+            return y
 
         # First call with tensor1
         x1 = torch.ones(64, device="neuron")
@@ -81,11 +84,12 @@ class TestIRCacheCorrectness:
         """Test that cache keys are unique for different configurations."""
 
         @TorchNeuronNKIKernel.trace
-        def key_kernel(x, y):
+        def key_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Test different shapes
         x1 = torch.randn(64, device="neuron")
@@ -111,25 +115,28 @@ class TestIRCacheCorrectness:
         """Test IR cache with multiple different kernel types."""
 
         @TorchNeuronNKIKernel.trace
-        def kernel1(x, y):
+        def kernel1(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile * 2.0)
+            return y
 
         @TorchNeuronNKIKernel.trace
-        def kernel2(x, y):
+        def kernel2(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile + 1.0)
+            return y
 
         @TorchNeuronNKIKernel.trace
-        def kernel3(x, y):
+        def kernel3(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile * x_tile)
+            return y
 
         # Call each kernel multiple times
         x = torch.randn(64, device="neuron")
@@ -175,12 +182,13 @@ class TestIRCacheCorrectness:
         """Test IR cache with kernels that have scalar parameters."""
 
         @TorchNeuronNKIKernel.trace
-        def scalar_kernel(x, y, scale):
+        def scalar_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             result = x_tile * scale
             nl.store(y, value=result)
+            return y
 
         x = torch.randn(64, device="neuron")
         y1 = torch.empty(64, device="neuron")
@@ -200,11 +208,12 @@ class TestIRCacheCorrectness:
         """Test IR cache correctness with 2D tensors."""
 
         @TorchNeuronNKIKernel.trace
-        def tensor_2d_kernel(x, y):
+        def tensor_2d_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # First call
         x1 = torch.randn(16, 32, device="neuron")

@@ -11,8 +11,13 @@
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
-#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
+
+// Include Neuron Runtime headers
+extern "C" {
+#include <nrt/nrt.h>
+}
 
 namespace at::neuron {
 
@@ -28,28 +33,26 @@ CPUFallbackExecutor::CPUFallbackExecutor() : enabled_(true) {
 }
 
 OperationContextResult CPUFallbackExecutor::ExecuteCpuFallback(OperationContext* op) {
+  std::string operation_name = op->GetOpName();
   if (!enabled_) {
-    std::string error_msg = "CPU fallback is disabled for operation=" + op->GetOpName();
+    std::string error_msg = "CPU fallback is disabled for operation=" + operation_name;
     return OperationContextResult::CreateError(error_msg);
   }
 
   const auto start_time = std::chrono::steady_clock::now();
-  IncrementStatsCounter(&Stats::total_fallback_attempts);
 
-  TORCH_NEURONX_DEBUG("Starting CPU fallback", "operation=", op->GetOpName());
+  TORCH_NEURONX_DEBUG("Starting CPU fallback", "operation=", operation_name);
 
   try {
     ExecuteCpuFallbackImpl(op);
     const auto total_time = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start_time);
-    TORCH_NEURONX_DEBUG("CPU fallback completed", "operation=", op->GetOpName(),
+    TORCH_NEURONX_DEBUG("CPU fallback completed", "operation=", operation_name,
                         "time_us=", total_time.count());
-    IncrementStatsCounter(&Stats::successful_fallbacks);
     return OperationContextResult::CreateSuccess();
   } catch (const std::exception& e) {
-    IncrementStatsCounter(&Stats::failed_fallbacks);
     std::string error_msg =
-        "CPU fallback failed for '" + op->GetOpName() + "' failed: " + std::string(e.what());
+        "CPU fallback failed for '" + operation_name + "' failed: " + std::string(e.what());
     TORCH_NEURONX_ERROR(error_msg);
     return OperationContextResult::CreateError(error_msg);
   }
@@ -66,12 +69,11 @@ bool CPUFallbackExecutor::CanExecuteOnCpu(const std::string& op_name) const {
 }
 
 std::vector<torch::Tensor> CPUFallbackExecutor::TransferTensorsToCpu(
-    const std::vector<torch::Tensor>& neuron_tensors,
+    const std::vector<nrt_tensor_t*>& data_ptrs,
     const std::vector<TensorContext>& tensor_contexts) {
   // Validate input sizes match
-  TORCH_CHECK(neuron_tensors.size() == tensor_contexts.size(),
-              "Mismatch between neuron_tensors size (", neuron_tensors.size(),
-              ") and tensor_contexts size (", tensor_contexts.size(), ")");
+  TORCH_CHECK(data_ptrs.size() == tensor_contexts.size(), "Mismatch between data_ptrs size (",
+              data_ptrs.size(), ") and tensor_contexts size (", tensor_contexts.size(), ")");
 
   std::vector<torch::Tensor> cpu_tensors;
   cpu_tensors.reserve(tensor_contexts.size());
@@ -79,30 +81,12 @@ std::vector<torch::Tensor> CPUFallbackExecutor::TransferTensorsToCpu(
   for (size_t i = 0; i < tensor_contexts.size(); ++i) {
     try {
       const auto& context = tensor_contexts[i];
-      const auto& neuron_tensor = neuron_tensors[i];
-
-      // Validate tensor is on Neuron device
-      TORCH_CHECK(!context.get_device().is_cpu(), "Tensor at index ", i,
-                  " is already on CPU, expected Neuron device");
-
-      // Create CPU tensor with matching properties
       auto cpu_tensor = CreateCpuTensorLike(context);
-      TORCH_CHECK(cpu_tensor.is_contiguous(), "Created CPU tensor at index ", i,
-                  " is not contiguous");
-
-      // Find the NRT tensor for the Neuron data
-      void* src_data_ptr = neuron_tensor.data_ptr();
-      nrt_tensor_t* nrt_tensor = c10_neuron::NeuronCachingAllocator::findTensor(src_data_ptr);
-      TORCH_CHECK(nrt_tensor != nullptr, "Failed to find NRT tensor for data pointer at index ", i);
-
-      // Calculate byte offset for storage
-      const size_t byte_offset = context.get_storage_offset() * context.get_element_size();
-      const size_t size_bytes = context.get_size_bytes();
-
-      // Perform the actual copy from Neuron to CPU
-      torch_neuronx::utils::nrt_copy_neuron_to_cpu(nrt_tensor, cpu_tensor.data_ptr(), byte_offset,
-                                                   size_bytes);
-
+      TORCH_CHECK(cpu_tensor.is_contiguous(), "Destination CPU tensor must be contiguous");
+      nrt_tensor_t* data_ptr = data_ptrs[i];
+      torch_neuronx::utils::nrt_copy_neuron_to_cpu(data_ptr, cpu_tensor.data_ptr(),
+                                                   0 /* Tensor is already sliced */,
+                                                   context.get_size_bytes());
       cpu_tensors.emplace_back(std::move(cpu_tensor));
     } catch (const std::exception& e) {
       TORCH_NEURONX_ERROR("Failed to transfer tensor to CPU", "index=", i, "error=", e.what());
@@ -235,16 +219,6 @@ torch::Tensor CPUFallbackExecutor::CreateCpuTensorLike(const TensorContext& tens
   return torch::empty(tensor_context.get_shape(), options);
 }
 
-CPUFallbackExecutor::Stats CPUFallbackExecutor::GetStatistics() const {
-  std::lock_guard<std::mutex> lock(stats_mutex_);
-  return stats_;
-}
-
-void CPUFallbackExecutor::ResetStatistics() {
-  std::lock_guard<std::mutex> lock(stats_mutex_);
-  stats_ = Stats{};
-}
-
 void CPUFallbackExecutor::LoadConfiguration() {
   // Load CPU fallback configuration from environment variables
   const char* disable_cpu_fallback_recovery =
@@ -256,12 +230,28 @@ void CPUFallbackExecutor::LoadConfiguration() {
   TORCH_NEURONX_DEBUG("CPUFallbackExecutor configuration loaded", "enabled=", enabled_);
 }
 
-void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* op) {
-  const auto& input_contexts = op->input_tensors_context;
-  const auto cpu_inputs = TransferTensorsToCpu(op->kernel_execution->GetInputs(), input_contexts);
+void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
+  const auto& fallback_ctx = operation->cpu_fallback_context;
+
+  // Convert void* to nrt_tensor_t* using allocator
+  TORCH_NEURONX_DEBUG("size of tensors_data_ptrs in fallback context - ",
+                      fallback_ctx.tensor_data_ptrs.size());
+  std::vector<nrt_tensor_t*> src_ptrs;
+  src_ptrs.reserve(fallback_ctx.tensor_data_ptrs.size());
+  for (void* ptr : fallback_ctx.tensor_data_ptrs) {
+    nrt_tensor_t* nrt_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ptr);
+    TORCH_CHECK(nrt_ptr, "Invalid input data pointer for CPU fallback");
+    src_ptrs.push_back(nrt_ptr);
+  }
+
+  auto& hlo_kernel = operation->GetKernel<KernelTypeEnum::kHLO>();
+  std::vector<nrt_tensor_t*> dst_ptrs = hlo_kernel.GetDstDataPtrs();
+
+  const auto& input_contexts = fallback_ctx.tensor_metadata;
+  const auto cpu_inputs = TransferTensorsToCpu(src_ptrs, input_contexts);
 
   // Create CPU output tensors using TensorContext
-  const auto& output_contexts = op->output_tensors_context;
+  const auto& output_contexts = operation->output_tensors_context;
   std::vector<torch::Tensor> cpu_outputs;
   cpu_outputs.reserve(output_contexts.size());
   for (const auto& context : output_contexts) {
@@ -269,15 +259,11 @@ void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* op) {
   }
 
   // Execute on CPU with native PyTorch out parameter handling
-  const auto cpu_results = ExecuteOperationOnCpu(op->GetOpName(), cpu_inputs, cpu_outputs, op);
-  TransferTensorsFromCpuToNeuron(cpu_results, op);
-
-  TORCH_NEURONX_DEBUG("CPU fallback execution completed", "operation=", op->GetOpName());
-}
-
-void CPUFallbackExecutor::IncrementStatsCounter(uint64_t Stats::* counter) {
-  std::lock_guard<std::mutex> lock(stats_mutex_);
-  (stats_.*counter)++;
+  const auto cpu_results =
+      ExecuteOperationOnCpu(operation->GetOpName(), cpu_inputs, cpu_outputs, operation);
+  // Transfer results back using data pointers from context
+  TransferTensorsFromCpuToNeuron(cpu_results, dst_ptrs);
+  TORCH_NEURONX_DEBUG("CPU fallback execution completed", "operation=", operation->GetOpName());
 }
 
 std::vector<torch::Tensor> CPUFallbackExecutor::ExtractResultsFromStack(
@@ -336,34 +322,14 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
   std::vector<c10::IValue> stack;
   stack.reserve(schema.arguments().size());
 
-  size_t input_idx = 0;
+  const auto& fallback_ctx = op ? op->cpu_fallback_context : CPUFallbackContext();
+  size_t cpu_input_idx = 0;
   size_t output_idx = 0;
-  size_t static_idx = 0;
-  size_t list_idx = 0;
 
   // Process each argument in schema order
   for (size_t arg_pos = 0; arg_pos < schema.arguments().size(); ++arg_pos) {
     const auto& arg = schema.arguments()[arg_pos];
     const std::string& arg_name = arg.name();
-
-    // Handle static arguments (constants provided at operation definition time)
-    const auto& fallback_ctx = op ? op->cpu_fallback_context : CPUFallbackContext();
-    if (op && static_idx < fallback_ctx.static_arg_positions.size() &&
-        fallback_ctx.static_arg_positions[static_idx] == static_cast<int64_t>(arg_pos)) {
-      const auto& static_arg = fallback_ctx.static_args[static_idx];
-
-      if (static_arg.isTensor()) {
-        // Static tensor arguments are pre-transferred to CPU and included in cpu_inputs
-        TORCH_CHECK(input_idx < cpu_inputs.size(), "Missing CPU input for static tensor argument '",
-                    arg_name, "' at position ", arg_pos);
-        stack.emplace_back(cpu_inputs[input_idx++]);
-      } else {
-        // Non-tensor static arguments can be used directly
-        stack.emplace_back(static_arg);
-      }
-      static_idx++;
-      continue;
-    }
 
     // Handle output arguments (for in-place operations)
     if (arg.is_out()) {
@@ -373,27 +339,57 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
       continue;
     }
 
-    // Handle list arguments (tensor lists that were flattened)
-    if (op && list_idx < fallback_ctx.list_arg_positions.size() &&
-        fallback_ctx.list_arg_positions[list_idx] == static_cast<int64_t>(arg_pos)) {
-      const int64_t list_len = fallback_ctx.list_arg_lengths[list_idx];
-      c10::List<torch::Tensor> tensor_list;
-
-      for (int64_t i = 0; i < list_len; ++i) {
-        TORCH_CHECK(input_idx < cpu_inputs.size(),
-                    "Not enough inputs to reconstruct tensor list at position ", arg_pos, " (need ",
-                    list_len, " tensors)");
-        tensor_list.push_back(cpu_inputs[input_idx++]);
-      }
-
-      stack.emplace_back(std::move(tensor_list));
-      list_idx++;
+    // Check if this argument is provided as a kwarg
+    if (op && !fallback_ctx.original_kwargs.empty() &&
+        fallback_ctx.original_kwargs.contains(arg_name)) {
+      const auto& kwarg_value = fallback_ctx.original_kwargs.at(arg_name);
+      stack.emplace_back(kwarg_value);
       continue;
     }
 
-    // Handle regular input arguments
-    if (input_idx < cpu_inputs.size()) {
-      stack.emplace_back(cpu_inputs[input_idx++]);
+    // Get original input from context
+    if (op && arg_pos < fallback_ctx.original_inputs.size()) {
+      const auto& original_input = fallback_ctx.original_inputs[arg_pos];
+
+      if (original_input.isTensor()) {
+        // Tensor input - use transferred CPU tensor
+        TORCH_CHECK(cpu_input_idx < cpu_inputs.size(), "Missing CPU input for tensor '", arg_name,
+                    "' at position ", arg_pos);
+        stack.emplace_back(cpu_inputs[cpu_input_idx++]);
+      } else if (original_input.isTensorList()) {
+        // Tensor list - need to transfer each tensor to CPU
+        auto neuron_tensor_list = original_input.toTensorList();
+        c10::List<at::Tensor> cpu_tensor_list;
+        for (size_t i = 0; i < neuron_tensor_list.size(); ++i) {
+          TORCH_CHECK(cpu_input_idx < cpu_inputs.size(),
+                      "Missing CPU input for tensor list element at position ", arg_pos, "[", i,
+                      "]");
+          cpu_tensor_list.push_back(cpu_inputs[cpu_input_idx++]);
+        }
+        stack.emplace_back(cpu_tensor_list);
+      } else {
+        // Scalar input - check if schema expects a Tensor
+        const auto& arg_type = arg.type();
+        if (arg_type->kind() == c10::TypeKind::TensorType) {
+          // Schema expects Tensor but we have scalar - convert it
+          torch::Tensor scalar_tensor;
+          if (original_input.isInt()) {
+            scalar_tensor = torch::tensor(original_input.toInt(), torch::kCPU);
+          } else if (original_input.isDouble()) {
+            scalar_tensor = torch::tensor(original_input.toDouble(), torch::kCPU);
+          } else if (original_input.isBool()) {
+            scalar_tensor = torch::tensor(original_input.toBool(), torch::kCPU);
+          } else {
+            // Unsupported scalar type - use as-is and let PyTorch handle it
+            stack.emplace_back(original_input);
+            continue;
+          }
+          stack.emplace_back(scalar_tensor);
+        } else {
+          // Schema expects scalar - use directly from original_inputs
+          stack.emplace_back(original_input);
+        }
+      }
     } else if (arg.default_value().has_value()) {
       // Use default value if available
       stack.emplace_back(arg.default_value().value());
@@ -411,51 +407,26 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
 }
 
 void CPUFallbackExecutor::TransferTensorsFromCpuToNeuron(
-    const std::vector<torch::Tensor>& cpu_results, OperationContext* op) {
-  const auto& output_contexts = op->output_tensors_context;
-  const auto& original_neuron_outputs = op->kernel_execution->GetOutputs();
+    const std::vector<torch::Tensor>& cpu_results, const std::vector<nrt_tensor_t*>& data_ptrs) {
+  TORCH_CHECK(data_ptrs.size() == cpu_results.size(), "Mismatch output tensor sizes (",
+              data_ptrs.size(), ") and (", cpu_results.size(), ")");
 
-  // Validate sizes match
-  TORCH_CHECK(output_contexts.size() == cpu_results.size(),
-              "Output tensor count mismatch for operation '", op->GetOpName(), "': expected ",
-              output_contexts.size(), " but got ", cpu_results.size());
-
-  TORCH_CHECK(original_neuron_outputs.size() == cpu_results.size(),
-              "Original Neuron output count mismatch for operation '", op->GetOpName(),
-              "': expected ", original_neuron_outputs.size(), " but got ", cpu_results.size());
-
-  // Transfer each CPU result back to its corresponding Neuron output tensor
-  for (size_t i = 0; i < output_contexts.size(); ++i) {
-    const auto& output_context = output_contexts[i];
+  for (size_t i = 0; i < cpu_results.size(); ++i) {
     const auto& cpu_result = cpu_results[i];
-    const auto& neuron_output = original_neuron_outputs[i];
+    nrt_tensor_t* data_ptr = data_ptrs[i];
 
     try {
-      // Validate CPU result is contiguous for efficient copy
-      TORCH_CHECK(cpu_result.is_contiguous(), "CPU result tensor at index ", i,
-                  " must be contiguous for copy to Neuron device");
+      TORCH_CHECK(cpu_result.is_contiguous(), "CPU result tensor must be contiguous");
+      size_t size_bytes = cpu_result.numel() * cpu_result.element_size();
+      torch_neuronx::utils::nrt_copy_cpu_to_neuron(cpu_result.data_ptr(), data_ptr,
+                                                   0 /* Tensor is already sliced */, size_bytes);
 
-      // Find the NRT tensor for the destination
-      void* dst_ptr = neuron_output.data_ptr();
-      nrt_tensor_t* nrt_tensor = c10_neuron::NeuronCachingAllocator::findTensor(dst_ptr);
-      TORCH_CHECK(nrt_tensor != nullptr, "Failed to find NRT tensor for output at index ", i);
-
-      // Calculate byte offset for storage
-      const size_t byte_offset =
-          output_context.get_storage_offset() * output_context.get_element_size();
-      const size_t size_bytes = output_context.get_size_bytes();
-
-      // Perform the actual copy from CPU to Neuron
-      torch_neuronx::utils::nrt_copy_cpu_to_neuron(cpu_result.data_ptr(), nrt_tensor, byte_offset,
-                                                   size_bytes);
-
-      TORCH_NEURONX_DEBUG("Copied CPU result to Neuron output tensor",
-                          "operation=", op->GetOpName(), "index=", i, "shape=", cpu_result.sizes(),
-                          "size_bytes=", size_bytes);
+      TORCH_NEURONX_DEBUG("Copied CPU result to Neuron output tensor", "index=", i,
+                          "final_shape=", cpu_result.sizes());
 
     } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failed to copy CPU result to Neuron output tensor",
-                          "operation=", op->GetOpName(), "index=", i, "error=", e.what());
+      TORCH_NEURONX_ERROR("Failed to copy CPU result to Neuron output tensor", "index=", i,
+                          "error=", e.what());
       throw std::runtime_error("Neuron output tensor copy failed for index " + std::to_string(i) +
                                ": " + std::string(e.what()));
     }

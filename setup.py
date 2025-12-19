@@ -84,7 +84,10 @@ class BuildPyCommand(build_ext):
     def run(self):
         builder_path = "torch_neuronx/protos"
         # Compile proto files
-        proto_files = [f"{builder_path}/hlo.proto", f"{builder_path}/xla/xla_data.proto"]
+        proto_files = [
+            f"{builder_path}/hlo.proto",
+            f"{builder_path}/xla/xla_data.proto",
+        ]
         command = [
             "python",
             "-m",

@@ -400,14 +400,17 @@ class TorchNeuronXLAKernel(BaseNeuronKernel):
         # Generate cache key and get/compile NEFF
         cache_key = self.get_cache_key(*processed_inputs, donate_argnums=donate_argnums)
         # Prepare execution dictionaries
-        input_dict, list_arg_positions, list_arg_lengths = (
-            self.arg_processor.prepare_execution_inputs(processed_inputs, device)
-        )
+        input_dict = self.arg_processor.prepare_execution_inputs(processed_inputs, device)
         # Prepare outputs
         original_output_dict = {}
         for i, out in enumerate(output_tensors):
             original_output_dict[f"output{i}"] = TypeConverter.convert_for_neuron(out)
 
+        # Get CPU fallback context stored directly on kernel
+        cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
+        # need to handle the case where the kernel is created after impl.execute call
+        if cpu_fallback_context is None:
+            cpu_fallback_context = {"original_inputs": list(inputs), "original_kwargs": {}}
         # TODO -  remove sync flow once async CRs are merged
         if is_sync_mode_enabled():
             self._execute_sync(
@@ -423,9 +426,8 @@ class TorchNeuronXLAKernel(BaseNeuronKernel):
                 processed_inputs,
                 tuple(input_dict.values()),
                 tuple(original_output_dict.values()),
+                cpu_fallback_context,
                 donate_argnums,
-                list_arg_positions,
-                list_arg_lengths,
             )
 
         return self.finalize_outputs(
@@ -460,9 +462,8 @@ class TorchNeuronXLAKernel(BaseNeuronKernel):
         processed_inputs: tuple,
         non_static_inputs,
         output_tensors,
+        cpu_fallback_context,
         donate_argnums: tuple[int, ...] | None = None,
-        list_arg_positions: list | None = None,
-        list_arg_lengths: list | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Execute the kernel using the modern C++ binding path.
 
@@ -486,13 +487,6 @@ class TorchNeuronXLAKernel(BaseNeuronKernel):
             stack_trace = "".join(traceback.format_list(traceback.extract_stack()[:-2]))
         else:
             stack_trace = ""
-
-        # Create CPU fallback context using ArgumentProcessor
-        cpu_fallback_context = self.arg_processor.create_cpu_fallback_context(
-            processed_inputs,
-            list_arg_positions or [],
-            list_arg_lengths or [],
-        )
 
         # Submit to C++ XLA pipeline
         import torch_neuronx._C as _C

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 
 namespace at::neuron {
 
@@ -12,8 +13,10 @@ namespace at::neuron {
 class CPUFallbackExecutor;
 
 /**
- * ErrorRecovery provides simple CPU fallback for failed Neuron operations
- * Per-stream instance that attempts CPU fallback when Neuron execution fails
+ * ErrorRecovery provides recovery strategies for failed Neuron operations
+ * Per-stream instance that attempts various recovery strategies including:
+ * - OOM recovery (clear cache and retry)
+ * - CPU fallback for compilation failures
  */
 class ErrorRecovery {
  public:
@@ -23,48 +26,46 @@ class ErrorRecovery {
   ErrorRecovery();
 
   /**
-   * Attempt to recover from an operation failure
-   * This method encapsulates all recovery logic including:
-   * - Deciding whether to attempt CPU fallback
-   * - Executing CPU fallback if appropriate
-   * - Setting the operation promise with the result
+   * Attempt to recover from an operation compilation failure
    *
    * @param op The failed operation
-   * @return OperationContextResult
+   * @param e CompilationRuntimeException/ExecutionRuntimeException exception
+   * @return OperationContextResult indicating success or continued failure
    */
-  OperationContextResult AttemptRecovery(OperationContext* op);
+  OperationContextResult AttemptRecovery(OperationContext* op,
+                                         const torch_neuronx::CompilationRuntimeException& e);
+  OperationContextResult AttemptRecovery(OperationContext* op,
+                                         const torch_neuronx::ExecutionRuntimeException& e);
+
+  /**
+   * Check if an error is an OOM error that can be recovered
+   * @param nrt_status The NRT status code
+   * @return true if this is a recoverable OOM error
+   */
+  bool IsRecoverableOOM(int nrt_status) const;
+
+  /**
+   * Attempt OOM recovery by clearing cache and retrying
+   * @param op The failed operation
+   * @param device The device where OOM occurred
+   * @return OperationContextResult indicating success or failure
+   */
+  OperationContextResult AttemptOOMRecovery(OperationContext* op, int device);
 
   /**
    * Check if we should attempt CPU fallback for a failed operation
-   * Simple decision: if fallback is enabled, try it; otherwise fail
    */
   bool ShouldAttemptCpuFallback();
 
   /**
-   * Execute CPU fallback for a failed operation
+   * Check if we should attempt OOM recovery for a failed operation
+   */
+  bool ShouldAttemptOOMRecovery(const torch_neuronx::ExecutionRuntimeException& e);
+
+  /**
+   * Execute CPU fallback for a failed compilable kernel
    */
   OperationContextResult ExecuteCpuFallback(OperationContext* op);
-
-  /**
-   * Get fallback statistics for monitoring
-   */
-  struct RecoveryStats {
-    uint64_t total_fallback_attempts;
-    uint64_t successful_fallbacks;
-    uint64_t failed_fallbacks;
-
-    double fallback_success_rate() const {
-      if (total_fallback_attempts == 0) return 0.0;
-      return double(successful_fallbacks) / double(total_fallback_attempts);
-    }
-  };
-
-  RecoveryStats GetRecoveryStats() const;
-
-  /**
-   * Reset recovery statistics
-   */
-  void ResetRecoveryStats();
 
   /**
    * Destructor
@@ -81,12 +82,25 @@ class ErrorRecovery {
    */
   void LoadConfiguration();
 
-  // Statistics
-  mutable std::mutex stats_mutex_;
-  RecoveryStats stats_;
+  /**
+   * Attempt to recover from a compilable operation failure
+   *
+   * @param operation OperationContext for a compilable kernel
+   * @return OperationContextResult indicating success or continued failure
+   */
+  OperationContextResult AttemptCompilableRecovery(OperationContext* operation);
+  /**
+   * Attempt to recover from a executable allocation kernel failure
+   *
+   * @param kernel The allocation direct kernel execution
+   * @return OperationContextResult indicating success or continued failure
+   */
+  OperationContextResult AttemptRecovery(const AllocDirectKernelExecution& kernel,
+                                         const torch_neuronx::ExecutionRuntimeException& e);
 
   // Configuration flags
   bool fallback_enabled_;
+  bool oom_recovery_enabled_;
 
   // CPU fallback executor
   std::unique_ptr<CPUFallbackExecutor> cpu_fallback_executor_;

@@ -1,5 +1,6 @@
 """Tests for NKI op registration."""
 
+import neuronxcc.nki.typing as nt
 import pytest
 import torch
 import torch.fx
@@ -14,13 +15,14 @@ class TestNKIJitDecorator:
         """Test a simple addition kernel with @nki.jit."""
 
         @nki.jit
-        def add_kernel(x1, x2, y):
+        def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x1_tile = nl.load(x1[0:128])
             x2_tile = nl.load(x2[0:128])
             y_tile = x1_tile + x2_tile
             nl.store(y[0:128], value=y_tile)
+            return y
 
         x1 = torch.randn(128, device="neuron")
         x2 = torch.randn(128, device="neuron")
@@ -35,11 +37,12 @@ class TestNKIJitDecorator:
         """Test that @nki.jit adds proper kernel attributes."""
 
         @nki.jit
-        def test_kernel(x, y):
+        def test_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         assert hasattr(test_kernel, "_is_nki_kernel")
         assert test_kernel._is_nki_kernel is True
@@ -49,12 +52,13 @@ class TestNKIJitDecorator:
         """Test scaling kernel with @nki.jit."""
 
         @nki.jit
-        def scale_kernel(x, y, scale):
+        def scale_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = x_tile * scale
             nl.store(y[0:128], value=y_tile)
+            return y
 
         x = torch.randn(128, device="neuron")
         y = torch.empty(128, device="neuron")
@@ -73,13 +77,14 @@ class TestNKIOpRegistration:
         """Test basic op registration with in-place mutation."""
 
         @nki.jit
-        def add_kernel(x1, x2, y):
+        def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x1_tile = nl.load(x1[0:128])
             x2_tile = nl.load(x2[0:128])
             y_tile = x1_tile + x2_tile
             nl.store(y[0:128], value=y_tile)
+            return y
 
         @nki_op("test::nki_add", mutates_args={"y"})
         def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -114,11 +119,12 @@ class TestNKIOpRegistration:
         """Test NKI ops with different data types."""
 
         @nki.jit
-        def copy_kernel(x, y):
+        def copy_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         @nki_op("test::dtype_test", mutates_args={})
         def dtype_test(x: torch.Tensor) -> torch.Tensor:
@@ -138,21 +144,23 @@ class TestNKIOpRegistration:
         """Test multiple NKI ops in the same graph."""
 
         @nki.jit
-        def add_kernel(x1, x2, y):
+        def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x1_tile = nl.load(x1[0:128])
             x2_tile = nl.load(x2[0:128])
             y_tile = x1_tile + x2_tile
             nl.store(y[0:128], value=y_tile)
+            return y
 
         @nki.jit
-        def mul_kernel(x, y, scale):
+        def mul_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = x_tile * scale
             nl.store(y[0:128], value=y_tile)
+            return y
 
         @nki_op("test::multi_add", mutates_args={})
         def multi_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
@@ -183,13 +191,14 @@ class TestNKIOpRegistration:
         """Test NKI op with forward and backward pass."""
 
         @nki.jit
-        def add_kernel(x, y, output):
+        def add_kernel(x, y, output: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = nl.load(y[0:128])
             result = x_tile + y_tile
             nl.store(output[0:128], value=result)
+            return output
 
         @nki_op("test::add_fwd", mutates_args={})
         def add_fwd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -230,12 +239,13 @@ class TestTorchCompileIntegration:
         """Test that NKI ops work with torch.compile."""
 
         @nki.jit
-        def add_one_kernel(x, y):
+        def add_one_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = x_tile + 1.0
             nl.store(y[0:128], value=y_tile)
+            return y
 
         @nki_op("test::add_one", mutates_args={})
         def add_one(x: torch.Tensor) -> torch.Tensor:

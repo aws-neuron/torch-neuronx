@@ -1,0 +1,49 @@
+{
+  "test_configurations": [
+    {
+      "class": "ReplicateStateDictTest",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": []
+    },
+    {
+      "class": "ReplicateTest",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Expected device_id to be int or torch.device - PatchDevice cannot pass isinstance() check against original torch.device class",
+          "tests": [
+            "test_replicate_device_id"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: AllGatherXlaOp requires tensors on neuron device - tests use CPU tensors which are incompatible with Neuron XLA collective ops",
+          "tests": [
+            "test_replicate_single_module",
+            "test_replicate_multi_module",
+            "test_replicate_with_kwargs"
+          ]
+        }
+      ]
+    },
+    {
+      "class": "ReplicateFullyShardInit",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Expected device_id to be int or torch.device - PatchDevice cannot pass isinstance() check against original torch.device class",
+          "tests": [
+            "test_replicate_device_id"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: AllGatherXlaOp requires tensors on neuron device - tests use CPU tensors which are incompatible with Neuron XLA collective ops",
+          "tests": [
+            "test_replicate_single_module",
+            "test_replicate_multi_module",
+            "test_replicate_with_kwargs"
+          ]
+        }
+      ]
+    }
+  ]
+}

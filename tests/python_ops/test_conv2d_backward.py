@@ -5,6 +5,7 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from torch_neuronx.utils import use_mlir_aten_ops
 
 TEST_CONFIGS = [
     # Test bias
@@ -150,6 +151,9 @@ DTYPE_TOLERANCE_CONFIGS = [
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.skipif(
+    use_mlir_aten_ops(), reason="Test gets stuck when lowering aten ops with torch compile"
+)
 class TestConv2dBackwardRegistration:
     """Test cases for conv2d backward operation"""
 

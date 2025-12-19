@@ -12,6 +12,7 @@ from torch.distributed.tensor import (
     distribute_tensor,
 )
 from torch.distributed.tensor.debug import CommDebugMode
+from torch.testing._internal import common_distributed
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
@@ -26,8 +27,15 @@ from tests.utils.neuron_test_utils import (
     track_neuron_ops,
 )
 
+# Set custom timeout for specific tests (in seconds)
+common_distributed.TIMEOUT_OVERRIDE["test_linear_tensor_parallel"] = 600
+
 
 class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
+    @property
+    def device_type(self):
+        return "neuron"
+
     def setUp(self):
         super().setUp()
         self._spawn_processes()
@@ -113,7 +121,6 @@ class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
 
     @with_comms
-    @pytest.mark.xfail(reason="dispatcher bug in PT 2.8 sync mode, accuracy issue in PT 2.9")
     def test_linear_tensor_parallel(self):
         """Test linear operation with tensor parallel sharding on features dimension."""
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
@@ -151,7 +158,7 @@ class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
         # Run distributed version and capture ops
         with comm_mode, track_neuron_ops():
             dist_out = f.linear(dist_input, dist_weight, dist_bias)
-            self.assertEqual(comm_mode.get_total_counts(), 2)  # change to 0 for PT 2.9
+            self.assertEqual(comm_mode.get_total_counts(), 2)
             self.assertTrue(dist_out.placements[0].is_shard(dim=1))
         assert_op_runs_on_neuron("aten::linear")
         # Verify the output is correct

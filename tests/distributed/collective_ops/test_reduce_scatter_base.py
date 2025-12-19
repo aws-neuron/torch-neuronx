@@ -202,6 +202,42 @@ def run_reduce_scatter_partial_group_test(rank, world_size, kwargs):
         pass
 
 
+def run_bucketing_memory_test(rank, world_size, kwargs):
+    """Test reduce_scatter_tensor with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    with open(f"./neuron_core_id_{rank}.txt", "w") as f:
+        f.write(str(core_id))
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/"
+        "model_shared_scratchpad/peak"
+    )
+    for i in range(2):
+        tensor_size = 134217732 + i * 134217732
+        size_per_rank = tensor_size // world_size
+        input_tensor = torch.ones(tensor_size, dtype=torch.float32) * (rank + 1)
+        input_tensor_neuron = input_tensor.to("neuron")
+        output_tensor = torch.zeros(size_per_rank, dtype=torch.float32, device="neuron")
+
+        dist.reduce_scatter_tensor(output_tensor, input_tensor_neuron, op=dist.ReduceOp.SUM)
+
+        expected = torch.ones(size_per_rank, dtype=torch.float32) * (1 + 2)
+        assert torch.allclose(output_tensor.cpu(), expected)
+
+        peak = int(
+            os.popen(
+                f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+                f"neuron_core{core_id}/stats/memory_usage/device_mem/"
+                "model_shared_scratchpad/peak"
+            )
+            .read()
+            .strip()
+        )
+        assert peak <= 1073741824, f"Memory {peak} exceeds 1GB"
+
+
 class TestReduceScatterTensor(BaseCollectiveOpTest):
     @pytest.mark.parametrize(
         "dtype",
@@ -273,6 +309,10 @@ class TestReduceScatterTensor(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test reduce_scatter_tensor with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+    def test_bucketing_memory(self):
+        """Test reduce_scatter_tensor with bucketing for memory efficiency."""
+        self.distributed_tester.run_test(run_bucketing_memory_test)
 
 
 class TestReduceScatterTensorWorldSize4(BaseCollectiveOpTest):

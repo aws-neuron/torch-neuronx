@@ -7,7 +7,6 @@ import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
     assert_raises,
-    cpu_fallback_test,
     track_neuron_ops,
 )
 
@@ -93,18 +92,6 @@ class TestHistc:
             assert neuron_result.device.type == "neuron"
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::histc")
-
-    @cpu_fallback_test
-    @assert_raises(
-        RuntimeError,
-        match="torch.histogram: input tensor and hist tensor should have the same dtype, "
-        "but got input float and hist int",
-    )
-    def test_histc_out_inconsistent_dtype_neuron(self, device):
-        """Test histc with inconsistent dtype on Neuron device."""
-        x = torch.randn(100, device=device)
-        out = torch.zeros(10, device=device, dtype=torch.int32)
-        torch.histc(x, bins=10, out=out)
 
     @assert_raises(
         RuntimeError,

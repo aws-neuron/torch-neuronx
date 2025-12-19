@@ -35,6 +35,15 @@ def suppress_specific_warnings(patterns):
         warnings.showwarning = original_showwarning
 
 
+def use_mlir_aten_ops():
+    """Check if torch-mlir aten ops lowering is enabled
+
+    Returns:
+        bool: True if TORCH_NEURONX_MLIR_ATEN_OPS is set to "1"
+    """
+    return os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
+
+
 def is_sync_mode_enabled():
     """Check if legacy launch blocking is enabled via environment variable.
 

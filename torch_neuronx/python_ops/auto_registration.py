@@ -14,6 +14,8 @@ from typing import Any
 import torch
 import torch.library
 
+from torch_neuronx.utils import use_mlir_aten_ops
+
 from .base import (
     BinaryOperation,
     ComparisonOperation,
@@ -38,7 +40,15 @@ def register_implementation(aten_name: str, impl_class: type[OperationImplementa
 
     Called automatically by the @neuron_op decorator.
     """
-    _NEURON_OPS_REGISTRY[aten_name]["implementations"].append(impl_class)
+    # TODO: Remove once MLIR support is added for these ops
+    mlir_unsupported_patterns = ("copy", "contiguous", "attention")
+
+    should_register = not use_mlir_aten_ops() or any(
+        pattern in aten_name for pattern in mlir_unsupported_patterns
+    )
+
+    if should_register:
+        _NEURON_OPS_REGISTRY[aten_name]["implementations"].append(impl_class)
 
 
 def neuron_op(
@@ -283,11 +293,7 @@ def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
 
     op_name = aten_name.replace("aten::", "")
 
-    # Check if it's an in-place operation (contains underscore followed by dot
-    # or ends with underscore)
-    is_inplace = "_." in op_name or (op_name.endswith("_") and "." not in op_name)
-
-    if is_inplace:
+    if operation.is_inplace:
         # In-place operations need special handling to ensure they modify the input tensor
         def wrapper(self, *args, **kwargs):
             # Call the operation with out=self to ensure in-place modification
@@ -297,7 +303,14 @@ def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
     else:
         # Standard wrapper - just pass everything through
         def wrapper(*args, **kwargs):
-            return operation(*args, **kwargs)
+            result = operation(*args, **kwargs)
+            # torch-mlir ops will always return tuple as output
+            if isinstance(result, tuple):
+                # PyTorch expects single Tensor object as output if there is only single output
+                # Otherwise, it expects tuple of Tensors
+                return result if len(result) > 1 else result[0]
+            else:
+                return result
 
     wrapper.__name__ = f"{op_name.replace('.', '_').replace(':', '_')}_neuron"
 

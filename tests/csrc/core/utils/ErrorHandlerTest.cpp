@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockStreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/ErrorHandler.h"
 
 using namespace at::neuron;
@@ -31,7 +32,7 @@ class ErrorHandlerTest : public ::testing::Test {
   }
 
   // Helper to create standard mock operation
-  OperationContext create_mock_operation(
+  std::unique_ptr<OperationContext> create_mock_operation(
       const std::string& op_name = "test_op",
       const std::vector<torch::Tensor>& inputs = {torch::ones({2, 3})},
       const std::vector<torch::Tensor>& outputs = {torch::ones({2, 3})}) {
@@ -40,12 +41,16 @@ class ErrorHandlerTest : public ::testing::Test {
     EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
     EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-    OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
-    mock_op.submit_time = std::chrono::steady_clock::now();
+    auto mock_op =
+        std::make_unique<OperationContext>(std::move(mock_kernel), std::vector<TensorContext>{},
+                                           std::vector<TensorContext>{}, "test_stack_trace");
+    mock_op->submit_time = std::chrono::steady_clock::now();
+    mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
     return mock_op;
   }
 
   std::unique_ptr<ErrorHandler> error_handler_;
+  mock::MockStreamImpl mock_stream_;
 };
 
 // Test ErrorHandler constructor and environment variable handling
@@ -115,77 +120,63 @@ TEST_F(ErrorHandlerTest, CleanErrorMessage) {
 }
 
 // Test extract_nrt_status method
-TEST_F(ErrorHandlerTest, ExtractNrtStatusValidStatus) {
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("Error occurred with status: 1"), 1);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status= 2 - some error"), 2);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status= 1005 - some error"), 1005);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("Multiple errors status: -999"), -999);
-}
+// ExtractNrtStatus is now internal - status is extracted from ExecutionRuntimeException
+TEST_F(ErrorHandlerTest, ClassifyErrorWithValidStatus) {
+  torch_neuronx::ExecutionRuntimeException e1("Error occurred", static_cast<NRT_STATUS>(1));
+  auto msg1 = error_handler_->ClassifyNrtError(e1);
+  EXPECT_THAT(msg1, ::testing::HasSubstr("Non-specific failure"));
 
-TEST_F(ErrorHandlerTest, ExtractNrtStatusNoStatus) {
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("Error without status code"), -999);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus(""), -999);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status: invalid"), -999);
-}
+  torch_neuronx::ExecutionRuntimeException e2("Some error", static_cast<NRT_STATUS>(2));
+  auto msg2 = error_handler_->ClassifyNrtError(e2);
+  EXPECT_THAT(msg2, ::testing::HasSubstr("Invalid NEFF"));
 
-TEST_F(ErrorHandlerTest, ExtractNrtStatusEdgeCases) {
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status: 0"), 0);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status= -1"), -1);
-  EXPECT_EQ(error_handler_->ExtractNrtStatus("status: 999999"), 999999);
+  torch_neuronx::ExecutionRuntimeException e1005("Busy error", static_cast<NRT_STATUS>(1005));
+  auto msg1005 = error_handler_->ClassifyNrtError(e1005);
+  EXPECT_THAT(msg1005, ::testing::HasSubstr("Neuron core busy"));
 }
 
 // Test classify_nrt_error method with various status codes
 TEST_F(ErrorHandlerTest, ClassifyNrtErrorStatuses) {
-  ErrorContext context;
-
   // Test key status codes from different categories
   struct StatusTest {
     int status;
     std::string expected_substr;
   };
 
-  std::vector<StatusTest> tests = {{1, "Non-specific failure"},
-                                   {2, "Invalid NEFF, instruction, or input"},
-                                   {5, "Operation timed out"},
-                                   {6, "Hardware failure"},
-                                   {1002, "Invalid input to exec()"},
-                                   {1005, "Neuron core busy/locked"},
-                                   {1201, "HBM encountered an unrepairable uncorrectable error"},
-                                   {1203, "DMA engine encountered an unrecoverable error"}};
+  std::vector<StatusTest> tests = {{1, "Non-specific failure"}, {2, "Invalid NEFF"},
+                                   {5, "Operation timed out"},  {6, "Hardware failure"},
+                                   {1002, "Invalid input"},     {1005, "Neuron core busy"},
+                                   {1201, "HBM encountered"},   {1203, "DMA engine encountered"}};
 
   for (const auto& test : tests) {
-    auto [ctx, msg] =
-        error_handler_->ClassifyNrtError("status: " + std::to_string(test.status), context);
+    torch_neuronx::ExecutionRuntimeException e("Test error", static_cast<NRT_STATUS>(test.status));
+    auto msg = error_handler_->ClassifyNrtError(e);
     EXPECT_THAT(msg, ::testing::HasSubstr(test.expected_substr))
         << "Failed for status: " << test.status;
   }
 }
 
 TEST_F(ErrorHandlerTest, ClassifyNrtErrorUnknownStatus) {
-  ErrorContext context;
-
-  auto [ctx, msg] = error_handler_->ClassifyNrtError("status: 9999", context);
-  // The actual message format is "status: 9999, " so let's check for that
-  EXPECT_THAT(msg, ::testing::HasSubstr("status: 9999"));
+  torch_neuronx::ExecutionRuntimeException e("Unknown error", static_cast<NRT_STATUS>(9999));
+  auto msg = error_handler_->ClassifyNrtError(e);
+  EXPECT_THAT(msg, ::testing::HasSubstr("Unknown status"));
 }
 
-TEST_F(ErrorHandlerTest, ClassifyNrtErrorNoStatus) {
-  ErrorContext context;
-
-  auto [ctx, msg] = error_handler_->ClassifyNrtError("No status in message", context);
+TEST_F(ErrorHandlerTest, ClassifyNrtErrorDefaultStatus) {
+  torch_neuronx::ExecutionRuntimeException e("No status error", static_cast<NRT_STATUS>(-999));
+  auto msg = error_handler_->ClassifyNrtError(e);
   EXPECT_THAT(msg, ::testing::HasSubstr("Unknown status"));
-  EXPECT_THAT(msg, ::testing::HasSubstr("-999"));
 }
 
 // Test create_error_context method
 TEST_F(ErrorHandlerTest, CreateErrorContextWithNullOperation) {
-  ErrorContext context =
-      error_handler_->CreateErrorContext(nullptr, ErrorContext::Stage::COMPILATION);
+  auto mock_op = create_mock_operation();
 
-  EXPECT_TRUE(context.operation_name.empty());
+  ErrorContext context =
+      error_handler_->CreateErrorContext(mock_op.get(), ErrorContext::Stage::COMPILATION);
+
+  EXPECT_EQ(context.operation_name, "test_op");
   EXPECT_EQ(context.current_stage, ErrorContext::Stage::COMPILATION);
-  EXPECT_TRUE(context.input_shapes.empty());
-  EXPECT_TRUE(context.output_shapes.empty());
 }
 
 TEST_F(ErrorHandlerTest, CreateErrorContextWithMockOperation) {
@@ -201,13 +192,12 @@ TEST_F(ErrorHandlerTest, CreateErrorContextWithMockOperation) {
 
   OperationContext op(std::move(mock_kernel), {}, {}, "test_stack_trace");
   op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
   ErrorContext context = error_handler_->CreateErrorContext(&op, ErrorContext::Stage::COMPILATION);
 
   EXPECT_EQ(context.operation_name, "test_op");
   EXPECT_EQ(context.current_stage, ErrorContext::Stage::COMPILATION);
-  EXPECT_EQ(context.input_shapes.size(), 2);
-  EXPECT_EQ(context.output_shapes.size(), 1);
 }
 
 // Test handle_compilation_error method
@@ -219,7 +209,7 @@ TEST_F(ErrorHandlerTest, HandleCompilationError) {
   context.stream_id = 123;
 
   std::string result =
-      error_handler_->HandleCompilationError(&mock_op, "Compilation failed", context);
+      error_handler_->HandleCompilationError(mock_op.get(), "Compilation failed", context);
 
   EXPECT_THAT(result, ::testing::HasSubstr("Compilation error occurred on Neuron"));
   EXPECT_THAT(result, ::testing::HasSubstr("operation=test_op"));
@@ -240,32 +230,25 @@ TEST_F(ErrorHandlerTest, HandleExecutionErrorWithStatusCode) {
 
   OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
+  mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
   // Test with a specific NRT status code to verify the full flow
-  std::string error_with_status = "NRT execution failed with status: 1005 - core busy";
+  torch_neuronx::ExecutionRuntimeException exec_error("NRT execution failed - core busy",
+                                                      static_cast<NRT_STATUS>(1005));
 
-  // Step 1: Test ExtractNrtStatus
-  int extracted_status = error_handler_->ExtractNrtStatus(error_with_status);
-  EXPECT_EQ(extracted_status, 1005);
+  // Test ClassifyNrtError
+  auto classified_message = error_handler_->ClassifyNrtError(exec_error);
+  EXPECT_THAT(classified_message, ::testing::HasSubstr("Neuron core busy"));
 
-  // Step 2: Test ClassifyNrtError
+  // Test HandleExecutionError with the classified message
   ErrorContext context;
   context.operation_name = "test_op";
   context.stream_id = 456;
 
-  auto [classified_context, classified_message] =
-      error_handler_->ClassifyNrtError(error_with_status, context);
-  EXPECT_THAT(classified_message, ::testing::HasSubstr("Neuron core busy/locked"));
-  EXPECT_THAT(classified_message, ::testing::HasSubstr("status: 1005"));
+  std::string result = error_handler_->HandleExecutionError(&mock_op, classified_message, context);
 
-  // Step 3: Test HandleExecutionError with the classified message
-  std::string result =
-      error_handler_->HandleExecutionError(&mock_op, classified_message, classified_context);
-
-  EXPECT_THAT(result, ::testing::HasSubstr("NRT Execution error occurred on Neuron"));
-  EXPECT_THAT(result, ::testing::HasSubstr("operation=test_op"));
-  EXPECT_THAT(result, ::testing::HasSubstr("NRT EXECUTION FAILED"));
-  EXPECT_THAT(result, ::testing::HasSubstr("Neuron core busy/locked"));
+  EXPECT_THAT(result, ::testing::HasSubstr("NRT Execution error"));
+  EXPECT_THAT(result, ::testing::HasSubstr("test_op"));
   EXPECT_THAT(result, ::testing::HasSubstr("test_stack_trace"));
 }
 
@@ -282,45 +265,45 @@ TEST_F(ErrorHandlerTest, HandleExecutionErrorWithDifferentStatusCodes) {
 
   OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
+  mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
   // Test with hardware error status
   {
-    std::string error_with_status = "Hardware error occurred with status: 1201";
-    auto [context, classified_message] =
-        error_handler_->ClassifyNrtError(error_with_status, ErrorContext{});
+    torch_neuronx::ExecutionRuntimeException exec_error("Hardware error occurred",
+                                                        static_cast<NRT_STATUS>(1201));
+    auto classified_message = error_handler_->ClassifyNrtError(exec_error);
+    ErrorContext context;
 
     std::string result =
         error_handler_->HandleExecutionError(&mock_op, classified_message, context);
 
-    EXPECT_THAT(result,
-                ::testing::HasSubstr("HBM encountered an unrepairable uncorrectable error"));
-    EXPECT_THAT(result, ::testing::HasSubstr("NRT EXECUTION FAILED"));
+    EXPECT_THAT(result, ::testing::HasSubstr("HBM encountered"));
   }
 
   // Test with timeout error status
   {
-    std::string error_with_status = "Operation timed out with status: 5";
-    auto [context, classified_message] =
-        error_handler_->ClassifyNrtError(error_with_status, ErrorContext{});
+    torch_neuronx::ExecutionRuntimeException exec_error("Operation timed out",
+                                                        static_cast<NRT_STATUS>(5));
+    auto classified_message = error_handler_->ClassifyNrtError(exec_error);
+    ErrorContext context;
 
     std::string result =
         error_handler_->HandleExecutionError(&mock_op, classified_message, context);
 
     EXPECT_THAT(result, ::testing::HasSubstr("Operation timed out"));
-    EXPECT_THAT(result, ::testing::HasSubstr("NRT EXECUTION FAILED"));
   }
 
   // Test with unknown status code
   {
-    std::string error_with_status = "Unknown error with status: 9999";
-    auto [context, classified_message] =
-        error_handler_->ClassifyNrtError(error_with_status, ErrorContext{});
+    torch_neuronx::ExecutionRuntimeException exec_error("Unknown error",
+                                                        static_cast<NRT_STATUS>(9999));
+    auto classified_message = error_handler_->ClassifyNrtError(exec_error);
+    ErrorContext context;
 
     std::string result =
         error_handler_->HandleExecutionError(&mock_op, classified_message, context);
 
-    EXPECT_THAT(result, ::testing::HasSubstr("status: 9999"));
-    EXPECT_THAT(result, ::testing::HasSubstr("NRT EXECUTION FAILED"));
+    EXPECT_THAT(result, ::testing::HasSubstr("Unknown status"));
   }
 }
 
@@ -342,8 +325,6 @@ TEST_F(ErrorHandlerTest, GenerateErrorMessageEnhanced) {
   context.operation_name = "test_op";
   context.stream_id = 789;
   context.current_stage = ErrorContext::Stage::COMPILATION;
-  context.input_shapes = {"input0: [2, 3]", "input1: [4, 5]"};
-  context.output_shapes = {"output0: [2, 5]"};
 
   std::string result = enhanced_handler.GenerateErrorMessage("Base error", context);
 
@@ -352,40 +333,8 @@ TEST_F(ErrorHandlerTest, GenerateErrorMessageEnhanced) {
   EXPECT_THAT(result, ::testing::HasSubstr("Operation: test_op"));
   EXPECT_THAT(result, ::testing::HasSubstr("Stream ID: 789"));
   EXPECT_THAT(result, ::testing::HasSubstr("Stage: COMPILATION"));
-  EXPECT_THAT(result, ::testing::HasSubstr("Input Shapes:"));
-  EXPECT_THAT(result, ::testing::HasSubstr("input0: [2, 3]"));
-  EXPECT_THAT(result, ::testing::HasSubstr("Output Shapes:"));
-  EXPECT_THAT(result, ::testing::HasSubstr("output0: [2, 5]"));
 
   unsetenv("NEURON_ENHANCED_ERROR_HANDLING");
-}
-
-// Test error statistics functionality
-TEST_F(ErrorHandlerTest, ErrorStatistics) {
-  ErrorStatistics stats = error_handler_->GetErrorStatistics();
-
-  // Initially all counters should be zero
-  EXPECT_EQ(stats.compilation_errors.load(), 0);
-  EXPECT_EQ(stats.execution_errors.load(), 0);
-  EXPECT_EQ(stats.timeout_errors.load(), 0);
-  EXPECT_EQ(stats.get_total_errors(), 0);
-
-  // Test utility methods
-  EXPECT_EQ(stats.get_avg_error_handling_time_us(), 0);  // No calls yet
-  EXPECT_EQ(stats.get_error_rate(0), 0.0);               // No operations
-
-  // Test with some values
-  stats.total_error_handling_time_us = 1000;
-  stats.error_handling_calls = 10;
-  stats.compilation_errors = 10;
-  EXPECT_EQ(stats.get_avg_error_handling_time_us(), 100);
-  EXPECT_EQ(stats.get_error_rate(100), 0.1);  // 10 errors out of 100 operations
-
-  // Test reset functionality
-  error_handler_->ResetErrorStatistics();
-  stats = error_handler_->GetErrorStatistics();
-  EXPECT_EQ(stats.get_total_errors(), 0);
-  EXPECT_EQ(stats.retry_attempts.load(), 0);
 }
 
 // Test get_recent_errors method
@@ -412,22 +361,15 @@ TEST_F(ErrorHandlerTest, HandleOperationError) {
 
   OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
+  mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
-  // Test 1: Compilation error - should trigger CPU fallback attempt which will fail
-  // The warning "CPU fallback failed for 'test_op' failed: No CPU implementation found" is expected
-  auto compilation_result = error_handler_->HandleOperationError(
-      &mock_op, "Compilation failed", ErrorContext::Stage::COMPILATION, 123);
-
-  EXPECT_FALSE(compilation_result.IsSuccess());
-  EXPECT_THAT(compilation_result.GetError(), ::testing::HasSubstr("COMPILATION FAILED"));
-
-  // Test 2: Execution error with status code - should trigger CPU fallback attempt which will fail
-  auto execution_result = error_handler_->HandleOperationError(
-      &mock_op, "Execution failed with status: 1005", ErrorContext::Stage::EXECUTION, 456, 1005);
+  // Test 1: Execution error with status code - should be handled
+  torch_neuronx::ExecutionRuntimeException exec_error("Execution failed - core busy",
+                                                      static_cast<NRT_STATUS>(1005));
+  auto execution_result = error_handler_->HandleOperationError(&mock_op, exec_error);
 
   EXPECT_FALSE(execution_result.IsSuccess());
-  EXPECT_THAT(execution_result.GetError(), ::testing::HasSubstr("NRT EXECUTION FAILED"));
-  EXPECT_THAT(execution_result.GetError(), ::testing::HasSubstr("Neuron core busy/locked"));
+  EXPECT_THAT(execution_result.GetError(), ::testing::HasSubstr("Execution failed"));
 
   // The CPU fallback failures are expected behavior for this mock operation
   // This test verifies that error handling works correctly when both Neuron execution
@@ -566,15 +508,9 @@ TEST_F(ErrorHandlerTest, MultipleErrorRecording) {
   context3.current_stage = ErrorContext::Stage::COMPILATION;
 
   // Record multiple errors
-  error_handler_->HandleCompilationError(&mock_op1, "Error 1", context1);
-  error_handler_->HandleExecutionError(&mock_op2, "Error 2", context2);
-  error_handler_->HandleCompilationError(&mock_op3, "Error 3", context3);
-
-  // Check statistics
-  ErrorStatistics stats = error_handler_->GetErrorStatistics();
-  EXPECT_EQ(stats.compilation_errors.load(), 2);
-  EXPECT_EQ(stats.execution_errors.load(), 1);
-  EXPECT_EQ(stats.get_total_errors(), 3);
+  error_handler_->HandleCompilationError(mock_op1.get(), "Error 1", context1);
+  error_handler_->HandleExecutionError(mock_op2.get(), "Error 2", context2);
+  error_handler_->HandleCompilationError(mock_op3.get(), "Error 3", context3);
 
   // Check recent errors
   auto recent_errors = error_handler_->GetRecentErrors();
@@ -582,30 +518,6 @@ TEST_F(ErrorHandlerTest, MultipleErrorRecording) {
   EXPECT_EQ(recent_errors[0].operation_name, "op1");
   EXPECT_EQ(recent_errors[1].operation_name, "op2");
   EXPECT_EQ(recent_errors[2].operation_name, "op3");
-}
-
-TEST_F(ErrorHandlerTest, ErrorRecordingUpdatesStatistics) {
-  auto mock_op = create_mock_operation();
-
-  ErrorContext context;
-  context.operation_name = "test_op";
-  context.stream_id = 123;
-
-  // Initial statistics
-  ErrorStatistics initial_stats = error_handler_->GetErrorStatistics();
-  EXPECT_EQ(initial_stats.compilation_errors.load(), 0);
-  EXPECT_EQ(initial_stats.error_handling_calls.load(), 0);
-
-  // Record a compilation error
-  error_handler_->HandleCompilationError(&mock_op, "Compilation failed", context);
-
-  // Check updated statistics
-  ErrorStatistics updated_stats = error_handler_->GetErrorStatistics();
-  EXPECT_EQ(updated_stats.compilation_errors.load(), 1);
-  EXPECT_EQ(updated_stats.compilation_stage_errors.load(), 1);
-  EXPECT_EQ(updated_stats.error_handling_calls.load(), 1);
-  // Note: total_error_handling_time_us may be 0 if execution is very fast
-  EXPECT_GE(updated_stats.total_error_handling_time_us.load(), 0);
 }
 
 // Test concurrent access (thread-safety)
@@ -625,9 +537,9 @@ TEST_F(ErrorHandlerTest, ConcurrentErrorRecording) {
             (i % 2 == 0) ? ErrorContext::Stage::COMPILATION : ErrorContext::Stage::EXECUTION;
 
         if (i % 2 == 0) {
-          error_handler_->HandleCompilationError(&mock_op, "Error", context);
+          error_handler_->HandleCompilationError(mock_op.get(), "Error", context);
         } else {
-          error_handler_->HandleExecutionError(&mock_op, "Error", context);
+          error_handler_->HandleExecutionError(mock_op.get(), "Error", context);
         }
       }
     });
@@ -637,39 +549,23 @@ TEST_F(ErrorHandlerTest, ConcurrentErrorRecording) {
   for (auto& thread : threads) {
     thread.join();
   }
-
-  // Verify statistics
   // With i % 2 == 0 for compilation: i=0,2,4 (3 per thread)
   // With i % 2 != 0 for execution: i=1,3 (2 per thread)
-  ErrorStatistics stats = error_handler_->GetErrorStatistics();
   int expected_compilation = num_threads * 3;  // i=0,2,4 per thread
   int expected_execution = num_threads * 2;    // i=1,3 per thread
-  EXPECT_EQ(stats.compilation_errors.load(), expected_compilation);
-  EXPECT_EQ(stats.execution_errors.load(), expected_execution);
-  EXPECT_EQ(stats.get_total_errors(), num_threads * errors_per_thread);
-}
-
-TEST_F(ErrorHandlerTest, ConcurrentStatisticsAccess) {
-  const int num_threads = 20;
-  std::vector<std::thread> threads;
-  std::atomic<int> successful_reads{0};
-
-  for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([this, &successful_reads]() {
-      // Half the threads read statistics
-      for (int i = 0; i < 100; ++i) {
-        auto stats = error_handler_->GetErrorStatistics();
-        (void)stats;  // Intentionally unused - just testing thread safety
-        successful_reads++;
-      }
-    });
+  int recorded_compilation = 0;
+  int recorded_execution = 0;
+  auto recent_errors = error_handler_->GetRecentErrors();
+  for (const auto& err : recent_errors) {
+    if (err.current_stage == ErrorContext::Stage::COMPILATION) {
+      ++recorded_compilation;
+    } else if (err.current_stage == ErrorContext::Stage::EXECUTION) {
+      ++recorded_execution;
+    }
   }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  EXPECT_EQ(successful_reads.load(), num_threads * 100);
+  EXPECT_EQ(recent_errors.size(), num_threads * errors_per_thread);
+  EXPECT_EQ(recorded_compilation, expected_compilation);
+  EXPECT_EQ(recorded_execution, expected_execution);
 }
 
 // Test Edge cases for CleanErrorMessage

@@ -7,22 +7,23 @@ from contextlib import suppress
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import MultiProcessTestCase
+from torch.testing._internal.common_distributed import MultiProcContinuousTest, MultiProcessTestCase
 
 import torch_neuronx
 from conftest import SANITY_PT_DISTRIBUTED_TESTS
 from tests.pytorch_tests.distributed.neuron_patch import NeuronPatcher, pre_run_patches
 from tests.utils.neuron_test_utils import get_core_start_index, get_pytest_worker_index
 
+# We run with a maximum of 8 workers for the distributed tests.
+# Since since we have 64 cores, we need to set this to 8 to avoid over
+# subscription and to avoid running out of cores for other tests
+NEURON_RT_NUM_CORES = "8"
+
 
 class NeuronDistributedBase:
     @property
     def world_size(self):
         return 8
-
-    @property
-    def device_type(self):
-        return "neuron"
 
     @property
     def backend(self):
@@ -33,12 +34,13 @@ class NeuronDistributedBase:
         return torch.device("neuron", self.rank)
 
     @classmethod
-    def _setup_neuron_environment(cls, rank):
+    def _setup_neuron_environment(cls, rank, set_rt_visible_cores=False):
         process_index = get_pytest_worker_index()
-        core_start_index = get_core_start_index()
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
         rt_port = int(os.environ.get("NEURON_RT_PORT", "2025"))
         os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{rt_port + process_index}"
+        if set_rt_visible_cores:
+            core_start_index = get_core_start_index()
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
 
     @classmethod
     def _apply_patches(cls, exclude: list[str] | None = None):
@@ -52,8 +54,11 @@ class NeuronDistributedBase:
         """Common process group setup logic"""
         if not dist.is_initialized():
             store = dist.FileStore(self.file_name, self.world_size)
+            world_size = self.world_size
+            core_start_index = get_core_start_index()
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + self.rank)
             dist.init_process_group(
-                backend=self.backend, world_size=self.world_size, rank=self.rank, store=store
+                backend=self.backend, world_size=world_size, rank=self.rank, store=store
             )
 
         if register_default:
@@ -131,9 +136,11 @@ def create_test_classes(base_class, module_globals, spec_file="test_spec.json"):
         class_name = config["test_class_name"]
         neuron_class_name = f"TestNeuron{class_name}"
 
+        selected_base_class = _select_neuron_base_class(test_class, base_class)
+
         neuron_test_class = type(
             neuron_class_name,
-            (base_class, test_class),
+            (selected_base_class, test_class),
             {"__module__": module_globals.get("__name__", "__main__")},
         )
 
@@ -175,16 +182,17 @@ def create_test_classes(base_class, module_globals, spec_file="test_spec.json"):
 
         if needs_setup:
 
-            def setUp(self):
-                super(base_class, self).setUp()
+            def setUp(self, bc=selected_base_class):
+                os.environ["NEURON_RT_NUM_CORES"] = NEURON_RT_NUM_CORES
+                super(bc, self).setUp()
                 self._spawn_processes()
 
             neuron_test_class.setUp = setUp
 
         if needs_teardown:
 
-            def tearDown(self):
-                super(base_class, self).tearDown()
+            def tearDown(self, bc=selected_base_class):
+                super(bc, self).tearDown()
                 with suppress(OSError, AttributeError):
                     os.remove(self.file_name)
 
@@ -194,6 +202,10 @@ def create_test_classes(base_class, module_globals, spec_file="test_spec.json"):
 
 
 class NeuronMultiProcessTest(NeuronDistributedBase, MultiProcessTestCase):
+    @property
+    def device_type(self):
+        return "neuron"
+
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
         super()._setup_neuron_environment(rank)
@@ -201,11 +213,27 @@ class NeuronMultiProcessTest(NeuronDistributedBase, MultiProcessTestCase):
         super()._run(rank, test_name, file_name, parent_pipe, **kwargs)
 
 
+class NeuronMultiProcessTestDDP(NeuronDistributedBase, MultiProcessTestCase):
+    @property
+    def device_type(self):
+        return "neuron"
+
+    @classmethod
+    def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
+        super()._setup_neuron_environment(rank, set_rt_visible_cores=True)
+        cls._apply_patches()
+        super()._run(rank, test_name, file_name, parent_pipe, **kwargs)
+
+
 class NeuronCommonTest(NeuronDistributedBase):
+    @property
+    def device_type(self):
+        return "neuron"
+
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
         """Called inside each spawned child process"""
-        cls._setup_neuron_environment(rank)
+        cls._setup_neuron_environment(rank, set_rt_visible_cores=True)
         cls._apply_patches()
         super()._run(rank, test_name, file_name, parent_pipe, **kwargs)
 
@@ -220,3 +248,45 @@ class NeuronCommonTest(NeuronDistributedBase):
         super().tearDown()
         with suppress(OSError, AttributeError):
             os.remove(self.file_name)
+
+
+class NeuronCommonContTest(NeuronDistributedBase):
+    @classmethod
+    def _worker_loop(cls, rank, world_size, rdvz_file, task_queue, completion_queue):
+        """Called inside MultiProcContinuousTest class to spawn process"""
+        cls._setup_neuron_environment(rank, set_rt_visible_cores=True)
+        cls._apply_patches()
+        super()._worker_loop(rank, world_size, rdvz_file, task_queue, completion_queue)
+
+    @classmethod
+    def device_type(cls):
+        return "neuron"
+
+    @classmethod
+    def backend_str(cls):
+        return "neuron"
+
+
+_BASE_CLASS_MAPPING = {
+    MultiProcContinuousTest: NeuronCommonContTest,
+    # TODO: Add more mappings as needed
+}
+
+
+def _select_neuron_base_class(test_class, default_base_class):
+    """
+    Select appropriate base class based on test class hierarchy
+    Args:
+        test_class: The original PT test class
+        default_base_class: Fallback base class
+    Returns:
+        selected_base_class
+    """
+
+    parent_class_names = test_class.__mro__[1:]  ##Exclude self
+
+    for parent_name in parent_class_names:
+        if parent_name in _BASE_CLASS_MAPPING:
+            return _BASE_CLASS_MAPPING[parent_name]
+
+    return default_base_class

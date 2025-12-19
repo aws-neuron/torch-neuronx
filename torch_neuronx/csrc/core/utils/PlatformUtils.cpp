@@ -1,6 +1,7 @@
 #include "PlatformUtils.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -83,6 +84,14 @@ std::string GetLogicalNeuronCores() {
   }
 
   return GetPlatformConfig().logical_cores;
+}
+
+bool IsSyncModeEnabled() {
+  static bool is_sync_mode_enabled = []() {
+    const char* sync_mode = std::getenv("TORCH_NEURONX_SYNC_MODE");
+    return sync_mode != nullptr && strcmp(sync_mode, "1") == 0;
+  }();
+  return is_sync_mode_enabled;
 }
 
 }  // namespace utils

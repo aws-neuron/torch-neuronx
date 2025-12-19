@@ -682,6 +682,9 @@ class Operation(ABC):
             if expected_shape is not None:
                 self._resize_output_if_needed(out, expected_shape)
 
+        # Create CPU fallback context with original inputs (args and kwargs)
+        # This is created once here before any implementation can modify inputs
+        cpu_fallback_context = {"original_inputs": list(args), "original_kwargs": dict(kwargs)}
         result = None
         first_failure_message = None
         fallback_only_for_unimplemented = (
@@ -697,6 +700,9 @@ class Operation(ABC):
                 can_handle_impl, can_handle_error_msg = can_handle_result, None
 
             if can_handle_impl:
+                # Store context directly on kernel for access
+                if hasattr(impl, "kernel") and impl.kernel is not None:
+                    impl.kernel._cpu_fallback_context = cpu_fallback_context
                 result = impl.execute(*args, **kwargs)
                 if result.success:
                     # Log that this operation was executed on Neuron

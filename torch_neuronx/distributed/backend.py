@@ -19,10 +19,25 @@ from torch._C._distributed_c10d import (
 )
 
 import torch_neuronx
+from torch_neuronx.python_ops.base import _create_and_raise_detailed_error
+from torch_neuronx.python_ops.xla_ops.all_gather_xla import AllGatherXlaOp
+from torch_neuronx.python_ops.xla_ops.reduce_scatter_xla import ReduceScatterXLAOp
 
 from .ops import all_gather_op, all_reduce_op, all_to_all_op, reduce_scatter_op
 from .ops.functional_collectives import register_neuron_collectives
-from .utils import create_global_replica_group, get_free_port, get_reduce_type
+from .utils import (
+    _calculate_allgather_splits,
+    _execute_with_xla_op_check,
+    _gather_splits_direct_to_output,
+    _gather_splits_with_rank_views,
+    _should_use_split_allgather,
+    _validate_no_zero_dim0,
+    create_global_replica_group,
+    get_free_port,
+    get_reduce_scatter_inputs_outputs,
+    get_reduce_type,
+    parse_and_update_inputs,
+)
 
 _WORLD_SIZE = None
 
@@ -44,6 +59,16 @@ _register_neuron_backend()
 dist.register_rendezvous_handler("neuron", rendezvous_handler)
 
 register_neuron_collectives()
+# Feature flag: Set NEURON_USE_SPLIT_ALLGATHER=1 to enable new split-based allgather
+_USE_SPLIT_ALLGATHER: bool = os.environ.get("NEURON_USE_SPLIT_ALLGATHER", "1") == "1"
+
+# Feature flag: Set NEURON_USE_SPLIT_REDUCE_SCATTER=1 to enable new split-based reduce_scatter,
+# enabled by default
+_USE_SPLIT_REDUCE_SCATTER: bool = os.environ.get("NEURON_USE_SPLIT_REDUCE_SCATTER", "1") == "1"
+# Bucket size limit for collective operations (in MB)
+_COLLECTIVE_BUCKETSIZE_BYTES: int = (
+    int(os.environ.get("COLLECTIVE_BUCKETSIZE_IN_MB", "512")) * 1024 * 1024
+)
 
 
 def _ret_work(ret):
@@ -251,6 +276,17 @@ class ProcessGroupNeuron(ProcessGroup):
             _WORLD_SIZE = size
             _neuron_runtime_setup(rank, size, store)
 
+        # Initialize NaN checking (disabled by default)
+        self._enable_nan_check = False
+
+    def _set_enable_nan_check(self, enable_nan_check: bool) -> None:
+        """Set whether to enable NaN checking for collective operations.
+
+        Args:
+            enable_nan_check: Whether to enable NaN checking
+        """
+        self._enable_nan_check = enable_nan_check
+
     def getBackendName(self):  # noqa N802
         return "neuron"
 
@@ -295,12 +331,14 @@ class ProcessGroupNeuron(ProcessGroup):
 
         if all_reduce_options is None:
             all_reduce_options = AllreduceOptions()
-
         replica_groups = [dist.get_process_group_ranks(self)]
+        processed_tensors, reduce_type = parse_and_update_inputs(
+            tensors, all_reduce_options.reduceOp
+        )
         all_reduce_op(
-            tensors,
+            processed_tensors,
             replica_groups,
-            get_reduce_type(all_reduce_options.reduceOp),
+            reduce_type,
             out=tuple(tensors),
         )
         return _ret_work(tensors)
@@ -333,13 +371,29 @@ class ProcessGroupNeuron(ProcessGroup):
         if opts is None:
             opts = AllgatherOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
+        world_size = len(replica_groups[0])
 
-        # Handle dimension mismatch by squeezing the tensor with more dimensions
         if len(output_tensor.shape) != len(input_tensor.shape):
             output_tensor = output_tensor.squeeze()
             input_tensor = input_tensor.squeeze()
 
-        all_gather_op(input_tensor, replica_groups, out=output_tensor)
+        if _USE_SPLIT_ALLGATHER and _should_use_split_allgather(
+            input_tensor, world_size, _COLLECTIVE_BUCKETSIZE_BYTES
+        ):
+
+            def core_fn():
+                splits = _calculate_allgather_splits(input_tensor, world_size)
+                _gather_splits_direct_to_output(
+                    splits, output_tensor, input_tensor.numel(), replica_groups, world_size
+                )
+
+            ag_op = AllGatherXlaOp()
+            args = (input_tensor, replica_groups)
+            kwargs = {"out": output_tensor}
+            _execute_with_xla_op_check(ag_op, "_allgather_base", core_fn, None, args, kwargs)
+        else:
+            all_gather_op(input_tensor, replica_groups, out=output_tensor)
+
         return _ret_work(output_tensor)
 
     def allgather(self, output_tensors_list, input_tensors, opts: AllgatherOptions | None = None):
@@ -366,13 +420,34 @@ class ProcessGroupNeuron(ProcessGroup):
         if opts is None:
             opts = AllgatherOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
-        all_gather_op(
-            input_tensors,
-            replica_groups,
-            opts=opts,
-            out=tuple(output_tensors_list[0]),
-            slice_output=True,
-        )
+        world_size = len(replica_groups[0])
+
+        all_tensors = input_tensors + list(output_tensors_list)
+        _validate_no_zero_dim0(all_tensors)
+
+        if _USE_SPLIT_ALLGATHER and _should_use_split_allgather(
+            input_tensors[0], world_size, _COLLECTIVE_BUCKETSIZE_BYTES
+        ):
+
+            def core_fn():
+                splits = _calculate_allgather_splits(input_tensors[0], world_size)
+                _gather_splits_with_rank_views(
+                    splits, output_tensors_list[0], replica_groups, world_size
+                )
+
+            ag_op = AllGatherXlaOp()
+            args = (input_tensors, replica_groups)
+            kwargs = {"opts": opts, "out": tuple(output_tensors_list[0]), "slice_output": True}
+            _execute_with_xla_op_check(ag_op, "allgather", core_fn, None, args, kwargs)
+        else:
+            all_gather_op(
+                input_tensors,
+                replica_groups,
+                opts=opts,
+                out=tuple(output_tensors_list[0]),
+                slice_output=True,
+            )
+
         return _ret_work(output_tensors_list)
 
     def allgather_coalesced(
@@ -415,32 +490,22 @@ class ProcessGroupNeuron(ProcessGroup):
             opts = AllgatherOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
         world_size = len(replica_groups[0])
-        # Flatten the nested output structure for XLA backend compatibility
-        # XLA expects a flat list of tensors rather than nested structure
-        temp_outputs = []
-        for input_tensor in input_tensors:
-            concat_shape = (world_size * input_tensor.shape[0], *input_tensor.shape[1:])
-            temp_output = torch.empty(
-                concat_shape, dtype=input_tensor.dtype, device=input_tensor.device
+        total_output_bytes = sum(t.numel() * t.element_size() * world_size for t in input_tensors)
+
+        if _USE_SPLIT_ALLGATHER and total_output_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
+            for input_tensor, output_list in zip(input_tensors, output_tensors_list, strict=False):
+                self.allgather([output_list], [input_tensor], opts)
+        else:
+            flattened_outputs = [
+                tensor for output_list in output_tensors_list for tensor in output_list
+            ]
+            all_gather_op(
+                input_tensors,
+                replica_groups,
+                opts=opts,
+                out=tuple(flattened_outputs),
+                slice_output=True,
             )
-            temp_outputs.append(temp_output)
-
-        all_gather_op(
-            input_tensors,
-            replica_groups,
-            opts=opts,
-            out=tuple(temp_outputs),
-            slice_output=False,
-        )
-
-        for i, (temp_output, output_list) in enumerate(
-            zip(temp_outputs, output_tensors_list, strict=False)
-        ):
-            input_shape = input_tensors[i].shape
-            chunks = torch.split(temp_output, input_shape[0], dim=0)
-            # Copy each chunk to the corresponding output tensor
-            for j, chunk in enumerate(chunks):
-                output_list[j].copy_(chunk)
 
         return _ret_work(output_tensors_list)
 
@@ -472,20 +537,25 @@ class ProcessGroupNeuron(ProcessGroup):
             opts = AllgatherOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
 
-        # Filter empty tensors - outputs list maintains original structure. Empty output tensors
-        # Remain unchanged (no data to gather). We return full outputs list, not filtered version
         non_empty_indices = [i for i, inp in enumerate(inputs) if inp.numel() > 0]
-
         if len(non_empty_indices) == 0:
             return _ret_work(outputs)
 
         non_empty_inputs = [inputs[i] for i in non_empty_indices]
         non_empty_outputs = [outputs[i] for i in non_empty_indices]
 
-        all_gather_op(
-            non_empty_inputs, replica_groups, out=tuple(non_empty_outputs), slice_output=False
-        )
-
+        all_tensors = non_empty_inputs + non_empty_outputs
+        _validate_no_zero_dim0(all_tensors)
+        total_output_bytes = sum(o.numel() * o.element_size() for o in non_empty_outputs)
+        if _USE_SPLIT_ALLGATHER and total_output_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
+            for input_tensor, output_tensor in zip(
+                non_empty_inputs, non_empty_outputs, strict=False
+            ):
+                self._allgather_base(output_tensor, input_tensor, opts)
+        else:
+            all_gather_op(
+                non_empty_inputs, replica_groups, out=tuple(non_empty_outputs), slice_output=False
+            )
         assert len(outputs) == len(
             inputs
         ), "Internal error: output list length changed during operation"
@@ -554,15 +624,51 @@ class ProcessGroupNeuron(ProcessGroup):
         """
         if reduce_scatter_options is None:
             reduce_scatter_options = ReduceScatterOptions()
-        # Passing [0] to both input and output as the c10d inside torch wraps both
-        # customer inputs and outputs with one more level of list
+
         replica_groups = [dist.get_process_group_ranks(self)]
-        reduce_scatter_op(
-            input_tensors_list[0],  # passing input as a list of tensors to PG backend
-            replica_groups,
-            get_reduce_type(reduce_scatter_options.reduceOp),
-            out=output_tensors[0],  # passing output as a tensor to PG backend
+        input_tensors_list, reduce_type = parse_and_update_inputs(
+            input_tensors_list, reduce_scatter_options.reduceOp
         )
+
+        # Calculate input bytes for bucket size check
+        total_numel = sum(tensor.numel() for tensor in input_tensors_list[0])
+        input_bytes = total_numel * input_tensors_list[0][0].element_size()
+
+        if _USE_SPLIT_REDUCE_SCATTER and input_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
+            # Check can_handle with original input list before concatenation
+            rs_op = ReduceScatterXLAOp()
+            args = (input_tensors_list[0], replica_groups, reduce_type)
+            kwargs = {"out": output_tensors[0]}
+            can_handle_result = rs_op.can_handle(*args, **kwargs)
+            if isinstance(can_handle_result, tuple):
+                can_handle_impl, can_handle_error_msg = can_handle_result
+            else:
+                can_handle_impl, can_handle_error_msg = can_handle_result, None
+
+            if can_handle_impl:
+                if len(input_tensors_list[0]) == 1:
+                    input_tensor = input_tensors_list[0][0]
+                else:
+                    input_tensor = torch.cat(input_tensors_list[0], dim=0)
+                self._reduce_scatter_base(output_tensors[0], input_tensor, reduce_scatter_options)
+                return _ret_work(output_tensors)
+
+            base_debug_msg = "No implementation could handle operation reduce_scatter. "
+            _create_and_raise_detailed_error(
+                RuntimeError,
+                "reduce_scatter",
+                base_debug_msg + can_handle_error_msg,
+                args,
+                kwargs,
+                None,
+            )
+        else:
+            reduce_scatter_op(
+                input_tensors_list[0],  # passing input as a list of tensors to PG backend
+                replica_groups,
+                reduce_type,
+                out=output_tensors[0],  # passing output as a tensor to PG backend
+            )
         return _ret_work(output_tensors)
 
     def reduce_scatter_coalesced(self, output_tensors, input_tensors_list, opts):
@@ -587,12 +693,42 @@ class ProcessGroupNeuron(ProcessGroup):
         if reduce_scatter_options is None:
             reduce_scatter_options = ReduceScatterOptions()
         replica_groups = [dist.get_process_group_ranks(self)]
-        reduce_scatter_op(
-            [input_tensor],
-            replica_groups,
-            get_reduce_type(reduce_scatter_options.reduceOp),
-            out=output_tensor,
+        input_tensor, reduce_type = parse_and_update_inputs(
+            input_tensor, reduce_scatter_options.reduceOp
         )
+        world_size = len(replica_groups[0])
+        reduce_type = get_reduce_type(reduce_scatter_options.reduceOp)
+        input_bytes = input_tensor.numel() * input_tensor.element_size()
+
+        if _USE_SPLIT_REDUCE_SCATTER and input_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
+
+            def core_fn():
+                input_gen, output_gen = get_reduce_scatter_inputs_outputs(
+                    input_tensor, output_tensor, world_size
+                )
+
+                # Iterate over buckets with explicit cleanup
+                for input_tensor_bucketed, output_tensor_bucketed in zip(
+                    input_gen, output_gen, strict=False
+                ):
+                    reduce_scatter_op(
+                        [input_tensor_bucketed],
+                        replica_groups,
+                        reduce_type,
+                        out=output_tensor_bucketed,
+                    )
+
+            rs_op = ReduceScatterXLAOp()
+            args = ([input_tensor], replica_groups, reduce_type)
+            kwargs = {"out": output_tensor}
+            _execute_with_xla_op_check(rs_op, "_reduce_scatter_base", core_fn, None, args, kwargs)
+        else:
+            reduce_scatter_op(
+                [input_tensor],
+                replica_groups,
+                reduce_type,
+                out=output_tensor,
+            )
         return _ret_work(output_tensor)
 
     def reduce_scatter_tensor_coalesced(
@@ -647,9 +783,7 @@ class ProcessGroupNeuron(ProcessGroup):
         replica_groups = [dist.get_process_group_ranks(self)]
         world_size = len(replica_groups[0])
         reduce_type = get_reduce_type(opts.reduceOp)
-
         non_empty_inputs, non_empty_outputs = _filter_empty_tensors(inputs, outputs)
-
         if len(non_empty_inputs) == 0:
             return _ret_work(outputs)
 
@@ -662,17 +796,45 @@ class ProcessGroupNeuron(ProcessGroup):
         # Allocate output for scattered result
         total_chunk_size = sum(inp.shape[0] // world_size for inp in non_empty_inputs)
         output_shape = [total_chunk_size, *concatenated.shape[1:]]
-
         scattered_output = torch.empty(
             output_shape, dtype=concatenated.dtype, device=concatenated.device
         )
 
-        # Perform single reduce-scatter operation
-        reduce_scatter_op([concatenated], replica_groups, reduce_type, out=scattered_output)
+        # Calculate input bytes for bucket size check
+        input_bytes = concatenated.numel() * concatenated.element_size()
+
+        if _USE_SPLIT_REDUCE_SCATTER and input_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
+            # Check can_handle before processing
+            rs_op = ReduceScatterXLAOp()
+            args = ([concatenated], replica_groups, reduce_type)
+            kwargs = {"out": scattered_output}
+            can_handle_result = rs_op.can_handle(*args, **kwargs)
+            if isinstance(can_handle_result, tuple):
+                can_handle_impl, can_handle_error_msg = can_handle_result
+            else:
+                can_handle_impl, can_handle_error_msg = can_handle_result, None
+
+            if can_handle_impl:
+                # Reuse _reduce_scatter_base for the concatenated tensor
+                self._reduce_scatter_base(scattered_output, concatenated, opts)
+            else:
+                base_debug_msg = (
+                    "No implementation could handle operation reduce_scatter_tensor_coalesced. "
+                )
+                _create_and_raise_detailed_error(
+                    RuntimeError,
+                    "reduce_scatter_tensor_coalesced",
+                    base_debug_msg + can_handle_error_msg,
+                    args,
+                    kwargs,
+                    None,
+                )
+        else:
+            # Perform single reduce-scatter operation
+            reduce_scatter_op([concatenated], replica_groups, reduce_type, out=scattered_output)
 
         # Split result and copy to output tensors
         result_chunks = _split_scattered_result(scattered_output, non_empty_inputs, world_size)
-
         for out, chunk in zip(non_empty_outputs, result_chunks, strict=False):
             out.copy_(chunk)
 
@@ -739,7 +901,7 @@ class ProcessGroupNeuron(ProcessGroup):
             out=tuple(output_tensors),
         )
 
-        return _ret_work(tensors) if self.rank == opts.rootRank else _ret_work(None)
+        return _ret_work(tensors) if self.rank() == opts.rootRank else _ret_work(None)
 
     def allreduce_coalesced(
         self, tensors, all_reduce_coalesced_options: AllreduceCoalescedOptions | None = None
@@ -998,7 +1160,7 @@ class ProcessGroupNeuron(ProcessGroup):
         """
         if opts is None:
             opts = ScatterOptions()
-        if torch.distributed.get_rank() == opts.rootRank:
+        if self.rank() == opts.rootRank:
             assert (
                 len(input_tensors_list[0]) == self.size()
             ), "Incorrect number of inputs for scatter"

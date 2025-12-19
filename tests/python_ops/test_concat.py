@@ -84,7 +84,9 @@ class TestConcat:
         device = "neuron"
         input1 = torch.ones((3, 3, 3))
         input2 = torch.zeros((3, 3, 2))
-        input3 = torch.empty((3, 3, 1))
+        input3 = torch.full((3, 3, 1), 2)  # tensor of twos
+        # previously used empty but that can potentially lead to NaN values if
+        # that mem loc has a NaN from before
 
         out_cpu = torch.concat((input1, input2, input3), -1)
 
@@ -101,7 +103,9 @@ class TestConcat:
         device = "neuron"
         input1 = torch.ones((3, 3, 3))
         input2 = torch.zeros((3, 3, 2))
-        input3 = torch.empty((3, 3, 1))
+        input3 = torch.full((3, 3, 1), 2)  # tensor of twos
+        # previously used empty but that can potentially lead to NaN values if
+        # that mem loc has a NaN from before
 
         # Clear any previous tracking
         torch_neuronx.clear_op_tracking()
@@ -380,6 +384,63 @@ class TestConcat:
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
         assert out_neuron.dtype == torch.float32
+        assert out_neuron.shape == torch.Size([50])
+
+    def test_concat_four_tensors_float64(self):
+        """Test concatenating 4 float64 tensors"""
+
+        device = "neuron"
+        t1 = torch.randn(64, dtype=torch.float64, device=device)
+        t2 = torch.randn(16, dtype=torch.float64, device=device)
+        t3 = torch.randn(64, dtype=torch.float64, device=device)
+        t4 = torch.randn(4, dtype=torch.float64, device=device)
+
+        out_cpu = torch.concat((t1.cpu(), t2.cpu(), t3.cpu(), t4.cpu()), dim=0)
+
+        with track_neuron_ops():
+            out_neuron = torch.concat((t1, t2, t3, t4), dim=0)
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+        assert out_neuron.shape == torch.Size([148])
+        assert out_neuron.dtype == torch.float64
+
+    def test_concat_mixed_precision_float32_float64(self):
+        """Test dtype promotion with float32 and float64"""
+
+        device = "neuron"
+        t1 = torch.ones(10, dtype=torch.float32, device=device)
+        t2 = torch.ones(10, dtype=torch.float64, device=device)
+        t3 = torch.ones(10, dtype=torch.float32, device=device)
+
+        out_cpu = torch.concat((t1.cpu(), t2.cpu(), t3.cpu()), dim=0)
+
+        with track_neuron_ops():
+            out_neuron = torch.concat((t1, t2, t3), dim=0)
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+        assert out_neuron.dtype == torch.float64
+        assert out_neuron.shape == torch.Size([30])
+
+    def test_concat_many_tensors_float32_float64(self):
+        """Test concatenating 10 tensors with alternating float32/float64"""
+
+        device = "neuron"
+        tensors = []
+        for i in range(10):
+            dtype = torch.float64 if i % 2 == 0 else torch.float32
+            tensors.append(torch.ones(5, dtype=dtype, device=device))
+
+        tensors_cpu = [t.cpu() for t in tensors]
+        out_cpu = torch.concat(tensors_cpu, dim=0)
+
+        with track_neuron_ops():
+            out_neuron = torch.concat(tensors, dim=0)
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+        assert out_neuron.dtype == torch.float64
         assert out_neuron.shape == torch.Size([50])
 
     def test_concat_bfloat16_promotion(self):

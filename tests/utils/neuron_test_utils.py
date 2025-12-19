@@ -256,6 +256,56 @@ def assert_op_falls_back_on_cpu(op_name: str):
     raise AssertionError(f"Operation {op_name} was not tracked in execution")
 
 
+def assert_op_does_not_run(op_name: str):
+    """Assert that an operation does not run at all (neither on Neuron nor CPU).
+
+    This verifies that the operation is not in the executed ops list AND not in the
+    fallback ops list. This is useful for verifying that lazy materialization
+    optimizations completely eliminate unnecessary operations like contiguous().
+
+    Uses the runtime op tracking APIs instead of file-based checking.
+    Should be called within or after a track_neuron_ops() context.
+
+    Args:
+        op_name: Name of the operation to check (e.g., "aten::contiguous")
+
+    Raises:
+        AssertionError: If the operation ran on Neuron or fell back to CPU
+    """
+    executed_ops = torch_neuronx.get_executed_ops()
+    fallback_ops = torch_neuronx.get_fallback_ops()
+
+    # Check if op ran on Neuron
+    if op_name in executed_ops:
+        print(f"❌ {op_name} found in executed ops (running on Neuron!)")
+        raise AssertionError(
+            f"Operation {op_name} ran on Neuron when it should not have run at all"
+        )
+
+    # Check if op fell back to CPU
+    if op_name in fallback_ops:
+        print(f"❌ {op_name} found in fallback ops (offloaded to CPU!)")
+        raise AssertionError(
+            f"Operation {op_name} fell back to CPU when it should not have run at all"
+        )
+
+    # Check for NKI kernel execution patterns
+    nki_variants = [
+        f"nki_{op_name}",
+        op_name.replace("aten::", "nki_"),
+        op_name.replace("aten::", ""),
+    ]
+
+    for variant in nki_variants:
+        if any(variant in op for op in executed_ops):
+            print(f"❌ NKI kernel variant '{variant}' detected (running on Neuron!)")
+            raise AssertionError(
+                f"NKI kernel variant of {op_name} ran on Neuron when it should not have run at all"
+            )
+
+    print(f"✓ {op_name} did not run (neither on Neuron nor CPU) - operation was eliminated")
+
+
 def count_cpu_bounce_calls(fn) -> dict[str, int]:
     """Count CPU bounce calls for a function by wrapping NRT read/write.
 
@@ -313,21 +363,6 @@ def get_total_core_count():
 
 def get_core_start_index():
     return get_pytest_worker_index() * get_total_core_count() // get_pytest_worker_count()
-
-
-def cpu_fallback_test(func):
-    """Decorator that removes TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS for CPU fallback"""
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        original_value = os.environ.pop("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", None)
-        try:
-            return func(*args, **kwargs)
-        finally:
-            if original_value is not None:
-                os.environ["TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS"] = original_value
-
-    return wrapper
 
 
 def get_cache_size(kernel):

@@ -90,9 +90,6 @@ class NeuronStream {
   /// Make this stream wait for another stream
   void wait_stream(const NeuronStream& other) const;
 
-  /// Register an event to complete after the last currently queued operation
-  void register_event_after_current_operations(NeuronEvent* event) const;
-
   DeviceType device_type() const {
     return c10::DeviceType::PrivateUse1;  // 'neuron'
   }
@@ -119,8 +116,14 @@ class NeuronStream {
   /// Create a new stream on a device
   static NeuronStream createStream(c10::DeviceIndex device_index = -1, int priority = 0);
 
+  /// Submit an event signal primitive to this stream
+  void SubmitEventSignal(const NeuronEvent& event) const;
+
+  /// Submit an event wait primitive to this stream
+  void SubmitEventWait(const NeuronEvent& event) const;
+
  private:
-  std::shared_ptr<struct StreamImpl> get_stream_impl() const;
+  StreamImpl* get_stream_impl() const;
 
   c10::Stream stream_;
 };
@@ -143,12 +146,7 @@ void synchronize(c10::DeviceIndex device_index = -1);
 /// Submit an operation context to the asynchronous execution.
 /// @param stream The stream to submit the operation to
 /// @param operation_context The operation to execute
-void SubmitOperationContext(const NeuronStream& stream, struct OperationContext operation_context);
-
-/// Record a pending operation on a stream.
-/// @param storage_impl Neuron storage
-/// @param future The future returned from SubmitOperationContext
-void RecordPendingOperation(c10_neuron::NeuronStorageImpl* storage_impl,
-                            const std::shared_future<OperationContextResult>& future);
+void SubmitOperationContext(const NeuronStream& stream,
+                            std::unique_ptr<OperationContext> operation_context);
 
 }  // namespace at::neuron

@@ -26,7 +26,7 @@ class CPUFallbackExecutorTest : public ::testing::Test {
     // Clean up environment
     unsetenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS");
   }
-  std::unique_ptr<CPUFallbackExecutor> executor_;
+  std::unique_ptr<mock::MockCPUFallbackExecutor> executor_;
 };
 
 // Test CPUFallbackExecutor constructor and configuration
@@ -35,11 +35,6 @@ TEST_F(CPUFallbackExecutorTest, ConstructorAndConfiguration) {
   {
     CPUFallbackExecutor executor;
     EXPECT_TRUE(executor.IsEnabled());
-
-    auto stats = executor.GetStatistics();
-    EXPECT_EQ(stats.total_fallback_attempts, 0);
-    EXPECT_EQ(stats.successful_fallbacks, 0);
-    EXPECT_EQ(stats.failed_fallbacks, 0);
   }
 
   // Test 2: Disabled via environment variable
@@ -137,6 +132,8 @@ TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackWithMockOperation) {
 
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kHLO));
 
   std::vector<TensorContext> input_contexts, output_contexts;
   for (const auto& t : inputs) input_contexts.push_back(TensorContext::FromTensor(t));
@@ -152,103 +149,6 @@ TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackWithMockOperation) {
   // Should fail because "test_op" is not a real PyTorch operation
   EXPECT_FALSE(result.IsSuccess());
   EXPECT_THAT(result.GetError(), ::testing::HasSubstr("CPU fallback failed for"));
-
-  // Verify statistics were updated
-  auto stats = executor_->GetStatistics();
-  EXPECT_EQ(stats.total_fallback_attempts, 1);
-  EXPECT_EQ(stats.successful_fallbacks, 0);
-  EXPECT_EQ(stats.failed_fallbacks, 1);
-}
-
-// Test statistics functionality
-TEST_F(CPUFallbackExecutorTest, Statistics) {
-  // Test initial statistics
-  auto stats = executor_->GetStatistics();
-  EXPECT_EQ(stats.total_fallback_attempts, 0);
-  EXPECT_EQ(stats.successful_fallbacks, 0);
-  EXPECT_EQ(stats.failed_fallbacks, 0);
-
-  // Execute a fallback operation to generate statistics
-  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
-  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
-
-  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
-
-  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
-  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
-
-  std::vector<TensorContext> input_contexts, output_contexts;
-  for (const auto& t : inputs) input_contexts.push_back(TensorContext::FromTensor(t));
-  for (const auto& t : outputs) output_contexts.push_back(TensorContext::FromTensor(t));
-
-  OperationContext mock_op(std::move(mock_kernel), input_contexts, output_contexts,
-                           "test_stack_trace");
-  mock_op.submit_time = std::chrono::steady_clock::now();
-
-  executor_->ExecuteCpuFallback(&mock_op);
-
-  // Check updated statistics
-  stats = executor_->GetStatistics();
-  EXPECT_EQ(stats.total_fallback_attempts, 1);
-  EXPECT_EQ(stats.successful_fallbacks + stats.failed_fallbacks, 1);
-
-  // Test reset statistics
-  executor_->ResetStatistics();
-  stats = executor_->GetStatistics();
-  EXPECT_EQ(stats.total_fallback_attempts, 0);
-  EXPECT_EQ(stats.successful_fallbacks, 0);
-  EXPECT_EQ(stats.failed_fallbacks, 0);
-}
-
-// Test multiple fallback attempts to verify statistics accumulation
-TEST_F(CPUFallbackExecutorTest, MultipleStatisticsAccumulation) {
-  // Execute multiple fallback operations
-  for (int i = 0; i < 3; ++i) {
-    std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
-    std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
-
-    auto mock_kernel =
-        std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
-
-    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
-    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
-
-    std::vector<TensorContext> input_contexts, output_contexts;
-    for (const auto& t : inputs) input_contexts.push_back(TensorContext::FromTensor(t));
-    for (const auto& t : outputs) output_contexts.push_back(TensorContext::FromTensor(t));
-
-    OperationContext mock_op(std::move(mock_kernel), input_contexts, output_contexts,
-                             "test_stack_trace");
-    mock_op.submit_time = std::chrono::steady_clock::now();
-
-    executor_->ExecuteCpuFallback(&mock_op);
-  }
-
-  // Verify statistics were accumulated
-  auto stats = executor_->GetStatistics();
-  EXPECT_EQ(stats.total_fallback_attempts, 3);
-  EXPECT_EQ(stats.successful_fallbacks + stats.failed_fallbacks, 3);
-}
-
-// Test thread safety of statistics (basic test)
-TEST_F(CPUFallbackExecutorTest, StatisticsThreadSafety) {
-  // This is a basic test - in a real scenario you'd want more comprehensive threading tests
-
-  // Get stats multiple times to ensure no race conditions in basic usage
-  auto stats1 = executor_->GetStatistics();
-  auto stats2 = executor_->GetStatistics();
-
-  EXPECT_EQ(stats1.total_fallback_attempts, stats2.total_fallback_attempts);
-  EXPECT_EQ(stats1.successful_fallbacks, stats2.successful_fallbacks);
-  EXPECT_EQ(stats1.failed_fallbacks, stats2.failed_fallbacks);
-
-  // Reset and verify
-  executor_->ResetStatistics();
-  auto stats3 = executor_->GetStatistics();
-
-  EXPECT_EQ(stats3.total_fallback_attempts, 0);
-  EXPECT_EQ(stats3.successful_fallbacks, 0);
-  EXPECT_EQ(stats3.failed_fallbacks, 0);
 }
 
 // Test configuration loading with different environment variable values

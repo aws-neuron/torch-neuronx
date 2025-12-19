@@ -12,9 +12,17 @@ from torch.distributed.tensor.parallel import (
 )
 
 
-def create_llama_block(hidden_size, num_attention_heads, intermediate_size, device, dtype=None):
+def create_llama_block(
+    hidden_size,
+    num_attention_heads,
+    intermediate_size,
+    device,
+    dtype=None,
+    max_seq_len=4096,
+    rope_theta=1_000_000.0,
+):
     """
-    Create and configure a Llama transformer block.
+    Create and configure a Llama transformer block with TorchTitan RoPE.
 
     Args:
         hidden_size: Embedding dimension
@@ -22,11 +30,15 @@ def create_llama_block(hidden_size, num_attention_heads, intermediate_size, devi
         intermediate_size: Feed-forward dimension
         device: Device to place model on
         dtype: Data type for model weights (optional)
+        max_seq_len: Maximum sequence length for RoPE cache (default: 4096)
+        rope_theta: RoPE theta parameter (default: 1_000_000.0)
 
     Returns:
         Configured block on specified device with specified dtype
     """
-    block = LlamaTransformerBlock(hidden_size, num_attention_heads, intermediate_size)
+    block = LlamaTransformerBlock(
+        hidden_size, num_attention_heads, intermediate_size, max_seq_len, rope_theta
+    )
     block = block.to(device, dtype=dtype) if dtype is not None else block.to(device)
     block.eval()
     return block
@@ -127,18 +139,21 @@ def create_config(preset_name, batch_size, seq_len):
         "intermediate_size": base_config.intermediate_size,
         "head_dim": base_config.head_dim,
         "num_attention_heads": base_config.num_attention_heads,
+        "max_seq_len": base_config.max_seq_len,
+        "rope_theta": base_config.rope_theta,
         "batch_size": batch_size,
         "seq_len": seq_len,
     }
 
 
-def create_block(config, device, dtype=None, tp_mesh=None):
+def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     """Create block from config dictionary.
 
     Args:
         config: Configuration dictionary
         device: Device to place model on
         dtype: Data type for model weights (optional)
+        tp_mesh: Tensor parallel mesh (optional)
 
     Returns:
         Configured block on specified device with specified dtype
@@ -149,6 +164,8 @@ def create_block(config, device, dtype=None, tp_mesh=None):
         config["intermediate_size"],
         device,
         dtype,
+        config.get("max_seq_len", 4096),
+        config.get("rope_theta", 1_000_000.0),
     )
     if tp_mesh:
         return parallelize_block(block, tp_mesh)

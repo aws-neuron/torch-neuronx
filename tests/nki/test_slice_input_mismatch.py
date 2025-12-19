@@ -1,3 +1,4 @@
+import neuronxcc.nki.typing as nt
 import pytest
 import torch
 
@@ -9,11 +10,12 @@ def _make_identity_kernel():
     """Create a simple load/store kernel that copies x -> y."""
 
     @TorchNeuronNKIKernel.trace
-    def copy_kernel(x, y):
+    def copy_kernel(x, y: nt.mutable_tensor):
         import neuronxcc.nki.language as nl
 
         x_tile = nl.load(x)
         nl.store(y, value=x_tile)
+        return y
 
     return copy_kernel
 

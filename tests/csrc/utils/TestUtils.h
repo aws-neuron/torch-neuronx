@@ -35,4 +35,21 @@ inline std::vector<torch::Tensor> create_empty_tensor_vector() {
   return std::vector<torch::Tensor>();
 }
 
+// Helper function to extract data pointers from tensors.
+// Converts a vector of tensors to a vector of void pointers.
+//
+// Parameters:
+//   tensors: Vector of torch::Tensor objects
+//
+// Returns:
+//   A vector of void* pointing to the tensor data
+inline std::vector<void*> get_tensor_data_ptrs(const std::vector<torch::Tensor>& tensors) {
+  std::vector<void*> ptrs;
+  ptrs.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    ptrs.push_back(tensor.data_ptr());
+  }
+  return ptrs;
+}
+
 }  // namespace at::neuron::testing

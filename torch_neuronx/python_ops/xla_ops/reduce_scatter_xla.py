@@ -88,26 +88,51 @@ class ReduceScatterXLAOp(XLABuilderOpImpl):
             if original_tensor_count > 1:
                 processed_input = concatenate_tensors(scribe)
                 scatter_dimension = 0
+                reduce_scatter_output_shape = final_output_shape
+                needs_reshape = False
             else:
                 input_shape = list(first_input_tensor.shape)
                 output_shape = list(output_tensor.shape)
+                # Normalize shapes to handle rank mismatches
+                normalized_input_shape, normalized_output_shape = self._normalize_shapes(
+                    input_shape, output_shape
+                )
                 diff_indices = [
                     i
-                    for i, (a, b) in enumerate(zip(input_shape, output_shape, strict=False))
+                    for i, (a, b) in enumerate(
+                        zip(normalized_input_shape, normalized_output_shape, strict=False)
+                    )
                     if a != b
                 ]
                 scatter_dimension = diff_indices[0] if diff_indices else 0
-                processed_input = dtype_shape[first_input_tensor.shape].Parameter(
-                    parameter_number=0
-                )
+
+                # Create parameter with actual input shape
+                param = dtype_shape[first_input_tensor.shape].Parameter(parameter_number=0)
+
+                # Check if normalization changed the shapes
+                needs_reshape = len(input_shape) != len(normalized_input_shape) or len(
+                    output_shape
+                ) != len(normalized_output_shape)
+
+                # Reshape to normalized shape if ranks differ
+                if needs_reshape:
+                    processed_input = dtype_shape[normalized_input_shape].Reshape(param)
+                    reduce_scatter_output_shape = dtype_shape[normalized_output_shape]
+                else:
+                    processed_input = param
+                    reduce_scatter_output_shape = final_output_shape
 
             # Perform ReduceScatter
-            reduce_scatter_result = final_output_shape.ReduceScatter(
+            reduce_scatter_result = reduce_scatter_output_shape.ReduceScatter(
                 processed_input,
                 replica_groups=replica_groups,
                 to_apply=reduce_fn,
                 dimensions={scatter_dimension},
             )
+
+            # Reshape back to expected output shape if needed
+            if original_tensor_count == 1 and needs_reshape:
+                reduce_scatter_result = final_output_shape.Reshape(reduce_scatter_result)
 
             # For AVG, divide by number of replicas
             if reduce == "AVG":
@@ -190,6 +215,26 @@ class ReduceScatterXLAOp(XLABuilderOpImpl):
         """Validate output tensor compatibility."""
         return self._validate_output_tensor_with_error(output_tensor, input_tensor) is None
 
+    def _normalize_shapes(self, input_shape, output_shape):
+        """Normalize shapes to same rank by padding with 1s.
+
+        Pads the shorter shape with leading 1s to match ranks.
+        Then validates that dimensions can only differ if one side is 1.
+
+        Returns:
+            tuple: (normalized_input_shape, normalized_output_shape, error_message)
+        """
+        input_shape = list(input_shape)
+        output_shape = list(output_shape)
+
+        # Pad shorter shape with leading 1s
+        if len(input_shape) > len(output_shape):
+            output_shape = [1] * (len(input_shape) - len(output_shape)) + output_shape
+        elif len(output_shape) > len(input_shape):
+            input_shape = [1] * (len(output_shape) - len(input_shape)) + input_shape
+
+        return input_shape, output_shape
+
     def _validate_output_tensor_with_error(self, output_tensor, input_tensor):
         """Validate output tensor and return error message if invalid."""
         if output_tensor is None:
@@ -203,6 +248,7 @@ class ReduceScatterXLAOp(XLABuilderOpImpl):
 
         output_shape = list(output_tensor.shape)
         input_shape = list(input_tensor.shape)
+        input_shape, output_shape = self._normalize_shapes(input_shape, output_shape)
         if len(output_shape) != len(input_shape):
             return (
                 f"output tensor rank ({len(output_shape)}) must match "
@@ -237,6 +283,8 @@ class ReduceScatterXLAOp(XLABuilderOpImpl):
 
     def _validate_single_tensor_scatter_with_error(self, input_shape, output_shape, replica_groups):
         """Validate single tensor scatter and return error message if invalid."""
+        # Normalize shapes to handle rank mismatches
+        input_shape, output_shape = self._normalize_shapes(input_shape, output_shape)
         replica_group = self._get_replica_group(replica_groups)
         diff_indices = [
             i for i, (a, b) in enumerate(zip(input_shape, output_shape, strict=False)) if a != b

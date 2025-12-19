@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import torch_neuronx  # This registers the neuron device
-from tests.utils.neuron_test_utils import assert_raises, cpu_fallback_test
+from tests.utils.neuron_test_utils import assert_raises
 
 
 @pytest.mark.multi_device

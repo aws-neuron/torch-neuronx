@@ -1,27 +1,8 @@
 # Training Qwen3-8B with torch-neuronx
 
-## Build torch-neuronx with torch nightly build
-Starting with the torch-neuronx DLC
+## Build torch-neuronx from source
 
-```shell
-# enable torch nightly build
-cd ~
-git clone git@github.com:aws-neuron/torch-neuronx.git
-cd torch-neuronx
-git apply docs/torchtitan/qwen3/TorchNeuronx.diff
-
-# install bazel
-bash install_bazelisk.sh
-
-# install astral-uv
-pip install uv
-
-# install updated requirements
-uv pip install --system -e . --force-reinstall
-
-# build torch-neuronx
-./tools/build
-```
+See Installation section in [README.md](../../../README.md)
 
 ## Setup TorchTitan
 ```shell

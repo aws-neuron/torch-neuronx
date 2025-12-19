@@ -21,17 +21,6 @@ NeuronStorageImpl::NeuronStorageImpl(use_byte_size_t use_byte_size, size_t size_
 }
 
 void NeuronStorageImpl::release_resources() {
-  if (has_pending_operation()) {
-    try {
-      auto& future = pending_operation_future_.value();
-      if (future.valid()) {
-        future.get();
-      }
-    } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failure releasing Neuron tensor: ", std::string(e.what()));
-    }
-    pending_operation_future_.reset();
-  }
   // The DataPtr deleter will handle freeing the neuron tensor
   // We just need to call the base class implementation
   StorageImpl::release_resources();

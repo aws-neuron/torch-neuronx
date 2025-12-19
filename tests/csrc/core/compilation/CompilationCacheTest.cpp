@@ -17,7 +17,7 @@ using ::testing::Return;
 class MockNeuronKernelExecution : public CompilableKernelExecution {
  public:
   MockNeuronKernelExecution(const std::string& cache_key)
-      : CompilableKernelExecution("mock_op", {}, {}, cache_key, "", "", false) {}
+      : CompilableKernelExecution(cache_key, "", "", false) {}
 
   // Mock compilation that returns dummy NEFF data
   std::vector<uint8_t> CompileToNeff() const override {
@@ -468,7 +468,7 @@ TEST_F(CompilationCacheTest, ErrorHandlingInCompilation) {
   class ThrowingMockKernelExecution : public CompilableKernelExecution {
    public:
     ThrowingMockKernelExecution(const std::string& cache_key)
-        : CompilableKernelExecution("throwing_op", {}, {}, cache_key, "", "", false) {}
+        : CompilableKernelExecution(cache_key, "", "", false) {}
 
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("Compilation failed");
@@ -614,7 +614,7 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   class ThrowingMockKernelExecution : public CompilableKernelExecution {
    public:
     ThrowingMockKernelExecution(const std::string& cache_key)
-        : CompilableKernelExecution("throwing_op", {}, {}, cache_key, "", "", false) {}
+        : CompilableKernelExecution(cache_key, "", "", false) {}
 
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("Compilation failed");

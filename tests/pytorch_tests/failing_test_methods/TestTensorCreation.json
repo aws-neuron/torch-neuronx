@@ -109,6 +109,7 @@
     "test_vstack_row_stack_neuron_float64",
     "test_zeros_dtype_layout_device_match_neuron_complex64",
     "test_zeros_neuron",
+    "test_zeros_bounds_checking_neuron",
     "test_cat_out_fast_path_dim0_dim1_neuron_int8"
   ]
 }

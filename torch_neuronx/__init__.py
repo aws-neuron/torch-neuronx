@@ -21,11 +21,16 @@ import torch
 
 # Import build-time configuration (generated during wheel build)
 try:
-    from ._build_config import DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED, DEFAULT_SYNC_MODE
+    from ._build_config import (
+        DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED,
+        DEFAULT_MLIR_ATEN_OPS,
+        DEFAULT_SYNC_MODE,
+    )
 except ImportError:
     # Fallback if _build_config.py doesn't exist (e.g., editable install)
-    DEFAULT_SYNC_MODE = "1"  # Dev default
+    DEFAULT_SYNC_MODE = "0"  # Dev default
     DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED = "1"
+    DEFAULT_MLIR_ATEN_OPS = "0"
 
 # For some reason log level is being set to TRACE without this
 if "JAX_LOGGING_LEVEL" not in os.environ:
@@ -37,6 +42,9 @@ os.environ.setdefault("TORCH_NEURONX_SYNC_MODE", DEFAULT_SYNC_MODE)
 os.environ.setdefault(
     "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED
 )
+
+# Set default for aten ops lowering
+os.environ.setdefault("TORCH_NEURONX_MLIR_ATEN_OPS", DEFAULT_MLIR_ATEN_OPS)
 
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
@@ -62,7 +70,8 @@ from .streams import Event, Stream
 NeuronCachingAllocator = _C.NeuronCachingAllocator
 
 # Import NKI kernel support
-from .nki_kernel import TorchNeuronNKIKernel, nki, nki_op
+from .nki_hop import nki, nki_op
+from .nki_kernel import TorchNeuronNKIKernel
 
 # Register neuron as a custom backend
 # This replaces PrivateUse1 with 'neuron'

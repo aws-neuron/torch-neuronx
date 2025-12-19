@@ -17,6 +17,32 @@
 
 namespace at::neuron {
 
+// Traits to map KernelTypeEnum to actual kernel types
+template <KernelTypeEnum KernelType>
+struct KernelTypeTraits;
+
+#define DEFINE_KERNEL_TYPE_TRAITS(ENUM_VALUE, KERNEL_TYPE) \
+  template <>                                              \
+  struct KernelTypeTraits<KernelTypeEnum::ENUM_VALUE> {    \
+    using type = KERNEL_TYPE;                              \
+  };
+
+DEFINE_KERNEL_TYPE_TRAITS(kHLO, XLACompilableKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kCollective, CollectiveDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kAlloc, AllocDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kDealloc, DeallocDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kCopy, CopyDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kWrite, WriteDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kRead, ReadDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kSlice, SliceDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)
+
+#undef DEFINE_KERNEL_TYPE_TRAITS
+
+// Alias template for cleaner syntax
+template <KernelTypeEnum KernelType>
+using KernelType_t = typename KernelTypeTraits<KernelType>::type;
+
 // Result of an operation execution with status and error information.
 struct OperationContextResult {
   enum Status {
@@ -46,6 +72,9 @@ struct OperationContextResult {
   }
 };
 
+// Forward declaration
+class StreamImpl;
+
 // Represents a complete operation that transforms from input to result state.
 // Combines the functionality of PipelineOperation and ExecutionResult into a single object
 // that evolves through the execution pipeline stages.
@@ -64,11 +93,14 @@ struct OperationContext {
   // Pipeline state (populated during execution)
   std::string python_stack_trace;  // Python stack trace for debugging
 
+  // Stream context - pointer to the stream this operation belongs to
+  StreamImpl* stream;
+
   // Completion handling
   std::promise<OperationContextResult> promise;
 
-  // Event dependencies - events this operation must wait for before starting
-  std::vector<NeuronEvent> events_to_wait_for;
+  // Execution readiness state (set after compilation completes or for direct ops)
+  std::atomic<bool> execution_ready_{false};
 
   // Timing information for performance analysis
   std::chrono::steady_clock::time_point submit_time;    // When operation was submitted
@@ -87,6 +119,7 @@ struct OperationContext {
         output_tensors_context(output_contexts),
         cpu_fallback_context(std::move(fallback_context)),
         python_stack_trace(python_stack_trace),
+        stream(nullptr),
         promise() {}
 
   // Accessor for CPU fallback context
@@ -143,24 +176,31 @@ struct OperationContext {
   // Check if this operation requires compilation.
   bool RequiresCompilation() const { return kernel_execution->RequiresCompilation(); }
 
-  // Get the compilable kernel execution (only valid if RequiresCompilation() returns true).
-  CompilableKernelExecution& GetCompilableKernel() const {
-    if (!kernel_execution->RequiresCompilation()) {
-      throw std::logic_error("GetCompilableKernel() called on direct kernel execution (op: " +
-                             kernel_execution->GetOpName() + ")");
-    }
+  // Mark operation as ready for execution (compilation complete or direct op)
+  void MarkExecutionReady() { execution_ready_.store(true, std::memory_order_release); }
+  // Check if operation is ready for execution
+  bool IsExecutionReady() const { return execution_ready_.load(std::memory_order_acquire); }
 
-    return *static_cast<CompilableKernelExecution*>(kernel_execution.get());
+  // Check if this operation is ready to execute (for event wait primitives)
+  bool IsSchedulable() const {
+    if (GetKernelType() == KernelTypeEnum::kEvent) {
+      return GetKernel<KernelTypeEnum::kEvent>().IsReady();
+    }
+    return IsExecutionReady();
   }
 
-  // Get the direct kernel execution (only valid if RequiresCompilation() returns false).
-  DirectKernelExecution& GetDirectKernel() const {
-    if (kernel_execution->RequiresCompilation()) {
-      throw std::logic_error("GetDirectKernel() called on compilable kernel execution (op: " +
-                             kernel_execution->GetOpName() + ")");
-    }
+  KernelTypeEnum GetKernelType() const { return kernel_execution->GetKernelType(); }
 
-    return *static_cast<DirectKernelExecution*>(kernel_execution.get());
+  // Get the compilable kernel execution (only valid if RequiresCompilation() returns true).
+  template <KernelTypeEnum KernelType>
+  KernelType_t<KernelType>& GetKernel() const {
+    return *static_cast<KernelType_t<KernelType>*>(kernel_execution.get());
+  }
+
+  CompilableKernelExecution& GetCompilableKernel() const {
+    auto* compilable = dynamic_cast<CompilableKernelExecution*>(kernel_execution.get());
+    TORCH_CHECK(compilable, "Kernel execution is not a compilable kernel");
+    return *compilable;
   }
 
   void Execute() {

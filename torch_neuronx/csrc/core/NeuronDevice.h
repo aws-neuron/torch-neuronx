@@ -1,9 +1,17 @@
 #pragma once
 
+#include <ATen/core/Tensor.h>
 #include <c10/core/Device.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 
 namespace c10_neuron {
+
+// Helper to check if a device is a Neuron device
+bool IsNeuronDevice(const c10::Device& device);
+
+// Helper function to extract device ID from the inputs and outputs
+int GetTargetDeviceId(const std::vector<at::Tensor>& inputs,
+                      const std::vector<at::Tensor>& outputs);
 
 // Get the current Neuron device index
 int current_device();

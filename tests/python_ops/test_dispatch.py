@@ -1,11 +1,6 @@
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import (
-    assert_op_falls_back_on_cpu,
-    cpu_fallback_test,
-    track_neuron_ops,
-)
 
 
 def test_contiguous_dispatch():
@@ -34,30 +29,6 @@ def test_contiguous_already_contiguous():
     # Should return same tensor
     x_c = x.contiguous()
     assert x_c is x
-
-
-@cpu_fallback_test
-def test_fallback_handler_unregistered_op():
-    """Test that unregistered operations fall back to CPU"""
-    # Create a tensor on CPU first, then move to neuron
-    x_cpu = torch.tensor([1, 2, 3], dtype=torch.int32)
-    x = x_cpu.to("neuron")
-
-    # Clear any previous tracking
-    torch_neuronx.clear_op_tracking()
-
-    # Use track_neuron_ops context manager to track operations
-    with track_neuron_ops():
-        # Use an operation that's not registered on Neuron
-        # This should trigger the fallback handler
-        y = torch.ops.aten._test_optional_intlist(x, None)
-
-        # Verify that the operation was offloaded to CPU using the neuron op tracer
-        assert_op_falls_back_on_cpu("aten::_test_optional_intlist")
-
-    # Result should still be correct (computed on CPU)
-    expected = torch.ops.aten._test_optional_intlist(x_cpu, None)
-    assert torch.allclose(y.cpu(), expected)
 
 
 def test_python_op_called_for_contiguous():

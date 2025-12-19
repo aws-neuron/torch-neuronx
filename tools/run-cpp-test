@@ -70,6 +70,7 @@ print_test_summary() {
 VERBOSE=false
 CLEAN=false
 TEST_TARGET=""
+TEST_ENV_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -81,19 +82,25 @@ while [[ $# -gt 0 ]]; do
             CLEAN=true
             shift
             ;;
+        --test_env=*)
+            TEST_ENV_ARGS+=("$1")
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS] [TEST_TARGET]"
             echo ""
             echo "Options:"
-            echo "  -v, --verbose    Show verbose test output"
-            echo "  -c, --clean      Clean before testing"
-            echo "  -h, --help       Show this help message"
+            echo "  -v, --verbose           Show verbose test output"
+            echo "  -c, --clean             Clean before testing"
+            echo "  --test_env=VAR=VALUE    Pass environment variable to test (can be used multiple times)"
+            echo "  -h, --help              Show this help message"
             echo ""
             echo "Examples:"
-            echo "  $0                                    # Run all C++ tests"
-            echo "  $0 //tests/csrc:NeuronDeviceTest      # Run specific test"
-            echo "  $0 -v                                 # Run all tests with verbose output"
-            echo "  $0 -c //tests/csrc:all                # Clean and run all tests"
+            echo "  $0                                                  # Run all C++ tests"
+            echo "  $0 //tests/csrc:NeuronDeviceTest                    # Run specific test"
+            echo "  $0 -v                                               # Run all tests with verbose output"
+            echo "  $0 -c //tests/csrc:all                              # Clean and run all tests"
+            echo "  $0 --test_env=TORCH_NEURONX_LOG_LEVEL=3 //tests/... # Run with debug logging"
             echo ""
             echo "Environment Variables:"
             echo "  PYTORCH_LOCAL_PATH    Path to PyTorch installation (default: .venv/lib/python3.10/site-packages/torch)"
@@ -145,6 +152,11 @@ fi
 
 # Add the dynamic LD_LIBRARY_PATH to the test environment
 BAZEL_CMD="$BAZEL_CMD --test_env=LD_LIBRARY_PATH=\"$DYNAMIC_LD_LIBRARY_PATH\""
+
+# Add any --test_env arguments passed to the script
+for arg in "${TEST_ENV_ARGS[@]}"; do
+    BAZEL_CMD="$BAZEL_CMD $arg"
+done
 
 # Add the test target
 BAZEL_CMD="$BAZEL_CMD $TEST_TARGET"

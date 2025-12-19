@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -295,6 +297,54 @@ def run_shape_mismatch_error(rank, world_size, kwargs):
     )
 
 
+def run_bucketing_memory_test(rank, world_size, kwargs):
+    """Test reduce_scatter_tensor_coalesced with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    with open(f"./neuron_core_id_{rank}.txt", "w") as f:
+        f.write(str(core_id))
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/"
+        "model_shared_scratchpad/peak"
+    )
+
+    default_group = torch.distributed.group.WORLD
+
+    for i in range(2):
+        tensor_size = (134217736 + i * 134217736) // world_size // 2
+
+        # Two tensors with same shape except dim 0
+        input1 = torch.ones(tensor_size, 3, dtype=torch.float32) * (rank + 1)
+        input2 = torch.ones(tensor_size, 3, dtype=torch.float32) * (rank + 2)
+
+        inputs = [input1.to("neuron"), input2.to("neuron")]
+        outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
+            inputs, "sum", world_size, default_group.group_name
+        )
+
+        sum_of_ranks = sum(range(1, world_size + 1))
+        expected1 = torch.ones(tensor_size // world_size, 3, dtype=torch.float32) * sum_of_ranks
+        expected2 = torch.ones(tensor_size // world_size, 3, dtype=torch.float32) * (
+            sum_of_ranks + world_size
+        )
+
+        assert torch.allclose(outputs[0].cpu(), expected1), "Output 0 does not match expected1"
+        assert torch.allclose(outputs[1].cpu(), expected2), "Output 1 does not match expected2"
+
+        peak = int(
+            os.popen(
+                f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+                f"neuron_core{core_id}/stats/memory_usage/device_mem/"
+                "model_shared_scratchpad/peak"
+            )
+            .read()
+            .strip()
+        )
+        assert peak <= 1073741824, f"Memory {peak} exceeds 1GB"
+
+
 class TestReduceScatterTensorCoalesced(BaseCollectiveOpTest):
     """Test cases for functional reduce_scatter_tensor_coalesced."""
 
@@ -386,3 +436,7 @@ class TestReduceScatterTensorCoalesced(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test reduce_scatter_tensor_coalesced with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+    def test_bucketing_memory(self):
+        """Test reduce_scatter_tensor_coalesced with bucketing for memory efficiency."""
+        self.distributed_tester.run_test(run_bucketing_memory_test)

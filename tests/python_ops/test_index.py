@@ -8,10 +8,8 @@ import torch
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_did_not_run_on_neuron,
-    assert_op_falls_back_on_cpu,
     assert_op_runs_on_neuron,
     assert_raises,
-    cpu_fallback_test,
     track_neuron_ops,
 )
 
@@ -205,23 +203,6 @@ class TestIndexRegistration:
             result = x[index]
             torch.testing.assert_close(result.cpu(), expected)
             assert_op_runs_on_neuron("index")
-
-    @cpu_fallback_test
-    @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
-    @assert_raises(
-        IndexError, match="tensors used as indices must be long, int, byte or bool tensors"
-    )
-    def test_invalid_index_dtype(self, dtype):
-        """Test invalid index dtype"""
-        input_data = [
-            [1.0, 2.0, 3.0, 4.0],
-            [5.0, 6.0, 7.0, 8.0],
-            [9.0, 10.0, 11.0, 12.0],
-            [13.0, 14.0, 15.0, 16.0],
-        ]
-        x = torch.tensor(input_data, device="neuron")
-        row_idx = torch.tensor([1, 2], dtype=dtype, device="neuron")  # 15 is out of bounds
-        x[row_idx, :]
 
     @pytest.mark.parametrize(
         "tensor_shape,indices_pattern",

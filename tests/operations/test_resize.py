@@ -163,3 +163,37 @@ class TestResize:
             assert x.shape == (20, 20)
             assert x.dtype == dtype
             assert_op_runs_on_neuron("aten::resize_")
+
+    @pytest.mark.parametrize(
+        "resize_case",
+        [
+            ("increase_size", (50, 50), (100, 100)),
+            ("decrease_size", (50, 50), (25, 25)),
+            ("same_size", (50, 50), (50, 50)),
+            ("different_dims", (50, 50), (10, 10, 10)),
+        ],
+    )
+    def test_resize_preserves_storage_identity(self, resize_case):
+        """Test that resize preserves storage identity - noswap data ptr."""
+        case_name, initial_shape, target_shape = resize_case
+        device = torch.device("neuron")
+
+        # Create tensor
+        tensor = torch.ones(initial_shape, device=device, dtype=torch.float32)
+
+        # Get C++ memory address to raw data buffer
+        original_storage_ptr = tensor.untyped_storage()._cdata
+
+        # Perform resize operation
+        with track_neuron_ops():
+            tensor.resize_(*target_shape)
+            assert tensor.shape == target_shape
+
+            # Check that underlying storage pointer is preserved
+            new_storage_ptr = tensor.untyped_storage()._cdata
+            assert new_storage_ptr == original_storage_ptr, (
+                f"Storage pointer should be preserved for {case_name} resize: "
+                f"{original_storage_ptr} != {new_storage_ptr}"
+            )
+
+            assert_op_runs_on_neuron("aten::resize_")

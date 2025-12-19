@@ -1,8 +1,10 @@
 """RMSNorm-specific block and performance calculations."""
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from block_def.rms_norm import Qwen3RMSNorm, RMSNorm
+from torch.distributed.tensor.parallel import SequenceParallel, parallelize_module
 
 
 def create_rms_norm_block(d_model, implementation, device, dtype=None):
@@ -61,7 +63,7 @@ def count_rms_norm_flops(d_model, seq_len, batch_size):
 
 def get_presets():
     """Return list of available implementations as presets."""
-    return ["custom", "torch", "qwen3", "qwen3_no_upcast"]
+    return ["custom", "torch", "qwen3", "qwen3_no_upcast", "rms_norm_tp"]
 
 
 def create_config(preset_name, batch_size, seq_len):
@@ -83,20 +85,30 @@ def create_config(preset_name, batch_size, seq_len):
     }
 
 
-def create_block(config, device, dtype=None, tp_mesh=None):
+def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     """Create block from config dictionary.
 
     Args:
         config: Configuration dictionary
         device: Device to place model on
         dtype: Data type for model weights (optional)
+        tp_mesh: Device mesh for tensor parallelism (optional)
 
     Returns:
         Configured block on specified device with specified dtype
     """
-    return create_rms_norm_block(
-        config["hidden_size"], config.get("implementation", "custom"), device, dtype
-    )
+    implementation = config.get("implementation", "custom")
+
+    if implementation == "rms_norm_tp":
+        block = nn.RMSNorm(config["hidden_size"], eps=1e-6)
+        block = block.to(device, dtype=dtype) if dtype is not None else block.to(device)
+
+        if tp_mesh and dist.is_initialized():
+            parallelize_module(block, tp_mesh, SequenceParallel())
+        return block
+
+    # No TP - use original implementations
+    return create_rms_norm_block(config["hidden_size"], implementation, device, dtype)
 
 
 def count_flops(config):

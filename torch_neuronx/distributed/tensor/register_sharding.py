@@ -17,8 +17,13 @@ from torch.distributed.tensor._op_schema import (
 )
 from torch.distributed.tensor._ops import (
     expand_to_full_mesh_op_strategy,
+    generate_redistribute_costs,
+    infer_broadcast_dims_map,
+    is_tensor_shardable,
+    map_placements_after_broadcast,
     register_op_strategy,
 )
+from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
 from torch.distributed.tensor._ops._matrix_ops import (
     _mm_like_strategy,
 )
@@ -332,83 +337,84 @@ def derive_bias_spec_from_grad_output(grad_output_spec, mesh):
 
 @register_op_strategy(aten.linear.default)
 def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
+    """
+    Linear strategy following the einsum-based approach used in addmm.
+
+    linear(input, weight, bias) computes: input @ weight.T + bias
+    where weight has shape (out_features, in_features)
+    """
     mesh = op_schema.get_mesh_from_args(validate=False)
     input_strategy, weight_strategy = op_schema.args_schema[:2]
     bias_strategy = op_schema.args_schema[2] if len(op_schema.args_schema) > 2 else None
 
-    strategies = []
-    num_strategies = len(input_strategy.strategies)
+    assert isinstance(input_strategy, OpStrategy)
+    assert isinstance(weight_strategy, OpStrategy)
 
-    for i in range(num_strategies):
-        input_spec = input_strategy.strategies[i].output_spec
-        weight_spec = weight_strategy.strategies[i].output_spec
-        bias_spec = bias_strategy.strategies[i].output_spec if bias_strategy else None
+    input_shape = input_strategy.shape
+    input_ndim = len(input_shape)
 
-        output_placements = []
-        input_ndim = len(input_spec.shape)
+    # Generate einsum equation for input @ weight.T
+    # Note: weight is (out_features, in_features), so we transpose it
+    # Simple 2D case: mk,nk->mn
+    # Batched case: ...mk,nk->...mn
+    batch_dims = "".join(chr(ord("a") + j) for j in range(input_ndim - 1))
+    mm_equation = f"{batch_dims}k,nk->{batch_dims}n"
 
-        for mesh_dim_idx in range(mesh.ndim):
-            input_placement = input_spec.placements[mesh_dim_idx]
-            weight_placement = weight_spec.placements[mesh_dim_idx]
+    # Generate all possible mm strategies
+    mm_strategy = gen_einsum_strategies(mm_equation, mesh)
 
-            if isinstance(input_placement, Shard):
-                input_shard_dim = input_placement.dim
-                if input_shard_dim < 0:
-                    input_shard_dim = input_ndim + input_shard_dim
+    # Compute expected output shape from mm
+    mm_out_shape = list(input_shape)
+    mm_out_shape[-1] = weight_strategy.shape[0]  # out_features
+    mm_out_shape = torch.Size(mm_out_shape)
 
-                # Input sharded on last dim (features) + weight sharded on input features (dim 1)
-                # Results in Partial (needs all_reduce)
-                if (
-                    input_shard_dim == input_ndim - 1
-                    and isinstance(weight_placement, Shard)
-                    and weight_placement.dim == 1
-                ):  # Changed from 0 to 1
-                    output_placements.append(Partial())
-                # Input sharded on batch dims - output inherits same sharding
-                elif input_shard_dim < input_ndim - 1:
-                    output_placements.append(input_placement)
-                else:
-                    output_placements.append(Replicate())
-            elif (
-                isinstance(weight_placement, Shard) and weight_placement.dim == 0
-            ):  # Changed from 1 to 0
-                # Weight sharded on output features - output sharded on last dim
-                output_placements.append(Shard(input_ndim - 1))
-            else:
-                # Both replicated
-                output_placements.append(Replicate())
+    # Filter strategies and handle bias
+    filtered_strategies = []
+    for strtg in mm_strategy.strategies:
+        assert strtg.input_specs is not None
+        input_spec = strtg.input_specs[0]
+        weight_spec = strtg.input_specs[1]
+        out_spec = strtg.output_spec
 
-        # Create output tensor meta (same shape as input but last dim = weight.shape[1])
-        output_shape = list(input_spec.shape)
-        output_shape[-1] = weight_spec.shape[0]
+        # Check if input and weight are shardable with these specs
+        if not (
+            is_tensor_shardable(input_strategy.shape, input_spec)
+            and is_tensor_shardable(weight_strategy.shape, weight_spec)
+        ):
+            continue
 
-        output_stride = list(input_spec.tensor_meta.stride)
-        if len(output_stride) > 0:
-            output_stride[-1] = 1  # Last dimension is contiguous
+        redistribute_cost = [
+            generate_redistribute_costs(input_strategy, input_spec),
+            generate_redistribute_costs(weight_strategy, weight_spec),
+        ]
+        # Handle bias if present
+        if bias_strategy:
+            assert isinstance(bias_strategy, OpStrategy)
+            bias_shape = bias_strategy.shape
 
-        output_spec = DTensorSpec(
-            mesh=mesh,
-            placements=tuple(output_placements),
-            tensor_meta=TensorMeta(
-                shape=torch.Size(output_shape),
-                stride=tuple(output_stride),
-                dtype=input_spec.tensor_meta.dtype,
-            ),
-        )
-
-        input_specs = [input_spec, weight_spec]
-        if bias_spec:
-            input_specs.append(bias_spec)
-
-        strategies.append(
-            OpSpec(
-                output_specs=output_spec,
-                input_specs=tuple(input_specs),
-                redistribute_cost=[[0.0] for _ in input_specs],
+            # Bias is 1D with shape (out_features,)
+            # Map its placement from the output's last dimension
+            broadcast_dims_map = infer_broadcast_dims_map(mm_out_shape, bias_shape)
+            bias_placements = map_placements_after_broadcast(
+                out_spec.placements, mm_out_shape, broadcast_dims_map
             )
-        )
+            bias_spec = DTensorSpec(mesh=mesh, placements=bias_placements)
 
-    return OpStrategy(strategies=strategies)
+            # Check if bias is shardable
+            if not is_tensor_shardable(bias_shape, bias_spec):
+                continue
+
+            # Update input specs to include bias
+            strtg.input_specs = (input_spec, weight_spec, bias_spec)
+
+            # Calculate redistribute costs
+            redistribute_cost.append(generate_redistribute_costs(bias_strategy, bias_spec))
+
+        strtg.redistribute_cost = redistribute_cost
+        filtered_strategies.append(strtg)
+
+    mm_strategy.strategies = filtered_strategies
+    return mm_strategy
 
 
 @register_op_strategy(aten.linear_backward.default)

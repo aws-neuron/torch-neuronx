@@ -12,7 +12,7 @@ from ..base import ExecutionResult, OperationImplementation
 logger = logging.getLogger(__name__)
 
 
-@neuron_op("aten::cat.out")
+@neuron_op("aten::cat.out", disable_dtype_autocast=True)
 class ConcatXLAImpl(OperationImplementation):
     """Concat implementation using XLA"""
 

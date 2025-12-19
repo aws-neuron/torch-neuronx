@@ -263,17 +263,16 @@ std::string mergeStableHLOModules(const std::string& mod_str1, const std::string
  * @param module1_output_addrs Tensor addresses for module1 outputs
  * @param module2_input_addrs Tensor addresses for module2 inputs
  * @param module2_output_addrs Tensor addresses for module2 outputs
+ * @param mapping Optional pointer to capture mapping information
  * @param verify_output Optional flag to enable/disable MLIR verification (default: true)
  *
  * @return Merged module as MLIR text string with intermediates skipped, empty string on failure
  */
-std::string mergeStableHLOModulesSkipIntermediates(const std::string& mod_str1,
-                                                   const std::string& mod_str2,
-                                                   const std::vector<void*>& module1_input_addrs,
-                                                   const std::vector<void*>& module1_output_addrs,
-                                                   const std::vector<void*>& module2_input_addrs,
-                                                   const std::vector<void*>& module2_output_addrs,
-                                                   bool verify_output = true);
+std::string mergeStableHLOModulesSkipIntermediates(
+    const std::string& mod_str1, const std::string& mod_str2,
+    const std::vector<void*>& module1_input_addrs, const std::vector<void*>& module1_output_addrs,
+    const std::vector<void*>& module2_input_addrs, const std::vector<void*>& module2_output_addrs,
+    MergeMapping* mapping = nullptr, bool verify_output = true);
 
 /**
  * @brief Enhanced interface that returns both merged MLIR and correct tensor mappings

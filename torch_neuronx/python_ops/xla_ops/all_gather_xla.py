@@ -85,12 +85,26 @@ class AllGatherXlaOp(XLABuilderOpImpl):
                 return output_pieces, out_shapes
 
             if slice_output:
-                # Extract slices for each rank from the gathered tensors
-                slice_pieces, slice_shapes = _extract_rank_slices(
-                    dtype_shape, input_tensors[0].shape, gathered, world_size
-                )
-                # Create a tuple from all slices
-                return scribe.tuple(*slice_shapes).Tuple(*slice_pieces)
+                if len(input_tensors) == 1:
+                    # Single tensor case
+                    slice_pieces, slice_shapes = _extract_rank_slices(
+                        dtype_shape, input_tensors[0].shape, gathered, world_size
+                    )
+                    return scribe.tuple(*slice_shapes).Tuple(*slice_pieces)
+                else:
+                    # Multiple tensors case: slice each gathered tensor
+                    all_slices = []
+                    all_shapes = []
+                    for i, input_tensor in enumerate(input_tensors):
+                        gathered_i = dtype_shape[out_shapes[i]].GetTupleElement(
+                            gathered, tuple_index=i
+                        )
+                        slice_pieces, slice_shapes = _extract_rank_slices(
+                            dtype_shape, input_tensor.shape, gathered_i, world_size
+                        )
+                        all_slices.extend(slice_pieces)
+                        all_shapes.extend(slice_shapes)
+                    return scribe.tuple(*all_shapes).Tuple(*all_slices)
             else:
                 return gathered
 
@@ -177,25 +191,47 @@ class AllGatherXlaOp(XLABuilderOpImpl):
 
         # Validate shapes based on operation type
         if slice_output:
-            if len(tensors) != 1:
-                return (
-                    False,
-                    (f"slice_output=True requires exactly 1 input tensor, got {len(tensors)}"),
-                )
-            shape_mismatches = [
-                (i, out.shape)
-                for i, out in enumerate(output_tensors)
-                if out.shape != tensors[0].shape
-            ]
-            if shape_mismatches:
-                shape_info = ", ".join([f"output[{i}]: {shape}" for i, shape in shape_mismatches])
-                return (
-                    False,
-                    (
-                        f"with slice_output=True, all output tensors must match "
-                        f"input shape {tensors[0].shape}, found: {shape_info}"
-                    ),
-                )
+            if len(tensors) == 1:
+                # Single tensor case
+                shape_mismatches = [
+                    (i, out.shape)
+                    for i, out in enumerate(output_tensors)
+                    if out.shape != tensors[0].shape
+                ]
+                if shape_mismatches:
+                    shape_info = ", ".join(
+                        [f"output[{i}]: {shape}" for i, shape in shape_mismatches]
+                    )
+                    return (
+                        False,
+                        (
+                            f"with slice_output=True, all output tensors must match "
+                            f"input shape {tensors[0].shape}, found: {shape_info}"
+                        ),
+                    )
+            else:
+                # Multiple tensors case: output should be nested structure
+                if len(output_tensors) != len(tensors) * world_size:
+                    return (
+                        False,
+                        (
+                            f"with slice_output=True and {len(tensors)} input tensors, "
+                            f"expected {len(tensors) * world_size} output tensors, "
+                            f"got {len(output_tensors)}"
+                        ),
+                    )
+                for i, input_tensor in enumerate(tensors):
+                    for j in range(world_size):
+                        out_idx = i * world_size + j
+                        if output_tensors[out_idx].shape != input_tensor.shape:
+                            return (
+                                False,
+                                (
+                                    f"output tensor at index {out_idx} has shape "
+                                    f"{output_tensors[out_idx].shape}, "
+                                    f"expected {input_tensor.shape} to match input tensor {i}"
+                                ),
+                            )
             return True, None
 
         if len(tensors) == 1:

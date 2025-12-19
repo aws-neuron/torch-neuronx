@@ -94,11 +94,33 @@
       "file": "distributed/test_device_mesh.py"
     },
     {
-      "file": "distributed/test_collective_utils.py"
+      "file": "distributed/test_collective_utils.py",
+      "xfail": [
+        {
+          "reason": "Patching issue - Error AttributeError: can't set attribute 'world_size', NCT base class property doesn't support set method, manually changed to 4096 in NDTestbase, then test pass, non functional",
+          "tests": [
+            "test_summarize_ranks"
+          ]
+        },
+        {
+          "reason": "Patching issue, need patch to move tensor from cpu to neuron - P1 priority -  NotImplementedError: Operation all_gather is not implemented for Neuron. Args: [arg0: list([0]: Tensor(shape=torch.Size([5056]), dtype=torch.uint8, device=cpu, ",
+          "tests": [
+            "test_check_rng_sync_device_cpu"
+          ]
+        }
+      ]
     },
     {
       "class": "InitDeviceMeshTest",
-      "file": "distributed/test_device_mesh.py"
+      "file": "distributed/test_device_mesh.py",
+      "xfail": [
+        {
+          "reason": "Patching issue - P1 priority, test is running on fake backend, we patches to make it run on neuron, follow up as P1 - error: AttributeError: 'ProcessGroupNeuron' object has no attribute 'options' ",
+          "tests": [
+            "test_backend_override_argument_dict_with_name_and_options"
+          ]
+        }
+      ]
     },
     {
       "class": "TestDeviceMeshGetItem",
@@ -133,6 +155,19 @@
         "test_tensor_dtype_mismatch"
       ],
       "xfail": [
+        {
+          "reason": "Unsupported api signature, error - output shape [2] doesn't match the broadcast shape [1,2 ] ; root cause - ProcessGroupNeuron reduce_scatter_tensor_coalesced API requires outputs.shape[0] == input.shape[0] // world_size, e.g input shape (2, 2), output shape (1, 2), but nccl allows output shape (2,) as long as elements count matches",
+          "tests": [
+            "test_reduce_scatter_tensor_coalesced"
+          ]
+        },
+        {
+          "reason": "Inflight async work registry in currently unsupported",
+          "tests": [
+            "test_unwaited",
+            "test_wait_tensor"
+          ]
+        },
         {
           "reason": "Pending Investigation - set_device() to peer rank not supported, PT test error -  raise ValueError(Invalid device id: {device}. Valid range is 0 to {device_count() - 1})",
           "tests": [
@@ -263,7 +298,31 @@
     {
       "class": "ProcessGroupNCCLGroupTest",
       "file": "distributed/test_c10d_nccl.py",
+      "skip_tests": [
+        {
+          "reason": "Skipping as it is P1, bcs it requires _set_default_timeout in backend.py and _check_nccl_timeout override in test_c10d_nccl to a no-op to pass(verified manually).",
+          "tests": [
+            "test_set_nccl_pg_timeout_backend_nccl",
+            "test_set_nccl_pg_timeout_backend0",
+            "test_init_process_group_nccl_timeout"
+          ]
+        },
+        {
+          "reason": "Skipping as it is P1, as it requires adding backend.comm_split_count(), backend.is_initialized to backend.py, and patching needs torch.cuda.synchronize() to torch.neuron.synchronize(), and also patching c10d.new_group([0, 1], device_id=device) to have None instead of passing device to device_id to make it pass(verified manually)",
+          "tests": [
+            "test_comm_eager_init_subgroup",
+            "test_abort_in_destroy_multi_pgs",
+            "test_abort_in_destroy_mixed_empty_pgs"
+          ]
+        }
+      ],
       "xfail": [
+        {
+          "reason": "Patching issue + unsupported feature - Error - ValueError: device_id neuron:1 is out of range. Please use a device index less than the number of accelerators available: 1. Two folds, 1. pathcing issue on device count 2. more importantly this is testing block_current_stream that not supported ",
+          "tests": [
+            "test_block_current_stream"
+          ]
+        },
         {
           "reason": "Pending Investigation - this is config related, will fix in upcoming CR -  RuntimeError: Invalid value of device 'neuron', expect torch.device, str, or None",
           "tests": [
@@ -271,8 +330,15 @@
           ]
         },
         {
+          "reason": "Skipping as it is Fp8 tests. We need to xfail as these methods are used in setup without which other tests fail",
+          "tests": [
+            "test_nan_assert_float8_e5m2",
+            "test_nan_assert_float8_e4m3fn"
+          ]
+        },
+        {
           "test_nan_rank_filter": {
-            "reason": "Pending Investigation - torch.dist.send() is not supported in enuron backend"
+            "reason": "Pending Investigation - torch.dist.send() is not supported in neuron backend"
           }
         },
         {
@@ -314,7 +380,16 @@
     },
     {
       "class": "ProcessGroupNCCLInitTest",
-      "file": "distributed/test_c10d_nccl.py"
+      "file": "distributed/test_c10d_nccl.py",
+      "xfail": [
+        {
+          "reason": "Patching issue - recent change torch.neuron.device_count() to be local_world_size, which is 1 before init_process_group. PT test directly use 1 as world size, which causes rank not list error. Manually configure world size to 64, test functionality fine. Error -  ValueError: 13 is not in list",
+          "tests": [
+            "test_scalable_init",
+            "test_init_wo_backend_str"
+          ]
+        }
+      ]
     },
     {
       "class": "LargeCommTest",
@@ -328,7 +403,7 @@
         "test_broadcast_object_list_subgroup_set_device0_group_rank_False",
         "test_new_group_local_sync_duplicated_pg"
       ],
-      "xfail": [
+      "skip_tests": [
         {
           "reason": "Temporarily not supported send_recv. Error type - No backend type associated with device type neuron",
           "tests": [
@@ -343,7 +418,9 @@
             "test_send_recv_object_list_subgroup_set_device0_group_rank_False",
             "test_send_recv_subgroup_group_rank_False_async_op_True"
           ]
-        },
+        }
+      ],
+      "xfail": [
         {
           "reason": "Pending investigation - serialization related - Error type - EOFError: Ran out of input",
           "tests": [
@@ -374,6 +451,12 @@
           "test_all_reduce_tracing": {
             "reason": "Pending Investigation - cant set world_size - should be a simple config issue - pending RCA"
           }
+        },
+        {
+          "reason": "Not supported feature - NotImplementedError: alltoall_base: Only even split sizes are supported. Got output_split_sizes: [3, 6, 9, 12]",
+          "tests": [
+            "test_all_to_all_single_neuron"
+          ]
         }
       ]
     }

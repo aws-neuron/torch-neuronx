@@ -6,7 +6,7 @@ import torch
 import torch_neuronx  # Registers neuron backend and ops
 from tests.utils.neuron_test_utils import (
     assert_op_falls_back_on_cpu,
-    cpu_fallback_test,
+    assert_raises,
     track_neuron_ops,
 )
 
@@ -25,8 +25,7 @@ def fail_jax_kernel_call(monkeypatch):
     monkeypatch.setattr(JaxKernel, "__call__", _fail)
 
 
-class TestCpuFallback:
-    @cpu_fallback_test
+class TestCpuFallbackLoweringError:
     def test_factory_op_no_tensor_args_falls_back_cleanly(self, fail_jax_kernel_call):
         """
         When a factory op (no tensor inputs) fails in JAX path, ensure CPU fallback:
@@ -44,7 +43,6 @@ class TestCpuFallback:
             assert tuple(x.shape) == size
             assert_op_falls_back_on_cpu("aten::ones")
 
-    @cpu_fallback_test
     def test_factory_out_param_resize_and_copy_on_fallback(self, fail_jax_kernel_call):
         """
         With an out tensor provided on neuron device and wrong shape:
@@ -66,6 +64,160 @@ class TestCpuFallback:
             assert_op_falls_back_on_cpu("aten::ones.out")
 
 
+class TestCpuFallback:
+    @assert_raises(
+        RuntimeError,
+        match="CPU fallback failed. Cannot copy result to output tensor which is not contiguous",
+    )
+    def test_copy_neuron_to_neuron_non_contiguous(self):
+        tile_t = 128
+        tile_h = 128
+        nopad_t = 128
+        nopad_h = 64
+
+        x = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
+        y = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
+        z = x[:nopad_t, :nopad_h]
+
+        # Should raise error for copying to non-contiguous destination
+        y[:nopad_t, :nopad_h] = z
+
+    def test_fallback_handler_unregistered_op(self):
+        """Test that unregistered operations fall back to CPU"""
+        # Create a tensor on CPU first, then move to neuron
+        x_cpu = torch.tensor([1, 2, 3], dtype=torch.int32)
+        x = x_cpu.to("neuron")
+
+        # Clear any previous tracking
+        torch_neuronx.clear_op_tracking()
+
+        # Use track_neuron_ops context manager to track operations
+        with track_neuron_ops():
+            # Use an operation that's not registered on Neuron
+            # This should trigger the fallback handler
+            y = torch.ops.aten._test_optional_intlist(x, None)
+
+            # Verify that the operation was offloaded to CPU using the neuron op tracer
+            assert_op_falls_back_on_cpu("aten::_test_optional_intlist")
+
+        # Result should still be correct (computed on CPU)
+        expected = torch.ops.aten._test_optional_intlist(x_cpu, None)
+        assert torch.allclose(y.cpu(), expected)
+
+    @assert_raises(
+        RuntimeError,
+        match="torch.histogram: input tensor and hist tensor should have the same dtype, "
+        "but got input float and hist int",
+    )
+    def test_histc_out_inconsistent_dtype_neuron(self):
+        """Test histc with inconsistent dtype on Neuron device."""
+        device = "neuron"
+        x = torch.randn(100, device=device)
+        out = torch.zeros(10, device=device, dtype=torch.int32)
+        torch.histc(x, bins=10, out=out)
+
+    @assert_raises((IndexError, RuntimeError), match=r".*index_copy[\s\S]*out of bound.*")
+    def test_index_copy_with_indices_out_of_range(self):
+        """Test index select with indices out of range"""
+
+        device = "neuron"
+        input = torch.zeros(5, 3)
+        input_neuron = input.to(device)
+        source = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
+        source_neuron = source.to(device)
+        indices = torch.tensor([0, 6, 2])
+        indices_neuron = indices.to(device)
+        input_neuron.index_copy(0, indices_neuron, source_neuron)
+
+    @assert_raises(
+        RuntimeError, match=r"index_copy_\(\): Expected a long tensor for index, but got Float"
+    )
+    def test_index_copy_empty_indices(self):
+        """Test index select with empty index"""
+
+        device = "neuron"
+        input = torch.zeros(5, 3)
+        input_neuron = input.to(device)
+        source = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
+        source_neuron = source.to(device)
+        indices = torch.tensor([])
+        indices_neuron = indices.to(device)
+
+        # CPU error message does not seem to be descriptive neither
+        input_neuron.index_copy(0, indices_neuron, source_neuron)
+
+    @assert_raises(IndexError, match="index out of range in self")
+    def test_index_select_with_input_empty(self):
+        """Test index select with input empty"""
+
+        device = "neuron"
+        input = torch.empty((0,))
+        indices = torch.tensor([0])
+
+        torch.index_select(input.to(device), dim=0, index=indices.to(device))
+
+    @assert_raises(
+        AssertionError,
+        match=r".*aten::index_select ran on Neuron instead of falling back to CPU",
+    )
+    def test_index_select_empty_indices(self):
+        """Test index select with empty indices"""
+        device = "neuron"
+        input = torch.randn(3, 4)
+        input_neuron = input.to(device)
+        indices = torch.empty((0,), dtype=torch.int32)
+
+        # empty tensor handler should handle this without running on neuron or fall back to CPU
+        with track_neuron_ops():
+            result = torch.index_select(input_neuron, dim=0, index=indices.to(device))
+            assert result.numel() == 0
+            assert_op_falls_back_on_cpu("aten::index_select")
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
+    @assert_raises(
+        IndexError, match="tensors used as indices must be long, int, byte or bool tensors"
+    )
+    def test_invalid_index_dtype(self, dtype):
+        """Test invalid index dtype"""
+        input_data = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ]
+        x = torch.tensor(input_data, device="neuron")
+        row_idx = torch.tensor([1, 2], dtype=dtype, device="neuron")  # 15 is out of bounds
+        x[row_idx, :]
+
+    @pytest.mark.parametrize(
+        "shape1,shape2,shape3,expected_error",
+        [
+            (
+                (3, 4),
+                (5, 10),
+                None,
+                "mat1 and mat2 shapes cannot be multiplied \\(3x4 and 10x5\\)",
+            ),  # Wrong input dimension
+            (
+                (3, 4),
+                (5, 4),
+                (10,),
+                "The expanded size of the tensor \\(5\\) must match the existing size \\(10\\) "
+                "at non-singleton dimension 1",
+            ),  # Wrong bias dimension
+        ],
+    )
+    @assert_raises(RuntimeError)
+    def test_linear_dimension_mismatch_error(self, shape1, shape2, shape3, expected_error):
+        """Test that dimension mismatch raises appropriate error"""
+        with track_neuron_ops():
+            input_neuron = torch.rand(shape1, device="neuron")
+            weight_neuron = torch.rand(shape2, device="neuron")
+            bias_neuron = None if shape3 is None else torch.rand(shape3, device="neuron")
+
+            torch.nn.functional.linear(input_neuron, weight_neuron, bias=bias_neuron)
+
+
 @pytest.mark.skipif(
     os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
     reason="Async CPU fallback is only relevant with aysnc execution mode",
@@ -85,7 +237,6 @@ class TestCpuFallbackAsync:
         """Reset environment variables."""
         os.environ.pop("NEURON_CC_FLAGS", None)
 
-    @cpu_fallback_test
     def test_cpufallback_basic(self):
         """Test callBoxed path with scalar argument: mul."""
         x = torch.randn(2, 3, device="neuron")
@@ -98,7 +249,6 @@ class TestCpuFallbackAsync:
             assert torch.allclose(result.to("cpu"), expected)
             assert_op_falls_back_on_cpu("mul")
 
-    @cpu_fallback_test
     def test_static_arg_single_int(self):
         """Test CPU fallback with single int static arg: index_select(x, dim, index)."""
         x = torch.randn(3, 4, device="neuron")
@@ -110,7 +260,6 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert_op_falls_back_on_cpu("aten::index_select")
 
-    @cpu_fallback_test
     def test_static_arg_tuple_string_float(self):
         """Test CPU fallback with tuple, string and float as static arg: pad(x, pad, mode, value)"""
         x = torch.randn(2, 3, device="neuron")
@@ -121,7 +270,6 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert_op_falls_back_on_cpu("aten::pad")
 
-    @cpu_fallback_test
     def test_static_arg_bool(self):
         """Test CPU fallback with bool as static args: triu with diagonal."""
         m = torch.randn(4, 4, device="neuron")
@@ -133,7 +281,6 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert_op_falls_back_on_cpu("aten::triu")
 
-    @cpu_fallback_test
     def test_static_arg_multiple_tuples(self):
         """Test CPU fallback with multiple tuples static args: conv2d."""
         input_tensor = torch.randn(1, 3, 5, 5, device="neuron")
@@ -147,7 +294,6 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert_op_falls_back_on_cpu("aten::convolution")
 
-    @cpu_fallback_test
     def test_static_arg_stack(self):
         """Test CPU fallback with list of input tensors: stack(tensors, dim)."""
         t1 = torch.randn(2, 3, device="neuron")
@@ -159,7 +305,6 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert_op_falls_back_on_cpu("aten::stack")
 
-    @cpu_fallback_test
     def test_static_arg_tensor_inplace(self):
         """Test CPU fallback with tensor static arg in-place op: fill_(x, fill_value)."""
         x = torch.randn(2, 3, device="neuron")
@@ -172,7 +317,6 @@ class TestCpuFallbackAsync:
             assert torch.allclose(result.to("cpu"), torch.full((2, 3), 5.0))
             assert_op_falls_back_on_cpu("aten::fill_.Tensor")
 
-    @cpu_fallback_test
     def test_static_arg_scalar_inplace(self):
         """Test CPU fallback with tensor static arg in-place op: fill_(x, fill_value)."""
         x = torch.randn(2, 3, device="neuron")

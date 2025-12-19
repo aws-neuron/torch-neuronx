@@ -12,7 +12,6 @@ TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
 HAS_FUSED_RMS_NORM = TORCH_VERSION >= (2, 9)
 
 
-@pytest.mark.xfail
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 class TestRMSNormOperations:
     """Test RMS norm cases not covered by PyTorch's test_rmsnorm_numeric."""

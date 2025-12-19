@@ -28,6 +28,15 @@ class NoCastArgumentProcessor(ArgumentProcessor):
                 converted.append(inp)
             elif isinstance(inp, torch.Tensor):
                 converted.append(inp if inp.is_contiguous() else inp.contiguous())
+            # Handle nested structures
+            elif isinstance(inp, (list | tuple)):
+                converted.append(self.preprocess_inputs(tuple(inp)))
+            elif isinstance(inp, torch.dtype):
+                # Map torch.dtype to ScalarType enum values as defined in
+                # c10/core/ScalarType.h for MLIR lowring
+                scalar_type_int = ArgumentProcessor._get_scalar_type_value(inp)
+                converted.append(scalar_type_int)
             else:
                 converted.append(inp)
+
         return tuple(converted)

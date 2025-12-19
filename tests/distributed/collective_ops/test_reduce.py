@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.utils.neuron_test_utils import assert_raises, cpu_fallback_test
+from tests.utils.neuron_test_utils import assert_raises
 
 from .base_collective_op import BaseCollectiveOpTest
 
@@ -276,6 +276,29 @@ def run_different_device_test(rank, world_size, kwargs):
     dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
 
 
+def run_group_reduce_world_size_4_test(rank, world_size, kwargs):
+    """Test reduce within group [2,3] where all group members reduce to rank 3."""
+    group: dist.ProcessGroup = dist.new_group([2, 3])
+
+    if rank in [2, 3]:
+        # Each rank starts with tensor filled with its rank value
+        tensor = torch.ones(10, device="neuron") * rank
+
+        # Reduce to rank 3 (group_dst=1 since rank 3 is index 1 in group [2,3])
+        dist.reduce(tensor, group_dst=1, group=group)
+
+        if rank == 3:
+            # Rank 3 should have the sum: 2 + 3 = 5
+            expected = torch.ones(10) * 5
+            assert torch.allclose(tensor.cpu(), expected)
+        else:  # rank == 2
+            # Rank 2's tensor should remain unchanged
+            expected = torch.ones(10) * rank
+            assert torch.allclose(tensor.cpu(), expected)
+
+    dist.destroy_process_group(group)
+
+
 class TestReduce(BaseCollectiveOpTest):
     """Test cases for torch.distributed.reduce."""
 
@@ -382,3 +405,13 @@ class TestReduce(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test reduce with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+
+class TestReduceTensorWorldSize4(BaseCollectiveOpTest):
+    """Test cases for torch.distributed.scatter with a world size of 4."""
+
+    world_size = 4  # Set at class level instead of in setup_method
+
+    def test_group_reduce_with_rank_data(self):
+        """Test scatter within group [2,3] with group_src=1 (global rank 3)."""
+        self.distributed_tester.run_test(run_group_reduce_world_size_4_test)

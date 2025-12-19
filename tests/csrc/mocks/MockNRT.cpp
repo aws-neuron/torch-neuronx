@@ -97,6 +97,15 @@ NRT_STATUS nrt_tensor_read(const nrt_tensor_t* tensor, void* buf, size_t offset,
   return NRT_FAILURE;
 }
 
+NRT_STATUS nrt_tensor_copy(const nrt_tensor_t* src, size_t src_offset, nrt_tensor_t* dst,
+                           size_t dst_offset, size_t size) {
+  if (g_mocks_initialized) {
+    return torch_neuronx::testing::MockNRT::GetInstance()->nrt_tensor_copy(src, src_offset, dst,
+                                                                           dst_offset, size);
+  }
+  return NRT_FAILURE;
+}
+
 NRT_STATUS nrt_allocate_tensor_set(nrt_tensor_set_t** tensor_set) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrt_allocate_tensor_set(tensor_set);

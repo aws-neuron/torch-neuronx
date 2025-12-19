@@ -95,7 +95,9 @@ class TypeConverter(BaseTypeConverter):
             cpu_tmp = cast_policy.copy_neuron_to_cpu(
                 tensor, target_dtype=target_dtype, non_blocking=non_blocking
             )
-            return cast_policy.copy_cpu_to_neuron(cpu_tmp, tensor.device, target_dtype)
+            return cast_policy.copy_cpu_to_neuron(
+                cpu_tmp, tensor.device, target_dtype, non_blocking
+            )
 
         # Can't think of a reason why we would reach here but not confident enough to assert.
         # Keep the existing behavior; the code is too low in the stack to mess with it.
