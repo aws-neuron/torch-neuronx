@@ -112,7 +112,8 @@ class ToCopyNeuronImpl(OperationImplementation):
 
             result = torch.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
             try:
-                write_neuron_to_neuron(result, self_tensor, non_blocking=non_blocking)
+                # In case of D2D without CPU bounces, copies are not blocking.
+                write_neuron_to_neuron(result, self_tensor, non_blocking=True)
             except Exception as e:
                 return ExecutionResult(success=False, error_msg=str(e))
             return ExecutionResult(success=True, output=result)

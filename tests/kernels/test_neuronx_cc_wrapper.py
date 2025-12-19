@@ -109,18 +109,26 @@ class TestNeuronxCCWrapper:
             "custom-value",
         ]
 
-        config, lnc_override, workdir = wrapper._parse_neuronx_cc_args(args)
+        parsed = wrapper._parse_neuronx_cc_args(args)
 
-        assert config.input == str(input_file)
-        assert config.output == str(output)
-        assert workdir == str(temp_dirs["temp"])
-        assert config.framework == "XLA"
-        assert config.target == "trn1"
-        assert config.model_type == "transformer"
-        assert config.auto_cast == "fp16"
-        assert lnc_override == "1"
-        assert config.optimization_level == "-O2"
-        assert config.extra_flags == ["--custom-flag", "custom-value"]
+        # Verify I/O paths are returned separately in ParsedArgs, not in config
+        assert parsed.input_file == str(input_file)
+        assert parsed.output_file == str(output)
+        assert parsed.workdir == str(temp_dirs["temp"])
+
+        # Verify config contains only compilation parameters
+        assert parsed.config.framework == "XLA"
+        assert parsed.config.target == "trn1"
+        assert parsed.config.model_type == "transformer"
+        assert parsed.config.auto_cast == "fp16"
+        assert parsed.lnc_override == "1"
+        assert parsed.config.optimization_level == "-O2"
+        assert parsed.config.extra_flags == ["--custom-flag", "custom-value"]
+
+        # Verify config does NOT have input/output/workdir attributes
+        assert not hasattr(parsed.config, "input")
+        assert not hasattr(parsed.config, "output")
+        assert not hasattr(parsed.config, "workdir")
 
     def test_successful_compilation_hlo(
         self, temp_dirs, sample_hlo, sample_neff, mock_compiler_subprocess
@@ -361,11 +369,11 @@ class TestNeuronxCCWrapper:
             str(temp_dirs["temp"]),
         ]
 
-        config, lnc_override, workdir = wrapper._parse_neuronx_cc_args(args)
+        parsed = wrapper._parse_neuronx_cc_args(args)
 
         # Verify NEURON_CC_FLAGS are prepended before existing extra args
         expected_extra_flags = ["--env-flag", "env-value", "--existing-flag", "existing-value"]
-        assert config.extra_flags == expected_extra_flags
+        assert parsed.config.extra_flags == expected_extra_flags
 
     def test_neuron_cc_flags_empty(self, sample_hlo, temp_dirs, monkeypatch):
         """Test behavior when NEURON_CC_FLAGS is empty."""
@@ -387,8 +395,8 @@ class TestNeuronxCCWrapper:
             str(temp_dirs["temp"]),
         ]
 
-        config, lnc_override, workdir = wrapper._parse_neuronx_cc_args(args)
-        assert config.extra_flags == []
+        parsed = wrapper._parse_neuronx_cc_args(args)
+        assert parsed.config.extra_flags == []
 
     def test_input_file_corrupted_data(self, temp_dirs, mock_compiler_subprocess, monkeypatch):
         """Test compilation when input file has corrupted/unreadable data."""

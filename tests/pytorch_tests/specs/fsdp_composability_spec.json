@@ -1,0 +1,24 @@
+{
+  "test_configurations": [
+    {
+      "class": "TestFullyShard2DTraining",
+      "file": "distributed/_composable/test_composability/test_2d_composability.py",
+      "xfail": [
+        {
+          "reason": "raise error_metas.pop()[0].to_error(  # type: ignore[index]. AssertionError: Scalars are not equal/close!",
+          "tests": [
+            "test_tp_with_fsdp_offloading",
+            "test_train_parity_2d_transformer",
+            "test_train_parity_2d_mlp"
+          ]
+        },
+        {
+          "reason": "RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.",
+          "tests": [
+            "test_train_parity_2d_transformer_checkpoint_resume"
+          ]
+        }
+      ]
+    }
+  ]
+}

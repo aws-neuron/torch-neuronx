@@ -4,46 +4,44 @@
 
 #include <vector>
 
+#include "torch_neuronx/csrc/core/utils/TensorContext.h"
+
 namespace at::neuron {
 
 /**
  * Encapsulates all metadata needed for CPU fallback execution.
- * Groups static argument info and list argument reconstruction data.
- *
- * This struct bundles four pieces of information previously passed separately:
- * - static_args: Values of arguments marked as static (not compiled into NEFF)
- * - static_arg_positions: Original positions of static arguments
- * - list_arg_positions: Positions where list/tuple arguments were flattened
- * - list_arg_lengths: Number of elements in each flattened list/tuple
+ * Original inputs are stored in base.py and passed here.
+ * Metadata and data pointers are extracted in C++ from original_inputs.
  */
 struct CPUFallbackContext {
-  // Static arguments (constants not compiled into NEFF)
-  std::vector<c10::IValue> static_args;
-  std::vector<int64_t> static_arg_positions;
+  // All original positional inputs (tensors + scalars, lists preserved)
+  // Populated from Python in base.py before any implementation modifies inputs
+  std::vector<c10::IValue> original_inputs;
 
-  // List argument reconstruction metadata
-  std::vector<int64_t> list_arg_positions;
-  std::vector<int64_t> list_arg_lengths;
+  // Original keyword arguments (e.g., alpha=, out=, dim=)
+  // Populated from Python in base.py
+  c10::impl::GenericDict original_kwargs;
+
+  // Tensor metadata (shape, dtype, etc.) extracted from original_inputs
+  // Populated in ConvertToCPUFallbackContext
+  std::vector<TensorContext> tensor_metadata;
+
+  // Data pointers for tensor inputs, extracted from original_inputs
+  // Updated by ProcessTensorsWithSlicing for sliced tensors
+  std::vector<void*> tensor_data_ptrs;
 
   // Default constructor creates empty context
-  CPUFallbackContext() = default;
+  CPUFallbackContext()
+      : original_kwargs(c10::impl::GenericDict(c10::StringType::get(), c10::AnyType::get())) {}
 
-  // Full constructor
-  CPUFallbackContext(std::vector<c10::IValue> args, std::vector<int64_t> arg_positions,
-                     std::vector<int64_t> list_positions, std::vector<int64_t> list_lengths)
-      : static_args(std::move(args)),
-        static_arg_positions(std::move(arg_positions)),
-        list_arg_positions(std::move(list_positions)),
-        list_arg_lengths(std::move(list_lengths)) {}
-
-  // Check if context has any fallback metadata
-  bool HasData() const { return !static_args.empty() || !list_arg_positions.empty(); }
+  // Constructor takes only original_inputs
+  // Metadata and pointers are extracted later in ConvertToCPUFallbackContext
+  explicit CPUFallbackContext(std::vector<c10::IValue> inputs)
+      : original_inputs(std::move(inputs)),
+        original_kwargs(c10::impl::GenericDict(c10::StringType::get(), c10::AnyType::get())) {}
 
   // Check if context is empty
-  bool IsEmpty() const {
-    return static_args.empty() && static_arg_positions.empty() && list_arg_positions.empty() &&
-           list_arg_lengths.empty();
-  }
+  bool IsEmpty() const { return original_inputs.empty() && original_kwargs.empty(); }
 };
 
 }  // namespace at::neuron

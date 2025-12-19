@@ -147,6 +147,54 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     assert torch.allclose(tensor_neuron.cpu(), expected * 2)
 
 
+def run_premul_sum_scalar_all_reduce_test(rank, world_size, kwargs):
+    """Test all_reduce with PREMUL_SUM operation using scalar factor."""
+    # rank 0: [1, 2, 3, 4], rank 1: [3, 4, 5, 6]
+    tensor = torch.tensor(
+        [rank * 2 + 1.0, rank * 2 + 2.0, rank * 2 + 3.0, rank * 2 + 4.0], dtype=torch.float32
+    ).to("neuron")
+
+    # Create PREMUL_SUM operation with scalar factor 2.5
+    premul_factor = 2.5
+    reduce_op = dist._make_nccl_premul_sum(premul_factor)
+
+    # For PREMUL_SUM with factor 2.5:
+    # rank 0: [1, 2, 3, 4] * 2.5 = [2.5, 5.0, 7.5, 10.0]
+    # rank 1: [3, 4, 5, 6] * 2.5 = [7.5, 10.0, 12.5, 15.0]
+    # After SUM across all ranks:
+    #   All ranks get: [2.5+7.5, 5.0+10.0, 7.5+12.5, 10.0+15.0] = [10.0, 15.0, 20.0, 25.0]
+    expected = torch.tensor([10.0, 15.0, 20.0, 25.0], dtype=torch.float32)
+
+    dist.all_reduce(tensor, op=reduce_op)
+    assert torch.allclose(
+        tensor.cpu(), expected, rtol=1e-5
+    ), f"Rank {rank}: Expected {expected}, got {tensor.cpu()}"
+
+
+def run_premul_sum_tensor_all_reduce_test(rank, world_size, kwargs):
+    """Test all_reduce with PREMUL_SUM operation using tensor factor."""
+    # rank 0: [1, 2, 3, 4], rank 1: [3, 4, 5, 6]
+    tensor = torch.tensor(
+        [rank * 2 + 1.0, rank * 2 + 2.0, rank * 2 + 3.0, rank * 2 + 4.0], dtype=torch.float32
+    ).to("neuron")
+
+    # Create PREMUL_SUM operation with tensor factor 2.5
+    tensor_factor = torch.tensor([2.5], dtype=torch.float32).to("neuron")
+    reduce_op = dist._make_nccl_premul_sum(tensor_factor)
+
+    # For PREMUL_SUM with factor 2.5:
+    # rank 0: [1, 2, 3, 4] * 2.5 = [2.5, 5.0, 7.5, 10.0]
+    # rank 1: [3, 4, 5, 6] * 2.5 = [7.5, 10.0, 12.5, 15.0]
+    # After SUM across all ranks:
+    #   All ranks get: [2.5+7.5, 5.0+10.0, 7.5+12.5, 10.0+15.0] = [10.0, 15.0, 20.0, 25.0]
+    expected = torch.tensor([10.0, 15.0, 20.0, 25.0], dtype=torch.float32)
+
+    dist.all_reduce(tensor, op=reduce_op)
+    assert torch.allclose(
+        tensor.cpu(), expected, rtol=1e-5
+    ), f"Rank {rank}: Expected {expected}, got {tensor.cpu()}"
+
+
 def run_all_reduce_partial_group_test(rank, world_size, kwargs):
     """Test all_reduce with a partial group in a larger world.
 
@@ -269,6 +317,14 @@ class TestAllReduce(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test all_reduce with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+    def test_all_reduce_premul_sum_scalar(self):
+        """Test all_reduce with PREMUL_SUM operation using scalar factor."""
+        self.distributed_tester.run_test(run_premul_sum_scalar_all_reduce_test)
+
+    def test_all_reduce_premul_sum_tensor(self):
+        """Test all_reduce with PREMUL_SUM operation using tensor factor."""
+        self.distributed_tester.run_test(run_premul_sum_tensor_all_reduce_test)
 
 
 class TestAllReduceWorldSize4(BaseCollectiveOpTest):

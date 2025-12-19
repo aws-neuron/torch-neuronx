@@ -139,7 +139,7 @@ def create_config(preset_name, batch_size, seq_len):
     return config.to_dict()
 
 
-def create_block(config, device, dtype=None, tp_mesh=None):
+def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     """Create block from config dictionary.
 
     Args:

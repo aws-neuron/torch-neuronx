@@ -8,34 +8,13 @@ from torch.testing._internal.distributed._tensor.common_dtensor import ModelArgs
 
 import torch_neuronx
 from tests.pytorch_tests.distributed.common_distributed import create_test_classes
-from tests.pytorch_tests.distributed.neuron_patch import NeuronPatcher, PatchName, patch_common_fsdp
+from tests.pytorch_tests.distributed.neuron_patch import (
+    NeuronPatcher,
+    PatchName,
+    override_world_size,
+    patch_common_fsdp,
+)
 from tests.pytorch_tests.distributed.test_fsdp import NeuronFSDPTest
-
-
-def override_world_size(
-    globals_dict: dict[str, Any], world_size: int = 2, ignore_list: list[str] | None = None
-) -> None:
-    """
-    Override world_size property for all test classes not in the ignore list.
-
-    Args:
-        globals_dict: Dictionary containing global variables
-        world_size: The world_size value to set
-        ignore_list: List of class names to skip when overriding
-    """
-    if ignore_list is None:
-        ignore_list = []
-
-    ignore_list_neuron = ["TestNeuron" + class_name for class_name in ignore_list]
-
-    for name, obj in list(globals_dict.items()):
-        # __bases__ is to ensure that we only overide when this is a TestClass
-        if (
-            hasattr(obj, "world_size")
-            and hasattr(obj, "__bases__")
-            and name not in ignore_list_neuron
-        ):
-            obj.world_size = property(lambda self, ws=world_size: ws)
 
 
 def override_init_models(
@@ -108,7 +87,7 @@ patch_common_fsdp()
 create_test_classes(NeuronFSDPv2Test, globals(), "fsdp_v2_spec.json")
 override_world_size(
     globals(),
-    ignore_list=[
+    exclude_test_classes=[
         "TestFullyShardMetaDeviceInit",
         "TestHSDPWithCustomHook",
         "TestFullyShardDeviceDTensor",

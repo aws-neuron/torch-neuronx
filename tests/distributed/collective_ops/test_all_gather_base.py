@@ -187,6 +187,71 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     assert torch.allclose(output_tensor.cpu(), expected)
 
 
+def run_bucketing_memory_test(rank, world_size, kwargs):
+    """Test all_gather_into_tensor with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+    )
+    for i in range(3):
+        tensor_size = 31250000 + i * 31250000
+        tensor = torch.ones(tensor_size, dtype=torch.float32)
+        tensor_neuron = tensor.to("neuron")
+        output_tensor = torch.zeros((world_size * tensor_size,), device="neuron")
+
+        dist.all_gather_into_tensor(output_tensor, tensor_neuron)
+
+        expected = torch.ones(tensor_size)
+        for j in range(world_size):
+            start_idx = j * tensor_size
+            end_idx = (j + 1) * tensor_size
+            assert torch.allclose(output_tensor[start_idx:end_idx].cpu(), expected)
+
+        peak = int(
+            os.popen(
+                f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+                f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+            )
+            .read()
+            .strip()
+        )
+        assert peak <= 1073741824, f"Memory {peak} exceeds 1GB"
+
+
+def run_bucketing_memory_flat_2d_tensor_test(rank, world_size, kwargs):
+    """Test all_gather_into_tensor with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+    )
+    for i in range(3):
+        tensor_size = 31250000 + i * 31250000
+        tensor = torch.ones(1, tensor_size, dtype=torch.float32)
+        tensor_neuron = tensor.to("neuron")
+        gather_list = [torch.zeros(1, tensor_size, device="neuron") for _ in range(world_size)]
+
+        dist.all_gather(gather_list, tensor_neuron)
+        expected = tensor.clone()
+        for gathered_tensor in gather_list:
+            assert torch.allclose(gathered_tensor.cpu(), expected)
+
+        peak = int(
+            os.popen(
+                f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+                f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+            )
+            .read()
+            .strip()
+        )
+        assert peak <= 1073741824, f"Memory {peak} exceeds 1GB"
+
+
 class TestAllGather(BaseCollectiveOpTest):
     @pytest.mark.parametrize(
         "dtype",
@@ -247,3 +312,11 @@ class TestAllGather(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test all_gather_into_tensor with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+    def test_bucketing_memory(self):
+        """Test all_gather_into_tensor with bucketing for memory efficiency."""
+        self.distributed_tester.run_test(run_bucketing_memory_test)
+
+    def test_bucketing_memory_flat_2d_tensor_test(self):
+        """Test all_gather_into_tensor with bucketing for memory efficiency with flat 2d tensor"""
+        self.distributed_tester.run_test(run_bucketing_memory_flat_2d_tensor_test)

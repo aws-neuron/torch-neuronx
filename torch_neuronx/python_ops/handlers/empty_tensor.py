@@ -21,7 +21,10 @@ class BaseEmptyTensorHandler:
         Returns:
             True if any tensor is empty
         """
-        from torch.utils._pytree import tree_flatten
-
-        flat_tensors, _ = tree_flatten(args)
-        return any(isinstance(t, torch.Tensor) and t.numel() == 0 for t in flat_tensors)
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                if arg.numel() == 0:
+                    return True
+            elif isinstance(arg, list | tuple) and self.check_for_empty(*arg):
+                return True
+        return False

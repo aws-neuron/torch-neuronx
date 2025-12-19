@@ -69,7 +69,7 @@ class NeuronEvent {
   c10::DeviceIndex device_index() const { return impl_->device_index; }
 
   /// Complete the event (used by stream for async completion)
-  void complete_event() {
+  void complete_event() const {
     mark_completed();
     impl_->sync_cv.notify_all();
   }
@@ -83,9 +83,11 @@ class NeuronEvent {
   friend class NeuronStream;
 
   bool is_recorded() const noexcept { return impl_->is_recorded.load(std::memory_order_acquire); }
-  void mark_recorded() noexcept { impl_->is_recorded.store(true, std::memory_order_release); }
+  void mark_recorded() const noexcept { impl_->is_recorded.store(true, std::memory_order_release); }
   bool is_completed() const noexcept { return impl_->is_completed.load(std::memory_order_acquire); }
-  void mark_completed() noexcept { impl_->is_completed.store(true, std::memory_order_release); }
+  void mark_completed() const noexcept {
+    impl_->is_completed.store(true, std::memory_order_release);
+  }
 };
 
 // Forward declaration for getCurrentNeuronStream

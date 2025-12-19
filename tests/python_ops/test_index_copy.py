@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises, cpu_fallback_test
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises
 
 
 class TestIndexCopy:
@@ -101,38 +101,6 @@ class TestIndexCopy:
         indices_neuron = indices.to(device)
 
         input_neuron.index_copy(2, indices_neuron, source)
-
-    @cpu_fallback_test
-    @assert_raises((IndexError, RuntimeError), match=r".*index_copy[\s\S]*out of bound.*")
-    def test_index_copy_with_indices_out_of_range(self):
-        """Test index select with indices out of range"""
-
-        device = "neuron"
-        input = torch.zeros(5, 3)
-        input_neuron = input.to(device)
-        source = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
-        source_neuron = source.to(device)
-        indices = torch.tensor([0, 6, 2])
-        indices_neuron = indices.to(device)
-        input_neuron.index_copy(0, indices_neuron, source_neuron)
-
-    @cpu_fallback_test
-    @assert_raises(
-        RuntimeError, match=r"index_copy_\(\): Expected a long tensor for index, but got Float"
-    )
-    def test_index_copy_empty_indices(self):
-        """Test index select with empty index"""
-
-        device = "neuron"
-        input = torch.zeros(5, 3)
-        input_neuron = input.to(device)
-        source = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
-        source_neuron = source.to(device)
-        indices = torch.tensor([])
-        indices_neuron = indices.to(device)
-
-        # CPU error message does not seem to be descriptive neither
-        input_neuron.index_copy(0, indices_neuron, source_neuron)
 
     @assert_raises(
         TypeError,

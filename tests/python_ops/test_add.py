@@ -35,7 +35,7 @@ class TestAddRegistration:
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("add")
 
-    @assert_raises(RuntimeError, match="Cannot add non-contiguous tensor to NRT tensor set")
+    @assert_raises(RuntimeError, match="Cannot (add|process) non-contiguous tensor.*")
     def test_add_inplace_non_contiguous_output(self, monkeypatch):
         """Test in-place add operations on tensor slices"""
         monkeypatch.setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "1")

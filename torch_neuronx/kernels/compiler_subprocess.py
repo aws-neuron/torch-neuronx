@@ -5,7 +5,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
 
 from torch.utils._filelock import FileLock
 
@@ -19,11 +18,57 @@ from .cache_utils import (
 from .compiler_config import CompilerConfig
 
 
-class NEFFCacheKey(NamedTuple):
-    hlo_protobuf: bytes
-    config: CompilerConfig
-    lnc_override: str
-    compiler_version: str | None
+class NEFFCacheKey:
+    """Efficient cache key for NEFF compilation.
+
+    Uses lazy hash computation to avoid re-hashing on repeated access.
+    The hash combines HLO content hash with compiler configuration to
+    produce a deterministic cache key.
+    """
+
+    __slots__ = ("_config_hash", "_hash", "_hlo_hash")
+
+    def __init__(
+        self,
+        hlo_protobuf: bytes,
+        config: CompilerConfig,
+        lnc_override: str | None,
+        compiler_version: str | None,
+    ):
+        # Pre-compute HLO hash
+        self._hlo_hash = hashlib.sha256(hlo_protobuf).hexdigest()
+
+        # Create deterministic config representation for hashing
+        config_parts = [
+            config.target,
+            config.model_type,
+            config.optimization_level,
+            config.auto_cast,
+            config.framework,
+            lnc_override or config.lnc,
+            compiler_version or "",
+            *sorted(config.extra_flags),
+        ]
+        config_str = "|".join(config_parts)
+        self._config_hash = hashlib.sha256(config_str.encode()).hexdigest()
+
+        # Combine hashes for final key
+        self._hash = hashlib.sha256(f"{self._hlo_hash}:{self._config_hash}".encode()).hexdigest()
+
+    @property
+    def hash(self) -> str:
+        """Return the pre-computed hash."""
+        return self._hash
+
+    def __hash__(self) -> int:
+        """Return integer hash for use in dict/set."""
+        return hash(self._hash)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare cache keys by their hash."""
+        if not isinstance(other, NEFFCacheKey):
+            return NotImplemented
+        return self._hash == other._hash
 
 
 class CompilationError(Exception):
@@ -53,14 +98,14 @@ class CompilerSubprocess:
 
     def _nfs_cache_path(self, cache_key: NEFFCacheKey) -> Path:
         """Get NFS cache file path."""
-        key_hash = hashlib.sha256(str(cache_key).encode()).hexdigest()
+        key_hash = cache_key.hash
         return self.nfs_cache_dir / key_hash / f"{key_hash}.neff"
 
     def _generate_cache_key(
         self,
         hlo_protobuf: bytes,
         config: CompilerConfig,
-        lnc_override: str,
+        lnc_override: str | None,
         compiler_version: str,
     ) -> "NEFFCacheKey":
         """Generate deterministic cache key from all compilation inputs."""
@@ -78,9 +123,23 @@ class CompilerSubprocess:
         lnc_override: str | None = None,
         ir_type: str = "XLA",
         workdir: str | None = None,
+        input_file: str | None = None,
+        output_file: str | None = None,
     ) -> bytes:
-        """Two-tier cache lookup and compilation."""
+        """Two-tier cache lookup and compilation.
 
+        Args:
+            hlo_protobuf: HLO protobuf bytes or MLIR bytes
+            config: Compiler configuration
+            lnc_override: Optional override for logical neuron cores
+            ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+            workdir: Compilation working directory (optional, for async mode)
+            input_file: Path to input file (optional, for async mode)
+            output_file: Path to write output NEFF file (optional, for async mode)
+
+        Returns:
+            Compiled NEFF bytes
+        """
         # Skip caching if disabled
         if is_caching_disabled():
             return CompilerSubprocess.compile_hlo_protobuf_to_neff(
@@ -89,6 +148,8 @@ class CompilerSubprocess:
                 lnc_override,
                 ir_type,
                 workdir,
+                input_file,
+                output_file,
             )
 
         import neuronxcc
@@ -101,13 +162,17 @@ class CompilerSubprocess:
         nfs_path = self._nfs_cache_path(cache_key)
         if nfs_path.exists():
             try:
-                return nfs_path.read_bytes()
+                neff_bytes = nfs_path.read_bytes()
+                # For async, write to output file on cache hit
+                if output_file is not None:
+                    Path(output_file).write_bytes(neff_bytes)
+                return neff_bytes
             except OSError:
                 # NFS read failed, continue to local compilation
                 pass
 
         # 2. Use file lock for compilation
-        key_hash = hashlib.sha256(str(cache_key).encode()).hexdigest()
+        key_hash = cache_key.hash
         lock_dir = self.local_cache_dir / key_hash / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -121,13 +186,17 @@ class CompilerSubprocess:
             # Double-check NFS cache after acquiring lock
             if nfs_path.exists():
                 try:
-                    return nfs_path.read_bytes()
+                    neff_bytes = nfs_path.read_bytes()
+                    # For async, write to output file on cache hit
+                    if output_file:
+                        Path(output_file).write_bytes(neff_bytes)
+                    return neff_bytes
                 except OSError:
                     pass
 
             # Compile and cache
             neff_bytes = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                hlo_protobuf, config, lnc_override, ir_type, workdir
+                hlo_protobuf, config, lnc_override, ir_type, workdir, input_file, output_file
             )
 
             # Write to NFS cache atomically (this is basically writing to user provided disk)
@@ -154,6 +223,8 @@ class CompilerSubprocess:
     @staticmethod
     def run_neuronx_cc(
         config: CompilerConfig,
+        input_file: str,
+        output_file: str,
         lnc_override: str | None = None,
         workdir: str | None = None,
     ) -> None:
@@ -161,6 +232,8 @@ class CompilerSubprocess:
 
         Args:
             config: Compiler configuration
+            input_file: Path to input HLO/MLIR file
+            output_file: Path to output NEFF file
             lnc_override: Optional override for logical neuron cores
             workdir: Compilation working directory
 
@@ -170,7 +243,7 @@ class CompilerSubprocess:
         neuronx_cc = CompilerSubprocess.find_neuronx_cc()
         cmd = [
             neuronx_cc,
-            *config.get_neuronx_cc_args(lnc_override),
+            *config.get_neuronx_cc_args(input_file, output_file, lnc_override),
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
@@ -188,6 +261,8 @@ class CompilerSubprocess:
         lnc_override: str | None = None,
         ir_type: str = "XLA",
         workdir: str | None = None,
+        input_file: str | None = None,
+        output_file: str | None = None,
     ) -> bytes:
         """Compile HLO protobuf or MLIR directly to NEFF.
 
@@ -197,6 +272,8 @@ class CompilerSubprocess:
             lnc_override: Optional override for logical neuron cores
             ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
             workdir: Compilation working directory
+            input_file: Path to input file (for async mode when workdir is set)
+            output_file: Path to output NEFF file (for async mode)
 
         Returns:
             Compiled NEFF bytes
@@ -204,35 +281,39 @@ class CompilerSubprocess:
         Raises:
             NEFFCompilationError: If NEFF compilation fails
         """
-        # Async mode sets workdir, input, and output
+        # Async mode: workdir, input_file, output_file provided
         if workdir is not None:
-            assert config.input is not None, "Input file must be provided"
-            assert config.output is not None, "Output file must be provided"
-            CompilerSubprocess.run_neuronx_cc(config, lnc_override, workdir)
+            assert input_file is not None, "Input file must be provided"
+            assert output_file is not None, "Output file must be provided"
+            CompilerSubprocess.run_neuronx_cc(
+                config, input_file, output_file, lnc_override, workdir
+            )
             # Read and return compiled NEFF
-            return Path(config.output).read_bytes()
+            return Path(output_file).read_bytes()
 
-        # Create temp dir if workdir if not set
+        # Sync mode: Create temp dir for compilation
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
+            tmpdir_path = Path(tmpdir)
 
             # Determine file format based on ir_type
             # "StableHLO" uses MLIR format, "XLA" uses HLO protobuf
             hlo_file = (
-                tmpdir / "module.mlir" if ir_type == "StableHLO" else tmpdir / "module.hlo.pb"
+                tmpdir_path / "module.mlir"
+                if ir_type == "StableHLO"
+                else tmpdir_path / "module.hlo.pb"
             )
             hlo_file.write_bytes(hlo_protobuf)
-            config.input = str(hlo_file)
 
-            # Compile to NEFF
-            config.output = str(tmpdir / "module.neff")
+            # Use temp output file
+            temp_output = tmpdir_path / "module.neff"
 
             # Passing workdir is important when we run multi-worker
             # Seeing a race condition where the artifacts get mangled
             # causing runtime errors. Passing the workdir keeps all
             # artifacts contained in their respective folder.
-            # Need to pass explicity here, to recognize tempdir context.
-            CompilerSubprocess.run_neuronx_cc(config, lnc_override, tmpdir)
+            CompilerSubprocess.run_neuronx_cc(
+                config, str(hlo_file), str(temp_output), lnc_override, str(tmpdir_path)
+            )
 
             # Read and return compiled NEFF
-            return Path(config.output).read_bytes()
+            return Path(temp_output).read_bytes()

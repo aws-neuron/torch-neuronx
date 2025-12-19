@@ -50,28 +50,6 @@ class TestNeuronAllocator:
         assert storage.device.type == "neuron"
         assert storage.nbytes() == 1000
 
-    def test_allocator_cache_hit(self):
-        """Test that allocator reuses freed memory of same size"""
-        print("\n=== Testing cache hit functionality ===")
-
-        # Clear any existing cache
-        torch_neuronx._C.NeuronCachingAllocator.emptyCache()
-
-        # First allocation
-        x = torch.empty(1024, device="neuron")
-        ptr1 = x.data_ptr()
-        print(f"First allocation pointer: {ptr1}")
-        del x
-
-        # Second allocation - should reuse
-        y = torch.empty(1024, device="neuron")
-        ptr2 = y.data_ptr()
-        print(f"Second allocation pointer: {ptr2}")
-
-        assert ptr1 == ptr2, f"Allocator should reuse freed memory. Got ptr1={ptr1}, ptr2={ptr2}"
-
-        print("=== Cache hit test completed successfully ===\n")
-
     def test_empty_strided_uses_allocator(self):
         """Test that torch.empty_strided uses NeuronAllocator and doesn't fall to CPU"""
         a = torch.empty_strided((2, 3), (1, 2), device="neuron")

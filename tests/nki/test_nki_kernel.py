@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import neuronxcc.nki.typing as nt
 import pytest
 import torch
 
@@ -17,11 +18,12 @@ class TestBasicExecution:
         """Test a simple DMA copy kernel."""
 
         @TorchNeuronNKIKernel.trace
-        def dma_copy(x, y):
+        def dma_copy(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Create input and output tensors
         x = torch.randn(128, device="neuron")
@@ -37,12 +39,13 @@ class TestBasicExecution:
         """Test scaling a tensor by a constant."""
 
         @TorchNeuronNKIKernel.trace
-        def tensor_scale(x, y, scale):
+        def tensor_scale(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = x_tile * scale
             nl.store(y[0:128], value=y_tile)
+            return y
 
         x = torch.randn(128, device="neuron")
         y = torch.empty(128, device="neuron")
@@ -57,13 +60,14 @@ class TestBasicExecution:
         """Test element-wise addition of two tensors."""
 
         @TorchNeuronNKIKernel.trace
-        def tensor_add(x1, x2, y):
+        def tensor_add(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x1_tile = nl.load(x1[0:128])
             x2_tile = nl.load(x2[0:128])
             y_tile = x1_tile + x2_tile
             nl.store(y[0:128], value=y_tile)
+            return y
 
         x1 = torch.randn(128, device="neuron")
         x2 = torch.randn(128, device="neuron")
@@ -78,11 +82,12 @@ class TestBasicExecution:
         """Test kernels with different tensor shapes."""
 
         @TorchNeuronNKIKernel.trace
-        def copy_2d(x, y):
+        def copy_2d(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Test various 2D shapes
         shapes = [(10, 10), (16, 32), (128, 64)]
@@ -97,11 +102,12 @@ class TestBasicExecution:
         """Test kernels with different data types."""
 
         @TorchNeuronNKIKernel.trace
-        def copy_kernel(x, y):
+        def copy_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Test various dtypes
         dtypes = [torch.float32, torch.float16, torch.int32]
@@ -128,7 +134,7 @@ class TestCaching:
         """Test that NEFFs are cached for same shapes/dtypes."""
 
         @TorchNeuronNKIKernel.trace
-        def cached_kernel(x, y):
+        def cached_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             # Handle different sizes with slicing
@@ -140,6 +146,7 @@ class TestCaching:
                 # Process in chunks of 128
                 x_tile = nl.load(x[0:128])
                 nl.store(y[0:128], value=x_tile)
+            return y
 
         # First call - should compile
         x1 = torch.randn(64, device="neuron")
@@ -175,12 +182,13 @@ class TestCaching:
         """Test that model handles are cached for identical NEFFs."""
 
         @TorchNeuronNKIKernel.trace
-        def model_cached_kernel(x, y):
+        def model_cached_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             y_tile = x_tile * 2.0
             nl.store(y, value=y_tile)
+            return y
 
         # Check initial model cache
         initial_models = len(TorchNeuronNKIKernel._loaded_models)
@@ -205,11 +213,12 @@ class TestCaching:
         """Test cache clearing methods."""
 
         @TorchNeuronNKIKernel.trace
-        def clear_test_kernel(x, y):
+        def clear_test_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Execute to populate caches
         x = torch.randn(32, device="neuron")
@@ -237,22 +246,24 @@ class TestMultipleKernels:
         """Test that multiple kernels can coexist."""
 
         @TorchNeuronNKIKernel.trace
-        def kernel_add(x, y, out):
+        def kernel_add(x, y, out: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             y_tile = nl.load(y)
             result = x_tile + y_tile
             nl.store(out, value=result)
+            return out
 
         @TorchNeuronNKIKernel.trace
-        def kernel_multiply(x, y, out):
+        def kernel_multiply(x, y, out: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             y_tile = nl.load(y)
             result = x_tile * y_tile
             nl.store(out, value=result)
+            return out
 
         # Test add kernel
         x1 = torch.randn(64, device="neuron")
@@ -272,15 +283,16 @@ class TestMultipleKernels:
         """Test kernels with different parameter signatures."""
 
         @TorchNeuronNKIKernel.trace
-        def unary_kernel(x, out):
+        def unary_kernel(x, out: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             result = x_tile * x_tile  # square
             nl.store(out, value=result)
+            return out
 
         @TorchNeuronNKIKernel.trace
-        def ternary_kernel(x, y, z, out):
+        def ternary_kernel(x, y, z, out: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
@@ -288,6 +300,7 @@ class TestMultipleKernels:
             z_tile = nl.load(z)
             result = x_tile + y_tile * z_tile
             nl.store(out, value=result)
+            return out
 
         # Test unary kernel
         x = torch.randn(32, device="neuron")
@@ -314,11 +327,12 @@ class TestIRCaching:
         """Test that IR is cached and reused for same tensor shapes."""
 
         @TorchNeuronNKIKernel.trace
-        def cached_kernel(x, y):
+        def cached_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # First call - should populate IR cache
         x1 = torch.randn(64, device="neuron")
@@ -342,7 +356,7 @@ class TestIRCaching:
         """Test that different shapes create new IR cache entries."""
 
         @TorchNeuronNKIKernel.trace
-        def shape_kernel(x, y):
+        def shape_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             size = x.shape[0]
@@ -352,6 +366,7 @@ class TestIRCaching:
             else:
                 x_tile = nl.load(x[0:128])
                 nl.store(y[0:128], value=x_tile)
+            return y
 
         # First call with shape [64]
         x1 = torch.randn(64, device="neuron")
@@ -372,19 +387,21 @@ class TestIRCaching:
         """Test that cached IR returns correct structure (single vs tuple)."""
 
         @TorchNeuronNKIKernel.trace
-        def single_return_kernel(x, y):
+        def single_return_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         @TorchNeuronNKIKernel.trace
-        def tuple_return_kernel(x, y1, y2):
+        def tuple_return_kernel(x, y1: nt.mutable_tensor, y2: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y1, value=x_tile)
             nl.store(y2, value=x_tile * 2.0)
+            return y1, y2
 
         # Test single return
         x = torch.randn(64, device="neuron")
@@ -409,7 +426,7 @@ class TestIRCaching:
         """Test IR cache works correctly with NEFF cache."""
 
         @TorchNeuronNKIKernel.trace
-        def dual_cache_kernel(x, y):
+        def dual_cache_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             size = x.shape[0]
@@ -419,6 +436,7 @@ class TestIRCaching:
             else:
                 x_tile = nl.load(x[0:128])
                 nl.store(y[0:128], value=x_tile)
+            return y
 
         # First call: IR cache miss, NEFF cache miss
         x1 = torch.randn(64, device="neuron")
@@ -455,11 +473,12 @@ class TestIRCaching:
         """Test IR cache clearing."""
 
         @TorchNeuronNKIKernel.trace
-        def clear_test_kernel(x, y):
+        def clear_test_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Populate caches
         x = torch.randn(64, device="neuron")
@@ -483,11 +502,12 @@ class TestIRCaching:
         """Test that clear_all_caches clears IR cache."""
 
         @TorchNeuronNKIKernel.trace
-        def all_cache_kernel(x, y):
+        def all_cache_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Populate all caches
         x = torch.randn(64, device="neuron")
@@ -536,11 +556,12 @@ class TestIRCaching:
         try:
 
             @TorchNeuronNKIKernel.trace
-            def trace_test_kernel(x, y):
+            def trace_test_kernel(x, y: nt.mutable_tensor):
                 import neuronxcc.nki.language as nl
 
                 x_tile = nl.load(x)
                 nl.store(y, value=x_tile)
+                return y
 
             x = torch.randn(64, device="neuron")
             y = torch.empty(64, device="neuron")
@@ -601,11 +622,12 @@ class TestErrorHandling:
         """Test that CPU tensors raise appropriate error."""
 
         @TorchNeuronNKIKernel.trace
-        def error_kernel(x, y):
+        def error_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Create CPU tensors
         x = torch.randn(64)  # CPU tensor
@@ -619,11 +641,12 @@ class TestErrorHandling:
         """Test error when tensors are on different devices."""
 
         @TorchNeuronNKIKernel.trace
-        def mixed_device_kernel(x, y):
+        def mixed_device_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # One on Neuron, one on CPU
         x = torch.randn(64, device="neuron")
@@ -636,11 +659,12 @@ class TestErrorHandling:
         """Test error with non-tensor inputs."""
 
         @TorchNeuronNKIKernel.trace
-        def non_tensor_kernel(x, y):
+        def non_tensor_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x)
             nl.store(y, value=x_tile)
+            return y
 
         # Pass numpy array instead of tensor
         import numpy as np
@@ -932,13 +956,14 @@ class TestNKIKernelKey:
         """Test that IR caching works correctly with different argument types."""
 
         @TorchNeuronNKIKernel.trace
-        def mixed_args_kernel(x, y, scale, shape, enabled):
+        def mixed_args_kernel(x, y: nt.mutable_tensor, scale, shape, enabled):
             import neuronxcc.nki.language as nl
 
             if enabled:
                 x_tile = nl.load(x)
                 y_tile = x_tile * scale
                 nl.store(y, value=y_tile)
+            return y
 
         # First call - should populate IR cache
         x1 = torch.randn(64, device="neuron")

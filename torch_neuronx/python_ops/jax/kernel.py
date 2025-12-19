@@ -378,9 +378,20 @@ class JaxKernel(BaseNeuronKernel):
 
         kwarg_values = self._get_kw_inputs(kwargs)
         # Prepare execution inputs
-        input_dict, list_arg_positions, list_arg_lengths = (
-            self.arg_processor.prepare_execution_inputs(processed_inputs + kwarg_values, device)
+        input_dict = self.arg_processor.prepare_execution_inputs(
+            processed_inputs + kwarg_values, device
         )
+        # Get CPU fallback context stored directly on kernel
+        cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
+        # need to handle the case where the kernel is created after impl.execute call
+        if cpu_fallback_context is None:
+            original_inputs_for_ctx = (
+                context.original_inputs if context and context.has_original_inputs() else inputs
+            )
+            cpu_fallback_context = {
+                "original_inputs": list(original_inputs_for_ctx + kwarg_values),
+                "original_kwargs": {},
+            }
         # TODO (kvshbg) - remove sync flow once all async CRs are merged
         if not is_sync_mode_enabled():
             self._execute_async(
@@ -389,8 +400,7 @@ class JaxKernel(BaseNeuronKernel):
                 compile_kwargs,
                 execution_tensors,
                 cache_key,
-                list_arg_positions,
-                list_arg_lengths,
+                cpu_fallback_context,
             )
         else:
             self._execute_sync(
@@ -415,8 +425,7 @@ class JaxKernel(BaseNeuronKernel):
         compile_kwargs,
         execution_tensors,
         cache_key,
-        list_arg_positions,
-        list_arg_lengths,
+        cpu_fallback_context,
     ):
         """Execute kernel asynchronously using async pipeline.
 
@@ -435,7 +444,7 @@ class JaxKernel(BaseNeuronKernel):
         # For example:
         #   inputs: [used, static, used, not_used]
         #   kept_input_indices: [0, 1]
-        if kept_input_indices:
+        if kept_input_indices is not None:
             filtered_non_static_inputs = tuple([non_static_inputs[i] for i in kept_input_indices])
         else:
             filtered_non_static_inputs = tuple(non_static_inputs)
@@ -443,13 +452,6 @@ class JaxKernel(BaseNeuronKernel):
             stack_trace = "".join(traceback.format_list(traceback.extract_stack()[:-2]))
         else:
             stack_trace = ""
-
-        # Create CPU fallback context using ArgumentProcessor
-        cpu_fallback_context = self.arg_processor.create_cpu_fallback_context(
-            processed_inputs,
-            list_arg_positions or [],
-            list_arg_lengths or [],
-        )
 
         try:
             # pylint: disable=protected-access
@@ -734,7 +736,7 @@ class JaxKernel(BaseNeuronKernel):
             )
 
             kwarg_values = self._get_kw_inputs(kwargs)
-            input_dict, _, _ = self.arg_processor.prepare_execution_inputs(
+            input_dict = self.arg_processor.prepare_execution_inputs(
                 tile_inputs + kwarg_values, device
             )
             # Filter input_dict using kept_input_indices

@@ -52,20 +52,6 @@ TEST_F(NRTHandlerTest, ExecutionConfigConstruction) {
   EXPECT_EQ(config2.num_cores, 4);
 }
 
-TEST_F(NRTHandlerTest, ExecutionResultSuccess) {
-  auto result = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(100));
-  EXPECT_TRUE(result.success);
-  EXPECT_TRUE(result.error_message.empty());
-  EXPECT_EQ(result.execution_time.count(), 100);
-}
-
-TEST_F(NRTHandlerTest, ExecutionResultError) {
-  auto result = NRTHandler::ExecutionResult::Error("Test error");
-  EXPECT_FALSE(result.success);
-  EXPECT_EQ(result.error_message, "Test error");
-  EXPECT_EQ(result.execution_time.count(), 0);
-}
-
 // Note: Full integration tests for ExecuteCompilableKernel would require
 // mocking NeuronResourceManager and the full tensor allocation stack.
 // These tests focus on the ExecutionResult and ExecutionConfig structures.
@@ -77,14 +63,6 @@ TEST_F(NRTHandlerTest, ExecutionConfigCopy) {
 
   EXPECT_EQ(config2.device_id, 1);
   EXPECT_EQ(config2.num_cores, 2);
-}
-
-TEST_F(NRTHandlerTest, ExecutionResultCopy) {
-  auto result1 = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(50));
-  auto result2 = result1;
-
-  EXPECT_TRUE(result2.success);
-  EXPECT_EQ(result2.execution_time.count(), 50);
 }
 
 TEST_F(NRTHandlerTest, MultipleExecutionConfigs) {
@@ -102,39 +80,12 @@ TEST_F(NRTHandlerTest, MultipleExecutionConfigs) {
   EXPECT_EQ(configs[2].num_cores, 4);
 }
 
-TEST_F(NRTHandlerTest, ExecutionResultErrorMessages) {
-  auto result1 = NRTHandler::ExecutionResult::Error("Error 1");
-  auto result2 = NRTHandler::ExecutionResult::Error("Error 2");
-
-  EXPECT_FALSE(result1.success);
-  EXPECT_FALSE(result2.success);
-  EXPECT_EQ(result1.error_message, "Error 1");
-  EXPECT_EQ(result2.error_message, "Error 2");
-}
-
-TEST_F(NRTHandlerTest, ExecutionTimeMeasurement) {
-  auto result1 = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(10));
-  auto result2 = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(100));
-  auto result3 = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(1000));
-
-  EXPECT_LT(result1.execution_time, result2.execution_time);
-  EXPECT_LT(result2.execution_time, result3.execution_time);
-}
-
 TEST_F(NRTHandlerTest, ExecutionConfigDefaultValues) {
   NRTHandler::ExecutionConfig config;
 
   // Verify default values are sensible
   EXPECT_GE(config.device_id, 0);
   EXPECT_GT(config.num_cores, 0);
-}
-
-TEST_F(NRTHandlerTest, ExecutionResultEmptyErrorMessage) {
-  auto success_result = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(50));
-  EXPECT_TRUE(success_result.error_message.empty());
-
-  auto error_result = NRTHandler::ExecutionResult::Error("");
-  EXPECT_TRUE(error_result.error_message.empty());
 }
 
 TEST_F(NRTHandlerTest, ExecutionConfigBoundaryValues) {
@@ -145,20 +96,6 @@ TEST_F(NRTHandlerTest, ExecutionConfigBoundaryValues) {
   NRTHandler::ExecutionConfig config2(15, 16);
   EXPECT_EQ(config2.device_id, 15);
   EXPECT_EQ(config2.num_cores, 16);
-}
-
-TEST_F(NRTHandlerTest, ExecutionResultLongErrorMessage) {
-  std::string long_error(1000, 'x');
-  auto result = NRTHandler::ExecutionResult::Error(long_error);
-
-  EXPECT_FALSE(result.success);
-  EXPECT_EQ(result.error_message.length(), 1000);
-}
-
-TEST_F(NRTHandlerTest, ExecutionResultZeroTime) {
-  auto result = NRTHandler::ExecutionResult::Success(std::chrono::milliseconds(0));
-  EXPECT_TRUE(result.success);
-  EXPECT_EQ(result.execution_time.count(), 0);
 }
 
 TEST_F(NRTHandlerTest, ExecutionConfigMultiCore) {

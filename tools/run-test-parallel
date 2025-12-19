@@ -7,7 +7,7 @@ set -e
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests")
+readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback")
 readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
@@ -269,6 +269,10 @@ run_additional_tests() {
     run_and_record "multi_device_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/device/test_multi_device.py"
 
     local pytest_opts
+    pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
+    run_and_record "cpu_fallback_tests" "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=0 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/cpu_fallback/test_cpu_fallback.py"
+
+    local pytest_opts
     pytest_opts=$(build_pytest_options "streams-report" "$NUM_WORKERS")
     run_and_record "streams_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/streams"
 
@@ -276,21 +280,19 @@ run_additional_tests() {
     if [[ "$SKIP_PT_TEST_DISTRIBUTED" != "true" ]]; then
         # Get installed torch version
         local torch_version
-        torch_version="2.8.0"
-        # TODO: Change to dynamic update based on PT version once stable
-        # if command -v uv >/dev/null 2>&1; then
-        #     torch_version=$(uv pip list | grep "^torch " | awk '{print $2}' | cut -d'+' -f1)
-        # else
-        #     torch_version=$(pip list | grep "^torch " | awk '{print $2}' | cut -d'+' -f1)
-        # fi
+        if command -v uv >/dev/null 2>&1; then
+            torch_version=$(uv pip list | grep "^torch " | awk '{print $2}' | cut -d'+' -f1)
+        else
+            torch_version=$(pip list | grep "^torch " | awk '{print $2}' | cut -d'+' -f1)
+        fi
 
-        # # Fallback if detection fails
-        # if [[ -z "$torch_version" ]]; then
-        #     torch_version="2.8.0"
-        #     echo "Warning: Could not detect torch version, using fallback: $torch_version"
-        # else
-        #     echo "Detected torch version: $torch_version"
-        # fi
+        # Fallback if detection fails
+        if [[ -z "$torch_version" ]]; then
+            torch_version="2.9.1"
+            echo "Warning: Could not detect torch version, using fallback: $torch_version"
+        else
+            echo "Detected torch version: $torch_version"
+        fi
 
         python tests/pytorch_tests/clone_tests.py --torch-version "$torch_version"
 
@@ -298,11 +300,13 @@ run_additional_tests() {
             "test_dtensor.py"
             "test_dtensor_tp.py"
             "test_checkpoint.py"
-            "test_fsdp.py"
             "test_common_c10d.py"
             "test_ddp.py"
-            "fsdp_v2/"
         )
+
+        if [[ "$TORCH_NEURONX_SYNC_MODE" == "1" ]]; then
+            test_files+=("test_fsdp.py" "fsdp_v2/")
+        fi
 
         # Run each test configuration
         for test_file in "${test_files[@]}"; do

@@ -11,6 +11,7 @@
         {
           "reason": "Multiple failures - CUDA driver missing, tensor comparison mismatches, device assignment errors, unsupported operations",
           "tests": [
+            "test_train_parity_with_activation_checkpointing",
             "test_train_mixed_requires_grad_across_groups",
             "test_train_mixed_requires_grad_per_group",
             "test_3d_mlp_with_nd_mesh",
@@ -21,6 +22,12 @@
             "test_param_registration_after_forward",
             "test_root_move_forward_input_to_device",
             "test_train_parity_hsdp"
+          ]
+        },
+        {
+          "reason": "Relates to handling of optimizing collectives away when ws is 1 and CommDebugMode logging",
+          "tests": [
+            "test_train_parity_single_worldsize1"
           ]
         }
       ]
@@ -104,6 +111,12 @@
             "test_1d_process_group_init",
             "test_2d_process_group_init"
           ]
+        },
+        {
+          "reason": "Test only checks PyTorch error message, does not run any workload on Neuron",
+          "tests": [
+            "test_move_states_to_device_dtensor_invalid"
+          ]
         }
       ],
       "xfail": [
@@ -112,8 +125,7 @@
           "tests": [
             "test_rank0_broadcast_meta_device_init",
             "test_mixed_dtypes_no_grad_param",
-            "test_raise_noncontiguous_parameter",
-            "test_move_states_to_device_dtensor_invalid"
+            "test_raise_noncontiguous_parameter"
           ]
         }
       ]
@@ -167,6 +179,12 @@
             "test_fully_shard_force_sum_reduce_scatter",
             "test_fully_shard_alloc_from_pg"
           ]
+        },
+        {
+          "reason": "Replaced by neuron specific test in fsdp_v2/test_fully_shard_comm.py",
+          "tests": [
+            "test_unshard_without_lazy_init"
+          ]
         }
       ],
       "xfail": [
@@ -174,11 +192,16 @@
           "reason": "Communication and reduction operation failures",
           "tests": [
             "test_fully_shard_communication_count",
-            "test_set_reduce_scatter_divide_factor",
             "test_all_gather_fp32",
             "test_manual_reshard_with_reshard_after_forward_false",
             "test_set_reshard_after_forward",
-            "test_unshard_without_lazy_init"
+            "test_fully_shard_alloc_from_pg"
+          ]
+        },
+        {
+          "reason": "PyTorch 2.9.1 breaking change: init_device_mesh requires mesh_dim_names for world_size=1. Test imports init_device_mesh at module level before patches can be applied.",
+          "tests": [
+            "test_size1_reduceop"
           ]
         }
       ]

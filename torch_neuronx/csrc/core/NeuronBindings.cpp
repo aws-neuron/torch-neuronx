@@ -43,6 +43,15 @@
 // Operation execution
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
+// Slice utilities
+#include "torch_neuronx/csrc/utils/SliceUtils.h"
+// Lazy transformation management
+#include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistration.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistry.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/TypeUtils.h"
+// Internal operations
+#include "torch_neuronx/csrc/ops/InternalOps.h"
 
 // Include Neuron Runtime headers
 extern "C" {
@@ -54,6 +63,71 @@ namespace torch_neuronx {
 
 // Forward declarations
 bool are_python_ops_registered();
+
+// Helper struct to hold input transformation processing results
+struct InputTransformationResult {
+  std::vector<torch::Tensor> final_inputs;
+  std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> kernel_transforms;
+  bool has_input_transforms = false;
+};
+
+// Helper function to process inputs and setup transformations
+InputTransformationResult ProcessInputTransformations(const std::string& op_name,
+                                                      const std::vector<torch::Tensor>& inputs,
+                                                      bool has_collectives) {
+  InputTransformationResult result;
+  result.final_inputs.reserve(inputs.size());
+  result.kernel_transforms.resize(inputs.size());
+
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto& input = inputs[i];
+
+    // Check if tensor is non-contiguous
+    if (!input.is_contiguous()) {
+      // TODO: Add timing counter here for prologue perf measurement
+      TORCH_NEURONX_DEBUG("Detected non-contiguous input", "op=", op_name, "input_index=", i,
+                          "input_shape=", input.sizes(), "has_collectives=", has_collectives);
+
+      // TODO(apoorvgu): enable prologues for collectives when they lower to StableHLO
+      if (has_collectives) {
+        TORCH_NEURONX_DEBUG(
+            "Collective operation: using contiguous_internal for non-contiguous input",
+            "op=", op_name, "input_index=", i);
+
+        torch::Tensor contiguous_tensor = torch_neuronx::ops::contiguous_internal(input);
+        result.final_inputs.push_back(contiguous_tensor);
+        // kernel_transforms[i] remains empty for this input
+      } else {
+        // For non-collective operations, try to create a transformation
+        auto& registry = c10_neuron::lazy::TransformationRegistry::Get();
+        auto transform_result = registry.TryCreateAnyTransformation(input, op_name, i);
+
+        if (transform_result.has_value()) {
+          // SUPPORTED pattern - use the transformation
+          TORCH_NEURONX_DEBUG("Using supported pattern transformation", "op=", op_name,
+                              "input_index=", i, "pattern=", transform_result->pattern_name);
+
+          result.kernel_transforms[i].push_back(transform_result->transformation);
+          result.has_input_transforms = true;
+          result.final_inputs.push_back(transform_result->processed_input);
+        } else {
+          // UNSUPPORTED pattern - apply contiguous_internal as fallback
+          TORCH_NEURONX_DEBUG("Unsupported pattern, using contiguous_internal fallback",
+                              "op=", op_name, "input_index=", i);
+
+          torch::Tensor contiguous_tensor = torch_neuronx::ops::contiguous_internal(input);
+          result.final_inputs.push_back(contiguous_tensor);
+          // kernel_transforms[i] remains empty for this input
+        }
+      }
+    } else {
+      // Already contiguous - use as-is
+      result.final_inputs.push_back(input);
+    }
+  }
+
+  return result;
+}
 
 // Track slice tensors per tensor set for cleanup
 static std::unordered_map<nrt_tensor_set_t*, std::vector<nrt_tensor_t*>> slice_tensors_map;
@@ -409,6 +483,9 @@ at::Tensor call_python_contiguous_op(const at::Tensor& self, c10::MemoryFormat m
 
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // Register transformations explicitly (static initializer may not run)
+  c10_neuron::lazy::RegisterTransformations();
+
   // Initialize Stream and Event base classes
   THNPStream_init(m.ptr());
   THNPEvent_init(m.ptr());
@@ -442,33 +519,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Raw NRT memory operations for CPU fallback
   m.def(
       "_nrt_copy_raw_to_cpu",
-      [](py::capsule src_ptr, at::Tensor& dst_tensor, size_t src_offset, size_t size) {
-        // Get the NRT tensor from the capsule
-        nrt_tensor_t* nrt_tensor = static_cast<nrt_tensor_t*>(src_ptr);
+      [](const at::Tensor& src, at::Tensor& dst, int device_id, bool non_blocking = false) {
+        TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
+                    "Expected Neuron tensor, got ", src.device());
+        TORCH_CHECK(dst.device().is_cpu(), "Destination tensor must be on CPU, got ", dst.device());
 
-        // Get destination pointer
-        void* dst_ptr = dst_tensor.data_ptr();
+        void* dst_data_ptr = dst.data_ptr();
+        size_t src_offset = src.storage_offset() * src.element_size();
+        size_t size = dst.nbytes();
 
-        at::neuron::synchronize(dst_tensor.device().index());
+        if (!at::neuron::utils::IsSyncModeEnabled()) {
+          void* src_ptr = at::neuron::utils::GetBaseTensorPtr(src.data_ptr(), src_offset);
+          auto read_kernel = std::make_unique<at::neuron::ReadDirectKernelExecution>(
+              "neuron::copy::neuron_to_cpu", src_ptr, dst_data_ptr, src_offset, size, device_id);
+          auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
+          auto current_stream = at::neuron::getCurrentNeuronStream(device_id);
+          at::neuron::SubmitOperationContext(current_stream, std::move(context));
+          if (!non_blocking) {
+            at::neuron::synchronize(device_id);
+          }
+          return;
+        }
 
         // Perform the copy
-        torch_neuronx::utils::nrt_copy_neuron_to_cpu(nrt_tensor, dst_ptr, src_offset, size);
+        auto storage_impl = src.storage().unsafeGetStorageImpl();
+        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
+        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
+        torch_neuronx::utils::nrt_copy_neuron_to_cpu(nrt_tensor, dst_data_ptr, src_offset, size);
       },
       "Copy raw data from Neuron device to CPU tensor");
 
   m.def(
       "_nrt_copy_cpu_to_raw",
-      [](const at::Tensor& src_tensor, py::capsule dst_ptr, size_t dst_offset, size_t size) {
-        // Get the NRT tensor from the capsule
-        nrt_tensor_t* nrt_tensor = static_cast<nrt_tensor_t*>(dst_ptr);
+      [](const at::Tensor& src, const at::Tensor& dst, int device_id, bool non_blocking = false) {
+        TORCH_CHECK(src.device().is_cpu(), "Source tensor must be on CPU, got ", src.device());
+        TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
+                    "Destination tensor must be on Neuron device, got ", dst.device());
+        TORCH_CHECK(dst.is_contiguous(), "Destination tensor must be contiguous");
 
-        // Get source pointer
-        void* src_ptr = src_tensor.data_ptr();
+        void* src_data_ptr = src.data_ptr();
+        size_t size = src.nbytes();
+        size_t dst_offset = dst.storage_offset() * dst.element_size();
 
-        at::neuron::synchronize(src_tensor.device().index());
+        auto storage_impl = dst.storage().unsafeGetStorageImpl();
+        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
 
-        // Perform the copy
-        torch_neuronx::utils::nrt_copy_cpu_to_neuron(src_ptr, nrt_tensor, dst_offset, size);
+        if (!at::neuron::utils::IsSyncModeEnabled()) {
+          void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), dst_offset);
+          auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+              "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, dst_offset, size, device_id);
+          auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
+          auto current_stream = at::neuron::getCurrentNeuronStream(device_id);
+          at::neuron::SubmitOperationContext(current_stream, std::move(context));
+          if (!non_blocking) {
+            at::neuron::synchronize(device_id);
+          }
+          return;
+        }
+
+        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
+        torch_neuronx::utils::nrt_copy_cpu_to_neuron(src_data_ptr, nrt_tensor, dst_offset, size);
       },
       "Copy raw data from CPU tensor to Neuron device");
 
@@ -482,6 +592,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto storage_impl = tensor.storage().unsafeGetStorageImpl();
         auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
         nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
+
+        // Check for null pointer before creating PyCapsule
+        TORCH_CHECK(nrt_tensor != nullptr,
+                    "Cannot get NRT tensor capsule: tensor data pointer is null. "
+                    "This may indicate the tensor was not properly allocated or "
+                    "the allocation operation has not completed yet. "
+                    "Tensor shape: ",
+                    tensor.sizes(), ", dtype: ", tensor.dtype(), ", device: ", tensor.device());
 
         // Return as a PyCapsule to avoid exposing raw pointer
         return py::capsule(nrt_tensor, "nrt_tensor_t");
@@ -931,6 +1049,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          const std::vector<torch::Tensor>& outputs, py::bytes lowered_ir_bytes,
          py::object stream_obj, const std::string& cache_key, const std::string& python_stack_trace,
          const bool has_collectives, const py::object& cpu_fallback_context = py::none()) {
+        auto transform_result =
+            torch_neuronx::ProcessInputTransformations(op_name, inputs, has_collectives);
+
         at::neuron::NeuronStream stream;
         if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
           stream = THNPStream_Unpack(stream_obj.ptr());
@@ -960,12 +1081,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         at::neuron::CPUFallbackContext fallback_ctx =
             at::neuron::utils::ConvertToCPUFallbackContext(cpu_fallback_context);
 
-        auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
-            op_name, inputs, outputs, cache_key, ir_bytes, has_collectives);
+        int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, outputs);
+        // Process tensors with slicing - updates fallback_ctx.tensor_data_ptrs in-place
+        std::vector<void*> src_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
+            transform_result.final_inputs, fallback_ctx, stream, device_id);
+        std::vector<void*> dst_ptrs =
+            at::neuron::utils::ProcessTensorsWithSlicing(outputs, fallback_ctx, stream, device_id);
 
-        at::neuron::OperationContext context(std::move(xla_kernel), input_tensors_context,
-                                             output_tensors_context, python_stack_trace,
-                                             std::move(fallback_ctx));
+        auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
+            op_name, src_ptrs, dst_ptrs, cache_key, ir_bytes, has_collectives, device_id);
+
+        if (transform_result.has_input_transforms) {
+          xla_kernel->SetInputTransformations(std::move(transform_result.kernel_transforms));
+        }
+
+        auto context = std::make_unique<at::neuron::OperationContext>(
+            std::move(xla_kernel), input_tensors_context, output_tensors_context,
+            python_stack_trace, std::move(fallback_ctx));
         at::neuron::SubmitOperationContext(stream, std::move(context));
       },
       "Submit XLA task with pre-lowered IR for asynchronous execution", py::arg("op_name"),
@@ -973,13 +1105,93 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("cache_key"), py::arg("python_stack_trace"), py::arg("has_collectives"),
       py::arg("cpu_fallback_context") = py::none());
 
+  // torch.compile: compile StableHLO to NEFF and store in cache
+  m.def(
+      "compile_graph",
+      [](const std::string& base_cache_key, py::bytes stablehlo_bytes,
+         bool has_collectives) -> std::string {
+        // Convert StableHLO bytes
+        std::string_view stablehlo_str = stablehlo_bytes.cast<std::string_view>();
+        std::vector<uint8_t> stablehlo_vec(stablehlo_str.begin(), stablehlo_str.end());
+
+        // Create compile kernel and get final cache key
+        auto compile_kernel = std::make_unique<at::neuron::CompileOnlyKernelExecution>(
+            base_cache_key, stablehlo_vec, has_collectives);
+
+        // Get final cache key before moving kernel
+        std::string cache_key = compile_kernel->GetCacheKey();
+
+        // Create OperationContext for compilation
+        std::vector<at::neuron::TensorContext> empty_input_context;
+        std::vector<at::neuron::TensorContext> empty_output_context;
+        auto context = std::make_unique<at::neuron::OperationContext>(
+            std::move(compile_kernel), empty_input_context, empty_output_context, "");
+
+        // Submit for compilation via proper stream infrastructure
+        auto stream = at::neuron::getCurrentNeuronStream();
+        at::neuron::SubmitOperationContext(stream, std::move(context));
+        return cache_key;
+      },
+      "Compile StableHLO to NEFF and store in cache, return final cache key",
+      py::arg("base_cache_key"), py::arg("stablehlo_bytes"), py::arg("has_collectives"));
+
+  // torch.compile: execute compiled graph using cache key
+  m.def(
+      "execute_compiled_graph",
+      [](const std::string& graph_name, const std::string& cache_key,
+         const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs,
+         bool has_collectives) {
+        TORCH_NEURONX_DEBUG("execute_compiled_graph invoked.", "graph_name=", graph_name,
+                            "cache_key=", cache_key);
+
+        // Get current stream
+        auto stream = at::neuron::getCurrentNeuronStream();
+
+        // Extract device_id from tensors
+        int target_device_id = c10_neuron::GetTargetDeviceId(inputs, outputs);
+
+        // Create empty fallback context
+        at::neuron::CPUFallbackContext fallback_ctx;
+
+        // Get tensor data pointers with slicing support
+        std::vector<void*> input_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
+            inputs, fallback_ctx, stream, target_device_id);
+        std::vector<void*> output_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
+            outputs, fallback_ctx, stream, target_device_id);
+
+        // Create NeffDirectKernelExecution with NEFF bytes
+        auto kernel = std::make_unique<at::neuron::NeffDirectKernelExecution>(
+            graph_name, cache_key, input_ptrs, output_ptrs, target_device_id, has_collectives);
+
+        // Store tensor metadata
+        std::vector<at::neuron::TensorContext> input_tensors_context;
+        input_tensors_context.reserve(inputs.size());
+        for (const auto& tensor : inputs) {
+          input_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
+        }
+
+        std::vector<at::neuron::TensorContext> output_tensors_context;
+        output_tensors_context.reserve(outputs.size());
+        for (const auto& tensor : outputs) {
+          output_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
+        }
+
+        // Create and submit operation context
+        auto context = std::make_unique<at::neuron::OperationContext>(
+            std::move(kernel), input_tensors_context, output_tensors_context, "",
+            std::move(fallback_ctx));
+        at::neuron::SubmitOperationContext(stream, std::move(context));
+      },
+      "Execute compiled graph using cache key", py::arg("graph_name"), py::arg("cache_key"),
+      py::arg("inputs"), py::arg("outputs"), py::arg("has_collectives"));
+
   // Register cleanup function that runs during module destruction
   // This happens before Python's atexit handlers and before C++ destructors
   static auto cleanup_streams_func = +[]() {
     try {
       // Synchronize all devices to ensure pending operations complete
       // This runs while Python services are still available for C++ -> Python calls
-      auto& manager = at::neuron::StreamManager::Instance();
+      auto& manager = at::neuron::NeuronResourceManager::Instance().GetStreamManager();
       int device_count = torch_neuronx::neuron_getDeviceCount();
       for (int device_idx = 0; device_idx < device_count; ++device_idx) {
         manager.SynchronizeDevice(device_idx);

@@ -71,6 +71,7 @@ class OutputHandler(BaseOutputHandler):
         meta_inputs: tuple | None = None,
         expected_dtypes_override: list | None = None,
         kwargs: dict | None = None,
+        convert_to_jax_spec=True,
     ) -> tuple[tuple, bool, list, list]:
         """Infer output specifications using PyTorch meta tensors for both shape and dtype.
 
@@ -119,8 +120,14 @@ class OutputHandler(BaseOutputHandler):
 
             specs = []
             for shape, dtype in zip(shapes, pytorch_dtypes, strict=False):
-                jax_dtype = self.type_converter.to_execution_jax_dtype(dtype)
-                specs.append(jax.ShapeDtypeStruct(shape, jax_dtype))
+                if convert_to_jax_spec:
+                    jax_dtype = self.type_converter.to_execution_jax_dtype(dtype)
+                    specs.append(jax.ShapeDtypeStruct(shape, jax_dtype))
+                else:
+                    dtype = self._maybe_downcast_dtype(dtype)
+                    specs.append([shape, dtype])
+                # jax_dtype = self.type_converter.to_execution_jax_dtype(dtype)
+                # specs.append(jax.ShapeDtypeStruct(shape, jax_dtype))
 
             is_single = len(specs) == 1
             return tuple(specs), is_single, pytorch_dtypes, []
@@ -143,12 +150,23 @@ class OutputHandler(BaseOutputHandler):
         # Convert to JAX specs
         specs = []
         for shape, dtype in zip(shapes, pytorch_dtypes, strict=False):
-            jax_dtype = self.type_converter.to_execution_jax_dtype(dtype)
-            specs.append(jax.ShapeDtypeStruct(shape, jax_dtype))
+            if convert_to_jax_spec:
+                jax_dtype = self.type_converter.to_execution_jax_dtype(dtype)
+                specs.append(jax.ShapeDtypeStruct(shape, jax_dtype))
+            else:
+                dtype = self._maybe_downcast_dtype(dtype)
+                specs.append([shape, dtype])
 
         # Return JAX specs for execution, but PyTorch dtypes for final casting
 
         return tuple(specs), is_single, pytorch_dtypes, none_mask
+
+    def _maybe_downcast_dtype(self, dtype):
+        if dtype == torch.int64:
+            dtype = torch.int32
+        elif dtype == torch.float64:
+            dtype = torch.float32
+        return dtype
 
     def _get_tensor_dtypes(self, inputs: tuple) -> list:
         """Get dtypes of tensor inputs.

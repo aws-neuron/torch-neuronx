@@ -5,10 +5,7 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
-    assert_op_falls_back_on_cpu,
     assert_op_runs_on_neuron,
-    assert_raises,
-    cpu_fallback_test,
     track_neuron_ops,
 )
 

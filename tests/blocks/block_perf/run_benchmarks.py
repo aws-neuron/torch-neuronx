@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 from utils import printf
 
@@ -245,16 +246,15 @@ def run_block_step(
         with maybe_enable_autocast(enable_autocast, autocast_dtype, device_name):
 
             def execute_block():
+                start_time = time.perf_counter()
                 if forward_only:
-                    start_time = time.perf_counter()
                     _ = run_block(block, input_tensor, block_module, is_causal=is_causal)
-                    return (time.perf_counter() - start_time) * 1000
                 else:
-                    start_time = time.perf_counter()
                     outputs = run_block(block, input_tensor, block_module, is_causal=is_causal)
                     loss = compute_loss(outputs)
                     loss.backward()
-                    return (time.perf_counter() - start_time) * 1000
+                torch.neuron.synchronize()
+                return (time.perf_counter() - start_time) * 1000
 
             if with_profile:
                 with profile(
@@ -266,7 +266,6 @@ def run_block_step(
                     total_ms = execute_block()
             else:
                 total_ms = execute_block()
-    torch.neuron.synchronize()
     return total_ms, prof
 
 
@@ -346,8 +345,12 @@ def profile_block_step(
     printf("\nDetailed Time Breakdown (sorted by self CPU time):")
     printf(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
     if trace_json:
-        prof.export_chrome_trace(trace_json)
-        printf(f"\nTrace exported to: {trace_json}")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            prof.export_chrome_trace(trace_json)
+            printf(f"\\nTrace exported to: {trace_json}")
+        if dist.is_initialized():
+            dist.barrier()
     return prof
 
 
@@ -513,18 +516,22 @@ def benchmark_block(
     device = setup_device(device_name)
 
     tp_mesh = None
+    dp_mesh = None
     if torch.distributed.is_initialized():
         dp_size = torch.distributed.get_world_size() // tp_size
         device_mesh = init_device_mesh(device.type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         tp_mesh = device_mesh["tp"]
+        dp_mesh = device_mesh["dp"]
 
     # Create block(s) using module's create_block function
     if n_layers == 1:
         # Single block (original behavior)
-        block = block_module.create_block(config, device, dtype, tp_mesh)
+        block = block_module.create_block(config, device, dtype, tp_mesh, dp_mesh)
     else:
         # Stack multiple blocks
-        block = StackedBlocks(block_module.create_block, n_layers, config, device, dtype, tp_mesh)
+        block = StackedBlocks(
+            block_module.create_block, n_layers, config, device, dtype, tp_mesh, dp_mesh
+        )
 
     # Create input tensor
     if block_type == "qwen3":
@@ -564,7 +571,13 @@ def benchmark_block(
             device=device,
             dtype=dtype,
         )
-
+    # Convert to DTensor for TP
+    if tp_mesh and block_type == "rms_norm":
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size == 1:
+            input_tensor = DTensor.from_local(input_tensor, tp_mesh, [Replicate()])
+        else:
+            input_tensor = DTensor.from_local(input_tensor, tp_mesh, [Shard(1)])
     # Warmup + Benchmark + Profile
     warmup_timings = warmup_block(
         block,
@@ -632,7 +645,7 @@ def main():
         "--block",
         type=str,
         default="llama",
-        choices=["llama", "gpt_oss", "qwen3", "rms_norm", "rope"],
+        choices=["llama", "gpt_oss", "qwen3", "qwen3_torchtitan", "rms_norm", "rope"],
     )
     args_temp, _ = parser_temp.parse_known_args()
 
@@ -650,7 +663,7 @@ def main():
         "--block",
         type=str,
         default="llama",
-        choices=["llama", "qwen3", "rms_norm", "gpt_oss", "rope"],
+        choices=["llama", "qwen3", "qwen3_torchtitan", "rms_norm", "gpt_oss", "rope"],
         help="Block type to benchmark (default: llama)",
     )
 

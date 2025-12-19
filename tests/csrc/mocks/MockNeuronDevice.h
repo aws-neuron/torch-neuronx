@@ -12,3 +12,14 @@ std::string GetInstanceType();
 void SetMockInstanceType(const std::string& instance_type);
 
 }  // namespace torch_neuronx
+
+// Mock device count function for c10_neuron namespace
+namespace c10_neuron::testing {
+
+// Get the number of devices available
+int device_count();
+
+// Test helper to set mock device count
+void SetMockDeviceCount(int count);
+
+}  // namespace c10_neuron::testing

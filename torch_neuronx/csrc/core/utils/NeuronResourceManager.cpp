@@ -8,6 +8,7 @@
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
+#include "torch_neuronx/csrc/core/streams/StreamManager.h"
 
 namespace {
 // Resource configuration constants
@@ -163,6 +164,11 @@ OperationExecutionEngine& NeuronResourceManager::GetOperationExecutionEngine() {
   return *operation_execution_engine_;
 }
 
+StreamManager& NeuronResourceManager::GetStreamManager() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return *stream_manager_;
+}
+
 ResourceSemaphore& NeuronResourceManager::GetResourceSemaphore() {
   std::lock_guard<std::mutex> lock(mutex_);
   return *resource_semaphore_;
@@ -184,44 +190,6 @@ NeuronResourceManager::ResourceStats NeuronResourceManager::GetResourceStats() c
       TORCH_NEURONX_ERROR("Failed to get compilation cache stats", "error=", e.what());
       stats.compilation_cache_size = 0;
       stats.compilation_cache_memory = 0;
-    }
-  }
-
-  // Get model handle cache statistics
-  if (model_handle_cache_) {
-    try {
-      auto cache_stats = model_handle_cache_->GetStatistics();
-      stats.model_handle_cache_size = cache_stats.total_entries;
-    } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failed to get model handle cache stats", "error=", e.what());
-      stats.model_handle_cache_size = 0;
-    }
-  }
-
-  // Get resource semaphore statistics
-  if (resource_semaphore_) {
-    try {
-      stats.resource_available_slots = resource_semaphore_->AvailableCount();
-      stats.resource_acquired_slots = resource_semaphore_->AcquiredSlots();
-      stats.resource_waiting_threads = resource_semaphore_->WaitingThreads();
-    } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failed to get resource semaphore stats", "error=", e.what());
-      stats.resource_available_slots = 0;
-      stats.resource_acquired_slots = 0;
-      stats.resource_waiting_threads = 0;
-    }
-  }
-
-  // Get global execution manager statistics
-  if (operation_execution_engine_) {
-    try {
-      auto exec_stats = operation_execution_engine_->GetStatistics();
-      stats.execution_queue_size = exec_stats.queue_size;
-      stats.execution_worker_active = exec_stats.worker_active;
-    } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failed to get execution manager stats", "error=", e.what());
-      stats.execution_queue_size = 0;
-      stats.execution_worker_active = false;
     }
   }
 
@@ -257,6 +225,10 @@ NeuronResourceManager::NeuronResourceManager() {
     operation_execution_engine_ = std::make_unique<OperationExecutionEngine>(
         compilation_cache_.get(), model_handle_cache_.get());
     TORCH_NEURONX_DEBUG("OperationExecutionEngine initialized");
+
+    // Initialize stream manager
+    stream_manager_ = std::make_unique<StreamManager>(operation_execution_engine_.get());
+    TORCH_NEURONX_DEBUG("StreamManager initialized");
 
     // Initialize resource semaphore for future thread pool usage
     int max_slots = GetMaxResourceSlots();

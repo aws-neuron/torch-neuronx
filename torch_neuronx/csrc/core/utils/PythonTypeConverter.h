@@ -7,6 +7,7 @@
 
 #include <vector>
 
+#include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackContext.h"
 
 namespace py = pybind11;
@@ -48,7 +49,7 @@ namespace at::neuron::utils {
  *
  * @see c10::IValue for details on PyTorch's internal value representation.
  */
-inline std::vector<c10::IValue> ConvertStaticArgsToIValues(const py::list& py_list) {
+inline std::vector<c10::IValue> ConvertArgsToIValues(const py::list& py_list) {
   std::vector<c10::IValue> result;
   result.reserve(py_list.size());
 
@@ -95,20 +96,29 @@ inline std::vector<c10::IValue> ConvertStaticArgsToIValues(const py::list& py_li
         // Determine if sequence contains homogeneous types
         // This enables more efficient typed list representations in PyTorch
         py::object first = seq[0];
-        bool all_bool = py::isinstance<py::bool_>(first);
-        bool all_float = !all_bool && py::isinstance<py::float_>(first);
-        bool all_int = !all_bool && !all_float && py::isinstance<py::int_>(first);
+        bool all_tensor = THPVariable_Check(first.ptr());
+        bool all_bool = !all_tensor && py::isinstance<py::bool_>(first);
+        bool all_float = !all_tensor && !all_bool && py::isinstance<py::float_>(first);
+        bool all_int = !all_tensor && !all_bool && !all_float && py::isinstance<py::int_>(first);
 
         // Verify all elements match the first element's type
-        for (size_t j = 1; j < seq.size() && (all_bool || all_float || all_int); ++j) {
+        for (size_t j = 1; j < seq.size() && (all_tensor || all_bool || all_float || all_int);
+             ++j) {
           py::object item = seq[j];
+          if (all_tensor && !THPVariable_Check(item.ptr())) all_tensor = false;
           if (all_bool && !py::isinstance<py::bool_>(item)) all_bool = false;
           if (all_float && !py::isinstance<py::float_>(item)) all_float = false;
           if (all_int && !py::isinstance<py::int_>(item)) all_int = false;
         }
 
         // Convert to typed list if homogeneous
-        if (all_bool) {
+        if (all_tensor) {
+          c10::List<at::Tensor> list;
+          for (auto item : seq) {
+            list.push_back(THPVariable_Unpack(item.ptr()));
+          }
+          result.push_back(list);
+        } else if (all_bool) {
           c10::List<bool> list;
           for (auto item : seq) {
             list.push_back(item.cast<bool>());
@@ -128,7 +138,7 @@ inline std::vector<c10::IValue> ConvertStaticArgsToIValues(const py::list& py_li
           result.push_back(list);
         } else {
           // Mixed types - convert to heterogeneous tuple of IValues
-          // This handles cases like [1, "hello", 3.14, True]
+          // This handles cases like [1, "hello", 3.14, True] and nested lists
           std::vector<c10::IValue> tuple_elements;
           for (auto item : seq) {
             if (py::isinstance<py::bool_>(item)) {
@@ -139,6 +149,16 @@ inline std::vector<c10::IValue> ConvertStaticArgsToIValues(const py::list& py_li
               tuple_elements.push_back(item.cast<double>());
             } else if (py::isinstance<py::str>(item)) {
               tuple_elements.push_back(item.cast<std::string>());
+            } else if (py::isinstance<py::tuple>(item) || py::isinstance<py::list>(item)) {
+              // Recursively handle nested sequences
+              py::list nested_list;
+              nested_list.append(item);
+              auto nested_result = ConvertArgsToIValues(nested_list);
+              if (!nested_result.empty()) {
+                tuple_elements.push_back(nested_result[0]);
+              } else {
+                tuple_elements.push_back(c10::IValue());
+              }
             } else {
               // Unsupported type within sequence - convert to None
               tuple_elements.push_back(c10::IValue());
@@ -158,20 +178,58 @@ inline std::vector<c10::IValue> ConvertStaticArgsToIValues(const py::list& py_li
 }
 
 /**
+ * @brief Recursively extracts tensor metadata and data pointers from IValue.
+ *
+ * Handles nested lists of tensors by recursively traversing the structure.
+ *
+ * @param input The IValue to process (tensor, tensor list, or other)
+ * @param tensor_metadata Output vector for tensor metadata
+ * @param tensor_data_ptrs Output vector for tensor data pointers
+ */
+inline void ExtractTensorMetadataRecursive(const c10::IValue& input,
+                                           std::vector<at::neuron::TensorContext>& tensor_metadata,
+                                           std::vector<void*>& tensor_data_ptrs) {
+  if (input.isTensor()) {
+    const auto& tensor = input.toTensor();
+    tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
+    tensor_data_ptrs.push_back(tensor.data_ptr());
+  } else if (input.isTensorList()) {
+    c10::List<at::Tensor> tensor_list = input.toTensorList();
+    for (size_t i = 0; i < tensor_list.size(); ++i) {
+      const auto& tensor = tensor_list.get(i);
+      tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
+      tensor_data_ptrs.push_back(tensor.data_ptr());
+    }
+  } else if (input.isList()) {
+    // Handle nested generic lists (e.g., List<IValue>)
+    c10::List<c10::IValue> list = input.toList();
+    for (size_t i = 0; i < list.size(); ++i) {
+      ExtractTensorMetadataRecursive(list.get(i), tensor_metadata, tensor_data_ptrs);
+    }
+  } else if (input.isTuple()) {
+    // Handle tuples containing tensors
+    auto tuple = input.toTuple();
+    for (const auto& elem : tuple->elements()) {
+      ExtractTensorMetadataRecursive(elem, tensor_metadata, tensor_data_ptrs);
+    }
+  }
+  // Scalars and other types are ignored
+}
+
+/**
  * @brief Converts a Python dictionary to CPUFallbackContext.
  *
  * This function converts a Python dictionary containing CPU fallback metadata
- * into a C++ CPUFallbackContext struct. The dictionary is expected to have
- * the following keys:
- * - 'static_args': list of static argument values
- * - 'static_positions': list of int positions for static args
- * - 'list_positions': list of int positions for list arguments
- * - 'list_lengths': list of int lengths for each list argument
+ * into a C++ CPUFallbackContext struct. The dictionary is expected to have:
+ * - 'original_inputs': list of ALL original input values (tensors + scalars, lists preserved)
+ *
+ * The function extracts tensor_metadata and tensor_data_ptrs from original_inputs.
+ * Lists of tensors are preserved as c10::List<at::Tensor> in original_inputs.
  *
  * @param context A Python object (dict or None) containing the fallback context.
  *                If None or empty, returns a default-constructed CPUFallbackContext.
  *
- * @return CPUFallbackContext The converted context struct.
+ * @return CPUFallbackContext The converted context struct with metadata extracted.
  */
 inline CPUFallbackContext ConvertToCPUFallbackContext(const py::object& context) {
   // Handle None or empty context
@@ -186,56 +244,70 @@ inline CPUFallbackContext ConvertToCPUFallbackContext(const py::object& context)
 
   py::dict ctx_dict = context.cast<py::dict>();
 
-  // Extract static_args
-  std::vector<c10::IValue> static_args;
-  if (ctx_dict.contains("static_args")) {
-    py::object args_obj = ctx_dict["static_args"];
-    if (py::isinstance<py::list>(args_obj)) {
-      static_args = ConvertStaticArgsToIValues(args_obj.cast<py::list>());
-    }
-  }
+  // Extract original_inputs and build tensor_metadata and data_ptrs
+  std::vector<c10::IValue> original_inputs;
+  std::vector<at::neuron::TensorContext> tensor_metadata;
+  std::vector<void*> tensor_data_ptrs;
 
-  // Extract static_positions
-  std::vector<int64_t> static_positions;
-  if (ctx_dict.contains("static_positions")) {
-    py::object pos_obj = ctx_dict["static_positions"];
-    if (py::isinstance<py::list>(pos_obj)) {
-      py::list pos_list = pos_obj.cast<py::list>();
-      static_positions.reserve(pos_list.size());
-      for (size_t i = 0; i < pos_list.size(); ++i) {
-        static_positions.push_back(pos_list[i].cast<int64_t>());
+  if (ctx_dict.contains("original_inputs")) {
+    py::object inputs_obj = ctx_dict["original_inputs"];
+
+    if (py::isinstance<py::list>(inputs_obj)) {
+      py::list inputs_list = inputs_obj.cast<py::list>();
+
+      original_inputs = ConvertArgsToIValues(inputs_list);
+
+      // Reserve space for efficiency
+      tensor_metadata.reserve(original_inputs.size());
+      tensor_data_ptrs.reserve(original_inputs.size());
+
+      // Recursively extract tensor metadata from all inputs (handles nested lists)
+      for (const auto& input : original_inputs) {
+        ExtractTensorMetadataRecursive(input, tensor_metadata, tensor_data_ptrs);
       }
     }
   }
 
-  // Extract list_positions
-  std::vector<int64_t> list_positions;
-  if (ctx_dict.contains("list_positions")) {
-    py::object pos_obj = ctx_dict["list_positions"];
-    if (py::isinstance<py::list>(pos_obj)) {
-      py::list pos_list = pos_obj.cast<py::list>();
-      list_positions.reserve(pos_list.size());
-      for (size_t i = 0; i < pos_list.size(); ++i) {
-        list_positions.push_back(pos_list[i].cast<int64_t>());
+  // Create context with original_inputs
+  CPUFallbackContext ctx(std::move(original_inputs));
+
+  // Populate extracted metadata and pointers
+  ctx.tensor_metadata = std::move(tensor_metadata);
+  ctx.tensor_data_ptrs = std::move(tensor_data_ptrs);
+
+  // Extract original_kwargs directly into GenericDict
+  if (ctx_dict.contains("original_kwargs")) {
+    py::object kwargs_obj = ctx_dict["original_kwargs"];
+    if (py::isinstance<py::dict>(kwargs_obj)) {
+      py::dict kwargs_dict = kwargs_obj.cast<py::dict>();
+      for (auto item : kwargs_dict) {
+        std::string key = item.first.cast<std::string>();
+        py::object value = item.second.cast<py::object>();
+
+        // Convert Python value to IValue
+        c10::IValue ivalue_key(key);
+        c10::IValue ivalue_val;
+
+        if (value.is_none()) {
+          ivalue_val = c10::IValue();
+        } else if (THPVariable_Check(value.ptr())) {
+          ivalue_val = THPVariable_Unpack(value.ptr());
+        } else if (py::isinstance<py::bool_>(value)) {
+          ivalue_val = value.cast<bool>();
+        } else if (py::isinstance<py::int_>(value)) {
+          ivalue_val = value.cast<int64_t>();
+        } else if (py::isinstance<py::float_>(value)) {
+          ivalue_val = value.cast<double>();
+        } else if (py::isinstance<py::str>(value)) {
+          ivalue_val = value.cast<std::string>();
+        }
+
+        ctx.original_kwargs.insert(ivalue_key, ivalue_val);
       }
     }
   }
 
-  // Extract list_lengths
-  std::vector<int64_t> list_lengths;
-  if (ctx_dict.contains("list_lengths")) {
-    py::object len_obj = ctx_dict["list_lengths"];
-    if (py::isinstance<py::list>(len_obj)) {
-      py::list len_list = len_obj.cast<py::list>();
-      list_lengths.reserve(len_list.size());
-      for (size_t i = 0; i < len_list.size(); ++i) {
-        list_lengths.push_back(len_list[i].cast<int64_t>());
-      }
-    }
-  }
-
-  return CPUFallbackContext(std::move(static_args), std::move(static_positions),
-                            std::move(list_positions), std::move(list_lengths));
+  return ctx;
 }
 
 }  // namespace at::neuron::utils

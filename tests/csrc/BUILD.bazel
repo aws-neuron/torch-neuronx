@@ -45,6 +45,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "NeuronHooksInterfaceTest",
+    srcs = ["core/NeuronHooksInterfaceTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
     name = "CacheEntryTest",
     srcs = ["core/compilation/CacheEntryTest.cpp"],
     deps = ["//:compilation"],
@@ -104,6 +110,12 @@ torch_neuronx_cc_test(
     deps = ["//:runtime"],
 )
 
+torch_neuronx_cc_test(
+    name = "NeuronBindingsTest",
+    srcs = ["core/NeuronBindingsTest.cpp"],
+    deps = ["//:runtime"],
+)
+
 
 torch_neuronx_cc_test(
     name = "OperationContextTest",
@@ -145,6 +157,39 @@ torch_neuronx_cc_test(
     name = "ContiguousTransposeTest",
     srcs = ["core/lazy_materialization/ContiguousTransposeTest.cpp"],
     deps = ["//:lazy_materialization"],
+)
+
+torch_neuronx_cc_test(
+    name = "OperationPrologueTest",
+    srcs = ["core/lazy_materialization/OperationPrologueTest.cpp"],
+    deps = [
+        "//:lazy_materialization",
+        "//:device",
+        "//:torch_neuronx_core",
+        "//:runtime",
+        "//:neuron_bindings",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "TransformationsTest",
+    srcs = ["core/lazy_materialization/TransformationsTest.cpp"],
+    deps = [
+        "//:lazy_materialization",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "LazyTransformationManagerTest",
+    srcs = ["core/lazy_materialization/LazyTransformationManagerTest.cpp"],
+    deps = [
+        "//:lazy_materialization",
+        "//:device",
+        "//:torch_neuronx_core",
+        "//:runtime",
+        "//:neuron_bindings",
+        "//:concatenation",
+    ],
 )
 
 torch_neuronx_cc_test(

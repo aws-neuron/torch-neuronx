@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "tests/csrc/utils/TestUtils.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 
 using namespace at::neuron;
@@ -16,30 +17,22 @@ class KernelExecutionTest : public ::testing::Test {
     output_tensor_ = create_test_tensor({2, 3});
     inputs_ = {input_tensor_};
     outputs_ = {output_tensor_};
+    input_ptrs_ = get_tensor_data_ptrs(inputs_);
+    output_ptrs_ = get_tensor_data_ptrs(outputs_);
   }
 
   torch::Tensor input_tensor_;
   torch::Tensor output_tensor_;
   std::vector<torch::Tensor> inputs_;
   std::vector<torch::Tensor> outputs_;
+  std::vector<void*> input_ptrs_;
+  std::vector<void*> output_ptrs_;
 };
-
-TEST_F(KernelExecutionTest, DtypeConversionNeeded) {
-  // Test types that need conversion
-  EXPECT_TRUE(NeuronKernelExecution::NeedsDtypeConversion(torch::kInt64));
-  EXPECT_TRUE(NeuronKernelExecution::NeedsDtypeConversion(torch::kDouble));
-
-  // Test types that don't need conversion
-  EXPECT_FALSE(NeuronKernelExecution::NeedsDtypeConversion(torch::kFloat32));
-  EXPECT_FALSE(NeuronKernelExecution::NeedsDtypeConversion(torch::kFloat16));
-  EXPECT_FALSE(NeuronKernelExecution::NeedsDtypeConversion(torch::kBFloat16));
-  EXPECT_FALSE(NeuronKernelExecution::NeedsDtypeConversion(torch::kInt32));
-}
 
 TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("compilable_op", inputs_, outputs_, "cache_key_123",
-                                      hlo_bytes, false);
+  XLACompilableKernelExecution kernel("compilable_op", input_ptrs_, output_ptrs_, "cache_key_123",
+                                      hlo_bytes, false, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "compilable_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -51,8 +44,8 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
 
 TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("collective_op", inputs_, outputs_, "cache_key", hlo_bytes,
-                                      true);
+  XLACompilableKernelExecution kernel("collective_op", input_ptrs_, output_ptrs_, "cache_key",
+                                      hlo_bytes, true, 0);
 
   EXPECT_TRUE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
@@ -60,8 +53,8 @@ TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
 
 TEST_F(KernelExecutionTest, CompilableKernelCompilation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("compilable_op", inputs_, outputs_, "cache_key", hlo_bytes,
-                                      false);
+  XLACompilableKernelExecution kernel("compilable_op", input_ptrs_, output_ptrs_, "cache_key",
+                                      hlo_bytes, false, 0);
 
   // Test compilation - will throw since we don't have real compiler
   EXPECT_THROW(kernel.CompileToNeff(), std::exception);
@@ -71,11 +64,12 @@ TEST_F(KernelExecutionTest, CompilableKernelValidation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   // Test with empty cache key (should be invalid)
-  XLACompilableKernelExecution kernel1("op", inputs_, outputs_, "", hlo_bytes, false);
+  XLACompilableKernelExecution kernel1("op", input_ptrs_, output_ptrs_, "", hlo_bytes, false, 0);
   EXPECT_FALSE(kernel1.IsValid());
 
   // Test with empty op name (should be invalid)
-  XLACompilableKernelExecution kernel2("", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel2("", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes, false,
+                                       0);
   EXPECT_FALSE(kernel2.IsValid());
 }
 
@@ -84,8 +78,8 @@ TEST_F(KernelExecutionTest, CompilableKernelValidation) {
 TEST_F(KernelExecutionTest, XLAKernelConstruction) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};  // "HLO"
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "xla_cache_key", hlo_bytes,
-                                      false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "xla_cache_key",
+                                      hlo_bytes, false, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "xla_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -98,7 +92,8 @@ TEST_F(KernelExecutionTest, XLAKernelConstruction) {
 TEST_F(KernelExecutionTest, XLAKernelWithEmptyHLO) {
   std::vector<uint8_t> empty_hlo;
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "cache_key", empty_hlo, false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "cache_key", empty_hlo,
+                                      false, 0);
 
   EXPECT_FALSE(kernel.IsValid());  // Should be invalid with empty HLO
 }
@@ -106,55 +101,21 @@ TEST_F(KernelExecutionTest, XLAKernelWithEmptyHLO) {
 TEST_F(KernelExecutionTest, XLAKernelCompilation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F, 0x01, 0x02};
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "cache_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
+                                      false, 0);
 
   // TODO(rpsilva): Integrate or mock the compiler.
   EXPECT_THROW(kernel.CompileToNeff(), std::exception);
 }
 
-TEST_F(KernelExecutionTest, NKIKernelConstruction) {
-  NKICompilableKernelExecution kernel("nki_op", "test_kernel", "/path/to/module.py", inputs_,
-                                      outputs_, "nki_cache_key", false);
-
-  EXPECT_EQ(kernel.GetOpName(), "nki_op");
-  EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("nki_cache_key") == 0);
-  EXPECT_EQ(kernel.GetKernelName(), "test_kernel");
-  EXPECT_EQ(kernel.GetModulePath(), "/path/to/module.py");
-  EXPECT_FALSE(kernel.HasCollectives());
-  EXPECT_TRUE(kernel.IsValid());
-}
-
-TEST_F(KernelExecutionTest, NKIKernelWithEmptyKernelName) {
-  NKICompilableKernelExecution kernel("nki_op", "", "/path/to/module.py", inputs_, outputs_,
-                                      "cache_key", false);
-
-  EXPECT_FALSE(kernel.IsValid());  // Should be invalid with empty kernel name
-}
-
-TEST_F(KernelExecutionTest, NKIKernelWithEmptyModulePath) {
-  NKICompilableKernelExecution kernel("nki_op", "test_kernel", "", inputs_, outputs_, "cache_key",
-                                      false);
-
-  EXPECT_FALSE(kernel.IsValid());  // Should be invalid with empty module path
-}
-
-TEST_F(KernelExecutionTest, NKIKernelCompilation) {
-  NKICompilableKernelExecution kernel("nki_op", "test_kernel", "/path/to/module.py", inputs_,
-                                      outputs_, "cache_key", false);
-
-  // Test compilation - this will throw since NKI compilation is not implemented yet
-  EXPECT_THROW(kernel.CompileToNeff(), std::logic_error);
-}
-
 TEST_F(KernelExecutionTest, CollectiveKernelConstruction) {
   CollectiveDirectKernelExecution kernel(
-      "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, inputs_,
-      outputs_, c10d::ReduceOp::SUM);
+      "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
+      output_ptrs_, c10d::ReduceOp::SUM, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "allreduce_op");
   EXPECT_FALSE(kernel.RequiresCompilation());
-  EXPECT_EQ(kernel.GetKernelType(), DirectKernelExecution::KernelType::kCollective);
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kCollective);
   EXPECT_EQ(kernel.GetCollectiveType(),
             CollectiveDirectKernelExecution::CollectiveType::kAllReduce);
   EXPECT_EQ(kernel.GetReduceOp(), c10d::ReduceOp::SUM);
@@ -172,8 +133,8 @@ TEST_F(KernelExecutionTest, CollectiveKernelAllTypes) {
       CollectiveDirectKernelExecution::CollectiveType::kReduce};
 
   for (auto type : types) {
-    CollectiveDirectKernelExecution kernel("collective", type, inputs_, outputs_,
-                                           c10d::ReduceOp::SUM);
+    CollectiveDirectKernelExecution kernel("collective", type, input_ptrs_, output_ptrs_,
+                                           c10d::ReduceOp::SUM, 0);
     EXPECT_EQ(kernel.GetCollectiveType(), type);
     EXPECT_TRUE(kernel.IsValid());
   }
@@ -187,8 +148,8 @@ TEST_F(KernelExecutionTest, CollectiveKernelReduceOps) {
 
   for (auto reduce_op : reduce_ops) {
     CollectiveDirectKernelExecution kernel(
-        "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, inputs_, outputs_,
-        reduce_op);
+        "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
+        output_ptrs_, reduce_op, 0);
     EXPECT_EQ(kernel.GetReduceOp(), reduce_op);
     EXPECT_TRUE(kernel.IsValid());
   }
@@ -199,18 +160,15 @@ TEST_F(KernelExecutionTest, PolymorphicBehavior) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   std::vector<std::unique_ptr<NeuronKernelExecution>> kernels;
-  kernels.push_back(std::make_unique<XLACompilableKernelExecution>("xla", inputs_, outputs_, "key",
-                                                                   hlo_bytes, false));
-  kernels.push_back(std::make_unique<NKICompilableKernelExecution>(
-      "nki", "kernel", "/path", inputs_, outputs_, "key", false));
+  kernels.push_back(std::make_unique<XLACompilableKernelExecution>("xla", input_ptrs_, output_ptrs_,
+                                                                   "key", hlo_bytes, false, 0));
   kernels.push_back(std::make_unique<CollectiveDirectKernelExecution>(
-      "collective", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, inputs_, outputs_,
-      c10d::ReduceOp::SUM));
+      "collective", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
+      output_ptrs_, c10d::ReduceOp::SUM, 0));
 
   // Verify polymorphic behavior
   EXPECT_TRUE(kernels[0]->RequiresCompilation());   // XLA kernel
-  EXPECT_TRUE(kernels[1]->RequiresCompilation());   // NKI kernel
-  EXPECT_FALSE(kernels[2]->RequiresCompilation());  // Collective kernel
+  EXPECT_FALSE(kernels[1]->RequiresCompilation());  // Collective kernel
 
   for (const auto& kernel : kernels) {
     EXPECT_TRUE(kernel->IsValid());
@@ -221,7 +179,8 @@ TEST_F(KernelExecutionTest, PolymorphicBehavior) {
 TEST_F(KernelExecutionTest, CacheKeyIncludesCompilerExtension) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "base_key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "base_key", hlo_bytes,
+                                      false, 0);
 
   // Cache key should start with base key
   std::string cache_key = kernel.GetCacheKey();
@@ -238,7 +197,8 @@ TEST_F(KernelExecutionTest, CacheKeyIncludesCompilerExtension) {
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false,
+                                      0);
 
   // Test that we can access compilation configuration
   EXPECT_FALSE(kernel.GetAdditionalArgs().empty());
@@ -259,7 +219,8 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   setenv("NEURON_CC_FLAGS", "--custom-flag=value", 1);
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
 
-  XLACompilableKernelExecution kernel("xla_op", inputs_, outputs_, "key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false,
+                                      0);
 
   // Check that environment variables are reflected
   EXPECT_TRUE(kernel.GetAdditionalArgs().find("--custom-flag=value") != std::string::npos);
@@ -274,32 +235,18 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
 
-TEST_F(KernelExecutionTest, NKIEnvironmentVariableSupport) {
-  // Set environment variables
-  setenv("NEURON_NKI_COMPILE_FLAGS", "--nki-custom-flag", 1);
-  setenv("NEURON_COMPILER_OPT_LEVEL", "-O3", 1);
-
-  NKICompilableKernelExecution kernel("nki_op", "kernel", "/path", inputs_, outputs_, "key", false);
-
-  // Check that environment variables are reflected
-  EXPECT_TRUE(kernel.GetAdditionalArgs().find("--nki-custom-flag") != std::string::npos);
-  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O3");
-
-  // Clean up
-  unsetenv("NEURON_NKI_COMPILE_FLAGS");
-  unsetenv("NEURON_COMPILER_OPT_LEVEL");
-}
-
 TEST_F(KernelExecutionTest, CacheKeyUniquenessWithDifferentArgs) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   // Create two kernels with same base key but different environment settings
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O1", 1);
-  XLACompilableKernelExecution kernel1("op", inputs_, outputs_, "same_base", hlo_bytes, false);
+  XLACompilableKernelExecution kernel1("op", input_ptrs_, output_ptrs_, "same_base", hlo_bytes,
+                                       false, 0);
   std::string key1 = kernel1.GetCacheKey();
 
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
-  XLACompilableKernelExecution kernel2("op", inputs_, outputs_, "same_base", hlo_bytes, false);
+  XLACompilableKernelExecution kernel2("op", input_ptrs_, output_ptrs_, "same_base", hlo_bytes,
+                                       false, 0);
   std::string key2 = kernel2.GetCacheKey();
 
   // Keys should be different due to different optimization levels
@@ -314,7 +261,7 @@ TEST_F(KernelExecutionTest, CacheKeyUniquenessWithDifferentArgs) {
 
 TEST_F(KernelExecutionTest, CachedNeffManagement) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("op", inputs_, outputs_, "key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false, 0);
 
   // Initially no cached NEFF
   EXPECT_FALSE(kernel.HasCachedNeff());
@@ -339,7 +286,7 @@ TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
   setenv("NEURON_CC_FLAGS", "--test-flag", 1);
 
-  XLACompilableKernelExecution kernel("op", inputs_, outputs_, "key", hlo_bytes, false);
+  XLACompilableKernelExecution kernel("op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false, 0);
 
   // Verify that compilation config would include these settings
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
@@ -347,6 +294,253 @@ TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
 
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
   unsetenv("NEURON_CC_FLAGS");
+}
+
+TEST_F(KernelExecutionTest, EventSignalKernelConstruction) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  EXPECT_EQ(kernel.GetOpName(), "event_signal");
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kEvent);
+  EXPECT_EQ(kernel.GetEventAction(), EventDirectKernelExecution::EventAction::kSignal);
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, EventWaitKernelConstruction) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_wait", event,
+                                    EventDirectKernelExecution::EventAction::kWait, 0);
+
+  EXPECT_EQ(kernel.GetOpName(), "event_wait");
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kEvent);
+  EXPECT_EQ(kernel.GetEventAction(), EventDirectKernelExecution::EventAction::kWait);
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, EventSignalKernelIsAlwaysReady) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  // Signal kernels are always ready to execute
+  EXPECT_TRUE(kernel.IsReady());
+}
+
+TEST_F(KernelExecutionTest, EventWaitKernelReadinessFollowsEvent) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_wait", event,
+                                    EventDirectKernelExecution::EventAction::kWait, 0);
+
+  // Wait kernel is ready when event is not recorded (query returns true)
+  EXPECT_TRUE(kernel.IsReady());
+
+  // Simulate event being recorded but not completed
+  event.get_impl()->is_recorded.store(true, std::memory_order_release);
+  event.get_impl()->is_completed.store(false, std::memory_order_release);
+
+  // Now wait kernel should not be ready
+  EXPECT_FALSE(kernel.IsReady());
+
+  // Complete the event
+  event.complete_event();
+
+  // Now wait kernel should be ready
+  EXPECT_TRUE(kernel.IsReady());
+}
+
+TEST_F(KernelExecutionTest, EventSignalKernelExecuteCompletesEvent) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  // Event should not be completed initially
+  EXPECT_FALSE(event.get_impl()->is_completed.load());
+
+  // Execute the signal kernel
+  kernel.Execute();
+
+  // Event should now be completed
+  EXPECT_TRUE(event.get_impl()->is_completed.load());
+  EXPECT_TRUE(event.query());
+}
+
+TEST_F(KernelExecutionTest, EventWaitKernelExecuteWhenReady) {
+  NeuronEvent event;
+  event.complete_event();  // Pre-complete the event
+
+  EventDirectKernelExecution kernel("event_wait", event,
+                                    EventDirectKernelExecution::EventAction::kWait, 0);
+
+  EXPECT_TRUE(kernel.IsReady());
+
+  // Execute should not throw when event is ready
+  EXPECT_NO_THROW(kernel.Execute());
+}
+
+TEST_F(KernelExecutionTest, EventKernelGetEventReturnsCorrectEvent) {
+  NeuronEvent event;
+
+  EventDirectKernelExecution kernel("event_op", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  // The kernel should hold a copy of the event that shares the same impl
+  const NeuronEvent& kernel_event = kernel.GetEvent();
+  EXPECT_EQ(kernel_event.get_impl(), event.get_impl());
+}
+
+TEST_F(KernelExecutionTest, EventKernelSharedEventState) {
+  NeuronEvent original_event;
+  NeuronEvent event_copy = original_event;
+
+  EventDirectKernelExecution kernel("event_signal", event_copy,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  // Execute the kernel (signals the event)
+  kernel.Execute();
+
+  // Both the original event and the copy should see the completion
+  EXPECT_TRUE(original_event.query());
+  EXPECT_TRUE(event_copy.query());
+  EXPECT_TRUE(kernel.GetEvent().query());
+}
+
+TEST_F(KernelExecutionTest, EventKernelDifferentDevices) {
+  NeuronEvent event;
+
+  // Create event kernels on different devices
+  EventDirectKernelExecution kernel_dev0("event_signal_0", event,
+                                         EventDirectKernelExecution::EventAction::kSignal, 0);
+  EventDirectKernelExecution kernel_dev1("event_signal_1", event,
+                                         EventDirectKernelExecution::EventAction::kSignal, 1);
+
+  EXPECT_TRUE(kernel_dev0.IsValid());
+  EXPECT_TRUE(kernel_dev1.IsValid());
+}
+
+// CompileOnlyKernelExecution tests
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution kernel("base_cache_key", stablehlo_bytes, false);
+
+  EXPECT_TRUE(kernel.IsValid());
+  EXPECT_TRUE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
+  EXPECT_FALSE(kernel.HasCollectives());
+  EXPECT_TRUE(kernel.GetCacheKey().find("base_cache_key") == 0);
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelWithCollectives) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution kernel("cache_key", stablehlo_bytes, true);
+
+  EXPECT_TRUE(kernel.HasCollectives());
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelValidation) {
+  // Empty StableHLO bytes should be invalid
+  std::vector<uint8_t> empty_bytes;
+  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false);
+
+  EXPECT_FALSE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelCacheKey) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution kernel("base_key", stablehlo_bytes, false);
+
+  std::string cache_key = kernel.GetCacheKey();
+  // Cache key should start with base key
+  EXPECT_TRUE(cache_key.find("base_key") == 0);
+  // Cache key should include compiler extension
+  EXPECT_GT(cache_key.length(), std::string("base_key").length());
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_CC_FLAGS", "--compile-only-flag", 1);
+  setenv("NEURON_COMPILER_OPT_LEVEL", "-O3", 1);
+
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, false);
+
+  EXPECT_TRUE(kernel.GetAdditionalArgs().find("--compile-only-flag") != std::string::npos);
+  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O3");
+
+  unsetenv("NEURON_CC_FLAGS");
+  unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelDefaultOptLevel) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  unsetenv("NEURON_COMPILER_OPT_LEVEL");
+
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, false);
+
+  // Default optimization level for torch.compile should be -O2
+  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelCompilation) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, false);
+
+  // CompileToNeff should throw since we don't have real compiler
+  EXPECT_THROW(kernel.CompileToNeff(), std::exception);
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelExecuteIsNoOp) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, false);
+
+  // Execute should be a no-op and not throw
+  EXPECT_NO_THROW(kernel.Execute());
+}
+
+// NeffDirectKernelExecution tests
+
+TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
+  NeffDirectKernelExecution kernel("graph_name", "cache_key", input_ptrs_, output_ptrs_, 0, false);
+
+  EXPECT_EQ(kernel.GetOpName(), "graph_name");
+  EXPECT_EQ(kernel.GetCacheKey(), "cache_key");
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
+  EXPECT_FALSE(kernel.HasCollectives());
+}
+
+TEST_F(KernelExecutionTest, NeffDirectKernelWithCollectives) {
+  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, true);
+
+  EXPECT_TRUE(kernel.HasCollectives());
+}
+
+TEST_F(KernelExecutionTest, NeffDirectKernelValidation) {
+  // Valid kernel with inputs and outputs
+  NeffDirectKernelExecution valid_kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+  EXPECT_TRUE(valid_kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, NeffDirectKernelCompileToNeffThrows) {
+  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+
+  // CompileToNeff should throw logic_error since NEFF is pre-compiled
+  EXPECT_THROW(kernel.CompileToNeff(), std::logic_error);
+}
+
+TEST_F(KernelExecutionTest, NeffDirectKernelRequiresCompilation) {
+  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+
+  // RequiresCompilation returns true to force cache lookup
+  EXPECT_TRUE(kernel.RequiresCompilation());
 }
 
 int main(int argc, char** argv) {

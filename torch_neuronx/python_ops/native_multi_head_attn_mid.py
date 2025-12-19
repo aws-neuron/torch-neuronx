@@ -169,7 +169,6 @@ class NativeMultiHeadAttnMidXLAImpl(ScaledDotProductAttnXLAImpl):
         q_transposed = query.transpose(-2, -1)
         k_transposed = key.transpose(-2, -1)
         v_transposed = value.transpose(-2, -1)
-
         # Call base XLA implementation with mapped parameter names
         result = super().execute(
             q_transposed,

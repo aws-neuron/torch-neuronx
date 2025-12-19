@@ -29,10 +29,8 @@ def is_distributed_test(item):
     )
 
 
-def is_kaizen_test(session):
-    return any(
-        marker.name.endswith("_kaizen") for item in session.items for marker in item.iter_markers()
-    )
+def is_launcher_env(session):
+    return not os.path.exists("/dev/neuron0")
 
 
 def pytest_addoption(parser):
@@ -100,12 +98,13 @@ def ensure_neuron_initialized(request):
 
     # torch import inside this function, as TOD worker doesn't have torch
     # exit early if in tod environment or bb test
-    if is_kaizen_test(request.session):
+    if is_launcher_env(request.session):
         return
 
     import torch
     from packaging.version import Version
 
+    torch_neuronx = None
     if Version("2.9.0") > Version(torch.__version__):
         import torch_neuronx
 
@@ -117,13 +116,14 @@ def ensure_neuron_initialized(request):
     if has_distributed_tests:
         return
 
-    # Use only one core
+    # Use only one core for non-distributed tests (when not using xdist)
     os.environ["NEURON_RT_NUM_CORES"] = "1"
     # NEURON_RT_VIRTUAL_CORE_SIZE can be set externally to control LNC
     # If not set, defaults to 2 (LNC=2)
 
     # Force initialization
-    torch_neuronx._lazy_init()
+    if torch_neuronx is not None:
+        torch_neuronx._lazy_init()
 
     # Force a dummy tensor operation to complete initialization
     # This ensures all Python ops are registered before tests run
@@ -166,8 +166,18 @@ if hasattr(pytest, "hookimpl"):
             # Need to set this so that the distributed test can start from correct core count
             node.workerinput["TOTAL_DEVICE_COUNT"] = str(device_count)
 
-            # Set NEURON_RT_NUM_CORES to 1 to ensure single device per process
-            os.environ["NEURON_RT_NUM_CORES"] = "1"
+            # Check if this is a distributed test by looking at the test file paths
+            test_paths = getattr(node.config, "args", [])
+            is_distributed_test = any("distributed" in str(path) for path in test_paths)
+
+            if is_distributed_test:
+                # Distributed tests: divide total cores by number of workers
+                worker_count = getattr(node.config.option, "numprocesses", 1)
+                cores_per_worker = device_count // worker_count
+                os.environ["NEURON_RT_NUM_CORES"] = str(cores_per_worker)
+            else:
+                # Non-distributed tests: 1 core per process
+                os.environ["NEURON_RT_NUM_CORES"] = "1"
             # NEURON_RT_VIRTUAL_CORE_SIZE can be set externally to control LNC
             # If not set, defaults to 2 (LNC=2)
     except ImportError:

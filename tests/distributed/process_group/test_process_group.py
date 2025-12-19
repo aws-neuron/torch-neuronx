@@ -303,3 +303,17 @@ def reset_global_state():
             del os.environ[var]
         if original_env[var] is not None:
             os.environ[var] = original_env[var]
+
+
+def test_set_enable_nan_check(process_group):
+    """Test _set_enable_nan_check method functionality."""
+    # Test default state
+    assert process_group._enable_nan_check is False
+
+    # Test enabling
+    process_group._set_enable_nan_check(True)
+    assert process_group._enable_nan_check is True
+
+    # Test disabling
+    process_group._set_enable_nan_check(False)
+    assert process_group._enable_nan_check is False

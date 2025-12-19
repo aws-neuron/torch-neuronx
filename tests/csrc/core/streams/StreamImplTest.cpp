@@ -57,7 +57,6 @@ class StreamImplTest : public ::testing::Test {
 
   void TearDown() override {
     if (stream_) {
-      stream_->Synchronize();
       stream_.reset();
     }
     mock_engine_wrapper_.reset();
@@ -70,19 +69,6 @@ class StreamImplTest : public ::testing::Test {
   std::unique_ptr<MockOperationExecutionEngineWrapper> mock_engine_wrapper_;
   OperationExecutionEngine* engine_;
   std::shared_ptr<StreamImpl> stream_;
-
-  // Helper to create a mock compilable kernel with default expectations
-  std::unique_ptr<MockCompilableKernelExecution> CreateMockKernel(const std::string& name) {
-    // Create CPU tensors - the mock will provide device info through GetInputs/GetOutputs
-    auto inputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-    auto outputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-
-    auto kernel = std::make_unique<MockCompilableKernelExecution>(name, inputs, outputs);
-    EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
-    EXPECT_CALL(*kernel, CompileToNeff())
-        .WillRepeatedly(Return(std::vector<uint8_t>{0x01, 0x02, 0x03}));
-    return kernel;
-  }
 };
 
 // Test basic construction
@@ -100,219 +86,10 @@ TEST_F(StreamImplTest, QueryEmptyStream) { EXPECT_TRUE(stream_->Query()); }
 // Test Synchronize on empty stream
 TEST_F(StreamImplTest, SynchronizeEmptyStream) { EXPECT_NO_THROW(stream_->Synchronize()); }
 
-// Test GetResourceStats
-TEST_F(StreamImplTest, GetResourceStats) {
-  auto stats = stream_->GetResourceStats();
-
-  EXPECT_EQ(stats.stream_id, 1);
-  EXPECT_EQ(stats.total_submitted, 0);
-  EXPECT_EQ(stats.total_completed, 0);
-  EXPECT_EQ(stats.total_failed, 0);
-  EXPECT_TRUE(stats.is_idle);
-  EXPECT_GE(stats.uptime.count(), 0);
-}
-
-// Test operation submission and tracking
-TEST_F(StreamImplTest, OperationSubmissionTracking) {
-  auto kernel = CreateMockKernel("test_op");
-
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // Stats should show submitted operation
-  auto stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, 1);
-
-  // Wait for completion
-  EXPECT_NO_THROW(stream_->Synchronize());
-
-  // Stats should show operation completed
-  stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, 1);
-  EXPECT_EQ(stats.total_completed, 1);
-  EXPECT_TRUE(stats.is_idle);
-}
-
-// Test multiple operations
-TEST_F(StreamImplTest, MultipleOperations) {
-  const int num_ops = 5;
-  std::vector<std::future<OperationContextResult>> futures;
-
-  for (int i = 0; i < num_ops; ++i) {
-    auto kernel = CreateMockKernel("test_op_" + std::to_string(i));
-    auto op = OperationContext(std::move(kernel));
-    futures.push_back(stream_->SubmitOperationContext(std::move(op)));
-  }
-
-  // Synchronize and check all completed
-  EXPECT_NO_THROW(stream_->Synchronize());
-
-  auto stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, num_ops);
-  EXPECT_EQ(stats.total_completed, num_ops);
-  EXPECT_TRUE(stats.is_idle);
-}
-
-// Test Query with active operations
-TEST_F(StreamImplTest, QueryWithActiveOperations) {
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // May or may not be idle depending on execution speed
-  // Just verify Query doesn't crash
-  stream_->Query();
-
-  stream_->Synchronize();
+// Test basic stream functionality without statistics
+TEST_F(StreamImplTest, BasicStreamFunctionality) {
+  // Verify stream can handle operations without statistics tracking
   EXPECT_TRUE(stream_->Query());
-}
-
-// Test event registration with no operations
-TEST_F(StreamImplTest, RegisterEventWithNoOperations) {
-  NeuronEvent event;
-
-  // Should complete immediately
-  stream_->RegisterEventWithLastOperation(&event);
-
-  EXPECT_TRUE(event.query());
-}
-
-// Test event registration with operations
-TEST_F(StreamImplTest, RegisterEventWithOperations) {
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  NeuronEvent event;
-  stream_->RegisterEventWithLastOperation(&event);
-
-  // Event should complete after synchronization
-  stream_->Synchronize();
-  EXPECT_TRUE(event.query());
-}
-
-// Test multiple events
-TEST_F(StreamImplTest, MultipleEvents) {
-  const int num_ops = 3;
-  std::vector<std::unique_ptr<NeuronEvent>> events;
-
-  for (int i = 0; i < num_ops; ++i) {
-    auto kernel = CreateMockKernel("test_op_" + std::to_string(i));
-    auto op = OperationContext(std::move(kernel));
-    stream_->SubmitOperationContext(std::move(op));
-
-    auto event = std::make_unique<NeuronEvent>();
-    stream_->RegisterEventWithLastOperation(event.get());
-    events.push_back(std::move(event));
-  }
-
-  stream_->Synchronize();
-
-  // All events should be completed
-  for (const auto& event : events) {
-    EXPECT_TRUE(event->query());
-  }
-}
-
-// Test null event registration
-TEST_F(StreamImplTest, RegisterNullEvent) {
-  EXPECT_NO_THROW(stream_->RegisterEventWithLastOperation(nullptr));
-}
-
-// Test event dependency registration
-TEST_F(StreamImplTest, RegisterEventDependency_CompletedEvent) {
-  // Create and complete an event
-  NeuronEvent event;
-  event.complete_event();
-  EXPECT_TRUE(event.query());
-
-  // Register as dependency - should be no-op since event is complete
-  EXPECT_NO_THROW(stream_->RegisterEventDependencyForNextOperation(event));
-}
-
-TEST_F(StreamImplTest, RegisterEventDependency_IncompleteEvent) {
-  // We need to mark it as incomplete by setting the internal state
-  NeuronEvent event;
-
-  // Mark event as recorded but not completed to simulate an incomplete event
-  event.get_impl()->is_recorded.store(true, std::memory_order_release);
-  event.get_impl()->is_completed.store(false, std::memory_order_release);
-  EXPECT_FALSE(event.query());
-
-  // Register as dependency
-  EXPECT_NO_THROW(stream_->RegisterEventDependencyForNextOperation(event));
-
-  // Submit operation - it should have the event as dependency
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // Complete the event
-  event.complete_event();
-
-  // Stream should complete
-  EXPECT_NO_THROW(stream_->Synchronize());
-}
-
-// Test event handle semantics - copies share state
-TEST_F(StreamImplTest, EventHandleSharedState) {
-  // Create event and make a copy
-  NeuronEvent original_event;
-  NeuronEvent event_copy = original_event;
-
-  // Register copy with operation
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  stream_->SubmitOperationContext(std::move(op));
-  stream_->RegisterEventWithLastOperation(&event_copy);
-
-  // Synchronize stream
-  stream_->Synchronize();
-
-  // Both handles should see completion
-  EXPECT_TRUE(original_event.query());
-  EXPECT_TRUE(event_copy.query());
-}
-
-// Test multiple event dependencies on same operation
-TEST_F(StreamImplTest, MultipleEventDependencies) {
-  // Create multiple incomplete events
-  NeuronEvent event1, event2, event3;
-
-  // Register all as dependencies
-  stream_->RegisterEventDependencyForNextOperation(event1);
-  stream_->RegisterEventDependencyForNextOperation(event2);
-  stream_->RegisterEventDependencyForNextOperation(event3);
-
-  // Submit operation
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // Complete events one by one
-  event1.complete_event();
-  event2.complete_event();
-  event3.complete_event();
-
-  // Stream should complete
-  EXPECT_NO_THROW(stream_->Synchronize());
-}
-
-// Test event dependency with already completed event
-TEST_F(StreamImplTest, EventDependency_AlreadyCompleted) {
-  // Create and complete event
-  NeuronEvent event;
-  event.complete_event();
-
-  // Register as dependency (should be no-op)
-  stream_->RegisterEventDependencyForNextOperation(event);
-
-  // Submit operation - should execute immediately
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // Should complete quickly since no blocking
   EXPECT_NO_THROW(stream_->Synchronize());
 }
 
@@ -323,9 +100,6 @@ TEST_F(StreamImplTest, StreamWithDifferentPriorities) {
 
   EXPECT_EQ(high_priority_stream->priority, 10);
   EXPECT_EQ(low_priority_stream->priority, 1);
-
-  high_priority_stream->Synchronize();
-  low_priority_stream->Synchronize();
 }
 
 // Test stream on different devices
@@ -335,13 +109,10 @@ TEST_F(StreamImplTest, StreamOnDifferentDevices) {
 
   EXPECT_EQ(stream_device_0->device_index, 0);
   EXPECT_EQ(stream_device_1->device_index, 1);
-
-  stream_device_0->Synchronize();
-  stream_device_1->Synchronize();
 }
 
-// Test concurrent synchronization
-TEST_F(StreamImplTest, ConcurrentSynchronization) {
+// Test concurrent synchronization on empty stream
+TEST_F(StreamImplTest, ConcurrentSynchronizationEmptyStream) {
   std::vector<std::thread> threads;
 
   for (int i = 0; i < 5; ++i) {
@@ -353,75 +124,6 @@ TEST_F(StreamImplTest, ConcurrentSynchronization) {
   }
 
   EXPECT_TRUE(stream_->Query());
-}
-
-// Test resource stats during operation execution
-TEST_F(StreamImplTest, ResourceStatsDuringExecution) {
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  // Get stats while operation may be running
-  auto stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, 1);
-  EXPECT_GE(stats.total_completed, 0);
-
-  stream_->Synchronize();
-
-  stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_completed, 1);
-}
-
-// Test uptime tracking
-TEST_F(StreamImplTest, UptimeTracking) {
-  std::this_thread::sleep_for(10ms);
-
-  auto stats = stream_->GetResourceStats();
-  EXPECT_GE(stats.uptime.count(), 0);
-}
-
-// Test shutdown flag
-TEST_F(StreamImplTest, ShutdownFlag) {
-  EXPECT_FALSE(stream_->shutdown_requested.load());
-
-  // Trigger shutdown by destroying stream
-  stream_->Synchronize();
-  stream_.reset();
-
-  // Create new stream to verify it starts with shutdown_requested = false
-  stream_ = std::make_shared<StreamImpl>(0, 5, 0, engine_);
-  EXPECT_FALSE(stream_->shutdown_requested.load());
-}
-
-// Test operation with compilable kernel
-TEST_F(StreamImplTest, OperationWithCompilableKernel) {
-  auto inputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-  auto outputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-
-  auto kernel = std::make_unique<MockCompilableKernelExecution>("compilable_op", inputs, outputs,
-                                                                "test_key", false);
-  EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
-
-  auto op = OperationContext(std::move(kernel));
-  auto future = stream_->SubmitOperationContext(std::move(op));
-
-  stream_->Synchronize();
-
-  auto stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, 1);
-}
-
-// Test stream destruction with pending operations
-TEST_F(StreamImplTest, DestructionWithPendingOperations) {
-  auto kernel = CreateMockKernel("test_op");
-  auto op = OperationContext(std::move(kernel));
-  stream_->SubmitOperationContext(std::move(op));
-
-  // Destroy stream - should synchronize first
-  EXPECT_NO_THROW(stream_.reset());
-
-  // Recreate for teardown
-  stream_ = std::make_shared<StreamImpl>(0, 1, 0, engine_);
 }
 
 // Test error handler initialization
@@ -437,40 +139,12 @@ TEST_F(StreamImplTest, OperationExecutionEnginePointer) {
 TEST_F(StreamImplTest, StreamWithZeroPriority) {
   auto zero_priority_stream = std::make_shared<StreamImpl>(0, 100, 0, engine_);
   EXPECT_EQ(zero_priority_stream->priority, 0);
-  zero_priority_stream->Synchronize();
 }
 
 // Test stream with negative priority
 TEST_F(StreamImplTest, StreamWithNegativePriority) {
   auto negative_priority_stream = std::make_shared<StreamImpl>(0, 101, -5, engine_);
   EXPECT_EQ(negative_priority_stream->priority, -5);
-  negative_priority_stream->Synchronize();
-}
-
-// Test concurrent operation submission
-TEST_F(StreamImplTest, ConcurrentOperationSubmission) {
-  std::vector<std::thread> threads;
-  std::atomic<int> submitted{0};
-
-  for (int i = 0; i < 5; ++i) {
-    threads.emplace_back([this, &submitted, i]() {
-      auto kernel = CreateMockKernel("test_op_" + std::to_string(i));
-      auto op = OperationContext(std::move(kernel));
-      stream_->SubmitOperationContext(std::move(op));
-      submitted++;
-    });
-  }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  stream_->Synchronize();
-
-  EXPECT_EQ(submitted.load(), 5);
-  auto stats = stream_->GetResourceStats();
-  EXPECT_EQ(stats.total_submitted, 5);
-  EXPECT_EQ(stats.total_completed, 5);
 }
 
 // Test GetStreamId
@@ -479,7 +153,111 @@ TEST_F(StreamImplTest, GetStreamId) {
 
   auto another_stream = std::make_shared<StreamImpl>(0, 42, 0, engine_);
   EXPECT_EQ(another_stream->GetStreamId(), 42);
-  another_stream->Synchronize();
+}
+
+// Test GetNextReadyOperation on empty stream returns nullptr
+TEST_F(StreamImplTest, GetNextReadyOperationEmptyStream) {
+  auto* result = stream_->GetNextReadyOperation();
+  EXPECT_EQ(result, nullptr);
+}
+
+// Test active_operations_ starts empty
+TEST_F(StreamImplTest, ActiveOperationsStartsEmpty) {
+  // Query returns true when no active operations
+  EXPECT_TRUE(stream_->Query());
+}
+
+// Test multiple Query calls are consistent
+TEST_F(StreamImplTest, MultipleQueryCallsConsistent) {
+  EXPECT_TRUE(stream_->Query());
+  EXPECT_TRUE(stream_->Query());
+  EXPECT_TRUE(stream_->Query());
+}
+
+// Test Synchronize is idempotent on empty stream
+TEST_F(StreamImplTest, SynchronizeIdempotentOnEmptyStream) {
+  EXPECT_NO_THROW(stream_->Synchronize());
+  EXPECT_NO_THROW(stream_->Synchronize());
+  EXPECT_NO_THROW(stream_->Synchronize());
+  EXPECT_TRUE(stream_->Query());
+}
+
+// Test stream with large stream ID
+TEST_F(StreamImplTest, StreamWithLargeStreamId) {
+  auto large_id_stream = std::make_shared<StreamImpl>(0, 999999, 0, engine_);
+  EXPECT_EQ(large_id_stream->GetStreamId(), 999999);
+  EXPECT_TRUE(large_id_stream->Query());
+}
+
+// Test stream with various device indices
+TEST_F(StreamImplTest, StreamWithVariousDeviceIndices) {
+  for (c10::DeviceIndex device = 0; device < 4; ++device) {
+    auto stream = std::make_shared<StreamImpl>(device, device + 100, 0, engine_);
+    EXPECT_EQ(stream->device_index, device);
+    EXPECT_EQ(stream->stream_id, device + 100);
+  }
+}
+
+// Test stream priority range
+TEST_F(StreamImplTest, StreamPriorityRange) {
+  // Test various priority values
+  std::vector<int> priorities = {-100, -10, -1, 0, 1, 10, 100};
+
+  for (int prio : priorities) {
+    auto stream = std::make_shared<StreamImpl>(0, 200 + prio, prio, engine_);
+    EXPECT_EQ(stream->priority, prio);
+  }
+}
+
+// Test concurrent Query calls
+TEST_F(StreamImplTest, ConcurrentQueryCalls) {
+  std::vector<std::thread> threads;
+  std::atomic<int> true_count{0};
+
+  for (int i = 0; i < 10; ++i) {
+    threads.emplace_back([this, &true_count]() {
+      if (stream_->Query()) {
+        true_count++;
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // All should return true for empty stream
+  EXPECT_EQ(true_count.load(), 10);
+}
+
+// Test stream destruction is safe
+TEST_F(StreamImplTest, StreamDestructionIsSafe) {
+  auto temp_stream = std::make_shared<StreamImpl>(0, 500, 0, engine_);
+  EXPECT_NE(temp_stream, nullptr);
+  EXPECT_TRUE(temp_stream->Query());
+
+  // Destruction should be safe
+  EXPECT_NO_THROW(temp_stream.reset());
+}
+
+// Test multiple streams can coexist
+TEST_F(StreamImplTest, MultipleStreamsCoexist) {
+  std::vector<std::shared_ptr<StreamImpl>> streams;
+
+  for (int i = 0; i < 5; ++i) {
+    streams.push_back(std::make_shared<StreamImpl>(0, 300 + i, i - 2, engine_));
+  }
+
+  // All streams should be queryable
+  for (const auto& s : streams) {
+    EXPECT_TRUE(s->Query());
+  }
+
+  // Verify each has correct properties
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_EQ(streams[i]->stream_id, 300 + i);
+    EXPECT_EQ(streams[i]->priority, i - 2);
+  }
 }
 
 int main(int argc, char** argv) {

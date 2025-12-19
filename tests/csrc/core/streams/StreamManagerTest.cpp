@@ -41,11 +41,8 @@ class StreamManagerTest : public ::testing::Test {
 
     ON_CALL(*nrt_mock, nrt_execute(_, _, _)).WillByDefault(Return(NRT_SUCCESS));
 
-    // Initialize copy utils mocks
     copy_utils_session_ = std::make_unique<torch_neuronx::utils::testing::MockCopyUtilsSession>();
-
-    // StreamManager is a singleton, so we just get the instance
-    manager_ = &StreamManager::Instance();
+    manager_ = &NeuronResourceManager::Instance().GetStreamManager();
   }
 
   void TearDown() override {
@@ -61,24 +58,13 @@ class StreamManagerTest : public ::testing::Test {
 
   // Helper to create a mock compilable kernel with default expectations
   std::unique_ptr<MockCompilableKernelExecution> CreateMockKernel(const std::string& name) {
-    auto inputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-    auto outputs = std::vector<torch::Tensor>{create_test_tensor({2, 3})};
-
-    auto kernel = std::make_unique<MockCompilableKernelExecution>(name, inputs, outputs);
+    auto kernel = std::make_unique<MockCompilableKernelExecution>(name);
     EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
     EXPECT_CALL(*kernel, CompileToNeff())
         .WillRepeatedly(Return(std::vector<uint8_t>{0x01, 0x02, 0x03}));
     return kernel;
   }
 };
-
-// Test singleton instance
-TEST_F(StreamManagerTest, SingletonInstance) {
-  auto& instance1 = StreamManager::Instance();
-  auto& instance2 = StreamManager::Instance();
-
-  EXPECT_EQ(&instance1, &instance2);
-}
 
 // Test GetStream creates stream if not exists
 TEST_F(StreamManagerTest, GetStreamCreatesIfNotExists) {
@@ -158,40 +144,6 @@ TEST_F(StreamManagerTest, SynchronizeDeviceWithNoStreams) {
   EXPECT_NO_THROW(manager_->SynchronizeDevice(99));
 }
 
-// Test SynchronizeDevice with single stream
-
-// Test SynchronizeDevice with multiple streams
-
-// Test DestroyStream
-
-// Test DestroyStream with non-existent stream
-TEST_F(StreamManagerTest, DestroyNonExistentStream) {
-  EXPECT_NO_THROW(manager_->DestroyStream(0, 99999));
-}
-
-// Test GetResourceStats
-TEST_F(StreamManagerTest, GetResourceStats) {
-  auto stats = manager_->GetResourceStats();
-
-  EXPECT_GE(stats.total_streams, 0);
-  EXPECT_GE(stats.total_pending_operations, 0);
-  EXPECT_GE(stats.total_memory_usage_estimate, 0);
-  EXPECT_GE(stats.nrt_available_slots, 0);
-  EXPECT_GE(stats.nrt_acquired_slots, 0);
-  EXPECT_GE(stats.nrt_waiting_threads, 0);
-}
-
-// Test GetResourceStats with active streams
-TEST_F(StreamManagerTest, GetResourceStatsWithActiveStreams) {
-  auto stream1 = manager_->GetStream(0, 700);
-  auto stream2 = manager_->GetStream(0, 701);
-
-  auto stats = manager_->GetResourceStats();
-  EXPECT_GE(stats.total_streams, 2);
-}
-
-// Test GetResourceStats with pending operations
-
 // Test thread-local current stream tracking
 TEST_F(StreamManagerTest, ThreadLocalCurrentStreamTracking) {
   SetCurrentStreamId(0, 900);
@@ -257,7 +209,7 @@ TEST_F(StreamManagerTest, ConcurrentStreamCreation) {
 // Test concurrent GetStream calls
 TEST_F(StreamManagerTest, ConcurrentGetStreamCalls) {
   std::vector<std::thread> threads;
-  std::vector<std::shared_ptr<StreamImpl>> streams(10);
+  std::vector<StreamImpl*> streams(10);
 
   for (int i = 0; i < 10; ++i) {
     threads.emplace_back([this, &streams, i]() { streams[i] = manager_->GetStream(0, 1200); });
@@ -288,29 +240,6 @@ TEST_F(StreamManagerTest, ConcurrentSynchronizeDeviceCalls) {
   }
 
   EXPECT_TRUE(stream->Query());
-}
-
-// Test GetResourceStats thread safety
-TEST_F(StreamManagerTest, GetResourceStatsThreadSafety) {
-  std::vector<std::thread> threads;
-  std::atomic<int> success_count{0};
-
-  for (int i = 0; i < 10; ++i) {
-    threads.emplace_back([this, &success_count]() {
-      for (int j = 0; j < 10; ++j) {
-        auto stats = manager_->GetResourceStats();
-        if (stats.total_streams >= 0) {
-          success_count++;
-        }
-      }
-    });
-  }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  EXPECT_EQ(success_count.load(), 100);
 }
 
 // Test default stream (stream_id 0) exists
@@ -352,19 +281,6 @@ TEST_F(StreamManagerTest, StreamPriorityOrdering) {
 
   EXPECT_GT(high_priority_stream->priority, medium_priority_stream->priority);
   EXPECT_GT(medium_priority_stream->priority, low_priority_stream->priority);
-}
-
-// Test DestroyStream removes stream from device map
-TEST_F(StreamManagerTest, DestroyStreamRemovesFromMap) {
-  auto stream_id = manager_->CreateStream(0, 0);
-  auto stream_before = manager_->GetStream(0, stream_id);
-
-  stream_before->Synchronize();
-  manager_->DestroyStream(0, stream_id);
-
-  // Getting stream again creates a new instance
-  auto stream_after = manager_->GetStream(0, stream_id);
-  EXPECT_NE(stream_before.get(), stream_after.get());
 }
 
 // Test concurrent operations on different streams

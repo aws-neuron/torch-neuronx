@@ -11,9 +11,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
-#include "torch_neuronx/csrc/core/utils/TensorContext.h"
 
 namespace at::neuron {
 
@@ -27,7 +27,7 @@ class CPUFallbackExecutor {
   /**
    * Execute an operation on CPU as fallback
    *
-   * @param op The operation context containing all necessary information
+   * @param kernel The compilable kernel context containing all necessary information
    * @return OperationContextResult with CPU execution results
    */
   OperationContextResult ExecuteCpuFallback(OperationContext* op);
@@ -46,20 +46,6 @@ class CPUFallbackExecutor {
   void SetEnabled(bool enabled) { enabled_ = enabled; }
   bool IsEnabled() const { return enabled_; }
 
-  /**
-   * Get statistics about CPU fallback usage
-   */
-  struct Stats {
-    uint64_t total_fallback_attempts = 0;
-    uint64_t successful_fallbacks = 0;
-    uint64_t failed_fallbacks = 0;
-    std::chrono::microseconds total_cpu_execution_time{0};
-    std::chrono::microseconds total_transfer_time{0};
-  };
-
-  Stats GetStatistics() const;
-  void ResetStatistics();
-
   ~CPUFallbackExecutor() = default;
 
   CPUFallbackExecutor(const CPUFallbackExecutor&) = delete;
@@ -67,16 +53,16 @@ class CPUFallbackExecutor {
 
  protected:
   /**
-   * Handle using TensorContext for metadata
+   * Transfer tensors from CPU device to Neuron
    */
   virtual void TransferTensorsFromCpuToNeuron(const std::vector<torch::Tensor>& cpu_results,
-                                              OperationContext* op);
+                                              const std::vector<nrt_tensor_t*>& data_ptrs);
 
   /**
-   * Transfer tensors from Neuron device to CPU using TensorContext for metadata
+   * Transfer tensors from Neuron device to CPU
    */
-  virtual std::vector<torch::Tensor> TransferTensorsToCpu(
-      const std::vector<torch::Tensor>& neuron_tensors,
+  std::vector<torch::Tensor> TransferTensorsToCpu(
+      const std::vector<nrt_tensor_t*>& data_ptrs,
       const std::vector<TensorContext>& tensor_contexts);
 
  private:
@@ -86,7 +72,7 @@ class CPUFallbackExecutor {
   std::vector<torch::Tensor> ExecuteOperationOnCpu(const std::string& op_name,
                                                    const std::vector<torch::Tensor>& cpu_inputs,
                                                    const std::vector<torch::Tensor>& cpu_outputs,
-                                                   const OperationContext* op = nullptr);
+                                                   const OperationContext* op);
 
   /**
    * Parse operation name to get the actual ATen operator
@@ -107,11 +93,6 @@ class CPUFallbackExecutor {
    * Implementation method for CPU fallback execution
    */
   void ExecuteCpuFallbackImpl(OperationContext* op);
-
-  /**
-   * Stats counter increment
-   */
-  void IncrementStatsCounter(uint64_t Stats::* counter);
 
   /**
    * Extract results from the PyTorch stack to vector
@@ -137,14 +118,9 @@ class CPUFallbackExecutor {
                                                 const std::vector<torch::Tensor>& cpu_outputs,
                                                 const c10::FunctionSchema& schema,
                                                 bool has_out_params,
-                                                const OperationContext* op = nullptr) const;
+                                                const OperationContext* op) const;
 
-  // Configuration
   bool enabled_;
-
-  // Statistics
-  mutable std::mutex stats_mutex_;
-  Stats stats_;
 };
 
 }  // namespace at::neuron

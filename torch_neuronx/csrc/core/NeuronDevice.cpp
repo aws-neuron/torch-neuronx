@@ -22,6 +22,52 @@ int world_size = -1;
 int rank = -1;
 }  // namespace
 
+// Helper to check if a device is a Neuron device
+bool IsNeuronDevice(const c10::Device& device) {
+  return device.type() == c10::DeviceType::PrivateUse1;
+}
+
+// Helper function to extract device ID from a kernel's storage impls.
+// Iterates through all storages to ensure they're on the same device and returns that device ID.
+int GetTargetDeviceId(const std::vector<at::Tensor>& inputs,
+                      const std::vector<at::Tensor>& outputs) {
+  int device_id = -1;
+  bool device_found = false;
+
+  // Check all input tensors
+  for (const auto& input : inputs) {
+    c10::Device device = input.storage().device();
+    TORCH_CHECK(IsNeuronDevice(device), "Input storage is not on Neuron device");
+    int current_device = device.index();
+    if (!device_found) {
+      device_id = current_device;
+      device_found = true;
+    } else if (device_id != current_device) {
+      throw std::runtime_error("Inconsistent device IDs found in kernel inputs: expected device " +
+                               std::to_string(device_id) + " but found device " +
+                               std::to_string(current_device));
+    }
+  }
+
+  // Check all output tensors
+  for (const auto& output : outputs) {
+    c10::Device device = output.storage().device();
+    TORCH_CHECK(IsNeuronDevice(device), "Output storage is not on Neuron device");
+    int current_device = device.index();
+    if (!device_found) {
+      device_id = current_device;
+      device_found = true;
+    } else if (device_id != current_device) {
+      throw std::runtime_error("Inconsistent device IDs found in kernel outputs: expected device " +
+                               std::to_string(device_id) + " but found device " +
+                               std::to_string(current_device));
+    }
+  }
+
+  TORCH_CHECK(device_found, "No device found in kernel inputs and outputs");
+  return device_id;
+}
+
 int current_device() { return current_device_index; }
 
 void set_device(int device) {

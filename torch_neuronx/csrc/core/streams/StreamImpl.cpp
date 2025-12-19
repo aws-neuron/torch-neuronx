@@ -14,6 +14,7 @@
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
@@ -58,7 +59,6 @@ StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id, int prio,
       stream_id(id),
       priority(prio),
       operation_execution_engine_(operation_execution_engine),
-      creation_time_(std::chrono::steady_clock::now()),
       operation_timeout_(StreamConfig::kOperationTimeout) {
   TORCH_NEURONX_STREAM_DEBUG("Creating StreamImpl", "device_index=", device_index,
                              "stream_id=", stream_id, "priority=", priority);
@@ -79,68 +79,36 @@ StreamImpl::~StreamImpl() {
 
   TORCH_NEURONX_DEBUG("Synchronizing stream before destruction", "stream_id=", stream_id);
   Synchronize();
-
-  shutdown_requested.store(true, std::memory_order_release);
-
   TORCH_NEURONX_DEBUG("Stream destruction completed", "stream_id=", stream_id);
 }
 
 std::future<OperationContextResult> StreamImpl::SubmitOperationContext(
-    OperationContext operation_context) {
+    std::unique_ptr<OperationContext> operation) {
   TORCH_NEURONX_STREAM_DEBUG("Submitting operation context", "stream_id=", stream_id,
-                             "op=", operation_context.GetOpName());
-  auto op = std::make_shared<OperationContext>(std::move(operation_context));
-  op->MarkSubmitted();
+                             "op=", operation->GetOpName());
+  operation->stream = this;
+  std::string operation_name = operation->GetOpName();
+  operation->MarkSubmitted();
 
-  // Track resource usage
-  total_operations_submitted_++;
+  OperationContext* op_ptr = operation.get();
+  auto future = op_ptr->promise.get_future();
 
-  // Collect blocking events for this operation
-  {
-    std::lock_guard<std::mutex> lock(event_state_mutex_);
-
-    std::vector<NeuronEvent> events_to_wait;
-
-    for (const auto& event_state : tracked_events_) {
-      if (event_state.type == EventState::BLOCKING && !event_state.event.query()) {
-        events_to_wait.push_back(event_state.event);
-        TORCH_NEURONX_STREAM_DEBUG("Adding blocking event to operation", "stream_id=", stream_id);
-      }
-    }
-
-    if (!events_to_wait.empty()) {
-      op->events_to_wait_for = std::move(events_to_wait);
-      TORCH_NEURONX_STREAM_DEBUG("Attached blocking events to operation", "stream_id=", stream_id,
-                                 "op=", op->GetOpName(),
-                                 "num_blocking_events=", op->events_to_wait_for.size());
-    }
-  }
-
-  // Add to unified operation tracking
   {
     std::lock_guard<std::mutex> lock(active_operations_mutex_);
-    active_operations_.push_back(op);
+    active_operations_.push_back(std::move(operation));
     TORCH_NEURONX_STREAM_DEBUG("Added operation to active tracking", "stream_id=", stream_id,
-                               "op=", op->GetOpName(), "total_active=", active_operations_.size());
+                               "op=", operation_name, "total_active=", active_operations_.size());
   }
 
-  // Route to global execution manager via NeuronResourceManager
-  TORCH_NEURONX_STREAM_DEBUG("Routing to global execution manager", "stream_id=", stream_id,
-                             "op=", op->GetOpName());
-
-  // As of now, in order to guarantee serial set of executions, we enqueue
-  // all tasks through the same sequence of workers. We skip the actual compilation
-  // in case the operation does not require one, while retaining the original
-  // order of execution.
-  OperationExecutionTask task(op.get(), this, priority, TaskType::COMPILATION);
-  operation_execution_engine_->SubmitTask(std::move(task));
-
-  TORCH_NEURONX_STREAM_DEBUG("Operation submitted to global execution manager",
-                             "stream_id=", stream_id, "op=", op->GetOpName());
-
-  TORCH_NEURONX_STREAM_DEBUG("Operation context submitted successfully", "stream_id=", stream_id,
-                             "op=", op->GetOpName());
-  return op->promise.get_future();
+  if (op_ptr->RequiresCompilation()) {
+    operation_execution_engine_->SubmitCompilationTask(op_ptr);
+  } else {
+    op_ptr->MarkExecutionReady();
+    operation_execution_engine_->NotifyExecutionReady();
+  }
+  TORCH_NEURONX_STREAM_DEBUG("Operation submitted successfully", "stream_id=", stream_id,
+                             "op=", operation_name);
+  return future;
 }
 
 bool StreamImpl::Query() const {
@@ -173,24 +141,6 @@ void StreamImpl::Synchronize() {
   error_handler_->CheckAndThrowPendingException(stream_id, /* clear exception */ true);
 
   TORCH_NEURONX_DEBUG("Stream synchronization completed", "stream_id=", stream_id);
-}
-
-StreamImpl::StreamResourceStats StreamImpl::GetResourceStats() const {
-  StreamResourceStats stats;
-  stats.stream_id = stream_id;
-  stats.total_submitted = total_operations_submitted_.load();
-  stats.total_completed = total_operations_completed_.load();
-  stats.total_failed = total_operations_failed_.load();
-  stats.is_idle = Query();
-
-  // Calculate uptime
-  auto now = std::chrono::steady_clock::now();
-  stats.uptime = std::chrono::duration_cast<std::chrono::seconds>(now - creation_time_);
-
-  stats.compilation_queue_size = 0;
-  stats.execution_queue_size = 0;
-
-  return stats;
 }
 
 void StreamImpl::RemoveActiveOperation(const OperationContext* operation) {
@@ -229,148 +179,72 @@ void StreamImpl::CompleteOperation(OperationContext* operation) {
                       "op=", operation->GetOpName(),
                       "execution_time_us=", operation->GetExecutionTime().count(),
                       "total_time_us=", operation->GetTotalTime().count());
-  // Complete events associated with this operation
-  CompleteEventsForOperation(operation);
-
-  total_operations_completed_++;
 
   operation->promise.set_value(OperationContextResult::CreateSuccess());
 
   RemoveActiveOperation(operation);
 }
 
-void StreamImpl::RegisterEventWithLastOperation(NeuronEvent* event) {
-  if (!event) {
-    return;
-  }
-
-  std::shared_ptr<OperationContext> last_operation;
-
-  {
-    std::lock_guard<std::mutex> op_lock(active_operations_mutex_);
-
-    if (active_operations_.empty()) {
-      TORCH_NEURONX_STREAM_DEBUG("No operations active, completing event immediately",
-                                 "stream_id=", stream_id);
-      event->complete_event();
-      return;
-    }
-
-    last_operation = active_operations_.back();
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(event_state_mutex_);
-    tracked_events_.emplace_back(*event, EventState::COMPLETING, last_operation.get());
-
-    TORCH_NEURONX_STREAM_DEBUG("Registered event for completion", "stream_id=", stream_id,
-                               "op=", last_operation->GetOpName(),
-                               "total_tracked=", tracked_events_.size());
-  }
-}
-
-void StreamImpl::RegisterEventDependencyForNextOperation(const NeuronEvent& event) {
-  if (event.query()) {
-    TORCH_NEURONX_STREAM_DEBUG("Event already complete, no blocking needed",
-                               "stream_id=", stream_id);
-    return;
-  }
-
-  std::lock_guard<std::mutex> lock(event_state_mutex_);
-
-  // Check if already tracked
-  auto event_impl = event.get_impl();
-  for (const auto& state : tracked_events_) {
-    if (state.event.get_impl() == event_impl) {
-      TORCH_NEURONX_STREAM_DEBUG("Event already tracked", "stream_id=", stream_id);
-      return;
-    }
-  }
-
-  // Add a BLOCKING event
-  tracked_events_.emplace_back(event, EventState::BLOCKING);
-
-  TORCH_NEURONX_STREAM_DEBUG("Registered event as blocking dependency", "stream_id=", stream_id,
-                             "total_tracked=", tracked_events_.size());
-}
-
-void StreamImpl::HandleErrorWithCleanup(OperationContext* operation,
-                                        const std::string& error_message, ErrorContext::Stage stage,
-                                        int error_code) {
-  TORCH_NEURONX_DEBUG("Delegating error handling to ErrorHandler", "stream_id=", stream_id,
-                      "op=", operation->GetOpName(), "stage=", static_cast<int>(stage));
-
-  try {
-    WaitForPriorOperationsToComplete(operation);
-  } catch (const std::exception& sync_error) {
-    TORCH_NEURONX_ERROR("Failed to synchronize prior operations before CPU fallback",
-                        "stream_id=", stream_id, "op=", operation->GetOpName(),
-                        "sync_error=", sync_error.what());
-
-    std::string full_error = "Synchronization failed: " + std::string(sync_error.what());
-    operation->promise.set_value(OperationContextResult::CreateError(full_error));
-    RemoveActiveOperation(operation);
-    total_operations_failed_++;
-    return;
-  }
-
-  auto status =
-      error_handler_->HandleOperationError(operation, error_message, stage, stream_id, error_code);
+// Template implementation for handling Neuron runtime exceptions
+template <typename ExceptionType>
+void StreamImpl::HandleErrorWithCleanup(OperationContext* operation, const ExceptionType& e) {
+  static_assert(torch_neuronx::is_neuron_runtime_exception_v<ExceptionType>,
+                "ExceptionType must be CompilationRuntimeException or ExecutionRuntimeException");
+  auto status = error_handler_->HandleOperationError(operation, e);
 
   if (status.IsSuccess()) {
-    // CPU fallback succeeded - complete the operation normally
-    TORCH_NEURONX_DEBUG("CPU fallback succeeded, completing operation normally",
+    TORCH_NEURONX_DEBUG("Recovery succeeded, completing operation normally",
                         "stream_id=", stream_id, "op=", operation->GetOpName());
     CompleteOperation(operation);
   } else {
     operation->promise.set_value(status);
     RemoveActiveOperation(operation);
-    total_operations_failed_++;
   }
 }
 
-void StreamImpl::WaitForPriorOperationsToComplete(const OperationContext* failed_operation) {
+// Explicit template instantiations
+template void StreamImpl::HandleErrorWithCleanup<torch_neuronx::CompilationRuntimeException>(
+    OperationContext*, const torch_neuronx::CompilationRuntimeException&);
+template void StreamImpl::HandleErrorWithCleanup<torch_neuronx::ExecutionRuntimeException>(
+    OperationContext*, const torch_neuronx::ExecutionRuntimeException&);
+
+void StreamImpl::WaitForPriorOperationsToComplete(const OperationContext* operation) {
   TORCH_NEURONX_DEBUG("Waiting for prior operations to complete before CPU fallback",
-                      "stream_id=", stream_id, "failed_op=", failed_operation->GetOpName());
+                      "stream_id=", stream_id, "failed_op=", operation->GetOpName());
   {
     std::unique_lock<std::mutex> lock(active_operations_mutex_);
 
-    bool is_at_front =
-        !active_operations_.empty() && active_operations_.front().get() == failed_operation;
+    bool is_at_front = !active_operations_.empty() && active_operations_.front().get() == operation;
     if (is_at_front) {
       return;
     }
 
-    completion_cv.wait(lock, [this, failed_operation]() {
+    completion_cv.wait(lock, [this, operation]() {
       // Since active_operations_ is FIFO, we only need to check if the failed operation
       // is at the front of the queue. If it is, there are no prior operations.
-      return active_operations_.empty() || active_operations_.front().get() == failed_operation;
+      return active_operations_.empty() || active_operations_.front().get() == operation;
     });
   }
   error_handler_->CheckAndThrowPendingException(stream_id, /* clear exception */ false);
 
   TORCH_NEURONX_DEBUG(
       "All prior operations completed successfully, safe to proceed with CPU fallback",
-      "stream_id=", stream_id, "failed_op=", failed_operation->GetOpName());
+      "stream_id=", stream_id, "failed_op=", operation->GetOpName());
 }
 
-void StreamImpl::CompleteEventsForOperation(OperationContext* operation) {
-  std::lock_guard<std::mutex> lock(event_state_mutex_);
-  tracked_events_.erase(
-      std::remove_if(
-          tracked_events_.begin(), tracked_events_.end(),
-          [this, operation](EventState& state) {
-            // Complete COMPLETING events for this operation
-            if (state.type == EventState::COMPLETING && state.completing_operation == operation) {
-              TORCH_NEURONX_STREAM_DEBUG("Completing event for operation", "stream_id=", stream_id,
-                                         "op=", operation->GetOpName());
-              state.event.complete_event();
-              return true;  // Remove immediately after completion
-            }
+OperationContext* StreamImpl::GetNextReadyOperation() {
+  std::lock_guard<std::mutex> lock(active_operations_mutex_);
 
-            // Also cleanup any completed BLOCKING events
-            return state.can_be_removed();
-          }),
-      tracked_events_.end());
+  if (active_operations_.empty()) {
+    return nullptr;
+  }
+
+  auto& first_op = active_operations_.front();
+  // Check if operation is compiled (if needed) and ready to execute
+  if (first_op->IsSchedulable()) {
+    return first_op.get();
+  }
+  return nullptr;
 }
+
 }  // namespace at::neuron

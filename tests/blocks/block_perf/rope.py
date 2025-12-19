@@ -80,7 +80,7 @@ def create_config(preset_name, batch_size, seq_len):
     return config
 
 
-def create_block(config, device, dtype=None, tp_mesh=None):
+def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     return create_rope_block(config, device, dtype)
 
 

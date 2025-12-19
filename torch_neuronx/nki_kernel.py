@@ -1,27 +1,34 @@
 """TorchNeuronNKIKernel - NKI kernel execution for torch-neuronx."""
 
+import base64
 import hashlib
+import json
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
+from neuronxcc.nki.compiler.backends.neuron import sema
+from neuronxcc.nki.compiler.backends.neuron.dimensions import serialize_dims
+from neuronxcc.nki.compiler.backends.neuron.FrameworkKernel import _base_name
+from neuronxcc.nki.compiler.backends.neuron.metaclasses import modified_tensor_type
 from neuronxcc.nki.compiler.backends.neuron.NumpyKernel import BaremetalKernel
+from neuronxcc.nki.compiler.backends.neuron.tensor import tensor as nki_tensor
 from neuronxcc.nki.compiler.backends.neuron.tensors import (
     KernelTensor,
     TensorRef,
 )
+from neuronxcc.starfish.penguin.ir.Function import AliasType
+from neuronxcc.starfish.penguin.ir.NativeKernel import KERNEL_VERSION
 from neuronxcc.starfish.support import dtype as neuron_dtype
-from torch._library.custom_ops import CustomOpDef, custom_op
-from torch._library.infer_schema import infer_schema
 
 from . import _C
 from .utils import (
     get_logical_neuron_cores,
     get_platform_target,
-    is_float8_e4m3fn_supported,
     is_neff_cache_disabled,
     log_neff_cache_hit,
     log_neff_cache_miss,
@@ -94,6 +101,19 @@ class NKIKernelKey:
         )
 
 
+@dataclass(frozen=True)
+class TraceResult:
+    dumped_config: str
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    return_types: tuple[tuple[Any, tuple[int, ...]], ...]
+    operand_output_aliases: dict[int, int]
+    result_is_sequence: bool
+    constant_values: tuple
+    cache_key: int
+    has_collectives: bool
+
+
 class TorchNeuronNKIKernel(BaremetalKernel):
     """NKI kernel with torch-neuronx execution.
 
@@ -131,21 +151,51 @@ class TorchNeuronNKIKernel(BaremetalKernel):
         # Otherwise, merge defaults with provided options (provided options take precedence)
         else:
             kwargs["additional_compile_opt"] = f"{default_compile_opts} {additional_opts}".strip()
-
+        # NKI uses the kernel_return calling convention by default
+        kwargs.setdefault("kernel_return", True)
         kwargs["platform_target"] = get_platform_target()
         super().__init__(**kwargs)
 
     def translate_to_neuron_dtype(self, _dtype):
         """Convert PyTorch dtype to Neuron dtype."""
-        if _dtype == torch.bfloat16:
-            return neuron_dtype.bfloat16
+
+        torch_to_neuron_dtype = {
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.float16: np.float16,
+            torch.int64: np.int64,
+            torch.int32: np.int32,
+            torch.int16: np.int16,
+            torch.int8: np.int8,
+            torch.uint8: np.uint8,
+            torch.uint16: np.uint16,
+            torch.uint32: np.uint32,
+            torch.uint64: np.uint64,
+            torch.bool: np.uint8,
+            torch.complex64: np.complex64,
+            torch.complex128: np.complex128,
+            torch.bfloat16: neuron_dtype.bfloat16,
+        }
+
         if _dtype == getattr(torch, "float8_e4m3fn", None):
-            if not is_float8_e4m3fn_supported():
-                return neuron_dtype.float8_e4m3
-            return neuron_dtype.float8_e4m3fn
-        if _dtype == getattr(torch, "float8_e5m2", None):
-            return neuron_dtype.float8_e5m2
-        # For other dtypes, use numpy conversion
+            raise RuntimeError("float8_e4m3fn is not supported in neuronxcc. ")
+
+        if hasattr(torch, "float8_e5m2"):
+            torch_to_neuron_dtype[torch.float8_e5m2] = neuron_dtype.float8_e5m2
+
+        if hasattr(torch, "float8_e4m3fn"):
+            torch_to_neuron_dtype[torch.float8_e4m3fn] = neuron_dtype.float8_e4m3fn
+
+        if hasattr(torch, "float8_e4m3fnuz"):
+            torch_to_neuron_dtype[torch.float8_e4m3fnuz] = neuron_dtype.float8_e4m3fn
+
+        if hasattr(torch, "float8_e5m2fnuz"):
+            torch_to_neuron_dtype[torch.float8_e5m2fnuz] = neuron_dtype.float8_e5m2
+
+        if _dtype in torch_to_neuron_dtype:
+            return torch_to_neuron_dtype[_dtype]
+
+        # For other dtype that is common with numpy, use builtin pytorch to do the translation
         return torch.empty(1, dtype=_dtype, device="cpu").numpy().dtype
 
     def is_framework_tensor(self, t):
@@ -457,6 +507,11 @@ class TorchNeuronNKIKernel(BaremetalKernel):
         input_set = _C._nrt_allocate_tensor_set()
         output_set = _C._nrt_allocate_tensor_set()
 
+        # Ensure that all operations prior to the NKI execution are completed, in case
+        # prior operations are dispatched asynchronously.
+        # TODO: Remove once NKI is extended to go through the C++ async pipeline.
+        torch.neuron.synchronize()
+
         try:
             tensor_devices = []
             # Add inputs to tensor set
@@ -494,11 +549,6 @@ class TorchNeuronNKIKernel(BaremetalKernel):
                 f"received {tensor_devices}"
             )
 
-            # Ensure that all operations prior to the NKI execution are completed, in case
-            # prior operations are dispatched asynchronously.
-            # TODO: Remove once NKI is extended to go through the C++ async pipeline.
-            torch.neuron.synchronize()
-
             # Load NEFF if not already loaded (using content hash)
             neff_hash = hashlib.sha256(neff_bytes).hexdigest()
             if neff_hash not in self._loaded_models:
@@ -517,6 +567,199 @@ class TorchNeuronNKIKernel(BaremetalKernel):
 
         # Return trace filename (for compatibility)
         return self.save_trace_name or "profile.ntff"
+
+    def dump_config(self, *args, **kwargs):
+        r"""Returns the `backend_config`, the list of input names and the list of the output name,
+        based on given arguments.
+
+        If `self.enable_cache` is True, `dump_config` will try to retrieve the results
+        from the cache using `args`, `kwargs` and the spmd launch grid and other
+        kernel attributes as key to identify the identical backend_config.
+
+        Otherwise, `dump_config` will always generate new backend_config.
+
+        # NOTE: THis is still used by legacy framework code, dont change the signature
+        """
+        with self.bind_arguments(*args, **kwargs) as boundargs:
+            return self.dump_config_with_boundargs(boundargs)
+
+    def dump_config_with_boundargs(self, boundargs):
+        self._map_args(boundargs)
+        hash_key = self._generate_hash_key(boundargs.arguments)
+
+        cache = getattr(self.func, "__neuron_kernel_interface_kernel_cache__", {})
+        existing_config = cache.get(hash_key, None)
+        if existing_config is not None:
+            return existing_config
+
+        ret_val, code, constants = self.specialize_and_call(boundargs)
+        dumped_config = self.encode_backend_config(code)
+        has_collectives = self.has_collectives
+
+        assert (
+            constants is not None
+        ), "enable_const_rewrite should be turned on for framework kernels."
+
+        return_names = set()
+        result_is_sequence = False
+        if isinstance(ret_val, Sequence):
+            return_names = {_base_name(t) for t in ret_val}
+            result_is_sequence = True
+        elif ret_val:
+            return_names = {_base_name(ret_val)}
+
+        input_names = tuple(t.name for t in code.inputs)
+        input_names = input_names[: len(input_names) - len(constants)]
+        output_names = tuple(t.name for t in code.outputs if t.name not in return_names)
+        return_types = self.translate_return_types(ret_val)
+
+        operand_output_aliases = self.generate_operand_output_aliases(code)
+
+        result = self.assemble_result(
+            dumped_config,
+            input_names=input_names,
+            output_names=output_names,
+            return_types=return_types,
+            operand_output_aliases=operand_output_aliases,
+            result_is_sequence=result_is_sequence,
+            constant_values=constants,
+            cache_key=hash_key,
+            has_collectives=has_collectives,
+        )
+
+        if self.enable_cache:
+            cache[hash_key] = result
+
+        return result
+
+    def _map_to_decltensor_or_passthrough(self, t):
+        if isinstance(t, tuple) and hasattr(t, "_fields"):
+            return t
+        if isinstance(t, tuple | list):
+            res = [self._map_to_decltensor_or_passthrough(e) for e in t]
+            if isinstance(t, tuple):
+                res = tuple(res)
+            return res
+        if isinstance(t, dict):
+            return {k: self._map_to_decltensor_or_passthrough(v) for k, v in t.items()}
+        if not self.is_framework_tensor(t):
+            return t
+
+        try:
+            shape, dtype = self.map_framework_tensor(t)
+        except ValueError:
+            raise ValueError("map_framework_tensor must return a tuple of shape and type") from None
+
+        return nki_tensor[shape, self.translate_to_neuron_dtype(dtype)]
+
+    def _return_shape_dtype_or_hashable(self, t, name):
+        if isinstance(t, modified_tensor_type):
+            return (t.tensor_shape, t.tensor_dtype)
+
+        if isinstance(t, str):
+            return t
+
+        if isinstance(t, Sequence):
+            return tuple(
+                self._return_shape_dtype_or_hashable(e, name=f"{name}[{i}]")
+                for i, e in enumerate(t)
+            )
+        elif isinstance(t, dict):
+            return tuple(
+                (k, self._return_shape_dtype_or_hashable(v, name=f"{name}[{k}]"))
+                for k, v in sorted(t.items())
+            )
+
+        if not isinstance(t, Hashable):
+            sema.err_nki_param_not_hashable(name=name, ty=type(t))
+        return t
+
+    def _map_args(self, boundargs):
+        for name, value in boundargs.arguments.items():
+            boundargs.arguments[name] = self._map_to_decltensor_or_passthrough(value)
+
+    def _generate_hash_key(self, args):
+        hash_key = [
+            self._return_shape_dtype_or_hashable(arg, name=name) for name, arg in args.items()
+        ]
+
+        hash_key.append(tuple(self.grid))
+        hash_key.append(self.opts)
+        hash_key.append(self._platform_target_is_fallback)
+
+        return hash(tuple(hash_key))
+
+    def generate_operand_output_aliases(self, code):
+        outputs = code.outputs
+
+        def get_alias_output_index(aliased_tensor, alias_type):
+            assert alias_type == AliasType.must_alias, f"Unexpected alias type {alias_type}!"
+            return outputs.index(aliased_tensor)
+
+        operand_output_aliases = {
+            i: get_alias_output_index(aliased_tensor, alias_type)
+            for i, in_tensor in enumerate(code.inputs)
+            for aliased_tensor, alias_type in code.findAliasTensor(in_tensor)
+        }
+        return operand_output_aliases
+
+    def encode_backend_config(self, code):
+        config = {}
+        config["kernel_version"] = KERNEL_VERSION
+        config["func_literal"] = code.serialize_ir_string(f"{self.func.__name__}_ir")
+        config["grid"] = serialize_dims(self.grid)
+        config["func_name"] = self.func.__name__
+        config["has_collectives"] = self.has_collectives
+        config["mac_count"] = self.matmul_mac_count
+        config["tiled"] = code.has_attr("tiled")
+        if not self._platform_target_is_fallback:
+            config["platform_target"] = self.opts.platform_target
+        dumped_config = base64.b64encode(json.dumps(config).encode("utf-8")).decode("utf-8")
+        return dumped_config
+
+    def assemble_result(
+        self,
+        dumped_config,
+        input_names,
+        output_names,
+        return_types,
+        operand_output_aliases,
+        result_is_sequence,
+        constant_values,
+        cache_key,
+        has_collectives,
+    ):
+        result = TraceResult(
+            dumped_config=dumped_config,
+            input_names=input_names,
+            output_names=output_names,
+            return_types=return_types,
+            operand_output_aliases=operand_output_aliases,
+            result_is_sequence=result_is_sequence,
+            constant_values=constant_values,
+            cache_key=cache_key,
+            has_collectives=has_collectives,
+        )
+
+        return result
+
+    def translate_return_types(self, ret_val):
+        if ret_val is None:
+            return []
+
+        if isinstance(ret_val, Sequence):
+            return [self.translate_return_type(t) for t in ret_val]
+
+        assert isinstance(ret_val, nki_tensor), "Unexpected return type!"
+        return [self.translate_return_type(ret_val)]
+
+    def translate_return_type(self, ret_val):
+        assert isinstance(ret_val, nki_tensor), "Unexpected return type!"
+        return ret_val.dtype, ret_val.shape
+
+    @property
+    def enable_cache(self):
+        return True
 
     @classmethod
     def clear_model_cache(cls):
@@ -555,63 +798,3 @@ class TorchNeuronNKIKernel(BaremetalKernel):
     def get_neff_cache_size(cls):
         """Get the current size of the NEFF cache."""
         return len(cls._neff_cache)
-
-
-def nki_op(
-    name: str,
-    fn: Callable | None = None,
-    mutates_args: str | Iterable[str] = {},
-) -> Callable:
-    """Create a custom operator whose implementation is backed by NKI kernels.
-
-    Similar to triton_op but for Neuron NKI kernels.
-
-    Args:
-        name (str): A name for the custom op that looks like "{namespace}::{name}",
-            e.g. "mylib::my_add".
-        mutates_args (Iterable[str] or "unknown"): The names of args that the function mutates.
-
-    Example::
-        >>> @nki_op("mylib::add", mutates_args={})
-        >>> def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        >>>     output = torch.empty_like(x)
-        >>>     wrap_nki(add_kernel)(x, y, output)
-        >>>     return output
-    """
-
-    def dec(fn: Callable[..., object]) -> CustomOpDef:
-        def backend_fn(*args, **kwargs):
-            return fn(*args, **kwargs)
-
-        result = custom_op(
-            name,
-            backend_fn,
-            mutates_args=mutates_args,
-            schema=infer_schema(fn, mutates_args=mutates_args),
-        )
-        # We require that the user pass us a function that is make_fx traceable,
-        # so we can just register it as the Fake/meta kernel.
-        result.register_fake(fn)
-
-        return result
-
-    if fn is None:
-        return dec
-    else:
-        return dec(fn)
-
-
-class nki:  # noqa N801
-    @staticmethod
-    def jit(fn):
-        """NKI equivalent of @triton.jit decorator."""
-
-        def wrapper(*args, **kwargs):
-            # Apply your trace when the function is called
-            traced_kernel = TorchNeuronNKIKernel.trace(fn)
-            return traced_kernel(*args, **kwargs)
-
-        # Mark as NKI kernel for introspection
-        wrapper._is_nki_kernel = True
-        wrapper._original_fn = fn
-        return wrapper

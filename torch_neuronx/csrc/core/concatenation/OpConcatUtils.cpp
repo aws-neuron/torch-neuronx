@@ -663,10 +663,18 @@ static void populateInputMapping(MergeMapping* mapping, const InputMappingInfo& 
                                  const DependencyAnalysis& analysis) {
   if (!mapping) return;
 
+  // IMPORTANT: Module numbers are based on INPUT ARGUMENT ORDER to
+  // mergeStableHLOModulesSkipIntermediates, NOT execution order. Module 1 = first argument
+  // (module1), Module 2 = second argument (module2). This ensures the mapping reflects the original
+  // function call order.
+
+  // Determine which inputs come from module1 vs module2 based on execution order
+  bool firstIsModule1 = analysis.module1First;
+
   // Build input mapping - First module inputs
   for (size_t i = 0; i < inputInfo.firstModuleInputMapping.size(); ++i) {
     size_t merged_idx = inputInfo.firstModuleInputMapping[i];
-    int module_num = analysis.module1First ? 1 : 2;
+    int module_num = firstIsModule1 ? 1 : 2;
     mapping->input_mapping[merged_idx] = {module_num, i};
     TORCH_NEURONX_DEBUG("Input mapping: merged[", merged_idx, "] -> module", module_num, "[", i,
                         "]");
@@ -678,7 +686,7 @@ static void populateInputMapping(MergeMapping* mapping, const InputMappingInfo& 
       size_t merged_idx = inputInfo.secondModuleInputMapping[i].value();
       // Check if this is already mapped (common input case)
       if (mapping->input_mapping.find(merged_idx) == mapping->input_mapping.end()) {
-        int module_num = analysis.module1First ? 2 : 1;
+        int module_num = firstIsModule1 ? 2 : 1;
         mapping->input_mapping[merged_idx] = {module_num, i};
         TORCH_NEURONX_DEBUG("Input mapping: merged[", merged_idx, "] -> module", module_num, "[", i,
                             "]");
@@ -696,16 +704,21 @@ static void populateOutputMapping(MergeMapping* mapping, const OutputBuildInfo& 
 
   size_t output_idx = 0;
 
-  // Use original module identity, not execution order
-  int first_module_num = analysis.module1First ? 1 : 2;
-  int second_module_num = analysis.module1First ? 2 : 1;
+  // IMPORTANT: Module numbers are based on INPUT ARGUMENT ORDER to
+  // mergeStableHLOModulesSkipIntermediates, NOT execution order. Module 1 = first argument
+  // (module1), Module 2 = second argument (module2). This ensures the mapping reflects the original
+  // function call order.
+
+  // Determine which outputs come from module1 vs module2 based on execution order
+  bool firstIsModule1 = analysis.module1First;
 
   // First-executing module outputs (only included ones)
   for (size_t i = 0; i < outputInfo.firstModuleOutputIncluded.size(); ++i) {
     if (outputInfo.firstModuleOutputIncluded[i]) {
-      mapping->output_mapping[output_idx] = {first_module_num, i};
-      TORCH_NEURONX_DEBUG("Output mapping: merged[", output_idx, "] -> module", first_module_num,
-                          "[", i, "]");
+      int module_num = firstIsModule1 ? 1 : 2;
+      mapping->output_mapping[output_idx] = {module_num, i};
+      TORCH_NEURONX_DEBUG("Output mapping: merged[", output_idx, "] -> module", module_num, "[", i,
+                          "]");
       output_idx++;
     }
   }
@@ -713,9 +726,10 @@ static void populateOutputMapping(MergeMapping* mapping, const OutputBuildInfo& 
   // Second-executing module outputs (only included ones)
   for (size_t i = 0; i < outputInfo.secondModuleOutputIncluded.size(); ++i) {
     if (outputInfo.secondModuleOutputIncluded[i]) {
-      mapping->output_mapping[output_idx] = {second_module_num, i};
-      TORCH_NEURONX_DEBUG("Output mapping: merged[", output_idx, "] -> module", second_module_num,
-                          "[", i, "]");
+      int module_num = firstIsModule1 ? 2 : 1;
+      mapping->output_mapping[output_idx] = {module_num, i};
+      TORCH_NEURONX_DEBUG("Output mapping: merged[", output_idx, "] -> module", module_num, "[", i,
+                          "]");
       output_idx++;
     }
   }
@@ -1051,6 +1065,7 @@ std::string mergeStableHLOModules(const std::string& mod_str1, const std::string
  * @param module1_output_addrs Tensor addresses for module1 outputs
  * @param module2_input_addrs Tensor addresses for module2 inputs
  * @param module2_output_addrs Tensor addresses for module2 outputs
+ * @param mapping Optional pointer to capture mapping information
  * @param verify_output Optional flag to enable/disable MLIR verification (default: true)
  *
  * @return Merged module as MLIR text string with intermediates skipped, empty string on failure
@@ -1061,7 +1076,7 @@ std::string mergeStableHLOModulesSkipIntermediates(const std::string& mod_str1,
                                                    const std::vector<void*>& module1_output_addrs,
                                                    const std::vector<void*>& module2_input_addrs,
                                                    const std::vector<void*>& module2_output_addrs,
-                                                   bool verify_output) {
+                                                   MergeMapping* mapping, bool verify_output) {
   TORCH_NEURONX_DEBUG("mergeStableHLOModulesSkipIntermediates: Starting skip intermediates merge");
 
   mlir::MLIRContext context;
@@ -1088,10 +1103,10 @@ std::string mergeStableHLOModulesSkipIntermediates(const std::string& mod_str1,
   auto analysis = analyzeDependencies(module1_input_addrs, module1_output_addrs,
                                       module2_input_addrs, module2_output_addrs);
 
-  // Merge with skip intermediates
+  // Merge with skip intermediates, passing mapping pointer through
   auto merged_module = mergeModulesSkipIntermediates(
       module1.get(), module2.get(), &context, module1_input_addrs, module1_output_addrs,
-      module2_input_addrs, module2_output_addrs, analysis, nullptr, verify_output);
+      module2_input_addrs, module2_output_addrs, analysis, mapping, verify_output);
 
   if (!merged_module) {
     TORCH_NEURONX_DEBUG("ERROR: mergeStableHLOModulesSkipIntermediates: Module merge failed");

@@ -9,9 +9,15 @@
 #include <unordered_map>
 #include <vector>
 
+// Include NRT headers for NRT_STATUS type
+extern "C" {
+#include <nrt/nrt.h>
+}
+
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/utils/ErrorRecovery.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 
 namespace at::neuron {
 
@@ -40,10 +46,8 @@ struct ErrorContext {
   std::chrono::steady_clock::time_point error_time;
 
   // Additional context
-  std::string hlo_dump_path;               // Path to HLO dump for compilation errors
-  std::string neff_path;                   // Path to NEFF file if available
-  std::vector<std::string> input_shapes;   // Input tensor shapes for debugging
-  std::vector<std::string> output_shapes;  // Expected output tensor shapes
+  std::string hlo_dump_path;  // Path to HLO dump for compilation errors
+  std::string neff_path;      // Path to NEFF file if available
 
   std::string error_details;
 
@@ -71,115 +75,6 @@ struct ErrorContext {
       default:
         return "UNKNOWN";
     }
-  }
-};
-
-/**
- * ErrorStatistics tracks error patterns for monitoring and debugging
- */
-struct ErrorStatistics {
-  // Error counts by type
-  std::atomic<uint64_t> compilation_errors{0};
-  std::atomic<uint64_t> execution_errors{0};
-  std::atomic<uint64_t> timeout_errors{0};
-  std::atomic<uint64_t> resource_errors{0};
-  std::atomic<uint64_t> user_errors{0};
-  std::atomic<uint64_t> transient_errors{0};
-
-  // Error counts by stage
-  std::atomic<uint64_t> submission_stage_errors{0};
-  std::atomic<uint64_t> lowering_stage_errors{0};
-  std::atomic<uint64_t> compilation_stage_errors{0};
-  std::atomic<uint64_t> execution_stage_errors{0};
-
-  // Default constructor
-  ErrorStatistics() = default;
-
-  // Copy constructor - copy atomic values
-  ErrorStatistics(const ErrorStatistics& other)
-      : compilation_errors(other.compilation_errors.load()),
-        execution_errors(other.execution_errors.load()),
-        timeout_errors(other.timeout_errors.load()),
-        resource_errors(other.resource_errors.load()),
-        user_errors(other.user_errors.load()),
-        transient_errors(other.transient_errors.load()),
-        submission_stage_errors(other.submission_stage_errors.load()),
-        lowering_stage_errors(other.lowering_stage_errors.load()),
-        compilation_stage_errors(other.compilation_stage_errors.load()),
-        execution_stage_errors(other.execution_stage_errors.load()),
-        retry_attempts(other.retry_attempts.load()),
-        successful_retries(other.successful_retries.load()),
-        failed_retries(other.failed_retries.load()),
-        total_error_handling_time_us(other.total_error_handling_time_us.load()),
-        error_handling_calls(other.error_handling_calls.load()) {}
-
-  // Assignment operator - assign atomic values
-  ErrorStatistics& operator=(const ErrorStatistics& other) {
-    if (this != &other) {
-      compilation_errors.store(other.compilation_errors.load());
-      execution_errors.store(other.execution_errors.load());
-      timeout_errors.store(other.timeout_errors.load());
-      resource_errors.store(other.resource_errors.load());
-      user_errors.store(other.user_errors.load());
-      transient_errors.store(other.transient_errors.load());
-      submission_stage_errors.store(other.submission_stage_errors.load());
-      lowering_stage_errors.store(other.lowering_stage_errors.load());
-      compilation_stage_errors.store(other.compilation_stage_errors.load());
-      execution_stage_errors.store(other.execution_stage_errors.load());
-      retry_attempts.store(other.retry_attempts.load());
-      successful_retries.store(other.successful_retries.load());
-      failed_retries.store(other.failed_retries.load());
-      total_error_handling_time_us.store(other.total_error_handling_time_us.load());
-      error_handling_calls.store(other.error_handling_calls.load());
-    }
-    return *this;
-  }
-
-  // Reset all counters to zero
-  void reset() {
-    compilation_errors.store(0);
-    execution_errors.store(0);
-    timeout_errors.store(0);
-    resource_errors.store(0);
-    user_errors.store(0);
-    transient_errors.store(0);
-    submission_stage_errors.store(0);
-    lowering_stage_errors.store(0);
-    compilation_stage_errors.store(0);
-    execution_stage_errors.store(0);
-    retry_attempts.store(0);
-    successful_retries.store(0);
-    failed_retries.store(0);
-    total_error_handling_time_us.store(0);
-    error_handling_calls.store(0);
-  }
-
-  // Recovery statistics
-  std::atomic<uint64_t> retry_attempts{0};
-  std::atomic<uint64_t> successful_retries{0};
-  std::atomic<uint64_t> failed_retries{0};
-
-  // Timing statistics
-  std::atomic<uint64_t> total_error_handling_time_us{0};
-  std::atomic<uint64_t> error_handling_calls{0};
-
-  // Get average error handling time
-  uint64_t get_avg_error_handling_time_us() const {
-    uint64_t calls = error_handling_calls.load();
-    if (calls == 0) return 0;
-    return total_error_handling_time_us.load() / calls;
-  }
-
-  // Get total error count
-  uint64_t get_total_errors() const {
-    return compilation_errors.load() + execution_errors.load() + timeout_errors.load() +
-           resource_errors.load() + user_errors.load() + transient_errors.load();
-  }
-
-  // Get error rate (errors per total operations)
-  double get_error_rate(uint64_t total_operations) const {
-    if (total_operations == 0) return 0.0;
-    return double(get_total_errors()) / double(total_operations);
   }
 };
 
@@ -217,19 +112,22 @@ class ErrorHandler {
                                    ErrorContext& context);
 
   /**
-   * Handle operation errors with CPU fallback and exception tracking
-   * This is the main entry point for StreamImpl error handling
+   * Handle compilation errors with recovery strategies and exception tracking
    * @param op The operation that failed
-   * @param error_message The error message
-   * @param stage The pipeline stage where the error occurred
-   * @param stream_id The stream ID for exception tracking
-   * @param error_code Optional error code for execution errors
-   * @return OperationContextResult indicating success (CPU fallback) or error
+   * @param e The compilation exception
+   * @return OperationContextResult indicating success (recovery) or error
    */
   OperationContextResult HandleOperationError(OperationContext* op,
-                                              const std::string& error_message,
-                                              ErrorContext::Stage stage, uint32_t stream_id,
-                                              int error_code = 0);
+                                              const torch_neuronx::CompilationRuntimeException& e);
+
+  /**
+   * Handle execution errors with recovery strategies and exception tracking
+   * @param op The operation that failed
+   * @param e The execution exception
+   * @return OperationContextResult indicating success (recovery) or error
+   */
+  OperationContextResult HandleOperationError(OperationContext* op,
+                                              const torch_neuronx::ExecutionRuntimeException& e);
 
   /**
    * Create enhanced error context for an operation
@@ -240,20 +138,12 @@ class ErrorHandler {
   ErrorContext CreateErrorContext(OperationContext* op, ErrorContext::Stage stage) const;
 
   /**
-   * Extract NRT status code from error message
-   * @param error_message The error message containing "status: N"
-   * @return The extracted status code, or -999 if not found
-   */
-  int ExtractNrtStatus(const std::string& error_message) const;
-
-  /**
    * Classify an NRT error message to determine error handling strategy
-   * @param error_message The NRT error message with error code
+   * @param e The ExecutionRuntimeException exception
    * @param context The error context
-   * @return Pair of updated context and readable error description
+   * @return Readable error description
    */
-  std::pair<ErrorContext, std::string> ClassifyNrtError(const std::string& error_message,
-                                                        ErrorContext context) const;
+  std::string ClassifyNrtError(const torch_neuronx::ExecutionRuntimeException& e) const;
 
   /**
    * Generate comprehensive error message with context
@@ -263,17 +153,6 @@ class ErrorHandler {
    */
   std::string GenerateErrorMessage(const std::string& base_message,
                                    const ErrorContext& context) const;
-
-  /**
-   * Get error statistics for monitoring
-   * @return Current error statistics
-   */
-  ErrorStatistics GetErrorStatistics() const;
-
-  /**
-   * Reset error statistics (useful for testing)
-   */
-  void ResetErrorStatistics();
 
   /**
    * Get recent error history for debugging
@@ -314,11 +193,7 @@ class ErrorHandler {
    */
   static std::string CleanErrorMessage(const std::string& error_message);
 
-  /**
-   * Check and rethrow any active pending exception
-   * @param stream_id The stream ID
-   * @param clear_exception Whether to clear the pending exception prior to throwing
-   */
+  // Exception tracking helpers
   void CheckAndThrowPendingException(c10::StreamId stream_id, bool clear_exception);
 
   /**
@@ -373,10 +248,6 @@ class ErrorHandler {
    */
   std::string GenerateDebugFilename(const std::string& prefix, const std::string& extension,
                                     const ErrorContext& context) const;
-
-  // Error statistics
-  mutable std::mutex stats_mutex_;
-  ErrorStatistics stats_;
 
   // Recent error history
   mutable std::mutex history_mutex_;

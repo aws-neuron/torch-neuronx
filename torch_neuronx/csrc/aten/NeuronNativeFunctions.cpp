@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/NeuronHooksInterface.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
@@ -51,34 +52,22 @@ static inline void resize_storage_neuron(at::TensorImpl* self, size_t new_size_b
   if (skip_empty_resize && self->numel() == 0) {
     return;
   }
+
   // Get current storage size
   size_t current_size = self->unsafe_storage().nbytes();
 
   // Check if we need to reallocate
   if (new_size_bytes > current_size) {
-    // Need larger storage
-    int device_index = self->device().index();
+    // Get underlying storage
+    auto& storage = self->unsafe_storage();
 
-    // Set device context
-    c10_neuron::set_device(device_index);
+    // Get the Neuron hooks interface
+    auto hooks = torch_neuronx::get_neuron_hooks();
+    TORCH_CHECK(hooks != nullptr, "Neuron hooks interface not available");
 
-    // Allocate new storage
-    auto new_storage = make_neuron_storage(new_size_bytes, device_index);
-
-    // Copy existing data if any
-    if (self->numel() > 0 && current_size > 0) {
-      void* old_data = self->unsafe_storage().data_ptr().get();
-      void* new_data = new_storage.data_ptr().get();
-
-      // Copy min of old and new size
-      size_t copy_size = std::min(current_size, new_size_bytes);
-      bool success =
-          c10_neuron::NeuronCachingAllocator::copyTensorData(new_data, old_data, copy_size);
-      TORCH_CHECK(success, "Failed to copy data during resize");
-    }
-
-    // Replace storage
-    self->set_storage_and_dtype(new_storage, self->dtype());
+    // Use the hooks interface to resize the storage
+    // This will use set_data_ptr_noswap internally to preserve storage identity
+    hooks->resizePrivateUse1Bytes(storage, new_size_bytes);
   }
 }
 

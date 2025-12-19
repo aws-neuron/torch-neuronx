@@ -307,16 +307,14 @@ TEST_F(NeuronResourceManagerTest, GetModelHandleCache) {
   auto& cache = manager_->GetModelHandleCache();
 
   // Should be able to use the cache
-  auto stats = cache.GetStatistics();
-  EXPECT_GE(stats.total_entries, 0);
+  EXPECT_NO_THROW(cache.GetCacheEntries());
 }
 
 TEST_F(NeuronResourceManagerTest, GetOperationExecutionEngine) {
   auto& engine = manager_->GetOperationExecutionEngine();
 
   // Should be able to use the engine
-  auto stats = engine.GetStatistics();
-  EXPECT_GE(stats.queue_size, 0);
+  EXPECT_NO_THROW(engine.Shutdown());
 }
 
 TEST_F(NeuronResourceManagerTest, GetResourceSemaphore) {
@@ -325,18 +323,6 @@ TEST_F(NeuronResourceManagerTest, GetResourceSemaphore) {
   // Should be able to use the semaphore
   EXPECT_GE(semaphore.AvailableCount(), 0);
   EXPECT_GE(semaphore.MaxSlots(), 0);
-}
-
-TEST_F(NeuronResourceManagerTest, GetResourceStats) {
-  auto stats = manager_->GetResourceStats();
-
-  EXPECT_GE(stats.compilation_cache_size, 0);
-  EXPECT_GE(stats.compilation_cache_memory, 0);
-  EXPECT_GE(stats.model_handle_cache_size, 0);
-  EXPECT_GE(stats.resource_available_slots, 0);
-  EXPECT_GE(stats.resource_acquired_slots, 0);
-  EXPECT_GE(stats.resource_waiting_threads, 0);
-  EXPECT_GE(stats.execution_queue_size, 0);
 }
 
 TEST_F(NeuronResourceManagerTest, ConcurrentAccess) {
@@ -349,10 +335,9 @@ TEST_F(NeuronResourceManagerTest, ConcurrentAccess) {
         // Access all resources to verify thread safety
         (void)manager_->GetCompilationCache();
         (void)manager_->GetOperationExecutionEngine();
-        (void)manager_->GetResourceSemaphore();
-        auto stats = manager_->GetResourceStats();
+        auto& semaphore = manager_->GetResourceSemaphore();
 
-        if (stats.resource_available_slots >= 0) {
+        if (semaphore.AvailableCount() >= 0) {
           success_count++;
         }
       }
@@ -366,15 +351,17 @@ TEST_F(NeuronResourceManagerTest, ConcurrentAccess) {
   EXPECT_EQ(success_count.load(), 100);
 }
 
-TEST_F(NeuronResourceManagerTest, ResourceStatsConsistency) {
-  auto stats1 = manager_->GetResourceStats();
-  auto stats2 = manager_->GetResourceStats();
+TEST_F(NeuronResourceManagerTest, SemaphoreConsistency) {
+  auto& semaphore = manager_->GetResourceSemaphore();
 
-  // Stats should be consistent (or at least reasonable)
-  EXPECT_GE(stats1.resource_available_slots + stats1.resource_acquired_slots,
-            stats1.resource_acquired_slots);
-  EXPECT_GE(stats2.resource_available_slots + stats2.resource_acquired_slots,
-            stats2.resource_acquired_slots);
+  // Semaphore should maintain consistent state
+  int available = semaphore.AvailableCount();
+  int acquired = semaphore.AcquiredSlots();
+  int max_slots = semaphore.MaxSlots();
+
+  EXPECT_GE(available, 0);
+  EXPECT_GE(acquired, 0);
+  EXPECT_EQ(available + acquired, max_slots);
 }
 
 TEST_F(NeuronResourceManagerTest, SemaphoreUsage) {

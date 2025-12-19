@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -226,6 +228,74 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     assert torch.allclose(outputs[1].cpu(), expected2), f"Rank {rank}: Output 1 mismatch"
 
 
+def run_bucketing_memory_test(rank, world_size, kwargs):
+    """Test all_gather_into_tensor_coalesced with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+    )
+    for i in range(3):
+        tensor_size = 31250000 + i * 31250000
+        input1 = torch.ones(tensor_size, dtype=torch.float32)
+        input2 = torch.ones(tensor_size, dtype=torch.float32) * 2
+        inputs = [input1.to("neuron"), input2.to("neuron")]
+
+        default_group = torch.distributed.group.WORLD
+        outputs = _c10d_functional.all_gather_into_tensor_coalesced(
+            inputs, world_size, default_group.group_name
+        )
+
+        expected1 = torch.cat([torch.ones(tensor_size) for _ in range(world_size)], dim=0)
+        expected2 = torch.cat([torch.ones(tensor_size) * 2 for _ in range(world_size)], dim=0)
+        assert torch.allclose(outputs[0].cpu(), expected1)
+        assert torch.allclose(outputs[1].cpu(), expected2)
+
+        peak_raw = os.popen(
+            f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+            f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+        ).read()
+        peak_str = peak_raw.strip()
+        peak = int(peak_str) if peak_str else 0
+        assert peak < 1073741824, f"Memory {peak} exceeds 1GB"
+
+
+def run_bucketing_memory_flat_2d_tensor_test(rank, world_size, kwargs):
+    """Test all_gather_into_tensor_coalesced with bucketing to ensure memory stays under 1GB."""
+    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
+    dev_id = int(core_id) // 8
+    core_id = int(core_id) - (dev_id * 8)
+    os.system(
+        f"echo 0 | sudo tee /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+        f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+    )
+    for i in range(3):
+        tensor_size = 31250000 + i * 31250000
+        input1 = torch.ones(1, tensor_size, dtype=torch.float32)
+        input2 = torch.ones(1, tensor_size, dtype=torch.float32) * 2
+        inputs = [input1.to("neuron"), input2.to("neuron")]
+
+        default_group = torch.distributed.group.WORLD
+        outputs = _c10d_functional.all_gather_into_tensor_coalesced(
+            inputs, world_size, default_group.group_name
+        )
+
+        expected1 = torch.cat([torch.ones(1, tensor_size) for _ in range(world_size)], dim=0)
+        expected2 = torch.cat([torch.ones(1, tensor_size) * 2 for _ in range(world_size)], dim=0)
+        assert torch.allclose(outputs[0].cpu(), expected1)
+        assert torch.allclose(outputs[1].cpu(), expected2)
+
+        peak_raw = os.popen(
+            f"cat /sys/devices/virtual/neuron_device/neuron{dev_id}/"
+            f"neuron_core{core_id}/stats/memory_usage/device_mem/model_shared_scratchpad/peak"
+        ).read()
+        peak_str = peak_raw.strip()
+        peak = int(peak_str) if peak_str else 0
+        assert peak < 1073741824, f"Memory {peak} exceeds 1GB"
+
+
 class TestAllGatherIntoTensorCoalesced(BaseCollectiveOpTest):
     """Test cases for functional all_gather_into_tensor_coalesced."""
 
@@ -284,3 +354,11 @@ class TestAllGatherIntoTensorCoalesced(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test all_gather_into_tensor_coalesced with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+    def test_bucketing_memory(self):
+        """Test all_gather_into_tensor_coalesced with bucketing for memory efficiency."""
+        self.distributed_tester.run_test(run_bucketing_memory_test)
+
+    def test_bucketing_memory_flat_2d_tensor_test(self):
+        """Test all_gather_into_tensor with bucketing for memory efficiency with flat 2d tensor"""
+        self.distributed_tester.run_test(run_bucketing_memory_flat_2d_tensor_test)

@@ -9,6 +9,7 @@
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/streams/StreamManager.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 namespace at::neuron {
 
@@ -22,8 +23,9 @@ c10::DeviceIndex resolve_device_index(c10::DeviceIndex device_index) {
 }
 }  // namespace
 
-std::shared_ptr<StreamImpl> NeuronStream::get_stream_impl() const {
-  auto stream_impl = StreamManager::Instance().GetStream(device_index(), id());
+StreamImpl* NeuronStream::get_stream_impl() const {
+  auto& manager = at::neuron::NeuronResourceManager::Instance().GetStreamManager();
+  auto stream_impl = manager.GetStream(device_index(), id());
   TORCH_CHECK(stream_impl != nullptr, "Stream implementation not found for stream ", id(),
               " on device ", device_index());
   return stream_impl;
@@ -51,13 +53,9 @@ void NeuronStream::wait_event(const NeuronEvent& event) const {
     return;
   }
 
-  // Register this event as a dependency for the next operation on this stream
-  try {
-    get_stream_impl()->RegisterEventDependencyForNextOperation(event);
-    TORCH_NEURONX_DEBUG("Registered event dependency for stream", "stream_id=", id());
-  } catch (const std::exception& e) {
-    TORCH_CHECK(false, "Failed to register event dependency on stream ", id(), ": ", e.what());
-  }
+  // Submit event wait primitive
+  SubmitEventWait(event);
+  TORCH_NEURONX_DEBUG("Submitted event wait primitive", "stream_id=", id());
 }
 
 void NeuronStream::wait_stream(const NeuronStream& other) const {
@@ -86,22 +84,6 @@ void NeuronStream::wait_stream(const NeuronStream& other) const {
   }
 }
 
-void NeuronStream::register_event_after_current_operations(NeuronEvent* event) const {
-  TORCH_NEURONX_TRACE_FUNCTION();
-  TORCH_CHECK(event != nullptr, "Cannot register null event on stream ", id());
-
-  try {
-    auto stream_impl = get_stream_impl();
-    stream_impl->RegisterEventWithLastOperation(event);
-  } catch (const std::exception& e) {
-    TORCH_NEURONX_ERROR("Failed to register event with stream", "stream_id=", id(),
-                        "error=", e.what());
-    // Avoid hanging the event
-    event->complete_event();
-    throw;
-  }
-}
-
 NeuronStream NeuronStream::getDefaultStream(c10::DeviceIndex device_index) {
   device_index = resolve_device_index(device_index);
   return NeuronStream(0, device_index, UNCHECKED);
@@ -119,8 +101,31 @@ void NeuronStream::setCurrentStream(const NeuronStream& stream) {
 
 NeuronStream NeuronStream::createStream(c10::DeviceIndex device_index, int priority) {
   device_index = resolve_device_index(device_index);
-  c10::StreamId stream_id = StreamManager::Instance().CreateStream(device_index, priority);
+  auto& manager = at::neuron::NeuronResourceManager::Instance().GetStreamManager();
+  c10::StreamId stream_id = manager.CreateStream(device_index, priority);
   return NeuronStream(stream_id, device_index, UNCHECKED);
+}
+
+void NeuronStream::SubmitEventSignal(const NeuronEvent& event) const {
+  TORCH_NEURONX_DEBUG("Submitting event signal primitive", "stream_id=", id(),
+                      "device=", device_index());
+
+  auto event_kernel = std::make_unique<EventDirectKernelExecution>(
+      "event_signal", event, EventDirectKernelExecution::EventAction::kSignal, device_index());
+
+  auto operation = std::make_unique<OperationContext>(std::move(event_kernel));
+  SubmitOperationContext(*this, std::move(operation));
+}
+
+void NeuronStream::SubmitEventWait(const NeuronEvent& event) const {
+  TORCH_NEURONX_DEBUG("Submitting event wait primitive", "stream_id=", id(),
+                      "device=", device_index());
+
+  auto event_kernel = std::make_unique<EventDirectKernelExecution>(
+      "event_wait", event, EventDirectKernelExecution::EventAction::kWait, device_index());
+
+  auto operation = std::make_unique<OperationContext>(std::move(event_kernel));
+  SubmitOperationContext(*this, std::move(operation));
 }
 
 // Global functions
@@ -138,16 +143,19 @@ c10::DeviceIndex current_device() { return c10_neuron::current_device(); }
 
 void synchronize(c10::DeviceIndex device_index) {
   device_index = resolve_device_index(device_index);
-  StreamManager::Instance().SynchronizeDevice(device_index);
+  auto& manager = at::neuron::NeuronResourceManager::Instance().GetStreamManager();
+  manager.SynchronizeDevice(device_index);
 }
 
-void SubmitOperationContext(const NeuronStream& stream, OperationContext operation_context) {
-  TORCH_NEURONX_TRACE_FUNCTION_WITH_ARGS("op_name=", operation_context.GetOpName());
+void SubmitOperationContext(const NeuronStream& stream,
+                            std::unique_ptr<OperationContext> operation) {
+  TORCH_NEURONX_TRACE_FUNCTION_WITH_ARGS("op_name=", operation->GetOpName());
   TORCH_NEURONX_DEBUG("Submit operation context", "stream_id=", stream.id(),
-                      "op=", operation_context.GetOpName(), "device=", stream.device_index());
+                      "op=", operation->GetOpName(), "device=", stream.device_index());
 
-  auto stream_impl = StreamManager::Instance().GetStream(stream.device_index(), stream.id());
-  auto future = stream_impl->SubmitOperationContext(std::move(operation_context));
+  auto& stream_manager = NeuronResourceManager::Instance().GetStreamManager();
+  auto stream_impl = stream_manager.GetStream(stream.device_index(), stream.id());
+  auto future = stream_impl->SubmitOperationContext(std::move(operation));
   auto shared_future = future.share();
 
   static const bool neuron_launch_blocking = []() {
@@ -162,12 +170,6 @@ void SubmitOperationContext(const NeuronStream& stream, OperationContext operati
       throw std::runtime_error(result.GetError());
     }
   }
-}
-
-void RecordPendingOperation(c10_neuron::NeuronStorageImpl* storage_impl,
-                            const std::shared_future<OperationContextResult>& future) {
-  TORCH_CHECK(storage_impl != nullptr, "Storage implementation cannot be null");
-  storage_impl->record_pending_operation(future);
 }
 
 }  // namespace at::neuron

@@ -9,6 +9,7 @@
 #include <typeinfo>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h"
 #include "torch_neuronx/csrc/core/utils/ErrorRecovery.h"
 
@@ -90,42 +91,15 @@ std::string ErrorHandler::HandleExecutionError(OperationContext* op,
   return complete_message;
 }
 
-int ErrorHandler::ExtractNrtStatus(const std::string& error_message) const {
-  size_t status_pos = error_message.find("status");
-  if (status_pos != std::string::npos) {
-    size_t search_start = status_pos + 6;  // Skip "status"
-
-    // Skip separators (whitespace, =, :)
-    while (search_start < error_message.length() &&
-           (std::isspace(error_message[search_start]) || error_message[search_start] == '=' ||
-            error_message[search_start] == ':')) {
-      search_start++;
-    }
-
-    // Extract number
-    size_t number_end = error_message.find_first_not_of("-0123456789", search_start);
-    if (number_end == std::string::npos) {
-      number_end = error_message.length();
-    }
-
-    if (search_start < number_end) {
-      std::string status_str = error_message.substr(search_start, number_end - search_start);
-      try {
-        return std::stoi(status_str);
-      } catch (const std::exception&) {
-        return -999;
-      }
-    }
-  }
-  return -999;
-}
-
-std::pair<ErrorContext, std::string> ErrorHandler::ClassifyNrtError(
-    const std::string& error_message, ErrorContext context) const {
-  int nrt_status = ExtractNrtStatus(error_message);
+std::string ErrorHandler::ClassifyNrtError(
+    const torch_neuronx::ExecutionRuntimeException& e) const {
   std::string readable_error = "";
+  int nrt_status = e.GetNRTStatus();
 
   switch (nrt_status) {
+    case 0:  // NRT_SUCCESS
+      readable_error = "Success (unexpected in error context)";
+      break;
     case 1:  // NRT_FAILURE
       readable_error = "Non-specific failure";
       break;
@@ -206,53 +180,25 @@ std::pair<ErrorContext, std::string> ErrorHandler::ClassifyNrtError(
     case 1205:  // NRT_EXEC_HW_ERR_REPAIRABLE_HBM_UE
       readable_error = "HBM repairable uncorrectable error";
       break;
-    case 1206:  // NRT_NETWORK_PROXY_FAILURE
+    case 1206:
       readable_error = "EFA network proxy failure";
       break;
-    case -999:  // default case since extract_nrt_status returns -999
+    default:
+      // Handle unknown status codes including 1206 (NRT_NETWORK_PROXY_FAILURE) and -999
       readable_error = "Unknown status (status: " + std::to_string(nrt_status) + ")";
       break;
   }
 
-  return {context, error_message + ", " + readable_error};
+  return std::string(e.what()) + ", " + readable_error;
 }
 
 ErrorContext ErrorHandler::CreateErrorContext(OperationContext* op,
                                               ErrorContext::Stage stage) const {
   ErrorContext context;
 
-  if (op) {
-    context.operation_name = op->GetOpName();
-    context.submit_time = op->submit_time;
-
-    // Extract tensor shapes for debugging
-    const auto& input_tensors = op->kernel_execution->GetInputs();
-    for (size_t i = 0; i < input_tensors.size(); ++i) {
-      const auto& tensor = input_tensors[i];
-      std::ostringstream shape_str;
-      shape_str << "input" << std::to_string(i) << ": [";
-      for (int64_t i = 0; i < tensor.dim(); ++i) {
-        if (i > 0) shape_str << ", ";
-        shape_str << tensor.size(i);
-      }
-      shape_str << "]";
-      context.input_shapes.push_back(shape_str.str());
-    }
-
-    const auto& output_tensors = op->kernel_execution->GetOutputs();
-    for (size_t i = 0; i < output_tensors.size(); ++i) {
-      const auto& tensor = output_tensors[i];
-      std::ostringstream shape_str;
-      shape_str << "output" << std::to_string(i) << ": [";
-      for (int64_t i = 0; i < tensor.dim(); ++i) {
-        if (i > 0) shape_str << ", ";
-        shape_str << tensor.size(i);
-      }
-      shape_str << "]";
-      context.output_shapes.push_back(shape_str.str());
-    }
-  }
-
+  context.stream_id = op->stream->stream_id;
+  context.operation_name = op->GetOpName();
+  context.submit_time = op->submit_time;
   context.current_stage = stage;
   context.error_time = std::chrono::steady_clock::now();
 
@@ -271,20 +217,6 @@ std::string ErrorHandler::GenerateErrorMessage(const std::string& base_message,
     msg << "\nStage: " << context.get_stage_name();
     msg << "\nElapsed Time: " << context.get_elapsed_time().count() << "ms";
 
-    if (!context.input_shapes.empty()) {
-      msg << "\nInput Shapes:";
-      for (const auto& shape : context.input_shapes) {
-        msg << "\n  " << shape;
-      }
-    }
-
-    if (!context.output_shapes.empty()) {
-      msg << "\nOutput Shapes:";
-      for (const auto& shape : context.output_shapes) {
-        msg << "\n  " << shape;
-      }
-    }
-
     if (!context.hlo_dump_path.empty()) {
       msg << "\nHLO Dump: " << context.hlo_dump_path;
     }
@@ -296,18 +228,6 @@ std::string ErrorHandler::GenerateErrorMessage(const std::string& base_message,
   }
 
   return msg.str();
-}
-
-ErrorStatistics ErrorHandler::GetErrorStatistics() const {
-  std::lock_guard<std::mutex> lock(stats_mutex_);
-  return stats_;
-}
-
-void ErrorHandler::ResetErrorStatistics() {
-  std::lock_guard<std::mutex> lock(stats_mutex_);
-  stats_.reset();
-
-  TORCH_NEURONX_DEBUG("Error statistics reset");
 }
 
 std::vector<ErrorContext> ErrorHandler::GetRecentErrors(size_t max_errors) const {
@@ -363,30 +283,6 @@ std::string ErrorHandler::CleanErrorMessage(const std::string& error_message) {
 
 void ErrorHandler::RecordError(const ErrorContext& context,
                                std::chrono::microseconds processing_time) {
-  // Update statistics
-  {
-    std::lock_guard<std::mutex> lock(stats_mutex_);
-
-    // Update error counts by stage
-    switch (context.current_stage) {
-      case ErrorContext::Stage::SUBMISSION:
-        stats_.submission_stage_errors++;
-        break;
-      case ErrorContext::Stage::COMPILATION:
-        stats_.compilation_errors++;
-        stats_.compilation_stage_errors++;
-        break;
-      case ErrorContext::Stage::EXECUTION:
-        stats_.execution_errors++;
-        stats_.execution_stage_errors++;
-        break;
-    }
-
-    // Update timing statistics
-    stats_.total_error_handling_time_us += processing_time.count();
-    stats_.error_handling_calls++;
-  }
-
   // Add to recent error history
   {
     std::lock_guard<std::mutex> lock(history_mutex_);
@@ -426,58 +322,61 @@ std::string ErrorHandler::GenerateDebugFilename(const std::string& prefix,
   return filename.str();
 }
 
-OperationContextResult ErrorHandler::HandleOperationError(OperationContext* op,
-                                                          const std::string& error_message,
-                                                          ErrorContext::Stage stage,
-                                                          uint32_t stream_id, int error_code) {
-  TORCH_NEURONX_DEBUG("Operation failed on neuron - recovery might be attempted");
+OperationContextResult ErrorHandler::HandleOperationError(
+    OperationContext* op, const torch_neuronx::CompilationRuntimeException& e) {
+  uint32_t stream_id = op->stream->stream_id;
+  TORCH_NEURONX_DEBUG("Handling compilation error", "stream_id=", stream_id,
+                      "op=", op->GetOpName());
 
-  auto recovery_status = error_recovery_->AttemptRecovery(op);
+  auto recovery_status = error_recovery_->AttemptRecovery(op, e);
   if (recovery_status.IsSuccess()) {
     return recovery_status;
   }
 
-  // Create error context
-  ErrorContext context = CreateErrorContext(op, stage);
+  // Create error context with inferred stage
+  ErrorContext context = CreateErrorContext(op, ErrorContext::Stage::COMPILATION);
 
   std::string error_details;
-  // Call the appropriate stage-specific error handler for monitoring/logging ONLY
-  // These handlers should NOT set the promise again - it's already been set above
   try {
-    // Use consolidated monitoring method for all error stages
-    switch (stage) {
-      case ErrorContext::Stage::COMPILATION: {
-        // TODO - add mapping of compilation_error to human_readable if available
-        auto cleaned_error_message = CleanErrorMessage(error_message);
-        error_details = HandleCompilationError(op, cleaned_error_message, context);
-        context.error_details = error_details;
-        break;
-      }
-      case ErrorContext::Stage::EXECUTION: {
-        auto [nrt_context, readable_error] = ClassifyNrtError(error_message, context);
-        error_details = HandleExecutionError(op, readable_error, nrt_context);
-        context.error_details = error_details;
-        break;
-      }
-      default: {
-        error_details = "Unknown stage error: " + error_message;
-        TORCH_NEURONX_WARN("Unknown error stage for monitoring", "stage=", static_cast<int>(stage),
-                           "stream_id=", stream_id);
-        context.error_details = error_details;
-        break;
-      }
-    }
-
+    auto cleaned_error_message = CleanErrorMessage(e.what());
+    error_details = HandleCompilationError(op, cleaned_error_message, context);
+    context.error_details = error_details;
     RecordErrorForMonitoring(op, context);
   } catch (const std::exception& handler_error) {
-    TORCH_NEURONX_WARN("Error monitoring threw exception, but promise will be set",
-                       "stream_id=", stream_id, "op=", op->GetOpName(),
-                       "handler_error=", handler_error.what());
+    TORCH_NEURONX_WARN("Error monitoring threw exception", "stream_id=", stream_id,
+                       "op=", op->GetOpName(), "handler_error=", handler_error.what());
+  }
+  auto exception_ptr = std::make_exception_ptr(std::runtime_error(error_details));
+  RecordFirstException(stream_id, exception_ptr);
+
+  return OperationContextResult::CreateError(error_details);
+}
+
+OperationContextResult ErrorHandler::HandleOperationError(
+    OperationContext* op, const torch_neuronx::ExecutionRuntimeException& e) {
+  uint32_t stream_id = op->stream->stream_id;
+  TORCH_NEURONX_DEBUG("Handling execution error", "stream_id=", stream_id, "op=", op->GetOpName());
+
+  auto recovery_status = error_recovery_->AttemptRecovery(op, e);
+  if (recovery_status.IsSuccess()) {
+    return recovery_status;
   }
 
-  auto exception_ptr = std::make_exception_ptr(std::runtime_error(error_details));
+  // Create error context with inferred stage
+  ErrorContext context = CreateErrorContext(op, ErrorContext::Stage::EXECUTION);
 
-  // Record this as the first exception for the stream
+  // TODO: Use ExecutionRuntimeException properties to parse NRT statuses.
+  std::string error_details;
+  try {
+    auto readable_error = e.HasNRTStatus() ? ClassifyNrtError(e) : std::string(e.what());
+    error_details = HandleExecutionError(op, readable_error, context);
+    context.error_details = error_details;
+    RecordErrorForMonitoring(op, context);
+  } catch (const std::exception& handler_error) {
+    TORCH_NEURONX_WARN("Error monitoring threw exception", "stream_id=", stream_id,
+                       "op=", op->GetOpName(), "handler_error=", handler_error.what());
+  }
+  auto exception_ptr = std::make_exception_ptr(std::runtime_error(error_details));
   RecordFirstException(stream_id, exception_ptr);
 
   return OperationContextResult::CreateError(error_details);
@@ -498,7 +397,8 @@ void ErrorHandler::RecordFirstException(uint32_t stream_id, std::exception_ptr e
 // Consolidated monitoring method that does NOT set promises (promises already set by caller)
 void ErrorHandler::RecordErrorForMonitoring(OperationContext* op, const ErrorContext& context) {
   TORCH_NEURONX_DEBUG("Recording error for monitoring only", "stream_id=", context.stream_id,
-                      "op=", op->GetOpName(), "stage=", static_cast<int>(context.current_stage));
+                      "op=", op->GetOpName(), "stage=", static_cast<int>(context.current_stage),
+                      "error_details=", context.error_details);
 
   // Get the appropriate timing based on the error stage
   std::chrono::microseconds processing_time;
@@ -523,11 +423,15 @@ void ErrorHandler::CheckAndThrowPendingException(c10::StreamId stream_id, bool c
   if (has_pending_exception_) {
     TORCH_NEURONX_DEBUG("Propagating pending exception during synchronization",
                         "stream_id=", stream_id);
+
+    // Clear the exception state before rethrowing
     auto exception_to_throw = first_exception_;
     if (clear_exception) {
       first_exception_ = nullptr;
       has_pending_exception_ = false;
     }
+
+    // Rethrow the exception
     std::rethrow_exception(exception_to_throw);
   }
 }

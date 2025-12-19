@@ -20,16 +20,15 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
  protected:
   // Override ProcessExecutionTask to skip device checks and NRT execution
   // Just immediately complete the operation successfully
-  void ProcessExecutionTask(OperationExecutionTask& task) noexcept override {
-    auto* stream = task.stream;
-    auto* op = task.operation;
+  void ProcessExecutionTask(OperationContext* operation) noexcept override {
+    auto* stream = operation->stream;
 
     // Set execution timing
-    op->StartExecution();
-    op->execute_end = std::chrono::steady_clock::now();
+    operation->StartExecution();
+    operation->execute_end = std::chrono::steady_clock::now();
 
     // Complete the operation on the stream
-    stream->CompleteOperation(op);
+    stream->CompleteOperation(operation);
   }
 };
 

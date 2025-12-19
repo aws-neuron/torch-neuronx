@@ -14,6 +14,7 @@ namespace at::neuron {
 class CompilationCache;
 class ModelHandleCache;
 class OperationExecutionEngine;
+class StreamManager;
 
 // Enhanced semaphore implementation for resource management with priority support.
 //
@@ -142,6 +143,10 @@ class NeuronResourceManager {
   // Returns: Reference to the execution engine
   OperationExecutionEngine& GetOperationExecutionEngine();
 
+  // Get the stream manager for stream lifecycle management
+  // Returns: Reference to the stream manager
+  StreamManager& GetStreamManager();
+
   // Get the shared resource semaphore for general resource management
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
@@ -150,12 +155,6 @@ class NeuronResourceManager {
   struct ResourceStats {
     size_t compilation_cache_size;    // Number of cached NEFFs
     size_t compilation_cache_memory;  // Estimated cache memory usage in bytes
-    size_t model_handle_cache_size;   // Number of cached model handles
-    size_t resource_available_slots;  // Available resource semaphore slots
-    size_t resource_acquired_slots;   // Currently acquired resource slots
-    size_t resource_waiting_threads;  // Threads waiting for resource slots
-    size_t execution_queue_size;      // Number of pending executions
-    bool execution_worker_active;     // Whether execution worker is running
   };
 
   // Get comprehensive resource statistics
@@ -181,6 +180,7 @@ class NeuronResourceManager {
   // Shared resources
   std::unique_ptr<CompilationCache> compilation_cache_;
   std::unique_ptr<ModelHandleCache> model_handle_cache_;
+  std::unique_ptr<StreamManager> stream_manager_;
   std::unique_ptr<OperationExecutionEngine> operation_execution_engine_;
   std::unique_ptr<ResourceSemaphore> resource_semaphore_;
 };

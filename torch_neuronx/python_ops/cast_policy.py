@@ -125,14 +125,14 @@ def prepare_src_for_neuron_to_neuron_copy(src: torch.Tensor, dst: torch.Tensor) 
     )
 
 
-def write_neuron_to_neuron(
-    dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False
-) -> None:
+def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = True) -> None:
     """In-place copy/cast from Neuron tensor `src` to Neuron tensor `dst`.
 
     - If dtypes match: direct NRT device copy.
     - If 64-bit is involved (src or dst): CPU bounce for cast (Neuron lacks 64-bit).
     - Else: device-side cast kernel for <=32-bit dtypes.
+
+    NOTE: By default, this is non-blocking, unless there is a CPU bounce.
     """
     import torch_neuronx._C as _C  # local import
 
@@ -146,8 +146,9 @@ def write_neuron_to_neuron(
         return
 
     if is_64bit(dst.dtype) or is_64bit(src.dtype):
-        cpu_tmp = copy_neuron_to_cpu(src, target_dtype=dst.dtype, non_blocking=non_blocking)
-        _C._nrt_copy_cpu_to_neuron_tensor(cpu_tmp, dst, non_blocking=non_blocking)
+        # Implicit synchronization
+        cpu_tmp = copy_neuron_to_cpu(src, target_dtype=dst.dtype, non_blocking=False)
+        _C._nrt_copy_cpu_to_neuron_tensor(cpu_tmp, dst, non_blocking=False)
         return
 
     # <=32-bit on-device cast

@@ -32,6 +32,8 @@ class MockNRT {
   MOCK_METHOD(void*, nrt_tensor_get_va, (const nrt_tensor_t*));
   MOCK_METHOD(NRT_STATUS, nrt_tensor_write, (nrt_tensor_t*, const void*, size_t, size_t));
   MOCK_METHOD(NRT_STATUS, nrt_tensor_read, (const nrt_tensor_t*, void*, size_t, size_t));
+  MOCK_METHOD(NRT_STATUS, nrt_tensor_copy,
+              (const nrt_tensor_t*, size_t, nrt_tensor_t*, size_t, size_t));
 
   // Tensor set management
   MOCK_METHOD(NRT_STATUS, nrt_allocate_tensor_set, (nrt_tensor_set_t**));

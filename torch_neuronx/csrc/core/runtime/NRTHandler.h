@@ -34,23 +34,6 @@ namespace at::neuron {
 class NRTHandler {
  public:
   /**
-   * Result of NRT execution attempt
-   */
-  struct ExecutionResult {
-    bool success;
-    std::string error_message;
-    std::chrono::milliseconds execution_time;
-
-    static ExecutionResult Success(std::chrono::milliseconds exec_time) {
-      return {true, "", exec_time};
-    }
-
-    static ExecutionResult Error(const std::string& error) {
-      return {false, error, std::chrono::milliseconds(0)};
-    }
-  };
-
-  /**
    * Configuration for NRT execution
    */
   struct ExecutionConfig {
@@ -72,40 +55,39 @@ class NRTHandler {
   /**
    * Execute a compilable kernel using NRT
    *
-   * @param compilable_kernel The compilable kernel to execute
+   * @param hlo_kernel The compilable kernel to execute
    * @param op_name Operation name for logging
    * @param config Execution configuration
    * @return ExecutionResult indicating success/failure and timing
    */
-  static ExecutionResult ExecuteCompilableKernel(const CompilableKernelExecution& compilable_kernel,
-                                                 const std::string& op_name,
-                                                 const ExecutionConfig& config);
+  static void PrepareAndExecuteModel(nrt::Model* model, const std::vector<nrt_tensor_t*>& inputs,
+                                     const std::vector<nrt_tensor_t*>& outputs,
+                                     const ExecutionConfig& config);
+
+  /**
+   * Get or load model from cache
+   */
+  static nrt::Model* GetOrLoadModel(const CompilableKernelExecution& compilable_kernel,
+                                    const ExecutionConfig& config);
 
  private:
   /**
    * Prepare input tensor set from compilable kernel
    */
-  static void PrepareInputTensorSet(const CompilableKernelExecution& compilable_kernel,
+  static void PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
                                     nrt::TensorSet& input_set);
 
   /**
    * Prepare output tensor set from compilable kernel
    */
-  static void PrepareOutputTensorSet(const CompilableKernelExecution& compilable_kernel,
+  static void PrepareOutputTensorSet(const std::vector<nrt_tensor_t*>& outputs,
                                      nrt::TensorSet& output_set);
-
-  /**
-   * Get or load model from cache
-   */
-  static std::shared_ptr<nrt::Model> GetOrLoadModel(
-      const CompilableKernelExecution& compilable_kernel, const ExecutionConfig& config);
 
   /**
    * Execute model with proper resource management
    */
-  static ExecutionResult ExecuteModel(const std::string& op_name, std::shared_ptr<nrt::Model> model,
-                                      nrt::TensorSet& input_set, nrt::TensorSet& output_set,
-                                      const ExecutionConfig& config);
+  static void ExecuteModel(const std::shared_ptr<nrt::Model>& model, nrt::TensorSet& input_set,
+                           nrt::TensorSet& output_set, const ExecutionConfig& config);
 };
 
 }  // namespace at::neuron

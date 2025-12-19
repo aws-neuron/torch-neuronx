@@ -1,0 +1,913 @@
+# ruff: noqa: N806, N803, N812
+
+"""
+Unit tests for FX graph transformation passes for Neuron backend.
+
+These tests build FX graphs using the fx_passes helper functions,
+execute them with real tensors, and verify numerical accuracy against
+PyTorch reference implementations.
+"""
+
+import operator
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+import torch.fx as fx
+import torch.nn.functional as F
+from torch.fx.passes.shape_prop import ShapeProp
+
+from torch_neuronx.neuron_dynamo_backend import fx_passes
+
+
+class TestExpandKVForGQA:
+    """Tests that execute the FX graph produced by fx_passes._expand_kv_for_gqa."""
+
+    def test_gqa_expansion_numerical_accuracy(self):
+        """Test that the generated FX graph produces correct numerical results."""
+        b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
+        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+
+        graph = fx.Graph()
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(b, h_kv, s, e)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(b, h_kv, s, e)}
+
+        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        graph.output((key_out, value_out))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        key = torch.randn(b, h_kv, s, e)
+        value = torch.randn(b, h_kv, s, e)
+        key_expanded, value_expanded = gm(key, value)
+
+        # Compute expected result manually
+        repeat_factor = h_q // h_kv
+        expected_key = key.unsqueeze(2).expand(b, h_kv, repeat_factor, s, e).reshape(b, h_q, s, e)
+        expected_value = (
+            value.unsqueeze(2).expand(b, h_kv, repeat_factor, s, e).reshape(b, h_q, s, e)
+        )
+
+        torch.testing.assert_close(key_expanded, expected_key)
+        torch.testing.assert_close(value_expanded, expected_value)
+
+    def test_gqa_expansion_head_repetition(self):
+        """Test that each KV head is correctly repeated to match Q heads."""
+        b, h_q, h_kv, s, e = 1, 6, 2, 8, 4
+        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=8, S=s, E=e)
+        repeat_factor = h_q // h_kv
+
+        graph = fx.Graph()
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(b, h_kv, s, e)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(b, h_kv, s, e)}
+
+        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        graph.output((key_out, value_out))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        key = torch.randn(b, h_kv, s, e)
+        value = torch.randn(b, h_kv, s, e)
+        key_expanded, value_expanded = gm(key, value)
+
+        # Verify each KV head is repeated correctly
+        for kv_idx in range(h_kv):
+            for r in range(repeat_factor):
+                q_idx = kv_idx * repeat_factor + r
+                torch.testing.assert_close(key_expanded[:, q_idx], key[:, kv_idx])
+                torch.testing.assert_close(value_expanded[:, q_idx], value[:, kv_idx])
+
+    def test_no_expansion_when_equal_heads(self):
+        """Test that no expansion happens when H_q == H_kv (returns same nodes)."""
+        graph = fx.Graph()
+        shapes = fx_passes.AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
+        key = graph.placeholder("key")
+        key.meta = {"val": torch.empty(2, 8, 64, 32)}
+        value = graph.placeholder("value")
+        value.meta = {"val": torch.empty(2, 8, 64, 32)}
+
+        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key, value, shapes)
+
+        # Should return original nodes unchanged
+        assert key_out is key
+        assert value_out is value
+
+    def test_invalid_head_ratio_raises(self):
+        """Test that invalid head ratios raise ValueError."""
+        graph = fx.Graph()
+        shapes = fx_passes.AttentionShapes(B=2, H_q=7, H_kv=2, L=64, S=64, E=32)
+        key = graph.placeholder("key")
+        key.meta = {"val": torch.empty(2, 2, 64, 32)}
+        value = graph.placeholder("value")
+        value.meta = {"val": torch.empty(2, 2, 64, 32)}
+
+        with pytest.raises(ValueError, match="must be multiple of"):
+            fx_passes._expand_kv_for_gqa(graph, key, value, shapes)
+
+
+class TestReduceGQAGradients:
+    """Tests that execute the FX graph produced by fx_passes._reduce_gqa_gradients."""
+
+    def test_gradient_reduction_numerical_accuracy(self):
+        """Test that gradient reduction produces correct numerical results."""
+        B, H_q, H_kv, S, E = 2, 8, 2, 16, 32
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=16, S=S, E=E)
+        repeat_factor = H_q // H_kv
+
+        graph = fx.Graph()
+        grad_key_node = graph.placeholder("grad_key")
+        grad_key_node.meta = {"val": torch.empty(B, H_q, S, E)}
+        grad_value_node = graph.placeholder("grad_value")
+        grad_value_node.meta = {"val": torch.empty(B, H_q, S, E)}
+
+        grad_key_out, grad_value_out = fx_passes._reduce_gqa_gradients(
+            graph, grad_key_node, grad_value_node, shapes, torch.float32
+        )
+        graph.output((grad_key_out, grad_value_out))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        grad_key = torch.randn(B, H_q, S, E)
+        grad_value = torch.randn(B, H_q, S, E)
+        grad_key_reduced, grad_value_reduced = gm(grad_key, grad_value)
+
+        # Expected: reshape and sum across repeated heads
+        expected_grad_key = grad_key.reshape(B, H_kv, repeat_factor, S, E).sum(dim=2)
+        expected_grad_value = grad_value.reshape(B, H_kv, repeat_factor, S, E).sum(dim=2)
+
+        torch.testing.assert_close(grad_key_reduced, expected_grad_key)
+        torch.testing.assert_close(grad_value_reduced, expected_grad_value)
+
+    def test_no_reduction_when_equal_heads(self):
+        """Test that no reduction happens when H_q == H_kv."""
+        graph = fx.Graph()
+        shapes = fx_passes.AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
+        grad_key = graph.placeholder("grad_key")
+        grad_key.meta = {"val": torch.empty(2, 8, 64, 32)}
+        grad_value = graph.placeholder("grad_value")
+        grad_value.meta = {"val": torch.empty(2, 8, 64, 32)}
+
+        grad_key_out, grad_value_out = fx_passes._reduce_gqa_gradients(
+            graph, grad_key, grad_value, shapes, torch.float32
+        )
+
+        assert grad_key_out is grad_key
+        assert grad_value_out is grad_value
+
+
+class TestComputeAttentionScores:
+    """Tests that execute the FX graph produced by fx_passes._compute_attention_scores."""
+
+    def test_attention_scores_numerical_accuracy(self):
+        """Test that attention scores computation produces correct results."""
+        B, H, L, S, E = 2, 4, 16, 32, 64
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_node, scale, shapes, torch.float32
+        )
+        graph.output(scores)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        result = gm(query, key)
+
+        # Expected: Q @ K^T * scale
+        expected = torch.matmul(query, key.transpose(-2, -1)) * scale
+
+        torch.testing.assert_close(result, expected)
+
+    def test_scale_is_applied_correctly(self):
+        """Test that the scale factor is correctly applied."""
+        B, H, L, S, E = 1, 2, 4, 4, 8
+        scale = 0.5  # Use a distinctive scale
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_node, scale, shapes, torch.float32
+        )
+        graph.output(scores)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        result = gm(query, key)
+
+        unscaled = torch.matmul(query, key.transpose(-2, -1))
+        torch.testing.assert_close(result, unscaled * scale)
+
+
+class TestComputeSoftmax:
+    """Tests that execute the FX graph produced by fx_passes._compute_softmax."""
+
+    def test_softmax_matches_pytorch(self):
+        """Test that softmax computation matches PyTorch's F.softmax."""
+        B, H, L, S = 2, 4, 16, 32
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+
+        graph = fx.Graph()
+        scores_node = graph.placeholder("scores")
+        scores_node.meta = {"val": torch.empty(B, H, L, S)}
+
+        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, torch.float32)
+        graph.output(attn_weights)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        scores = torch.randn(B, H, L, S)
+        result = gm(scores)
+        expected = F.softmax(scores, dim=-1)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+
+    def test_softmax_numerical_stability(self):
+        """Test softmax is numerically stable with large values."""
+        B, H, L, S = 1, 1, 1, 4
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
+
+        graph = fx.Graph()
+        scores_node = graph.placeholder("scores")
+        scores_node.meta = {"val": torch.empty(B, H, L, S)}
+
+        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, torch.float32)
+        graph.output(attn_weights)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        # Large values that would overflow naive exp()
+        scores = torch.tensor([[[[100.0, 200.0, 300.0, 400.0]]]])
+        result = gm(scores)
+
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+        torch.testing.assert_close(result.sum(dim=-1), torch.ones(B, H, L), rtol=1e-5, atol=1e-6)
+
+
+class TestReplaceSortStable:
+    """Tests for fx_passes._replace_sort_stable_with_identity function."""
+
+    def test_sort_values_become_identity(self):
+        """Test that sorted values output becomes identity (input passthrough)."""
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x.meta = {"val": torch.randn(2, 4, 8)}
+
+        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
+        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
+
+        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
+        graph.output(sorted_vals)
+
+        fx_passes._replace_sort_stable_with_identity(graph)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        test_input = torch.randn(2, 4, 8)
+        result = gm(test_input)
+
+        # After replacement, sorted_vals should be identity (same as input)
+        torch.testing.assert_close(result, test_input)
+
+    def test_returns_false_when_no_sort_nodes(self):
+        """Test that function returns False when no sort.stable nodes exist."""
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        y = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        graph.output(y)
+
+        modified = fx_passes._replace_sort_stable_with_identity(graph)
+
+        assert modified is False
+
+
+class TestFullAttentionPipeline:
+    """Integration tests that build and execute full attention computation graphs."""
+
+    def test_mha_attention_forward(self):
+        """Test building and executing a complete MHA attention forward pass."""
+        B, H, L, S, E = 2, 4, 8, 16, 32
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E)}
+
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_node, scale, shapes, torch.float32
+        )
+        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores, shapes, torch.float32)
+        output = graph.call_function(torch.ops.aten.matmul.default, args=(attn_weights, value_node))
+        graph.output(output)
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        result = gm(query, key, value)
+
+        # Compute expected
+        expected_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        expected_weights = F.softmax(expected_scores, dim=-1)
+        expected = torch.matmul(expected_weights, value)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+
+    def test_gqa_attention_forward(self):
+        """Test attention pipeline with GQA (H_q != H_kv)."""
+        B, H_q, H_kv, L, S, E = 2, 8, 2, 8, 16, 32
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H_q, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H_kv, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H_kv, S, E)}
+
+        # Expand KV for GQA
+        key_expanded, value_expanded = fx_passes._expand_kv_for_gqa(
+            graph, key_node, value_node, shapes
+        )
+
+        # Compute attention
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_expanded, scale, shapes, torch.float32
+        )
+        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores, shapes, torch.float32)
+        output = graph.call_function(
+            torch.ops.aten.matmul.default, args=(attn_weights, value_expanded)
+        )
+        graph.output(output)
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H_q, L, E)
+        key = torch.randn(B, H_kv, S, E)
+        value = torch.randn(B, H_kv, S, E)
+
+        result = gm(query, key, value)
+
+        # Compute expected with manual GQA expansion
+        repeat_factor = H_q // H_kv
+        key_exp = key.unsqueeze(2).expand(B, H_kv, repeat_factor, S, E).reshape(B, H_q, S, E)
+        value_exp = value.unsqueeze(2).expand(B, H_kv, repeat_factor, S, E).reshape(B, H_q, S, E)
+        expected_scores = torch.matmul(query, key_exp.transpose(-2, -1)) * scale
+        expected_weights = F.softmax(expected_scores, dim=-1)
+        expected = torch.matmul(expected_weights, value_exp)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+
+
+class TestLegalizeFlexAttentionPass:
+    """Tests for fx_passes.legalize_flex_attention_pass function."""
+
+    def test_pass_handles_graph_with_sort_stable(self):
+        """Test that pass removes sort.stable nodes even without flex_attention."""
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x.meta = {"val": torch.randn(2, 4, 8)}
+
+        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
+        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
+
+        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
+        graph.output(sorted_vals)
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+        result = fx_passes.legalize_flex_attention_pass(gm)
+
+        # Should remove sort.stable
+        sort_nodes = [n for n in result.graph.nodes if n.target == torch.ops.aten.sort.stable]
+        assert len(sort_nodes) == 0
+
+    def test_pass_returns_same_module_when_no_changes_needed(self):
+        """Test that pass returns unchanged module for simple graphs."""
+
+        class SimpleModule(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        gm = fx.symbolic_trace(SimpleModule())
+        result = fx_passes.legalize_flex_attention_pass(gm)
+
+        assert result is gm
+
+
+class TestFlexAttentionLegalization:
+    """Test fx_passes.legalize_flex_attention_pass with real flex_attention graphs."""
+
+    def test_flex_attention_legalization_numerical_accuracy(self):
+        """Test that legalized flex_attention produces same output as original."""
+        from functorch.compile import aot_module, make_boxed_func
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, L, S, E = 1, 4, 16, 16, 32
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value)
+
+        captured_gm = None
+
+        def capture_compiler(gm: torch.fx.GraphModule, example_inputs):
+            nonlocal captured_gm
+            captured_gm = gm
+            return make_boxed_func(gm.forward)
+
+        class FlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v)
+
+        model = FlexAttnModule()
+
+        aot_model = aot_module(
+            model,
+            fw_compiler=capture_compiler,
+        )
+
+        with torch.no_grad():
+            _ = aot_model(query, key, value)
+
+        assert captured_gm is not None
+
+        legalized_gm = fx_passes.legalize_flex_attention_pass(captured_gm)
+
+        flex_nodes = [
+            n
+            for n in legalized_gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.higher_order.flex_attention
+        ]
+
+        assert len(flex_nodes) == 0
+
+        with torch.no_grad():
+            legalized_output = legalized_gm(query, key, value)
+
+        # Unpack if tuple
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+
+class TestDtypeSizeCombinations:
+    """Tests for various dtype and size combinations across attention functions."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_gqa_expansion_dtypes(self, dtype):
+        """Test GQA expansion preserves dtype correctly."""
+        b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
+        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+
+        graph = fx.Graph()
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(b, h_kv, s, e, dtype=dtype)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(b, h_kv, s, e, dtype=dtype)}
+
+        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        graph.output((key_out, value_out))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        key = torch.randn(b, h_kv, s, e, dtype=dtype)
+        value = torch.randn(b, h_kv, s, e, dtype=dtype)
+        key_expanded, value_expanded = gm(key, value)
+
+        assert key_expanded.dtype == dtype
+        assert value_expanded.dtype == dtype
+        assert key_expanded.shape == (b, h_q, s, e)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_attention_scores_dtypes(self, dtype):
+        """Test attention scores computation with different dtypes."""
+        B, H, L, S, E = 2, 4, 16, 32, 64
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E, dtype=dtype)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E, dtype=dtype)}
+
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_node, scale, shapes, dtype
+        )
+        graph.output(scores)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E, dtype=dtype)
+        key = torch.randn(B, H, S, E, dtype=dtype)
+        result = gm(query, key)
+
+        assert result.dtype == dtype
+        expected = torch.matmul(query, key.transpose(-2, -1)) * scale
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_softmax_dtypes(self, dtype):
+        """Test softmax computation with different dtypes."""
+        B, H, L, S = 2, 4, 16, 32
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+
+        graph = fx.Graph()
+        scores_node = graph.placeholder("scores")
+        scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
+
+        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, dtype)
+        graph.output(attn_weights)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        scores = torch.randn(B, H, L, S, dtype=dtype)
+        result = gm(scores)
+
+        assert result.dtype == dtype
+        expected = F.softmax(scores.float(), dim=-1).to(dtype)
+        # bfloat16 has lower precision
+        rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 1, 1, 1, 8),  # Minimal sizes
+            (1, 1, 4, 4, 16),  # Small
+            (2, 8, 64, 64, 64),  # Medium
+            (4, 16, 128, 128, 128),  # Larger
+            (1, 32, 1, 512, 64),  # Many heads, single query
+            (2, 4, 256, 32, 32),  # Long query, short KV
+        ],
+    )
+    def test_attention_scores_various_sizes(self, B, H, L, S, E):
+        """Test attention scores with various tensor sizes."""
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+
+        scores = fx_passes._compute_attention_scores(
+            graph, query_node, key_node, scale, shapes, torch.float32
+        )
+        graph.output(scores)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        result = gm(query, key)
+
+        assert result.shape == (B, H, L, S)
+        expected = torch.matmul(query, key.transpose(-2, -1)) * scale
+        torch.testing.assert_close(result, expected)
+
+
+class TestComputeAttentionBackward:
+    """Tests for fx_passes._compute_attention_backward function."""
+
+    def test_backward_gradient_shapes(self):
+        """Test that backward pass produces correct gradient shapes."""
+        B, H, L, S, E = 2, 4, 16, 32, 64
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E)}
+        attn_weights_node = graph.placeholder("attn_weights")
+        attn_weights_node.meta = {"val": torch.empty(B, H, L, S)}
+        grad_out_node = graph.placeholder("grad_out")
+        grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
+
+        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+            graph,
+            query_node,
+            key_node,
+            value_node,
+            attn_weights_node,
+            grad_out_node,
+            scale,
+            shapes,
+            torch.float32,
+        )
+        graph.output((grad_q, grad_k, grad_v))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+        attn_weights = F.softmax(torch.randn(B, H, L, S), dim=-1)
+        grad_out = torch.randn(B, H, L, E)
+
+        grad_query, grad_key, grad_value = gm(query, key, value, attn_weights, grad_out)
+
+        assert grad_query.shape == (B, H, L, E)
+        assert grad_key.shape == (B, H, S, E)
+        assert grad_value.shape == (B, H, S, E)
+
+    def test_backward_grad_value_numerical(self):
+        """Test grad_value computation: grad_value = attn_weights^T @ grad_out."""
+        B, H, L, S, E = 1, 2, 4, 8, 16
+        scale = 1.0
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E)}
+        attn_weights_node = graph.placeholder("attn_weights")
+        attn_weights_node.meta = {"val": torch.empty(B, H, L, S)}
+        grad_out_node = graph.placeholder("grad_out")
+        grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
+
+        _, _, grad_v = fx_passes._compute_attention_backward(
+            graph,
+            query_node,
+            key_node,
+            value_node,
+            attn_weights_node,
+            grad_out_node,
+            scale,
+            shapes,
+            torch.float32,
+        )
+        graph.output(grad_v)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+        attn_weights = F.softmax(torch.randn(B, H, L, S), dim=-1)
+        grad_out = torch.randn(B, H, L, E)
+
+        grad_value = gm(query, key, value, attn_weights, grad_out)
+
+        # Expected: attn_weights^T @ grad_out
+        expected_grad_value = torch.matmul(attn_weights.transpose(-2, -1), grad_out)
+        torch.testing.assert_close(grad_value, expected_grad_value)
+
+    def test_backward_with_autograd_reference(self):
+        """Test backward pass against PyTorch autograd reference."""
+        B, H, L, S, E = 1, 2, 4, 8, 16
+        scale = 1.0 / (E**0.5)
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        # Create inputs with gradients
+        query = torch.randn(B, H, L, E, requires_grad=True)
+        key = torch.randn(B, H, S, E, requires_grad=True)
+        value = torch.randn(B, H, S, E, requires_grad=True)
+
+        # Forward pass with PyTorch
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        attn_weights = F.softmax(scores, dim=-1)
+        output = torch.matmul(attn_weights, value)
+
+        # Backward with PyTorch
+        grad_out = torch.randn(B, H, L, E)
+        output.backward(grad_out)
+
+        expected_grad_q = query.grad.clone()
+        expected_grad_k = key.grad.clone()
+        expected_grad_v = value.grad.clone()
+
+        # Now test our implementation
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E)}
+        attn_weights_node = graph.placeholder("attn_weights")
+        attn_weights_node.meta = {"val": torch.empty(B, H, L, S)}
+        grad_out_node = graph.placeholder("grad_out")
+        grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
+
+        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+            graph,
+            query_node,
+            key_node,
+            value_node,
+            attn_weights_node,
+            grad_out_node,
+            scale,
+            shapes,
+            torch.float32,
+        )
+        graph.output((grad_q, grad_k, grad_v))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        # Use detached tensors and recomputed attn_weights
+        query_detached = query.detach()
+        key_detached = key.detach()
+        value_detached = value.detach()
+        attn_weights_detached = attn_weights.detach()
+
+        grad_query, grad_key, grad_value = gm(
+            query_detached, key_detached, value_detached, attn_weights_detached, grad_out
+        )
+
+        torch.testing.assert_close(grad_query, expected_grad_q, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(grad_key, expected_grad_k, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(grad_value, expected_grad_v, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_backward_dtypes(self, dtype):
+        """Test backward pass preserves dtype."""
+        B, H, L, S, E = 1, 2, 4, 8, 16
+        scale = 1.0
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E, dtype=dtype)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E, dtype=dtype)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E, dtype=dtype)}
+        attn_weights_node = graph.placeholder("attn_weights")
+        attn_weights_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
+        grad_out_node = graph.placeholder("grad_out")
+        grad_out_node.meta = {"val": torch.empty(B, H, L, E, dtype=dtype)}
+
+        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+            graph,
+            query_node,
+            key_node,
+            value_node,
+            attn_weights_node,
+            grad_out_node,
+            scale,
+            shapes,
+            dtype,
+        )
+        graph.output((grad_q, grad_k, grad_v))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        query = torch.randn(B, H, L, E, dtype=dtype)
+        key = torch.randn(B, H, S, E, dtype=dtype)
+        value = torch.randn(B, H, S, E, dtype=dtype)
+        attn_weights = F.softmax(torch.randn(B, H, L, S, dtype=dtype), dim=-1)
+        grad_out = torch.randn(B, H, L, E, dtype=dtype)
+
+        grad_query, grad_key, grad_value = gm(query, key, value, attn_weights, grad_out)
+
+        assert grad_query.dtype == dtype
+        assert grad_key.dtype == dtype
+        assert grad_value.dtype == dtype
+
+
+class TestScoreModInlining:
+    """Tests for score_mod inlining functionality."""
+
+    def test_inline_score_mod_creates_nodes(self):
+        """Test that _inline_score_mod creates expected nodes in graph."""
+        B, H, L, S, E = 1, 2, 4, 8, 16
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        # Create a simple score_mod that adds a bias
+        class SimpleScoreMod(torch.nn.Module):
+            def forward(self, score, b_idx, h_idx, q_idx, kv_idx):
+                return score + 1.0
+
+        score_mod_module = fx.symbolic_trace(SimpleScoreMod())
+
+        # Main graph
+        main_graph = fx.Graph()
+        scaled_scores = main_graph.placeholder("scaled_scores")
+        scaled_scores.meta = {"val": torch.empty(B, H, L, S)}
+
+        # Create index tensors
+        index_tensors = fx_passes._create_index_tensors(main_graph, shapes)
+
+        gm = fx.GraphModule(torch.nn.Module(), main_graph)
+
+        # Inline score_mod
+        final_scores = fx_passes._inline_score_mod(
+            main_graph,
+            gm,
+            "score_mod",
+            score_mod_module,
+            scaled_scores,
+            index_tensors,
+            shapes,
+        )
+
+        main_graph.output(final_scores)
+        gm = fx.GraphModule(torch.nn.Module(), main_graph)
+
+        # Verify the graph has add operation
+        add_nodes = [
+            n for n in main_graph.nodes if n.op == "call_function" and "add" in str(n.target)
+        ]
+        assert len(add_nodes) > 0
+
+    def test_inline_score_mod_with_arithmetic(self):
+        """Test score_mod inlining with arithmetic operations using indices."""
+        B, H, L, S, E = 1, 2, 4, 8, 16
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        # Create a score_mod that uses indices in arithmetic (no tensor constants)
+        class ArithmeticScoreMod(torch.nn.Module):
+            def forward(self, score, b_idx, h_idx, q_idx, kv_idx):
+                # Scale score based on position difference
+                return score * (1.0 + q_idx.float() * 0.1)
+
+        score_mod_module = fx.symbolic_trace(ArithmeticScoreMod())
+
+        main_graph = fx.Graph()
+        scaled_scores = main_graph.placeholder("scaled_scores")
+        scaled_scores.meta = {"val": torch.empty(B, H, L, S)}
+
+        index_tensors = fx_passes._create_index_tensors(main_graph, shapes)
+
+        gm = fx.GraphModule(torch.nn.Module(), main_graph)
+
+        final_scores = fx_passes._inline_score_mod(
+            main_graph,
+            gm,
+            "score_mod",
+            score_mod_module,
+            scaled_scores,
+            index_tensors,
+            shapes,
+        )
+
+        main_graph.output(final_scores)
+        gm = fx.GraphModule(torch.nn.Module(), main_graph)
+
+        # Verify the graph has mul operations from the score_mod
+        mul_nodes = [
+            n for n in main_graph.nodes if n.op == "call_function" and "mul" in str(n.target)
+        ]
+        assert len(mul_nodes) > 0
+
+    def test_create_index_tensors_shapes(self):
+        """Test that _create_index_tensors creates correctly shaped tensors."""
+        B, H, L, S, E = 2, 4, 8, 16, 32
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        b_idx, h_idx, q_idx, kv_idx = fx_passes._create_index_tensors(graph, shapes)
+        graph.output((b_idx, h_idx, q_idx, kv_idx))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        b, h, q, kv = gm()
+
+        # Check shapes after view operations
+        assert b.shape == (B, 1, 1, 1)
+        assert h.shape == (1, H, 1, 1)
+        assert q.shape == (1, 1, L, 1)
+        assert kv.shape == (1, 1, 1, S)
+
+    def test_create_index_tensors_values(self):
+        """Test that _create_index_tensors creates correct index values."""
+        B, H, L, S, E = 3, 2, 4, 5, 8
+        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        graph = fx.Graph()
+        b_idx, h_idx, q_idx, kv_idx = fx_passes._create_index_tensors(graph, shapes)
+        graph.output((b_idx, h_idx, q_idx, kv_idx))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        b, h, q, kv = gm()
+
+        # Check values
+        torch.testing.assert_close(b.squeeze(), torch.arange(B, dtype=torch.int32))
+        torch.testing.assert_close(h.squeeze(), torch.arange(H, dtype=torch.int32))
+        torch.testing.assert_close(q.squeeze(), torch.arange(L, dtype=torch.int32))
+        torch.testing.assert_close(kv.squeeze(), torch.arange(S, dtype=torch.int32))

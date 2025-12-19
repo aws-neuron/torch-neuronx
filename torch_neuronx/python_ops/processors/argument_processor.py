@@ -1,10 +1,13 @@
 """Argument processing utilities for JAX operations."""
 
 import logging
+import os
 
 import torch
 
 from torch_neuronx.kernels.type_converter import TypeConverter
+from torch_neuronx.python_ops.jax.compilation.jax_compiler import JaxCompiler
+from torch_neuronx.utils import is_sync_mode_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +49,34 @@ class ArgumentProcessor:
             Tuple of preprocessed inputs
         """
         converted = []
+        # Prologues are enabled by default, but disabled if:
+        # 1. StableHLO is not enabled (required for prologue)
+        # 2. OR TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
+        # 3. OR sync mode is enabled
+        prologue_disabled = (
+            not JaxCompiler.is_stablehlo_enabled()
+            or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false")
+            or is_sync_mode_enabled()
+        )
 
         for i, inp in enumerate(inputs):
             # Skip static arguments
             if i in self.static_argnums:
                 converted.append(inp)
             elif isinstance(inp, torch.Tensor):
-                # Ensure contiguous and convert for Neuron
-                tensor = inp.contiguous() if not inp.is_contiguous() else inp
-                converted.append(TypeConverter.convert_for_neuron(tensor))
+                # Make tensor contiguous if prologue is disabled and tensor is not contiguous
+                if prologue_disabled and not inp.is_contiguous():
+                    inp = inp.contiguous()
+                # Convert for Neuron
+                converted.append(TypeConverter.convert_for_neuron(inp))
+            # Handle nested structures
+            elif isinstance(inp, (list | tuple)):
+                converted.append(self.preprocess_inputs(tuple(inp)))
+            elif isinstance(inp, torch.dtype):
+                # Map torch.dtype to ScalarType enum values as defined in
+                # c10/core/ScalarType.h for MLIR lowring
+                scalar_type_int = ArgumentProcessor._get_scalar_type_value(inp)
+                converted.append(scalar_type_int)
             else:
                 # Keep scalars as-is
                 converted.append(inp)
@@ -86,7 +108,7 @@ class ArgumentProcessor:
 
     def prepare_execution_inputs(
         self, inputs: tuple, device: torch.device
-    ) -> tuple[dict[str, torch.Tensor], list[int], list[int]]:
+    ) -> dict[str, torch.Tensor]:
         """Prepare input dictionary for NEFF execution.
 
         Args:
@@ -94,10 +116,7 @@ class ArgumentProcessor:
             device: Target device
 
         Returns:
-            Tuple of (input_dict, list_arg_positions, list_arg_lengths)
-            - input_dict: Dictionary mapping input names to tensors
-            - list_arg_positions: Original positions of list/tuple arguments
-            - list_arg_lengths: Number of elements in each list/tuple
+            Dictionary mapping input names to tensors
         """
 
         def to_device(tensor: torch.Tensor) -> torch.Tensor:
@@ -109,8 +128,6 @@ class ArgumentProcessor:
 
         input_dict = {}
         tensor_idx = 0
-        list_arg_positions = []
-        list_arg_lengths = []
 
         for i, inp in enumerate(inputs):
             if isinstance(inp, torch.Tensor):
@@ -119,22 +136,17 @@ class ArgumentProcessor:
             elif inp is not None and i not in self.static_argnums:
                 if isinstance(inp, list | tuple):
                     # Handle tuple of tensors and mixed structures for ops like index_put, index
-                    list_arg_positions.append(i)
-                    list_length = 0
                     for val in inp:
                         if isinstance(val, torch.Tensor):
                             input_dict[f"input{tensor_idx}"] = TypeConverter.convert_for_neuron(
                                 to_device(val)
                             )
                             tensor_idx += 1
-                            list_length += 1
                         elif isinstance(val, float | int):
                             scalar_tensor = torch.tensor(val, device=device)
                             scalar_tensor = TypeConverter.convert_for_neuron(scalar_tensor)
                             input_dict[f"input{tensor_idx}"] = scalar_tensor
                             tensor_idx += 1
-                            list_length += 1
-                    list_arg_lengths.append(list_length)
                 else:
                     # Convert non-static scalars to tensors
                     scalar_tensor = torch.tensor(inp, device=device)
@@ -143,7 +155,7 @@ class ArgumentProcessor:
                     tensor_idx += 1
             # Static arguments are baked into compilation
         logger.debug(f"Prepared {len(input_dict)} inputs for execution")
-        return input_dict, list_arg_positions, list_arg_lengths
+        return input_dict
 
     def extract_device(self, inputs: tuple) -> torch.device:
         """Extract device from input tensors.
@@ -183,43 +195,37 @@ class ArgumentProcessor:
 
         return base_key
 
-    def create_cpu_fallback_context(
-        self,
-        processed_inputs: tuple,
-        list_arg_positions: list[int],
-        list_arg_lengths: list[int],
-    ) -> dict:
-        """Create CPU fallback context dictionary from processed inputs.
+    @staticmethod
+    def _get_scalar_type_value(dtype: torch.dtype) -> int:
+        """Convert torch.dtype to ScalarType enum value.
 
-        This method extracts static arguments and their positions based on
-        static_argnums, and bundles them with list argument metadata into
-        a dictionary suitable for passing to C++ bindings.
+        Maps torch.dtype to the corresponding integer values from c10::ScalarType enum
+        as defined in c10/core/ScalarType.h. The order follows the
+        AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS macro.
 
         Args:
-            processed_inputs: Preprocessed input tensors and values
-            list_arg_positions: Original positions of list/tuple arguments
-            list_arg_lengths: Number of elements in each list/tuple
+            dtype: PyTorch dtype to convert
 
         Returns:
-            Dictionary with keys:
-            - static_args: List of static argument values
-            - static_positions: List of int positions for static args
-            - list_positions: List of int positions for list arguments
-            - list_lengths: List of int lengths for each list argument
+            Integer value corresponding to the ScalarType enum
         """
-        static_args = []
-        static_positions = []
-
-        # Extract static arguments based on static_argnums
-        if self._static_argnums:
-            for idx in self._static_argnums:
-                if idx < len(processed_inputs):
-                    static_args.append(processed_inputs[idx])
-                    static_positions.append(idx)
-
-        return {
-            "static_args": static_args,
-            "static_positions": static_positions,
-            "list_positions": list_arg_positions,
-            "list_lengths": list_arg_lengths,
+        dtype_to_scalar_type = {
+            torch.uint8: 0,  # Byte
+            torch.int8: 1,  # Char
+            torch.int16: 2,  # Short
+            torch.int32: 3,  # Int
+            torch.int64: 4,  # Long
+            torch.float16: 5,  # Half
+            torch.float32: 6,  # Float
+            torch.float64: 7,  # Double
+            # torch.complex32: 8,   # ComplexHalf (not commonly used)
+            torch.complex64: 9,  # ComplexFloat
+            torch.complex128: 10,  # ComplexDouble
+            torch.bool: 11,  # Bool
+            # Quantized types: 12-14, 16-17
+            torch.bfloat16: 15,  # BFloat16
+            # Float8 types: 23-26
+            # Additional types: 27-45
         }
+
+        return dtype_to_scalar_type.get(dtype, 6)  # Default to Float (6)

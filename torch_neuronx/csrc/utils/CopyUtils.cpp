@@ -1,7 +1,11 @@
 #include "CopyUtils.h"
 
+#include "../core/KernelExecution.h"
 #include "../core/NeuronStorageImpl.h"
+#include "../core/OperationContext.h"
 #include "../core/allocator/NeuronCachingAllocator.h"
+#include "../core/streams/StreamImpl.h"
+#include "../core/utils/PlatformUtils.h"
 #include "../ops/InternalOps.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 
@@ -15,9 +19,6 @@ nrt_tensor_t* get_nrt_tensor(const at::Tensor& tensor, bool non_blocking) {
   // Get the storage implementation
   auto storage_impl = tensor.storage().unsafeGetStorageImpl();
   auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
-  // Given we employ a synchronization level for all operations, this serves as
-  // a validation for now.
-  TORCH_CHECK(neuron_storage->is_valid(non_blocking), "Neuron tensor is not valid");
   return neuron_storage->neuron_tensor();
 }
 
@@ -31,17 +32,33 @@ void copy_cpu_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blockin
               "Please call .contiguous() on CPU tensor before copying to Neuron");
   TORCH_CHECK(dst.is_contiguous(), "Destination Neuron tensor must be contiguous");
 
-  if (!non_blocking) {
-    at::neuron::synchronize(dst.device().index());
+  size_t size_bytes = src.nbytes();
+  // Skip copy if there are no bytes to copy (empty tensor)
+  if (size_bytes == 0) {
+    return;
+  }
+  int device = dst.device().index();
+  void* src_data_ptr = src.data_ptr();
+  // Calculate offset based on tensor's storage offset
+  size_t byte_offset = dst.storage_offset() * dst.element_size();
+
+  if (!at::neuron::utils::IsSyncModeEnabled()) {
+    void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), byte_offset);
+    auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+        "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, byte_offset, size_bytes, device);
+    auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
+    auto stream = at::neuron::getCurrentNeuronStream(device);
+    at::neuron::SubmitOperationContext(stream, std::move(context));
+    if (!non_blocking) {
+      at::neuron::synchronize(device);
+    }
+    return;
   }
 
   nrt_tensor_t* nrt_dst = get_nrt_tensor(dst, non_blocking);
   TORCH_CHECK(nrt_dst != nullptr, "Failed to get Neuron tensor handle");
 
-  // Calculate offset based on tensor's storage offset
-  size_t byte_offset = dst.storage_offset() * dst.element_size();
-
-  nrt_copy_cpu_to_neuron(src.data_ptr(), nrt_dst, byte_offset, src.nbytes());
+  nrt_copy_cpu_to_neuron(src_data_ptr, nrt_dst, byte_offset, size_bytes);
 }
 
 void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blocking) {
@@ -58,25 +75,40 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   TORCH_CHECK(dst.is_contiguous(),
               "Destination CPU tensor must be contiguous for direct copy from Neuron");
 
-  if (!non_blocking) {
-    at::neuron::synchronize(src.device().index());
+  size_t size_bytes = dst.nbytes();
+  // Skip copy if there are no bytes to copy (empty tensor)
+  if (size_bytes == 0) {
+    return;
+  }
+
+  int device = src.device().index();
+  void* dst_data_ptr = dst.data_ptr();
+  // Calculate offset based on tensor's storage offset
+  size_t byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
+
+  if (!at::neuron::utils::IsSyncModeEnabled()) {
+    auto stream = at::neuron::getCurrentNeuronStream(device);
+    void* src_ptr = at::neuron::utils::GetBaseTensorPtr(src_to_copy.data_ptr(), byte_offset);
+    auto read_kernel = std::make_unique<at::neuron::ReadDirectKernelExecution>(
+        "neuron::copy::neuron_to_cpu", src_ptr, dst_data_ptr, byte_offset, size_bytes, device);
+    auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
+    at::neuron::SubmitOperationContext(stream, std::move(context));
+    if (!non_blocking) {
+      at::neuron::synchronize(device);
+    }
+    return;
   }
 
   nrt_tensor_t* nrt_src = get_nrt_tensor(src_to_copy, non_blocking);
   TORCH_CHECK(nrt_src != nullptr, "Failed to get Neuron tensor handle");
 
-  // Calculate offset based on tensor's storage offset
-  size_t byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
-  nrt_copy_neuron_to_cpu(nrt_src, dst.data_ptr(), byte_offset, dst.nbytes());
+  nrt_copy_neuron_to_cpu(nrt_src, dst_data_ptr, byte_offset, size_bytes);
 }
 
 void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size_t src_offset,
                             size_t size) {
   TORCH_CHECK(src_data_ptr != nullptr, "Source data pointer must not be null");
-  // Skip copy if there are no bytes to copy (empty tensor)
-  if (size == 0) {
-    return;
-  }
+  TORCH_CHECK(size > 0, "Destination size must be valid");
   NRT_STATUS status = nrt_tensor_read(src_data_ptr, dst_data_ptr, src_offset, size);
   if (status != NRT_SUCCESS) {
     throw std::runtime_error("Failed to copy data from Neuron device. Status: " +
@@ -87,10 +119,8 @@ void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size
 void nrt_copy_cpu_to_neuron(void* src_data_ptr, nrt_tensor_t* dst_data_ptr, size_t dst_offset,
                             size_t size) {
   TORCH_CHECK(dst_data_ptr != nullptr, "Destination data pointer must not be null");
+  TORCH_CHECK(size > 0, "Destination size must be valid");
   // Skip copy if there are no bytes to copy (empty tensor)
-  if (size == 0) {
-    return;
-  }
   NRT_STATUS status = nrt_tensor_write(dst_data_ptr, src_data_ptr, dst_offset, size);
   if (status != NRT_SUCCESS) {
     throw std::runtime_error("Failed to copy data to Neuron device. Status: " +
@@ -116,32 +146,45 @@ void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_bloc
 
   TORCH_CHECK(dst.is_contiguous(), "Destination Neuron tensor must be contiguous");
 
-  if (!non_blocking) {
-    at::neuron::synchronize(src.device().index());
-    at::neuron::synchronize(dst.device().index());
+  // Ensure tensors have same size
+  TORCH_CHECK(src_to_copy.nbytes() == dst.nbytes(),
+              "Source and destination must have same number of bytes");
+
+  int device = src.device().index();
+  size_t size_bytes = src_to_copy.nbytes();
+  // Skip copy if there are no bytes to copy (empty tensor)
+  if (size_bytes == 0) {
+    return;
+  }
+
+  // Calculate offsets based on tensor's storage offset
+  size_t src_byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
+  size_t dst_byte_offset = dst.storage_offset() * dst.element_size();
+
+  if (!at::neuron::utils::IsSyncModeEnabled()) {
+    void* src_to_copy_ptr =
+        at::neuron::utils::GetBaseTensorPtr(src_to_copy.data_ptr(), src_byte_offset);
+    void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), dst_byte_offset);
+    auto copy_kernel = std::make_unique<at::neuron::CopyDirectKernelExecution>(
+        "neuron::copy::neuron_to_neuron", src_to_copy_ptr, dst_ptr, src_byte_offset,
+        dst_byte_offset, size_bytes, device);
+    auto context = std::make_unique<at::neuron::OperationContext>(std::move(copy_kernel));
+    auto current_stream = at::neuron::getCurrentNeuronStream(device);
+    at::neuron::SubmitOperationContext(current_stream, std::move(context));
+
+    if (!non_blocking) {
+      at::neuron::synchronize(device);
+    }
+    return;
   }
 
   nrt_tensor_t* nrt_src = get_nrt_tensor(src_to_copy, non_blocking);
   nrt_tensor_t* nrt_dst = get_nrt_tensor(dst, non_blocking);
   TORCH_CHECK(nrt_src != nullptr, "Failed to get source Neuron tensor handle");
   TORCH_CHECK(nrt_dst != nullptr, "Failed to get destination Neuron tensor handle");
-
-  // Calculate offsets based on tensor's storage offset
-  size_t src_byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
-  size_t dst_byte_offset = dst.storage_offset() * dst.element_size();
-
-  // Ensure tensors have same size
-  TORCH_CHECK(src_to_copy.nbytes() == dst.nbytes(),
-              "Source and destination must have same number of bytes");
-
-  // Skip copy if there are no bytes to copy (empty tensor)
-  if (src_to_copy.nbytes() == 0) {
-    return;
-  }
-
   NRT_STATUS status = nrt_tensor_copy(nrt_src, src_byte_offset,  // src + offset
                                       nrt_dst, dst_byte_offset,  // dst + offset
-                                      src_to_copy.nbytes());
+                                      size_bytes);
 
   TORCH_CHECK(status == NRT_SUCCESS, "Failed to copy between Neuron tensors. Status: ", status);
 }

@@ -1,15 +1,15 @@
 """Test that linear operation is properly registered with PyTorch dispatcher."""
 
 import logging
+import os
 
 import pytest
 import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
+    assert_op_did_not_run_on_neuron,
     assert_op_runs_on_neuron,
-    assert_raises,
-    cpu_fallback_test,
     track_neuron_ops,
 )
 
@@ -152,35 +152,6 @@ class TestLinearRegistration:
             assert_op_runs_on_neuron("aten::linear")
             torch.testing.assert_close(output_neuron.cpu(), output_cpu)
 
-    @cpu_fallback_test
-    @pytest.mark.parametrize(
-        "shape1,shape2,shape3,expected_error",
-        [
-            (
-                (3, 4),
-                (5, 10),
-                None,
-                "mat1 and mat2 shapes cannot be multiplied \\(3x4 and 10x5\\)",
-            ),  # Wrong input dimension
-            (
-                (3, 4),
-                (5, 4),
-                (10,),
-                "The expanded size of the tensor \\(5\\) must match the existing size \\(10\\) "
-                "at non-singleton dimension 1",
-            ),  # Wrong bias dimension
-        ],
-    )
-    @assert_raises(RuntimeError)
-    def test_linear_dimension_mismatch_error(self, shape1, shape2, shape3, expected_error):
-        """Test that dimension mismatch raises appropriate error"""
-        with track_neuron_ops():
-            input_neuron = torch.rand(shape1, device="neuron")
-            weight_neuron = torch.rand(shape2, device="neuron")
-            bias_neuron = None if shape3 is None else torch.rand(shape3, device="neuron")
-
-            torch.nn.functional.linear(input_neuron, weight_neuron, bias=bias_neuron)
-
     def test_linear_empty_tensors(self):
         """Test linear with empty tensors"""
         with track_neuron_ops():
@@ -316,7 +287,15 @@ class TestLinearBackward:
             if bias_neuron is not None:
                 bias_neuron.grad = bias_neuron_grad
             # Verify operations ran on Neuron
-            assert_op_runs_on_neuron("aten::linear")
+            if (
+                requires_grads == (False, False, True)
+                and grad_output.ndim == 1
+                and os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
+            ):
+                # Backward becomes no-op in this case and will not execute on Neuron
+                assert_op_did_not_run_on_neuron("aten::linear")
+            else:
+                assert_op_runs_on_neuron("aten::linear")
 
         # Check that gradients match
         if requires_grads[0]:

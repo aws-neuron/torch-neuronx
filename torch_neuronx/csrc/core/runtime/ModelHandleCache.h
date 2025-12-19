@@ -41,15 +41,6 @@ class ModelHandleCache {
       const CompilableKernelExecution& kernel_execution, int device_index, int num_cores = 1);
 
   /**
-   * Get cache statistics
-   */
-  struct CacheStats {
-    size_t total_entries;
-  };
-
-  CacheStats GetStatistics() const;
-
-  /**
    * Get detailed cache entry information for debugging
    */
   struct CacheEntryInfo {

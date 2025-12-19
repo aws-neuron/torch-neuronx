@@ -20,11 +20,11 @@ class MockCPUFallbackExecutor : public CPUFallbackExecutor {
 
  protected:
   void TransferTensorsFromCpuToNeuron(const std::vector<torch::Tensor>& cpu_results,
-                                      OperationContext* op) override;
+                                      const std::vector<nrt_tensor_t*>& data_ptrs);
 
   std::vector<torch::Tensor> TransferTensorsToCpu(
-      const std::vector<torch::Tensor>& neuron_tensors,
-      const std::vector<TensorContext>& tensor_contexts) override;
+      const std::vector<nrt_tensor_t*>& data_ptrs,
+      const std::vector<TensorContext>& tensor_contexts);
 };
 
 }  // namespace at::neuron::testing

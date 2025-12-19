@@ -97,14 +97,6 @@ std::shared_ptr<at::neuron::nrt::Model> ModelHandleCache::GetOrLoadModel(
   }
 }
 
-ModelHandleCache::CacheStats ModelHandleCache::GetStatistics() const {
-  std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-
-  CacheStats stats;
-  stats.total_entries = cache_.size();
-  return stats;
-}
-
 std::vector<ModelHandleCache::CacheEntryInfo> ModelHandleCache::GetCacheEntries() const {
   std::shared_lock<std::shared_mutex> lock(cache_mutex_);
 

@@ -5,7 +5,7 @@ description = "Neuron Backend for PyTorch"
 authors = [{name = "AWS Neuron Team"}]
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "torch~=2.8.0",
+    "torch~=2.9.0",
     "jax",
     "numpy<2", # neuronx-cc requires numpy 1.x
     "grpcio-tools",
@@ -14,6 +14,9 @@ dependencies = [
 
 [project.entry-points."torch.backends"]
 torch_neuronx = "torch_neuronx:_autoload"
+
+[project.entry-points."torch_dynamo_backends"]
+neuron = "torch_neuronx.neuron_dynamo_backend.backend:neuron_backend"
 
 [build-system]
 requires = ["setuptools", "wheel", "torch", "grpcio-tools"]

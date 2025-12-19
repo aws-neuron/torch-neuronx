@@ -16,9 +16,10 @@ namespace at::neuron {
 // Forward declarations
 struct StreamImpl;
 class NeuronResourceManager;
+class OperationExecutionEngine;
 
 /**
- * StreamManager is a singleton that manages all Neuron streams across devices.
+ * StreamManager manages all Neuron streams across devices.
  * It provides centralized stream creation, lifecycle management, and resource coordination.
  *
  * Key responsibilities:
@@ -31,20 +32,18 @@ class NeuronResourceManager;
  */
 class StreamManager {
  public:
-  /// Get the singleton instance
-  static StreamManager& Instance();
+  /// Constructor - takes OperationExecutionEngine to avoid mutex recursion
+  explicit StreamManager(OperationExecutionEngine* operation_execution_engine);
+  ~StreamManager() = default;
 
   /// Get or create a stream for the given device and stream ID
-  std::shared_ptr<StreamImpl> GetStream(c10::DeviceIndex device_index, c10::StreamId stream_id);
+  StreamImpl* GetStream(c10::DeviceIndex device_index, c10::StreamId stream_id);
 
   /// Create a new stream on the specified device
   c10::StreamId CreateStream(c10::DeviceIndex device_index = -1, int priority = 0);
 
   /// Synchronize all streams on a device
   void SynchronizeDevice(c10::DeviceIndex device_index);
-
-  /// Destroy a specific stream
-  void DestroyStream(c10::DeviceIndex device_index, c10::StreamId stream_id);
 
   /// Resource statistics for monitoring and debugging
   struct ManagerResourceStats {
@@ -59,10 +58,13 @@ class StreamManager {
   /// Get comprehensive resource statistics
   ManagerResourceStats GetResourceStats() const;
 
- private:
-  StreamManager();
-  ~StreamManager();
+  /// Iterate through all streams on a device with a callback
+  /// @param device_index The device to iterate streams on
+  /// @param callback Function to call for each stream. Return true to stop iteration.
+  void ForEachStreamImpl(c10::DeviceIndex device_index,
+                         const std::function<bool(StreamImpl*)>& callback);
 
+ private:
   // Non-copyable, non-movable
   StreamManager(const StreamManager&) = delete;
   StreamManager& operator=(const StreamManager&) = delete;
@@ -72,13 +74,12 @@ class StreamManager {
   // Thread synchronization
   mutable std::mutex mutex_;
 
+  OperationExecutionEngine* operation_execution_engine_;
+
   // Stream storage: device_index -> stream_id -> StreamImpl
   std::unordered_map<c10::DeviceIndex,
-                     std::unordered_map<c10::StreamId, std::shared_ptr<StreamImpl>>>
+                     std::unordered_map<c10::StreamId, std::unique_ptr<StreamImpl>>>
       streams_;
-
-  // Background monitoring
-  std::atomic<bool> monitoring_enabled_{true};
 };
 
 // Thread-local current stream tracking functions
