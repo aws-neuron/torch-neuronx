@@ -53,6 +53,20 @@ std::optional<TransformationCreationResult> TryCreateSlice(const at::Tensor& inp
                                                            const std::string& op_name,
                                                            size_t input_index);
 
+/**
+ * @brief Try to create a BROADCAST transformation
+ *
+ * Detects broadcast patterns by analyzing tensor strides for zero-stride dimensions.
+ *
+ * @param input Input tensor to analyze
+ * @param op_name Name of the operation for logging
+ * @param input_index Index of this input in the operation
+ * @return TransformationResult if pattern detected, nullopt otherwise
+ */
+std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor& input,
+                                                               const std::string& op_name,
+                                                               size_t input_index);
+
 }  // namespace Creators
 
 // ============================================================================
@@ -117,6 +131,38 @@ class SliceHandler : public TransformationHandler {
    * @param input_index Index of the input being processed
    * @param state Current transformation state
    * @param group Vector of SLICE transformations
+   * @param op_name Operation name for logging
+   * @return TransformationTask containing transformation metadata
+   */
+  TransformationTask ProcessGroup(size_t input_index, TransformationState& state,
+                                  const std::vector<TensorTransformation>& group,
+                                  const std::string& op_name) const override;
+};
+
+/**
+ * @brief Handler for BROADCAST transformations
+ */
+class BroadcastHandler : public TransformationHandler {
+ public:
+  /**
+   * @brief Find the end of a BROADCAST transformation group
+   *
+   * BROADCAST transformations are processed individually for now.
+   *
+   * @param transformations Full list of transformations
+   * @param start_index Starting index
+   * @param state Current transformation state
+   * @return Index of last transformation in group (inclusive)
+   */
+  size_t FindGroupEnd(const std::vector<TensorTransformation>& transformations, size_t start_index,
+                      const TransformationState& state) const override;
+
+  /**
+   * @brief Process a group of BROADCAST transformations
+   *
+   * @param input_index Index of the input being processed
+   * @param state Current transformation state
+   * @param group Vector of BROADCAST transformations
    * @param op_name Operation name for logging
    * @return TransformationTask containing transformation metadata
    */

@@ -101,7 +101,7 @@ std::future<OperationContextResult> StreamImpl::SubmitOperationContext(
   }
 
   if (op_ptr->RequiresCompilation()) {
-    operation_execution_engine_->SubmitCompilationTask(op_ptr);
+    operation_execution_engine_->SubmitOperation(op_ptr);
   } else {
     op_ptr->MarkExecutionReady();
     operation_execution_engine_->NotifyExecutionReady();

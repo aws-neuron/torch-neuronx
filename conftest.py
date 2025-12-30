@@ -192,3 +192,13 @@ def pytest_runtest_setup(item):
         worker_input = item.config.workerinput
         if "TOTAL_DEVICE_COUNT" in worker_input:
             os.environ["TOTAL_DEVICE_COUNT"] = worker_input["TOTAL_DEVICE_COUNT"]
+
+
+@pytest.fixture(scope="function", autouse=True)
+def reset_dynamo(request):
+    """Reset torch dynamo state before each test to ensure isolation."""
+    # Skip if torch is not available (TOD worker, C++ tests, etc.)
+    if is_launcher_env(request.session):
+        return
+    import torch._dynamo
+    torch._dynamo.reset()

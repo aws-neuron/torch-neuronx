@@ -59,8 +59,16 @@ RUN apt-get update -y && \
     aws-neuronx-collectives=2.* \
     aws-neuronx-runtime-lib=2.*
 
+# Print Neuron Runtime and Collectives versions
+RUN echo "=== Neuron Runtime & Collectives Versions ===" && \
+    dpkg -l | grep aws-neuronx
+
 # Install Neuron Tools
 RUN apt-get install -y aws-neuronx-tools=2.*
+
+# Print Neuron Tools version
+RUN echo "=== Neuron Tools Version ===" && \
+    dpkg -l | grep aws-neuronx-tools
 
 # Install EFA Driver (only required for multi-instance training)
 # Using --skip-kmod to skip kernel module installation in container
@@ -75,8 +83,16 @@ RUN curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz 
     cd / && \
     rm -rf aws-efa-installer-latest.tar.gz aws-efa-installer
 
+# Print EFA version
+RUN echo "=== EFA Driver Version ===" && \
+    /opt/amazon/efa/bin/fi_info --version 2>/dev/null || echo "EFA version check failed - may not be available in container"
+
 # Add PATH
 ENV PATH=/opt/aws/neuron/bin:$PATH
+
+# Configure Bazelisk to use GitHub releases instead of releases.bazel.build
+# This works around SSL certificate issues with releases.bazel.build
+ENV BAZELISK_BASE_URL=https://github.com/bazelbuild/bazel/releases/download
 
 # Set Neuron repository as additional index (PyPI remains primary)
 RUN python -m pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com

@@ -401,7 +401,7 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with dtype mismatch. Error thrown by torch directly"""
         self.distributed_tester.run_test(run_dtype_mismatch_test)
 
-    @assert_raises(RuntimeError, match=r".*all input tensors must be on neuron device, found.*")
+    @assert_raises(RuntimeError, match=r".*Operation all_to_all is not implemented for Neuron.*")
     def test_different_devices_error(self):
         """Test alltoall with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)

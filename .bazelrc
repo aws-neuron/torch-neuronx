@@ -2,6 +2,9 @@
 common --enable_bzlmod
 common --enable_workspace
 
+# Use GitHub-hosted registry to work around SSL certificate issues with bcr.bazel.build
+common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/
+
 common --repo_env=HERMETIC_PYTHON_VERSION=3.10
 
 # Make Bazel print out all options from rc files
@@ -59,3 +62,6 @@ build --action_env=PYTORCH_USE_EXTERNAL="0"
 build --action_env=NRT_LOCAL_PATH=/opt/aws/neuron
 
 test --test_env=LD_LIBRARY_PATH
+
+# avoid hitting CPU related alarms in Kaizen
+build --local_cpu_resources=HOST_CPUS*0.8

@@ -5,13 +5,13 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::cat", "aten::cat.out"], static_argnames=("dim",))
-def torch_cat(tensors, dim=0):
+@register_aten(["aten::cat", "aten::cat.out"], static_argnums=(1,))
+def torch_cat(tensors, dim=0, out=None):
     return torch.cat(tensors, dim)
 
 
-@register_aten(["aten::stack", "aten::stack.out"], static_argnames=("dim",))
-def torch_stack(tensors, dim=0):
+@register_aten(["aten::stack", "aten::stack.out"], static_argnums=(1,))
+def torch_stack(tensors, dim=0, out=None):
     return torch.stack(tensors, dim)
 
 

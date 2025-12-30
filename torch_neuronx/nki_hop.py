@@ -57,6 +57,14 @@ class NKIRegistry:
     kernel_to_id: ClassVar[dict["TorchNeuronNKIKernel", int]] = {}
     kernel_arg_names: ClassVar[dict[int, list[str]]] = {}
     kernel_default_args: ClassVar[dict[int, dict[str, Any]]] = {}
+    """
+     In NKI kernels, non-tensor arguments are considered constant
+    arguments that are embedded to the kernel during tracing. Some
+    of the arguments are not traceable via dynamo so we handle them
+    separately. The compiled kernels do not need the constant args
+    and only consume tensor inputs.
+    """
+    constant_args: ClassVar[dict[int, dict[str, Any]]] = {}
 
     def add_kernel(
         self,
@@ -91,17 +99,43 @@ class NKIRegistry:
         assert idx in self.kernel_default_args
         return self.kernel_default_args[idx]
 
+    def add_constant_args(self, args: dict[str, Any], hash_key: int):
+        self.constant_args[hash_key] = args
+
+    def get_constant_args(self, hash_key: int) -> dict[str, Any]:
+        # Returns the constant args
+        assert hash_key in self.constant_args
+        return self.constant_args[hash_key]
+
     def reset_table(self) -> None:
         # Resets the table
         self.id_to_kernel = {}
         self.kernel_to_id = {}
         self.kernel_arg_names = {}
         self.kernel_default_args = {}
+        self.constant_args = {}
 
 
 kernel_registry = NKIRegistry()
 
 
+def merge_tensor_constant_args(
+    kernel_idx: int, args: Sequence[Any], arg_names: Sequence[str], constant_args_key: int
+) -> Sequence[Any]:
+    # Merges tensor args with constant args
+    kernel_arg_names = kernel_registry.get_kernel_arg_names(kernel_idx)
+    constant_args = kernel_registry.get_constant_args(constant_args_key)
+    tensor_args_dict = dict(zip(arg_names, args, strict=False))
+    merged = {}
+    for name in kernel_arg_names:
+        if name in tensor_args_dict:
+            merged[name] = tensor_args_dict[name]
+        else:
+            merged[name] = constant_args[name]
+    return merged
+
+
+# TODO: rename here and fx_importer to avoid confusion (e.g. NKIKernelHOP)
 # Used for wrapping a NKI Kernel
 class NKIKernelWrapper(HigherOrderOperator):
     def __init__(self) -> None:
@@ -114,6 +148,8 @@ class NKIKernelWrapper(HigherOrderOperator):
         backend_config: str,
         operand_output_aliases: dict[int, int],
         args: Sequence[Any],
+        arg_names: Sequence[str],
+        constant_args_key: int,
     ) -> Any:
         return super().__call__(
             kernel_idx=kernel_idx,
@@ -121,6 +157,8 @@ class NKIKernelWrapper(HigherOrderOperator):
             backend_config=backend_config,
             operand_output_aliases=operand_output_aliases,
             args=args,
+            arg_names=arg_names,
+            constant_args_key=constant_args_key,
         )
 
 
@@ -135,9 +173,12 @@ def nki_kernel_wrapper_dense(
     backend_config: str,
     operand_output_aliases: dict[int, int],
     args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
 ):
     kernel = kernel_registry.get_kernel(kernel_idx)
-    return kernel[grid](*args)
+    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
+    return kernel[grid](**merged_args)
 
 
 @nki_kernel_wrapper.py_impl(FakeTensorMode)
@@ -149,22 +190,22 @@ def nki_kernel_wrapper_fake_tensor_mode(
     backend_config: str,
     operand_output_aliases: dict[int, int],
     args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
 ) -> Any:
     with mode:
         kernel = kernel_registry.get_kernel(kernel_idx)
-
-        dconfig = kernel[grid].dump_config(*args)
+        merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
+        dconfig = kernel[grid].dump_config(**merged_args)
         return_types = dconfig.return_types
 
         if len(return_types) == 1:
             return torch.empty(
                 return_types[0][1], dtype=map_external_dtype_to_torch(return_types[0][0])
-            ).to(args[0].device)
+            ).to("neuron")
         else:
             return tuple(
-                torch.empty(
-                    rtype[1], dtype=map_external_dtype_to_torch(rtype[0]), device=args[0].device
-                )
+                torch.empty(rtype[1], dtype=map_external_dtype_to_torch(rtype[0])).to("neuron")
                 for rtype in return_types
             )
 
@@ -178,6 +219,8 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     backend_config: str,
     operand_output_aliases: dict[int, int],
     args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
 ):
     node_args = {
         "kernel_idx": kernel_idx,
@@ -185,10 +228,12 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
         "backend_config": backend_config,
         "operand_output_aliases": operand_output_aliases,
         "args": args,
+        "arg_names": arg_names,
+        "constant_args_key": constant_args_key,
     }
+    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
     kernel = kernel_registry.get_kernel(kernel_idx)
-
-    dconfig = kernel[grid].dump_config(*args)
+    dconfig = kernel[grid].dump_config(**merged_args)
     node_args["backend_config"] = str(dconfig.dumped_config)
     node_args["operand_output_aliases"] = dconfig.operand_output_aliases
     with disable_proxy_modes_tracing():
@@ -218,12 +263,17 @@ def nki_kernel_wrapper_functionalize(
     backend_config: str,
     operand_output_aliases: dict[int, int],
     args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
 ) -> None:
-    unwrapped_args = ctx.unwrap_tensors(args)  # type: ignore[arg-type]
-
+    unwrapped_args = [
+        ctx.unwrap_tensors(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
+    ]
+    merged_args = merge_tensor_constant_args(
+        kernel_idx, unwrapped_args, arg_names, constant_args_key
+    )
     kernel = kernel_registry.get_kernel(kernel_idx)
-
-    dconfig = kernel[grid].dump_config(*args)
+    dconfig = kernel[grid].dump_config(**merged_args)
 
     with ctx.redispatch_to_next():
         unwrapped_outputs = nki_kernel_wrapper(
@@ -232,6 +282,8 @@ def nki_kernel_wrapper_functionalize(
             backend_config=backend_config,
             operand_output_aliases=dconfig.operand_output_aliases,
             args=unwrapped_args,
+            arg_names=arg_names,
+            constant_args_key=constant_args_key,
         )
     if not isinstance(unwrapped_outputs, list | tuple):
         tuple_outputs = (unwrapped_outputs,)
@@ -391,12 +443,26 @@ class TracingNKIHOPifier(NKIHOPifier):
     ) -> None:
         assert isinstance(wrapper.kernel_idx, int)
 
+        tensor_args = []
+        tensor_arg_names = []
+        constant_args = {}
+        for idx, name in enumerate(wrapper.kernel_arg_names):
+            arg = combined_args[idx]
+            if isinstance(arg, torch.Tensor):
+                tensor_args.append(arg)
+                tensor_arg_names.append(name)
+            else:
+                constant_args[name] = arg
+        hash_key = wrapper.kernel._generate_hash_key(constant_args)
+        kernel_registry.add_constant_args(constant_args, hash_key)
         return nki_kernel_wrapper(
             kernel_idx=wrapper.kernel_idx,
             grid=grid,  # type: ignore[arg-type]
             backend_config="",
             operand_output_aliases={},
-            args=combined_args,
+            args=tensor_args,
+            arg_names=tensor_arg_names,
+            constant_args_key=hash_key,
         )
 
 

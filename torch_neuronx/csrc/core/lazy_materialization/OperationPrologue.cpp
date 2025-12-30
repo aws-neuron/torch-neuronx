@@ -53,9 +53,11 @@ std::string GenerateMlir(const TransformationTask& task) {
       throw std::runtime_error("Invalid SliceParams in TransformationTask");
 
     case TransformationType::BROADCAST:
-      // TODO: Implement broadcast MLIR generation
-      throw std::runtime_error(
-          "Broadcast MLIR generation not yet implemented - requires BroadcastOpBuilder");
+      if (auto* params = std::get_if<BroadcastParams>(&task.params)) {
+        return mlir_generators::GenerateBroadcast(task.input_shape, task.output_shape,
+                                                  params->broadcast_dims, task.element_type);
+      }
+      throw std::runtime_error("Invalid BroadcastParams in TransformationTask");
 
     case TransformationType::NONE:
       // Generate empty/identity MLIR for inputs with no transformations

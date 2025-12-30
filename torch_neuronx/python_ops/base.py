@@ -54,12 +54,18 @@ class OperationImplementation(ABC):
         for the operation. Override this method when multiple implementations
         exist and need to filter based on input arguments.
         """
-        if any(
-            arg.device.type != "neuron"
-            for arg in args
-            if isinstance(arg, torch.Tensor) and arg.ndim != 0
-        ):
-            return False
+        for arg in args:
+            if (
+                isinstance(arg, torch.Tensor) and arg.ndim != 0 and arg.device.type != "neuron"
+            ) or (
+                isinstance(arg, list | tuple)
+                and any(
+                    value.device.type != "neuron"
+                    for value in arg
+                    if isinstance(value, torch.Tensor) and value.ndim != 0
+                )
+            ):
+                return False
 
         return not any(
             kwarg.device.type != "neuron"

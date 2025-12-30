@@ -1,9 +1,18 @@
 import torch
 
 import torch_neuronx._C as _C
-from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastImpl
-from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceImpl
-from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeImpl
+from torch_neuronx.python_ops.contiguous_broadcast import (
+    ContiguousBroadcastJAXImpl,
+    ContiguousBroadcastMLIRImpl,
+)
+from torch_neuronx.python_ops.contiguous_slice import (
+    ContiguousSliceJAXImpl,
+    ContiguousSliceMLIRImpl,
+)
+from torch_neuronx.python_ops.contiguous_transpose import (
+    ContiguousTransposeJAXImpl,
+    ContiguousTransposeMLIRImpl,
+)
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -99,9 +108,12 @@ class ContiguousNKIImpl(OperationImplementation):
 def contiguous_internal(self_tensor, memory_format=None):
     """Internal contiguous implementation that can be called from C++ without dispatcher"""
     implementations = [
-        ContiguousTransposeImpl(),
-        ContiguousBroadcastImpl(),
-        ContiguousSliceImpl(),
+        ContiguousTransposeJAXImpl(),
+        ContiguousTransposeMLIRImpl(),
+        ContiguousBroadcastJAXImpl(),
+        ContiguousBroadcastMLIRImpl(),
+        ContiguousSliceJAXImpl(),
+        ContiguousSliceMLIRImpl(),
         ContiguousNKIImpl(),
     ]
     from .cast_policy import validate_neuron_memory_format

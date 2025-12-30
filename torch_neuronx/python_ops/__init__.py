@@ -65,6 +65,7 @@ def _register_common_ops():
 def register_legacy_ops():
     """Register Python operations with PyTorch dispatcher"""
 
+    from . import contiguous_broadcast, contiguous_slice, contiguous_transpose
     from .addmm import AddmmOp
     from .auto_registration import auto_register_neuron_ops
     from .comparison import (
@@ -223,6 +224,7 @@ def register_mlir_ops():
     """Register MLIR-based operations with PyTorch dispatcher."""
     from torch_neuronx.python_ops.torch_mlir import initialize_torch_mlir_backend
 
+    from . import contiguous_broadcast, contiguous_slice, contiguous_transpose
     from .auto_registration import auto_register_neuron_ops
 
     # Register common ops (attention, scatter, gather)
