@@ -26,15 +26,16 @@ struct PlatformConfig {
 // Gets the platform configuration for the current instance type.
 const PlatformConfig& GetPlatformConfig() {
   static const std::unordered_map<std::string, PlatformConfig> platform_configs = {
-      {"inf1", {"inf1", "1"}}, {"trn1", {"trn1", "1"}}, {"trn1n", {"trn1", "1"}},
-      {"inf2", {"trn1", "1"}}, {"trn2", {"trn2", "2"}}, {"trn2n", {"trn2", "2"}},
-      {"trn2u", {"trn2", "2"}}};
+      {"inf1", {"inf1", "1"}},  {"trn1", {"trn1", "1"}}, {"trn1n", {"trn1", "1"}},
+      {"inf2", {"trn1", "1"}},  {"trn2", {"trn2", "2"}}, {"trn2n", {"trn2", "2"}},
+      {"trn2u", {"trn2", "2"}}, {"trn3", {"trn3", "2"}}};
 
   std::string instance = GetInstanceType();
   auto it = platform_configs.find(instance);
   if (it == platform_configs.end()) {
-    throw std::runtime_error("Unknown instance type: " + instance +
-                             ". Supported types: inf1, trn1, trn1n, inf2, trn2, trn2n, trn2u");
+    throw std::runtime_error(
+        "Unknown instance type: " + instance +
+        ". Supported types: inf1, trn1, trn1n, inf2, trn2, trn2n, trn2u, trn3");
   }
   return it->second;
 }
@@ -63,6 +64,8 @@ std::string GetInstanceType() {
         return "trn2n";
       case NRT_INSTANCE_TRN2U:
         return "trn2u";
+      case NRT_INSTANCE_TRN3:
+        return "trn3";
       default:
         throw std::runtime_error(
             "Unknown Neuron instance family: " + std::to_string(instance_info.family) +

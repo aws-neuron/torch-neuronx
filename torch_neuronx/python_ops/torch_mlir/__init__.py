@@ -4,6 +4,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Import ops to trigger decorator registration
+from . import ops
+
 
 def initialize_torch_mlir_backend(aten_lib=None, verbose: bool = False):
     """Initialize torch-mlir backend and register operations.
@@ -15,8 +18,6 @@ def initialize_torch_mlir_backend(aten_lib=None, verbose: bool = False):
     Returns:
         Number of operations registered
     """
-    # Import ops to trigger decorator registration
-    from . import ops
 
     # Finalize PyTorch registrations
     from .operation_registry import finalize_registrations

@@ -10,26 +10,29 @@ from tests.utils.neuron_test_utils import get_cache_size
 
 
 def test_contiguous_slice_uses_jax_kernel(monkeypatch):
-    """slice case should use the JAX slice kernel, not the generic copy."""
+    """Slice case should use the slice kernel (JAX or MLIR), not the generic copy."""
     from torch_neuronx.python_ops import contiguous as contiguous_mod
-    from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceImpl
+    from torch_neuronx.python_ops.contiguous_slice import (
+        ContiguousSliceJAXImpl,
+        ContiguousSliceMLIRImpl,
+    )
 
-    jax_called = {"count": 0}
+    slice_called = {"count": 0}
     generic_called = {"count": 0}
 
-    # Wrap _get_kernel to intercept JAX kernel calls
-    orig_get_kernel = ContiguousSliceImpl._get_kernel
+    for impl_class in [ContiguousSliceJAXImpl, ContiguousSliceMLIRImpl]:
+        orig_get_kernel = impl_class._get_kernel
 
-    def wrapped_get_kernel(self):
-        k = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            k = orig_get_kernel(self)
 
-        def wrapper(*args, **kwargs):
-            jax_called["count"] += 1
-            return k(*args, **kwargs)
+            def wrapper(*args, **kwargs):
+                slice_called["count"] += 1
+                return k(*args, **kwargs)
 
-        return wrapper
+            return wrapper
 
-    monkeypatch.setattr(ContiguousSliceImpl, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
     # Wrap the generic fallback to ensure it's not hit in the slice case
     orig_generic = contiguous_mod.contiguous_generic_kernel
@@ -52,7 +55,7 @@ def test_contiguous_slice_uses_jax_kernel(monkeypatch):
     assert torch.allclose(y, sliced_view)
 
     # Validate paths taken
-    assert jax_called["count"] >= 1, "Expected JAX slice kernel to be invoked"
+    assert slice_called["count"] >= 1, "Expected JAX/MLIR slice kernel to be invoked"
     assert generic_called["count"] == 0, "Generic fallback should not be used for slice"
 
 
@@ -158,27 +161,30 @@ def test_multiple_dimensions_sliced_fallback():
 
 def test_contiguous_slice_compilation_caching(monkeypatch):
     """Test that different slice patterns compile separate kernels."""
-    from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceImpl
+    from torch_neuronx.python_ops.contiguous_slice import (
+        ContiguousSliceJAXImpl,
+        ContiguousSliceMLIRImpl,
+    )
 
     compile_called = {"count": 0}
-    orig_get_kernel = ContiguousSliceImpl._get_kernel
 
-    def wrapped_get_kernel(self):
-        kernel = orig_get_kernel(self)
+    for impl_class in [ContiguousSliceJAXImpl, ContiguousSliceMLIRImpl]:
+        orig_get_kernel = impl_class._get_kernel
 
-        def wrapper(*args, **kwargs):
-            orig_cache_size = get_cache_size(kernel)
-            result = kernel(*args, **kwargs)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            kernel = orig_get_kernel(self)
 
-            updated_cache_size = get_cache_size(kernel)
-            if updated_cache_size > orig_cache_size:
-                compile_called["count"] += 1
+            def wrapper(*args, **kwargs):
+                orig_cache_size = get_cache_size(kernel)
+                result = kernel(*args, **kwargs)
+                updated_cache_size = get_cache_size(kernel)
+                if updated_cache_size > orig_cache_size:
+                    compile_called["count"] += 1
+                return result
 
-            return result
+            return wrapper
 
-        return wrapper
-
-    monkeypatch.setattr(ContiguousSliceImpl, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
     # Test case 1: slice last dimension
     x1 = torch.randn(4, 8, 64, device="neuron", dtype=torch.float32)

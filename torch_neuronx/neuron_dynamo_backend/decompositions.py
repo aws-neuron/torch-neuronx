@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import torch
 from neuronxcc.nki.kernels import flash_fwd
+from neuronxcc.nki.kernels.attention import FlashConfig
 
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.nki_hop import nki
@@ -259,8 +260,30 @@ def sdpa_fused_overrideable_decomposition(
     """
     B, H, L, E = query.shape
     S = key.shape[-2]
+    D = key.shape[-1]
     nki_attention_enabled = _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True)
-    if L % 2048 == 0 and nki_attention_enabled:
+    # Dynamically determine seq_tile_size based on sequence length
+    # Get default from FlashConfig
+    default_seq_tile_size = FlashConfig().seq_tile_size
+    training = dropout_p > 0.0 or torch.is_grad_enabled()
+    # Prefer default tile size when possible for optimal memory usage
+    if S % default_seq_tile_size == 0:
+        # Keep the default - this is the preferred case
+        seq_tile_size = default_seq_tile_size
+    else:
+        # Only change if we must - prefer larger tiles up to default for better perf
+        # We know this works due to our can_handle check (seq_len % 512 == 0)
+        seq_tile_size = 1024 if S % 1024 == 0 else 512
+
+    # Conditions to use NKI SDPA kernel
+    can_use_nki_sdpa = L % 128 == 0 and S % 128 == 0 and D <= 128
+    can_use_nki_sdpa = can_use_nki_sdpa and S % seq_tile_size == 0
+    # Attn_bias is not yet supported
+    can_use_nki_sdpa = can_use_nki_sdpa and attn_bias is None
+
+    # Create config with custom seq_tile_size
+    config = FlashConfig(training=training, seq_tile_size=seq_tile_size)
+    if can_use_nki_sdpa and nki_attention_enabled:
         if dropout_p > 0.0:
             seed = torch.randint(0, 2**31 - 1, (1,), device=query.device, dtype=torch.int32)
         else:
@@ -269,7 +292,6 @@ def sdpa_fused_overrideable_decomposition(
         k = key.transpose(2, 3)
         v = value  # default should_transpose_v is False
 
-        # TODO: config = FlashConfig() does not work with dynamo tracing.
         output, logsumexp = wrapped_flash_fwd[query.shape[0], query.shape[1]](
             q,
             k,
@@ -281,7 +303,7 @@ def sdpa_fused_overrideable_decomposition(
             sliding_window=-1,
             mixed_precision=True,
             dropout_p=dropout_p,
-            config=None,
+            config=config,
         )
 
     else:

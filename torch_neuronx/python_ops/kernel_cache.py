@@ -14,6 +14,7 @@ from threading import RLock
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.processors.argument_processor import ArgumentProcessor
+from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,7 @@ class KernelKey:
     argproc_id: str
 
 
-_CACHE: dict[KernelKey, JaxKernel] = {}
+_CACHE: dict[KernelKey, JaxKernel | TorchMlirKernel] = {}
 _LOCK = RLock()
 
 
@@ -80,6 +81,35 @@ def get_or_create_jax_kernel(
         )
         if argument_processor_cls is not None:
             kernel.arg_processor = argument_processor_cls(static_argnames)  # type: ignore[assignment]
+        _CACHE[key] = kernel
+        return kernel
+
+
+def get_or_create_mlir_kernel(
+    *,
+    mlir_fn: Callable,
+    op_name: str,
+    static_argnames: tuple[str, ...] | None = None,
+) -> TorchMlirKernel:
+    """Return a cached TorchMlirKernel for the given configuration."""
+    key = KernelKey(
+        fn_id=_fn_identity(mlir_fn),
+        op_name=op_name,
+        static_argnums=(),
+        static_argnames=tuple(static_argnames or ()),
+        output_params=(),
+        argproc_id="mlir",
+    )
+    with _LOCK:
+        k = _CACHE.get(key)
+        if k is not None:
+            return k
+        # Create MLIR kernel
+        kernel = TorchMlirKernel(
+            torch_fn=mlir_fn,
+            op_name=op_name,
+            static_argnames=static_argnames,
+        )
         _CACHE[key] = kernel
         return kernel
 

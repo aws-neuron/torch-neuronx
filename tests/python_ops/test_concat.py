@@ -114,8 +114,13 @@ class TestConcat:
         with track_neuron_ops():
             result = torch.concat((input1.to(device), input2.to(device), input3), -1)
 
-            # Verify that cat.out was offloaded to CPU
-            assert "aten::cat.out" in torch_neuronx.get_fallback_ops()
+            # xla op does not have aten::cat variant registered
+            if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1":
+                # Verify that cat was offloaded to CPU
+                assert "aten::cat" in torch_neuronx.get_fallback_ops()
+            else:
+                # Verify that cat.out was offloaded to CPU
+                assert "aten::cat.out" in torch_neuronx.get_fallback_ops()
 
         # Verify the result is correct (same as CPU implementation)
         out_cpu = torch.concat((input1, input2, input3), -1)
@@ -232,7 +237,8 @@ class TestConcat:
         assert result is out
 
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
+        or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
         reason="Need to update the op logging for sync mode for short-circuited tests",
     )
     def test_concat_single_tensor(self):
@@ -263,7 +269,8 @@ class TestConcat:
         assert result.requires_grad
 
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
+        or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
         reason="Need to update the op logging for sync mode for short-circuited tests",
     )
     def test_concat_single_tensor_no_out(self):
@@ -288,7 +295,8 @@ class TestConcat:
         assert out_neuron.shape == (100,)
 
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
+        or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
         reason="Need to update the op logging for sync mode for short-circuited tests",
     )
     def test_concat_single_tensor_with_out(self):
@@ -498,7 +506,8 @@ class TestConcat:
         assert out_neuron.shape == torch.Size([15])
 
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
+        or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
         reason="Need to update the op logging for sync mode for short-circuited tests",
     )
     def test_concat_single_tensor_float32(self):

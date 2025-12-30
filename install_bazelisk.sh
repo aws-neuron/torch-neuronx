@@ -70,52 +70,85 @@ print_info "Latest version: $LATEST_VERSION"
 # Download URL
 DOWNLOAD_URL="https://github.com/bazelbuild/bazelisk/releases/download/${LATEST_VERSION}/bazelisk-${BAZELISK_ARCH}"
 
-print_info "Downloading bazelisk from: $DOWNLOAD_URL"
+# Retry configuration
+MAX_RETRIES=3
+RETRY_DELAY=2  # seconds
 
-# Download bazelisk
-TEMP_FILE=$(mktemp)
-if ! curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"; then
-    print_error "Failed to download bazelisk"
-    rm -f "$TEMP_FILE"
-    exit 1
-fi
+# Function to perform installation and verification
+install_and_verify() {
+    print_info "Downloading bazelisk from: $DOWNLOAD_URL"
 
-# Verify the download
-if [[ ! -s "$TEMP_FILE" ]]; then
-    print_error "Downloaded file is empty"
-    rm -f "$TEMP_FILE"
-    exit 1
-fi
+    # Download bazelisk
+    TEMP_FILE=$(mktemp)
+    if ! curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"; then
+        print_error "Failed to download bazelisk"
+        rm -f "$TEMP_FILE"
+        return 1
+    fi
 
-# Make it executable
-chmod +x "$TEMP_FILE"
+    # Verify the download
+    if [[ ! -s "$TEMP_FILE" ]]; then
+        print_error "Downloaded file is empty"
+        rm -f "$TEMP_FILE"
+        return 1
+    fi
 
-# Move to installation directory
-if ! mv "$TEMP_FILE" "$INSTALL_DIR/bazelisk"; then
-    print_error "Failed to install bazelisk to $INSTALL_DIR. Must run as root user (sudo)."
-    rm -f "$TEMP_FILE"
-    exit 1
-fi
+    # Make it executable
+    chmod +x "$TEMP_FILE"
 
-print_info "bazelisk installed successfully to $INSTALL_DIR/bazelisk"
+    # Move to installation directory
+    if ! mv "$TEMP_FILE" "$INSTALL_DIR/bazelisk"; then
+        print_error "Failed to install bazelisk to $INSTALL_DIR. Must run as root user (sudo)."
+        rm -f "$TEMP_FILE"
+        return 1
+    fi
 
-# Create bazel symlink if it doesn't exist
-if [[ ! -f "$INSTALL_DIR/bazel" ]]; then
-    ln -s "$INSTALL_DIR/bazelisk" "$INSTALL_DIR/bazel"
-    print_info "Created bazel symlink"
-fi
+    print_info "bazelisk installed successfully to $INSTALL_DIR/bazelisk"
 
-# Verify installation
-print_info "Verifying installation..."
-if command -v bazelisk &> /dev/null; then
-    VERSION_OUTPUT=$(bazelisk version 2>/dev/null || echo "Failed to get version")
-    print_info "Installation successful!"
-    echo "bazelisk version: $VERSION_OUTPUT"
-else
-    print_error "bazelisk command not found in PATH"
-    print_info "You may need to restart your shell or run: export PATH=\"$INSTALL_DIR:\$PATH\""
-    exit 1
-fi
+    # Create bazel symlink if it doesn't exist
+    if [[ ! -f "$INSTALL_DIR/bazel" ]]; then
+        ln -s "$INSTALL_DIR/bazelisk" "$INSTALL_DIR/bazel"
+        print_info "Created bazel symlink"
+    fi
+
+    # Verify installation
+    print_info "Verifying installation..."
+    if ! command -v bazelisk &> /dev/null; then
+        print_error "bazelisk command not found in PATH"
+        return 1
+    fi
+
+    # Check if bazelisk can run and get version (this may download Bazel)
+    # Use GitHub releases as fallback if releases.bazel.build has certificate issues
+    export BAZELISK_BASE_URL="${BAZELISK_BASE_URL:-https://github.com/bazelbuild/bazel/releases/download}"
+    if VERSION_OUTPUT=$(bazelisk version 2>&1); then
+        print_info "Installation successful!"
+        echo "bazelisk version output:"
+        echo "$VERSION_OUTPUT" | head -5
+        return 0
+    else
+        print_error "Failed to get bazelisk version (exit code: $?)"
+        echo "Output: $VERSION_OUTPUT" | head -10
+        return 1
+    fi
+}
+
+# Perform installation with retries
+for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
+    print_info "Installation attempt $attempt/$MAX_RETRIES..."
+    if install_and_verify; then
+        break
+    fi
+
+    if [[ $attempt -lt $MAX_RETRIES ]]; then
+        print_warning "Installation attempt $attempt/$MAX_RETRIES failed. Retrying in ${RETRY_DELAY}s..."
+        sleep $RETRY_DELAY
+    else
+        print_error "Installation failed after $MAX_RETRIES attempts"
+        print_info "You may need to restart your shell or run: export PATH=\"$INSTALL_DIR:\$PATH\""
+        exit 1
+    fi
+done
 
 # Check if .bazelversion file exists in current directory
 if [[ -f ".bazelversion" ]]; then
@@ -123,6 +156,3 @@ if [[ -f ".bazelversion" ]]; then
     print_info "Found .bazelversion file specifying Bazel version: $BAZEL_VERSION"
     print_info "bazelisk will automatically use this version when run in this directory"
 fi
-
-print_info "Installation complete! You can now use 'bazelisk' or 'bazel' commands."
-print_info "bazelisk will automatically download and use the appropriate Bazel version for your projects."

@@ -238,7 +238,7 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test all_gather with specific process groups."""
         self.distributed_tester.run_test(run_group_argument_test)
 
-    @assert_raises(RuntimeError, match=r".*all tensors must be on neuron device, found.*")
+    @assert_raises(RuntimeError, match=r".*Operation all_gather is not implemented for Neuron.*")
     def test_different_devices(self):
         """Test all_gather with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)

@@ -1336,7 +1336,9 @@ class TestReduceScatter(BaseCollectiveOpTest):
     # DEVICE & MEMORY TESTS
     # ========================================================================
 
-    @assert_raises(RuntimeError, match=r".*all tensors must be on neuron device, found.*")
+    @assert_raises(
+        RuntimeError, match=r".*Operation reduce_scatter is not implemented for Neuron.*"
+    )
     def test_non_neuron_device(self):
         """Test with tensors not on neuron device."""
         self.distributed_tester.run_test(run_non_neuron_device_test)

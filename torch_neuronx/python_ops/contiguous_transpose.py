@@ -8,6 +8,7 @@ element-wise copying, it uses optimized transpose kernels.
 import torch
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
+from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -128,7 +129,6 @@ def _prepare_transpose_inputs(
     return permutation, base_view
 
 
-@neuron_op("aten::contiguous", priority=100)  # Higher priority than generic implementation
 class ContiguousTransposeImpl(OperationImplementation):
     """Transpose-based implementation for contiguous operation.
 
@@ -136,40 +136,6 @@ class ContiguousTransposeImpl(OperationImplementation):
     It handles cases where the tensor is a transpose/permutation of
     a contiguous tensor by using dynamically created transpose kernels.
     """
-
-    _kernel: JaxKernel | None = None
-
-    def __init__(self):
-        """Initialize with empty kernel cache."""
-        super().__init__()
-
-    def _get_kernel(self):
-        """Get or create a kernel for the given permutation.
-
-        This dynamically creates JAX kernel with static permutation argument
-
-        Returns:
-            JaxKernel for the specific permutation
-        """
-        if ContiguousTransposeImpl._kernel is not None:
-            return ContiguousTransposeImpl._kernel
-
-        # Create a new kernel with static permutation pattern
-        def transpose_fn(x, perm):
-            import jax.numpy as jnp
-
-            return jnp.transpose(x, axes=perm)
-
-        # Create kernel name - must use the actual ATen operation name
-        # for meta tensor evaluation to work properly
-        kernel_name = "aten::contiguous"
-
-        # Create and cache the kernel
-        ContiguousTransposeImpl._kernel = JaxKernel(
-            transpose_fn, op_name=kernel_name, static_argnums=(1,)
-        )
-
-        return ContiguousTransposeImpl._kernel
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
         """Check if this implementation can handle the given tensor.
@@ -202,12 +168,10 @@ class ContiguousTransposeImpl(OperationImplementation):
 
         # Check if we can compute a valid permutation
         permutation = compute_permutation_for_contiguous(shape, strides)
-
         return permutation is not None
 
     def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using transpose kernel.
-
         This uses compiled JAX transpose kernels to efficiently make
         the tensor contiguous without element-wise copying.
         """
@@ -216,12 +180,11 @@ class ContiguousTransposeImpl(OperationImplementation):
             permutation, base_view = _prepare_transpose_inputs(self_tensor)
 
             if permutation is None:
-                # This shouldn't happen if can_handle worked correctly
                 return ExecutionResult(
                     success=False, error_msg="Failed to compute permutation for transpose"
                 )
 
-            # Get or create the kernel (base -> current)
+            # Get the kernel
             kernel = self._get_kernel()
 
             # Execute the kernel on the base view. Provide ExecutionContext with
@@ -240,7 +203,6 @@ class ContiguousTransposeImpl(OperationImplementation):
                     success=False,
                     error_msg=f"Transpose output not contiguous for permutation {permutation}",
                 )
-
             return ExecutionResult(success=True, output=output)
 
         except Exception as e:
@@ -270,6 +232,64 @@ class ContiguousTransposeImpl(OperationImplementation):
 
         # Non-gradient path uses _execute_impl
         return self._execute_impl(self_tensor, memory_format)
+
+
+@neuron_op("aten::contiguous", priority=100)  # Higher priority than generic implementation
+class ContiguousTransposeJAXImpl(ContiguousTransposeImpl):
+    """JAX implementation for transpose-based contiguous operation."""
+
+    _kernel: JaxKernel | None = None
+
+    def can_handle(self, self_tensor, memory_format=None) -> bool:
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(self_tensor, memory_format)
+
+    def __init__(self):
+        super().__init__()
+        if ContiguousTransposeJAXImpl._kernel is None:
+
+            def transpose_fn(x, perm):
+                import jax.numpy as jnp
+
+                return jnp.transpose(x, axes=perm)
+
+            ContiguousTransposeJAXImpl._kernel = JaxKernel(
+                transpose_fn, op_name="aten::contiguous", static_argnums=(1,)
+            )
+
+    def _get_kernel(self):
+        return ContiguousTransposeJAXImpl._kernel
+
+
+@neuron_op("aten::contiguous", priority=100)  # Higher priority than generic implementation
+class ContiguousTransposeMLIRImpl(ContiguousTransposeImpl):
+    """MLIR implementation for transpose-based contiguous operation."""
+
+    _kernel: TorchMlirKernel | None = None
+
+    def can_handle(self, self_tensor, memory_format=None) -> bool:
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        if not use_mlir_aten_ops():
+            return False
+        return super().can_handle(self_tensor, memory_format)
+
+    def __init__(self):
+        super().__init__()
+        if ContiguousTransposeMLIRImpl._kernel is None:
+
+            def transpose_fn(x, axes):
+                return torch.permute(x, axes).clone()
+
+            ContiguousTransposeMLIRImpl._kernel = TorchMlirKernel(
+                transpose_fn, op_name="aten::contiguous", static_argnums=(1,)
+            )
+
+    def _get_kernel(self):
+        return ContiguousTransposeMLIRImpl._kernel
 
 
 class ContiguousTransposeFunction(torch.autograd.Function):

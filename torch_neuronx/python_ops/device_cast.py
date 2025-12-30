@@ -14,7 +14,10 @@ import torch
 
 from torch_neuronx.python_ops.jax.context import ExecutionContext
 from torch_neuronx.python_ops.jax.type_converter import JaxTypeConverter
-from torch_neuronx.python_ops.kernel_cache import get_or_create_jax_kernel
+from torch_neuronx.python_ops.kernel_cache import (
+    get_or_create_jax_kernel,
+    get_or_create_mlir_kernel,
+)
 from torch_neuronx.python_ops.processors.no_cast_argument_processor import (
     NoCastArgumentProcessor,
 )
@@ -26,11 +29,56 @@ def _jax_copy_fn(x, out_dtype=None):
     return x.astype(out_dtype)
 
 
+def _mlir_cast_fn(x, out_dtype=None):
+    return x.to(dtype=out_dtype) if out_dtype else x
+
+
+class DeviceCastJAXImpl:
+    """JAX implementation for device casting."""
+
+    @staticmethod
+    def can_handle():
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        return not use_mlir_aten_ops()
+
+    @staticmethod
+    def cast(src_prepared, dst_prepared):
+        kernel = get_or_create_jax_kernel(
+            jax_fn=_jax_copy_fn,
+            op_name="aten::copy_",
+            static_argnames=("out_dtype",),
+            argument_processor_cls=NoCastArgumentProcessor,
+        )
+        exec_ctx = ExecutionContext(original_inputs=(src_prepared,))
+        jax_out_dtype = JaxTypeConverter().to_execution_jax_dtype(dst_prepared.dtype)
+        kernel(src_prepared, context=exec_ctx, out=dst_prepared, out_dtype=jax_out_dtype)
+
+
+class DeviceCastMLIRImpl:
+    """MLIR implementation for device casting."""
+
+    @staticmethod
+    def can_handle():
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        return use_mlir_aten_ops()
+
+    @staticmethod
+    def cast(src_prepared, dst_prepared):
+        kernel = get_or_create_mlir_kernel(
+            mlir_fn=_mlir_cast_fn,
+            op_name="aten::copy_",
+            static_argnames=("out_dtype",),
+        )
+        kernel(src_prepared, out=dst_prepared, out_dtype=dst_prepared.dtype)
+
+
 def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor, non_blocking: bool) -> None:
     """Cast `src` into `dst` on Neuron device without CPU bounce for <=32-bit dtypes.
 
     - If dtypes match, performs a direct device-to-device copy.
-    - Otherwise, uses a tiny JAX kernel to cast on device and write into `dst`.
+    - Otherwise, uses a tiny JAX/MLIR kernel to cast on device and write into `dst`.
 
     Args:
         src: Source Neuron tensor
@@ -47,22 +95,14 @@ def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor, non_block
         return
 
     # Ensure contiguous inputs/outputs for kernel simplicity without redispatch
-    # Use internal helper to avoid calling aten::contiguous through dispatcher
     from torch_neuronx.python_ops.cast_policy import ensure_contiguous_on_device
 
     src_prepared = ensure_contiguous_on_device(src)
     dst_prepared = ensure_contiguous_on_device(dst)
 
-    # Reuse a tiny JAX kernel via process-local cache
-    kernel = get_or_create_jax_kernel(
-        jax_fn=_jax_copy_fn,
-        op_name="aten::copy_",  # reuse copy_ meta/out semantics for kernel plumbing
-        static_argnames=("out_dtype",),
-        argument_processor_cls=NoCastArgumentProcessor,
-    )
-
-    exec_ctx = ExecutionContext(original_inputs=(src_prepared,))
-    jax_out_dtype = JaxTypeConverter().to_execution_jax_dtype(dst_prepared.dtype)
-
-    # Execute kernel to write into dst
-    kernel(src_prepared, context=exec_ctx, out=dst_prepared, out_dtype=jax_out_dtype)
+    if DeviceCastJAXImpl.can_handle():
+        DeviceCastJAXImpl.cast(src_prepared, dst_prepared)
+    elif DeviceCastMLIRImpl.can_handle():
+        DeviceCastMLIRImpl.cast(src_prepared, dst_prepared)
+    else:
+        raise RuntimeError("No device cast implementations available")

@@ -1,0 +1,34 @@
+"""Loss function operations."""
+
+from torch._decomp import decompositions
+from torch._refs.nn.functional import TensorLikeType
+
+from ..operation_registry import register_aten
+
+
+@register_aten(["aten::nll_loss_forward"], static_argnums=(3, 4))
+def nll_loss(
+    input: TensorLikeType,
+    target: TensorLikeType,
+    weight: TensorLikeType | None,
+    reduction: int,
+    ignore_index: int,
+):
+    """NLL loss forward using PyTorch decomposition."""
+    return decompositions.nll_loss_forward(input, target, weight, reduction, ignore_index)
+
+
+@register_aten(["aten::nll_loss_backward"], static_argnums=(4, 5))
+def nll_loss_backward(
+    grad_output: TensorLikeType,
+    input: TensorLikeType,
+    target: TensorLikeType,
+    weight: TensorLikeType | None,
+    reduction: int,
+    ignore_index: int,
+    total_weight: TensorLikeType,
+):
+    """NLL loss backward using PyTorch decomposition."""
+    return decompositions.nll_loss_backward(
+        grad_output, input, target, weight, reduction, ignore_index, total_weight
+    )

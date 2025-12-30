@@ -8,16 +8,18 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
+#include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
-
 namespace at::neuron {
 
 // Forward declarations
 class CompilationCache;
 class ModelHandleCache;
+class ConcatenationEngine;
 
 // Priority levels for task execution
 enum class TaskPriority { HIGH = 0, DEFAULT = 1, LOW = 2 };
@@ -70,7 +72,8 @@ class OperationExecutionEngine {
 
   // Constructor and destructor (now public since managed by NeuronResourceManager)
   OperationExecutionEngine(CompilationCache* compilation_cache,
-                           ModelHandleCache* model_handle_cache);
+                           ModelHandleCache* model_handle_cache, int64_t queue_low_threshold = 10,
+                           int64_t queue_target_depth = 50);
   ~OperationExecutionEngine();
 
   // Deleted copy/move constructors and assignment operators
@@ -80,13 +83,28 @@ class OperationExecutionEngine {
   OperationExecutionEngine& operator=(OperationExecutionEngine&&) = delete;
 
   void SubmitCompilationTask(OperationContext* operation);
+  // Submit operation to concatenation queue (if enabled) or directly to compilation
+  void SubmitOperation(OperationContext* operation);
   // Notify the execution worker that an operation is ready
   void NotifyExecutionReady();
 
+  // Execution queue depth management
+  int64_t GetExecutionQueueDepth() const { return execution_queue_depth_.load(); }
+  int64_t GetQueueLowThreshold() const { return queue_low_threshold_; }
+  int64_t GetQueueTargetDepth() const { return queue_target_depth_; }
+
  private:
   // Worker threads
+  std::thread concatenation_thread_;
   std::thread compilation_thread_;
   std::thread execution_thread_;
+
+  // Concatenation infrastructure (only initialized if flag is enabled)
+  std::unique_ptr<ConcatenationEngine> concatenation_engine_;
+  std::deque<OperationContext*> concatenation_queue_;
+  mutable std::mutex concatenation_mutex_;
+  std::condition_variable concatenation_cv_;
+  bool concatenation_enabled_{false};
 
   PriorityQueue<OperationContext*> compilation_queue_;
 
@@ -104,9 +122,18 @@ class OperationExecutionEngine {
   CompilationCache* compilation_cache_{nullptr};
   ModelHandleCache* model_handle_cache_{nullptr};
 
+  // Execution queue depth tracking for dynamic buffering
+  std::atomic<int64_t> execution_queue_depth_{0};
+  int64_t queue_low_threshold_;
+  int64_t queue_target_depth_;
+
   // Worker thread implementations
+  void ConcatenationWorker();
   void CompilationWorker();
   void ExecutionWorker();
+
+  // Check if concatenation is enabled via environment variable
+  bool IsConcatenationEnabled() const;
 
   // Preprocessing helpers prologue attached with operations if needed
   bool ProcessPreprocessingTask(OperationContext* operation) noexcept;

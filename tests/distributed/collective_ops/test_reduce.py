@@ -394,9 +394,7 @@ class TestReduce(BaseCollectiveOpTest):
         """Test reduce with tensors containing mixed special values (inf, nan, normal)."""
         self.distributed_tester.run_test(run_with_mixed_special_values_test)
 
-    @assert_raises(
-        RuntimeError, match=r".*all tensors must be on neuron device, found tensors on.*"
-    )
+    @assert_raises(RuntimeError, match=r".*Operation all_reduce is not implemented for Neuron.*")
     def test_different_devices(self):
         """Test reduce with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)

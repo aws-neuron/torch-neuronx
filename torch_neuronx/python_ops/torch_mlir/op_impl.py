@@ -1,6 +1,7 @@
 """Torch-MLIR operation implementation."""
 
 import logging
+import traceback
 
 import torch
 
@@ -71,9 +72,18 @@ class TorchMlirOpImpl(CompilableOpImpl):
                     return ExecutionResult(success=True, output=result)
 
             # Execute kernel
-            result = self.kernel(*args, context=context, **kwargs)
+            try:
+                result = self.kernel(*args, context=context, **kwargs)
 
-            return ExecutionResult(success=True, output=result)
+                return ExecutionResult(success=True, output=result)
+            except Exception as e:
+                # Do not fall back for user/input contract errors; match PyTorch behavior
+                error_traceback = traceback.format_exc()
+                if isinstance(e, IndexError | ValueError | TypeError):
+                    raise
+                error_message = f"{e!s}\n{error_traceback}"
+                logger.debug(f"Execution failed: {error_message}")
+                return ExecutionResult(success=False, error_msg=error_message)
 
     def _execute_impl(self):
         pass

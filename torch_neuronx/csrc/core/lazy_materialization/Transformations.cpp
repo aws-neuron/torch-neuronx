@@ -134,6 +134,12 @@ struct SliceInfo {
   int64_t start_offset;   // Where slice starts
 };
 
+// Information about detected broadcast pattern
+struct BroadcastInfo {
+  std::vector<int64_t> base_shape;      // Shape with size-1 for broadcasted dims
+  std::vector<int64_t> broadcast_dims;  // Which dimensions are broadcasted
+};
+
 // Helper for slice detection
 bool VerifySingleSliceAtAxis(const std::vector<int64_t>& shape, const std::vector<int64_t>& strides,
                              size_t slice_axis, int64_t original_size) {
@@ -189,6 +195,49 @@ std::optional<SliceInfo> DetectSlicePattern(const at::Tensor& tensor) {
   }
 
   return std::nullopt;
+}
+
+// Detect broadcast pattern from tensor strides
+std::optional<BroadcastInfo> DetectBroadcastPattern(const at::Tensor& tensor) {
+  auto shape = tensor.sizes();
+  auto strides = tensor.strides();
+  int64_t n = shape.size();
+
+  if (n == 0) {
+    TORCH_NEURONX_DEBUG("Broadcast detection rejected: empty tensor (n=0)");
+    return std::nullopt;
+  }
+
+  // Identify broadcasted dimensions (stride=0, size>1)
+  std::vector<int64_t> broadcasted_dims;
+  for (int64_t i = 0; i < n; ++i) {
+    if (strides[i] < 0) {
+      TORCH_NEURONX_DEBUG("Broadcast detection rejected: negative stride", "dim=", i,
+                          "stride=", strides[i], "shape=", shape, "strides=", strides);
+      return std::nullopt;
+    } else if (strides[i] == 0 && shape[i] > 1) {
+      broadcasted_dims.push_back(i);
+    }
+  }
+
+  // No broadcast dimensions found
+  if (broadcasted_dims.empty()) {
+    TORCH_NEURONX_DEBUG("Broadcast detection rejected: no broadcast dimensions found",
+                        "shape=", shape, "strides=", strides);
+    return std::nullopt;
+  }
+
+  // Construct base shape with size-1 for broadcasted dims
+  std::vector<int64_t> base_shape(shape.begin(), shape.end());
+  for (int64_t dim : broadcasted_dims) {
+    base_shape[dim] = 1;
+  }
+
+  TORCH_NEURONX_DEBUG("Broadcast pattern detected successfully!", "shape=", shape,
+                      "strides=", strides, "broadcast_dims=", broadcasted_dims,
+                      "base_shape=", base_shape);
+
+  return BroadcastInfo{base_shape, broadcasted_dims};
 }
 
 }  // anonymous namespace
@@ -348,6 +397,72 @@ std::optional<TransformationCreationResult> TryCreateSlice(const at::Tensor& inp
                                       .pattern_name = "SLICE"};
 }
 
+std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor& input,
+                                                               const std::string& op_name,
+                                                               size_t input_index) {
+  TORCH_NEURONX_DEBUG("TryCreateBroadcast called", "op=", op_name, "input_index=", input_index,
+                      "is_contiguous=", input.is_contiguous(), "shape=", input.sizes(),
+                      "strides=", input.strides());
+
+  // Step 1: Try to detect broadcast pattern
+  auto broadcast_info = DetectBroadcastPattern(input);
+  if (!broadcast_info.has_value()) {
+    TORCH_NEURONX_DEBUG("TryCreateBroadcast: DetectBroadcastPattern returned nullopt",
+                        "op=", op_name, "input_index=", input_index);
+    return std::nullopt;  // Not a broadcast pattern
+  }
+
+  TORCH_NEURONX_DEBUG("Detected supported broadcast pattern", "op=", op_name,
+                      "input_index=", input_index,
+                      "num_broadcast_dims=", broadcast_info->broadcast_dims.size());
+
+  // Step 2: INPUT SHAPE: Base shape with size-1 for broadcasted dimensions
+  std::vector<int64_t> input_shape = broadcast_info->base_shape;
+
+  // Step 3: OUTPUT SHAPE: Current tensor shape (after broadcast)
+  std::vector<int64_t> output_shape(input.sizes().begin(), input.sizes().end());
+
+  // Step 4: PARAMS: Create broadcast_dimensions mapping for StableHLO
+  // StableHLO broadcast_in_dim requires a complete mapping [0,1,2,...,rank-1]
+  // that maps each input dimension to its corresponding output dimension
+  std::vector<int64_t> broadcast_params(input_shape.size());
+  std::iota(broadcast_params.begin(), broadcast_params.end(), 0);
+
+  TORCH_NEURONX_DEBUG("TryCreateBroadcast: Computed broadcast_dimensions",
+                      "input_shape=", input_shape, "output_shape=", output_shape,
+                      "broadcast_dimensions=", broadcast_params,
+                      "originally_broadcasted_dims=", broadcast_info->broadcast_dims);
+
+  // Step 5: Get element type
+  std::string element_type = ScalarTypeToElementTypeString(input.scalar_type());
+
+  // Step 6: Create identity permutation (broadcasts don't change permutation)
+  std::vector<int64_t> identity_perm(input_shape.size());
+  std::iota(identity_perm.begin(), identity_perm.end(), 0);
+
+  // Step 7: Create BROADCAST transformation
+  TensorTransformation transform(TransformationType::BROADCAST, input_shape, output_shape,
+                                 element_type,
+                                 broadcast_params,  // params: broadcasted dimension indices
+                                 identity_perm,     // current_perm: identity
+                                 identity_perm);    // target_perm: stays identity
+
+  // Step 8: Create base view with size-1 for broadcasted dimensions
+  // Keep the same strides, just change the shape
+  std::vector<int64_t> input_strides(input.strides().begin(), input.strides().end());
+  at::Tensor base_view = input.as_strided(c10::IntArrayRef(input_shape),
+                                          c10::IntArrayRef(input_strides), input.storage_offset());
+
+  TORCH_NEURONX_DEBUG("Created base view for broadcast", "op=", op_name,
+                      "input_index=", input_index, "base_shape=", base_view.sizes(),
+                      "broadcast_view_shape=", input.sizes());
+
+  return TransformationCreationResult{.is_supported = true,
+                                      .transformation = transform,
+                                      .processed_input = base_view,
+                                      .pattern_name = "BROADCAST"};
+}
+
 }  // namespace Creators
 
 // ============================================================================
@@ -463,6 +578,48 @@ TransformationTask SliceHandler::ProcessGroup(size_t input_index, Transformation
   // Return TransformationTask
   return TransformationTask{.input_index = input_index,
                             .type = TransformationType::SLICE,
+                            .input_shape = transform.input_shape,
+                            .output_shape = transform.output_shape,
+                            .element_type = transform.element_type,
+                            .current_perm = state.current_perm,
+                            .params = params};
+}
+
+// BroadcastHandler
+size_t BroadcastHandler::FindGroupEnd(const std::vector<TensorTransformation>& transformations,
+                                      size_t start_index, const TransformationState& state) const {
+  // Process BROADCAST operations individually for now (no grouping)
+  // Return start_index + 1 to include just this one transformation
+  return start_index + 1;
+}
+
+TransformationTask BroadcastHandler::ProcessGroup(size_t input_index, TransformationState& state,
+                                                  const std::vector<TensorTransformation>& group,
+                                                  const std::string& op_name) const {
+  TORCH_NEURONX_DEBUG("Processing BROADCAST group", "op=", op_name, "input_index=", input_index,
+                      "group_size=", group.size());
+
+  // Should only be one broadcast in the group for now
+  const auto& transform = group[0];
+
+  // Extract broadcast dimensions from params
+  std::vector<int64_t> broadcast_dims = transform.params;
+
+  TORCH_NEURONX_DEBUG(
+      "BroadcastHandler: Creating transformation task", "input_shape=", transform.input_shape,
+      "output_shape=", transform.output_shape, "broadcast_dims=", broadcast_dims,
+      "broadcast_dims.size()=", broadcast_dims.size(), "input_rank=", transform.input_shape.size());
+
+  // Update state for next transformation in chain
+  state.current_shape = transform.output_shape;
+
+  // Build BroadcastParams
+  BroadcastParams params;
+  params.broadcast_dims = broadcast_dims;
+
+  // Return TransformationTask
+  return TransformationTask{.input_index = input_index,
+                            .type = TransformationType::BROADCAST,
                             .input_shape = transform.input_shape,
                             .output_shape = transform.output_shape,
                             .element_type = transform.element_type,
