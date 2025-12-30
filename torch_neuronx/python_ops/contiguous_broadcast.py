@@ -1,6 +1,7 @@
 import torch
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
+from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -77,7 +78,6 @@ def _prepare_broadcast_inputs(
     return expand_dims, base_view
 
 
-@neuron_op("aten::contiguous", priority=95)  # lower priority than ContiguousTransposeImpl
 class ContiguousBroadcastImpl(OperationImplementation):
     """Broadcast-based implementation for contiguous operation.
 
@@ -85,32 +85,8 @@ class ContiguousBroadcastImpl(OperationImplementation):
     (stride 0 with size > 1) and can be made contiguous using expand operations.
     """
 
-    _kernel: JaxKernel | None = None
-
-    def __init__(self):
-        """Initialize with empty kernel cache."""
-        super().__init__()
-
-    def _get_kernel(self):
-        """Get or create a kernel for expanding to the target shape."""
-        if ContiguousBroadcastImpl._kernel is not None:
-            return ContiguousBroadcastImpl._kernel
-
-        def expand_fn(x, target_shape):
-            import jax.numpy as jnp
-
-            return jnp.broadcast_to(x, target_shape)
-
-        kernel_name = "aten::contiguous"
-        ContiguousBroadcastImpl._kernel = JaxKernel(
-            expand_fn, op_name=kernel_name, static_argnums=(1,)
-        )
-
-        return ContiguousBroadcastImpl._kernel
-
     def can_handle(self, self_tensor, memory_format=None) -> bool:
         """Check if this implementation can handle the given tensor."""
-
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
 
@@ -132,37 +108,33 @@ class ContiguousBroadcastImpl(OperationImplementation):
             return False
 
         # Check if we can handle this broadcast pattern
-
         result = compute_broadcast_for_contiguous(shape, strides)
         return result is not None
-
-    def _execute_impl_internal(self, self_tensor, memory_format=None) -> torch.Tensor:
-        expand_result = _prepare_broadcast_inputs(self_tensor)
-        if expand_result is None:
-            raise RuntimeError("ContiguousBroadcastFunction: not a valid broadcast pattern")
-
-        expand_dims, base_view = expand_result
-
-        # Execute JAX kernel
-        from .jax.context import ExecutionContext
-
-        target_shape = tuple(self_tensor.shape)
-        kernel = self._get_kernel()
-        exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
-        output = kernel(base_view, target_shape, context=exec_ctx)
-
-        return output
 
     def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using broadcast kernel."""
         try:
-            output = self._execute_impl_internal(self_tensor, memory_format=memory_format)
+            expand_result = _prepare_broadcast_inputs(self_tensor)
+            if expand_result is None:
+                return ExecutionResult(
+                    success=False, error_msg="Failed to compute broadcast inputs"
+                )
+
+            expand_dims, base_view = expand_result
+
+            kernel = self._get_kernel()
+
+            from .jax.context import ExecutionContext
+
+            target_shape = tuple(self_tensor.shape)
+            exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
+            output = kernel(base_view, target_shape, context=exec_ctx)
+
             if not output.is_contiguous():
                 return ExecutionResult(
                     success=False,
                     error_msg="Broadcast output not contiguous",
                 )
-
             return ExecutionResult(success=True, output=output)
 
         except Exception as e:
@@ -184,6 +156,70 @@ class ContiguousBroadcastImpl(OperationImplementation):
                 )
 
         return self._execute_impl(self_tensor, memory_format)
+
+
+@neuron_op("aten::contiguous", priority=95)  # lower priority than ContiguousTransposeImpl
+class ContiguousBroadcastJAXImpl(ContiguousBroadcastImpl):
+    """JAX implementation for broadcast-based contiguous operation."""
+
+    _kernel: JaxKernel | None = None
+
+    def can_handle(self, self_tensor, memory_format=None) -> bool:
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(self_tensor, memory_format)
+
+    def __init__(self):
+        super().__init__()
+        if ContiguousBroadcastJAXImpl._kernel is None:
+
+            def expand_fn(x, target_shape):
+                import jax.numpy as jnp
+
+                return jnp.broadcast_to(x, target_shape)
+
+            ContiguousBroadcastJAXImpl._kernel = JaxKernel(
+                expand_fn, op_name="aten::contiguous", static_argnums=(1,)
+            )
+
+    def _get_kernel(self):
+        return ContiguousBroadcastJAXImpl._kernel
+
+
+@neuron_op("aten::contiguous", priority=95)  # lower priority than ContiguousTransposeImpl
+class ContiguousBroadcastMLIRImpl(ContiguousBroadcastImpl):
+    """MLIR implementation for broadcast-based contiguous operation."""
+
+    _kernel: TorchMlirKernel | None = None
+
+    def can_handle(self, self_tensor, memory_format=None) -> bool:
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        if not use_mlir_aten_ops():
+            return False
+        return super().can_handle(self_tensor, memory_format)
+
+    def __init__(self):
+        super().__init__()
+        if ContiguousBroadcastMLIRImpl._kernel is None:
+
+            def expand_fn(x, target_shape):
+                repeat_factors = []
+                for _, (src_size, tgt_size) in enumerate(zip(x.shape, target_shape, strict=False)):
+                    if src_size == 1 and tgt_size > 1:
+                        repeat_factors.append(tgt_size)
+                    else:
+                        repeat_factors.append(1)
+                return x.repeat(*repeat_factors)
+
+            ContiguousBroadcastMLIRImpl._kernel = TorchMlirKernel(
+                expand_fn, op_name="aten::contiguous", static_argnums=(1,)
+            )
+
+    def _get_kernel(self):
+        return ContiguousBroadcastMLIRImpl._kernel
 
 
 class ContiguousBroadcastFunction(torch.autograd.Function):

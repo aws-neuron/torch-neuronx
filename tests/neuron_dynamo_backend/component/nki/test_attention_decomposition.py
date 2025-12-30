@@ -25,15 +25,16 @@ class TestAttentionDecomposition:
         "batch_size,num_heads,seq_len,head_dim",
         [
             (4, 8, 128, 128),
-            (2, 16, 512, 64),
-            (1, 8, 2048, 64),
+            (1, 2, 1024, 128),
+            (2, 4, 2048, 64),
         ],
     )
     def test_attention_decomposition(self, batch_size, num_heads, seq_len, head_dim):
         """Test attention with neuron backend"""
-        query = torch.randn(batch_size, num_heads, seq_len, head_dim, device="neuron")
-        key = torch.randn(batch_size, num_heads, seq_len, head_dim, device="neuron")
-        value = torch.randn(batch_size, num_heads, seq_len, head_dim, device="neuron")
+        seqlen_q = 128  # Minimum query length to enable sdpa decomposition
+        query = torch.rand(batch_size, num_heads, seqlen_q, head_dim, device="neuron")
+        key = torch.rand(batch_size, num_heads, seq_len, head_dim, device="neuron")
+        value = torch.rand(batch_size, num_heads, seq_len, head_dim, device="neuron")
 
         # Compile with neuron backend
         compiled_attention = torch.compile(attention_func, backend="neuron", dynamic=False)

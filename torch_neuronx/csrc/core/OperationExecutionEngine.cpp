@@ -12,6 +12,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
@@ -71,13 +72,31 @@ T PriorityQueue<T>::pop_front() {
 template class PriorityQueue<OperationContext*>;
 
 OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation_cache,
-                                                   ModelHandleCache* model_handle_cache)
-    : compilation_cache_(compilation_cache), model_handle_cache_(model_handle_cache) {
+                                                   ModelHandleCache* model_handle_cache,
+                                                   int64_t queue_low_threshold,
+                                                   int64_t queue_target_depth)
+    : compilation_cache_(compilation_cache),
+      model_handle_cache_(model_handle_cache),
+      queue_low_threshold_(queue_low_threshold),
+      queue_target_depth_(queue_target_depth) {
+  // Check if concatenation is enabled
+  concatenation_enabled_ = IsConcatenationEnabled();
+
+  if (concatenation_enabled_) {
+    TORCH_NEURONX_DEBUG("Concatenation is enabled, creating ConcatenationEngine",
+                        "queue_low_threshold=", queue_low_threshold_,
+                        "queue_target_depth=", queue_target_depth_);
+    concatenation_engine_ = std::make_unique<ConcatenationEngine>(
+        &execution_queue_depth_, queue_low_threshold_, queue_target_depth_);
+    concatenation_thread_ = std::thread(&OperationExecutionEngine::ConcatenationWorker, this);
+  }
+
   // Start worker threads
   compilation_thread_ = std::thread(&OperationExecutionEngine::CompilationWorker, this);
   execution_thread_ = std::thread(&OperationExecutionEngine::ExecutionWorker, this);
 
   TORCH_NEURONX_DEBUG("OperationExecutionEngine worker threads started",
+                      "concatenation_enabled=", concatenation_enabled_,
                       "compilation_thread_id=", compilation_thread_.get_id(),
                       "execution_thread_id=", execution_thread_.get_id());
 }
@@ -92,9 +111,15 @@ void OperationExecutionEngine::Shutdown() {
   TORCH_NEURONX_DEBUG("Shutting down OperationExecutionEngine");
 
   // Wake up all worker threads
+  if (concatenation_enabled_) {
+    concatenation_cv_.notify_all();
+  }
   compilation_cv_.notify_all();
   execution_cv_.notify_all();
 
+  if (concatenation_enabled_ && concatenation_thread_.joinable()) {
+    concatenation_thread_.join();
+  }
   if (compilation_thread_.joinable()) {
     compilation_thread_.join();
   }
@@ -227,6 +252,24 @@ void OperationExecutionEngine::ProcessExecutionTask(OperationContext* operation)
       torch_neuronx::markExecutedLogged(operation_name);
     }
     stream->CompleteOperation(operation);
+
+    // Decrement execution queue depth after execution
+    if (concatenation_enabled_) {
+      int64_t new_depth = execution_queue_depth_.fetch_sub(1) - 1;
+
+      // Check if we need to trigger refill
+      if (new_depth < queue_low_threshold_) {
+        TORCH_NEURONX_DEBUG("Execution queue depth below threshold, triggering refill",
+                            "current_depth=", new_depth, "threshold=", queue_low_threshold_);
+        // Enqueue nullptr with priority to front of concatenation queue
+        {
+          std::lock_guard<std::mutex> lock(concatenation_mutex_);
+          concatenation_queue_.push_front(nullptr);
+        }
+        concatenation_cv_.notify_one();
+      }
+    }
+
     TORCH_NEURONX_DEBUG("Execution task completed successfully", "operation_name=", operation_name);
   } catch (const torch_neuronx::ExecutionRuntimeException& e) {
     stream->HandleErrorWithCleanup(operation, e);
@@ -256,6 +299,26 @@ bool OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operat
   }
 }
 
+void OperationExecutionEngine::SubmitOperation(OperationContext* operation) {
+  if (shutdown_requested_.load()) {
+    TORCH_NEURONX_DEBUG("Rejecting operation submission during shutdown",
+                        "op=", operation->GetOpName());
+    return;
+  }
+
+  if (concatenation_enabled_) {
+    // Route through concatenation queue
+    {
+      std::lock_guard<std::mutex> lock(concatenation_mutex_);
+      concatenation_queue_.push_back(operation);
+    }
+    concatenation_cv_.notify_one();
+  } else {
+    // Route directly to compilation queue
+    SubmitCompilationTask(operation);
+  }
+}
+
 void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation) {
   if (shutdown_requested_.load()) {
     TORCH_NEURONX_DEBUG("Rejecting compilation task submission during shutdown",
@@ -268,6 +331,75 @@ void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation
     compilation_queue_.push_back(operation);
   }
   compilation_cv_.notify_one();
+}
+
+void OperationExecutionEngine::ConcatenationWorker() {
+  TORCH_NEURONX_DEBUG("Concatenation worker thread started");
+
+  while (true) {
+    // Wait for a task or shutdown signal
+    std::unique_lock<std::mutex> lock(concatenation_mutex_);
+    concatenation_cv_.wait(lock, [this] {
+      return !concatenation_queue_.empty() || shutdown_requested_.load(std::memory_order_acquire);
+    });
+
+    if (shutdown_requested_.load(std::memory_order_acquire) && concatenation_queue_.empty()) {
+      break;
+    }
+
+    if (!concatenation_queue_.empty()) {
+      OperationContext* operation = concatenation_queue_.front();
+      concatenation_queue_.pop_front();
+      lock.unlock();
+
+      TORCH_NEURONX_DEBUG("Processing concatenation task",
+                          "op=", operation ? operation->GetOpName() : "Flush");
+
+      // Process the operation through concatenation engine
+      auto operations_to_compile = concatenation_engine_->processConcatenationTask(operation);
+
+      // Submit all resulting operations to compilation queue
+      for (auto* op : operations_to_compile) {
+        try {
+          if (op->cascading_operations.empty()) {
+            SubmitCompilationTask(op);
+          } else {
+            // Own compilation for concatenated ops to catch failures
+            ProcessCompilationTask(op);
+            NotifyExecutionReady();
+          }
+          // Compilation for concatenated op succeeded.
+          execution_queue_depth_.fetch_add(1);
+
+          // TODO(apoorvgu,fhaolin): Implement changes to reflect concatenated ops in
+          // StreamImpl::active_operations_.
+          // 1. Find the sequence of operations in active_operations_
+          // 2. Populate cascading_operations with shared_ptrs
+          // 3. Replace the sequence with the concatenated operation
+
+        } catch (const torch_neuronx::CompilationRuntimeException& e) {
+          // Encountered compiler error fallback to op by op
+          auto cascading_operations = concatenation_engine_->processCompilationFailure(op);
+
+          // Increment for the number of ops being enqueued
+          execution_queue_depth_.fetch_add(cascading_operations.size());
+          for (auto& cascading_op : cascading_operations) {
+            // Submit for compilation like normal flow
+            SubmitCompilationTask(cascading_op);
+          }
+        }
+        // Other exceptions are not caught since they cannot
+        // be recovered from.
+      }
+    }
+  }
+  TORCH_NEURONX_DEBUG("Concatenation worker thread terminated");
+}
+
+bool OperationExecutionEngine::IsConcatenationEnabled() const {
+  const char* concat_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  return concat_env && (std::string(concat_env) == "1" || std::string(concat_env) == "true" ||
+                        std::string(concat_env) == "yes");
 }
 
 }  // namespace at::neuron

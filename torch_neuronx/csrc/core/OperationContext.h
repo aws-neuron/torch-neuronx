@@ -109,6 +109,10 @@ struct OperationContext {
   std::chrono::steady_clock::time_point execute_start;  // When execution started
   std::chrono::steady_clock::time_point execute_end;    // When execution completed
 
+  // Cascading operations if this was concatenated
+  // PS: this is populated by taking shared ownership from streamImpl::active_operations_
+  std::list<std::shared_ptr<OperationContext>> cascading_operations;
+
   explicit OperationContext(std::unique_ptr<at::neuron::NeuronKernelExecution> kernel_exec,
                             const std::vector<TensorContext>& input_contexts = {},
                             const std::vector<TensorContext>& output_contexts = {},

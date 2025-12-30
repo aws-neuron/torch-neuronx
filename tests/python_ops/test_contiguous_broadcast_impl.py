@@ -11,27 +11,30 @@ from tests.utils.neuron_test_utils import get_cache_size
 
 
 def test_contiguous_broadcast_uses_jax_kernel(monkeypatch):
-    """Broadcast case should use the JAX broadcast kernel, not the generic copy."""
-    # Patch the generic contiguous symbol used by the fallback impl
+    """Broadcast case should use the broadcast kernel (JAX or MLIR), not the generic copy."""
     from torch_neuronx.python_ops import contiguous as contiguous_mod
-    from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastImpl
+    from torch_neuronx.python_ops.contiguous_broadcast import (
+        ContiguousBroadcastJAXImpl,
+        ContiguousBroadcastMLIRImpl,
+    )
 
-    jax_called = {"count": 0}
+    broadcast_called = {"count": 0}
     generic_called = {"count": 0}
 
-    # Wrap _get_kernel to intercept JAX kernel calls
-    orig_get_kernel = ContiguousBroadcastImpl._get_kernel
+    for impl_class in [ContiguousBroadcastJAXImpl, ContiguousBroadcastMLIRImpl]:
+        orig_get_kernel = impl_class._get_kernel
 
-    def wrapped_get_kernel(self):
-        k = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel, impl_class=impl_class):
+            k = orig_get_kernel(self)
 
-        def wrapper(*args, **kwargs):
-            jax_called["count"] += 1
-            return k(*args, **kwargs)
+            def wrapper(*args, **kwargs):
+                broadcast_called["count"] += 1
+                print(f"{impl_class.__name__}._get_kernel called")
+                return k(*args, **kwargs)
 
-        return wrapper
+            return wrapper
 
-    monkeypatch.setattr(ContiguousBroadcastImpl, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
     # Wrap the generic fallback to ensure it's not hit in the broadcast case
     orig_generic = contiguous_mod.contiguous_generic_kernel
@@ -56,7 +59,7 @@ def test_contiguous_broadcast_uses_jax_kernel(monkeypatch):
     assert torch.all(y == 42.0)
 
     # Validate paths taken
-    assert jax_called["count"] >= 1, "Expected JAX broadcast kernel to be invoked"
+    assert broadcast_called["count"] >= 1, "Expected broadcast jax/mlir kernel to be invoked"
     assert generic_called["count"] == 0, "Generic fallback should not be used for broadcast"
 
 
@@ -141,24 +144,27 @@ def test_contiguous_broadcast_various_dimensions(source_shape, target_shape):
 def test_repeat_kv_uses_jax_kernel(monkeypatch):
     """Test repeat_kv uses broadcast jax kernel"""
     from torch_neuronx.python_ops import contiguous as contiguous_mod
-    from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastImpl
+    from torch_neuronx.python_ops.contiguous_broadcast import (
+        ContiguousBroadcastJAXImpl,
+        ContiguousBroadcastMLIRImpl,
+    )
 
     jax_called = {"count": 0}
     generic_called = {"count": 0}
 
-    # Wrap _get_kernel to intercept JAX kernel calls
-    orig_get_kernel = ContiguousBroadcastImpl._get_kernel
+    for impl_class in [ContiguousBroadcastJAXImpl, ContiguousBroadcastMLIRImpl]:
+        orig_get_kernel = impl_class._get_kernel
 
-    def wrapped_get_kernel(self):
-        k = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            k = orig_get_kernel(self)
 
-        def wrapper(*args, **kwargs):
-            jax_called["count"] += 1
-            return k(*args, **kwargs)
+            def wrapper(*args, **kwargs):
+                jax_called["count"] += 1
+                return k(*args, **kwargs)
 
-        return wrapper
+            return wrapper
 
-    monkeypatch.setattr(ContiguousBroadcastImpl, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
     # Wrap the generic fallback to ensure it's not hit in the broadcast case
     orig_generic = contiguous_mod.contiguous_generic_kernel
@@ -194,34 +200,37 @@ def test_repeat_kv_uses_jax_kernel(monkeypatch):
 
     assert torch.allclose(y.cpu(), y_cpu), "repeat_kv output on neuron does not match cpu"
     # Validate paths taken
-    assert jax_called["count"] >= 1, "Expected JAX broadcast kernel to be invoked"
+    assert jax_called["count"] >= 1, "Expected broadcast kernel to be invoked"
     assert generic_called["count"] == 0, "Generic fallback should not be used for broadcast"
 
 
 def test_incorrect_fallback_to_generic_kernel(monkeypatch):
     """Test incorrect fallback to generic kernel for different target shapes"""
 
-    from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastImpl
+    from torch_neuronx.python_ops.contiguous_broadcast import (
+        ContiguousBroadcastJAXImpl,
+        ContiguousBroadcastMLIRImpl,
+    )
 
     compile_called = {"count": 0}
-    orig_get_kernel = ContiguousBroadcastImpl._get_kernel
 
-    def wrapped_get_kernel(self):
-        kernel = orig_get_kernel(self)
+    for impl_class in [ContiguousBroadcastJAXImpl, ContiguousBroadcastMLIRImpl]:
+        orig_get_kernel = impl_class._get_kernel
 
-        def wrapper(*args, **kwargs):
-            orig_cache_size = get_cache_size(kernel)
-            result = kernel(*args, **kwargs)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            kernel = orig_get_kernel(self)
 
-            updated_cache_size = get_cache_size(kernel)
-            if updated_cache_size > orig_cache_size:
-                compile_called["count"] += 1
+            def wrapper(*args, **kwargs):
+                orig_cache_size = get_cache_size(kernel)
+                result = kernel(*args, **kwargs)
+                updated_cache_size = get_cache_size(kernel)
+                if updated_cache_size > orig_cache_size:
+                    compile_called["count"] += 1
+                return result
 
-            return result
+            return wrapper
 
-        return wrapper
-
-    monkeypatch.setattr(ContiguousBroadcastImpl, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
     def mock_contiguous_generic_kernel(
         src, dst, shape, src_strides, dst_strides, src_storage_offset=0

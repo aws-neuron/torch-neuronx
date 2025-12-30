@@ -220,6 +220,15 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "ConcatenationEngineTest",
+    srcs = ["core/concatenation/ConcatenationEngineTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:runtime",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "ReshapeOpBuilderTest",
     srcs = ["core/opbuilder/module_builder/ReshapeOpBuilderTest.cpp"],
     deps = ["//:opbuilder"],
@@ -247,4 +256,10 @@ torch_neuronx_cc_test(
     name = "CPUFallbackContextTest",
     srcs = ["core/utils/CPUFallbackContextTest.cpp"],
     deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "BroadcastOpBuilderTest",
+    srcs = ["core/opbuilder/module_builder/BroadcastOpBuilderTest.cpp"],
+    deps = ["//:opbuilder"],
 )

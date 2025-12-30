@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Optional
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
@@ -87,7 +88,7 @@ def nki_add_inplace_and_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return e
 
 
-@nki_op("nki::scaled_add_inplace", mutates_args={"b"})
+@nki_op(f"{my_namespace}::scaled_add_inplace", mutates_args={"b"})
 def nki_scaled_add_inplace_op(a: torch.Tensor, scale: float, b: torch.Tensor) -> torch.Tensor:
     grid = [a.shape[0] // 128, b.shape[1] // 512]
     return nki_scaled_add_inplace[grid](a, scale, b)
@@ -139,6 +140,52 @@ def ref_scaled_add_func(a, b, scale):
     return c * scale + d
 
 
+def ref_aliased_with_constant_func(
+    scale: float, out: torch.Tensor, mode: str | None = None, input: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Reference function for nki_aliased_kernel_with_constant"""
+
+    scaled = out * scale if mode == "multiply" else out + scale
+
+    if input is not None:
+        return input + scaled
+    else:
+        return scaled
+
+
+@nki.jit
+def nki_aliased_kernel_with_constant(
+    scale: float, out: nt.mutable_tensor, mode: str | None = None, input: torch.Tensor | None = None
+):
+    offset_i_x = nl.program_id(0) * 128
+    offset_i_y = nl.program_id(1) * 512
+
+    ix = offset_i_x + nl.arange(128)[:, None]
+    iy = offset_i_y + nl.arange(512)[None, :]
+
+    out_tile = nl.load(out[ix, iy])
+    scaled_tile = out_tile * scale
+
+    scaled_tile = out_tile * scale if mode == "multiply" else out_tile + scale
+
+    if input is not None:
+        input_tile = nl.load(input[ix, iy])
+        result_tile = input_tile + scaled_tile
+    else:
+        result_tile = scaled_tile
+
+    nl.store(out[ix, iy], value=result_tile)
+    return out
+
+
+@nki_op(f"{my_namespace}::aliased_with_constant", mutates_args={"out"})
+def nki_aliased_with_constant_op(
+    scale: float, out: torch.Tensor, mode: str | None, input: torch.Tensor | None = None
+) -> torch.Tensor:
+    grid = [out.shape[0] // 128, out.shape[1] // 512]
+    nki_aliased_kernel_with_constant[grid](scale, out, mode, input)
+
+
 class TestNKIDyamoIntegration:
     def test_nki_func_compiled(self):
         """Test nki_func with neuron backend"""
@@ -175,3 +222,31 @@ class TestNKIDyamoIntegration:
         assert result.shape == ref.shape
         assert result.dtype == ref.dtype
         assert torch.allclose(result, ref, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "mode,has_input",
+        [
+            ("multiply", True),
+            ("multiply", False),
+            (None, True),
+            (None, False),
+        ],
+    )
+    def test_nki_aliased_with_constant(self, mode, has_input):
+        """Test nki_aliased_kernel_with_constant with different optional parameter combinations"""
+        out = torch.ones((256, 1024), dtype=torch.float32)
+        input_tensor = torch.rand((256, 1024), dtype=torch.float32) if has_input else None
+        out_neuron = out.clone().to("neuron")
+        input_neuron = input_tensor.clone().to("neuron") if has_input else None
+        scale = 2.5
+
+        # Reference
+        ref = ref_aliased_with_constant_func(scale, out, mode, input_tensor)
+
+        # NKI op
+        compiled_func = torch.compile(
+            lambda *args: nki_aliased_with_constant_op(*args), backend="neuron", fullgraph=True
+        )
+        compiled_func(scale, out_neuron, mode, input_neuron)
+
+        assert torch.allclose(out_neuron.cpu(), ref, rtol=1e-5, atol=1e-5)

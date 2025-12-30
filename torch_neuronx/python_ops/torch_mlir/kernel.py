@@ -93,7 +93,7 @@ class TorchMlirKernel(BaseNeuronKernel):
     ) -> tuple:
         """Get cached output specs or compute them."""
         cache_key = self._generate_unified_cache_key(
-            context.original_inputs or inputs,
+            context.original_inputs if context else inputs,
             kwargs,
             context,
         )
@@ -101,13 +101,35 @@ class TorchMlirKernel(BaseNeuronKernel):
         if cache_key in self._output_spec_cache:
             return self._output_spec_cache[cache_key]
 
-        # Infer output specs using output handler
+        # For non-aten ops, run torch_fn directly with meta tensors
+        if not self.op_name.startswith("aten::"):
+            meta_inputs = []
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    meta_inputs.append(torch.empty(inp.shape, dtype=inp.dtype, device="meta"))
+                else:
+                    meta_inputs.append(inp)
+
+            meta_output = self.torch_fn(*meta_inputs, **kwargs)
+            outputs = (meta_output,) if not isinstance(meta_output, tuple) else meta_output
+
+            output_specs = []
+            expected_dtypes = []
+            for out in outputs:
+                output_specs.append([tuple(out.shape), out.dtype])
+                expected_dtypes.append(out.dtype)
+
+            result = (tuple(output_specs), expected_dtypes, [])
+            self._output_spec_cache[cache_key] = result
+            return result
+
+        # Infer output specs using output handler for aten ops
         output_specs, _, expected_dtypes, none_mask = self.output_handler.infer_output_specs(
             self.torch_fn,
             inputs,
             self.op_name,
             static_argnums=None,
-            meta_inputs=context.original_inputs,
+            meta_inputs=context.original_inputs if context else None,
             expected_dtypes_override=None,
             kwargs=kwargs,
             convert_to_jax_spec=False,
@@ -256,8 +278,12 @@ class TorchMlirKernel(BaseNeuronKernel):
 
                 compile_inputs = []
                 for idx, inp in enumerate(processed_inputs):
-                    if idx not in self.static_argnums and type(inp) in [int, float]:
-                        if isinstance(inp, int):
+                    if idx not in self.static_argnums and isinstance(inp, int | float | bool):
+                        if isinstance(inp, bool):
+                            compile_inputs.append(
+                                torch.tensor(inp, dtype=torch.bool, device=device)
+                            )
+                        elif isinstance(inp, int):
                             compile_inputs.append(
                                 torch.tensor(inp, dtype=torch.int32, device=device)
                             )
@@ -321,4 +347,4 @@ class TorchMlirKernel(BaseNeuronKernel):
                 tuple(corrected_outputs), none_mask, False
             )
 
-        return tuple(corrected_outputs)
+        return corrected_outputs[0] if len(corrected_outputs) == 1 else tuple(corrected_outputs)
