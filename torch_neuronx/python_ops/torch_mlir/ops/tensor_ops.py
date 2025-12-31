@@ -38,3 +38,8 @@ def torch_tril(x, diagonal=0):
 @register_aten(["aten::flip", "aten::flip.out"])
 def torch_flip(x, dims):
     return torch.flip(x, dims)
+
+
+@register_aten(["aten::pad"], static_argnums=(1, 2, 3))
+def torch_pad(input, pad, mode="constant", value=0):
+    return torch.nn.functional.pad(input, pad, mode, value)

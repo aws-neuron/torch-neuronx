@@ -53,6 +53,18 @@ try:
     from . import _C
 
     _C._register_device()
+
+    # Wrap neuron C extensions with torch._dynamo.disable since they can't be traced.
+    import inspect
+
+    for name in dir(_C):
+        obj = getattr(_C, name)
+        if callable(obj) and not inspect.isclass(obj):
+            try:
+                wrapped = torch._dynamo.disable(obj)
+                setattr(_C, name, wrapped)
+            except (TypeError, AttributeError):
+                pass
 except ImportError as e:
     import warnings
 

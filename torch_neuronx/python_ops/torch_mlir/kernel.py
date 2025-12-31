@@ -8,6 +8,7 @@ import torch
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.backend import neuron_backend
+from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
 from torch_neuronx.utils import cast_dtype_if_needed
 
@@ -228,13 +229,13 @@ class TorchMlirKernel(BaseNeuronKernel):
                     execution_tensors.append(provided_tensor)
                 else:
                     # Need temporary
-                    execution_tensors.append(torch.empty(spec[0], dtype=spec[1], device=device))
+                    execution_tensors.append(io_tensor.empty(spec[0], dtype=spec[1], device=device))
 
             execution_tensors = tuple(execution_tensors)
         else:
             # Create new output tensors
             for spec in output_specs:
-                execution_tensors.append(torch.empty(spec[0], dtype=spec[1], device=device))
+                execution_tensors.append(io_tensor.empty(spec[0], dtype=spec[1], device=device))
             execution_tensors = tuple(execution_tensors)
 
         return execution_tensors, expected_dtypes, provided_output
@@ -281,15 +282,15 @@ class TorchMlirKernel(BaseNeuronKernel):
                     if idx not in self.static_argnums and isinstance(inp, int | float | bool):
                         if isinstance(inp, bool):
                             compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.bool, device=device)
+                                io_tensor.tensor(inp, dtype=torch.bool, device=device)
                             )
                         elif isinstance(inp, int):
                             compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.int32, device=device)
+                                io_tensor.tensor(inp, dtype=torch.int32, device=device)
                             )
                         elif isinstance(inp, float):
                             compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.float32, device=device)
+                                io_tensor.tensor(inp, dtype=torch.float32, device=device)
                             )
                     else:
                         compile_inputs.append(inp)

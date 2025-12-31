@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import torch
 
+from torch_neuronx.python_ops import io_tensor
+
 
 def is_64bit(dtype: torch.dtype | None) -> bool:
     """Return True if dtype is a 64-bit type needing CPU bounce on Neuron.
@@ -98,7 +100,7 @@ def copy_neuron_to_cpu(
     """
     import torch_neuronx._C as _C  # local import
 
-    cpu_tmp = torch.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
+    cpu_tmp = io_tensor.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
     _C._nrt_copy_neuron_to_cpu_tensor(neuron_src, cpu_tmp, non_blocking=non_blocking)
     if target_dtype is not None and target_dtype != cpu_tmp.dtype:
         cpu_tmp = cpu_tmp.to(target_dtype)

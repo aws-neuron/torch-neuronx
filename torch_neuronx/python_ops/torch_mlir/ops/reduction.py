@@ -43,24 +43,22 @@ def torch_amin(self, dim=None, keepdim=False):
     return torch.amin(self, dim, keepdim)
 
 
-@register_aten(
-    ["aten::all", "aten::all.out", "aten::all.all_out"], static_argnames=("dim", "keepdim")
-)
-def torch_all(x, dim=None, keepdim=False):
+@register_aten(["aten::all", "aten::all.out", "aten::all.all_out"], static_argnums=(1, 2))
+def torch_all(x, dim=None, keepdim=False, out=None):
     if dim is None:
         return torch.all(x)
     return torch.all(x, dim, keepdim)
 
 
-@register_aten(
-    ["aten::any", "aten::any.out", "aten::any.all_out"], static_argnames=("dim", "keepdim")
-)
-def torch_any(x, dim=None, keepdim=False):
+@register_aten(["aten::any", "aten::any.out", "aten::any.all_out"], static_argnums=(1, 2))
+def torch_any(x, dim=None, keepdim=False, out=None):
     if dim is None:
-        return torch.any(x)
-    return torch.any(x, dim, keepdim)
+        return torch.any(x).to(torch.bool)
+    return torch.any(x, dim, keepdim).to(torch.bool)
 
 
-@register_aten(["aten::cumsum", "aten::cumsum.out"], static_argnames=("dtype",))
+@register_aten(
+    ["aten::cumsum", "aten::cumsum.out"], static_argnums=(1,), static_argnames=("dtype",)
+)
 def torch_cumsum(x, dim, dtype=None):
     return torch.cumsum(x, dim, dtype=dtype)

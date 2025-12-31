@@ -50,10 +50,11 @@ def torch_addmv(self, mat, vec, beta=1, alpha=1):
 
 @register_aten(
     ["aten::linalg_vector_norm", "aten::linalg_vector_norm.out"],
-    static_argnames=("ord", "dim", "keepdim"),
+    static_argnums=(1, 2, 3),
+    static_argnames=("dtype",),
 )
-def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False):
-    return torch.linalg.vector_norm(x, ord, dim, keepdim)
+def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
+    return torch.linalg.vector_norm(x, ord, dim, keepdim, dtype=dtype)
 
 
 @register_aten(

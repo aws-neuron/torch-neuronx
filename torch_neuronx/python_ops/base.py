@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.utils import move_pytree_to_cpu
 
 from .handlers import BaseEmptyTensorHandler
@@ -237,7 +238,7 @@ class UnaryOpImplementation(OperationImplementation):
             return ExecutionResult(success=False, error_msg="No input tensor provided")
 
         out = kwargs.get("out")
-        output = torch.empty_like(input) if out is None else out
+        output = io_tensor.empty_like(input) if out is None else out
         return ExecutionResult(success=True, output=output)
 
     def _validate_shapes(self, input: torch.Tensor, out=None) -> bool:
@@ -266,7 +267,7 @@ class BinaryOpImplementation(OperationImplementation):
         device = input1.device if isinstance(input1, torch.Tensor) else input2.device
 
         # Create output tensor
-        output = torch.empty(output_shape, dtype=dtype, device=device) if out is None else out
+        output = io_tensor.empty(output_shape, dtype=dtype, device=device) if out is None else out
         return ExecutionResult(success=True, output=output)
 
     def _get_output_dtype(self, input1, input2):
@@ -363,7 +364,9 @@ class MatrixOpImplementation(OperationImplementation):
             device = args[0].device if isinstance(args[0], torch.Tensor) else args[1].device
 
             out = kwargs.get("out")
-            output = torch.empty(output_shape, dtype=dtype, device=device) if out is None else out
+            output = (
+                io_tensor.empty(output_shape, dtype=dtype, device=device) if out is None else out
+            )
 
             return ExecutionResult(success=True, output=output)
         except Exception as e:
@@ -400,7 +403,9 @@ class ComparisonOpImplementation(OperationImplementation):
         device = input1.device if isinstance(input1, torch.Tensor) else input2.device
 
         # Create bool output tensor
-        output = torch.empty(output_shape, dtype=torch.bool, device=device) if out is None else out
+        output = (
+            io_tensor.empty(output_shape, dtype=torch.bool, device=device) if out is None else out
+        )
         return ExecutionResult(success=True, output=output)
 
 

@@ -23,8 +23,9 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
-from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

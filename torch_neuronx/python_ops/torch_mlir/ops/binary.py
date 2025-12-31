@@ -34,9 +34,10 @@ def torch_div(x, y, rounding_mode=None):
     if rounding_mode is None:
         return x / y
     elif rounding_mode == "floor":
-        return x // y
+        result = x // y
     else:
-        return torch.trunc(x / y)
+        result = torch.trunc(x / y)
+    return torch.where(y == 0, torch.sign(x) * float("inf"), result)
 
 
 @register_aten(

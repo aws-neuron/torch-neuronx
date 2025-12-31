@@ -40,7 +40,18 @@ def torch_eye(n, m=None, dtype=None, **kwargs):
 
 @register_aten(["aten::fill_", "aten::fill_.Scalar"])
 def torch_fill(x, value, out=None):
-    return torch.full_like(x, value)
+    """Scalar are converted into tensor to avoid recompilation
+    so input `value` will be a tensor
+    """
+    return torch.broadcast_to(value, x.shape).to(x.dtype)
+
+
+@register_aten(["aten::full", "aten::full.out"], static_argnums=(0,))
+def torch_full(size, value, out=None, dtype=None):
+    """Scalar are converted into tensor to avoid recompilation
+    so input `value` will be a tensor
+    """
+    return torch.broadcast_to(value, size).to(dtype)
 
 
 @register_aten(["aten::zero_"])
