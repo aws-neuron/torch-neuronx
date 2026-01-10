@@ -101,7 +101,7 @@ class TestTopK:
             # Should run on Neuron
             assert_op_runs_on_neuron("aten::topk")
 
-    @assert_raises(RuntimeError, match="selected index k out of range")
+    @assert_raises(RuntimeError, match="selected index k out of range|k not in range for dimension")
     def test_topk_k_too_large_fallback(self):
         """Test that topk with k > dimension size raises RuntimeError"""
         with track_neuron_ops():

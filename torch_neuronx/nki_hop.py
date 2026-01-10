@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
+from torch._dynamo import allow_in_graph
 from torch._dynamo.variables.constant import ConstantVariable
 from torch._library.custom_ops import custom_op
 from torch._library.infer_schema import infer_schema
@@ -163,6 +164,33 @@ class NKIKernelWrapper(HigherOrderOperator):
 
 
 nki_kernel_wrapper = NKIKernelWrapper()
+nki_kernel_wrapper = allow_in_graph(nki_kernel_wrapper)
+
+
+@nki_kernel_wrapper.py_impl(torch._C.DispatchKey.Meta)
+def nki_kernel_wrapper_meta(
+    *,
+    kernel_idx: int,
+    grid: NKIGridType,
+    backend_config: str,
+    operand_output_aliases: dict[int, int],
+    args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
+):
+    kernel = kernel_registry.get_kernel(kernel_idx)
+    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
+    dconfig = kernel[grid].dump_config(**merged_args)
+    return_types = dconfig.return_types
+
+    if len(return_types) == 1:
+        shape, dtype = return_types[0][1], return_types[0][0]
+        return torch.empty(shape, dtype=map_external_dtype_to_torch(dtype), device="meta")
+    else:
+        return tuple(
+            torch.empty(rtype[1], dtype=map_external_dtype_to_torch(rtype[0]), device="meta")
+            for rtype in return_types
+        )
 
 
 @nki_kernel_wrapper.py_impl(DispatchKey.CompositeExplicitAutograd)
@@ -176,9 +204,27 @@ def nki_kernel_wrapper_dense(
     arg_names: Sequence[str],
     constant_args_key: int,
 ):
-    kernel = kernel_registry.get_kernel(kernel_idx)
-    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
-    return kernel[grid](**merged_args)
+    if not backend_config:
+        kernel = kernel_registry.get_kernel(kernel_idx)
+        merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
+        dconfig = kernel[grid].dump_config(**merged_args)
+        backend_config = str(dconfig.dumped_config)
+        operand_output_aliases = dconfig.operand_output_aliases
+
+    # Use torch-mlir backend for neuron tensors
+    from torch_neuronx.python_ops.torch_mlir.nki_op_impl import get_nki_torch_mlir_op
+
+    nki_op_fn = get_nki_torch_mlir_op(
+        kernel_idx=kernel_idx,
+        grid=grid,
+        backend_config=backend_config,
+        operand_output_aliases=operand_output_aliases,
+        args=args,
+        arg_names=arg_names,
+        constant_args_key=constant_args_key,
+    )
+
+    return nki_op_fn(*args)
 
 
 @nki_kernel_wrapper.py_impl(FakeTensorMode)
@@ -496,7 +542,9 @@ class TraceableNKIKernelWrapper:
         assert self.kernel is not None
 
     def __getitem__(self, grid: "NKIGridType") -> "TraceableNKIKernelWrapper":
-        return tracing_nki_hopifier_singleton.call_getitem(self, grid)
+        from neuronxcc.nki.compiler.backends.neuron.dimensions import serialize_dims
+
+        return tracing_nki_hopifier_singleton.call_getitem(self, serialize_dims(grid))
 
     def run(self, *args: Sequence[Any], **kwargs: dict[str, Any]) -> Any:
         return tracing_nki_hopifier_singleton.call_run(self, args, kwargs, None)
@@ -505,7 +553,7 @@ class TraceableNKIKernelWrapper:
         return tracing_nki_hopifier_singleton.call_nki_kernel(self, args, kwargs, None)
 
 
-def wrap_nki(nki_kernel: TorchNeuronNKIKernel) -> Any:
+def wrap_nki(nki_kernel) -> Any:
     """Allows capture of a nki kernel into a graph via torch.compile
 
     These technologies perform Dispatcher-based tracing (via
@@ -514,6 +562,29 @@ def wrap_nki(nki_kernel: TorchNeuronNKIKernel) -> Any:
     can actually be traced into a graph.
 
     """
+
+    # Detect which NKI library was used based on the kernel's module
+    kernel_module = nki_kernel.__class__.__module__
+
+    if "neuronxcc" in kernel_module:
+        # Use V1 for neuronxcc-based kernels
+        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV1
+
+        target_class = TorchNeuronNKIKernelV1
+    else:
+        # Use V2 for nki library-based kernels
+        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV2
+
+        target_class = TorchNeuronNKIKernelV2
+
+    if not isinstance(nki_kernel, target_class):
+        new_kernel = target_class.__new__(target_class)
+        new_kernel.__dict__.update(nki_kernel.__dict__)
+        new_kernel.func_name = nki_kernel.func.__name__
+        new_kernel.enable_cache = True
+        new_kernel.func.__neuron_kernel_interface_kernel_cache__ = {}
+        nki_kernel = new_kernel
+
     # get list of argument names from nki_func
     sig = nki_kernel.sign
     arg_names = list(sig.parameters.keys())
@@ -522,12 +593,6 @@ def wrap_nki(nki_kernel: TorchNeuronNKIKernel) -> Any:
         for name, param in sig.parameters.items()
         if param.default is not inspect.Parameter.empty
     }
-    if not is_wrap_nki_enabled():
-
-        def wrapper(*args, **kwargs):
-            return nki_kernel(*args, **kwargs)
-
-        return wrapper
     return TraceableNKIKernelWrapper(nki_kernel, None, [], arg_names, kernel_default_args)
 
 
@@ -598,16 +663,3 @@ def nki_op(
         return dec
     else:
         return dec(fn)
-
-
-class nki:  # noqa N801
-    @staticmethod
-    def jit(fn):
-        """NKI equivalent of @triton.jit decorator."""
-        traced_kernel = TorchNeuronNKIKernel.trace(fn)
-        wrapper = wrap_nki(traced_kernel)
-
-        # Mark as NKI kernel for introspection
-        wrapper._is_nki_kernel = True
-        wrapper._original_fn = fn
-        return wrapper

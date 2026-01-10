@@ -1,0 +1,212 @@
+"""Torch-MLIR implementation for NKI kernels."""
+
+import torch
+
+from torch_neuronx.nki_hop import nki_kernel_wrapper
+from torch_neuronx.python_ops import io_tensor
+from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
+
+
+def nki_torch_fn(*args, **nki_params):
+    """Global torch function for all NKI kernels."""
+    return nki_kernel_wrapper(**nki_params, args=args)
+
+
+class NkiKernel(TorchMlirKernel):
+    """Specialized kernel for NKI that handles aliasing in execution tensor preparation."""
+
+    def _pad_outputs_for_aliasing(
+        self,
+        provided_output,
+        downcasted_outputs,
+        original_outputs=None,
+        operand_output_aliases=None,
+    ):
+        """Pad downcasted and original outputs to match provided_output length for aliasing."""
+        if not isinstance(provided_output, tuple) or len(provided_output) <= 1:
+            return downcasted_outputs, original_outputs
+
+        def _pad_single_output(outputs, target_length):
+            """Helper to pad a single output tuple to target length."""
+            if outputs is None:
+                return None
+
+            # Convert to tuple if needed
+            if not isinstance(outputs, tuple):
+                outputs = (outputs,)
+
+            if len(provided_output) > len(outputs):
+                padded = list(outputs)
+                # Pad by repeating outputs at aliased indices
+                if operand_output_aliases:
+                    for i in range(len(outputs), target_length):
+                        # Find which output this aliased position should repeat
+                        aliased_output_idx = None
+                        for input_id, output_id in operand_output_aliases.items():
+                            if output_id == i:
+                                aliased_output_idx = input_id % len(outputs)
+                                break
+
+                        if aliased_output_idx is not None:
+                            padded.append(outputs[aliased_output_idx])
+                        else:
+                            padded.append(outputs[0])  # Fallback
+                else:
+                    # Fallback: repeat first output
+                    for _ in range(target_length - len(outputs)):
+                        padded.append(outputs[0])
+                outputs = tuple(padded)
+
+            return outputs
+
+        # Pad both downcasted and original outputs using the same logic
+        target_length = len(provided_output)
+        padded_downcasted = _pad_single_output(downcasted_outputs, target_length)
+        padded_original = _pad_single_output(original_outputs, target_length)
+
+        return padded_downcasted, padded_original
+
+    def _prepare_execution_tensors(self, provided_output, downcasted_outputs):
+        """Handle aliasing by padding outputs first, then use parent logic."""
+        operand_output_aliases = getattr(self, "operand_output_aliases", {})
+        downcasted_outputs, _ = self._pad_outputs_for_aliasing(
+            provided_output, downcasted_outputs, operand_output_aliases=operand_output_aliases
+        )
+        return super()._prepare_execution_tensors(provided_output, downcasted_outputs)
+
+    def _upcast_execution_results(self, execution_tensors, downcasted_outputs, original_outputs):
+        """Handle aliasing by padding outputs first, then use parent logic."""
+        operand_output_aliases = getattr(self, "operand_output_aliases", {})
+        downcasted_outputs, original_outputs = self._pad_outputs_for_aliasing(
+            execution_tensors if isinstance(execution_tensors, tuple) else (execution_tensors,),
+            downcasted_outputs,
+            original_outputs,
+            operand_output_aliases=operand_output_aliases,
+        )
+        return super()._upcast_execution_results(
+            execution_tensors, downcasted_outputs, original_outputs
+        )
+
+    def _copy_to_provided_output(self, upcast_tensors, provided_output):
+        """Handle aliasing - only copy to actual outputs, skip aliased inputs."""
+        if not isinstance(provided_output, tuple):
+            return super()._copy_to_provided_output(upcast_tensors, provided_output)
+
+        if not isinstance(upcast_tensors, tuple):
+            upcast_tensors = (upcast_tensors,)
+
+        # Only copy to actual outputs (first len(upcast_tensors) of provided_output)
+        actual_provided = provided_output[: len(upcast_tensors)]
+        super()._copy_to_provided_output(upcast_tensors, tuple(actual_provided))
+
+
+class NKITorchMlirOpImpl(TorchMlirOpImpl):
+    """Single torch-mlir op implementation for all NKI kernels."""
+
+    def __init__(self):
+        # Use the global NKI torch function
+        super().__init__(
+            aten_op_name="nki_kernel_global",
+            torch_fn=nki_torch_fn,
+            output_params=None,
+            static_argnums=(),
+            static_argnames=(),
+        )
+        # Replace with specialized kernel that handles aliasing
+        self.kernel = NkiKernel(
+            op_name=self.aten_op_name,
+            torch_fn=self.torch_fn,
+            output_params=self.output_params,
+            static_argnums=self.static_argnums,
+            static_argnames=self.static_argnames,
+        )
+
+    def __call__(self, *args, **kwargs):
+        """Handle aliasing by passing proper output tensors via out= parameter."""
+        operand_output_aliases = kwargs.get("operand_output_aliases", {})
+
+        # Attach aliasing info to kernel for use in internal methods
+        self.kernel.operand_output_aliases = operand_output_aliases
+
+        if operand_output_aliases:
+            # Use meta dispatch to get expected output shapes/dtypes without execution
+            tensor_inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
+
+            # Create fake tensors for meta dispatch
+            fake_args = []
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    fake_args.append(io_tensor.empty_like(arg, device="meta"))
+                else:
+                    fake_args.append(arg)
+
+            # Get meta output from torch function
+            meta_output = self.torch_fn(*fake_args, **kwargs)
+            if not isinstance(meta_output, tuple):
+                meta_output = (meta_output,)
+
+            # Create output tensors: actual outputs + aliased inputs
+            output_tensors = []
+
+            # Add actual output tensors
+            for out in meta_output:
+                output_tensors.append(io_tensor.empty_like(out, device=tensor_inputs[0].device))
+
+            # Add aliased input tensors (these will be mutated in-place)
+            for input_id in operand_output_aliases:
+                if input_id < len(tensor_inputs):
+                    output_tensors.append(tensor_inputs[input_id])
+
+            # Execute with proper output tensors
+            kwargs["out"] = tuple(output_tensors)
+            result = self.execute(*args, **kwargs)
+
+            if result.success:
+                # Return only the actual outputs (first len(meta_output) tensors)
+                actual_outputs = output_tensors[: len(meta_output)]
+                return actual_outputs[0] if len(actual_outputs) == 1 else tuple(actual_outputs)
+            else:
+                raise RuntimeError(f"NKI kernel execution failed: {result.error_msg}")
+
+        # No aliasing - normal execution
+        result = self.execute(*args, **kwargs)
+        if result.success:
+            return result.output
+        else:
+            raise RuntimeError(f"NKI kernel execution failed: {result.error_msg}")
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        """Check if this implementation can handle the given arguments."""
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.device.type != "neuron":
+                return False
+        return True
+
+
+# Global NKI op instance (like aten ops)
+_global_nki_op = NKITorchMlirOpImpl()
+
+
+def get_nki_torch_mlir_op(
+    kernel_idx: int,
+    grid,
+    backend_config: str,
+    operand_output_aliases: dict,
+    args: list,
+    arg_names: list,
+    constant_args_key: int,
+):
+    """Get the global NKI op and call it with the specific kernel parameters."""
+    # Create the NKI parameters
+    nki_params = {
+        "kernel_idx": kernel_idx,
+        "grid": grid,
+        "backend_config": backend_config,
+        "operand_output_aliases": operand_output_aliases,
+        "arg_names": arg_names,
+        "constant_args_key": constant_args_key,
+    }
+
+    # Use the global op but with specific kernel parameters
+    return lambda *args: _global_nki_op(*args, **nki_params)

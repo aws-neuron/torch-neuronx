@@ -65,3 +65,7 @@ torch_neuronx/protos/xla/*.py
 
 # Ignore the pytorch test directory
 tests/pytorch_tests/test/
+
+# lock files
+MODULE.bazel.lock
+uv.lock

@@ -12,6 +12,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.python_ops.native_multi_head_attn_mid import NativeMultiHeadAttnMidOp
 from torch_neuronx.python_ops.native_multi_head_attn_prefix import NativeMultiHeadAttnPrefixOp
 
@@ -41,7 +42,7 @@ class TestNativeMultiHeadAttnMid:
         # Verify output shape
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
         assert attn_output.device.type == "neuron"
-        assert not torch.isnan(attn_output).any()
+        assert not torch.isnan(attn_output.cpu()).any()
 
     def test_causal_attention(self):
         """Test attention with causal masking."""
@@ -58,7 +59,7 @@ class TestNativeMultiHeadAttnMid:
         attn_output = _mid_op(q, k, v, use_causal_mask=True, dropout_p=0.0, training=False)
 
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
-        assert not torch.isnan(attn_output).any()
+        assert not torch.isnan(attn_output.cpu()).any()
 
     def test_out_variant(self):
         """Test the out variant of the operation."""
@@ -81,7 +82,7 @@ class TestNativeMultiHeadAttnMid:
         # Verify in-place modification
         assert result is out
         assert out.data_ptr() == out_ptr
-        assert not torch.isnan(out).any()
+        assert not torch.isnan(out.cpu()).any()
 
     @pytest.mark.parametrize("batch_size", [1, 2, 4])
     def test_different_batch_sizes(self, batch_size):
@@ -152,7 +153,7 @@ class TestNativeMultiHeadAttnMid:
 
         # Verify final output
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
-        assert not torch.isnan(attn_output).any()
+        assert not torch.isnan(attn_output.cpu()).any()
 
     @assert_raises(RuntimeError)
     def test_invalid_key_shape(self):
@@ -219,7 +220,7 @@ class TestNativeMultiHeadAttnMid:
             assert_op_runs_on_neuron("native_multi_head_attn_mid")
 
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
-        assert not torch.isnan(attn_output).any()
+        assert not torch.isnan(attn_output.cpu()).any()
 
     @pytest.mark.parametrize("seq_len", [512, 1024, 1536])
     def test_smaller_sequences_with_dynamic_tile_size(self, seq_len):
@@ -238,7 +239,7 @@ class TestNativeMultiHeadAttnMid:
             assert_op_runs_on_neuron("native_multi_head_attn_mid")
 
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
-        assert not torch.isnan(attn_output).any()
+        assert not torch.isnan(attn_output.cpu()).any()
 
     def test_sequence_length_constraint_xla_fallback(self):
         """Test that NKI can't handle non-512 multiples but XLA fallback works."""
@@ -315,8 +316,13 @@ class TestNativeMultiHeadAttnMid:
         assert attn_output.dtype == dtype
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
 
-    def test_mid_attn_ir_cache_correctness(self):
+    @patch(
+        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        wraps=convert_fx_to_stablehlo,
+    )
+    def test_mid_attn_ir_cache_correctness(self, mock_compiler):
         """Test that IR cache is properly incremented and hit on subsequent calls."""
+
         batch_size = 2
         num_heads = 4
         seq_len = 2048
@@ -326,51 +332,29 @@ class TestNativeMultiHeadAttnMid:
         k = torch.randn(batch_size, num_heads, d_head, seq_len, device="neuron")
         v = torch.randn(batch_size, num_heads, d_head, seq_len, device="neuron")
 
-        # Clear caches to ensure clean state
-        torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
-
-        # Get initial cache size (should be 0)
-        initial_cache_size = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert initial_cache_size == 0, f"Expected empty cache, got size {initial_cache_size}"
+        initial_count = mock_compiler.call_count
 
         # First call - should trace and cache IR
         output1 = _mid_op(q, k, v, use_causal_mask=False, dropout_p=0.0, training=False)
-
-        # Cache should have 1 entry now
-        cache_size_after_first = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_first == 1
-        ), f"Expected cache size 1 after first call, got {cache_size_after_first}"
+        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
         # Second call - should use cached IR (cache size unchanged)
         output2 = _mid_op(q, k, v, use_causal_mask=False, dropout_p=0.0, training=False)
-
-        cache_size_after_second = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_second == 1
-        ), f"Expected cache size 1 after second call (cache hit), got {cache_size_after_second}"
-
-        # Third call - should also use cached IR (cache size unchanged)
-        output3 = _mid_op(q, k, v, use_causal_mask=False, dropout_p=0.0, training=False)
-
-        cache_size_after_third = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_third == 1
-        ), f"Expected cache size 1 after third call (cache hit), got {cache_size_after_third}"
+        assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
 
         # Verify outputs are consistent
-        torch.testing.assert_close(output1, output2, rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(output1, output3, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
 
-    def test_mid_attn_ir_cache_different_inputs_same_shape(self):
+    @patch(
+        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        wraps=convert_fx_to_stablehlo,
+    )
+    def test_mid_attn_ir_cache_different_inputs_same_shape(self, mock_compiler):
         """Test IR cache hit with different inputs, same shapes."""
         batch_size = 2
         num_heads = 4
         seq_len = 2048
         d_head = 128
-
-        # Clear caches
-        torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
 
         # First call with specific input values
         torch.manual_seed(42)
@@ -378,7 +362,11 @@ class TestNativeMultiHeadAttnMid:
         k1 = torch.randn(batch_size, num_heads, d_head, seq_len, device="neuron")
         v1 = torch.randn(batch_size, num_heads, d_head, seq_len, device="neuron")
 
+        initial_count = mock_compiler.call_count
+
         output1 = _mid_op(q1, k1, v1, use_causal_mask=False, dropout_p=0.0, training=False)
+
+        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
         # Second call with different input values but same shapes - should hit cache
         torch.manual_seed(123)
@@ -388,26 +376,29 @@ class TestNativeMultiHeadAttnMid:
 
         output2 = _mid_op(q2, k2, v2, use_causal_mask=False, dropout_p=0.0, training=False)
 
+        assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+
         # Verify shapes are the same
         assert output1.shape == output2.shape
 
         # Verify outputs are different (since inputs are different)
         # Use a threshold to ensure they're meaningfully different
-        diff = torch.abs(output1 - output2).mean().item()
+        diff = torch.abs(output1.cpu() - output2.cpu()).mean().item()
         assert diff > 1e-3, f"Outputs should be different with different inputs, but diff={diff}"
 
         print(
             f"Mid Attention IR Cache with different inputs: outputs differ by {diff:.6f} (expected)"
         )
 
-    def test_mid_attn_ir_cache_different_shapes(self):
+    @patch(
+        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        wraps=convert_fx_to_stablehlo,
+    )
+    def test_mid_attn_ir_cache_different_shapes(self, mock_compiler):
         """Test that IR cache creates separate entries for different shapes and different inputs."""
         batch_size = 2
         num_heads = 4
         d_head = 128
-
-        # Clear caches
-        torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
 
         # First shape: seq_len = 2048
         seq_len1 = 2048
@@ -415,13 +406,11 @@ class TestNativeMultiHeadAttnMid:
         k1 = torch.randn(batch_size, num_heads, d_head, seq_len1, device="neuron")
         v1 = torch.randn(batch_size, num_heads, d_head, seq_len1, device="neuron")
 
+        initial_count = mock_compiler.call_count
+
         output1 = _mid_op(q1, k1, v1, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        # Cache should have 1 entry
-        cache_size_after_first = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_first == 1
-        ), f"Expected cache size 1 after first shape, got {cache_size_after_first}"
+        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
         # Second shape: seq_len = 4096 (different shape)
         seq_len2 = 4096
@@ -431,11 +420,7 @@ class TestNativeMultiHeadAttnMid:
 
         output2 = _mid_op(q2, k2, v2, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        # Cache should have 2 entries now (different shape creates new entry)
-        cache_size_after_second = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_second == 2
-        ), f"Expected cache size 2 after second shape, got {cache_size_after_second}"
+        assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
 
         # Reuse first shape with different inputs - should hit cache (size stays at 2)
         q3 = torch.randn(batch_size, num_heads, d_head, seq_len1, device="neuron")
@@ -444,11 +429,7 @@ class TestNativeMultiHeadAttnMid:
 
         output3 = _mid_op(q3, k3, v3, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        # Cache should still have 2 entries (cache hit for first shape)
-        cache_size_after_third = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after_third == 2
-        ), f"Expected cache size 2 after reusing first shape, got {cache_size_after_third}"
+        assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
 
         # Verify output shapes
         assert output1.shape == (batch_size, num_heads, seq_len1, d_head)

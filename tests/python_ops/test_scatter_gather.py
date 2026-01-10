@@ -12,6 +12,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 
 # Test cases for both scatter and gather operations
 SHAPE_TEST_CASES = [
@@ -285,12 +286,13 @@ class TestScatterGatherRegistration:
 class TestGatherPriorityImpl:
     """Test priority-based implementation for gather."""
 
-    def test_gather_nki_kernel_used(self):
+    @patch(
+        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        wraps=convert_fx_to_stablehlo,
+    )
+    def test_gather_nki_kernel_used(self, mock_compiler):
         """Verify NKI kernel is used for 2D tensors with dim=0"""
-        torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
-
-        initial_cache_size = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert initial_cache_size == 0
+        initial_count = mock_compiler.call_count
 
         input_neuron = torch.randn(3, 4, dtype=torch.float32, device="neuron")
         index_tensor = torch.tensor([0, 2], device="neuron")
@@ -300,10 +302,7 @@ class TestGatherPriorityImpl:
             torch.gather(input_neuron, 0, index_neuron)
             assert_op_runs_on_neuron("aten::gather")
 
-        cache_size_after = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-        assert (
-            cache_size_after == 1
-        ), f"Expected NKI kernel to be cached, got cache size {cache_size_after}"
+        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
     @patch("torch_neuronx.python_ops.gather.GatherNKIImpl.can_handle", return_value=False)
     def test_gather_xla_fallback(self, mocked_handle):

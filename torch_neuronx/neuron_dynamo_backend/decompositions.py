@@ -15,10 +15,10 @@ from neuronxcc.nki.kernels import flash_fwd
 from neuronxcc.nki.kernels.attention import FlashConfig
 
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
-from torch_neuronx.nki_hop import nki
+from torch_neuronx.nki_hop import wrap_nki
 
 logger = logging.getLogger(__name__)
-wrapped_flash_fwd = nki.jit(flash_fwd)
+wrapped_flash_fwd = wrap_nki(flash_fwd)
 
 # ops that are not supported by the backend (yet)
 DECOMP_NAMES = {
@@ -34,10 +34,16 @@ DECOMP_NAMES = {
     "aten._unsafe_view",
     "aten._softmax",
     "aten.flex_attention",
-    "aten.topk",
-    "aten.silu",
     "aten.index_copy",
     "aten.index_copy_",
+    "aten.replication_pad2d",
+    "aten.reflection_pad2d",
+    "aten.embedding",
+    "aten.embedding_dense_backward",
+    "aten.native_layer_norm_backward",
+    "aten.nll_loss_backward",
+    "aten.clamp_min",
+    "aten.clamp_max",
 }
 
 
@@ -370,11 +376,71 @@ def index_copy_decomposition(
     return torch.scatter(input, dim, index_expanded, source)
 
 
+def linalg_vector_norm_decomposition(x, ord=2, dim=None, keepdim=False, dtype=None):
+    """Custom decomposition for vector_norm to ensure correct results.
+
+    Reference https://github.com/pytorch/pytorch/blob/bfa6f5e0730dead84017e779e02de6cea768ee33/torch/_refs/linalg/__init__.py#L131
+    """
+    # Check input dtype
+    if not (x.dtype.is_floating_point or x.dtype.is_complex):
+        raise RuntimeError(
+            "linalg.vector_norm: Expected a floating point or complex tensor as input. "
+            f"Got {x.dtype}"
+        )
+
+    # Check dtype parameter
+    if dtype is not None:
+        if not (dtype.is_floating_point or dtype.is_complex):
+            raise RuntimeError(
+                f"linalg.vector_norm: dtype should be floating point or complex. Got {dtype}"
+            )
+
+        if dtype.is_complex != x.dtype.is_complex:
+            expected = "complex" if x.dtype.is_complex else "real"
+            raise RuntimeError(
+                f"linalg.vector_norm: dtype should be {expected} for {expected} inputs. Got {dtype}"
+            )
+
+        # Check for narrowing conversion
+        dtype_size = torch.finfo(dtype).bits
+        x_dtype_size = torch.finfo(x.dtype).bits
+        if dtype_size < x_dtype_size:
+            raise RuntimeError(
+                f"linalg.vector_norm: the dtype of the input ({x.dtype}) should be convertible "
+                f"without narrowing to the specified dtype ({dtype})"
+            )
+
+    if dtype is not None:
+        x = x.to(dtype)
+
+    if ord == 0.0:
+        return torch.sum(torch.ne(x, 0.0), dim=dim, keepdim=keepdim, dtype=dtype)
+    elif ord == float("inf"):
+        result = torch.amax(torch.abs(x), dim=dim, keepdim=keepdim)
+    elif ord == float("-inf"):
+        result = torch.amin(torch.abs(x), dim=dim, keepdim=keepdim)
+    else:
+        x_abs = torch.abs(x)
+        result = torch.pow(torch.sum(torch.pow(x_abs, ord), dim=dim, keepdim=keepdim), 1.0 / ord)
+
+        # Handle negative ord with zeros
+        if ord < 0:
+            has_zero = torch.sum(torch.eq(x, 0), dim=dim, keepdim=keepdim) > 0
+            result = torch.where(has_zero, torch.zeros_like(result), result)
+
+    # Handle NaNs
+    has_nan = torch.sum(torch.isnan(x), dim=dim, keepdim=keepdim) > 0
+    result = torch.where(has_nan, torch.full_like(result, float("nan")), result)
+
+    return result
+
+
 # Registry of custom decompositions
 CUSTOM_DECOMPOSITIONS = {
     torch.ops.aten.as_strided.default: custom_as_strided_decomposition,
     torch.ops.aten.scalar_tensor.default: scalar_tensor_decomposition,
     torch.ops.aten.index_copy.default: index_copy_decomposition,
+    torch.ops.aten.linalg_vector_norm.default: linalg_vector_norm_decomposition,
 }
 
 # Register SDPA decompositions

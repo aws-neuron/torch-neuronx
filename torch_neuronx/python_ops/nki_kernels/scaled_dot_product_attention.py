@@ -3,24 +3,30 @@
 import math
 
 import neuronxcc.nki.language as nl
+import torch
 from neuronxcc.nki.kernels.attention import FlashConfig, flash_fwd
 
+from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import suppress_specific_warnings
 
+wrapped_flash_fwd = wrap_nki(flash_fwd)
 
-def scaled_dot_product_attention_kernel(
-    q,
-    k,
-    v,
-    attn_output,
-    is_causal=False,
-    dropout_p=0.0,
-    scale=None,
-    is_gqa=False,
-    training=False,
-    seed=None,
-    lse=None,
-):
+
+@nki_op("nki_kernels::scaled_dot_product_attention_kernel", mutates_args={})
+def _scaled_dot_product_attention_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_output: torch.Tensor,
+    is_causal: bool,
+    dropout_p: float,
+    scale: float | None,
+    is_gqa: bool,
+    training: bool,
+    seed: int | None,
+    lse: torch.Tensor | None,
+    should_transpose_v: bool,
+) -> torch.Tensor:
     """
     Wrapper for the NKI flash attention kernel for scaled_dot_product_attention.
 
@@ -45,7 +51,6 @@ def scaled_dot_product_attention_kernel(
         - For GQA, the grid uses kv_heads, not query_heads
     """
     # Import here to avoid circular import
-    from torch_neuronx import TorchNeuronNKIKernel
     from torch_neuronx.utils import get_logical_neuron_cores
 
     # LNC sharding factor for NKI kernel based on available neuron cores
@@ -66,9 +71,8 @@ def scaled_dot_product_attention_kernel(
             q_heads % kv_heads == 0
         ), f"Query heads ({q_heads}) must be divisible by KV heads ({kv_heads}) for GQA"
 
-    # Calculate softmax scale if not provided
     if scale is None:
-        scale = 1.0 / math.sqrt(embed_dim)
+        scale = 1 / math.sqrt(embed_dim)
 
     # Determine seq_tile_size based on sequence length
     # Get default from FlashConfig
@@ -87,12 +91,9 @@ def scaled_dot_product_attention_kernel(
     # (batch, heads, seq_len, embed_dim) format to avoid transpose
     config = FlashConfig(
         training=training,  # Use the passed training flag
-        should_transpose_v=False,  # V is already in correct format
+        should_transpose_v=should_transpose_v,  # V is already in correct format
         seq_tile_size=seq_tile_size,
     )
-
-    # For training mode without dropout, seed can still be None
-    # LSE will be populated by the kernel if training=True
 
     # Create the kernel with grid
     # For GQA, use kv_heads in grid, not q_heads!
@@ -105,24 +106,14 @@ def scaled_dot_product_attention_kernel(
     else:
         grid = (batch_size, grid_heads)
 
-    # Create traced kernel
-    return_overrides = (attn_output, lse) if training else attn_output
-
-    traced_kernel = TorchNeuronNKIKernel(
-        func=getattr(flash_fwd, "func", flash_fwd),
-        grid=grid,
-        kernel_return=True,
-        return_tensor_overrides=return_overrides,
-    )
-
     suppressed_warnings = ["Block dimension is deprecated", "shadowing tile"]
     if training:
         with suppress_specific_warnings(suppressed_warnings):
-            out_ret, lse_ret = traced_kernel(
+            out_ret, lse_ret = wrapped_flash_fwd[grid](
                 q,
                 k,
                 v,
-                seed,
+                seed=seed,
                 use_causal_mask=is_causal,
                 mixed_precision=True,
                 softmax_scale=scale,
@@ -135,7 +126,7 @@ def scaled_dot_product_attention_kernel(
             lse.copy_(lse_ret)
     else:
         with suppress_specific_warnings(suppressed_warnings):
-            out_ret = traced_kernel(
+            out_ret = wrapped_flash_fwd[grid](
                 q,
                 k,
                 v,
@@ -158,3 +149,33 @@ def scaled_dot_product_attention_kernel(
     attn_output = attn_output.transpose(1, 2).contiguous().transpose(1, 2)
 
     return attn_output
+
+
+def scaled_dot_product_attention_kernel(
+    q,
+    k,
+    v,
+    attn_output,
+    is_causal=False,
+    dropout_p=0.0,
+    scale=None,
+    is_gqa=False,
+    training=False,
+    seed=None,
+    lse=None,
+    should_transpose_v=False,
+):
+    return _scaled_dot_product_attention_kernel(
+        q,
+        k,
+        v,
+        attn_output,
+        is_causal=is_causal,
+        dropout_p=dropout_p,
+        scale=scale,
+        is_gqa=is_gqa,
+        training=training,
+        seed=seed,
+        lse=lse,
+        should_transpose_v=should_transpose_v,
+    )

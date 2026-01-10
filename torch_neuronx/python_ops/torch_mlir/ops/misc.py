@@ -5,15 +5,26 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::embedding"])
+@register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
 def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
-    return torch.embedding(weights, indices, padding_idx, scale_grad_by_freq, sparse)
+    return torch.embedding(
+        weights, indices, padding_idx=padding_idx, scale_grad_by_freq=False, sparse=sparse
+    )
 
 
-@register_aten(["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"])
+@register_aten(
+    ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
+    static_argnums=(2, 3, 4),
+)
 def torch_embedding_dense_backward(
     grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
 ):
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(
+            "Expected tensor for argument #2 'indices' to have one of the following "
+            "scalar types: Long, Int; but got torch.FloatTensor instead "
+            "(while checking arguments for embedding_backward)"
+        )
     return torch.ops.aten.embedding_dense_backward(
         grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
     )

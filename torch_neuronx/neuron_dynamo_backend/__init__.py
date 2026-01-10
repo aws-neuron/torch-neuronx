@@ -22,13 +22,13 @@ neuron_dynamo_backend environment variables:
         whether to preserve directory with compilation artifacts after execution is complete
     TORCH_NEURONX_DEBUG_DIR: str (default="/tmp/neuron_backend_<random string>")
         directory in which to save compilation artifacts
+    TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION: bool (default=False)
+        disables fallback execution on failure for neuron backend.
     TORCH_NEURONX_ENABLE_NKI_SDPA: bool (default=True)
         enables decomposing scaled_dot_product_attention to the NKI kernel if possible.
         currently, the decomposition happens only when seqlen % 2048 == 0 for queries.
     NEURON_CC_FLAGS: str (default="")
         flags passed to neuronx-cc call
-
-
 """
 
 from torch_neuronx.neuron_dynamo_backend.backend import (

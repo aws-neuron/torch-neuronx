@@ -28,6 +28,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
     save_mlir_bytecode,
 )
 from torch_neuronx.neuron_dynamo_backend.fx_passes import legalize_flex_attention_pass
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.utils.io_utils import save_fx_graph_txt
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,8 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
                 try:
                     return executor(*inputs)
                 except Exception as e:
+                    if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
+                        raise e from e
                     logger.error(f"Execution failed: {e}")
                     # Fallback to original execution for debugging
                     logger.warning("Falling back to original GraphModule execution")

@@ -43,7 +43,7 @@ def torch_scatter_value(x, dim, index, value):
 def torch_scatter_src(input, dim, index, src, reduce=None):
     if reduce is None:
         return torch.scatter(input, dim, index, src)
-    torch.scatter(input, dim, index, src, reduce=reduce)
+    return torch.scatter(input, dim, index, src, reduce=reduce)
 
 
 # (["aten::masked_select", "aten::masked_select.out", "aten::masked_select.Tensor_out"])
@@ -78,12 +78,16 @@ def torch_nonzero(x):
     return torch.nonzero(x)
 
 
-@register_aten(["aten::nonzero_static", "aten::nonzero_static.out"])
+@register_aten(["aten::nonzero_static", "aten::nonzero_static.out"], static_argnums=(-1, -2))
 def torch_nonzero_static(x, *, size, fill_value=-1):
     return torch.ops.aten.nonzero_static(x, size=size, fill_value=fill_value)
 
 
-# @register_aten(["aten::topk", "aten::topk.values"])
+@register_aten(
+    ["aten::topk", "aten::topk.values"],
+    static_argnums=(1,),
+    static_argnames=("dim", "largest", "sorted"),
+)
 def torch_topk(x, k, dim=-1, largest=True, sorted=True):
     return torch.topk(x, k, dim, largest, sorted)
 

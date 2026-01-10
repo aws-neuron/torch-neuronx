@@ -1,15 +1,17 @@
-"""Torch-MLIR kernel implementation."""
-
 import logging
+import os
+import traceback
 from collections.abc import Callable
 
 import torch
 
+from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
-from torch_neuronx.neuron_dynamo_backend.backend import neuron_backend
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
-from torch_neuronx.utils import cast_dtype_if_needed
+from torch_neuronx.utils import is_sync_mode_enabled
 
 from ..jax.config import CompilationConfig
 from ..jax.context import ExecutionContext
@@ -47,11 +49,9 @@ class TorchMlirKernel(BaseNeuronKernel):
         self.mlir_compiler = TorchMlirCompiler()
         self.hlo_compiler = HloCompiler(compiler_config)
         self.cache = CompilationCache()
+        self.hlo_cache = {}
         self.arg_processor = ArgumentProcessor(static_argnames)
-        self.arg_processor.static_argnums = ()
         self.output_handler = OutputHandler()
-
-        self._output_spec_cache = {}
 
         assert isinstance(self.static_argnums, tuple)
         assert isinstance(self.static_argnames, tuple)
@@ -88,57 +88,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         return key_with_kwargs
 
-    def _get_cached_output_specs(
-        self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
-    ) -> tuple:
-        """Get cached output specs or compute them."""
-        cache_key = self._generate_unified_cache_key(
-            context.original_inputs if context else inputs,
-            kwargs,
-            context,
-        )
-
-        if cache_key in self._output_spec_cache:
-            return self._output_spec_cache[cache_key]
-
-        # For non-aten ops, run torch_fn directly with meta tensors
-        if not self.op_name.startswith("aten::"):
-            meta_inputs = []
-            for inp in inputs:
-                if isinstance(inp, torch.Tensor):
-                    meta_inputs.append(torch.empty(inp.shape, dtype=inp.dtype, device="meta"))
-                else:
-                    meta_inputs.append(inp)
-
-            meta_output = self.torch_fn(*meta_inputs, **kwargs)
-            outputs = (meta_output,) if not isinstance(meta_output, tuple) else meta_output
-
-            output_specs = []
-            expected_dtypes = []
-            for out in outputs:
-                output_specs.append([tuple(out.shape), out.dtype])
-                expected_dtypes.append(out.dtype)
-
-            result = (tuple(output_specs), expected_dtypes, [])
-            self._output_spec_cache[cache_key] = result
-            return result
-
-        # Infer output specs using output handler for aten ops
-        output_specs, _, expected_dtypes, none_mask = self.output_handler.infer_output_specs(
-            self.torch_fn,
-            inputs,
-            self.op_name,
-            static_argnums=None,
-            meta_inputs=context.original_inputs if context else None,
-            expected_dtypes_override=None,
-            kwargs=kwargs,
-            convert_to_jax_spec=False,
-        )
-
-        result = (output_specs, expected_dtypes, none_mask)
-        self._output_spec_cache[cache_key] = result
-        return result
-
     def _get_compilation_kwargs(self, kwargs):
         """Process kwargs for lowering."""
         # Exclude unsupported kwargs
@@ -161,190 +110,623 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         return compilation_kwargs
 
-    def _get_or_compile_neff(self, inputs: tuple, kwargs: dict) -> bytes:
-        """Get NEFF from cache or compile if needed.
+    def _get_or_compile_hlo_and_neff(
+        self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
+    ) -> tuple[bytes, bytes, list[int], tuple, tuple, str]:
+        """Get HLO and NEFF from cache or compile if needed.
 
         Args:
             inputs: Preprocessed inputs
             kwargs: Keyword arguments
+            context: Execution context with original inputs
 
         Returns:
-            Compiled NEFF bytes
+            Tuple of (hlo_bytes, neff_bytes, kept_input_indices,
+                     downcasted_outputs, original_outputs, cache_key)
         """
-        cache_key = self._generate_unified_cache_key(inputs, kwargs)
+        cache_key = self._generate_unified_cache_key(
+            context.original_inputs if context and context.has_original_inputs() else inputs, kwargs
+        )
+
+        if cache_key in self.hlo_cache:
+            hlo_bytes, io_spec, kept_input_indices, downcasted_outputs, original_outputs = (
+                self.hlo_cache[cache_key]
+            )
+        else:
+            # Generate HLO
+            (
+                hlo_bytes,
+                io_spec,
+                cast_spec,
+                kept_input_indices,
+                downcasted_outputs,
+                original_outputs,
+            ) = self._generate_hlo(inputs, kwargs, context)
+            self.hlo_cache[cache_key] = (
+                hlo_bytes,
+                io_spec,
+                kept_input_indices,
+                downcasted_outputs,
+                original_outputs,
+            )
+
+        if not is_sync_mode_enabled():
+            return (
+                hlo_bytes,
+                None,
+                kept_input_indices,
+                downcasted_outputs,
+                original_outputs,
+                cache_key,
+            )
 
         # Try cache first
         neff_bytes = self.cache.get_neff(cache_key)
         if neff_bytes is not None:
-            return neff_bytes
+            return (
+                hlo_bytes,
+                neff_bytes,
+                kept_input_indices,
+                downcasted_outputs,
+                original_outputs,
+                cache_key,
+            )
 
-        # Compile: PyTorch -> MLIR (StableHLO) -> NEFF
-        compilation_kwargs = self._get_compilation_kwargs(kwargs)
-        stablehlo_module = self.mlir_compiler.compile(
-            self.torch_fn, self.op_name, inputs, compilation_kwargs
-        )
-        stablehlo_text = self.mlir_compiler.export_to_hlo(stablehlo_module).encode()
-        neff_bytes = self.hlo_compiler.compile_to_neff(stablehlo_text, ir_type="StableHLO")
+        # Compile HLO to NEFF
+        neff_bytes = self.hlo_compiler.compile_to_neff(hlo_bytes, ir_type="StableHLO")
 
         # Store in cache
         self.cache.store_neff(cache_key, neff_bytes)
 
-        return neff_bytes
+        return (
+            hlo_bytes,
+            neff_bytes,
+            kept_input_indices,
+            downcasted_outputs,
+            original_outputs,
+            cache_key,
+        )
 
-    def _prepare_outputs(
-        self,
-        output_specs: list,
-        expected_dtypes: list,
-        device: torch.device,
-        kwargs: dict,
-    ) -> tuple[torch.Tensor | tuple[torch.Tensor, ...], list, torch.Tensor | tuple | None]:
-        """Prepare output tensors from specs.
+    def _generate_hlo(
+        self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
+    ) -> tuple[bytes, object, object, list[int], tuple, tuple]:
+        """Generate HLO from PyTorch function.
 
         Args:
-            output_specs: Output specifications
-            expected_dtypes: Expected dtypes
-            device: Device for tensors
+            inputs: Preprocessed inputs (potentially downcasted)
             kwargs: Keyword arguments
+            context: Execution context with original inputs
 
         Returns:
-            Tuple of (execution_tensors, expected_dtypes, provided_output)
+            Tuple of (HLO bytes, io_spec, cast_spec, kept_input_indices,
+                        downcasted_outputs, original_outputs)
         """
-        # Check for provided output tensors
-        provided_output = self.output_handler.extract_output_params(kwargs, self.output_params)
+        compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
+        # Use torch._dynamo.optimize to capture graph module like torch.compile
+        import torch._dynamo as dynamo
+
+        from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
+
+        # Get the same decomposition table used by neuron_backend
+        decomposition_table = get_decomposition_table(decompose_all=False)
+
+        # Create fake tensors and mapping recursively
+        fake_inputs = []
+        fake_to_flattened_idx = {}  # Map fake tensor id to flattened position
+        flattened_idx = 0
+
+        def create_fake_recursive(obj, original_idx):
+            nonlocal flattened_idx
+            if isinstance(obj, torch.Tensor):
+                fake_tensor = torch.empty_like(obj, device="meta")
+                fake_to_flattened_idx[id(fake_tensor)] = flattened_idx
+                flattened_idx += 1
+                return fake_tensor
+            elif isinstance(obj, list | tuple):
+                return type(obj)(create_fake_recursive(item, original_idx) for item in obj)
+            else:
+                return obj
+
+        # We create tensors on meta device so that we can get the output shapes.
+        # Note: each op has a meta device registration (we need it for dtensor to work)
+        for idx, inp in enumerate(inputs):
+            fake_inp = create_fake_recursive(inp, idx)
+            fake_inputs.append(fake_inp)
+        # Get downcasted outputs for graph compilation
+        downcasted_outputs = self.torch_fn(*fake_inputs, **compilation_kwargs)
+
+        # Get original outputs using original inputs (for correct dtypes)
+        original_outputs = None
+        if context and context.has_original_inputs():
+            original_fake_inputs = []
+            for inp in context.original_inputs:
+                fake_inp = create_fake_recursive(inp, 0)  # Index doesn't matter here
+                original_fake_inputs.append(fake_inp)
+            original_outputs = self.torch_fn(*original_fake_inputs, **compilation_kwargs)
+        else:
+            original_outputs = downcasted_outputs  # Fallback if no context
+
+        captured_gm = None
+        kept_input_indices = []
+
+        def capture_backend(gm, example_inputs):
+            nonlocal captured_gm, kept_input_indices
+            captured_gm = gm
+
+            # Create input mapping: example_inputs id -> flattened tensor index
+            kept_input_indices = []
+            for example_input in example_inputs:
+                if id(example_input) in fake_to_flattened_idx:
+                    kept_input_indices.append(fake_to_flattened_idx[id(example_input)])
+
+            # Apply decompositions like neuron_backend does
+            from torch._dynamo.backends.common import aot_autograd
+
+            # Use aot_autograd with decompositions but capture the graph module
+            def fw_compiler(decomposed_gm, inputs):
+                nonlocal captured_gm
+                captured_gm = decomposed_gm
+                return decomposed_gm  # Return the graph module itself
+
+            aot_backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                decompositions=decomposition_table,
+            )
+            return aot_backend(gm, example_inputs)
+
+        # Configure dynamo for graph capture only (not execution)
+        with (
+            dynamo.config.patch(
+                assume_static_by_default=True,  # Equivalent to dynamic=False
+                automatic_dynamic_shapes=False,
+                capture_scalar_outputs=True,
+                capture_dynamic_output_shape_ops=False,
+                cache_size_limit=float("inf"),
+            ),
+            torch.no_grad(),
+        ):  # Avoid grad_mode guards
+            # Create compiled function directly
+            compiled_fn = dynamo.optimize(
+                capture_backend,
+                nopython=True,  # Equivalent to fullgraph=True
+            )(self.torch_fn)
+
+            # Trigger compilation by calling the function with fake tensors
+            compiled_fn(*fake_inputs, **compilation_kwargs)
+
+            gm = captured_gm
+
+        # Convert to StableHLO
+        stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs)
+
+        return (
+            str(stablehlo_module).encode(),
+            io_spec,
+            cast_spec,
+            kept_input_indices,
+            downcasted_outputs,
+            original_outputs,
+        )
+
+    def _reconstruct_outputs(self, execution_tensors, original_outputs):
+        """Reconstruct full output structure with None values."""
+        if original_outputs is None:
+            return None
+
+        if not isinstance(original_outputs, tuple):
+            return execution_tensors
+
+        # Map execution tensors back to original structure
+        result = []
+        tensor_idx = 0
+
+        for orig_out in original_outputs:
+            if orig_out is None:
+                result.append(None)
+            else:
+                if isinstance(execution_tensors, tuple):
+                    result.append(execution_tensors[tensor_idx])
+                else:
+                    result.append(execution_tensors)
+                tensor_idx += 1
+
+        return tuple(result) if len(result) > 1 else result[0]
+
+    def _create_output_tensors_from_original(self, original_outputs, device):
+        """Create output tensors based on original_outputs structure."""
+        if original_outputs is None:
+            return None
+
+        if not isinstance(original_outputs, tuple | list):
+            # Single output
+            if original_outputs is None:
+                return None
+            return io_tensor.empty_like(original_outputs, device=device)
+
+        # Multiple outputs - only create tensors for non-None outputs
         execution_tensors = []
-        if provided_output is not None:
-            # Use provided tensors or create temporaries if needed
-            provided_list = (
-                provided_output if isinstance(provided_output, tuple) else (provided_output,)
+        for out in original_outputs:
+            if out is not None:
+                execution_tensors.append(io_tensor.empty_like(out, device=device))
+
+        return tuple(execution_tensors) if len(execution_tensors) > 1 else execution_tensors[0]
+
+    def _upcast_execution_results(self, execution_tensors, downcasted_outputs, original_outputs):
+        """Upcast execution results to match original output dtypes."""
+        if original_outputs is None or downcasted_outputs is None:
+            return execution_tensors
+
+        if not isinstance(original_outputs, tuple):
+            # Single output
+            if original_outputs is None or downcasted_outputs is None:
+                return execution_tensors
+            if original_outputs.dtype != downcasted_outputs.dtype:
+                return execution_tensors.to(original_outputs.dtype)
+            return execution_tensors
+
+        # Multiple outputs - upcast where needed
+        if not isinstance(execution_tensors, tuple):
+            execution_tensors = (execution_tensors,)
+
+        upcast_tensors = []
+        tensor_idx = 0
+
+        for orig_out, downcast_out in zip(original_outputs, downcasted_outputs, strict=False):
+            if orig_out is None:
+                continue  # Skip None outputs
+
+            exec_tensor = execution_tensors[tensor_idx]
+            if orig_out.dtype != downcast_out.dtype:
+                upcast_tensors.append(exec_tensor.to(orig_out.dtype))
+            else:
+                upcast_tensors.append(exec_tensor)
+            tensor_idx += 1
+
+        return tuple(upcast_tensors) if len(upcast_tensors) > 1 else upcast_tensors[0]
+
+    def _handle_empty_tensors(self, original_outputs, processed_inputs, device):
+        """Handle empty tensors using original_outputs for shape/dtype info."""
+        from torch_neuronx.python_ops.jax.config import IndexOps, ReductionOps
+
+        if original_outputs is None:
+            return None
+
+        # For reductions, return identity values (zeros, ones, etc.)
+        if ReductionOps.is_reduction(self.op_name):
+            return self._create_reduction_identity(original_outputs, device)
+
+        # For index ops, return input tensor if index is empty
+        if IndexOps.is_index(self.op_name):
+            return self._create_index_result(original_outputs, processed_inputs, device)
+
+        # General case: create zeros with original output shapes
+        return self._create_zeros_like_original(original_outputs, device)
+
+    def _create_reduction_identity(self, original_outputs, device):
+        """Create identity values for reductions."""
+        from torch_neuronx.python_ops.jax.config import ReductionOps
+
+        # Get identity value for this reduction operation
+        identity = ReductionOps.get_identity_value(self.op_name)
+
+        if identity is None:
+            # No identity value - this should error on empty tensors
+            raise RuntimeError(f"Cannot perform {self.op_name} on empty tensor (no identity value)")
+
+        # Create tensors filled with identity value
+        return self._create_filled_tensors(original_outputs, device, identity)
+
+    def _create_filled_tensors(self, original_outputs, device, fill_value):
+        """Create tensors filled with a specific value."""
+        if not isinstance(original_outputs, tuple):
+            if original_outputs is None:
+                return None
+            return torch.full(
+                original_outputs.shape, fill_value, dtype=original_outputs.dtype, device=device
             )
 
-            for spec, provided_tensor in zip(output_specs, provided_list, strict=False):
-                # Check if we can use provided tensor directly
-                if (
-                    tuple(provided_tensor.shape) == tuple(spec[0])
-                    and provided_tensor.dtype == spec[1]
-                ):
-                    execution_tensors.append(provided_tensor)
-                else:
-                    # Need temporary
-                    execution_tensors.append(torch.empty(spec[0], dtype=spec[1], device=device))
+        outputs = []
+        for i, out in enumerate(original_outputs):
+            if out is None:
+                outputs.append(None)
+            elif i == 0:
+                # First output gets the identity value
+                outputs.append(torch.full(out.shape, fill_value, dtype=out.dtype, device=device))
+            else:
+                # Additional outputs (like indices) get zeros
+                outputs.append(torch.zeros(out.shape, dtype=out.dtype, device=device))
 
-            execution_tensors = tuple(execution_tensors)
+        return tuple(outputs)
+
+    def _create_index_result(self, original_outputs, processed_inputs, device):
+        """Create result for index operations."""
+        from torch_neuronx.python_ops.jax.config import IndexOps
+
+        # Check if this is an index operation with empty index tensor
+        index_argnum = IndexOps.get_index_argnum(self.op_name)
+        input_argnum = IndexOps.get_input_argnum(self.op_name)
+
+        if (
+            index_argnum is not None
+            and input_argnum is not None
+            and index_argnum < len(processed_inputs)
+            and input_argnum < len(processed_inputs)
+        ):
+            input_tensor = processed_inputs[input_argnum]
+            index_tensor = processed_inputs[index_argnum]
+
+            if (
+                isinstance(input_tensor, torch.Tensor)
+                and isinstance(index_tensor, torch.Tensor)
+                and input_tensor.numel() > 0
+                and index_tensor.numel() == 0
+            ):
+                # Return input tensor unchanged for empty index
+                return input_tensor
+
+        # Default: create zeros
+        return self._create_zeros_like_original(original_outputs, device)
+
+    def _create_zeros_like_original(self, original_outputs, device):
+        """Create zero tensors matching original output structure."""
+        if not isinstance(original_outputs, tuple):
+            if original_outputs is None:
+                return None
+            return (
+                io_tensor.zeros(original_outputs.shape, device=device)
+                if original_outputs.numel() > 0
+                else io_tensor.empty_like(original_outputs, device=device)
+            )
+
+        outputs = []
+        for out in original_outputs:
+            if out is None:
+                outputs.append(None)
+            else:
+                outputs.append(
+                    io_tensor.zeros(out.shape, device=device)
+                    if out.numel() > 0
+                    else io_tensor.empty_like(out, device=device)
+                )
+
+        return tuple(outputs)
+
+    def _should_handle_empty(self, args) -> bool:
+        """Check if any input tensors are empty."""
+        return any(isinstance(arg, torch.Tensor) and arg.numel() == 0 for arg in args)
+
+    def _prepare_execution_tensors(self, provided_output, downcasted_outputs):
+        """Prepare execution tensors, only creating new ones if downcasting is needed."""
+
+        def _prepare_single_tensor(provided, downcast):
+            """Helper to prepare a single tensor."""
+            if provided is None or downcast is None:
+                return provided, False
+
+            # Resize provided tensor if shape mismatch
+            if provided.shape != downcast.shape:
+                provided.resize_(downcast.shape)
+
+            # If dtype mismatch, create new tensor for execution
+            if provided.dtype != downcast.dtype:
+                return io_tensor.empty_like(downcast, device=provided.device), True
+
+            # Can use provided tensor directly (after potential resize)
+            return provided, False
+
+        if downcasted_outputs is None:
+            return provided_output, False
+
+        is_single_output = not isinstance(provided_output, tuple)
+        provided_tuple = (provided_output,) if is_single_output else provided_output
+        downcast_tuple = (
+            (downcasted_outputs,)
+            if not isinstance(downcasted_outputs, tuple)
+            else downcasted_outputs
+        )
+
+        execution_tensors = []
+        needs_copy = False
+        for provided, downcast in zip(provided_tuple, downcast_tuple, strict=False):
+            tensor, copy_needed = _prepare_single_tensor(provided, downcast)
+            execution_tensors.append(tensor)
+            needs_copy = needs_copy or copy_needed
+
+        if is_single_output:
+            return execution_tensors[0], needs_copy
+
+        return tuple(execution_tensors), needs_copy
+
+    def _copy_to_provided_output(self, upcast_tensors, provided_output):
+        """Copy execution results to provided output tensors."""
+        if not isinstance(provided_output, tuple):
+            provided_output.copy_(upcast_tensors)
         else:
-            # Create new output tensors
-            for spec in output_specs:
-                execution_tensors.append(torch.empty(spec[0], dtype=spec[1], device=device))
-            execution_tensors = tuple(execution_tensors)
+            if not isinstance(upcast_tensors, tuple):
+                upcast_tensors = (upcast_tensors,)
+            for provided, result in zip(provided_output, upcast_tensors, strict=False):
+                if provided is not None and result is not None:
+                    provided.copy_(result)
 
-        return execution_tensors, expected_dtypes, provided_output
+    def _all_outputs_zero_sized(self, original_outputs):
+        """Check if all outputs have zero-sized shapes."""
 
-    def is_empty_output(self, output_specs):
-        def _is_zero_shape(shape):
-            # Zero-sized if any dimension is zero
-            return any(dim == 0 for dim in shape)
+        def _is_zero_shape(tensor):
+            return tensor is not None and any(dim == 0 for dim in tensor.shape)
 
-        return output_specs and all(_is_zero_shape(spec[0]) for spec in output_specs)
+        if not isinstance(original_outputs, tuple | list):
+            return _is_zero_shape(original_outputs)
+
+        return all(_is_zero_shape(out) for out in original_outputs if out is not None)
 
     def __call__(self, *args, context: ExecutionContext | None = None, **kwargs):
         """Execute the kernel."""
+        self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
+
         # Preprocess inputs
-        processed_inputs = self.arg_processor.preprocess_inputs(args)
-
-        # Get output specs
-        output_specs, expected_dtypes, none_mask = self._get_cached_output_specs(
-            processed_inputs, kwargs, context
-        )
-
-        # Handle all None outputs early
-        if none_mask and all(none_mask):
-            return tuple(None for _ in none_mask)
-
+        processed_inputs = self.arg_processor.preprocess_inputs(args, scalar_to_tensor=True)
         device = self.arg_processor.extract_device(processed_inputs)
 
-        # Prepare outputs
-        execution_tensors, expected_dtypes, provided_output = self._prepare_outputs(
-            output_specs, expected_dtypes, device, kwargs
+        # Get or compile HLO/NEFF and metadata
+        (
+            hlo_bytes,
+            neff_bytes,
+            kept_input_indices,
+            downcasted_outputs,
+            original_outputs,
+            cache_key,
+        ) = self._get_or_compile_hlo_and_neff(processed_inputs, kwargs, context)
+        # Check for empty tensors after getting original_outputs
+        if self._should_handle_empty(processed_inputs):
+            _C._log_executed_op(self.op_name)
+            return self._handle_empty_tensors(original_outputs, processed_inputs, device)
+
+        # Early return if no valid outputs
+        if original_outputs is None or (
+            isinstance(original_outputs, tuple) and all(out is None for out in original_outputs)
+        ):
+            _C._log_executed_op(self.op_name)
+            return original_outputs
+
+        # Check for zero-sized outputs - skip execution if all outputs are zero-sized
+        if self._all_outputs_zero_sized(original_outputs):
+            _C._log_executed_op(self.op_name)
+            return self._create_zeros_like_original(original_outputs, device)
+
+        # Check for provided outputs in kwargs
+        provided_output = self.output_handler.extract_output_params(kwargs, self.output_params)
+
+        needs_copy = False
+        if provided_output is not None:
+            # Check if we need to downcast for execution
+            execution_tensors, needs_copy = self._prepare_execution_tensors(
+                provided_output, downcasted_outputs
+            )
+        elif self.op_name.endswith("_"):
+            # For inplace operations, use the first input tensor as output
+            execution_tensors = processed_inputs[0]
+        else:
+            # Create output tensors from downcasted_outputs (for execution)
+            execution_tensors = self._create_output_tensors_from_original(
+                downcasted_outputs, device
+            )
+
+        # Create filtered inputs using kept_input_indices on flattened inputs
+        def flatten_tensors(inputs):
+            """Flatten nested tensor structures for execution."""
+            flattened = []
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    flattened.append(inp)
+                elif isinstance(inp, list | tuple):
+                    flattened.extend(flatten_tensors(inp))
+            return flattened
+
+        # Flatten processed inputs for execution
+        flattened_processed_inputs = flatten_tensors(processed_inputs)
+        filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
+
+        # Execute based on sync/async mode
+        if not is_sync_mode_enabled():
+            cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
+            if cpu_fallback_context is None:
+                original_inputs_for_ctx = (
+                    context.original_inputs if context and context.has_original_inputs() else args
+                )
+                cpu_fallback_context = {
+                    "original_inputs": list(original_inputs_for_ctx),
+                    "original_kwargs": {},
+                }
+
+            self._execute_async(
+                filtered_inputs,
+                execution_tensors
+                if isinstance(execution_tensors, list | tuple)
+                else (execution_tensors,),
+                hlo_bytes,
+                cache_key,
+                cpu_fallback_context,
+            )
+        else:
+            device = self.arg_processor.extract_device(processed_inputs)
+            self._execute_sync(
+                filtered_inputs,
+                execution_tensors
+                if isinstance(execution_tensors, list | tuple)
+                else (execution_tensors,),
+                neff_bytes,
+                device,
+            )
+
+        # Upcast execution results based on original_outputs dtypes
+        upcast_tensors = self._upcast_execution_results(
+            execution_tensors, downcasted_outputs, original_outputs
         )
 
-        if not self.is_empty_output(output_specs):
-            if getattr(self.torch_fn, "use_torch_compile", True):
-                # Additional processing to convert scalar value into tensor so that
-                # non-static scalar value is not compiled into HLO and cause incorrect results
-                # TODO do this in argument_processor.py once Jax is removed
-                torch_fn = self.torch_fn
-                if getattr(self.torch_fn, "uses_preprocessing", False):
-                    torch_fn, processed_inputs, kwargs = self.torch_fn(*processed_inputs, **kwargs)
+        # Copy results to provided output tensors only if downcasting was needed
+        if provided_output is not None and needs_copy:
+            self._copy_to_provided_output(upcast_tensors, provided_output)
+            return provided_output
 
-                compile_inputs = []
-                for idx, inp in enumerate(processed_inputs):
-                    if idx not in self.static_argnums and isinstance(inp, int | float | bool):
-                        if isinstance(inp, bool):
-                            compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.bool, device=device)
-                            )
-                        elif isinstance(inp, int):
-                            compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.int32, device=device)
-                            )
-                        elif isinstance(inp, float):
-                            compile_inputs.append(
-                                torch.tensor(inp, dtype=torch.float32, device=device)
-                            )
-                    else:
-                        compile_inputs.append(inp)
+        # Reconstruct full output structure with None values
+        return self._reconstruct_outputs(upcast_tensors, original_outputs)
 
-                compile_inputs = tuple(compile_inputs)
-                compile_kwargs = self._get_compilation_kwargs(kwargs)
-                compiled_model = torch.compile(
-                    torch_fn,
-                    backend=neuron_backend,
-                    fullgraph=True,
-                    dynamic=False,
-                    options={"model_name": self.op_name},
-                )
-                with torch._dynamo.config.patch(cache_size_limit=float("inf")):
-                    execution_tensors = compiled_model(*compile_inputs, **compile_kwargs)
+    def _execute_async(
+        self,
+        filtered_inputs: tuple,
+        execution_tensors: tuple,
+        hlo_bytes: bytes,
+        cache_key: str,
+        cpu_fallback_context: dict,
+    ):
+        """Execute kernel asynchronously using async pipeline.
 
-                if not isinstance(execution_tensors, tuple):
-                    execution_tensors = (execution_tensors,)
-            else:
-                # Get or compile NEFF
-                neff_bytes = self._get_or_compile_neff(processed_inputs, kwargs)
+        Args:
+            filtered_inputs: Pre-filtered input tensors
+            execution_tensors: Output tensors for execution
+            hlo_bytes: Compiled HLO bytes
+            cache_key: Cache key for the operation
+            cpu_fallback_context: CPU fallback context
+        """
+        if os.environ.get("TORCH_NEURONX_ENABLE_STACK_TRACE", "0") == "1":
+            stack_trace = "".join(traceback.format_list(traceback.extract_stack()[:-2]))
+        else:
+            stack_trace = ""
 
-                # Prepare execution inputs/outputs
-                input_dict = self.arg_processor.prepare_execution_inputs(processed_inputs, device)
-                output_dict = {f"output{i}": out for i, out in enumerate(execution_tensors)}
-
-                # Execute NEFF (uses BaseNeuronKernel.execute_neff)
-                self.execute_neff(neff_bytes, input_dict, output_dict, op_name=self.op_name)
-
-        # Handle provided outputs
-        if provided_output is not None:
-            exec_list = (
-                execution_tensors if isinstance(execution_tensors, tuple) else (execution_tensors,)
+        try:
+            _C._submit_xla_task_to_pipeline(
+                self.op_name,
+                filtered_inputs,
+                execution_tensors,
+                hlo_bytes,
+                None,
+                cache_key,
+                stack_trace,
+                False,
+                cpu_fallback_context,
             )
-            corrected = []
-            for i, exec_tensor in enumerate(exec_list):
-                target_dtype = expected_dtypes[i] if i < len(expected_dtypes) else None
-                corrected.append(cast_dtype_if_needed(exec_tensor, target_dtype))
-            corrected_result = tuple(corrected) if len(corrected) > 1 else corrected[0]
-            return self.output_handler.handle_output_parameter(corrected_result, provided_output)
+        except RuntimeError as e:
+            raise RuntimeError(f"XLA kernel execution failed: {e}") from e
 
-        # No provided outputs
-        corrected_outputs = []
-        for i, tensor in enumerate(execution_tensors):
-            # torch.compile outputs will automatically add None values
-            if tensor is None:
-                corrected_outputs.append(tensor)
-            else:
-                target_dtype = expected_dtypes[i] if i < len(expected_dtypes) else None
-                corrected_outputs.append(cast_dtype_if_needed(tensor, target_dtype))
+    def _execute_sync(
+        self,
+        filtered_inputs: tuple,
+        execution_tensors: tuple,
+        neff_bytes: bytes,
+        device: torch.device,
+    ):
+        """Execute kernel synchronously.
 
-        # Handle None reconstruction if needed
-        if not getattr(self.torch_fn, "use_torch_compile", True) and none_mask and any(none_mask):
-            return self.output_handler.reconstruct_with_none_values(
-                tuple(corrected_outputs), none_mask, False
-            )
+        Args:
+            filtered_inputs: Pre-filtered input tensors
+            execution_tensors: Output tensors for execution
+            neff_bytes: Compiled NEFF bytes
+            device: Target device
+        """
+        # Prepare input/output dictionaries for NEFF execution
+        filtered_input_dict = {f"input{i}": inp for i, inp in enumerate(filtered_inputs)}
+        output_dict = {f"output{i}": out for i, out in enumerate(execution_tensors)}
 
-        return corrected_outputs[0] if len(corrected_outputs) == 1 else tuple(corrected_outputs)
+        # Execute NEFF (uses BaseNeuronKernel.execute_neff)
+        self.execute_neff(neff_bytes, filtered_input_dict, output_dict, op_name=self.op_name)

@@ -4,8 +4,9 @@ import neuronxcc.nki.typing as nt
 import pytest
 import torch
 import torch.fx
+from neuronxcc import nki
 
-from torch_neuronx import nki, nki_op
+from torch_neuronx import nki_op, wrap_nki
 
 
 class TestNKIJitDecorator:
@@ -14,68 +15,7 @@ class TestNKIJitDecorator:
     def test_simple_add_kernel(self):
         """Test a simple addition kernel with @nki.jit."""
 
-        @nki.jit
-        def add_kernel(x1, x2, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
-
-            x1_tile = nl.load(x1[0:128])
-            x2_tile = nl.load(x2[0:128])
-            y_tile = x1_tile + x2_tile
-            nl.store(y[0:128], value=y_tile)
-            return y
-
-        x1 = torch.randn(128, device="neuron")
-        x2 = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
-
-        add_kernel(x1, x2, y)
-
-        expected = x1 + x2
-        assert torch.allclose(y, expected)
-
-    def test_kernel_attributes(self):
-        """Test that @nki.jit adds proper kernel attributes."""
-
-        @nki.jit
-        def test_kernel(x, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
-
-            x_tile = nl.load(x)
-            nl.store(y, value=x_tile)
-            return y
-
-        assert hasattr(test_kernel, "_is_nki_kernel")
-        assert test_kernel._is_nki_kernel is True
-        assert hasattr(test_kernel, "_original_fn")
-
-    def test_scale_kernel(self):
-        """Test scaling kernel with @nki.jit."""
-
-        @nki.jit
-        def scale_kernel(x, y: nt.mutable_tensor, scale):
-            import neuronxcc.nki.language as nl
-
-            x_tile = nl.load(x[0:128])
-            y_tile = x_tile * scale
-            nl.store(y[0:128], value=y_tile)
-            return y
-
-        x = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
-        scale = 3.0
-
-        scale_kernel(x, y, scale)
-
-        expected = x * scale
-        assert torch.allclose(y, expected)
-
-
-class TestNKIOpRegistration:
-    """Test nki_op registration and execution."""
-
-    def test_basic_op_registration(self):
-        """Test basic op registration with in-place mutation."""
-
+        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -97,7 +37,64 @@ class TestNKIOpRegistration:
         nki_add(x1, x2, y)
 
         expected = x1 + x2
-        assert torch.allclose(y, expected)
+        assert torch.allclose(y.cpu(), expected.cpu())
+
+    def test_scale_kernel(self):
+        """Test scaling kernel with @nki.jit."""
+
+        @wrap_nki
+        @nki.jit
+        def scale_kernel(x, y: nt.mutable_tensor, scale):
+            import neuronxcc.nki.language as nl
+
+            x_tile = nl.load(x[0:128])
+            y_tile = x_tile * scale
+            nl.store(y[0:128], value=y_tile)
+            return y
+
+        @nki_op("test::nki_scale", mutates_args={"y"})
+        def nki_scale(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
+            scale_kernel(x, y, scale)
+
+        x = torch.randn(128, device="neuron")
+        y = torch.empty(128, device="neuron")
+        scale = 3.0
+
+        scale_kernel(x, y, scale)
+
+        expected = x * scale
+        assert torch.allclose(y.cpu(), expected.cpu())
+
+
+class TestNKIOpRegistration:
+    """Test nki_op registration and execution."""
+
+    def test_basic_op_registration(self):
+        """Test basic op registration with in-place mutation."""
+
+        @wrap_nki
+        @nki.jit
+        def add_kernel(x1, x2, y: nt.mutable_tensor):
+            import neuronxcc.nki.language as nl
+
+            x1_tile = nl.load(x1[0:128])
+            x2_tile = nl.load(x2[0:128])
+            y_tile = x1_tile + x2_tile
+            nl.store(y[0:128], value=y_tile)
+            return y
+
+        @nki_op("test::nki_add", mutates_args={"y"})
+        def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            add_kernel(x1, x2, y)
+
+        x1 = torch.randn(128, device="neuron")
+        x2 = torch.randn(128, device="neuron")
+        y = torch.empty(128, device="neuron")
+
+        nki_add(x1, x2, y)
+
+        expected = x1 + x2
+        assert torch.allclose(y.cpu(), expected.cpu())
 
     def test_op_appears_in_torch_ops(self):
         """Test that registered op appears in torch.ops namespace."""
@@ -113,11 +110,12 @@ class TestNKIOpRegistration:
         result = torch.ops.test.registry_test.default(x)
         expected = x * 2
 
-        assert torch.allclose(result, expected)
+        assert torch.allclose(result.cpu(), expected.cpu())
 
     def test_different_dtypes(self):
         """Test NKI ops with different data types."""
 
+        @wrap_nki
         @nki.jit
         def copy_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -138,11 +136,12 @@ class TestNKIOpRegistration:
             x = torch.randn(64, device="neuron", dtype=dtype)
 
             result = dtype_test(x)
-            assert torch.equal(result, x)
+            assert torch.equal(result.cpu(), x.cpu())
 
     def test_multiple_ops_in_graph(self):
         """Test multiple NKI ops in the same graph."""
 
+        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -153,6 +152,7 @@ class TestNKIOpRegistration:
             nl.store(y[0:128], value=y_tile)
             return y
 
+        @wrap_nki
         @nki.jit
         def mul_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
@@ -185,11 +185,12 @@ class TestNKIOpRegistration:
         result = combined_fn(x1, x2, scale)
         expected = (x1 + x2) * scale
 
-        assert torch.allclose(result, expected)
+        assert torch.allclose(result.cpu(), expected.cpu())
 
     def test_nki_op_forward_backward(self):
         """Test NKI op with forward and backward pass."""
 
+        @wrap_nki
         @nki.jit
         def add_kernel(x, y, output: nt.mutable_tensor):
             import neuronxcc.nki.language as nl

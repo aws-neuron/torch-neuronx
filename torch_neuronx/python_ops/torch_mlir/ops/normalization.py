@@ -5,12 +5,15 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"])
+@register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"], static_argnums=(1, 4))
 def torch_native_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     return torch.native_layer_norm(input, normalized_shape, weight, bias, eps)
 
 
-@register_aten(["aten::native_layer_norm_backward", "aten::native_layer_norm_backward.out"])
+@register_aten(
+    ["aten::native_layer_norm_backward", "aten::native_layer_norm_backward.out"],
+    static_argnums=(2, 7),
+)
 def torch_native_layer_norm_backward(
     grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
 ):

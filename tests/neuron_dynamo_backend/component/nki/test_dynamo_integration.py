@@ -6,8 +6,9 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 import pytest
 import torch
+from neuronxcc import nki
 
-from torch_neuronx import nki, nki_op
+from torch_neuronx import nki_op, wrap_nki
 
 # Use the test name as a namespace to avoid conflicts
 my_namespace = "TestNKIDyamoIntegration"
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+@wrap_nki
 @nki.jit
 def nki_tensor_add_kernel_(a_input, b_input):
     """NKI kernel for tensor addition"""
@@ -38,6 +40,7 @@ def nki_tensor_add_kernel_(a_input, b_input):
     return c_output
 
 
+@wrap_nki
 @nki.jit
 def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     """NKI kernel that computes multiplication and in_place add"""
@@ -58,6 +61,7 @@ def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     return c_output, a_input
 
 
+@wrap_nki
 @nki.jit
 def nki_scaled_add_inplace(a_input, scale, b_output: nt.mutable_tensor):
     """NKI kernel that computes scaled in_place add"""
@@ -153,6 +157,7 @@ def ref_aliased_with_constant_func(
         return scaled
 
 
+@wrap_nki
 @nki.jit
 def nki_aliased_kernel_with_constant(
     scale: float, out: nt.mutable_tensor, mode: str | None = None, input: torch.Tensor | None = None

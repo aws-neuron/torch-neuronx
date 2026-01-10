@@ -39,7 +39,7 @@ class ArgumentProcessor:
         """Set static_argnums."""
         self._static_argnums = value
 
-    def preprocess_inputs(self, inputs: tuple) -> tuple:
+    def preprocess_inputs(self, inputs: tuple, scalar_to_tensor: bool = False) -> tuple:
         """Preprocess inputs for Neuron compatibility.
 
         Args:
@@ -71,12 +71,16 @@ class ArgumentProcessor:
                 converted.append(TypeConverter.convert_for_neuron(inp))
             # Handle nested structures
             elif isinstance(inp, (list | tuple)):
-                converted.append(self.preprocess_inputs(tuple(inp)))
+                converted.append(self.preprocess_inputs(tuple(inp), scalar_to_tensor))
             elif isinstance(inp, torch.dtype):
                 # Map torch.dtype to ScalarType enum values as defined in
                 # c10/core/ScalarType.h for MLIR lowring
                 scalar_type_int = ArgumentProcessor._get_scalar_type_value(inp)
                 converted.append(scalar_type_int)
+            elif scalar_to_tensor and isinstance(inp, int):
+                converted.append(torch.tensor(inp, dtype=torch.int32, device="neuron"))
+            elif scalar_to_tensor and isinstance(inp, float):
+                converted.append(torch.tensor(inp, dtype=torch.float32, device="neuron"))
             else:
                 # Keep scalars as-is
                 converted.append(inp)

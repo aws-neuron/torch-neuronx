@@ -7,6 +7,7 @@ import torch
 
 from torch_neuronx.python_ops.base import CompilableOpImpl, ExecutionResult
 from torch_neuronx.python_ops.dtype_autocast import autocast_neuron
+from torch_neuronx.python_ops.jax.context import ExecutionContext
 
 from ..jax.handlers import OutputHandler
 from .kernel import TorchMlirKernel
@@ -59,21 +60,19 @@ class TorchMlirOpImpl(CompilableOpImpl):
         Returns:
             ExecutionResult with output tensor(s)
         """
+        exec_context = ExecutionContext(original_inputs=args)
         # Use dtype autocast context
         with autocast_neuron() as context:
-            # Process arguments
-            context.original_inputs = args
+            # Process arguments, excluding output parameters from casting
+            original_kwargs = kwargs
             args, kwargs, _ = context.process_args(args, kwargs, output_params=self.output_params)
 
-            # Check for empty tensors
-            if self._should_handle_empty(args):
-                result = self._handle_empty_tensors(args, kwargs, context)
-                if result is not None:
-                    return ExecutionResult(success=True, output=result)
+            # Validate output dtypes
+            context.validate_output_dtypes(original_kwargs)
 
             # Execute kernel
             try:
-                result = self.kernel(*args, context=context, **kwargs)
+                result = self.kernel(*args, context=exec_context, **kwargs)
 
                 return ExecutionResult(success=True, output=result)
             except Exception as e:

@@ -10,7 +10,11 @@ from torch_mlir import fx
 from torch_mlir import ir as mlir_ir
 from torch_mlir.compiler_utils import OutputType, run_pipeline_with_repro_report
 
-from torch_neuronx.neuron_dynamo_backend.config import get_raw_torch_path, get_transformed_fx_path
+from torch_neuronx.neuron_dynamo_backend.config import (
+    get_err_mlir_path,
+    get_raw_torch_path,
+    get_transformed_fx_path,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     legalize_replica_groups,
 )
@@ -75,6 +79,9 @@ def convert_fx_to_stablehlo(
         raw_path = get_raw_torch_path()
         save_mlir_bytecode(raw_module, raw_path)
         logger.debug(f"Saved RAW Torch module to {raw_path}")
+    raw_module.operation.attributes["torch.debug_dump_path"] = mlir_ir.StringAttr.get(
+        str(get_err_mlir_path()), raw_module.context
+    )
 
     # Custom Neuron RAW lowerings/transformations
     logger.debug("Applying Neuron lowerings/transformations")
