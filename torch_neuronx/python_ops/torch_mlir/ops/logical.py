@@ -82,8 +82,12 @@ def run_bitwise_shift_op(op_name, x, y):
 
     if not isinstance(y, torch.Tensor):
         y = torch.tensor(y)
-    elif not isinstance(x, torch.Tensor):
-        x = torch.full_like(y, x, dtype=torch.int32)
+    if not isinstance(x, torch.Tensor):
+        x = torch.full_like(y, x)
+
+    # Handle scalar tensor broadcasting
+    if x.dim() == 0 and y.dim() > 0:
+        x = x.expand_as(y)
 
     result_dtype = x.dtype
     x = x.to(torch.int32)

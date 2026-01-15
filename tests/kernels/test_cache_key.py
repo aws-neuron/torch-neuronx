@@ -355,6 +355,15 @@ class TestLegacyCacheKeyGeneration:
 class TestCacheKeyGeneration:
     """Test cache key generation for XLA kernels."""
 
+    def setup_method(self):
+        """Set env var to collect compilation stats/metrics"""
+        # Set env var to enable metrics collection
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
+
+    def teardown_method(self):
+        """Reset environment variables."""
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
+
     def test_scalar_values_share_cache_key(self):
         """Test that different runtime scalar values produce the same cache key."""
         torch_neuronx._C._clear_compilation_cache()

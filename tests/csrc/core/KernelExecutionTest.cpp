@@ -425,8 +425,6 @@ TEST_F(KernelExecutionTest, EventKernelDifferentDevices) {
   EXPECT_TRUE(kernel_dev1.IsValid());
 }
 
-// CompileOnlyKernelExecution tests
-
 TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
   std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
   CompileOnlyKernelExecution kernel("base_cache_key", stablehlo_bytes, false);
@@ -541,6 +539,61 @@ TEST_F(KernelExecutionTest, NeffDirectKernelRequiresCompilation) {
 
   // RequiresCompilation returns true to force cache lookup
   EXPECT_TRUE(kernel.RequiresCompilation());
+}
+
+TEST_F(KernelExecutionTest, WriteKernelScalarBoolConstruction) {
+  c10::Scalar scalar_value(true);
+  void* dst_ptr = output_ptrs_[0];
+
+  WriteDirectKernelExecution kernel("write_scalar_bool", scalar_value, dst_ptr, 0,
+                                    c10::ScalarType::Bool, 0);
+
+  EXPECT_EQ(kernel.GetOpName(), "write_scalar_bool");
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, WriteKernelScalarAllIntTypes) {
+  void* dst_ptr = output_ptrs_[0];
+  std::vector<c10::ScalarType> int_types = {
+      c10::ScalarType::Byte,   // uint8
+      c10::ScalarType::Char,   // int8
+      c10::ScalarType::Short,  // int16
+      c10::ScalarType::Int,    // int32
+      c10::ScalarType::Long    // int64
+  };
+
+  for (auto dtype : int_types) {
+    c10::Scalar scalar_value(123);
+    WriteDirectKernelExecution kernel("write_int", scalar_value, dst_ptr, 0, dtype, 0);
+    EXPECT_TRUE(kernel.IsValid()) << "Failed for dtype: " << static_cast<int>(dtype);
+  }
+}
+
+TEST_F(KernelExecutionTest, WriteKernelScalarAllFloatTypes) {
+  void* dst_ptr = output_ptrs_[0];
+  std::vector<c10::ScalarType> float_types = {c10::ScalarType::Half,    // float16
+                                              c10::ScalarType::Float,   // float32
+                                              c10::ScalarType::Double,  // float64
+                                              c10::ScalarType::BFloat16};
+
+  for (auto dtype : float_types) {
+    c10::Scalar scalar_value(1.5);
+    WriteDirectKernelExecution kernel("write_float", scalar_value, dst_ptr, 0, dtype, 0);
+    EXPECT_TRUE(kernel.IsValid()) << "Failed for dtype: " << static_cast<int>(dtype);
+  }
+}
+
+TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
+  void* src_ptr = input_ptrs_[0];
+  void* dst_ptr = output_ptrs_[0];
+  size_t size_bytes = 24;  // 2*3 floats * 4 bytes
+
+  WriteDirectKernelExecution kernel("write_buffer", src_ptr, dst_ptr, 0, size_bytes, 0);
+
+  EXPECT_EQ(kernel.GetOpName(), "write_buffer");
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kWrite);
+  EXPECT_TRUE(kernel.IsValid());
 }
 
 int main(int argc, char** argv) {

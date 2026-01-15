@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-custom_neuron_backend = create_neuron_backend(decompose_all=False)
+custom_neuron_backend = create_neuron_backend()
 
 
 def setup_distributed():

@@ -1,8 +1,9 @@
-"""Gather operation with NKI and XLA implementations"""
+"""Gather operation with NKI, MLIR and XLA implementations"""
 
 import torch
 
 from .base import ExecutionResult, Operation, OperationImplementation
+from .torch_mlir.ops.gather import GatherMLIRImpl, GatherOutMLIRImpl
 
 
 class GatherNKIImpl(OperationImplementation):
@@ -63,6 +64,7 @@ class GatherOp(Operation):
         self._implementations.append(GatherNKIImpl())
         from .xla_ops.gather_xla import GatherXLAImpl
 
+        self._implementations.append(GatherMLIRImpl())
         self._implementations.append(GatherXLAImpl())
 
     @property
@@ -76,6 +78,7 @@ class GatherOutOp(Operation):
     def _setup_implementations(self):
         from .xla_ops.gather_xla import GatherOutXLAImpl
 
+        self._implementations.append(GatherOutMLIRImpl())
         self._implementations.append(GatherOutXLAImpl())
 
     @property

@@ -4,6 +4,7 @@ import torch
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+from torch_neuronx.utils import use_mlir_aten_ops
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -108,6 +109,9 @@ class ContiguousSliceImpl(OperationImplementation):
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
 
+        if self_tensor.is_complex():
+            return False
+
         if memory_format is not None and (
             memory_format != torch.contiguous_format and memory_format != torch.preserve_format
         ):
@@ -132,40 +136,48 @@ class ContiguousSliceImpl(OperationImplementation):
         base_numel = self_tensor.numel() * original_size // shape[slice_axis]
         return base_numel * self_tensor.element_size() < 4 * 1024**3
 
-    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+    def _execute_impl_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using slice kernel."""
-        try:
-            shape = list(self_tensor.shape)
-            strides = list(self_tensor.stride())
-            slice_info = detect_slice_pattern(shape, strides, self_tensor.storage_offset())
+        shape = list(self_tensor.shape)
+        strides = list(self_tensor.stride())
+        slice_info = detect_slice_pattern(shape, strides, self_tensor.storage_offset())
 
-            if slice_info is None:
-                return ExecutionResult(success=False, error_msg="No valid slice pattern detected")
+        if slice_info is None:
+            return ExecutionResult(success=False, error_msg="No valid slice pattern detected")
 
-            slice_axis, original_size, start_offset = slice_info
+        slice_axis, original_size, start_offset = slice_info
 
-            # Create base view with original shape and contiguous strides
-            implied_shape = list(shape)
-            implied_shape[slice_axis] = original_size
-            base_strides = _row_major_strides(implied_shape)
+        # Create base view with original shape and contiguous strides
+        implied_shape = list(shape)
+        implied_shape[slice_axis] = original_size
+        base_strides = _row_major_strides(implied_shape)
 
-            # Calculate the base storage offset (start of the original tensor)
-            base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+        # Calculate the base storage offset (start of the original tensor)
+        base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
 
-            base_view = self_tensor.as_strided(
-                size=tuple(implied_shape),
-                stride=tuple(base_strides),
-                storage_offset=base_storage_offset,
-            )
+        base_view = self_tensor.as_strided(
+            size=tuple(implied_shape),
+            stride=tuple(base_strides),
+            storage_offset=base_storage_offset,
+        )
 
-            end_offset = start_offset + shape[slice_axis]
-            kernel = self._get_kernel()
+        end_offset = start_offset + shape[slice_axis]
+        kernel = self._get_kernel()
 
+        if use_mlir_aten_ops():
+            output = kernel(base_view, slice_axis, start_offset, end_offset)
+        else:
             from .jax.context import ExecutionContext
 
             exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
             output = kernel(base_view, slice_axis, start_offset, end_offset, context=exec_ctx)
 
+        return output
+
+    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute the operation without autograd support"""
+        try:
+            output = self._execute_impl_internal(self_tensor, memory_format=memory_format)
             if not output.is_contiguous():
                 return ExecutionResult(
                     success=False,
@@ -202,8 +214,6 @@ class ContiguousSliceJAXImpl(ContiguousSliceImpl):  # lower priority than Contig
     _kernel: JaxKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)
@@ -232,8 +242,6 @@ class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than Conti
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if not use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)

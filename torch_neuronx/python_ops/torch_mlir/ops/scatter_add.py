@@ -27,19 +27,15 @@ class ScatterAddMLIRImpl(TorchMlirOpImpl):
         )
         self.op_variant = op_variant
 
-    def _handle_empty_tensors(self, args, kwargs, context):
-        """Handle empty tensor cases for scatter_add"""
-        input = args[0]
-        if self.op_variant == "scatter_add_":
-            return input
-        elif self.op_variant == "scatter_add.out":
-            out = kwargs.get("out")
-            if out is not None:
-                out.copy_(input)
-                return out
-            return input.clone()
-        else:
-            return input.clone()
+    def can_handle(self, input, dim, index, src, out=None) -> bool:
+        from torch_neuronx.utils import use_mlir_aten_ops
+
+        return (
+            use_mlir_aten_ops()
+            and input.device.type == "neuron"
+            and index.device.type == "neuron"
+            and src.device.type == "neuron"
+        )
 
     def execute(self, *args, **kwargs):
         if self.op_variant == "scatter_add_":

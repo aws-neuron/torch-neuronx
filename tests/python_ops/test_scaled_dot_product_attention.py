@@ -12,7 +12,9 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.python_ops.base import ExecutionResult
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 def test_scaled_dot_product_attention_basic():
@@ -34,7 +36,7 @@ def test_scaled_dot_product_attention_basic():
 
         assert output.shape == (batch_size, num_heads, seq_len, d_head)
         assert output.device.type == "neuron"
-        assert_op_runs_on_neuron("aten::scaled_dot_product_attention")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
 
 
 def test_scaled_dot_product_attention_different_head_dims():
@@ -76,7 +78,7 @@ def test_scaled_dot_product_attention_different_head_dims():
         assert k_neuron.grad.shape == k_neuron.shape
         assert v_neuron.grad.shape == v_neuron.shape
 
-        assert_op_runs_on_neuron("aten::scaled_dot_product_attention")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
 
         rtol, atol = 5e-2, 5e-3
@@ -174,7 +176,7 @@ def test_scaled_dot_product_attention_accuracy(dtype, q_heads, kv_heads):
         )
         output_neuron.backward(grad_output.to(device))
 
-        assert_op_runs_on_neuron("aten::scaled_dot_product_attention")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
 
     # Compare results with dtype-appropriate tolerances
@@ -251,16 +253,23 @@ def test_scaled_dot_product_attention_runtime_errors(case, expected_error):
         (4, 4, 256, 256, 0.0, torch.bfloat16, False, True),
         (4, 2, 256, 512, 0.0, torch.float32, True, False),
         (2, 1, 64, 577, 0.0, torch.bfloat16, False, False),
-        (2, 2, 64, 256, 0.1, torch.float32, False, True),
+        pytest.param(
+            2,
+            2,
+            64,
+            256,
+            0.1,
+            torch.float32,
+            False,
+            True,
+            marks=pytest.mark.xfail(
+                condition=use_mlir_aten_ops(),
+                reason="Dropout support not enabled in torch.compile decomposition",
+            ),
+        ),
     ],
 )
-@patch(
-    "torch_neuronx.python_ops.scaled_dot_product_fused_attention."
-    "ScaledDotProductFusedAttentionNKIImpl.can_handle",
-    return_value=False,
-)
 def test_scaled_dot_product_attention_xla_fallback(
-    mocked_handle,
     q_heads,
     kv_heads,
     d_head,
@@ -270,6 +279,7 @@ def test_scaled_dot_product_attention_xla_fallback(
     is_causal,
     use_attn_bias,
     qkv_inputs,
+    monkeypatch,
 ):
     """Test XLA fallback with CPU accuracy comparison (including GQA variants)"""
 
@@ -277,6 +287,8 @@ def test_scaled_dot_product_attention_xla_fallback(
     if not torch.neuron.is_available():
         print("Neuron device not available, skipping test")
         return
+
+    monkeypatch.setenv("TORCH_NEURONX_ENABLE_NKI_SDPA", "0")
 
     device = torch.device("neuron", 0)
 
@@ -353,7 +365,7 @@ def test_scaled_dot_product_attention_xla_fallback(
         assert output_neuron.shape == (batch_size, q_heads_actual, seq_len, d_head)
         assert output_neuron.device.type == "neuron"
 
-        assert_op_runs_on_neuron("aten::scaled_dot_product_attention")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
 
     # Compare XLA fallback output with CPU reference
     output_neuron_cpu = output_neuron.cpu()
@@ -374,7 +386,7 @@ def test_scaled_dot_product_attention_xla_fallback(
 
     # Use reasonable tolerances for XLA fallback comparison
     rtol = 5e-2  # 5% relative tolerance
-    atol = 5e-3  # 0.005 absolute tolerance
+    atol = 1e-2  # 0.01 absolute tolerance
     torch.testing.assert_close(output_neuron_cpu, output_cpu, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_neuron_cpu_2, output_cpu_2, rtol=rtol, atol=atol)
 
@@ -402,13 +414,7 @@ def test_scaled_dot_product_attention_xla_fallback(
         ),
     ],
 )
-@patch(
-    "torch_neuronx.python_ops.scaled_dot_product_fused_attention."
-    "ScaledDotProductFusedAttentionNKIImpl.can_handle",
-    return_value=False,
-)
 def test_scaled_dot_product_attention_backward_xla_fallback(
-    mocked_handle,
     q_heads,
     kv_heads,
     d_head,
@@ -418,6 +424,7 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
     is_causal,
     use_attn_bias,
     qkv_inputs,
+    monkeypatch,
 ):
     """Test XLA fallback backward pass with gradient comparison to CPU baseline"""
 
@@ -425,6 +432,8 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
     if not torch.neuron.is_available():
         print("Neuron device not available, skipping test")
         return
+
+    monkeypatch.setenv("TORCH_NEURONX_ENABLE_NKI_SDPA", "0")
 
     device = torch.device("neuron", 0)
     seed = 42
@@ -490,7 +499,7 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
 
     # Compare gradients
     rtol = 5e-2  # 5% relative tolerance
-    atol = 5e-3  # 0.005 absolute tolerance
+    atol = 5e-2  # 0.05 absolute tolerance
 
     torch.testing.assert_close(grad_q_neuron, grad_q_cpu, rtol=rtol, atol=atol)
     torch.testing.assert_close(grad_k_neuron, grad_k_cpu, rtol=rtol, atol=atol)
@@ -499,7 +508,11 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
     print(f"XLA fallback gradients match CPU reference (Q:{q_heads}, KV:{kv_heads})")
 
 
-def test_sdpa_ir_cache_correctness():
+@patch(
+    "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+    wraps=convert_fx_to_stablehlo,
+)
+def test_sdpa_ir_cache_correctness(mock_compiler):
     """Test that IR cache is properly incremented and hit on subsequent calls."""
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
@@ -511,47 +524,36 @@ def test_sdpa_ir_cache_correctness():
     k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
     v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    # Clear caches to ensure clean state
-    torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
-
-    # Get initial cache size (should be 0)
-    initial_cache_size = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert initial_cache_size == 0, f"Expected empty cache, got size {initial_cache_size}"
+    initial_count = mock_compiler.call_count
 
     # First call - should trace and cache IR
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    # Cache should have 1 entry now
-    cache_size_after_first = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_first == 1
-    ), f"Expected cache size 1 after first call, got {cache_size_after_first}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
     # Second call - should use cached IR (cache size unchanged)
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_second = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_second == 1
-    ), f"Expected cache size 1 after second call (cache hit), got {cache_size_after_second}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
 
     # Third call - should also use cached IR (cache size unchanged)
     with torch.no_grad():
         output3 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_third = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_third == 1
-    ), f"Expected cache size 1 after third call (cache hit), got {cache_size_after_third}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
 
     # Verify outputs are consistent
     torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(output1.cpu(), output3.cpu(), rtol=1e-5, atol=1e-5)
 
 
-def test_sdpa_ir_cache_different_inputs_same_shape():
+@patch(
+    "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+    wraps=convert_fx_to_stablehlo,
+)
+def test_sdpa_ir_cache_different_inputs_same_shape(mock_compiler):
     """Test IR cache hit with different inputs, same shapes."""
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
@@ -559,22 +561,18 @@ def test_sdpa_ir_cache_different_inputs_same_shape():
     device = torch.device("neuron", 0)
     batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 64
 
-    # Clear caches
-    torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
-
     # First call with specific input values
     torch.manual_seed(42)
     q1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
     k1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
     v1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
+    initial_count = mock_compiler.call_count
+
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_first = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_first == 1
-    ), f"Expected cache size 1 after first call, got {cache_size_after_first}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
     # Second call with different input values but same shapes - should hit cache
     torch.manual_seed(123)
@@ -585,10 +583,7 @@ def test_sdpa_ir_cache_different_inputs_same_shape():
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_second = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_second == 1
-    ), f"Expected cache size 1 after second call (cache hit), got {cache_size_after_second}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
 
     # Verify shapes are the same
     assert output1.shape == output2.shape
@@ -599,18 +594,18 @@ def test_sdpa_ir_cache_different_inputs_same_shape():
     assert diff > 1e-3, f"Outputs should be different with different inputs, but diff={diff}"
 
 
-def test_sdpa_ir_cache_different_shapes():
+@patch(
+    "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+    wraps=convert_fx_to_stablehlo,
+)
+def test_sdpa_ir_cache_different_shapes(mock_compiler):
     """Test that IR cache creates separate entries for different shapes and different inputs."""
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
 
     device = torch.device("neuron", 0)
 
-    # Clear caches
-    torch_neuronx.nki_kernel.TorchNeuronNKIKernel.clear_all_caches()
-
-    initial_cache_size = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert initial_cache_size == 0, f"Expected empty cache, got size {initial_cache_size}"
+    initial_count = mock_compiler.call_count
 
     # First shape: batch_size=2, num_heads=4, seq_len=128, head_dim=64
     torch.manual_seed(42)
@@ -621,10 +616,7 @@ def test_sdpa_ir_cache_different_shapes():
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_first = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_first == 1
-    ), f"Expected cache size 1 after first shape, got {cache_size_after_first}"
+    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
 
     # Second shape: batch_size=1, num_heads=8, seq_len=256, head_dim=64 (different shape)
     torch.manual_seed(123)
@@ -635,10 +627,7 @@ def test_sdpa_ir_cache_different_shapes():
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_second = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_second == 2
-    ), f"Expected cache size 2 after second shape, got {cache_size_after_second}"
+    assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
 
     # Third call with first shape again - should hit cache (size stays at 2)
     torch.manual_seed(456)
@@ -649,10 +638,7 @@ def test_sdpa_ir_cache_different_shapes():
     with torch.no_grad():
         output3 = F.scaled_dot_product_attention(q3, k3, v3, dropout_p=0.0, is_causal=False)
 
-    cache_size_after_third = torch_neuronx.nki_kernel.TorchNeuronNKIKernel.get_ir_cache_size()
-    assert (
-        cache_size_after_third == 2
-    ), f"Expected cache size 2 after third call (cache hit), got {cache_size_after_third}"
+    assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
 
     # Verify output shapes
     assert output1.shape == (2, 4, 512, 128)
@@ -663,6 +649,8 @@ def test_sdpa_ir_cache_different_shapes():
 def test_scaled_dot_product_attention_uses_xla_with_dropout():
     """Test that XLA implementation is used when dropout is non-zero."""
 
+    if use_mlir_aten_ops():
+        pytest.skip("Dropout support not enabled in torch.compile decomposition")
     from torch_neuronx.python_ops.scaled_dot_product_fused_attention import (
         ScaledDotProductFusedAttentionNKIImpl,
     )

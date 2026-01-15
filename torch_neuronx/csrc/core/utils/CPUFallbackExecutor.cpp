@@ -339,7 +339,17 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
       continue;
     }
 
-    // Check if this argument is provided as a kwarg
+    // Check if this argument is provided as a tensor kwarg
+    if (op && fallback_ctx.IsKwargTensor(arg_name)) {
+      // Tensor kwarg - get from cpu_inputs at the appropriate index
+      size_t kwarg_tensor_idx = fallback_ctx.GetKwargTensorIndex(arg_name);
+      TORCH_CHECK(kwarg_tensor_idx < cpu_inputs.size(), "Missing CPU input for tensor kwarg '",
+                  arg_name, "'");
+      stack.emplace_back(cpu_inputs[kwarg_tensor_idx]);
+      continue;
+    }
+
+    // Check if this argument is provided as a scalar kwarg
     if (op && !fallback_ctx.original_kwargs.empty() &&
         fallback_ctx.original_kwargs.contains(arg_name)) {
       const auto& kwarg_value = fallback_ctx.original_kwargs.at(arg_name);
@@ -347,47 +357,34 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
       continue;
     }
 
-    // Get original input from context
-    if (op && arg_pos < fallback_ctx.original_inputs.size()) {
-      const auto& original_input = fallback_ctx.original_inputs[arg_pos];
+    // Get input from metadata at this position
+    if (op && arg_pos < fallback_ctx.input_metadata.size()) {
+      const auto& input_meta = fallback_ctx.input_metadata[arg_pos];
+      const auto& arg_type = arg.type();
 
-      if (original_input.isTensor()) {
-        // Tensor input - use transferred CPU tensor
+      if (IsTensor(input_meta)) {
         TORCH_CHECK(cpu_input_idx < cpu_inputs.size(), "Missing CPU input for tensor '", arg_name,
                     "' at position ", arg_pos);
         stack.emplace_back(cpu_inputs[cpu_input_idx++]);
-      } else if (original_input.isTensorList()) {
-        // Tensor list - need to transfer each tensor to CPU
-        auto neuron_tensor_list = original_input.toTensorList();
+      } else if (IsTensorList(input_meta)) {
+        size_t list_count = GetListSize(input_meta);
         c10::List<at::Tensor> cpu_tensor_list;
-        for (size_t i = 0; i < neuron_tensor_list.size(); ++i) {
+        for (size_t i = 0; i < list_count; ++i) {
           TORCH_CHECK(cpu_input_idx < cpu_inputs.size(),
                       "Missing CPU input for tensor list element at position ", arg_pos, "[", i,
                       "]");
           cpu_tensor_list.push_back(cpu_inputs[cpu_input_idx++]);
         }
         stack.emplace_back(cpu_tensor_list);
-      } else {
-        // Scalar input - check if schema expects a Tensor
-        const auto& arg_type = arg.type();
-        if (arg_type->kind() == c10::TypeKind::TensorType) {
-          // Schema expects Tensor but we have scalar - convert it
-          torch::Tensor scalar_tensor;
-          if (original_input.isInt()) {
-            scalar_tensor = torch::tensor(original_input.toInt(), torch::kCPU);
-          } else if (original_input.isDouble()) {
-            scalar_tensor = torch::tensor(original_input.toDouble(), torch::kCPU);
-          } else if (original_input.isBool()) {
-            scalar_tensor = torch::tensor(original_input.toBool(), torch::kCPU);
-          } else {
-            // Unsupported scalar type - use as-is and let PyTorch handle it
-            stack.emplace_back(original_input);
-            continue;
-          }
-          stack.emplace_back(scalar_tensor);
+      } else if (IsScalar(input_meta)) {
+        const auto& scalar_val = GetScalarValue(input_meta);
+        // Check if schema expects a Tensor but we have a scalar
+        if (arg_type->kind() == c10::TypeKind::TensorType && scalar_val.isScalar()) {
+          // Convert scalar to tensor
+          stack.emplace_back(torch::scalar_tensor(scalar_val.toScalar(), torch::kCPU));
         } else {
-          // Schema expects scalar - use directly from original_inputs
-          stack.emplace_back(original_input);
+          // Use the IValue directly (handles None, int, double, bool, lists, etc.)
+          stack.emplace_back(scalar_val);
         }
       }
     } else if (arg.default_value().has_value()) {

@@ -38,6 +38,8 @@
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/streams/StreamManager.h"
+// Metrics
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 // Copy helpers
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
 // Operation execution
@@ -274,7 +276,7 @@ void neuron_init() {
   {
     int actual_devices = c10_neuron::device_count();
     const auto max_representable = std::numeric_limits<c10::DeviceIndex>::max();
-    if (actual_devices > static_cast<int>(max_representable)) {
+    if (actual_devices > static_cast<int>(max_representable) + 1) {
       std::stringstream ss;
       ss << "Detected " << actual_devices
          << " Neuron devices (virtual neuron cores), but PyTorch's DeviceIndex"
@@ -483,6 +485,8 @@ at::Tensor call_python_contiguous_op(const at::Tensor& self, c10::MemoryFormat m
 
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // Initialize the logger
+  torch_neuronx::NeuronLogger::getInstance();
   // Register transformations explicitly (static initializer may not run)
   c10_neuron::lazy::RegisterTransformations();
 
@@ -566,12 +570,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
         if (!at::neuron::utils::IsSyncModeEnabled()) {
           void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), dst_offset);
-          auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
-              "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, dst_offset, size, device_id);
+
+          std::unique_ptr<at::neuron::WriteDirectKernelExecution> write_kernel;
+          bool needs_sync = !non_blocking;
+
+          if (src.numel() == 1) {
+            // Scalar path - value captured inline, no sync needed
+            write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+                "neuron::copy::cpu_to_neuron_scalar", src.item(), dst_ptr, dst_offset,
+                src.scalar_type(), device_id);
+            needs_sync = false;
+          } else {
+            // Buffer path
+            write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+                "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, dst_offset, size, device_id);
+          }
+
           auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
-          auto current_stream = at::neuron::getCurrentNeuronStream(device_id);
-          at::neuron::SubmitOperationContext(current_stream, std::move(context));
-          if (!non_blocking) {
+          at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(device_id),
+                                             std::move(context));
+          if (needs_sync) {
             at::neuron::synchronize(device_id);
           }
           return;
@@ -1004,23 +1022,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "_get_compilation_cache_stats",
       []() -> py::dict {
         auto& cache = at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
-        auto stats = cache.GetStatistics();
+        auto* metrics_arena = at::neuron::metrics::NeuronMetricsArena::Get();
 
         py::dict result;
-        result["total_entries"] = stats.total_entries;
-        result["cache_hits"] = stats.cache_hits;
-        result["cache_misses"] = stats.cache_misses;
-        result["hit_rate"] = stats.hit_rate;
-        result["memory_usage_bytes"] = stats.memory_usage_bytes;
-        result["total_compilation_time_ms"] = stats.total_compilation_time.count();
-        result["evictions_performed"] = stats.evictions_performed;
-        result["max_cache_size_bytes"] = stats.max_cache_size_bytes;
-        result["max_cache_entries"] = stats.max_cache_entries;
-        result["memory_utilization_ratio"] = stats.memory_utilization_ratio;
 
+        // Get counter values from centralized metrics
+        auto hits_data = metrics_arena->GetCounter("CompilationCache.Hits");
+        auto misses_data = metrics_arena->GetCounter("CompilationCache.Misses");
+        auto evictions_data = metrics_arena->GetCounter("CompilationCache.Evictions");
+        auto total_compilations_data =
+            metrics_arena->GetCounter("CompilationCache.TotalCompilations");
+
+        int64_t cache_hits = hits_data ? hits_data->Value() : 0;
+        int64_t cache_misses = misses_data ? misses_data->Value() : 0;
+        int64_t evictions = evictions_data ? evictions_data->Value() : 0;
+        int64_t total_compilations = total_compilations_data ? total_compilations_data->Value() : 0;
+
+        // Get metric data for timing and memory
+        auto compilation_time_metric = metrics_arena->GetMetric("CompilationCache.CompilationTime");
+        auto memory_usage_metric = metrics_arena->GetMetric("CompilationCache.MemoryUsage");
+
+        double total_compilation_time_us = 0.0;
+        size_t total_samples = 0;
+        if (compilation_time_metric) {
+          compilation_time_metric->Samples(&total_compilation_time_us, &total_samples);
+        }
+
+        double memory_usage_bytes = 0.0;
+        size_t memory_samples = 0;
+        if (memory_usage_metric) {
+          memory_usage_metric->Samples(&memory_usage_bytes, &memory_samples);
+        }
+
+        // Calculate derived statistics
+        int64_t total_requests = cache_hits + cache_misses;
+        double hit_rate = total_requests > 0 ? (double)cache_hits / total_requests : 0.0;
+
+        // Get cache configuration (these are still stored in the cache object)
+        size_t max_cache_size_bytes = cache.GetMaxCacheSizeBytes();
+        size_t max_cache_entries = cache.GetMaxCacheEntries();
+
+        // Get current memory usage from cache directly
+        size_t current_memory_usage = cache.GetMemoryUsageBytes();
+        double memory_utilization_ratio =
+            max_cache_size_bytes > 0 ? (double)current_memory_usage / max_cache_size_bytes : 0.0;
+
+        // Populate result dictionary
+        result["total_entries"] = total_compilations;
+        result["cache_hits"] = cache_hits;
+        result["cache_misses"] = cache_misses;
+        result["hit_rate"] = hit_rate;
+        result["memory_usage_bytes"] = current_memory_usage;
+        result["total_compilation_time_ms"] =
+            total_compilation_time_us / 1000.0;  // Convert µs to ms
+        result["evictions_performed"] = evictions;
+        result["max_cache_size_bytes"] = max_cache_size_bytes;
+        result["max_cache_entries"] = max_cache_entries;
+        result["memory_utilization_ratio"] = memory_utilization_ratio;
         return result;
       },
-      "Get compilation cache statistics");
+      "Get compilation cache statistics from metrics arena");
 
   m.def(
       "_clear_compilation_cache",
@@ -1029,6 +1090,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         cache.Clear();
       },
       "Clear the compilation cache");
+
+  m.def(
+      "_get_compilation_cache_entries",
+      []() -> py::list {
+        auto& cache = at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
+        auto entries = cache.GetCacheEntries();
+
+        py::list result;
+        for (const auto& entry : entries) {
+          py::dict d;
+          d["cache_key"] = entry.cache_key;
+          d["neff_size_bytes"] = entry.neff_size_bytes;
+          d["access_count"] = entry.access_count;
+          d["compilation_time_ms"] = entry.compilation_time.count();
+          result.append(d);
+        }
+        return result;
+      },
+      "Get compilation cache entries with per-graph compilation times, for torch.compile graph "
+      "metrics tracking");
 
   m.def(
       "_get_all_cache_keys",
@@ -1042,6 +1123,98 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return result;
       },
       "Get all cache keys");
+
+  // ============================================================================
+  // Metrics Bindings
+  // ============================================================================
+
+  m.def(
+      "_neuron_counter_names",
+      []() { return at::neuron::metrics::NeuronMetricsArena::Get()->GetCounterNames(); },
+      "Get list of all counter names that have data");
+
+  m.def(
+      "_neuron_counter_value",
+      [](const std::string& name) -> py::object {
+        auto* data = at::neuron::metrics::NeuronMetricsArena::Get()->GetCounter(name);
+        return data != nullptr ? py::cast<int64_t>(data->Value()) : py::none();
+      },
+      "Get the value of a specific counter");
+
+  m.def(
+      "_neuron_metric_names",
+      []() { return at::neuron::metrics::NeuronMetricsArena::Get()->GetMetricNames(); },
+      "Get list of all metric names that have data");
+
+  m.def(
+      "_neuron_metric_data",
+      [](const std::string& name) -> py::object {
+        auto* data = at::neuron::metrics::NeuronMetricsArena::Get()->GetMetric(name);
+        if (data == nullptr) {
+          return py::none();
+        }
+
+        double accumulator = 0.0;
+        size_t total_samples = 0;
+        auto samples = data->Samples(&accumulator, &total_samples);
+
+        py::dict result;
+        result["accumulator"] = accumulator;
+        result["total_samples"] = total_samples;
+        result["repr"] = data->Repr(accumulator);
+
+        py::list sample_list;
+        for (const auto& sample : samples) {
+          py::dict sample_dict;
+          sample_dict["timestamp_ns"] = sample.timestamp_ns;
+          sample_dict["value"] = sample.value;
+          sample_list.append(sample_dict);
+        }
+        result["samples"] = sample_list;
+
+        return result;
+      },
+      "Get detailed data for a specific metric");
+
+  m.def(
+      "_neuron_metrics_report", []() { return at::neuron::metrics::CreateMetricReport(); },
+      "Generate a comprehensive metrics report");
+
+  m.def(
+      "_neuron_metrics_report_filtered",
+      [](const py::list& counter_names, const py::list& metric_names) {
+        std::vector<std::string> counter_vec;
+        std::vector<std::string> metric_vec;
+
+        for (auto& counter : counter_names) {
+          counter_vec.push_back(counter.cast<std::string>());
+        }
+        for (auto& metric : metric_names) {
+          metric_vec.push_back(metric.cast<std::string>());
+        }
+
+        return at::neuron::metrics::CreateMetricReport(counter_vec, metric_vec);
+      },
+      "Generate a filtered metrics report with specific counters and metrics");
+
+  m.def(
+      "_neuron_clear_counters",
+      []() { at::neuron::metrics::NeuronMetricsArena::Get()->ClearCounters(); },
+      "Clear all counter values");
+
+  m.def(
+      "_neuron_clear_metrics",
+      []() { at::neuron::metrics::NeuronMetricsArena::Get()->ClearMetrics(); },
+      "Clear all metric data");
+
+  m.def(
+      "_neuron_metrics_enabled", []() { return at::neuron::metrics::IsMetricsEnabled(); },
+      "Check if metrics collection is enabled");
+
+  m.def(
+      "_neuron_set_metrics_enabled",
+      [](bool enabled) { at::neuron::metrics::SetMetricsEnabled(enabled); },
+      "Enable or disable metrics collection at runtime", py::arg("enabled"));
 
   m.def(
       "_submit_xla_task_to_pipeline",

@@ -1,5 +1,6 @@
 #include "KernelExecution.h"
 
+#include <c10/core/DynamicCast.h>
 #include <sys/mman.h>
 
 #include <algorithm>
@@ -330,16 +331,41 @@ WriteDirectKernelExecution::WriteDirectKernelExecution(const std::string& op_nam
       dst_offset_bytes_(dst_offset_bytes),
       dst_size_bytes_(dst_size_bytes) {}
 
+WriteDirectKernelExecution::WriteDirectKernelExecution(const std::string& op_name,
+                                                       const c10::Scalar& scalar_value,
+                                                       void* dst_ptr, size_t dst_offset_bytes,
+                                                       c10::ScalarType dtype, int device_id)
+    : NeuronKernelExecutionTyped<KernelTypeEnum::kWrite, c10::DeviceType::CPU,
+                                 c10::DeviceType::PrivateUse1>(op_name, {}, {dst_ptr}, device_id),
+      dst_offset_bytes_(dst_offset_bytes),
+      dst_size_bytes_(static_cast<size_t>(elementSize(dtype))) {
+  if (scalar_value.isComplex()) {
+    c10::cast_and_store<c10::complex<double>>(dtype, inline_buffer_,
+                                              scalar_value.toComplexDouble());
+  } else if (scalar_value.isFloatingPoint()) {
+    c10::cast_and_store<double>(dtype, inline_buffer_, scalar_value.toDouble());
+  } else if (scalar_value.isIntegral(/*includeBool=*/false)) {
+    c10::cast_and_store<int64_t>(dtype, inline_buffer_, scalar_value.toLong());
+  } else if (scalar_value.isBoolean()) {
+    c10::cast_and_store<bool>(dtype, inline_buffer_, scalar_value.toBool());
+  } else {
+    throw std::runtime_error("Unsupported scalar type for inline write");
+  }
+}
+
 bool WriteDirectKernelExecution::ValidateImpl() const { return dst_size_bytes_ > 0; }
 
 void WriteDirectKernelExecution::Execute() const {
-  void* src_data_ptr = GetSrcDataPtrs()[0];
   nrt_tensor_t* dst_data_ptr = GetDstDataPtrs()[0];
+  auto src_data_ptrs = GetSrcDataPtrs();
+  void* src_data_ptr =
+      src_data_ptrs.size() == 0 ? const_cast<uint8_t*>(inline_buffer_) : src_data_ptrs[0];
+
   NRT_STATUS status =
       nrt::WriteTensor(dst_data_ptr, src_data_ptr, dst_offset_bytes_, dst_size_bytes_);
   if (status != NRT_SUCCESS) {
-    std::string error_msg = "Failed to write tensor data. Status: " + std::to_string(status);
-    throw torch_neuronx::ExecutionRuntimeException(error_msg, status);
+    throw torch_neuronx::ExecutionRuntimeException(
+        "Failed to write tensor data. Status: " + std::to_string(status), status);
   }
 }
 

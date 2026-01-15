@@ -11,7 +11,6 @@ from jax._src.typing import Array, ArrayLike
 from jax._src.util import safe_zip
 
 from torch_neuronx.kernels.xla_kernel import TorchNeuronXLAKernel
-from torch_neuronx.python_ops.auto_registration import neuron_op
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
 
 logger = logging.getLogger(__name__)
@@ -75,8 +74,6 @@ def safe_nonzero(
     return out, mask.sum()
 
 
-@neuron_op("aten::nonzero")
-@neuron_op("aten::nonzero.out")
 class NonzeroXLAImpl(OperationImplementation):
     """nonzero implementation using XLA"""
 
@@ -141,8 +138,6 @@ class NonzeroXLAImpl(OperationImplementation):
             return ExecutionResult(success=False, error_msg=str(e))
 
 
-@neuron_op("aten::nonzero_static")
-@neuron_op("aten::nonzero_static.out")
 class NonzeroStaticXLAImpl(OperationImplementation):
     """nonzero_static implementation using XLA"""
 

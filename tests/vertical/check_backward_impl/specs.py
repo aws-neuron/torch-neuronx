@@ -87,7 +87,7 @@ class ScaledDotProductFusedAttentionOverrideableOpSpec(OpSpecBase):
     )
 
     def expected_neuron_op(self, *args, **kwargs) -> str | None:
-        return ["aten::scaled_dot_product_attention"]
+        return ["aten::_scaled_dot_product_fused_attention_overrideable"]
 
 
 @register_spec(vertical_test="CheckBackwardImplTest")

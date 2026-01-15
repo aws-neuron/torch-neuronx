@@ -545,3 +545,76 @@ class TestConcat:
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
         assert out_neuron.shape == torch.Size([15])
         assert out_neuron.dtype == torch.float32
+
+    def test_concat_rotary_embedding(self):
+        """Test concat for rotary embeddings with non-contiguous inputs"""
+
+        device = "neuron"
+        x = torch.randn(1, 2048, 8, 128)
+        x_neuron = x.to(device)
+
+        # Split and concat on CPU
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        out_cpu = torch.cat((-x2, x1), dim=-1)
+
+        with track_neuron_ops():
+            x1_neuron = x_neuron[..., : x_neuron.shape[-1] // 2]
+            x2_neuron = x_neuron[..., x_neuron.shape[-1] // 2 :]
+            out_neuron = torch.cat((-x2_neuron, x1_neuron), dim=-1)
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+
+    def test_concat_rotary_embedding_transpose(self):
+        """Test concat for rotary embeddings with non-contiguous transposed inputs"""
+
+        device = "neuron"
+        x = torch.randn(1, 8, 2048, 128)
+        x_neuron = x.to(device)
+        x_neuron = x_neuron.transpose(1, 2)
+        x = x.transpose(1, 2)
+
+        # Split and concat on CPU
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        out_cpu = torch.cat((-x2, x1), dim=-1)
+
+        with track_neuron_ops():
+            x1_neuron = x_neuron[..., : x_neuron.shape[-1] // 2]
+            x2_neuron = x_neuron[..., x_neuron.shape[-1] // 2 :]
+            out_neuron = torch.cat((-x2_neuron, x1_neuron), dim=-1)
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+
+    def test_concat_rotary_embedding_mul(self):
+        """Test concat for rotary embeddings with transposed inputs followed by matmul"""
+
+        device = "neuron"
+        x = torch.randn(1, 8, 2048, 128)
+        cos = torch.randn(1, 2048, 1, 128)
+        sin = torch.randn(1, 2048, 1, 128)
+        x_neuron = x.to(device)
+        cos_neuron = cos.to(device)
+        sin_neuron = sin.to(device)
+
+        x_neuron = x_neuron.transpose(1, 2)
+        x = x.transpose(1, 2)
+
+        # Split and concat on CPU
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        cat = torch.cat((-x2, x1), dim=-1)
+        out_cpu = x * cos
+        out_cpu += cat * sin
+
+        with track_neuron_ops():
+            x1_neuron = x_neuron[..., : x_neuron.shape[-1] // 2]
+            x2_neuron = x_neuron[..., x_neuron.shape[-1] // 2 :]
+            cat_neuron = torch.cat((-x2_neuron, x1_neuron), dim=-1)
+            out_neuron = x_neuron * cos_neuron
+            out_neuron += cat_neuron * sin_neuron
+            assert_op_runs_on_neuron("aten::cat")
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)

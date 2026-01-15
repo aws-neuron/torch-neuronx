@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 class TestIndexSelect:
@@ -69,7 +71,12 @@ class TestIndexSelect:
 
         torch.index_select(input.to(device), dim=0, index=indices.to(device))
 
-    @assert_raises(ValueError, match="indices must have an integer type")
+    @assert_raises(
+        TypeError if use_mlir_aten_ops() else ValueError,
+        match=re.escape("index_select(): Expected dtype int32 or int64 for index")
+        if use_mlir_aten_ops()
+        else "indices must have an integer type",
+    )
     def test_index_select_with_index_dtype_float(self):
         """Test index select with index dtype float"""
         device = "neuron"
@@ -81,7 +88,12 @@ class TestIndexSelect:
         # This triggers CPU fallback which fails with RuntimeError about dtype
         torch.index_select(input_neuron, dim=0, index=indices.to(device))
 
-    @assert_raises(IndexError, match="index_select\\(\\): Expected 1-D index tensor, got dim=2")
+    @assert_raises(
+        IndexError,
+        match=re.escape("index_select(): Index is supposed to be a vector")
+        if use_mlir_aten_ops()
+        else re.escape("index_select(): Expected 1-D index tensor, got dim=2"),
+    )
     def test_index_select_with_incorrect_indices_size(self):
         """Test index select with incorrect indices size"""
         device = "neuron"

@@ -11,14 +11,18 @@ import torch
 class DtypeAutocastContext:
     """Context for handling unsupported dtypes (float64, int64) on Neuron hardware"""
 
-    def __init__(self, cast_float64: bool = True, cast_int64: bool = True):
+    def __init__(
+        self, cast_float64: bool = True, cast_int64: bool = True, cast_dtype_params: bool = False
+    ):
         """
         Args:
             cast_float64: If True, cast float64 to float32
             cast_int64: If True, cast int64 to int32
+            cast_dtype_params: If True, cast dtype parameters
         """
         self.cast_float64 = cast_float64
         self.cast_int64 = cast_int64
+        self.cast_dtype_params = cast_dtype_params
 
         # Track which dtypes we had in inputs (for restoration)
         self.had_float64 = False
@@ -64,6 +68,12 @@ class DtypeAutocastContext:
                 else:
                     new_value.append(v)
             return type(value)(new_value), had_float64, had_int64
+        elif isinstance(value, torch.dtype) and self.cast_dtype_params:
+            # Handle dtype kwarg
+            if value == torch.float64 and self.cast_float64:
+                return torch.float32, True, False
+            elif value == torch.int64 and self.cast_int64:
+                return torch.int32, False, True
 
         return value, had_float64, had_int64
 
@@ -183,13 +193,16 @@ class DtypeAutocastContext:
 
 
 @contextmanager
-def autocast_neuron(cast_float64: bool = True, cast_int64: bool = True):
+def autocast_neuron(
+    cast_float64: bool = True, cast_int64: bool = True, cast_dtype_params: bool = False
+):
     """
     Context manager for handling unsupported dtypes on Neuron hardware.
 
     Args:
         cast_float64: If True, cast float64 to float32 (default: True)
         cast_int64: If True, cast int64 to int32 (default: True)
+        cast_dtype_params: If True, cast dtype parameters (default: False)
 
     Example:
         with autocast_neuron():
@@ -199,6 +212,12 @@ def autocast_neuron(cast_float64: bool = True, cast_int64: bool = True):
         with autocast_neuron(cast_int64=False):
             # Only float64 is handled, int64 will error if unsupported
             result = some_op(tensor_f64)
+
+        with autocast_neuron(cast_dtype_params=True):
+            # Also cast dtype parameters (needed for MLIR path)
+            result = some_op(tensor_f64, dtype=torch.int64)
     """
-    context = DtypeAutocastContext(cast_float64=cast_float64, cast_int64=cast_int64)
+    context = DtypeAutocastContext(
+        cast_float64=cast_float64, cast_int64=cast_int64, cast_dtype_params=cast_dtype_params
+    )
     yield context

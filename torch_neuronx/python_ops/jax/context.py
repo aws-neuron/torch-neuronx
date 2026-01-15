@@ -17,11 +17,17 @@ class ExecutionContext:
 
     - original_inputs: The original ATen inputs before preprocessing. Used for
       tasks like meta dtype inference where the ATen schema matters.
+    - original_kwargs: The original kwargs before dtype casting. Used for
+      inferring original output dtypes when dtype kwarg is present.
     - expected_dtypes: Optionally, precomputed expected output dtypes.
     """
 
     original_inputs: tuple[Any, ...] | None = None
+    original_kwargs: dict[str, Any] | None = None
     expected_dtypes: list[Any] | None = None
 
     def has_original_inputs(self) -> bool:
         return self.original_inputs is not None and len(self.original_inputs) > 0
+
+    def has_original_kwargs(self) -> bool:
+        return self.original_kwargs is not None

@@ -1,0 +1,2508 @@
+{
+  "test_configurations": [
+    {
+      "file": "dynamo/test_activation_checkpointing.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_compile_selective_checkpoint_list_ops_neuron",
+            "test_tags_must_save_tensor_that_has_backward_hook_neuron"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "NotImplementedError: Could not run 'aten::_scaled_dot_product_efficient_attention' with arguments from the 'CPU' backend. This could be because the operator doesn't exist for this backend, or was omitted during the selective/custom build process (if using custom build). If you are a Facebook employee using PyTorch on mobile, please visit https://fburl.com/ptmfixes for possible resolutions. 'aten::_scaled_dot_product_efficient_attention' is only available for these backends: [CUDA, PrivateUse1, Meta, NestedTensorCUDA, BackendSelect, Python, FuncTorchDynamicLayerBackMode, Functionalize, Named, Conjugate, Negative, ZeroTensor, ADInplaceOrView, AutogradOther, AutogradCPU, AutogradCUDA, AutogradHIP, AutogradXLA, AutogradMPS, AutogradIPU, AutogradXPU, AutogradHPU, AutogradVE, AutogradLazy, AutogradMTIA, AutogradMAIA, AutogradPrivateUse1, AutogradPrivateUse2, AutogradPrivateUse3, AutogradMeta, AutogradNestedTensor, Tracer, AutocastCPU, AutocastMTIA, AutocastMAIA, AutocastXPU, AutocastMPS, AutocastCUDA, AutocastPrivateUse1, FuncTorchBatched, BatchedNestedTensor, FuncTorchVmapMode, Batched, VmapMode, FuncTorchGradWrapper, PythonTLSSnapshot, FuncTorchDynamicLayerFrontMode, PreDispatch, PythonDispatcher].",
+          "tests": [
+            "test_autocast_flash_attention_neuron"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.aten.sigmoid_backward'",
+          "tests": [
+            "test_compile_selective_checkpoint_custom_rule_neuron",
+            "test_compile_selective_checkpoint_must_not_recompute_gemm_neuron",
+            "test_compile_selective_checkpoint_partial_ctx_fn_neuron",
+            "test_compile_selective_checkpoint_tensor_subclass_neuron"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'run_and_save_rng_state' not implemented in the FxImporter (tried '_import_hop_run_and_save_rng_state')",
+          "tests": [
+            "test_tags_dropout_neuron",
+            "test_tags_recomputed_rand_neuron"
+          ]
+        },
+        {
+          "reason": "NameError: name 'add_one_kernel' is not defined",
+          "tests": [
+            "test_compile_selective_checkpoint_triton_kernel_neuron"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.constant.bool'",
+          "tests": [
+            "test_compile_selective_checkpoint_outplace_op_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError: Backend not supported for None",
+          "tests": [
+            "test_compile_selective_checkpoint_random_op_neuron",
+            "test_pattern_matcher_neuron",
+            "test_symints_location_neuron"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_after_aot.py",
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: *: error: failed to legalize operation 'torch.operator' that was explicitly marked illegal",
+          "tests": [
+            "test_save_graph_repro"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_aot_autograd.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_LSTM",
+            "test_aot_sequence_nr",
+            "test_call_fn_with_non_const_inputs_aot_safe",
+            "test_double_backward_errors"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_donated_buffer1",
+            "test_donated_buffer4",
+            "test_donated_buffer_with_retain_or_create_graph1",
+            "test_donated_buffer_with_retain_or_create_graph2",
+            "test_donated_buffer_with_retain_or_create_graph3",
+            "test_donated_buffer_with_retain_or_create_graph4"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_alias_inputs"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_nn_parameter_construction"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.constant.float'",
+          "tests": [
+            "test_eager_sequence_nr"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 2, got 1)",
+          "tests": [
+            "test_aot_autograd_expand_mutation_backwards"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Function CompiledFunctionBackward returned an invalid gradient at index 0 - expected device cpu but got neuron:0",
+          "tests": [
+            "test_donated_buffer2",
+            "test_donated_buffer3",
+            "test_grad_inputs_alias_inputs"
+          ]
+        },
+        {
+          "reason": "AssertionError: Exception not raised",
+          "tests": [
+            "test_aot_autograd_expand_mutation_error"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: *: error: 'torch.aten.copy_' op operand #0 must be Multi-dimensional array modeling Torch's Tensor type, but got '!torch.vtensor<[4],f32>'",
+          "tests": [
+            "test_autograd_function_tangent_mutation"
+          ]
+        },
+        {
+          "reason": "AssertionError: The values for attribute 'shape' do not match: torch.Size([10]) != torch.Size([1000]).",
+          "tests": [
+            "test_inputs_overlapping_with_mutation_stress"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_donated_buffer5"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function mul>(*(FakeTensor(..., device='neuron:0', size=(2, 2), grad_fn=<Error>), FakeTensor(..., size=(2, 2), grad_fn=<AddBackward0>)), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mul.Tensor, found two different devices neuron:0, cpu')",
+          "tests": [
+            "test_call_fn_with_non_const_inputs_aot_unsafe_control_flow"
+          ]
+        },
+        {
+          "reason": "AssertionError: Encountered a set_ on a graph input, but the input has other mutations that we cannot",
+          "tests": [
+            "test_donated_buffer6"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_aot_autograd_cache.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_cache_lazy_backward_for_compiled_autograd",
+            "test_custom_autograd_function"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?x?xf32>'",
+          "tests": [
+            "test_saved_tensors_hooks_autograd_cache",
+            "test_saved_tensors_hooks_autograd_cache_symbolic"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 2, got 1)",
+          "tests": [
+            "test_dynamic_shapes_different_sizes"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?xf32>'",
+          "tests": [
+            "test_multi_graph_specialization",
+            "test_symbol_specialization"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'triton_kernel_wrapper_functional' not implemented in the FxImporter (tried '_import_hop_triton_kernel_wrapper_functional')",
+          "tests": [
+            "test_triton_op_cache_invalidation"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_autograd_lazy_backward",
+            "test_basic",
+            "test_clear_fx_graph_cache",
+            "test_fx_graph_cache_off",
+            "test_inference_graph_cache_hit_with_compiled_autograd_enabled",
+            "test_multiple_compile_triton_kernels",
+            "test_nn_module_with_params_global_constant",
+            "test_view_replay"
+          ]
+        },
+        {
+          "reason": "AssertionError: libcuda.so cannot found!",
+          "tests": [
+            "test_triton_op_cache_multiple_ops_invalidation"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'invoke_subgraph' not implemented in the FxImporter (tried '_import_hop_invoke_subgraph')",
+          "tests": [
+            "test_invoke_subgraph"
+          ]
+        },
+        {
+          "reason": "AssertionError: BackendCompilerFailed not raised",
+          "tests": [
+            "test_unsafe_mark_cacheable_fn_select_allow_in_graph",
+            "test_unsafe_mark_cacheable_fn_select_tag_activation_checkpoint"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Function CompiledFunctionBackward returned an invalid gradient at index 0 - expected device cpu but got neuron:0",
+          "tests": [
+            "test_autograd_function",
+            "test_autograd_no_dynamo_trace_backward"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Output storage is not on Neuron device",
+          "tests": [
+            "test_compiled_autograd_bypass"
+          ]
+        },
+        {
+          "reason": "RuntimeError: opt_ready_stream && opt_parent_stream INTERNAL ASSERT FAILED at \"/pytorch/torch/csrc/autograd/engine.cpp\":1084, please report a bug to PyTorch.",
+          "tests": [
+            "test_aot_runtime_trace_joint"
+          ]
+        },
+        {
+          "reason": "expected device cpu but got neuron:0",
+          "tests": [
+            "test_vmap"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_aot_compile.py",
+      "skip_tests": [
+        {
+          "reason": "aot_compile() not implemented for neuron backend",
+          "tests": [
+            "test_aot_compile_basic_fn",
+            "test_aot_compile_basic_fn_inductor",
+            "test_decorated_function_aot",
+            "test_guard_filter_override_aot",
+            "test_aot_compile_graph_break_error_fmt",
+            "test_aot_compile_basic_forward"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_autograd_function.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_function_with_bound_free_variable",
+            "test_smoke_from_test_autograd"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "RuntimeError: Function CompiledFunctionBackward returned an invalid gradient at index 0 - expected device cpu but got neuron:0",
+          "tests": [
+            "test_data_in_bwd",
+            "test_fwd_propogation_correctness",
+            "test_requires_grad_in_bwd"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 5, got 2)",
+          "tests": [
+            "test_multiple_different_non_tensor_inputs"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 3, got 1)",
+          "tests": [
+            "test_tensor_list_as_input"
+          ]
+        },
+        {
+          "reason": "NotImplementedError:",
+          "tests": [
+            "test_tensor_subclass_intermediary_input"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_autograd_function_equivalence"
+          ]
+        },
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_fwd_no_grad"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 2, got 1)",
+          "tests": [
+            "test_backward_returns_none_for_tensor_input"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_backends.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_inplace_normalize"
+          ]
+        },
+        {
+          "reason": "AssertionError: BackendCompilerFailed not raised",
+          "tests": [
+            "test_backend_recompilation"
+          ]
+        },
+        {
+          "reason": "torch._inductor.exc.InductorError: AssertionError: Expected code to be unreachable, but got: 'get_device_type(cpu: device)'",
+          "tests": [
+            "test_explain_with_backend"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_backward_higher_order_ops.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: invalid gradient at index 0 - expected device neuron:0 but got cpu",
+          "tests": [
+            "test_invoke_in_pt2",
+            "test_invoke_in_pt2_compiled_autograd",
+            "test_invoke_in_pt2_compiled_autograd_graph_breaks",
+            "test_invoke_in_pt2_compiled_autograd_side_effect"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_base_hop.py"
+    },
+    {
+      "file": "dynamo/test_base_output.py",
+      "skip_tests": [
+        {
+          "reason": "Requires diffusers library",
+          "tests": [
+            "test_create",
+            "test_assign",
+            "test_getitem",
+            "test_index",
+            "test_getattr",
+            "test_tuple"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_buffers_override.py"
+    },
+    {
+      "file": "dynamo/test_bytecode_utils.py"
+    },
+    {
+      "file": "dynamo/test_callback.py",
+      "xfail": [
+        {
+          "reason": "TypeError: create_neuron_backend.<locals>.neuron_backend_wrapper() got an unexpected keyword argument 'mode'",
+          "tests": [
+            "test_triggers"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_compile.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_compile_eager_options",
+            "test_to_sparse_to_dense_with_graph_break"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_ctx_manager.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_cuda_event_created_outside_of_graph",
+            "test_sdpa_kernel_ctx_manager_as_decorator",
+            "test_store_attr_graph_break_key_error"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "AttributeError: module 'torch_neuronx.neuron' has no attribute 'is_bf16_supported'",
+          "tests": [
+            "test_autocast",
+            "test_graph_break_inlining_autocast"
+          ]
+        },
+        {
+          "reason": "expected device cpu but got neuron:0",
+          "tests": [
+            "test_autocast_arguments_binding"
+          ]
+        },
+        {
+          "reason": "AssertionError: Object comparison failed: torch.float32 != torch.bfloat16",
+          "tests": [
+            "test_autocast_cpu",
+            "test_autocast_cpu_graph_break",
+            "test_autocast_cpu_graph_break_inner_fn",
+            "test_autocast_device"
+          ]
+        },
+        {
+          "reason": "RuntimeError: BFloat16 did not match Float",
+          "tests": [
+            "test_autocast_cpu_graph_break_2"
+          ]
+        },
+        {
+          "reason": "max() arg is an empty sequence",
+          "tests": [
+            "test_autocast_decorator"
+          ]
+        },
+        {
+          "reason": "AssertionError: Object comparison failed: torch.float32 != torch.float64",
+          "tests": [
+            "test_autocast_float64"
+          ]
+        },
+        {
+          "reason": "Dynamo failed to run FX node with fake tensors: call_function <built-in function add>(*(FakeTensor(..., device='neuron:0', size=(8, 8)), FakeTensor(..., size=(8, 8), dtype=torch.bfloat16)), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.add.Tensor, found two different devices neuron:0, cpu')",
+          "tests": [
+            "test_autocast_graph_break_method"
+          ]
+        },
+        {
+          "reason": "AssertionError: String comparison failed: 'neuron' != 'cuda'",
+          "tests": [
+            "test_autocast_sdpa",
+            "test_cuda_amp_autocast"
+          ]
+        },
+        {
+          "reason": "AssertionError: False is not true",
+          "tests": [
+            "test_is_autocast_cpu_enabled"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: torch.* op returned non-Tensor",
+          "tests": [
+            "test_cuda_event_method_create_stream_outside_of_compile"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_cuda_event_reconstruct"
+          ]
+        },
+        {
+          "reason": "AttributeError: module 'torch._C' has no attribute '_NeuronStreamBase'",
+          "tests": [
+            "test_cuda_event_across_graph_break",
+            "test_cuda_stream_across_graph_break",
+            "test_cuda_stream_compared_with_stream"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Skip calling `torch.compiler.disable()`d function",
+          "tests": [
+            "test_cuda_event_method",
+            "test_cuda_stream_compared_with_constant",
+            "test_cuda_stream_context_manager2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_generic_ctx_manager_with_graph_break_CustomizedCtxManagerWithGraphBreak",
+            "test_return_context_manager_with_graph_break"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Attempted to call a super() attribute that is not a function or method",
+          "tests": [
+            "test_cuda_stream_context_manager1",
+            "test_cuda_stream_method"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_debug_utils.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_aot_graph_parser_neuron",
+            "test_sym_aot_graph_parser_neuron"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_decorators.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_set_stance_aot_eager_then_compile",
+            "test_set_stance_eager_then_compile",
+            "test_set_stance_eager_then_compile_with_graph_break"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: * in function @main",
+          "tests": [
+            "test_assume_constant_result_on_user_defined_fn"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_deque_reconstruct.py"
+    },
+    {
+      "file": "dynamo/test_deviceguard.py"
+    },
+    {
+      "file": "dynamo/test_dicts.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_dict_keys_binop_op_and_",
+            "test_dict_keys_binop_op_or_",
+            "test_dict_keys_binop_op_sub",
+            "test_dict_keys_binop_op_xor",
+            "test_dict_keys_inplace_binop_op_iand",
+            "test_dict_keys_inplace_binop_op_ior",
+            "test_dict_keys_inplace_binop_op_isub",
+            "test_dict_keys_inplace_binop_op_ixor",
+            "test_mapping_proxy_for_nonlocal"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_dict_copy_alias",
+            "test_dict_subclass_contains"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Graph break under GenericContextWrappingVariable",
+          "tests": [
+            "test_fromkeys"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_einops.py",
+      "skip_tests": [
+        {
+          "reason": "Segmentation fault",
+          "tests": [
+            "test_functions_version_0_8_1"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: matmul: input datatypes mismatched",
+          "tests": [
+            "test_layers_version_0_8_1"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_error_messages.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: 'Grap[537 chars]ile \"test_error_messages.py\", line N, in test_[150 chars]0:\\n' != 'Grap[537 chars]ile \"<string>\", line N, in <module>\\n  File \"<[230 chars]0:\\n'",
+          "tests": [
+            "test_data_dependent_branching_gb"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'Grap[472 chars]ile \"test_error_messages.py\", line N, in test_[146 chars]()\\n' != 'Grap[472 chars]ile \"<string>\", line N, in <module>\\n  File \"<[226 chars]()\\n'",
+          "tests": [
+            "test_reconstruction_failure_gb"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_graph_break_traceback_above_dynamo_shows_user_code"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'Grap[472 chars]ile \"test_error_messages.py\", line N, in test_[277 chars]ct\\n' != 'Grap[472 chars]ile \"<string>\", line N, in <module>\\n  File \"<[357 chars]ct\\n'",
+          "tests": [
+            "test_graph_break_traceback_collapsed_resume_frames"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'call[66 chars]ile \"test_error_messages.py\", line N, in test_[163 chars]x)\\n' != 'call[66 chars]ile \"<string>\", line N, in <module>\\n  File \"<[243 chars]x)\\n'",
+          "tests": [
+            "test_lru_cache_warning_logs_nested_call"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'call[69 chars]ile \"test_error_messages.py\", line N, in test_[94 chars]))\\n' != 'call[69 chars]ile \"<string>\", line N, in <module>\\n  File \"<[174 chars]))\\n'",
+          "tests": [
+            "test_lru_cache_warning_logs_user_stack_trace"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'Grap[472 chars]ile \"test_error_messages.py\", line N, in test_[292 chars] 1\\n' != 'Grap[472 chars]ile \"<string>\", line N, in <module>\\n  File \"<[372 chars] 1\\n'",
+          "tests": [
+            "test_nested_compile_user_frames"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_assert_failure_in_generic_ctx_mgr"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_exc.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: 'WON\\[373 chars]ile \"test_exc.py\", line N, in test_internal_er[145 chars]====' != 'WON\\[373 chars]ile \"<string>\", line N, in <module>\\n  File \"<[225 chars]===='",
+          "tests": [
+            "test_internal_error_suppress_errors"
+          ]
+        },
+        {
+          "reason": "NotImplementedError:",
+          "tests": [
+            "test_not_implemented_error"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'Grap[461 chars]ile \"test_exc.py\", line N, in test_graph_break[195 chars]()\\n' != 'Grap[461 chars]ile \"<string>\", line N, in <module>\\n  File \"<[275 chars]()\\n'",
+          "tests": [
+            "test_graph_break_log"
+          ]
+        },
+        {
+          "reason": "AssertionError: <LogRecord: torch._dynamo.symbolic_convert.__graph_breaks, 10, /workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py, 611, \"Graph break in user code at /workspace/torch_neuron_eager/tests/pytorch_tests/test/dynamo/test_exc.py:200",
+          "tests": [
+            "test_graph_break_log_generic_jump"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_export_mutations.py",
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped",
+          "tests": [
+            "test_module_attribute_mutation_violation_negative_1",
+            "test_module_attribute_mutation_violation_negative_4",
+            "test_module_attribute_mutation_violation_positive_1"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_fake_distributed.py"
+    },
+    {
+      "file": "dynamo/test_flat_apply.py"
+    },
+    {
+      "file": "dynamo/test_exceptions.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_exception_with_another_exception",
+            "test_stop_iteration"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_frame_init.py"
+    },
+    {
+      "file": "dynamo/test_fx_graph_runnable.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: '' is not true : Expected fx_graph_runnable payload but got nothing",
+          "tests": [
+            "test_basic_tensor_add",
+            "test_broadcast_collective",
+            "test_reduce_scatter_collective",
+            "test_scalar_multiply",
+            "test_toy_model_basic",
+            "test_toy_model_batch_processing",
+            "test_two_inputs_matmul"
+          ]
+        },
+        {
+          "reason": "RuntimeError: NRT Execution error occurred on Neuron for operation=model_default",
+          "tests": [
+            "test_all_gather_collective",
+            "test_all_reduce_collective",
+            "test_dtensor_compile_redistribute"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_dynamic_shapes_run"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?x20xf32>'",
+          "tests": [
+            "test_toy_model_dynamic_batch"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<1x?xf32>'",
+          "tests": [
+            "test_broadcast_add_dynamic"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_fx_passes_pre_grad.py"
+    },
+    {
+      "file": "dynamo/test_functions.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_fn_with_self_set",
+            "test_inline_softmax",
+            "test_unsqueeze_inplace"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.aten.Float.Tensor' that was explicitly marked illegal",
+          "tests": [
+            "test_cast_tensor_single_elem"
+          ]
+        },
+        {
+          "reason": "TypeError: patch_module_function_from_cuda_to_neuron.<locals>.patched_func() missing 1 required positional argument: 'device_type'",
+          "tests": [
+            "test_torch_get_device_module"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_attrgetter",
+            "test_index",
+            "test_is_init_in_compile_mutated_tensor_tensor",
+            "test_rand_inlined",
+            "test_rand_tensor_partial"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_filter_infinite_iterator",
+            "test_itertools_compress_tensors",
+            "test_non_inlined_closure",
+            "test_np_constant_collections_as_input_int_or_float_float",
+            "test_np_constant_collections_as_input_int_or_float_int",
+            "test_returning_recursive_func",
+            "test_tree_map"
+          ]
+        },
+        {
+          "reason": "NameError: name 'device' is not defined",
+          "tests": [
+            "test_device_constant",
+            "test_func_default_torch_args"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: * of operation 'tensor<6x2xi64>'",
+          "tests": [
+            "test_itertools_permutations_basic"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Observed exception",
+          "tests": [
+            "test_torch_source"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped",
+          "tests": [
+            "test_dict_hasattr",
+            "test_tensor_type",
+            "test_tensor_type2"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: torch.* op returned non-Tensor",
+          "tests": [
+            "test_tensor_type3",
+            "test_tensor_type4"
+          ]
+        },
+        {
+          "reason": "AttributeError: 'torch_neuronx._C.NeuronDeviceProperties' object has no attribute 'major'",
+          "tests": [
+            "test_get_device_properties_tensor_device"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: argument of type: <class 'torch._C._TensorMeta'>",
+          "tests": [
+            "test_tensor_type5"
+          ]
+        },
+        {
+          "reason": "RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation max failed to execute on Neuron (last implementation: ImplementationWrapper). Details: ImplementationWrapper: NEFF compilation failed with return code 70",
+          "tests": [
+            "test_manual_seed"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Failed to trace builtin operator",
+          "tests": [
+            "test_partials_hasattr_set_attr"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function add>(*(FakeTensor(..., size=(2,)), None), **{}): got TypeError(\"unsupported operand type(s) for +: 'FakeTensor' and 'NoneType'\")",
+          "tests": [
+            "test_getattr_metaclass"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_method to(*(FakeTensor(..., size=(2,)), 'meta'), **{}): got AssertionError()",
+          "tests": [
+            "test_to"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_global.py"
+    },
+    {
+      "file": "dynamo/test_graph_deduplication.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'invoke_subgraph' not implemented in the FxImporter (tried '_import_hop_invoke_subgraph')",
+          "tests": [
+            "test_param_transfer_to_submodule",
+            "test_tuple_return"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_generator.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Unsupported not raised",
+          "tests": [
+            "test_reconstruct_generator_tensor_mutation"
+          ]
+        },
+        {
+          "reason": "AssertionError: 0 not greater than 0",
+          "tests": [
+            "test_zip_generator_2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_return_exhaust_generator"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_guard_manager.py"
+    },
+    {
+      "file": "dynamo/test_higher_order_ops.py",
+      "xfail": [
+        {
+          "reason": "torch.jit.frontend.NotSupportedError: Compiled functions can't take variable number of arguments or use keyword-only arguments with defaults:",
+          "tests": [
+            "test_hessian",
+            "test_hessian_argnums",
+            "test_jacfwd",
+            "test_jacfwd_has_aux",
+            "test_jacfwd_randomness",
+            "test_jacfwd_two_tensors_argnums",
+            "test_jvp_call_torch_compile_fn",
+            "test_jvp_freevar_python_scalar",
+            "test_jvp_freevar_tensor",
+            "test_jvp_has_aux",
+            "test_jvp_jvp",
+            "test_jvp_simple",
+            "test_jvp_two_tensors_disable_enable_disable_grad",
+            "test_jvp_two_tensors_disable_grad",
+            "test_jvp_two_tensors_has_aux",
+            "test_linearize_jvp_fn",
+            "test_linearize_recompiles"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <function _maybe_load_decompositions at 0x7f6d031913f0>(*(), **{}): got NotSupportedError(  File \"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/distributed/neuron_patch.py\", line 466",
+          "tests": [
+            "test_dual_level_guard"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[1460 chars],))\n        cumsum: \"i64[1]\" = tensor.cumsum([1690 chars],)\n' != 'clas[1460 chars],))\n\n        cumsum: \"i64[1]\" = tensor.cumsu[1692 chars],)\n'",
+          "tests": [
+            "test_jacrev"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[1671 chars],))\n        cumsum: \"i64[1]\" = tensor.cumsum([1696 chars]1)\n' != 'clas[1671 chars],))\n\n        cumsum: \"i64[1]\" = tensor.cumsu[1698 chars]1)\n'",
+          "tests": [
+            "test_jacrev_has_aux"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[1609 chars],))\n        cumsum: \"i64[1]\" = tensor.cumsum([1690 chars],)\n' != 'clas[1609 chars],))\n\n        cumsum: \"i64[1]\" = tensor.cumsu[1692 chars],)\n'",
+          "tests": [
+            "test_jacrev_two_tensors_argnums"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <function _maybe_load_decompositions at 0x7f6d031913f0>(*(), **{}): got NotSupportedError(  File \"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/distributed/neuron_patch.py\", line 466",
+          "tests": [
+            "test_jvp_guard_fail"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: Cannot access storage of BatchedTensorImpl",
+          "tests": [
+            "test_vmap_side_effects_append_input"
+          ]
+        },
+        {
+          "reason": "AssertionError: RecompileError not raised",
+          "tests": [
+            "test_vmap_recompile_different_config",
+            "test_vmap_recompile_same_config",
+            "test_vmap_recompile_with_randomness"
+          ]
+        },
+        {
+          "reason": "AssertionError: \"It looks like you're trying to call a compiled backward function within vmap/grad/vjp, which isn't supported\" does not match \"invalid gradient at index 0 - expected device neuron:0 but got cpu\"",
+          "tests": [
+            "test_grad_call_compiled_backward_fn",
+            "test_vjp_call_compiled_backward_fn",
+            "test_vmap_call_compiled_backward_fn"
+          ]
+        },
+        {
+          "reason": "AttributeError: module 'torch_neuronx.neuron' has no attribute 'initial_seed'",
+          "tests": [
+            "test_dropout",
+            "test_dropout_inductor",
+            "test_function",
+            "test_function_with_kwargs",
+            "test_module"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'cond' not implemented in the FxImporter (tried '_import_hop_cond')",
+          "tests": [
+            "test_cond_branches_no_arguments",
+            "test_cond_free_variable_in_both_branches",
+            "test_cond_pytree_operands",
+            "test_cond_with_empty_operands",
+            "test_cond_with_mismatched_output",
+            "test_hops_compile_backend_aot_eager_cond_simple_neuron_float32",
+            "test_hops_compile_backend_inductor_cond_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'auto_functionalized_v2' not implemented in the FxImporter (tried '_import_hop_auto_functionalized_v2')",
+          "tests": [
+            "test_hops_compile_backend_aot_eager_auto_functionalize_simple_neuron_float32",
+            "test_hops_compile_backend_inductor_auto_functionalize_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "AssertionError: False is not true",
+          "tests": [
+            "test_emit_functorch_guard_if_active"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_lift_tensors_with_shared_symbols",
+            "test_vmap_guard_ok"
+          ]
+        },
+        {
+          "reason": "AssertionError: 0 not greater than 0",
+          "tests": [
+            "test_vmap_grad_vmap_guard_fail",
+            "test_vmap_guard_fail",
+            "test_vmap_guard_fail_different_state",
+            "test_vmap_recompile_different_states"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'map_impl' not implemented in the FxImporter (tried '_import_hop_map_impl')",
+          "tests": [
+            "test_map_lowers_to_graph",
+            "test_map_multi_return",
+            "test_map_pytree_return",
+            "test_map_subgraph_name_is_valid",
+            "test_map_symint_input"
+          ]
+        },
+        {
+          "reason": "NameError: name 'device' is not defined",
+          "tests": [
+            "test_cond_branches_no_arguments_no_closure"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'invoke_quant_packed' not implemented in the FxImporter (tried '_import_hop_invoke_quant_packed')",
+          "tests": [
+            "test_hops_compile_backend_aot_eager_invoke_quant_packed_simple_neuron_float32",
+            "test_hops_compile_backend_inductor_invoke_quant_packed_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "AssertionError:",
+          "tests": [
+            "test_hops_compile_backend_inductor_invoke_quant_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'invoke_subgraph' not implemented in the FxImporter (tried '_import_hop_invoke_subgraph')",
+          "tests": [
+            "test_hops_compile_backend_aot_eager_invoke_subgraph_simple_neuron_float32",
+            "test_hops_compile_backend_inductor_invoke_subgraph_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'while_loop_stack_output' not implemented in the FxImporter (tried '_import_hop_while_loop_stack_output')",
+          "tests": [
+            "test_hops_compile_backend_aot_eager_while_loop_stack_output_simple_neuron_float32",
+            "test_hops_compile_backend_inductor_while_loop_stack_output_simple_neuron_float32"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_cond_with_constant_pred"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_inline_and_install.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_fx_pytree_inline_and_install",
+            "test_retracibility_dict_container_inp_out_inline_and_install",
+            "test_retracibility_inline_and_install",
+            "test_retracibility_nested_list_out_inline_and_install",
+            "test_zeroes_in_and_out_different_shape_on_test_with_aten_graph_inline_and_install"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Tracing through optional input is not supported yet",
+          "tests": [
+            "test_export_with_args_with_default_tensor_inline_and_install",
+            "test_export_with_args_with_default_tuple_inline_and_install",
+            "test_export_with_kwargs_with_default_tensor_inline_and_install",
+            "test_export_with_kwargs_with_default_tuple_inline_and_install"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'cond' not implemented in the FxImporter (tried '_import_hop_cond')",
+          "tests": [
+            "test_cond_raise_user_error_on_branch_return_multiple_tensors_inline_and_install",
+            "test_cond_supported_pred_types_inline_and_install",
+            "test_export_cond_in_aten_symbolic_inline_and_install",
+            "test_export_with_cond_branches_calling_methods_inline_and_install",
+            "test_export_with_cond_closure_inline_and_install",
+            "test_export_with_cond_with_closed_function_inline_and_install",
+            "test_export_with_module_layer_inline_and_install",
+            "test_predispatch_with_for_out_dtype_nested_inline_and_install"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_byte_tensor_does_not_crash_inline_and_install",
+            "test_export_inline_and_install",
+            "test_export_with_aten_graph_inline_and_install"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_dict_return_inline_and_install",
+            "test_dict_return_with_aten_graph_inline_and_install",
+            "test_dupes_2_inline_and_install",
+            "test_dupes_2_with_aten_graph_inline_and_install",
+            "test_dupes_and_bypass_inline_and_install",
+            "test_dupes_and_bypass_reorder_with_non_tensor_arg_inline_and_install",
+            "test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph_inline_and_install",
+            "test_dupes_and_bypass_with_aten_graph_inline_and_install",
+            "test_dupes_and_bypass_with_non_tensor_arg_inline_and_install",
+            "test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph_inline_and_install",
+            "test_dupes_inline_and_install",
+            "test_dupes_with_aten_graph_inline_and_install",
+            "test_export_graph_bypass_inline_and_install",
+            "test_export_graph_bypass_with_aten_graph_inline_and_install",
+            "test_export_graph_with_complex_reorder_inline_and_install",
+            "test_export_graph_with_complex_reorder_with_aten_graph_inline_and_install",
+            "test_export_graph_with_list_inline_and_install",
+            "test_export_graph_with_list_with_aten_graph_inline_and_install",
+            "test_export_mismatched_out_2_inline_and_install",
+            "test_export_mismatched_out_2_with_aten_graph_inline_and_install",
+            "test_export_mismatched_out_inline_and_install",
+            "test_export_mismatched_out_with_aten_graph_inline_and_install",
+            "test_export_shape_control_flow_1_inline_and_install",
+            "test_func_return_inline_and_install",
+            "test_func_return_with_aten_graph_inline_and_install",
+            "test_immutable_list_dict_inline_and_install",
+            "test_list_contains_inline_and_install",
+            "test_list_not_contains_inline_and_install",
+            "test_list_unpack_inline_and_install",
+            "test_list_unpack_with_aten_graph_inline_and_install",
+            "test_zeroes_in_and_out_different_shape_on_test_inline_and_install"
+          ]
+        },
+        {
+          "reason": "AssertionError: Did not raise when expected to",
+          "tests": [
+            "test_invalid_input_global_inline_and_install",
+            "test_invalid_input_global_multiple_access_inline_and_install",
+            "test_invalid_input_nonlocal_inline_and_install"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: *: error: failed to legalize operation 'torch.operator' that was explicitly marked illegal",
+          "tests": [
+            "test_zeroes_in_new_shape_scalar_out_inline_and_install",
+            "test_zeroes_in_new_shape_scalar_out_permute_dupe_and_bypass_inline_and_install",
+            "test_zeroes_in_new_shape_scalar_out_permute_inline_and_install"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'map_impl' not implemented in the FxImporter (tried '_import_hop_map_impl')",
+          "tests": [
+            "test_export_with_map_cond_inline_and_install",
+            "test_map_cond_param_buffer_lifted_inline_and_install"
+          ]
+        },
+        {
+          "reason": "NameError: name 'device' is not defined",
+          "tests": [
+            "test_symbool_inline_and_install"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function add>(*(Parameter(FakeTensor(..., size=(2, 3), requires_grad=True)), FakeTensor(..., device='meta', size=(2, 3))), **{}): got RuntimeError('Tensor on device meta is not on the expected device cpu!')",
+          "tests": [
+            "test_export_meta_inline_and_install"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Skip calling `torch.compiler.disable()`d function",
+          "tests": [
+            "test_dupes_and_bypass_with_non_tensor_output_inline_and_install",
+            "test_dupes_and_bypass_with_non_tensor_output_with_aten_graph_inline_and_install"
+          ]
+        },
+        {
+          "reason": "AssertionError: String comparison failed: 'self____buffers__buffer1' != 'L__self___buffer1'",
+          "tests": [
+            "test_param_buffer_safe_from_mutation_simple_inline_and_install"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_install_free_tensors.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_nets_as_input",
+            "test_resnet_structure",
+            "test_simple_batchnorm",
+            "test_transformer"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.UserError: It looks like one of the inputs with type `<class 'tests.pytorch_tests.test.dynamo.test_install_free_tensors.InstallParamsWhenExport.test_user_defined_object.<locals>.UserDefinedTestClass'>` is not supported or pytree-flattenable.",
+          "tests": [
+            "test_user_defined_object"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_interop.py"
+    },
+    {
+      "file": "dynamo/test_logging.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_default_logging",
+            "test_dump_compile_times",
+            "test_dynamo_debug_default_off_artifacts",
+            "test_hierarchical_compile",
+            "test_recompiles"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "TypeError: create_neuron_backend.<locals>.neuron_backend_wrapper() got an unexpected keyword argument 'mode'",
+          "tests": [
+            "test_cudagraph_static_inputs",
+            "test_cudagraphs"
+          ]
+        },
+        {
+          "reason": "AssertionError: did not find record with WON'T CONVERT among [<LogRecord: torch._subclasses.fake_tensor, 40, /workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_subclasses/fake_tensor.py, 2759, \"failed while attempting to run meta for %s\">]",
+          "tests": [
+            "test_dynamo_error"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_kernel_code",
+            "test_output_code"
+          ]
+        },
+        {
+          "reason": "AssertionError: \"+- __SHAPE_GUARD__: L['x'].size()[0] == [681 chars]im))\" != ''",
+          "tests": [
+            "test_guards_sloc"
+          ]
+        },
+        {
+          "reason": "AssertionError: Neuron runtime should not be initialized before the init_process_group.",
+          "tests": [
+            "test_ddp_graphs"
+          ]
+        },
+        {
+          "reason": "AssertionError: \"+- __SHAPE_GUARD__: L['x'].size()[0] == [234 chars]in #\" != ''",
+          "tests": [
+            "test_guards_sloc_vr"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Higher-order operation 'cond' not implemented in the FxImporter (tried '_import_hop_cond')",
+          "tests": [
+            "test_trace_source_cond"
+          ]
+        },
+        {
+          "reason": "AssertionError: 0 not greater than or equal to 3",
+          "tests": [
+            "test_inductor_debug"
+          ]
+        },
+        {
+          "reason": "AssertionError: String comparison failed: 'I0102 16:43:20.411000 457257 torch/_dynam[1905 chars]13\\n' != '/workspace/torch_neuron_eager/.venv/lib/p[2239 chars]13\\n'",
+          "tests": [
+            "test_logs_out"
+          ]
+        },
+        {
+          "reason": "AssertionError: did not find record with WON'T CONVERT among []",
+          "tests": [
+            "test_inductor_error"
+          ]
+        },
+        {
+          "reason": "AssertionError: did not find record with TREE_GUARD_MANAGER among []",
+          "tests": [
+            "test_guards_polyfill_sloc"
+          ]
+        },
+        {
+          "reason": "AssertionError: 0 not greater than or equal to 2",
+          "tests": [
+            "test_inductor_info"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_minifier.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: 'ReluCompileError' not found in 'Traceback (most recent call last):\\n  File \"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_dynamo/test_minifier_common.py\", line 150, in _maybe_subprocess_run\\n    exec(code, {\"__name__\": \"__main__\", \"__compile_source__\": code})\\n  File \"<string>\", line 4\\n    .\\n    ^\\nSyntaxError: invalid syntax\\n'",
+          "tests": [
+            "test_after_dynamo_cpu_compile_error_neuron",
+            "test_after_dynamo_cuda_compile_error_neuron",
+            "test_if_graph_minified_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'ReluRuntimeError' not found in 'Traceback (most recent call last):\\n  File \"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_dynamo/test_minifier_common.py\", line 150, in _maybe_subprocess_run\\n    exec(code, {\"__name__\": \"__main__\", \"__compile_source__\": code})\\n  File \"<string>\", line 4\\n    .\\n    ^\\nSyntaxError: invalid syntax\\n'",
+          "tests": [
+            "test_after_dynamo_cpu_runtime_error_neuron",
+            "test_after_dynamo_cuda_runtime_error_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'TestingOnlyCompileError' not found in 'Traceback (most recent call last):\\n  File \"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_dynamo/test_minifier_common.py\", line 150, in _maybe_subprocess_run\\n    exec(code, {\"__name__\": \"__main__\", \"__compile_source__\": code})\\n  File \"<string>\", line 4\\n    .\\n    ^\\nSyntaxError: invalid syntax\\n'",
+          "tests": [
+            "test_after_dynamo_non_leaf_compile_error_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'AccuracyError' not found in 'Traceback (most recent call last):\\n  File \"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/torch/_dynamo/test_minifier_common.py\", line 150, in _maybe_subprocess_run\\n    exec(code, {\"__name__\": \"__main__\", \"__compile_source__\": code})\\n  File \"<string>\", line 4\\n    .\\n    ^\\nSyntaxError: invalid syntax\\n'",
+          "tests": [
+            "test_after_dynamo_cpu_accuracy_error_neuron",
+            "test_after_dynamo_cuda_accuracy_error_neuron"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_model_output.py"
+    },
+    {
+      "file": "dynamo/test_modules.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_call_fn_with_non_const_inputs_safe",
+            "test_conv_call_forward_directly",
+            "test_conv_call_super_forward_directly",
+            "test_conv_transpose_call_super_forward_directly",
+            "test_hooks_allowed_modules_compiles",
+            "test_lazy_module1",
+            "test_param_requires_grad",
+            "test_unspecialized_seq",
+            "test_user_defined_nn_module_dynamic",
+            "test_conv_transpose_call_forward_directly",
+            "test_unspec_non_inlinable_module"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_lazy_module2",
+            "test_lazy_module5",
+            "test_lazy_module6",
+            "test_lazy_module7",
+            "test_lazy_module_kwargs",
+            "test_lazy_module_no_cls_to_become",
+            "test_module_patch"
+          ]
+        },
+        {
+          "reason": "AssertionError: The values for attribute 'device' do not match: cpu != neuron:0.",
+          "tests": [
+            "test_trace_delattr"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_nn_module_unspec_int_attr",
+            "test_no_op_assignment"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in method mm of type object at 0x7f7fdb1d1a00>(*(FakeTensor(..., device='neuron:0', size=(20, 10), grad_fn=<AsStridedBackward0>), Parameter(FakeTensor(..., size=(10, 10000), requires_grad=True))), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mm.default, found two different devices neuron:0, cpu')",
+          "tests": [
+            "test_backward_hooks"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function linear>(*(FakeTensor(..., device='neuron:0', size=(10, 10), grad_fn=<Error>), Parameter(FakeTensor(..., size=(10, 10), requires_grad=True)), Parameter(FakeTensor(..., size=(10,), requires_grad=True))), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mm.default, found two different devices neuron:0, cpu')",
+          "tests": [
+            "test_module_forward_has_graph_break"
+          ]
+        },
+        {
+          "reason": "AttributeError: Can't pickle local object 'create_neuron_backend.<locals>.neuron_backend_wrapper'",
+          "tests": [
+            "test_save_and_load_all_backends",
+            "test_save_and_load_inductor"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_hooks_allowed_modules"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 3, got 2)",
+          "tests": [
+            "test_dunder_call_explicitly"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_nops.py"
+    },
+    {
+      "file": "dynamo/test_optimizers.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_optimizing_over_tensor_with_requires_grad",
+            "test_state_dict"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_init_group"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_package.py",
+      "xfail": [
+        {
+          "reason": "torch._inductor.exc.InductorError: AssertionError: Expected code to be unreachable, but got: 'get_device_type(cpu: device)'",
+          "tests": [
+            "test_automatic_dynamo_graph_breaks_device_cpu",
+            "test_basic_fn_backend_inductor_device_cpu",
+            "test_dynamic_shape_backend_inductor_device_cpu",
+            "test_dynamo_cache_manual_load_device_cpu",
+            "test_graph_break_bomb_backend_inductor_device_cpu",
+            "test_lazy_backward_backend_inductor_device_cpu"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Function CompiledFunctionBackward returned an invalid gradient at index 0 - expected device cpu but got neuron:0",
+          "tests": [
+            "test_automatic_dynamo_lazy_backward_device_cpu"
+          ]
+        },
+        {
+          "reason": "TypeError: Type <class 'torch_neuronx.python_ops.auto_registration.create_auto_operation.<locals>.AutoOperation'> for object <torch_neuronx.python_ops.auto_registration.create_auto_operation.<locals>.AutoOperation object at 0x7f89aae2b520> cannot be saved into torch.compile() package since it's defined in local scope. Please define the class at global scope (top level of a module).",
+          "tests": [
+            "test_call_function_from_resume_device_cpu"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_automatic_dynamo_recompiles_device_cpu",
+            "test_automatic_dynamo_serialize_device_cpu",
+            "test_code_with_generator_device_cpu"
+          ]
+        },
+        {
+          "reason": "torch._inductor.exc.InductorError: LoweringException: AssertionError: Expected code to be unreachable, but got: 'get_device_type(neuron:0: device)'",
+          "tests": [
+            "test_nn_module"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_pgo.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_basic",
+            "test_different_file_paths_local_pgo",
+            "test_distinct_compile_id",
+            "test_pgo_dynamic_params",
+            "test_remote_basic",
+            "test_sticky_pgo_read_write"
+          ]
+        },
+        {
+          "reason": "AssertionError: Booleans mismatch: False is not True",
+          "tests": [
+            "test_no_empty_graph_allowlist"
+          ]
+        },
+        {
+          "reason": "AttributeError: 'NoneType' object has no attribute 'group'",
+          "tests": [
+            "test_whitelist_ints_floats",
+            "test_whitelist_suggestion"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_pre_dispatch.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_autocast_simple"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_precompile_context.py"
+    },
+    {
+      "file": "dynamo/test_profiler.py",
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function mul>(*(FakeTensor(..., size=(10,)), FakeTensor(..., device='neuron:0', size=(10,))), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mul.Tensor, found two different devices cpu, neuron:0')",
+          "tests": [
+            "test_profiler_dynamo_compiled_region"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_python_autograd.py"
+    },
+    {
+      "file": "dynamo/test_python_dispatcher.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_dispatch_key1",
+            "test_dispatch_key2"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_recompiles.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_automatic_dynamic_on_closed_ints",
+            "test_automatic_dynamic_reduce_recompiles",
+            "test_automatic_dynamic_shapes_mark_as_oblivious",
+            "test_automatic_dynamic_shapes_mark_as_unbacked",
+            "test_automatic_dynamic_tensor_scalar_change",
+            "test_dynamic_shape_parameter_recompile",
+            "test_recompiles_true_false_flop"
+          ]
+        },
+        {
+          "reason": "AssertionError: UserError not raised",
+          "tests": [
+            "test_automatic_dynamic_shapes_mark_as_oblivious_fail_counterfactual"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_reconstruct.py"
+    },
+    {
+      "file": "dynamo/test_recompile_ux.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: assert not True",
+          "tests": [
+            "test_drop_cache_on_skip"
+          ]
+        },
+        {
+          "reason": "AssertionError: no logs of level WARNING or higher triggered on torch._dynamo",
+          "tests": [
+            "test_mismatched_type",
+            "test_verbose_tensor_check"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_loop_torture"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_reorder_logs.py",
+      "skip_tests": [
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_constant_mutation",
+            "test_reorder_print_graph_break",
+            "test_reorder_custom_log_fn"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Unexpected type in sourceless builder",
+          "tests": [
+            "test_reorder_print",
+            "test_reorder_warnings"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_dont_reorder_print",
+            "test_ignore_logger_ignore_method0_fn0_should_ignore_logger_False",
+            "test_ignore_logger_ignore_method1_fn1_should_ignore_logger_False",
+            "test_ignore_logger_ignore_method2_fn2_should_ignore_logger_False",
+            "test_ignore_logger_ignore_method3_fn3_should_ignore_logger_False",
+            "test_ignore_logger_ignore_method4_fn4_should_ignore_logger_True",
+            "test_ignore_logger_ignore_method5_fn5_should_ignore_logger_True",
+            "test_ignore_logger_ignore_method6_fn6_should_ignore_logger_True",
+            "test_ignore_logger_ignore_method7_fn7_should_ignore_logger_True"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_sdpa.py"
+    },
+    {
+      "file": "dynamo/test_repros.py",
+      "skip_tests": [
+        {
+          "reason": "Segmentation fault",
+          "tests": [
+            "test_hf_gelu_inline"
+          ]
+        },
+        {
+          "reason": "Script exited with code: 137, reason: OOMKilled",
+          "tests": [
+            "test_hf_model_output"
+          ]
+        },
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_batch_norm_act",
+            "test_bigbird_unsqueeze_inplace",
+            "test_chunk_reformer_ff",
+            "test_convert_boxes_to_pooler_format",
+            "test_copy_weird_strides",
+            "test_do_paste_mask",
+            "test_dont_dce_rand",
+            "test_ellipsis",
+            "test_grad_references_cleared",
+            "test_hf_bigbird_unsqueeze",
+            "test_hf_t5_forward",
+            "test_hf_xsoftmax_training",
+            "test_issue175",
+            "test_longformer_chunk",
+            "test_maml_no_item_capture",
+            "test_nn_param_freevar_codegen",
+            "test_optim_state_references_cleared",
+            "test_reformer_eval",
+            "test_reformer_sorting",
+            "test_reformer_train",
+            "test_reinplacing",
+            "test_sdpa_dynamic_shapes_neuron",
+            "test_sigmoid_out",
+            "test_batchnorm_e2e",
+            "test_create_rand_mask_from_inputs",
+            "test_hf_xsoftmax_inference",
+            "test_module_attribute_error_neuron"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "AssertionError: False is not true",
+          "tests": [
+            "test_changing_stride"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_build_map_unpack_with_call",
+            "test_class_member",
+            "test_dropout_inline",
+            "test_ephemeral_module",
+            "test_exec_wildcard_import",
+            "test_guard_fail_tensor_bool",
+            "test_hf_classinstantier",
+            "test_iadd_graph_break",
+            "test_inductor_no_recursionerror_on_for_loops",
+            "test_is_symbolic_tracing",
+            "test_issue1466_size_aot_autograd",
+            "test_longtensor_list",
+            "test_named_buffers",
+            "test_no_grad_inline",
+            "test_nullcontext1",
+            "test_nullcontext2",
+            "test_rewrite_assert_dont_change_bytecode",
+            "test_swin_base_tensor_attr",
+            "test_vdd_duplicate_error"
+          ]
+        },
+        {
+          "reason": "TypeError: patch_module_function_from_cuda_to_neuron.<locals>.patched_func() missing 1 required positional argument: 'device_type'",
+          "tests": [
+            "test_lru_cache_warning_issued_during_tracing"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: 'NoneType' object is not callable",
+          "tests": [
+            "test_compile_complex_conj"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_as_strided_on_base_with_mutation_works",
+            "test_distributions_subclass",
+            "test_trace_functional_tensor_with"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Function CompiledFunctionBackward returned an invalid gradient at index 0 - expected device cpu but got neuron:0",
+          "tests": [
+            "test_data_attr_mutation_after_saved_for_bw",
+            "test_deepcopy_constant_tensor_in_aot_bwd_neuron",
+            "test_gan_repro_trying_to_backward_through_the_graph_a_second_time",
+            "test_intermediate_leaf_requires_grad"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: *: error: failed to legalize operation 'torch.operator' that was explicitly marked illegal",
+          "tests": [
+            "test_addr_alpha_beta_out",
+            "test_amp_foreach_fake_impl",
+            "test_foreach_decomp_arg_names",
+            "test_named_tuple_vt_clone_neuron",
+            "test_nanmean_out",
+            "test_setitem_tensor_prop"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.RecompileError: Recompiling function forward in /workspace/torch_neuron_eager/tests/pytorch_tests/test/dynamo/test_repros.py:1388",
+          "tests": [
+            "test_dynamic_shape_disable_duck_size"
+          ]
+        },
+        {
+          "reason": "AssertionError: String comparison failed: 'cpu' != 'cuda'",
+          "tests": [
+            "test_guard_default_device"
+          ]
+        },
+        {
+          "reason": "NameError: name 'device' is not defined",
+          "tests": [
+            "test_dynamic_shapes_right_side",
+            "test_stk_sdd_is_transposed"
+          ]
+        },
+        {
+          "reason": "AssertionError: \"def forward(self, s77 : torch.SymInt, s27 : torch.SymInt, L[294 chars]os,)\" != \"def forward(self, L_x_ : torch.Tensor):\\n    l_x_ = L_x_\\n [242 chars]os,)\"",
+          "tests": [
+            "test_dont_aggressively_write_assert"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.aten.Int.Tensor' that was explicitly marked illegal",
+          "tests": [
+            "test_deferred_runtime_asserts"
+          ]
+        },
+        {
+          "reason": "RuntimeError: NRT Execution error occurred on Neuron for operation=model_default",
+          "tests": [
+            "test_out_nested_cell_shape_change",
+            "test_out_nested_cell_tuple_shape_change",
+            "test_out_root_cell_shape_change",
+            "test_out_root_cell_tuple_shape_change"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 2, got 1)",
+          "tests": [
+            "test_disabling_unpack_hooks_within_compiled_region"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error:\nE   Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: loc(\"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/test/dynamo/test_subclasses.py\":524:0): error: 'torch.prim.NumToTensor.Scalar' op operand #0 must be Any Python numeric type compatible with being the scalar type of a tensor, but got '!torch.bool'",
+          "tests": [
+            "test_norm_dtype_neuron"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped",
+          "tests": [
+            "test_primtorch_no_graph_break"
+          ]
+        },
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_output_aliases_intermediate"
+          ]
+        },
+        {
+          "reason": "RuntimeError: attempting to assign a gradient with device type 'neuron' to a tensor with device type 'cpu'. Please ensure that the gradient and the tensor are on the same device",
+          "tests": [
+            "test_grad"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_mem_leak_guards"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: FIX ME: Unimplemented call_function: target=<function sym_sum at 0x7fb33edc3eb0>, {'from_node': [(name=sym_sum, pass_name=Interpreter_PropagateUnbackedSymInts, action=create, graph_id=140406635795008)",
+          "tests": [
+            "test_partitioner_activation_memory_budget_with_unbacked_symints"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_lru_cache_tracing",
+            "test_truthiness_of_symints_no_recompiles_neuron"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_out_overload_non_contiguous",
+            "test_sort_out2",
+            "test_specialized_stride",
+            "test_tensor_isinstance_tuple",
+            "test_weakref_callback"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: FIX ME: Unimplemented call_function: target=<function sym_sum at 0x7fa9657c7eb0>, {'from_node': [(name=sym_sum, pass_name=Interpreter_PropagateUnbackedSymInts, action=create, graph_id=140355406113536)",
+          "tests": [
+            "test_split_with_sizes_aot_autograd"
+          ]
+        },
+        {
+          "reason": "KeyError: 'fake_tensor_propagation'",
+          "tests": [
+            "test_maml_item_capture"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in function mul>(*(FakeTensor(..., size=(5,), requires_grad=True), FakeTensor(..., device='neuron:0', size=(5,))), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mul.Tensor, found two different devices cpu, neuron:0')",
+          "tests": [
+            "test_setattr_requires_grad_graph_breaks"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_unbind_copy_out",
+            "test_unspecialized_nn_module_with_torch_variable_attribute"
+          ]
+        },
+        {
+          "reason": "torch._inductor.exc.InductorError: AssertionError: Expected code to be unreachable, but got: 'get_device_type(cpu: device)'",
+          "tests": [
+            "test_tensor_set_data_backend_inductor_func_name_func2",
+            "test_tensor_set_data_backend_inductor_func_name_func3"
+          ]
+        },
+        {
+          "reason": "AssertionError: '2' != '8'",
+          "tests": [
+            "test_user_ctor_ctx_manager_custom_init_graph_break"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Failed to convert args/kwargs to proxy",
+          "tests": [
+            "test_torch_compile_in_compile_frame"
+          ]
+        },
+        {
+          "reason": "RuntimeError: _copy_from_and_resize now only support copy with same size, or dst.numel() == 0!",
+          "tests": [
+            "test_sort_out"
+          ]
+        },
+        {
+          "reason": "RuntimeError: function CompiledFunctionBackward returned an incorrect number of gradients (expected 2, got 1)",
+          "tests": [
+            "test_unpack_hooks_can_be_disabled",
+            "test_unpack_hooks_dont_run_during_tracing"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.runtime.assert' that was explicitly marked illegal",
+          "tests": [
+            "test_unsqueeze_mul_strides"
+          ]
+        },
+        {
+          "reason": "AssertionError: String comparison failed: 'cpu:0' != 'neuron:0'",
+          "tests": [
+            "test_guard_default_device_neuron"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: Could not run 'aten::_scaled_dot_product_flash_attention_backward' with arguments from the 'CPU' backend. This could be because the operator doesn't exist for this backend, or was omitted during the selective/custom build process (if using custom build). If you are a Facebook employee using PyTorch on mobile, please visit https://fburl.com/ptmfixes for possible resolutions. 'aten::_scaled_dot_product_flash_attention_backward' is only available for these backends: [CUDA, PrivateUse1, Meta, NestedTensorCUDA, BackendSelect, Python, FuncTorchDynamicLayerBackMode, Functionalize, Named, Conjugate, Negative, ZeroTensor, ADInplaceOrView, AutogradOther, AutogradCPU, AutogradCUDA, AutogradHIP, AutogradXLA, AutogradMPS, AutogradIPU, AutogradXPU, AutogradHPU, AutogradVE, AutogradLazy, AutogradMTIA, AutogradMAIA, AutogradPrivateUse1, AutogradPrivateUse2, AutogradPrivateUse3, AutogradMeta, AutogradNestedTensor, Tracer, AutocastCPU, AutocastMTIA, AutocastMAIA, AutocastXPU, AutocastMPS, AutocastCUDA, AutocastPrivateUse1, FuncTorchBatched, BatchedNestedTensor, FuncTorchVmapMode, Batched, VmapMode, FuncTorchGradWrapper, PythonTLSSnapshot, FuncTorchDynamicLayerFrontMode, PreDispatch, PythonDispatcher].",
+          "tests": [
+            "test_flash_attn_backward_mixed_strides_neuron"
+          ]
+        },
+        {
+          "reason": "AttributeError: module 'torch_neuronx.neuron' has no attribute 'memory_allocated'",
+          "tests": [
+            "test_memleak_when_graph_input_has_tensor_attr_neuron"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.aten.sigmoid_backward'",
+          "tests": [
+            "test_with_on_graph_break_inst",
+            "test_with_on_graph_break_nested"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Skip calling `torch.compiler.disable()`d function",
+          "tests": [
+            "test_torch_cuda_is_initialized_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError:",
+          "tests": [
+            "test_zero_dim_param_mixed_device_grad_neuron"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_sets.py"
+    },
+    {
+      "file": "dynamo/test_resume.py"
+    },
+    {
+      "file": "dynamo/test_skip_guard_eval_unsafe.py"
+    },
+    {
+      "file": "dynamo/test_skip_non_tensor.py"
+    },
+    {
+      "file": "dynamo/test_sources.py",
+      "xfail": [
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: * of operation 'tensor<3xi64>'",
+          "tests": [
+            "test_property_closure"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_structured_trace.py",
+      "xfail": [
+        {
+          "reason": "TypeError: create_neuron_backend.<locals>.neuron_backend_wrapper() got an unexpected keyword argument 'mode'",
+          "tests": [
+            "test_cudagraphs"
+          ]
+        },
+        {
+          "reason": "AssertionError: Neuron runtime should not be initialized before the init_process_group.",
+          "tests": [
+            "test_ddp_graphs"
+          ]
+        },
+        {
+          "reason": "AssertionError: '{\"dy[415 chars]ribe_tensor\": {\"id\": 0, \"ndim\": 1, \"dtype\": \"t[1246 chars]0}\\n' != '{\"dy[415 chars]ribe_source\": {\"describer_id\": \"ID\", \"id\": 0, [1070 chars]0}\\n'",
+          "tests": [
+            "test_dump_file"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_recompile_user_contexts_iteration"
+          ]
+        },
+        {
+          "reason": "AssertionError: '{\"dy[216 chars]ribe_tensor\": {\"id\": 0, \"ndim\": 2, \"dtype\": \"t[2817 chars]0}\\n' != '{\"dy[216 chars]ribe_source\": {\"describer_id\": \"ID\", \"id\": 0, [853 chars]0}\\n'",
+          "tests": [
+            "test_schedule"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_recompile_user_contexts"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_subclasses.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: 'clas[86 chars]Sym(s51)\",  # PlainAOTInput(idx=0)\\n        pr[1941 chars] )\\n' != 'clas[86 chars]Sym(s71)\",  # PlainAOTInput(idx=0)\\n        pr[1062 chars] )\\n'",
+          "tests": [
+            "test_njt_subclass_from_cat"
+          ]
+        },
+        {
+          "reason": "NameError: name 'device' is not defined",
+          "tests": [
+            "test_njt_subclass_from_buffer"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error:\nE   Failed Torch-MLIR Neuron partial lowering from TorchFX IR -> StableHLO IR: loc(\"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/test/dynamo/test_subclasses.py\":542:0): error: 'torch.prim.NumToTensor.Scalar' op operand #0 must be Any Python numeric type compatible with being the scalar type of a tensor, but got '!torch.bool'",
+          "tests": [
+            "test_disable_all_torch_function_restore_values",
+            "test_disable_all_torch_function_restore_values_graph_break"
+          ]
+        },
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_make_subclass"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: \nE   Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: loc(callsite(\"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/test/dynamo/test_subclasses.py\":866:0 at \"/home/ec2-user/work-torch-mlir/eager/src/TorchNeuronEager/tests/pytorch_tests/test/dynamo/test_subclasses.py\":871:0)): error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?x4xf32>'",
+          "tests": [
+            "test_no_torch_function_on_size_bytecode"
+          ]
+        },
+        {
+          "reason": "RuntimeError: NRT Execution error occurred on Neuron for operation=model_default",
+          "tests": [
+            "test_tensor_subclass_attr_codegen_tos"
+          ]
+        },
+        {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_torch_function_call_on_method",
+            "test_torch_function_call_on_method_arg"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[86 chars]Sym(s51)\",  # PlainAOTInput(idx=0)\\n        pr[1896 chars] )\\n' != 'clas[86 chars]Sym(s71)\",  # PlainAOTInput(idx=0)\\n        pr[1051 chars] )\\n'",
+          "tests": [
+            "test_njt_subclass_simple"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\\n     [1404 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[700 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_view_mul"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s97)\",  # PlainAOTInput(idx=0)\\n     [2003 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[1004 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_mul"
+          ]
+        },
+        {
+          "reason": "AssertionError: The length of the sequences mismatch: 1 != 0",
+          "tests": [
+            "test_recompile_with_symbool_inputs"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_compile_with_fake_tensor_automatic_dynamic"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\\n     [1548 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[708 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_view"
+          ]
+        },
+        {
+          "reason": "RuntimeError:",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_return_multiple"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s16)\",  # PlainAOTInput(idx=0)\\n     [1239 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 5]\",  # SubclassGetAttrAOTInput(ba[760 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_automatic_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\\n     [1373 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[520 chars] )\\n'",
+          "tests": [
+            "test_subclass_override_shape_and_to"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\\n     [1434 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[730 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_return_tensor_and_subclass"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\\n     [1536 chars] )\\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[708 chars] )\\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_clone_view"
+          ]
+        },
+        {
+          "reason": "AssertionError: The length of the sequences mismatch: 2 != 3",
+          "tests": [
+            "test_mark_static_with_subclass_desugaring_dynamic_True"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_basic_autograd",
+            "test_basic_autograd_inductor",
+            "test_in_graph_construction_from_input_6",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_basic",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_leaf_False_False",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_leaf_False_True",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_leaf_True_False",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_leaf_True_True",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_False_obscure",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_basic",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_leaf_False_False",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_leaf_False_True",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_leaf_True_False",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_obscure",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_dense_subclass_dense_subclass",
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_subclass_dense",
+            "test_return_shape",
+            "test_subclass_dense_subclass_dense_view",
+            "test_subclass_with_mutation_in_graph"
+          ]
+        },
+        {
+          "reason": "AssertionError: True is not false",
+          "tests": [
+            "test_wrapper_subclass_with_same_sized_inner_tensor"
+          ]
+        },
+        {
+          "reason": "AssertionError: Booleans mismatch: True is not False",
+          "tests": [
+            "test_binary_does_not_recompile",
+            "test_unary_does_not_recompile"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?x5xf64>'",
+          "tests": [
+            "test_inference_tensor",
+            "test_inline_nested_tensor_from_jagged"
+          ]
+        },
+        {
+          "reason": "AssertionError: s26 (could be from ['<ephemeral: intermediate_offsets_or_lengths>']) not in {s25: [], s26: []}.  If this assert is failing, it could be due to the issue described in https://github.com/pytorch/pytorch/pull/90665",
+          "tests": [
+            "test_in_graph_construction_from_intermediate_5"
+          ]
+        },
+        {
+          "reason": "AssertionError: s25 (could be from ['<ephemeral: intermediate_offsets_or_lengths>', '<ephemeral: intermediate_offsets_or_lengths>', '<ephemeral: intermediate_offsets_or_lengths>', '<ephemeral: intermediate_offsets_or_lengths>']) not in {s59: [\"L['values'].size()[0]\", \"L['nt2']._values.size()[0]\", \"L['nt2']._values.size()[0]\", \"L['nt2']._base.size()[0]\", \"L['nt']._values.size()[0]\", \"L['nt']._values.size()[0]\", \"L['nt']._base.size()[0]\"], s72: [\"L['nt2'].size()[1]\"], s74: [\"L['nt'].size()[1]\"]}.  If this assert is failing, it could be due to the issue described in https://github.com/pytorch/pytorch/pull/90665",
+          "tests": [
+            "test_in_graph_construction_mixed_2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: opt_ready_stream && opt_parent_stream INTERNAL ASSERT FAILED at \"/pytorch/torch/csrc/autograd/engine.cpp\":1084, please report a bug to PyTorch.",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_nested"
+          ]
+        },
+        {
+          "reason": "GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u12, u0) (unhinted: Eq(u12, u0)).  (Size-like symbols: u12, u0)",
+          "tests": [
+            "test_unbind"
+          ]
+        },
+        {
+          "reason": "AssertionError: AssertionError not raised",
+          "tests": [
+            "test_subclass_views_dynamic_True"
+          ]
+        },
+        {
+          "reason": "AssertionError: 'clas[81 chars]_1: \"Sym(s47)\",  # PlainAOTInput(idx=0)\n     [1373 chars] )\n' != 'clas[81 chars]_1: \"f32[3, 4]\",  # SubclassGetAttrAOTInput(ba[520 chars] )\n'",
+          "tests": [
+            "test_tensor_subclass_TwoTensor_simple"
+          ]
+        },
+        {
+          "reason": "error message=\"COMPILATION FAILED: Error: 2026-01-04T17:09:17Z INVALID_ARGUMENT: Unbounded dynamism is disabled for instruction: %Arg_1.2 = f32[?,3,1]{2,1,0} parameter(1)\"",
+          "tests": [
+            "test_inputs_to_compiled_fn_are_views_nt_view_name_base_is_nt_True_leaf_True_True"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_subgraphs.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_dynamic_getitem",
+            "test_dynamic_kwarg"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_torchrec.py",
+      "xfail": [
+        {
+          "reason": "NameError: name 'KeyedJaggedTensor' is not defined",
+          "tests": [
+            "test_bucketize",
+            "test_pooled",
+            "test_simple"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_trace_rules.py"
+    },
+    {
+      "file": "dynamo/test_unittest.py"
+    },
+    {
+      "file": "dynamo/test_unspec.py",
+      "skip_tests": [
+        {
+          "reason": "Segmentation fault",
+          "tests": [
+            "test_sum_dimlist_spec"
+          ]
+        },
+        {
+          "reason": "Remote test timeout",
+          "tests": [
+            "test_unspec_float_precision"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "TypeError: create_neuron_backend.<locals>.neuron_backend_wrapper() got an unexpected keyword argument 'mode'",
+          "tests": [
+            "test_mark_unbacked",
+            "test_mark_unbacked_channels_last"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: FIX ME: Unimplemented call_function: target=<function sym_max at 0x7f6278f2bd00>, {'stack_trace': '  File \"/workspace/torch_neuron_eager/tests/pytorch_tests/test/dynamo/test_unspec.py\", line 577, in fn\\n    return torch.ones(max(x.item(), 1024))\\n', 'source_fn_stack': [('sym_max', <function sym_max at 0x7f6278f2bd00>)], 'from_node': [(name=sym_max, pass_name=Interpreter_PropagateUnbackedSymInts, action=create, graph_id=140050787583168)",
+          "tests": [
+            "test_item_max"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_no_recompilations_with_efficient_attention"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.UserError: Could not guard on data-dependent expression zuf0 (unhinted: zuf0).  (Size-like symbols: none)",
+          "tests": [
+            "test_symfloat_to_tensor"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.constant.int'",
+          "tests": [
+            "test_rshift_dynamic"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Data-dependent branching",
+          "tests": [
+            "test_specializing_numpy_float_in_control_flow"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_no_recompiles",
+            "test_no_recompiles_prod_backward",
+            "test_unspecialized_float_multiply_precision"
+          ]
+        },
+        {
+          "reason": "AssertionError: False is not true",
+          "tests": [
+            "test_builtin_max_min"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?xf32>'",
+          "tests": [
+            "test_isinstance_symint",
+            "test_propagate_dynamic_dim"
+          ]
+        },
+        {
+          "reason": "AssertionError: '2' != '3'",
+          "tests": [
+            "test_unspec_float_input"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: failed to legalize operation 'torch.runtime.assert' that was explicitly marked illegal",
+          "tests": [
+            "test_mark_unbacked_hint_consistency"
+          ]
+        },
+        {
+          "reason": "AssertionError: '1' != '3'",
+          "tests": [
+            "test_symbol_guard_limit_before_specialize"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <built-in method tensor of type object at 0x7fad2dfd1a00>(*([FakeTensor(..., size=(20, 1), dtype=torch.float64), FakeTensor(..., size=(20, 1), dtype=torch.float64), FakeTensor(..., size=(20, 1), dtype=torch.float64), FakeTensor(..., size=(20, 1), dtype=torch.float64)],), **{'dtype': torch.float64, 'device': 'cpu'}): got ValueError('only one element tensors can be converted to Python scalars')",
+          "tests": [
+            "test_to_tensor"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: Compilation error occurred on Neuron for operation=torch_compile;",
+          "tests": [
+            "test_prune_torch_check"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not close!",
+          "tests": [
+            "test_tensorfiy_python_scalars_2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: FIX ME: Unimplemented call_function: target=<function sym_sum at 0x7fc54fdcbeb0>, {'from_node': [(name=sym_sum, pass_name=Interpreter_PropagateUnbackedSymInts, action=create, graph_id=140483545383888)",
+          "tests": [
+            "test_split_aot_autograd"
+          ]
+        },
+        {
+          "reason": "RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation relu failed to execute on Neuron (last implementation: PriorityImpl). Details: PriorityImpl: name 'device' is not defined. Args: [arg0: Tensor(shape=torch.Size([3, 6]), dtype=torch.float32, device=neuron:0, dispatch keys: DispatchKeySet(PrivateUse1, ADInplaceOrView, AutogradPrivateUse1, AutocastPrivateUse1))]. Kwargs: []",
+          "tests": [
+            "test_builtin_functions_on_device_neuron"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_utils.py",
+      "xfail": [
+        {
+          "reason": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, neuron:0 and cpu!",
+          "tests": [
+            "test_dynamo_timed",
+            "test_graph_node_shapes",
+            "test_log_dynamo_start",
+            "test_stack_trace"
+          ]
+        },
+        {
+          "reason": "AssertionError: ('dynamo.automatic_dynamic_shapes', True) not found in dict_items([('dynamo.automatic_dynamic_shapes', False)])",
+          "tests": [
+            "test_dynamic_shape_feature_use"
+          ]
+        },
+        {
+          "reason": "Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: *: error: 'stablehlo.broadcast_in_dim' op result #0 must be statically shaped or single bounded dimension tensor of 4/6/8/16/32/64-bit float or bool or 2/4/8/16/32/64-bit integer or complex type with 32/64-bit float elements or per-tensor integer quantized or per-axis integer quantized values, but got 'tensor<?x?xf32>'",
+          "tests": [
+            "test_graph_break_counting"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_verify_correctness.py",
+      "xfail": [
+        {
+          "reason": "AssertionError: expected failure",
+          "tests": [
+            "test_incorrect_verify_true"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "dynamo/test_view.py",
+      "xfail": [
+        {
+          "reason": "torch._dynamo.exc.Unsupported: Unsupported Tensor.item() call with capture_scalar_outputs=False",
+          "tests": [
+            "test_view_to_1d",
+            "test_view_to_2d"
+          ]
+        }
+      ]
+    }
+  ]
+}

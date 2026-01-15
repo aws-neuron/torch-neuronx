@@ -1,6 +1,7 @@
 """Test that zeros operation is properly registered with PyTorch dispatcher."""
 
 import logging
+import os
 
 import pytest
 import torch
@@ -121,9 +122,10 @@ class TestZerosRegistration:
     def test_zeros_out_of_different_sizes(self, size):
         """Test that zeros operation is properly registered with PyTorch dispatcher."""
         with track_neuron_ops():
-            out = torch.empty((1,), device="neuron")
+            out = torch.empty(size, device="neuron")
             tensor = torch.zeros(size, device="neuron", out=out)
-            assert_op_runs_on_neuron("aten::zero_")
+            op_name = "zeros" if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1" else "zero_"
+            assert_op_runs_on_neuron(f"aten::{op_name}")
             assert tensor is out
             assert tensor.device.type == "neuron"
             if isinstance(size, int):

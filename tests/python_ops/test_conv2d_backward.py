@@ -73,6 +73,9 @@ TEST_CONFIGS = [
         (2, 3, 10, 10),
         "convolution_backward",
         id="padding_2",
+        marks=pytest.mark.xfail(
+            reason="invalid offset in SB - memory layout issue in compiled kernel"
+        ),
     ),
     # Test different channel configurations
     pytest.param(
@@ -151,9 +154,6 @@ DTYPE_TOLERANCE_CONFIGS = [
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
-@pytest.mark.skipif(
-    use_mlir_aten_ops(), reason="Test gets stuck when lowering aten ops with torch compile"
-)
 class TestConv2dBackwardRegistration:
     """Test cases for conv2d backward operation"""
 

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -165,6 +167,8 @@ class TestAddCompositeOp:
     @pytest.mark.parametrize("composite_func", [torch.addcmul, torch.addcdiv])
     def test_composite_func_no_recompilation_different_values(self, composite_func):
         """Test that operations with different values don't trigger recompilation"""
+        # set env var to collect metrics
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
         device = "neuron"
         input = torch.randn(3, 3)
         tensor1 = torch.randn(3, 3)
@@ -216,10 +220,14 @@ class TestAddCompositeOp:
 
         # Verify outputs are different
         assert not torch.equal(out1, out2), "Different values should produce different outputs"
+        # reset environment variables
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
 
     @pytest.mark.parametrize("composite_func", [torch.addcmul, torch.addcdiv])
     def test_composite_func_recompilation_different_value_types(self, composite_func):
         """Test that operations with different value types DOES trigger recompilation"""
+        # set env var to collect metrics
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
         device = "neuron"
         input = torch.randn(3, 3)
         tensor1 = torch.randn(3, 3)
@@ -236,6 +244,7 @@ class TestAddCompositeOp:
 
         # First execution with value=2.0
         out1 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=2.0)
+        torch.neuron.synchronize()
 
         # Get cache sizes after first execution
         after_first_kernel_cache_size = kernel_cache_size()
@@ -248,6 +257,7 @@ class TestAddCompositeOp:
 
         # Second execution with different value=2
         out2 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=2)
+        torch.neuron.synchronize()
 
         # Get cache sizes after second execution
         after_second_kernel_cache_size = kernel_cache_size()
@@ -271,3 +281,5 @@ class TestAddCompositeOp:
 
         # Verify outputs are the same since 2.0 = 2
         assert torch.equal(out1, out2)
+        # reset environment variables
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)

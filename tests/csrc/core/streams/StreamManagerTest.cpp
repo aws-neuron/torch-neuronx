@@ -283,8 +283,6 @@ TEST_F(StreamManagerTest, StreamPriorityOrdering) {
   EXPECT_GT(medium_priority_stream->priority, low_priority_stream->priority);
 }
 
-// Test concurrent operations on different streams
-
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

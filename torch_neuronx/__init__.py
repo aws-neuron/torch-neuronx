@@ -53,6 +53,18 @@ try:
     from . import _C
 
     _C._register_device()
+
+    # Wrap neuron C extensions with torch._dynamo.disable since they can't be traced.
+    import inspect
+
+    for name in dir(_C):
+        obj = getattr(_C, name)
+        if callable(obj) and not inspect.isclass(obj):
+            try:
+                wrapped = torch._dynamo.disable(obj)
+                setattr(_C, name, wrapped)
+            except (TypeError, AttributeError):
+                pass
 except ImportError as e:
     import warnings
 
@@ -63,15 +75,14 @@ except ImportError as e:
 # Import and register Python operations
 from . import distributed, neuron, python_ops
 
-# Import stream and event classes
-from .streams import Event, Stream
-
-# Expose NeuronCachingAllocator for TorchNeuronNKIKernel
-NeuronCachingAllocator = _C.NeuronCachingAllocator
+# Import torch.compile metrics APIs
+from .neuron_dynamo_backend.metrics import get_dynamo_metrics, reset_dynamo_metrics
 
 # Import NKI kernel support
-from .nki_hop import nki, nki_op
-from .nki_kernel import TorchNeuronNKIKernel
+from .nki_hop import nki_op, wrap_nki
+
+# Import stream and event classes
+from .streams import Event, Stream
 
 # Register neuron as a custom backend
 # This replaces PrivateUse1 with 'neuron'

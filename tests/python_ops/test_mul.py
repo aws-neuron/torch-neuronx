@@ -174,3 +174,29 @@ class TestMul:
         # Compare with CPU result
         expected = torch.mul(a_cpu, b_cpu)
         torch.testing.assert_close(result_neuron.cpu(), expected)
+
+    def test_mul_transpose_contiguous(self):
+        """Test multiplication with transposed tensor and broadcasting
+
+        The transpose is used to create non-contiguous input.
+        """
+        # Create CPU tensors
+        a_cpu = torch.randn(8, 4)
+        b_cpu = torch.randn(4, 1)
+
+        # Move to Neuron device
+        a_neuron = a_cpu.to("neuron")
+        b_neuron = b_cpu.to("neuron")
+
+        # Transpose and multiply on CPU
+        a_transposed_cpu = a_cpu.transpose(0, 1)
+        expected = a_transposed_cpu * b_cpu
+
+        with track_neuron_ops():
+            # Transpose and multiply on Neuron
+            a_transposed_neuron = a_neuron.transpose(0, 1)
+            result_neuron = a_transposed_neuron * b_neuron
+            assert_op_runs_on_neuron("aten::mul")
+
+        # Compare results
+        torch.testing.assert_close(result_neuron.cpu(), expected)

@@ -1,11 +1,18 @@
 """NKI kernel wrapper for scatter_add operation"""
 
 import neuronxcc.nki.language as nl
+import torch
+from neuronxcc.nki._pre_prod_kernels.experimental.misc.scatter_add import scatter_add
 
-from torch_neuronx.utils import get_logical_neuron_cores
+from torch_neuronx.nki_hop import nki_op, wrap_nki
+
+wrapped_scatter_add_nki = wrap_nki(scatter_add)
 
 
-def scatter_add_kernel(input, dim, index, src):
+@nki_op("nki_kernels::scatter_add_kernel", mutates_args={})
+def scatter_add_kernel(
+    input: torch.Tensor, dim: int, index: torch.Tensor, src: torch.Tensor
+) -> torch.Tensor:
     """
     Wrapper for NKI scatter_add kernel.
 
@@ -18,18 +25,10 @@ def scatter_add_kernel(input, dim, index, src):
     Returns:
         input: Modified input tensor
     """
-    from neuronxcc.nki._pre_prod_kernels.experimental.misc.scatter_add import scatter_add
-
-    from torch_neuronx import TorchNeuronNKIKernel
+    from torch_neuronx.utils import get_logical_neuron_cores
 
     logical_neuron_cores = int(get_logical_neuron_cores())
-    traced_kernel = TorchNeuronNKIKernel(
-        func=getattr(scatter_add, "func", scatter_add),
-        grid=(nl.nc(logical_neuron_cores),),
-        kernel_return=True,
-        return_tensor_overrides=input,
-    )
 
-    result = traced_kernel(input=input, dim=dim, index=index, src=src)
+    result = wrapped_scatter_add_nki[(nl.nc(logical_neuron_cores),)](input, dim, index, src)
 
     return result

@@ -192,7 +192,7 @@ class ScaledDotProductFusedAttentionOp(Operation):
 
     @property
     def op_name(self) -> str:
-        return "scaled_dot_product_attention"
+        return "_scaled_dot_product_fused_attention_overrideable"
 
     def _unhandled_cpu_fallback(self, *args, **kwargs):
         # remap altered kwargs to original names - still breaks due to incompatible outputs
@@ -326,13 +326,6 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
             k_nki = key.transpose(-2, -1)
             v_nki = value  # Keep in original format, will transpose in kernel
 
-            # Create output gradient tensors (must be contiguous for device copy)
-            grad_q = torch.empty(q_nki.shape, dtype=q_nki.dtype, device=q_nki.device)
-            grad_k = torch.empty(k_nki.shape, dtype=k_nki.dtype, device=k_nki.device)
-            grad_v = torch.empty(
-                k_nki.shape, dtype=k_nki.dtype, device=k_nki.device
-            )  # Same shape as K
-
             # Calculate scale if not provided
             if scale is None:
                 scale = 1.0 / math.sqrt(embed_dim)
@@ -341,16 +334,13 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
             seed = philox_seed if dropout_p > 0.0 and philox_seed.numel() > 0 else None
 
             # Call the backward kernel
-            scaled_dot_product_attention_backward_kernel(
+            grad_q, grad_k, grad_v = scaled_dot_product_attention_backward_kernel(
                 grad_out=grad_out,
                 q=q_nki,
                 k=k_nki,
                 v=v_nki,
                 out=out,
                 lse=logsumexp,
-                grad_q=grad_q,
-                grad_k=grad_k,
-                grad_v=grad_v,
                 is_causal=is_causal,
                 dropout_p=dropout_p,
                 scale=scale,

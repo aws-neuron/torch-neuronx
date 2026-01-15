@@ -151,15 +151,6 @@ class NeuronResourceManager {
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
 
-  // Resource usage statistics for monitoring
-  struct ResourceStats {
-    size_t compilation_cache_size;    // Number of cached NEFFs
-    size_t compilation_cache_memory;  // Estimated cache memory usage in bytes
-  };
-
-  // Get comprehensive resource statistics
-  ResourceStats GetResourceStats() const;
-
  private:
   // Private constructor for singleton pattern
   NeuronResourceManager();

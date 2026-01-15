@@ -346,6 +346,34 @@ class TestConfigUtilities:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
 
+    @patch("torch_neuronx.neuron_dynamo_backend.config.get_rank")
+    @patch("torch_neuronx.neuron_dynamo_backend.config.get_artifacts_directory")
+    def test_get_err_mlir_path(self, mock_get_artifacts_dir, mock_get_rank):
+        """Test error MLIR path generation"""
+        mock_get_rank.return_value = 1
+        temp_dir = Path(tempfile.mkdtemp())
+        mock_get_artifacts_dir.return_value = temp_dir
+
+        try:
+            config.reset_timestamp()
+            config.set_model_name("test_model")
+            path = config.get_err_mlir_path()
+
+            # Check path structure
+            assert path.parent.parent.parent == temp_dir  # base_dir
+            assert path.parent.parent.name == "torch_mlir_error"
+            assert path.parent.name == "proc_1"
+            assert path.name.startswith("test_model_")
+            assert path.name.endswith(".mlir")
+
+            # Check directory creation
+            assert path.parent.exists()
+        finally:
+            import shutil
+
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+
     def test_path_generation_without_model_name(self):
         """Test path generation when model name is None"""
         with (

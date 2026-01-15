@@ -9,6 +9,7 @@
 #include "tests/csrc/mocks/MockNeuronDevice.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 
 using namespace at::neuron;
 using ::testing::_;
@@ -34,6 +35,9 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
 class CompilationCacheTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Enable metrics for testing
+    at::neuron::metrics::SetMetricsEnabled(true);
+
     cache_ = std::make_unique<CompilationCache>();
     torch_neuronx::SetMockInstanceType("trn1");
   }
@@ -80,34 +84,31 @@ TEST_F(CompilationCacheTest, DifferentKeysProduceDifferentResults) {
   // Results should be different
   EXPECT_NE(kernel_exec1.GetCachedNeff(), kernel_exec2.GetCachedNeff());
 }
-
-TEST_F(CompilationCacheTest, CacheStats) {
+// Test basic cache operations
+TEST_F(CompilationCacheTest, CacheBasicOperations) {
   std::vector<uint8_t> ir_bytes = {0x01, 0x02, 0x03, 0x04};
   uint32_t stream_id = 1;
 
-  // Initial stats
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 0);
-  EXPECT_EQ(stats.cache_hits, 0);
-  EXPECT_EQ(stats.cache_misses, 0);
-  EXPECT_EQ(stats.hit_rate, 0.0);
+  // Initial state - cache should be empty
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 0);
+  EXPECT_EQ(cache_->GetMemoryUsageBytes(), 0);
 
   // Add one entry
   MockNeuronKernelExecution kernel_exec1("test_key_1");
   cache_->GetOrCompileNeff(kernel_exec1, stream_id);
 
-  stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
-  EXPECT_EQ(stats.cache_misses, 1);
-  EXPECT_GT(stats.memory_usage_bytes, 0);
+  keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
+  EXPECT_GT(cache_->GetMemoryUsageBytes(), 0);
 
-  // Cache hit
+  // Cache hit - same key should return cached result
   MockNeuronKernelExecution kernel_exec2("test_key_1");
   cache_->GetOrCompileNeff(kernel_exec2, stream_id);
 
-  stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.cache_hits, 1);
-  EXPECT_EQ(stats.hit_rate, 0.5);  // 1 hit out of 2 total requests
+  // Should still have only one entry
+  keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(CompilationCacheTest, CacheEntryInfo) {
@@ -167,8 +168,8 @@ TEST_F(CompilationCacheTest, ConcurrentAccess) {
   }
 
   // Cache should have one entry
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 class LimitedCompilationCacheTest : public ::testing::Test {
@@ -228,13 +229,9 @@ TEST_F(LimitedCompilationCacheTest, SmallCacheEntriesEviction) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_LE(stats.total_entries, 2);        // Should not exceed limit
-  EXPECT_GT(stats.evictions_performed, 0);  // Should have performed evictions
-
   // Verify that the most recently used entries are kept
   auto all_keys = cache_->GetAllCacheKeys();
-  EXPECT_LE(all_keys.size(), 2);
+  EXPECT_LE(all_keys.size(), 2);  // Should not exceed limit
 }
 
 TEST_F(LimitedCompilationCacheTest, SmallCacheSizeEviction) {
@@ -269,9 +266,8 @@ TEST_F(LimitedCompilationCacheTest, SmallCacheSizeEviction) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_GT(stats.evictions_performed, 0);           // Should have performed evictions
-  EXPECT_LT(stats.memory_usage_bytes, 1024 * 1024);  // Should be under 1MB limit
+  // Should be under 1MB limit
+  EXPECT_LT(cache_->GetMemoryUsageBytes(), 1024 * 1024);
 }
 
 TEST_F(LimitedCompilationCacheTest, LRUEvictionOrder) {
@@ -343,9 +339,6 @@ TEST_F(LimitedCompilationCacheTest, EvictionWithActiveEntries) {
   EXPECT_EQ(all_keys.count("active_entry"), 1);  // Should remain (active)
   EXPECT_EQ(all_keys.count("second_entry"), 0);  // Should be evicted
   EXPECT_EQ(all_keys.count("third_entry"), 1);   // Should remain (just added)
-
-  auto stats = cache_->GetStatistics();
-  EXPECT_GT(stats.evictions_performed, 0);
 }
 
 TEST_F(LimitedCompilationCacheTest, NoEvictionWhenUnderLimits) {
@@ -359,12 +352,8 @@ TEST_F(LimitedCompilationCacheTest, NoEvictionWhenUnderLimits) {
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
   }
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 5);
-  EXPECT_EQ(stats.evictions_performed, 0);  // No evictions should occur
-
   auto all_keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(all_keys.size(), 5);
+  EXPECT_EQ(all_keys.size(), 5);  // All entries should be present
 }
 
 TEST_F(CompilationCacheTest, ManualEviction) {
@@ -377,14 +366,14 @@ TEST_F(CompilationCacheTest, ManualEviction) {
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
   }
 
-  auto stats_before = cache_->GetStatistics();
-  EXPECT_EQ(stats_before.total_entries, 5);
+  auto keys_before = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_before.size(), 5);
 
   // Manually evict to 2 entries
   cache_->EvictLruEntries(2);
 
-  auto stats_after = cache_->GetStatistics();
-  EXPECT_LE(stats_after.total_entries, 2);
+  auto keys_after = cache_->GetAllCacheKeys();
+  EXPECT_LE(keys_after.size(), 2);
 }
 
 TEST_F(CompilationCacheTest, ClearCache) {
@@ -397,16 +386,15 @@ TEST_F(CompilationCacheTest, ClearCache) {
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
   }
 
-  auto stats_before = cache_->GetStatistics();
-  EXPECT_GT(stats_before.total_entries, 0);
+  auto keys_before = cache_->GetAllCacheKeys();
+  EXPECT_GT(keys_before.size(), 0);
 
   // Clear cache
   cache_->Clear();
 
-  auto stats_after = cache_->GetStatistics();
-  EXPECT_EQ(stats_after.total_entries, 0);
-  EXPECT_EQ(stats_after.cache_hits, 0);
-  EXPECT_EQ(stats_after.cache_misses, 0);
+  auto keys_after = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_after.size(), 0);
+  EXPECT_EQ(cache_->GetMemoryUsageBytes(), 0);
 }
 
 TEST_F(CompilationCacheTest, GetAllCacheKeys) {
@@ -499,6 +487,10 @@ TEST_F(CompilationCacheTest, DifferentStreamsShareCache) {
   EXPECT_TRUE(kernel_exec2.HasCachedNeff());
   auto cached_neff = kernel_exec2.GetCachedNeff();
   EXPECT_EQ(neff_bytes1, cached_neff);
+
+  // Should still have only one entry
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(CompilationCacheTest, MultipleStreamsCompilingSameKey) {
@@ -530,8 +522,8 @@ TEST_F(CompilationCacheTest, MultipleStreamsCompilingSameKey) {
   }
 
   // Should only have one cache entry
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 // Cache Key Edge Cases
@@ -625,16 +617,16 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   MockNeuronKernelExecution successful_kernel("successful_key");
   cache_->GetOrCompileNeff(successful_kernel, stream_id);
 
-  auto stats_before = cache_->GetStatistics();
-  EXPECT_EQ(stats_before.total_entries, 1);
+  auto keys_before = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_before.size(), 1);
 
   // Try to compile a failing kernel
   ThrowingMockKernelExecution failing_kernel("failing_key");
   EXPECT_THROW(cache_->GetOrCompileNeff(failing_kernel, stream_id), std::runtime_error);
 
   // Cache should still be in a valid state
-  auto stats_after = cache_->GetStatistics();
-  EXPECT_EQ(stats_after.total_entries, 1);  // Should still have the successful entry
+  auto keys_after = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_after.size(), 1);  // Should still have the successful entry
 
   // Should be able to access the successful entry
   MockNeuronKernelExecution successful_kernel2("successful_key");
@@ -646,8 +638,8 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   cache_->GetOrCompileNeff(new_kernel, stream_id);
   EXPECT_TRUE(new_kernel.HasCachedNeff());
 
-  auto final_stats = cache_->GetStatistics();
-  EXPECT_EQ(final_stats.total_entries, 2);
+  auto final_keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(final_keys.size(), 2);
 }
 
 TEST_F(LimitedCompilationCacheTest, CacheConsistencyAfterEviction) {
@@ -665,12 +657,10 @@ TEST_F(LimitedCompilationCacheTest, CacheConsistencyAfterEviction) {
   }
 
   // Cache should have evicted some entries
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 3);
-  EXPECT_EQ(stats.evictions_performed, 2);
+  auto cache_keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(cache_keys.size(), 3);
 
   // Verify cache consistency - entries that are still cached should return correct data
-  auto cache_keys = cache_->GetAllCacheKeys();
   for (const auto& cached_key : cache_keys) {
     MockNeuronKernelExecution kernel_exec(cached_key);
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
@@ -684,8 +674,7 @@ TEST_F(LimitedCompilationCacheTest, CacheConsistencyAfterEviction) {
   }
 }
 
-// Additional Statistics and Configuration Tests
-TEST_F(CompilationCacheTest, CompilationTimeTracking) {
+TEST_F(CompilationCacheTest, SlowCompilationHandling) {
   uint32_t stream_id = 1;
 
   // Create a mock that takes measurable time to compile
@@ -700,21 +689,18 @@ TEST_F(CompilationCacheTest, CompilationTimeTracking) {
     }
   };
 
-  auto stats_before = cache_->GetStatistics();
-  EXPECT_EQ(stats_before.total_compilation_time.count(), 0);
-
   // Compile multiple entries
   for (int i = 0; i < 3; ++i) {
     SlowMockKernelExecution kernel_exec("slow_key_" + std::to_string(i));
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
   }
 
-  auto stats_after = cache_->GetStatistics();
-  EXPECT_GT(stats_after.total_compilation_time.count(), 150);  // At least 3 * 50ms
-  EXPECT_EQ(stats_after.total_entries, 3);
+  // Verify all entries were cached
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 3);
 }
 
-TEST_F(LimitedCompilationCacheTest, MemoryUtilizationRatio) {
+TEST_F(LimitedCompilationCacheTest, MemoryUsageTracking) {
   SetUpWithLimits(1000, 1);  // 1000 entries max, 1MB limit
   uint32_t stream_id = 1;
 
@@ -722,23 +708,16 @@ TEST_F(LimitedCompilationCacheTest, MemoryUtilizationRatio) {
   MockNeuronKernelExecution kernel_exec("memory_test_key");
   cache_->GetOrCompileNeff(kernel_exec, stream_id);
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.max_cache_size_bytes, 1024 * 1024);  // 1MB
-  EXPECT_GE(stats.memory_utilization_ratio, 0.0);
-  EXPECT_LE(stats.memory_utilization_ratio, 1.0);
-
-  // If we have memory usage, ratio should be > 0
-  if (stats.memory_usage_bytes > 0) {
-    EXPECT_GT(stats.memory_utilization_ratio, 0.0);
-  }
+  // Verify memory usage is tracked
+  EXPECT_GT(cache_->GetMemoryUsageBytes(), 0);
+  EXPECT_EQ(cache_->GetMaxCacheSizeBytes(), 1024 * 1024);  // 1MB
 }
 
 TEST_F(LimitedCompilationCacheTest, ConfigurationLimitsReflection) {
   SetUpWithLimits(100, 10);  // 100 entries max, 10MB limit
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.max_cache_size_bytes, 10 * 1024 * 1024);
-  EXPECT_EQ(stats.max_cache_entries, 100);
+  EXPECT_EQ(cache_->GetMaxCacheSizeBytes(), 10 * 1024 * 1024);
+  EXPECT_EQ(cache_->GetMaxCacheEntries(), 100);
 }
 
 TEST_F(LimitedCompilationCacheTest, ZeroCacheLimits) {
@@ -751,10 +730,10 @@ TEST_F(LimitedCompilationCacheTest, ZeroCacheLimits) {
   cache_->GetOrCompileNeff(kernel_exec, stream_id);
   EXPECT_TRUE(kernel_exec.HasCachedNeff());
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.max_cache_size_bytes, 0);
-  EXPECT_EQ(stats.max_cache_entries, 0);
-  EXPECT_EQ(stats.total_entries, 1);
+  EXPECT_EQ(cache_->GetMaxCacheSizeBytes(), 0);
+  EXPECT_EQ(cache_->GetMaxCacheEntries(), 0);
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(LimitedCompilationCacheTest, VeryLargeCacheLimits) {
@@ -764,9 +743,8 @@ TEST_F(LimitedCompilationCacheTest, VeryLargeCacheLimits) {
 
   SetUpWithLimits(large_entries, large_mb);
 
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.max_cache_size_bytes, large_mb * 1024 * 1024);
-  EXPECT_EQ(stats.max_cache_entries, large_entries);
+  EXPECT_EQ(cache_->GetMaxCacheSizeBytes(), large_mb * 1024 * 1024);
+  EXPECT_EQ(cache_->GetMaxCacheEntries(), large_entries);
 
   // Should still function normally
   uint32_t stream_id = 1;
@@ -797,8 +775,8 @@ TEST_F(CompilationCacheTest, SmartPointerLifecycle) {
   EXPECT_TRUE(kernel_exec3.HasCachedNeff());
 
   // The active entry should not have been evicted
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 1);
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(CompilationCacheTest, CacheDestructionCleanup) {
@@ -810,18 +788,16 @@ TEST_F(CompilationCacheTest, CacheDestructionCleanup) {
     cache_->GetOrCompileNeff(kernel_exec, stream_id);
   }
 
-  auto stats_before = cache_->GetStatistics();
-  EXPECT_EQ(stats_before.total_entries, 3);
-  EXPECT_GT(stats_before.memory_usage_bytes, 0);
+  auto keys_before = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_before.size(), 3);
+  EXPECT_GT(cache_->GetMemoryUsageBytes(), 0);
 
   // Clear cache (simulates destruction cleanup)
   cache_->Clear();
 
-  auto stats_after = cache_->GetStatistics();
-  EXPECT_EQ(stats_after.total_entries, 0);
-  EXPECT_EQ(stats_after.memory_usage_bytes, 0);
-  EXPECT_EQ(stats_after.cache_hits, 0);
-  EXPECT_EQ(stats_after.cache_misses, 0);
+  auto keys_after = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_after.size(), 0);
+  EXPECT_EQ(cache_->GetMemoryUsageBytes(), 0);
 }
 
 class CompilationCacheEnvTest : public ::testing::Test {
@@ -859,9 +835,8 @@ TEST_F(CompilationCacheEnvTest, EnvironmentVariableConfiguration) {
   // Create new cache instance to pick up environment variables
   auto env_cache = std::make_unique<CompilationCache>();
 
-  auto stats = env_cache->GetStatistics();
-  EXPECT_EQ(stats.max_cache_size_bytes, 50 * 1024 * 1024);
-  EXPECT_EQ(stats.max_cache_entries, 200);
+  EXPECT_EQ(env_cache->GetMaxCacheSizeBytes(), 50 * 1024 * 1024);
+  EXPECT_EQ(env_cache->GetMaxCacheEntries(), 200);
 }
 
 TEST_F(CompilationCacheEnvTest, InvalidEnvironmentVariables) {
@@ -888,11 +863,10 @@ TEST_F(CompilationCacheEnvTest, DefaultValuesWithoutEnvironment) {
 
   // Create cache without environment variables
   auto default_cache = std::make_unique<CompilationCache>();
-  auto stats = default_cache->GetStatistics();
 
   // Should use default constants
-  EXPECT_EQ(stats.max_cache_size_bytes, CompilationCache::kDefaultMaxCacheSizeBytes);
-  EXPECT_EQ(stats.max_cache_entries, CompilationCache::kDefaultMaxCacheEntries);
+  EXPECT_EQ(default_cache->GetMaxCacheSizeBytes(), CompilationCache::kDefaultMaxCacheSizeBytes);
+  EXPECT_EQ(default_cache->GetMaxCacheEntries(), CompilationCache::kDefaultMaxCacheEntries);
 }
 
 TEST_F(CompilationCacheTest, NestedLocks) {
@@ -968,15 +942,15 @@ TEST_F(CompilationCacheTest, ExceptionSafetyDuringCompilation) {
   EXPECT_EQ(exceptions_caught.load(), num_threads);
 
   // Cache should be clean (no pending compilations left)
-  auto stats = cache_->GetStatistics();
-  EXPECT_EQ(stats.total_entries, 0);
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 0);
 
   // Should be able to compile successfully after failures
   MockNeuronKernelExecution successful_kernel(cache_key);
   cache_->GetOrCompileNeff(successful_kernel, 999);
 
-  auto final_stats = cache_->GetStatistics();
-  EXPECT_EQ(final_stats.total_entries, 1);
+  auto final_keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(final_keys.size(), 1);
 }
 
 TEST_F(LimitedCompilationCacheTest, ConcurrentEvictionAndAccess) {
@@ -1016,6 +990,67 @@ TEST_F(LimitedCompilationCacheTest, ConcurrentEvictionAndAccess) {
   // First entry should remain accessible through smart pointer even if evicted
   EXPECT_GT(successful_accesses.load(), 0);
   EXPECT_TRUE(neff_ptr && !neff_ptr->empty());
+}
+
+TEST_F(CompilationCacheTest, CentralizedMetricsHitMissTracking) {
+  using namespace at::neuron::metrics;
+
+  // Test that the metrics framework can be used alongside CompilationCache
+  // Create counters to track cache operations
+  NeuronCounter hits_counter("CompilationCache.Test.Hits");
+  NeuronCounter misses_counter("CompilationCache.Test.Misses");
+
+  uint32_t stream_id = 1;
+
+  // First compilation - simulate a cache miss
+  MockNeuronKernelExecution kernel_exec1("metrics_test_key");
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+  misses_counter.AddValue(1);
+
+  // Second compilation with same key - simulate a cache hit
+  MockNeuronKernelExecution kernel_exec2("metrics_test_key");
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  hits_counter.AddValue(1);
+
+  // Verify counters work correctly
+  EXPECT_EQ(misses_counter.Value(), 1);
+  EXPECT_EQ(hits_counter.Value(), 1);
+
+  // Verify counters are accessible from the arena
+  auto* arena_hits = NeuronMetricsArena::Get()->GetCounter("CompilationCache.Test.Hits");
+  auto* arena_misses = NeuronMetricsArena::Get()->GetCounter("CompilationCache.Test.Misses");
+  ASSERT_NE(arena_hits, nullptr);
+  ASSERT_NE(arena_misses, nullptr);
+  EXPECT_EQ(arena_hits->Value(), 1);
+  EXPECT_EQ(arena_misses->Value(), 1);
+}
+
+TEST_F(CompilationCacheTest, CentralizedMetricsCompilationTracking) {
+  using namespace at::neuron::metrics;
+
+  // Test that timing metrics work alongside CompilationCache
+  NeuronMetric compile_time("CompilationCache.Test.CompilationTime", MetricFnTime);
+
+  uint32_t stream_id = 1;
+
+  // Compile a few entries and record timing
+  for (int i = 0; i < 3; ++i) {
+    auto start = GetCurrentTimeNs();
+    MockNeuronKernelExecution kernel_exec("metrics_compile_key_" + std::to_string(i));
+    cache_->GetOrCompileNeff(kernel_exec, stream_id);
+    auto end = GetCurrentTimeNs();
+    compile_time.AddSample(end, static_cast<double>(end - start));
+  }
+
+  // Verify compilation time metric has samples
+  EXPECT_EQ(compile_time.Samples().size(), 3);
+  EXPECT_GT(compile_time.Accumulator(), 0);  // Should have recorded some time
+
+  // Verify metric is accessible from the arena
+  auto* arena_metric =
+      NeuronMetricsArena::Get()->GetMetric("CompilationCache.Test.CompilationTime");
+  ASSERT_NE(arena_metric, nullptr);
+  EXPECT_GE(arena_metric->TotalSamples(), 3);
 }
 
 int main(int argc, char** argv) {

@@ -39,13 +39,6 @@ class TorchMlirCompiler:
 
         wrapper = OpWrapper(torch_fn, kwargs)
 
-        # Handle preprocessing before tracing
-        if getattr(torch_fn, "uses_preprocessing", False):
-            actual_fn, processed_args, processed_kwargs = torch_fn(*args, **kwargs)
-            wrapper.op_fn = actual_fn
-            wrapper.op_kwargs = processed_kwargs
-            args = processed_args
-
         # Generate StableHLO using torch-mlir fx
         stablehlo_module = fx.export_and_import(
             wrapper,

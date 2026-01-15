@@ -29,6 +29,18 @@ def is_distributed_test(item):
     )
 
 
+def is_lnc1_test(item):
+    """Check if test file has lnc1 in name (needs LNC=1 configuration)."""
+    return "_lnc1" in str(item.fspath)
+
+
+def is_all_cores_test(item):
+    """Check if test needs all cores visible (no NEURON_RT_NUM_CORES limit) -
+    Tests with "_all_cores" in filename need all cores visible.
+    """
+    return "_all_cores" in str(item.fspath)
+
+
 def is_launcher_env(session):
     return not os.path.exists("/dev/neuron0")
 
@@ -116,10 +128,20 @@ def ensure_neuron_initialized(request):
     if has_distributed_tests:
         return
 
-    # Use only one core for non-distributed tests (when not using xdist)
-    os.environ["NEURON_RT_NUM_CORES"] = "1"
-    # NEURON_RT_VIRTUAL_CORE_SIZE can be set externally to control LNC
-    # If not set, defaults to 2 (LNC=2)
+    # Check if ONLY lnc1 tests are being run
+    all_lnc1 = all(is_lnc1_test(item) for item in request.session.items)
+    # Check if all tests need all cores visible
+    needs_all_cores = all(is_all_cores_test(item) for item in request.session.items)
+
+    # Set LNC=1 if all tests require it
+    if all_lnc1:
+        os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
+
+    # If test needs all cores be visible, don't limit NEURON_RT_NUM_CORES
+    if needs_all_cores:
+        pass
+    else:
+        os.environ["NEURON_RT_NUM_CORES"] = "1"
 
     # Force initialization
     if torch_neuronx is not None:
@@ -159,7 +181,7 @@ if hasattr(pytest, "hookimpl"):
             devices = json.loads(result.stdout)
             total_cores = sum(device["nc_count"] for device in devices)
 
-            # Determine worker multiplier based on NEURON_RT_VIRTUAL_CORE_SIZE
+            # Determine worker multiplier based on NEURON_LOGICAL_NC_CONFIG
             multiplier = get_worker_multiplier()
 
             device_count = total_cores * multiplier
@@ -178,7 +200,7 @@ if hasattr(pytest, "hookimpl"):
             else:
                 # Non-distributed tests: 1 core per process
                 os.environ["NEURON_RT_NUM_CORES"] = "1"
-            # NEURON_RT_VIRTUAL_CORE_SIZE can be set externally to control LNC
+            # NEURON_LOGICAL_NC_CONFIG can be set externally to control LNC
             # If not set, defaults to 2 (LNC=2)
     except ImportError:
         # xdist not available, skip parallel configuration
@@ -194,6 +216,18 @@ def pytest_runtest_setup(item):
             os.environ["TOTAL_DEVICE_COUNT"] = worker_input["TOTAL_DEVICE_COUNT"]
 
 
+@pytest.fixture(scope="class")
+def enable_metrics_for_class():
+    """Enable TORCH_NEURONX_METRICS_ENABLED for classes using this fixture."""
+    original_value = os.environ.get("TORCH_NEURONX_METRICS_ENABLED")
+    os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
+    yield
+    if original_value is None:
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
+    else:
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = original_value
+
+
 @pytest.fixture(scope="function", autouse=True)
 def reset_dynamo(request):
     """Reset torch dynamo state before each test to ensure isolation."""
@@ -201,4 +235,5 @@ def reset_dynamo(request):
     if is_launcher_env(request.session):
         return
     import torch._dynamo
+
     torch._dynamo.reset()

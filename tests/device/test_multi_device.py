@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import torch_neuronx  # This registers the neuron device
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises, track_neuron_ops
 
 
 @pytest.mark.multi_device
@@ -77,3 +77,14 @@ class TestNeuronDevice(unittest.TestCase):
             assert (
                 x.storage().device.index == device_idx
             ), f"Device {device_idx}: Storage device changed to {x.storage().device}"
+
+    def test_ones_explicit_device_index(self):
+        """Test that explicit device argument is respected, not overridden by current device."""
+        device_count = torch_neuronx.device_count()
+        if device_count < 2:
+            pytest.skip("Need at least 2 neuron devices")
+
+        with track_neuron_ops():
+            x0 = torch.ones((2, 2), device="neuron:1")
+            assert x0.device.index == 1, f"Expected device index 1, got {x0.device.index}"
+            assert_op_runs_on_neuron("aten::ones")

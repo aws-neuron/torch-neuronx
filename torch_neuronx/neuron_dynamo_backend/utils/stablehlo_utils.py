@@ -155,3 +155,10 @@ def get_input_specs(module: ir.Module, func_name: str = "main") -> list[TensorSp
 
 def get_output_specs(module: ir.Module, func_name: str = "main") -> list[TensorSpec]:
     return list(parse_module_io(module, func_name).outputs)
+
+
+def shapes_match(shape1: TensorSpec, shape2: TensorSpec):
+    """Check if two shapes match exactly."""
+    if shape1 is None or shape2 is None:
+        return False
+    return shape1 == shape2

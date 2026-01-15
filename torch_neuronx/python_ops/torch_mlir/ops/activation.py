@@ -33,7 +33,7 @@ def torch_tanh(self, out=None):
 
 @register_aten(["aten::sigmoid_backward", "aten::sigmoid_backward.grad_input"])
 def torch_sigmoid_backward(grad_output, output):
-    return grad_output * (output * (1 - output))
+    return torch.ops.aten.sigmoid_backward.default(grad_output, output)
 
 
 @register_aten(["aten::silu_backward"])

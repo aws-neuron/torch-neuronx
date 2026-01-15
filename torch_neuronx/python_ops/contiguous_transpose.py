@@ -9,6 +9,7 @@ import torch
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+from torch_neuronx.utils import use_mlir_aten_ops
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -148,6 +149,9 @@ class ContiguousTransposeImpl(OperationImplementation):
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
 
+        if self_tensor.is_complex():
+            return False
+
         # Only handle contiguous or preserve formats (validation happens at entry)
         if memory_format is not None and (
             memory_format != torch.contiguous_format and memory_format != torch.preserve_format
@@ -170,23 +174,22 @@ class ContiguousTransposeImpl(OperationImplementation):
         permutation = compute_permutation_for_contiguous(shape, strides)
         return permutation is not None
 
-    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
-        """Execute contiguous operation using transpose kernel.
-        This uses compiled JAX transpose kernels to efficiently make
-        the tensor contiguous without element-wise copying.
-        """
-        try:
-            # Compute permutation and base contiguous view over same storage
-            permutation, base_view = _prepare_transpose_inputs(self_tensor)
+    def _execute_impl_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute contiguous operation using transpose kernel."""
+        # Compute permutation and base contiguous view over same storage
+        permutation, base_view = _prepare_transpose_inputs(self_tensor)
 
-            if permutation is None:
-                return ExecutionResult(
-                    success=False, error_msg="Failed to compute permutation for transpose"
-                )
+        if permutation is None:
+            return ExecutionResult(
+                success=False, error_msg="Failed to compute permutation for transpose"
+            )
 
-            # Get the kernel
-            kernel = self._get_kernel()
+        # Get the kernel
+        kernel = self._get_kernel()
 
+        if use_mlir_aten_ops():
+            output = kernel(base_view, permutation)
+        else:
             # Execute the kernel on the base view. Provide ExecutionContext with
             # original_inputs so meta shape/dtype inference uses the logical
             # input (current view) rather than the constructed base view.
@@ -195,13 +198,22 @@ class ContiguousTransposeImpl(OperationImplementation):
             exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
             output = kernel(base_view, permutation, context=exec_ctx)
 
+        return output
+
+    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute contiguous operation using transpose kernel.
+        This uses compiled JAX transpose kernels to efficiently make
+        the tensor contiguous without element-wise copying.
+        """
+        try:
+            output = self._execute_impl_internal(self_tensor, memory_format=memory_format)
             # Verify the output is contiguous
             if not output.is_contiguous():
                 # This shouldn't happen
                 # Fall back to the next implementation
                 return ExecutionResult(
                     success=False,
-                    error_msg=f"Transpose output not contiguous for permutation {permutation}",
+                    error_msg="Transpose output not contiguous",
                 )
             return ExecutionResult(success=True, output=output)
 
@@ -241,8 +253,6 @@ class ContiguousTransposeJAXImpl(ContiguousTransposeImpl):
     _kernel: JaxKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)
@@ -271,8 +281,6 @@ class ContiguousTransposeMLIRImpl(ContiguousTransposeImpl):
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if not use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)
@@ -302,22 +310,7 @@ class ContiguousTransposeFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousTransposeImpl):
-        # Compute permutation and base contiguous view over same storage
-        permutation, base_view = _prepare_transpose_inputs(self_tensor)
-        if permutation is None or base_view is None:
-            raise RuntimeError("ContiguousTransposeFunction: not a pure permutation view")
-
-        # Save minimal context for potential debugging
-        ctx.permutation = permutation
-
-        # Execute JAX kernel with context so meta uses the logical input
-        from .jax.context import ExecutionContext
-
-        kernel = impl._get_kernel()
-        exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
-        output = kernel(base_view, permutation, context=exec_ctx)
-
-        return output
+        return impl._execute_impl_internal(self_tensor, memory_format)
 
     @staticmethod
     def backward(ctx, grad_output):

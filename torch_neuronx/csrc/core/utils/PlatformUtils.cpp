@@ -81,7 +81,7 @@ std::string GetPlatformTarget() { return GetPlatformConfig().target; }
 
 std::string GetLogicalNeuronCores() {
   // Check environment variable override first
-  const char* env_lnc = std::getenv("NEURON_RT_VIRTUAL_CORE_SIZE");
+  const char* env_lnc = std::getenv("NEURON_LOGICAL_NC_CONFIG");
   if (env_lnc) {
     return std::string(env_lnc);
   }

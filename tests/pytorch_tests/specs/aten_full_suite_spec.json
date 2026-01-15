@@ -1,0 +1,396 @@
+{
+  "test_configurations": [
+    {
+      "class": "TestReductions",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_reductions.py"
+    },
+    {
+      "class": "TestCommon",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_ops.py"
+    },
+    {
+      "class": "TestTorchDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_torch.py"
+    },
+    {
+      "class": "TestNNDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_nn.py"
+    },
+    {
+      "class": "TestRandomTensorCreation",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_tensor_creation_ops.py"
+    },
+    {
+      "class": "TestTensorCreation",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_tensor_creation_ops.py"
+    },
+    {
+      "class": "TestLikeTensorCreation",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_tensor_creation_ops.py"
+    },
+    {
+      "class": "TestUnaryUfuncs",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_unary_ufuncs.py"
+    },
+    {
+      "class": "TestViewOps",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_view_ops.py"
+    },
+    {
+      "class": "TestBinaryUfuncs",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_binary_ufuncs.py"
+    },
+    {
+      "class": "TestScatterGather",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_scatter_gather_ops.py"
+    },
+    {
+      "class": "TestAutogradDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_autograd.py"
+    },
+    {
+      "class": "TestModule",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_modules.py"
+    },
+    {
+      "class": "TestBwdGradients",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_ops_gradients.py"
+    },
+    {
+      "class": "TestFwdGradients",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_ops_fwd_gradients.py"
+    },
+    {
+      "class": "TestJit",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_ops_jit.py"
+    },
+    {
+      "class": "TestShapeOps",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_shape_ops.py"
+    },
+    {
+      "class": "TestForeach",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_foreach.py"
+    },
+    {
+      "class": "TestMHADeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_native_mha.py"
+    },
+    {
+      "class": "TestIndexing",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_indexing.py"
+    },
+    {
+      "class": "TestLinalg",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_linalg.py"
+    },
+    {
+      "class": "TestMasked",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_masked.py"
+    },
+    {
+      "class": "TestSortAndSelect",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_sort_and_select.py"
+    },
+    {
+      "class": "TestNestedTensorDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_nestedtensor.py"
+    },
+    {
+      "class": "TestDeviceUtils",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_utils.py"
+    },
+    {
+      "class": "TestComplexTensor",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_complex.py"
+    },
+    {
+      "class": "TestContentStore",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_content_store.py"
+    },
+    {
+      "class": "TestTorchDlPack",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_dlpack.py"
+    },
+    {
+      "class": "TestExpandedWeightHelperFunction",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_expanded_weights.py"
+    },
+    {
+      "class": "TestNormalizeOperators",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_fx_experimental.py"
+    },
+    {
+      "class": "TestFusionPattern",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_jit_llga_fuser.py"
+    },
+    {
+      "class": "TestOp",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_jit_llga_fuser.py"
+    },
+    {
+      "class": "TestVmapBatchedGradientLegacy",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_legacy_vmap.py"
+    },
+    {
+      "class": "TestMeta",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_meta.py"
+    },
+    {
+      "class": "TestNumPyInterop",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_numpy_interop.py"
+    },
+    {
+      "class": "TestPrims",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_prims.py"
+    },
+    {
+      "class": "TestWrapperSubclassAliasing",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_python_dispatch.py"
+    },
+    {
+      "class": "TestSegmentReductions",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_segment_reductions.py"
+    },
+    {
+      "class": "TestSparseUnaryUfuncs",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_sparse.py"
+    },
+    {
+      "class": "TestFFT",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_spectral_ops.py"
+    },
+    {
+      "class": "TestTesting",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_testing.py"
+    },
+    {
+      "class": "TestTypePromotion",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_type_promotion.py"
+    },
+    {
+      "class": "TestDropoutNNDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "nn/test_dropout.py"
+    },
+    {
+      "class": "TestEmbeddingNNDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "nn/test_embedding.py"
+    },
+    {
+      "class": "TestMultiheadAttentionNNDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "nn/test_multihead_attention.py"
+    },
+    {
+      "class": "TestPoolingNNDeviceType",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "nn/test_pooling.py"
+    },
+    {
+      "class": "TestBits",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "quantization/core/experimental/test_bits.py"
+    },
+    {
+      "class": "TestFloat8Dtype",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "quantization/core/experimental/test_floatx.py"
+    },
+    {
+      "class": "TestDecomp",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_decomp.py"
+    }
+  ]
+}

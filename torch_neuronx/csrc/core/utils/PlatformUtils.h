@@ -29,7 +29,7 @@ std::string GetPlatformTarget();
 
 // Gets the logical neuron cores setting for compilation.
 // Checks environment variables first, then falls back to instance defaults.
-// The NEURON_RT_VIRTUAL_CORE_SIZE environment variable can override defaults.
+// The NEURON_LOGICAL_NC_CONFIG environment variable can override defaults.
 //
 // Returns:
 //   Logical neuron core count as string (e.g., "1", "2")

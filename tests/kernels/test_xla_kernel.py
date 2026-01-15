@@ -1,5 +1,7 @@
 """Test XLA kernel functionality."""
 
+import os
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -86,6 +88,8 @@ class TestXLAKernel:
 
     def test_cache_reuse(self):
         """Test that compiled NEFFs are cached properly."""
+        # set env var to collect metrics
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
 
         from torch_neuronx.kernels import TorchNeuronXLAKernel
 
@@ -137,6 +141,8 @@ class TestXLAKernel:
         # Verify results
         torch.testing.assert_close(result1.cpu(), torch.tensor([[2.0, 4.0], [6.0, 8.0]]))
         torch.testing.assert_close(result2.cpu(), torch.tensor([[15.0, 18.0], [21.0, 24.0]]))
+        # reset environment variable
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
 
     def test_shape_inference_simple(self):
         """Test automatic output shape inference for simple operations."""

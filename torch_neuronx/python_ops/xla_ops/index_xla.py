@@ -5,7 +5,7 @@ import logging
 import torch
 
 from torch_neuronx.kernels.xla_kernel import TorchNeuronXLAKernel
-from torch_neuronx.python_ops.auto_registration import create_auto_operation, neuron_op
+from torch_neuronx.python_ops.auto_registration import create_auto_operation
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
 from torch_neuronx.python_ops.xla_ops.nonzero_xla import NonzeroXLAImpl
 
@@ -48,8 +48,6 @@ def convert_indices(indices):
     return tuple(integer_indices)
 
 
-@neuron_op("aten::index.Tensor")
-@neuron_op("aten::index.Tensor_out")
 class IndexXLAImpl(OperationImplementation):
     """index implementation using XLA"""
 

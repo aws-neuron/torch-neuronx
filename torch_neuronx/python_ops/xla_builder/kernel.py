@@ -102,7 +102,7 @@ class XLABuilderKernel(BaseNeuronKernel):
             output_tensors = (output_tensors,)
 
         cache_key = self._generate_cache_key(self.op_name, processed_inputs, kwargs)
-        device = self.arg_processor.extract_device(inputs)
+        device = self.arg_processor.extract_device(inputs, kwargs)
         input_dict = self.arg_processor.prepare_execution_inputs(processed_inputs, device)
         # Get CPU fallback context stored directly on kernel
         cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)

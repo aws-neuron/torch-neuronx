@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 
 namespace at::neuron {
 
@@ -34,42 +35,6 @@ CompilationCache::CompilationCache() {
                                std::string(max_entries_env) + " (" + e.what() + ")");
     }
   }
-}
-
-CompilationCache::CacheStats CompilationCache::GetStatistics() const {
-  std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-
-  uint64_t hits = cache_hits_.load();
-  uint64_t misses = cache_misses_.load();
-  uint64_t total_requests = hits + misses;
-
-  // Calculate total memory usage and count valid entries
-  size_t total_memory = 0;
-  size_t valid_entries = 0;
-
-  for (const auto& [key, entry] : cache_) {
-    if (entry) {
-      total_memory += entry->neff_bytes.size();
-      total_memory += sizeof(CacheEntry) + key.size();
-      valid_entries++;
-    }
-  }
-
-  CacheStats stats;
-  stats.total_entries = valid_entries;
-  stats.cache_hits = hits;
-  stats.cache_misses = misses;
-  stats.hit_rate = total_requests > 0 ? static_cast<double>(hits) / total_requests : 0.0;
-  stats.memory_usage_bytes = total_memory;
-  stats.total_compilation_time = std::chrono::milliseconds(total_compilation_time_ms_.load());
-  stats.evictions_performed = evictions_performed_.load();
-  stats.max_cache_size_bytes = max_cache_size_bytes_.load();
-  stats.max_cache_entries = max_cache_entries_.load();
-  stats.memory_utilization_ratio =
-      stats.max_cache_size_bytes > 0
-          ? static_cast<double>(stats.memory_usage_bytes) / stats.max_cache_size_bytes
-          : 0.0;
-  return stats;
 }
 
 std::vector<CompilationCache::CacheEntryInfo> CompilationCache::GetCacheEntries() const {
@@ -111,12 +76,14 @@ void CompilationCache::Clear() {
   cache_.clear();
   pending_compilations_.clear();
 
-  // Reset aggregate statistics
-  cache_hits_ = 0;
-  cache_misses_ = 0;
-  total_compilation_time_ms_ = 0;
-  evictions_performed_ = 0;
-  total_compilations_ = 0;
+  // Reset cache-specific centralized metrics
+  auto* arena = metrics::NeuronMetricsArena::Get();
+  if (auto* counter = arena->GetCounter("CompilationCache.Hits")) counter->Clear();
+  if (auto* counter = arena->GetCounter("CompilationCache.Misses")) counter->Clear();
+  if (auto* counter = arena->GetCounter("CompilationCache.Evictions")) counter->Clear();
+  if (auto* counter = arena->GetCounter("CompilationCache.TotalCompilations")) counter->Clear();
+  if (auto* metric = arena->GetMetric("CompilationCache.CompilationTime")) metric->Clear();
+  if (auto* metric = arena->GetMetric("CompilationCache.MemoryUsage")) metric->Clear();
 }
 
 bool CompilationCache::CheckCacheAndCoordinateWork(
@@ -130,8 +97,8 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
     if (cache_it != cache_.end()) {
       auto cached_entry = cache_it->second;
       TORCH_CHECK(cached_entry != nullptr, "Cache entry can not be null");
-      // Record cache hit and update access statistics.
-      cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      // Record cache hit and increment access statistics.
+      TORCH_NEURONX_COUNTER("CompilationCache.Hits", 1);
       cached_entry->UpdateAccess();
 
       // Create managed pointer and set on kernel execution.
@@ -145,11 +112,11 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
     auto pending_it = pending_compilations_.find(cache_key);
     if (pending_it != pending_compilations_.end()) {
       // Another thread is compiling, count as hit since we'll get the result.
-      cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      TORCH_NEURONX_COUNTER("CompilationCache.Hits", 1);
       return true;
     } else {
       // Cache miss - this thread should compile.
-      cache_misses_.fetch_add(1, std::memory_order_relaxed);
+      TORCH_NEURONX_COUNTER("CompilationCache.Misses", 1);
       auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
       pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
       TORCH_NEURONX_DEBUG("Cache miss", "key=", cache_key);
@@ -220,7 +187,7 @@ void CompilationCache::CheckAndEvictIfNeeded() {
   // Perform LRU eviction to reach target size.
   size_t evicted = EvictLruEntries(target_entries);
   if (evicted > 0) {
-    evictions_performed_ += evicted;
+    TORCH_NEURONX_COUNTER("CompilationCache.Evictions", evicted);
     TORCH_NEURONX_DEBUG("Cache eviction performed", "evicted_entries=", evicted);
   }
 }
@@ -412,9 +379,10 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   auto compilation_time =
       std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
-  // Update aggregate compilation statistics.
-  total_compilation_time_ms_ += compilation_time.count();
-  total_compilations_++;
+  // Update centralized metrics
+  TORCH_NEURONX_COUNTER("CompilationCache.TotalCompilations", 1);
+  TORCH_NEURONX_BYTES_METRIC("CompilationCache.NeffSize", neff_bytes.size());
+  TORCH_NEURONX_TIME_METRIC("CompilationCache.CompilationTime", start_time, end_time);
 
   // Create cache entry with compiled NEFF and timing information.
   auto cache_entry = std::make_shared<CacheEntry>(std::move(neff_bytes), compilation_time);

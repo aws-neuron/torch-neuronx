@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import torch
 
+from torch_neuronx.python_ops import io_tensor
+
 
 def is_64bit(dtype: torch.dtype | None) -> bool:
     """Return True if dtype is a 64-bit type needing CPU bounce on Neuron.
@@ -83,7 +85,7 @@ def copy_cpu_to_neuron(
         tmp = tmp.to(target_dtype)
     if not tmp.is_contiguous():
         tmp = tmp.contiguous()
-    dst = torch.empty(cpu_src.shape, dtype=tmp.dtype, device=target_device)
+    dst = io_tensor.empty(cpu_src.shape, dtype=tmp.dtype, device=target_device)
     _C._nrt_copy_cpu_to_neuron_tensor(tmp, dst, non_blocking=non_blocking)
     return dst
 
@@ -98,7 +100,9 @@ def copy_neuron_to_cpu(
     """
     import torch_neuronx._C as _C  # local import
 
-    cpu_tmp = torch.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
+    if not neuron_src.is_contiguous():
+        neuron_src = ensure_contiguous_on_device(neuron_src)
+    cpu_tmp = io_tensor.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
     _C._nrt_copy_neuron_to_cpu_tensor(neuron_src, cpu_tmp, non_blocking=non_blocking)
     if target_dtype is not None and target_dtype != cpu_tmp.dtype:
         cpu_tmp = cpu_tmp.to(target_dtype)

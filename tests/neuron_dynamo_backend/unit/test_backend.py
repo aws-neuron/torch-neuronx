@@ -47,14 +47,18 @@ class TestCompileFxToStablehlo:
         mock_stablehlo_mlir = MagicMock()
         mock_io_spec = MagicMock()
         mock_cast_spec = [MagicMock()]
-        mock_convert_fx.return_value = (mock_stablehlo_mlir, mock_io_spec, mock_cast_spec)
+        mock_convert_fx.return_value = (
+            mock_stablehlo_mlir,
+            mock_io_spec,
+            mock_cast_spec,
+        )
 
         mock_get_artifacts_dir.return_value = self.temp_dir
         mock_get_stablehlo_path.return_value = self.temp_dir / "artifacts.stablehlo.mlir"
 
         # Call function
         stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec = backend._compile_fx_to_stablehlo(
-            mock_gm, example_inputs, model_name, segment_id, preserve_artifacts
+            mock_gm, example_inputs, model_name, segment_id, preserve_artifacts, None
         )
 
         # Verify results
@@ -66,7 +70,7 @@ class TestCompileFxToStablehlo:
 
         # Verify function calls
         mock_convert_fx.assert_called_once_with(
-            mock_gm, example_inputs, preserve_artifacts=preserve_artifacts
+            mock_gm, example_inputs, None, preserve_artifacts=preserve_artifacts
         )
 
         # Verify save operations
@@ -129,9 +133,13 @@ class TestDebugDirectoryCreationAndPopulation:
 
         # Mock compilation steps
         mock_stablehlo_mlir = MagicMock()
+        mock_io_spec = MagicMock()
+        mock_cast_spec = [MagicMock()]
         mock_compile_fx_to_stablehlo.return_value = (
             mock_stablehlo_mlir,
             Path("stablehlo_artifacts"),
+            mock_io_spec,
+            mock_cast_spec,
         )
 
         # Mock CompileGraph and Executor
@@ -167,12 +175,6 @@ class TestDebugDirectoryCreationAndPopulation:
         ):
             mock_managed_dir.return_value.__enter__.return_value = (self.temp_dir, True)
             mock_managed_dir.return_value.__exit__.return_value = None
-            mock_compile_fx_to_stablehlo.return_value = (
-                MagicMock(),
-                MagicMock(),
-                mock_io_specs,
-                mock_cast_spec,
-            )
             mock_compute_cache_key.return_value = "test_cache_key_123"
             mock_c_compile_graph.return_value = "exec_handle_456"
             _ = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
@@ -204,7 +206,11 @@ class TestDebugDirectoryCreationAndPopulation:
         mock_stablehlo_mlir = MagicMock()
         mock_io_spec = MagicMock()
         mock_cast_spec = [MagicMock()]
-        mock_convert_fx.return_value = (mock_stablehlo_mlir, mock_io_spec, mock_cast_spec)
+        mock_convert_fx.return_value = (
+            mock_stablehlo_mlir,
+            mock_io_spec,
+            mock_cast_spec,
+        )
 
         # Call function
         backend._compile_fx_to_stablehlo(mock_gm, example_inputs, model_name, segment_id, False)
@@ -249,6 +255,39 @@ class TestEnvironmentVariables:
         with patch.dict(os.environ, {}, clear=True):
             preserve = _getenv_bool("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", False)
             assert preserve is False
+
+    def test_disable_fallback_execution_environment_variable_integration(self):
+        """
+        Test that TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION environment variable works correctly
+        """
+        from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+
+        # Test with disable_fallback = True
+        with patch.dict(os.environ, {"TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "true"}):
+            disable_fallback = _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False)
+            assert disable_fallback is True
+
+        # Test with disable_fallback = False
+        with patch.dict(os.environ, {"TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "false"}):
+            disable_fallback = _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False)
+            assert disable_fallback is False
+
+        # Test default behavior (no env var) - should default to False
+        with patch.dict(os.environ, {}, clear=True):
+            disable_fallback = _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False)
+            assert disable_fallback is False
+
+        # Test with various truthy values
+        for value in ["1", "True", "yes", "Yes", "YES"]:
+            with patch.dict(os.environ, {"TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": value}):
+                disable_fallback = _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False)
+                assert disable_fallback is True, f"Failed for value: {value}"
+
+        # Test with various falsy values
+        for value in ["0", "False", "no", "No", "NO"]:
+            with patch.dict(os.environ, {"TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": value}):
+                disable_fallback = _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False)
+                assert disable_fallback is False, f"Failed for value: {value}"
 
 
 class TestNeuronBackendFxCompiler:
@@ -350,31 +389,112 @@ class TestNeuronBackendFxCompiler:
         assert torch.equal(result, fallback_output)
         mock_gm.forward.assert_called_once_with(test_input)
 
+    def test_disable_fallback_execution_environment_variable(self):
+        """Test TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION prevents fallback"""
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        example_inputs = [torch.randn(2, 3)]
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
+            ) as mock_compile_fx,
+            patch("torch_neuronx.neuron_dynamo_backend.backend.save_fx_graph_txt"),
+            patch("torch_neuronx.neuron_dynamo_backend.backend.CompileGraph") as mock_compile_graph,
+            patch("torch_neuronx.neuron_dynamo_backend.backend.Executor") as mock_executor,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.managed_artifacts_directory"
+            ) as mock_managed_dir,
+            patch.dict(os.environ, {"TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "true"}),
+        ):
+            mock_stablehlo_mlir = MagicMock()
+            mock_io_spec = MagicMock()
+            mock_cast_spec = [MagicMock()]
+            mock_compile_fx.return_value = (
+                mock_stablehlo_mlir,
+                Path("test"),
+                mock_io_spec,
+                mock_cast_spec,
+            )
+
+            mock_compile_graph_instance = MagicMock()
+            mock_compile_graph_instance.compile.return_value = "cache_key_123"
+            mock_compile_graph.return_value = mock_compile_graph_instance
+
+            mock_executor_instance = MagicMock()
+            mock_executor_instance.side_effect = RuntimeError("Execution failed")
+            mock_executor.return_value = mock_executor_instance
+
+            mock_managed_dir.return_value.__enter__.return_value = (self.temp_dir, False)
+            mock_managed_dir.return_value.__exit__.return_value = None
+
+            compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
+
+            # Should raise exception instead of falling back
+            with pytest.raises(RuntimeError, match="Execution failed"):
+                compiled_fn(*example_inputs)
+
+    def test_fallback_execution_enabled_by_default(self):
+        """Test fallback execution works when TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION is not set"""
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        fallback_output = torch.randn(2, 3)
+        mock_gm.forward.return_value = fallback_output
+        example_inputs = [torch.randn(2, 3)]
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
+            ) as mock_compile_fx,
+            patch("torch_neuronx.neuron_dynamo_backend.backend.save_fx_graph_txt"),
+            patch("torch_neuronx.neuron_dynamo_backend.backend.CompileGraph") as mock_compile_graph,
+            patch("torch_neuronx.neuron_dynamo_backend.backend.Executor") as mock_executor,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.managed_artifacts_directory"
+            ) as mock_managed_dir,
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            mock_stablehlo_mlir = MagicMock()
+            mock_io_spec = MagicMock()
+            mock_cast_spec = [MagicMock()]
+            mock_compile_fx.return_value = (
+                mock_stablehlo_mlir,
+                Path("test"),
+                mock_io_spec,
+                mock_cast_spec,
+            )
+
+            mock_compile_graph_instance = MagicMock()
+            mock_compile_graph_instance.compile.return_value = "cache_key_123"
+            mock_compile_graph.return_value = mock_compile_graph_instance
+
+            mock_executor_instance = MagicMock()
+            mock_executor_instance.side_effect = RuntimeError("Execution failed")
+            mock_executor.return_value = mock_executor_instance
+
+            mock_managed_dir.return_value.__enter__.return_value = (self.temp_dir, False)
+            mock_managed_dir.return_value.__exit__.return_value = None
+
+            compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
+
+            # Should fallback to original GraphModule execution
+            result = compiled_fn(*example_inputs)
+            assert torch.equal(result, fallback_output)
+            mock_gm.forward.assert_called_once()
+
 
 class TestCreateNeuronBackend:
     """Test create_neuron_backend factory function"""
 
     @patch("torch_neuronx.neuron_dynamo_backend.backend.get_decomposition_table")
-    def test_create_neuron_backend_default(self, mock_get_decomp_table):
-        """Test creating neuron backend with default settings"""
+    def test_create_neuron_backend(self, mock_get_decomp_table):
+        """Test creating neuron backend"""
         mock_decomp_table = {"decomp1": "func1", "decomp2": "func2"}
         mock_get_decomp_table.return_value = mock_decomp_table
 
         result = backend.create_neuron_backend()
 
         assert callable(result)  # Should return a wrapper function
-        mock_get_decomp_table.assert_called_once_with(False)  # decompose_all=False by default
-
-    @patch("torch_neuronx.neuron_dynamo_backend.backend.get_decomposition_table")
-    def test_create_neuron_backend_decompose_all(self, mock_get_decomp_table):
-        """Test creating neuron backend with decompose_all=True"""
-        mock_decomp_table = {"all_decomps": "all_funcs"}
-        mock_get_decomp_table.return_value = mock_decomp_table
-
-        result = backend.create_neuron_backend(decompose_all=True)
-
-        assert callable(result)  # Should return a wrapper function
-        mock_get_decomp_table.assert_called_once_with(True)  # decompose_all=True
 
 
 class TestBackendIntegration:

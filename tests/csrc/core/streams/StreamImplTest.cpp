@@ -86,10 +86,10 @@ TEST_F(StreamImplTest, QueryEmptyStream) { EXPECT_TRUE(stream_->Query()); }
 // Test Synchronize on empty stream
 TEST_F(StreamImplTest, SynchronizeEmptyStream) { EXPECT_NO_THROW(stream_->Synchronize()); }
 
-// Test basic stream functionality without statistics
-TEST_F(StreamImplTest, BasicStreamFunctionality) {
-  // Verify stream can handle operations without statistics tracking
-  EXPECT_TRUE(stream_->Query());
+// Test basic stream state
+TEST_F(StreamImplTest, BasicStreamState) {
+  EXPECT_EQ(stream_->GetStreamId(), 1);
+  EXPECT_TRUE(stream_->Query());  // Stream should be idle initially
   EXPECT_NO_THROW(stream_->Synchronize());
 }
 

@@ -1,8 +1,13 @@
-"""Scatter add operation with NKI and XLA implementations"""
+"""Scatter add operation with NKI, MLIR and XLA implementations"""
 
 import torch
 
 from .base import ExecutionResult, Operation, OperationImplementation
+from .torch_mlir.ops.scatter_add import (
+    ScatterAddInplaceMLIRImpl,
+    ScatterAddMLIRImpl,
+    ScatterAddOutMLIRImpl,
+)
 
 
 class ScatterAddNKIImpl(OperationImplementation):
@@ -52,6 +57,7 @@ class ScatterAddOp(Operation):
         self._implementations.append(ScatterAddNKIImpl())
         from .xla_ops.scatter_add_xla import ScatterAddXLAImpl
 
+        self._implementations.append(ScatterAddMLIRImpl())
         self._implementations.append(ScatterAddXLAImpl())
 
     @property
@@ -66,6 +72,7 @@ class ScatterAddInplaceOp(Operation):
         self._implementations.append(ScatterAddNKIImpl())
         from .xla_ops.scatter_add_xla import ScatterAddInplaceXLAImpl
 
+        self._implementations.append(ScatterAddInplaceMLIRImpl())
         self._implementations.append(ScatterAddInplaceXLAImpl())
 
     @property
@@ -79,6 +86,7 @@ class ScatterAddOutOp(Operation):
     def _setup_implementations(self):
         from .xla_ops.scatter_add_xla import ScatterAddOutXLAImpl
 
+        self._implementations.append(ScatterAddOutMLIRImpl())
         self._implementations.append(ScatterAddOutXLAImpl())
 
     @property

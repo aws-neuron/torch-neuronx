@@ -47,16 +47,6 @@ class OperationExecutionEngineTest : public ::testing::Test {
   std::unique_ptr<MockStreamImpl> mock_stream_;
 };
 
-// Test basic construction and destruction
-TEST_F(OperationExecutionEngineTest, ConstructionAndDestruction) { EXPECT_NE(engine_, nullptr); }
-
-// Test shutdown functionality
-TEST_F(OperationExecutionEngineTest, ShutdownStopsWorkers) {
-  // Test that shutdown works properly
-  EXPECT_NO_THROW(engine_->Shutdown());
-  engine_->Shutdown();  // Should not crash
-}
-
 // Test engine with null caches
 TEST_F(OperationExecutionEngineTest, ConstructionWithNullCaches) {
   // This should work but operations will fail

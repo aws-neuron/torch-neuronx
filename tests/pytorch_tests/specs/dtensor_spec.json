@@ -173,8 +173,7 @@
           "reason": "Tensor-likes are not close - dropout/random/embedding mismatch (3 tests)",
           "tests": [
             "test_deterministic_dropout_1d",
-            "test_init_with_user_generator",
-            "test_sharded_embedding_bag_rowwise"
+            "test_init_with_user_generator"
           ]
         },
         {
@@ -204,22 +203,6 @@
           "tests": [
             "test_partial_to_replicate_forward_backward_complex64",
             "test_partial_to_shard_complex64"
-          ]
-        },
-        {
-          "reason": "String comparison failed - cuda vs neuron device naming (4 tests)",
-          "tests": [
-            "test_insufficient_sharding_dims",
-            "test_sharding_columns",
-            "test_init_from_local_shards_and_global_metadata_with_local_view",
-            "test_recalc_for_metadata"
-          ]
-        },
-        {
-          "reason": "String comparison failed - rank device naming (2 tests)",
-          "tests": [
-            "test_uneven_shards",
-            "test_init_from_local_shards_and_global_metadata_with_all_zeros"
           ]
         },
         {
@@ -314,7 +297,7 @@
           "reason": "Device index out of range (2 tests)",
           "tests": [
             "test_compile_embedding_redistribute",
-            "test_invalid_sharding"
+            "test_ring_attention_sdpa"
           ]
         },
         {
@@ -457,6 +440,34 @@
           "reason": "Local shard tensor device mismatch with placement",
           "tests": [
             "test_st_base_init_from_local_shards_and_global_metadata"
+          ]
+        },
+        {
+          "reason": "Device index out of range (2 tests)",
+          "tests": [
+            "test_invalid_sharding"
+          ]
+        },
+        {
+          "reason": "String comparison failed - cuda vs neuron device naming (4 tests)",
+          "tests": [
+            "test_insufficient_sharding_dims",
+            "test_sharding_columns",
+            "test_init_from_local_shards_and_global_metadata_with_local_view",
+            "test_recalc_for_metadata"
+          ]
+        },
+        {
+          "reason": "String comparison failed - rank device naming (2 tests)",
+          "tests": [
+            "test_uneven_shards",
+            "test_init_from_local_shards_and_global_metadata_with_all_zeros"
+          ]
+        },
+        {
+          "reason": "Tensor-likes are not close - dropout/random/embedding mismatch (3 tests)",
+          "tests": [
+            "test_sharded_embedding_bag_rowwise"
           ]
         }
       ]

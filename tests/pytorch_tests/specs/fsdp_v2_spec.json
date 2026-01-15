@@ -17,11 +17,9 @@
             "test_3d_mlp_with_nd_mesh",
             "test_gradient_accumulation",
             "test_to_float64_after_init",
-            "test_register_fsdp_forward_method",
             "test_param_registration_after_backward",
             "test_param_registration_after_forward",
-            "test_root_move_forward_input_to_device",
-            "test_train_parity_hsdp"
+            "test_root_move_forward_input_to_device"
           ]
         },
         {
@@ -50,22 +48,13 @@
         {
           "reason": "State dict correctness failures and tensor comparison mismatches",
           "tests": [
-            "test_2d_state_dict_correctness",
             "test_hsdp_tp_state_dict_save_load"
           ]
         }
       ]
     },
     {
-      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py",
-      "xfail": [
-        {
-          "reason": "Overlap functionality failures",
-          "tests": [
-            "test_fully_shard_post_optim_event_overlap"
-          ]
-        }
-      ]
+      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py"
     },
     {
       "file": "distributed/_composable/fsdp/test_fully_shard_mixed_precision.py",
@@ -140,14 +129,6 @@
       "file": "distributed/_composable/fsdp/test_fully_shard_grad_scaler.py",
       "sanity_methods": [
         "test_1f1b_microbatching"
-      ],
-      "xfail": [
-        {
-          "reason": "in linear_backward_strategy assert grad_input_spec is not None",
-          "tests": [
-            "test_gradient_scaler"
-          ]
-        }
       ]
     },
     {
@@ -162,7 +143,6 @@
         {
           "reason": "Extension functionality failures",
           "tests": [
-            "test_all_gather_extension_hsdp_mesh",
             "test_all_gather_extensions_monkey_patch",
             "test_all_gather_extensions_train_parity"
           ]
@@ -207,15 +187,7 @@
       ]
     },
     {
-      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py",
-      "xfail": [
-        {
-          "reason": "Gradient clipping failure",
-          "tests": [
-            "test_clip_grad_norm_2d"
-          ]
-        }
-      ]
+      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py"
     },
     {
       "file": "distributed/_composable/fsdp/test_fully_shard_autograd.py",

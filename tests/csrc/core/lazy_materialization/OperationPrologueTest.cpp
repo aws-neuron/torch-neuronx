@@ -471,13 +471,13 @@ TEST_F(OperationPrologueTest, MixedNeuronAndCPUTensors) {
 
 //============================================================================
 // Test 5: Two Different Transformation Chains for Same Input Address
-// This tests the STEP 5 logic that uses dummy addresses for merging
+// This tests the STEP 5 logic for merging multiple transformation chains
 //============================================================================
 
 TEST_F(OperationPrologueTest, TwoChainsWithSameInputAddress) {
   // This test verifies that when we have multiple independent transformation chains
   // operating on different inputs, the STEP 5 merge logic correctly handles them
-  // using dummy addresses (0x0, 0x1, etc.) to avoid address conflicts during merge.
+  // using unique slot addresses to avoid address conflicts during merge.
 
   // Create two separate inputs with different shapes and transformations
   // Input 0: 3D tensor with transpose
@@ -519,12 +519,12 @@ TEST_F(OperationPrologueTest, TwoChainsWithSameInputAddress) {
   std::string cache_key = OperationPrologue::ComputePrologueCacheKey(
       input_ptrs, input_contexts, "test_two_chains_merge", kernel_transforms);
 
-  // Call: Generate prologue with cache key - this will exercise STEP 5's dummy address logic
+  // Call: Generate prologue with cache key - this will exercise STEP 5's merge logic
   auto result = OperationPrologue::GeneratePrologue(
       input_ptrs, input_contexts, "test_two_chains_merge", kernel_transforms, cache_key);
 
-  // Assertions: Verify successful merge with dummy addresses
-  ASSERT_TRUE(result.success) << "Merge with dummy addresses should succeed";
+  // Assertions: Verify successful merge
+  ASSERT_TRUE(result.success) << "Merge should succeed";
   ASSERT_TRUE(result.has_transformations) << "Should detect transformations";
 
   // Should have 2 tasks, one for each input's transformation chain
@@ -568,7 +568,7 @@ TEST_F(OperationPrologueTest, TwoChainsWithSameInputAddress) {
 //============================================================================
 
 TEST_F(OperationPrologueTest, SameTensorMixedTransform) {
-  // This test verifies the hybrid dummy address mapping where the same tensor appears
+  // This test verifies the slot-based address mapping where the same tensor appears
   // multiple times with mixed transformations - one transformed, one direct.
   // The prologue must correctly handle:
   // - One transformation chain for the transposed input
@@ -607,12 +607,12 @@ TEST_F(OperationPrologueTest, SameTensorMixedTransform) {
   std::string cache_key = OperationPrologue::ComputePrologueCacheKey(
       input_ptrs, input_contexts, "test_concat_same_tensor_mixed", kernel_transforms);
 
-  // Call: Generate prologue with cache key - this exercises STEP 5's hybrid dummy address logic
+  // Call: Generate prologue with cache key - this exercises STEP 5's merge logic
   // for handling mixed transformed and direct inputs with the same base address
   auto result = OperationPrologue::GeneratePrologue(
       input_ptrs, input_contexts, "test_concat_same_tensor_mixed", kernel_transforms, cache_key);
 
-  // Assertions: Verify successful merge with hybrid dummy addresses
+  // Assertions: Verify successful merge
   ASSERT_TRUE(result.success) << "Merge with mixed transformations should succeed";
   ASSERT_TRUE(result.has_transformations) << "Should detect transformations";
 

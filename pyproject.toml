@@ -32,9 +32,11 @@ dev = [
     "pytest-html",
     "pytest-cov",
     "pytest-json-report",
+    "pytest-timeout",
     "ruff>=0.8.0",
     "pyzstd",
     "pytest-forked",
+    "PyYAML"
 ]
 
 [tool.ruff]

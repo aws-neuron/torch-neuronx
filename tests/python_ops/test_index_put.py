@@ -9,6 +9,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -176,7 +177,12 @@ class TestIndexPut:
             ([True, True, True], [0, 1]),
         ],
     )
-    @assert_raises(ValueError, match="Incompatible shapes for broadcasting")
+    @assert_raises(
+        IndexError if use_mlir_aten_ops() else ValueError,
+        match="shape mismatch: indexing tensors could not be broadcast together with shapes.*"
+        if use_mlir_aten_ops()
+        else "Incompatible shapes for broadcasting",
+    )
     def test_index_put_broadcast_failure(self, device, indices):
         """Test index_put with different tensor shapes."""
         with track_neuron_ops():

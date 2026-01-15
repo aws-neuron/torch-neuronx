@@ -8,7 +8,7 @@ set -e
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback")
-readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py")
+readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
 # Global state
@@ -223,7 +223,7 @@ run_distributed_test_type() {
     local pytest_opts
     pytest_opts=$(build_pytest_options "$report_name" "$n")
 
-    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && ${RUNNER[*]} -m pytest $pytest_opts $SANITY_PT_DISTRIBUTED_TESTS tests/pytorch_tests/distributed/$test_file"
+    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && ${RUNNER[*]} -m pytest --forked $pytest_opts $SANITY_PT_DISTRIBUTED_TESTS tests/pytorch_tests/distributed/$test_file"
 }
 
 # Run main test suite
@@ -267,6 +267,11 @@ run_additional_tests() {
     local pytest_opts
     pytest_opts=$(build_pytest_options "multi-device-report" "1")
     run_and_record "multi_device_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/device/test_multi_device.py"
+
+    # LNC=1 + all cores test (requires special env vars, runs with all cores visible)
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "lnc1-all-cores-report" "1")
+    run_and_record "lnc1_all_cores_tests" "NEURON_LOGICAL_NC_CONFIG=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/device/test_device_lnc1_all_cores.py"
 
     local pytest_opts
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")

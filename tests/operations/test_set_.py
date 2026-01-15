@@ -7,6 +7,7 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_raises
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 def assert_no_set_fallbacks():
@@ -90,12 +91,13 @@ class TestSetOperations:
         assert target.data_ptr() == source.data_ptr()
         assert_no_set_fallbacks()
 
+    @pytest.mark.skipif(
+        condition=use_mlir_aten_ops(),
+        reason="Test gets stuck when lowering aten ops with torch-mlir",
+    )
     @pytest.mark.xfail(
         condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "0",
-        reason=(
-            "Fails in async mode with due to compilation error related to contiguous op; "
-            "needs RCA"
-        ),
+        reason=("Fails in async mode due to compilation error related to contiguous op; needs RCA"),
     )
     def test_set_source_tensor_with_view(self):
         """Test set_.source_Tensor with tensor view."""

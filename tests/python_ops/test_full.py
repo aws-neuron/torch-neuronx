@@ -1,10 +1,16 @@
 """Test that full operation is properly registered with PyTorch dispatcher."""
 
+import os
+
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from tests.utils.neuron_test_utils import (
+    assert_op_does_not_run,
+    assert_op_runs_on_neuron,
+    track_neuron_ops,
+)
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -63,11 +69,7 @@ class TestFull:
     @pytest.mark.parametrize(
         "dtype, fill_value",
         [
-            pytest.param(
-                torch.float64,
-                3.14,
-                marks=pytest.mark.xfail(reason="wrong values for float64 dtype"),
-            ),
+            (torch.float64, 3.14),
             (torch.float32, 3.14),
             (torch.float16, 2.5),
             (torch.bfloat16, 1.5),
@@ -133,10 +135,7 @@ class TestFull:
         "fill_value",
         [
             float("inf"),
-            pytest.param(
-                float("-inf"),
-                marks=pytest.mark.xfail(reason="cannot handle -inf for now"),
-            ),
+            float("-inf"),
             0.0,
             -0.0,
         ],
@@ -168,7 +167,10 @@ class TestFull:
             result = torch.full(shape, fill_value, device="neuron")
             assert result.shape == expected_cpu.shape
             assert result.numel() == 0
-            assert_op_runs_on_neuron("aten::full")
+            if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1":
+                assert_op_does_not_run("aten::full")
+            else:
+                assert_op_runs_on_neuron("aten::full")
 
     def test_full_layout_strided(self):
         """Test full with strided layout (default)."""
