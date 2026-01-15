@@ -10,6 +10,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 TEST_CONFIGS = [
     # Test different tensor shapes and dimensions
@@ -158,7 +159,9 @@ class TestIndexSelectBackward:
         torch.testing.assert_close(neuron_grad.cpu(), cpu_grad)
         assert_op_runs_on_neuron("aten::index_select_backward")
 
-    @assert_raises(ValueError, match="Cannot broadcast to shape with fewer dimensions")
+    @pytest.mark.xfail(
+        condition=not use_mlir_aten_ops(), reason="Scalar index not supported without MLIR aten ops"
+    )
     def test_index_select_backward_scalar_index(self):
         """Test index_select_backward with scalar index tensor"""
         input_shape = (3, 4)
@@ -169,13 +172,25 @@ class TestIndexSelectBackward:
         grad_output_shape[dim] = 1
         grad_output = torch.randn(grad_output_shape, dtype=torch.float32)
 
-        torch.ops.aten.index_select_backward(
-            grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
-        )
+        # CPU reference
+        cpu_grad = torch.ops.aten.index_select_backward(grad_output, input_shape, dim, indices)
+
+        # Neuron test
+        with track_neuron_ops():
+            neuron_grad = torch.ops.aten.index_select_backward(
+                grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
+            )
+
+        torch.testing.assert_close(neuron_grad.cpu(), cpu_grad)
+        assert_op_runs_on_neuron("aten::index_select_backward")
 
     @assert_raises(
         TypeError,
-        match="Indexer must have integer or boolean type, "
+        match=re.escape(
+            "index_select_backward(): Expected dtype int32/int64 for index but got: torch.float32"
+        )
+        if use_mlir_aten_ops()
+        else "Indexer must have integer or boolean type, "
         "got indexer with type float32 at position 0*",
     )
     def test_index_select_backward_float_indices(self):

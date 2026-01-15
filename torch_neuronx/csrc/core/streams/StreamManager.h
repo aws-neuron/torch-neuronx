@@ -45,19 +45,6 @@ class StreamManager {
   /// Synchronize all streams on a device
   void SynchronizeDevice(c10::DeviceIndex device_index);
 
-  /// Resource statistics for monitoring and debugging
-  struct ManagerResourceStats {
-    size_t total_streams;                ///< Total number of active streams
-    size_t total_pending_operations;     ///< Total pending operations across all streams
-    size_t total_memory_usage_estimate;  ///< Estimated memory usage in bytes
-    size_t nrt_available_slots;          ///< Available NRT execution slots
-    size_t nrt_acquired_slots;           ///< Currently acquired NRT slots
-    size_t nrt_waiting_threads;          ///< Threads waiting for NRT slots
-  };
-
-  /// Get comprehensive resource statistics
-  ManagerResourceStats GetResourceStats() const;
-
   /// Iterate through all streams on a device with a callback
   /// @param device_index The device to iterate streams on
   /// @param callback Function to call for each stream. Return true to stop iteration.

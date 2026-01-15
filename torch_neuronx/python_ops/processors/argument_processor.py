@@ -39,16 +39,21 @@ class ArgumentProcessor:
         """Set static_argnums."""
         self._static_argnums = value
 
-    def preprocess_inputs(self, inputs: tuple) -> tuple:
+    def preprocess_inputs(self, inputs: tuple, scalar_to_tensor: bool = False) -> tuple:
         """Preprocess inputs for Neuron compatibility.
 
+        Converts tensors, handles nested structures, maps torch.dtype to scalar type
+        integers, and optionally converts scalar values to tensors.
+
         Args:
-            inputs: Original input tensors and scalars
+            inputs: Original input tensors, scalars, and nested structures
+            scalar_to_tensor: If True, convert int/float scalars to tensors
+                Defaults to False.
 
         Returns:
             Tuple of preprocessed inputs
         """
-        converted = []
+
         # Prologues are enabled by default, but disabled if:
         # 1. StableHLO is not enabled (required for prologue)
         # 2. OR TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
@@ -59,29 +64,31 @@ class ArgumentProcessor:
             or is_sync_mode_enabled()
         )
 
-        for i, inp in enumerate(inputs):
-            # Skip static arguments
-            if i in self.static_argnums:
-                converted.append(inp)
-            elif isinstance(inp, torch.Tensor):
+        def preprocess_value(inp):
+            """preprocess a single input"""
+            if isinstance(inp, torch.Tensor):
                 # Make tensor contiguous if prologue is disabled and tensor is not contiguous
                 if prologue_disabled and not inp.is_contiguous():
                     inp = inp.contiguous()
-                # Convert for Neuron
-                converted.append(TypeConverter.convert_for_neuron(inp))
-            # Handle nested structures
+                return TypeConverter.convert_for_neuron(inp)
             elif isinstance(inp, (list | tuple)):
-                converted.append(self.preprocess_inputs(tuple(inp)))
+                return tuple(preprocess_value(item) for item in inp)
             elif isinstance(inp, torch.dtype):
                 # Map torch.dtype to ScalarType enum values as defined in
                 # c10/core/ScalarType.h for MLIR lowring
-                scalar_type_int = ArgumentProcessor._get_scalar_type_value(inp)
-                converted.append(scalar_type_int)
+                return ArgumentProcessor._get_scalar_type_value(inp)
+            elif scalar_to_tensor and isinstance(inp, int):
+                return torch.tensor(inp, dtype=torch.int32, device="neuron")
+            elif scalar_to_tensor and isinstance(inp, float):
+                return torch.tensor(inp, dtype=torch.float32, device="neuron")
             else:
                 # Keep scalars as-is
-                converted.append(inp)
+                return inp
 
-        return tuple(converted)
+        return tuple(
+            inp if i in self.static_argnums else preprocess_value(inp)
+            for i, inp in enumerate(inputs)
+        )
 
     def generate_input_signature(self, inputs: tuple) -> tuple:
         """Generate a signature for inputs (used for caching).
@@ -157,15 +164,20 @@ class ArgumentProcessor:
         logger.debug(f"Prepared {len(input_dict)} inputs for execution")
         return input_dict
 
-    def extract_device(self, inputs: tuple) -> torch.device:
+    def extract_device(self, inputs: tuple, kwargs: dict | None = None) -> torch.device:
         """Extract device from input tensors.
 
         Args:
             inputs: Input tensors and scalars
+            kwargs: Keyword arguments (may contain 'device')
 
         Returns:
-            Device from first tensor, or "neuron"
+            Device from kwargs['device'], first tensor, or "neuron"
         """
+        # Check for explicit device argument first
+        if kwargs and kwargs.get("device") is not None:
+            return torch.device(kwargs["device"])
+
         for inp in inputs:
             if isinstance(inp, torch.Tensor):
                 return inp.device

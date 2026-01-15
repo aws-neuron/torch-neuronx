@@ -310,19 +310,28 @@ TEST_F(NeuronResourceManagerTest, GetModelHandleCache) {
   EXPECT_NO_THROW(cache.GetCacheEntries());
 }
 
-TEST_F(NeuronResourceManagerTest, GetOperationExecutionEngine) {
-  auto& engine = manager_->GetOperationExecutionEngine();
-
-  // Should be able to use the engine
-  EXPECT_NO_THROW(engine.Shutdown());
-}
-
 TEST_F(NeuronResourceManagerTest, GetResourceSemaphore) {
   auto& semaphore = manager_->GetResourceSemaphore();
 
   // Should be able to use the semaphore
   EXPECT_GE(semaphore.AvailableCount(), 0);
   EXPECT_GE(semaphore.MaxSlots(), 0);
+}
+
+TEST_F(NeuronResourceManagerTest, ResourceAccessibility) {
+  // Verify all resources are accessible
+  auto& cache = manager_->GetCompilationCache();
+  auto& model_cache = manager_->GetModelHandleCache();
+  auto& engine = manager_->GetOperationExecutionEngine();
+  auto& semaphore = manager_->GetResourceSemaphore();
+
+  // Basic sanity checks using available methods
+  EXPECT_GE(semaphore.AvailableCount(), 0);
+  EXPECT_GE(semaphore.MaxSlots(), 0);
+
+  // Verify caches are accessible
+  (void)cache.GetAllCacheKeys();
+  (void)model_cache.GetAllCacheKeys();
 }
 
 TEST_F(NeuronResourceManagerTest, ConcurrentAccess) {

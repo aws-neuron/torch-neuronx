@@ -442,7 +442,7 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
     def test_alltoall_partial_group_unsupported_world_size(self):
         """Test alltoall with unsupported world size."""
         partial_group = [0, 1]
-        os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "2"
+        os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
         self.distributed_tester.run_test(
             run_partial_group_alltoall_test,
             partial_group=partial_group,
@@ -453,7 +453,7 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
         [
             {
                 "partial_group": [0, 2, 4, 6],
-                "NEURON_RT_VIRTUAL_CORE_SIZE": "1",
+                "NEURON_LOGICAL_NC_CONFIG": "1",
             },
             {
                 "partial_group": [2, 3, 4, 5],
@@ -469,8 +469,8 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
     )
     def test_alltoall_partial_group_supported_fail_cases(self, group_config):
         partial_group = group_config["partial_group"]
-        lnc = group_config.get("NEURON_RT_VIRTUAL_CORE_SIZE", "2")
-        os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = lnc
+        lnc = group_config.get("NEURON_LOGICAL_NC_CONFIG", "2")
+        os.environ["NEURON_LOGICAL_NC_CONFIG"] = lnc
         self.distributed_tester.run_test(
             run_partial_group_alltoall_test,
             partial_group=partial_group,

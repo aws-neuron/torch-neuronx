@@ -1,33 +1,82 @@
 # ruff: noqa: N806, N803, N812
 
 """
-Unit tests for FX graph transformation passes for Neuron backend.
+Unit tests for FlexAttentionLegalization pass.
 
-These tests build FX graphs using the fx_passes helper functions,
-execute them with real tensors, and verify numerical accuracy against
-PyTorch reference implementations.
+These tests verify the PassBase-based FlexAttentionLegalization class
+produces correct numerical results and properly integrates with PassManager.
 """
 
 import operator
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 import torch.fx as fx
 import torch.nn.functional as F
-from torch.fx.passes.shape_prop import ShapeProp
+from torch.fx.passes.pass_manager import PassManager
 
-from torch_neuronx.neuron_dynamo_backend import fx_passes
+from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
+    AttentionShapes,
+    FlexAttentionLegalization,
+)
+
+
+def legalize_flex_attention_pass(gm: fx.GraphModule) -> fx.GraphModule:
+    flex_pass = FlexAttentionLegalization()
+    result = flex_pass(gm)
+    return result.graph_module
+
+
+class TestFlexAttentionLegalizationPassBase:
+    """Tests for PassBase interface compliance."""
+
+    def test_pass_has_name_property(self):
+        """Test that pass has required name property."""
+        flex_pass = FlexAttentionLegalization()
+        assert flex_pass.name == "flex_attention_legalization"
+
+    def test_pass_works_with_pass_manager(self):
+        """Test that pass integrates correctly with PassManager."""
+
+        class SimpleModule(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        gm = fx.symbolic_trace(SimpleModule())
+
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        result = pm(gm)
+
+        # Should return PassResult
+        assert result is not None
+        assert hasattr(result, "graph_module")
+
+    def test_pass_returns_pass_result(self):
+        """Test that call() returns PassResult with correct attributes."""
+
+        class SimpleModule(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        gm = fx.symbolic_trace(SimpleModule())
+
+        flex_pass = FlexAttentionLegalization()
+        result = flex_pass(gm)
+
+        assert hasattr(result, "graph_module")
+        assert hasattr(result, "modified")
 
 
 class TestExpandKVForGQA:
-    """Tests that execute the FX graph produced by fx_passes._expand_kv_for_gqa."""
+    """Tests for GQA expansion via FlexAttentionLegalization._expand_kv_for_gqa."""
 
     def test_gqa_expansion_numerical_accuracy(self):
         """Test that the generated FX graph produces correct numerical results."""
         b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
-        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         key_node = graph.placeholder("key")
@@ -35,7 +84,7 @@ class TestExpandKVForGQA:
         value_node = graph.placeholder("value")
         value_node.meta = {"val": torch.empty(b, h_kv, s, e)}
 
-        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        key_out, value_out = flex_pass._expand_kv_for_gqa(graph, key_node, value_node, shapes)
         graph.output((key_out, value_out))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -56,8 +105,10 @@ class TestExpandKVForGQA:
     def test_gqa_expansion_head_repetition(self):
         """Test that each KV head is correctly repeated to match Q heads."""
         b, h_q, h_kv, s, e = 1, 6, 2, 8, 4
-        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=8, S=s, E=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=8, S=s, E=e)
         repeat_factor = h_q // h_kv
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         key_node = graph.placeholder("key")
@@ -65,7 +116,7 @@ class TestExpandKVForGQA:
         value_node = graph.placeholder("value")
         value_node.meta = {"val": torch.empty(b, h_kv, s, e)}
 
-        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        key_out, value_out = flex_pass._expand_kv_for_gqa(graph, key_node, value_node, shapes)
         graph.output((key_out, value_out))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -82,14 +133,16 @@ class TestExpandKVForGQA:
 
     def test_no_expansion_when_equal_heads(self):
         """Test that no expansion happens when H_q == H_kv (returns same nodes)."""
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
-        shapes = fx_passes.AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
+        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
         key = graph.placeholder("key")
         key.meta = {"val": torch.empty(2, 8, 64, 32)}
         value = graph.placeholder("value")
         value.meta = {"val": torch.empty(2, 8, 64, 32)}
 
-        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key, value, shapes)
+        key_out, value_out = flex_pass._expand_kv_for_gqa(graph, key, value, shapes)
 
         # Should return original nodes unchanged
         assert key_out is key
@@ -97,25 +150,29 @@ class TestExpandKVForGQA:
 
     def test_invalid_head_ratio_raises(self):
         """Test that invalid head ratios raise ValueError."""
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
-        shapes = fx_passes.AttentionShapes(B=2, H_q=7, H_kv=2, L=64, S=64, E=32)
+        shapes = AttentionShapes(B=2, H_q=7, H_kv=2, L=64, S=64, E=32)
         key = graph.placeholder("key")
         key.meta = {"val": torch.empty(2, 2, 64, 32)}
         value = graph.placeholder("value")
         value.meta = {"val": torch.empty(2, 2, 64, 32)}
 
         with pytest.raises(ValueError, match="must be multiple of"):
-            fx_passes._expand_kv_for_gqa(graph, key, value, shapes)
+            flex_pass._expand_kv_for_gqa(graph, key, value, shapes)
 
 
 class TestReduceGQAGradients:
-    """Tests that execute the FX graph produced by fx_passes._reduce_gqa_gradients."""
+    """Tests for GQA gradient reduction via FlexAttentionLegalization._reduce_gqa_gradients."""
 
     def test_gradient_reduction_numerical_accuracy(self):
         """Test that gradient reduction produces correct numerical results."""
         B, H_q, H_kv, S, E = 2, 8, 2, 16, 32
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=16, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=16, S=S, E=E)
         repeat_factor = H_q // H_kv
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         grad_key_node = graph.placeholder("grad_key")
@@ -123,7 +180,7 @@ class TestReduceGQAGradients:
         grad_value_node = graph.placeholder("grad_value")
         grad_value_node.meta = {"val": torch.empty(B, H_q, S, E)}
 
-        grad_key_out, grad_value_out = fx_passes._reduce_gqa_gradients(
+        grad_key_out, grad_value_out = flex_pass._reduce_gqa_gradients(
             graph, grad_key_node, grad_value_node, shapes, torch.float32
         )
         graph.output((grad_key_out, grad_value_out))
@@ -142,14 +199,16 @@ class TestReduceGQAGradients:
 
     def test_no_reduction_when_equal_heads(self):
         """Test that no reduction happens when H_q == H_kv."""
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
-        shapes = fx_passes.AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
+        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
         grad_key = graph.placeholder("grad_key")
         grad_key.meta = {"val": torch.empty(2, 8, 64, 32)}
         grad_value = graph.placeholder("grad_value")
         grad_value.meta = {"val": torch.empty(2, 8, 64, 32)}
 
-        grad_key_out, grad_value_out = fx_passes._reduce_gqa_gradients(
+        grad_key_out, grad_value_out = flex_pass._reduce_gqa_gradients(
             graph, grad_key, grad_value, shapes, torch.float32
         )
 
@@ -158,13 +217,15 @@ class TestReduceGQAGradients:
 
 
 class TestComputeAttentionScores:
-    """Tests that execute the FX graph produced by fx_passes._compute_attention_scores."""
+    """Tests for attention score computation via FlexAttentionLegalization."""
 
     def test_attention_scores_numerical_accuracy(self):
         """Test that attention scores computation produces correct results."""
         B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -172,7 +233,7 @@ class TestComputeAttentionScores:
         key_node = graph.placeholder("key")
         key_node.meta = {"val": torch.empty(B, H, S, E)}
 
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
         graph.output(scores)
@@ -191,7 +252,9 @@ class TestComputeAttentionScores:
         """Test that the scale factor is correctly applied."""
         B, H, L, S, E = 1, 2, 4, 4, 8
         scale = 0.5  # Use a distinctive scale
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -199,7 +262,7 @@ class TestComputeAttentionScores:
         key_node = graph.placeholder("key")
         key_node.meta = {"val": torch.empty(B, H, S, E)}
 
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
         graph.output(scores)
@@ -214,18 +277,20 @@ class TestComputeAttentionScores:
 
 
 class TestComputeSoftmax:
-    """Tests that execute the FX graph produced by fx_passes._compute_softmax."""
+    """Tests for softmax computation via FlexAttentionLegalization."""
 
     def test_softmax_matches_pytorch(self):
         """Test that softmax computation matches PyTorch's F.softmax."""
         B, H, L, S = 2, 4, 16, 32
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S)}
 
-        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, torch.float32)
+        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -238,13 +303,15 @@ class TestComputeSoftmax:
     def test_softmax_numerical_stability(self):
         """Test softmax is numerically stable with large values."""
         B, H, L, S = 1, 1, 1, 4
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S)}
 
-        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, torch.float32)
+        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -258,10 +325,12 @@ class TestComputeSoftmax:
 
 
 class TestReplaceSortStable:
-    """Tests for fx_passes._replace_sort_stable_with_identity function."""
+    """Tests for sort.stable replacement via FlexAttentionLegalization."""
 
     def test_sort_values_become_identity(self):
         """Test that sorted values output becomes identity (input passthrough)."""
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
         x = graph.placeholder("x")
         x.meta = {"val": torch.randn(2, 4, 8)}
@@ -272,7 +341,7 @@ class TestReplaceSortStable:
         sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
         graph.output(sorted_vals)
 
-        fx_passes._replace_sort_stable_with_identity(graph)
+        flex_pass._replace_sort_stable_with_identity(graph)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
         test_input = torch.randn(2, 4, 8)
@@ -283,12 +352,14 @@ class TestReplaceSortStable:
 
     def test_returns_false_when_no_sort_nodes(self):
         """Test that function returns False when no sort.stable nodes exist."""
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
         x = graph.placeholder("x")
         y = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
         graph.output(y)
 
-        modified = fx_passes._replace_sort_stable_with_identity(graph)
+        modified = flex_pass._replace_sort_stable_with_identity(graph)
 
         assert modified is False
 
@@ -300,7 +371,9 @@ class TestFullAttentionPipeline:
         """Test building and executing a complete MHA attention forward pass."""
         B, H, L, S, E = 2, 4, 8, 16, 32
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -310,10 +383,10 @@ class TestFullAttentionPipeline:
         value_node = graph.placeholder("value")
         value_node.meta = {"val": torch.empty(B, H, S, E)}
 
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(torch.ops.aten.matmul.default, args=(attn_weights, value_node))
         graph.output(output)
 
@@ -336,7 +409,9 @@ class TestFullAttentionPipeline:
         """Test attention pipeline with GQA (H_q != H_kv)."""
         B, H_q, H_kv, L, S, E = 2, 8, 2, 8, 16, 32
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -347,15 +422,15 @@ class TestFullAttentionPipeline:
         value_node.meta = {"val": torch.empty(B, H_kv, S, E)}
 
         # Expand KV for GQA
-        key_expanded, value_expanded = fx_passes._expand_kv_for_gqa(
+        key_expanded, value_expanded = flex_pass._expand_kv_for_gqa(
             graph, key_node, value_node, shapes
         )
 
         # Compute attention
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_expanded, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(
             torch.ops.aten.matmul.default, args=(attn_weights, value_expanded)
         )
@@ -381,7 +456,7 @@ class TestFullAttentionPipeline:
 
 
 class TestLegalizeFlexAttentionPass:
-    """Tests for fx_passes.legalize_flex_attention_pass function."""
+    """Tests for the legalize_flex_attention_pass convenience function."""
 
     def test_pass_handles_graph_with_sort_stable(self):
         """Test that pass removes sort.stable nodes even without flex_attention."""
@@ -396,7 +471,7 @@ class TestLegalizeFlexAttentionPass:
         graph.output(sorted_vals)
 
         gm = fx.GraphModule(torch.nn.Module(), graph)
-        result = fx_passes.legalize_flex_attention_pass(gm)
+        result = legalize_flex_attention_pass(gm)
 
         # Should remove sort.stable
         sort_nodes = [n for n in result.graph.nodes if n.target == torch.ops.aten.sort.stable]
@@ -410,13 +485,29 @@ class TestLegalizeFlexAttentionPass:
                 return x + 1
 
         gm = fx.symbolic_trace(SimpleModule())
-        result = fx_passes.legalize_flex_attention_pass(gm)
+        result = legalize_flex_attention_pass(gm)
 
         assert result is gm
 
+    def test_pass_manager_integration(self):
+        """Test that FlexAttentionLegalization works with PassManager."""
 
-class TestFlexAttentionLegalization:
-    """Test fx_passes.legalize_flex_attention_pass with real flex_attention graphs."""
+        class SimpleModule(torch.nn.Module):
+            def forward(self, x):
+                return x * 2
+
+        gm = fx.symbolic_trace(SimpleModule())
+
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        result = pm(gm)
+
+        # Verify the pass ran without errors
+        assert result.graph_module is not None
+
+
+class TestFlexAttentionLegalizationE2E:
+    """End-to-end tests for FlexAttentionLegalization with real flex_attention graphs."""
 
     def test_flex_attention_legalization_numerical_accuracy(self):
         """Test that legalized flex_attention produces same output as original."""
@@ -455,7 +546,67 @@ class TestFlexAttentionLegalization:
 
         assert captured_gm is not None
 
-        legalized_gm = fx_passes.legalize_flex_attention_pass(captured_gm)
+        # Test using the class-based pass with PassManager
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        flex_nodes = [
+            n
+            for n in captured_gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.higher_order.flex_attention
+        ]
+
+        assert len(flex_nodes) == 0
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        # Unpack if tuple
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    def test_flex_attention_legalization_via_convenience_function(self):
+        """Test legalization using the convenience function."""
+        from functorch.compile import aot_module, make_boxed_func
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, L, S, E = 1, 2, 8, 8, 16
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value)
+
+        captured_gm = None
+
+        def capture_compiler(gm: torch.fx.GraphModule, example_inputs):
+            nonlocal captured_gm
+            captured_gm = gm
+            return make_boxed_func(gm.forward)
+
+        class FlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v)
+
+        model = FlexAttnModule()
+
+        aot_model = aot_module(
+            model,
+            fw_compiler=capture_compiler,
+        )
+
+        with torch.no_grad():
+            _ = aot_model(query, key, value)
+
+        assert captured_gm is not None
+
+        # Test using the convenience function
+        legalized_gm = legalize_flex_attention_pass(captured_gm)
 
         flex_nodes = [
             n
@@ -468,7 +619,6 @@ class TestFlexAttentionLegalization:
         with torch.no_grad():
             legalized_output = legalized_gm(query, key, value)
 
-        # Unpack if tuple
         if isinstance(legalized_output, tuple):
             legalized_output = legalized_output[0]
 
@@ -482,7 +632,9 @@ class TestDtypeSizeCombinations:
     def test_gqa_expansion_dtypes(self, dtype):
         """Test GQA expansion preserves dtype correctly."""
         b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
-        shapes = fx_passes.AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         key_node = graph.placeholder("key")
@@ -490,7 +642,7 @@ class TestDtypeSizeCombinations:
         value_node = graph.placeholder("value")
         value_node.meta = {"val": torch.empty(b, h_kv, s, e, dtype=dtype)}
 
-        key_out, value_out = fx_passes._expand_kv_for_gqa(graph, key_node, value_node, shapes)
+        key_out, value_out = flex_pass._expand_kv_for_gqa(graph, key_node, value_node, shapes)
         graph.output((key_out, value_out))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -507,7 +659,9 @@ class TestDtypeSizeCombinations:
         """Test attention scores computation with different dtypes."""
         B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -515,7 +669,7 @@ class TestDtypeSizeCombinations:
         key_node = graph.placeholder("key")
         key_node.meta = {"val": torch.empty(B, H, S, E, dtype=dtype)}
 
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, dtype
         )
         graph.output(scores)
@@ -533,13 +687,15 @@ class TestDtypeSizeCombinations:
     def test_softmax_dtypes(self, dtype):
         """Test softmax computation with different dtypes."""
         B, H, L, S = 2, 4, 16, 32
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
 
-        attn_weights, _, _ = fx_passes._compute_softmax(graph, scores_node, shapes, dtype)
+        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, dtype)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -566,7 +722,9 @@ class TestDtypeSizeCombinations:
     def test_attention_scores_various_sizes(self, B, H, L, S, E):
         """Test attention scores with various tensor sizes."""
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -574,7 +732,7 @@ class TestDtypeSizeCombinations:
         key_node = graph.placeholder("key")
         key_node.meta = {"val": torch.empty(B, H, S, E)}
 
-        scores = fx_passes._compute_attention_scores(
+        scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
         graph.output(scores)
@@ -590,13 +748,15 @@ class TestDtypeSizeCombinations:
 
 
 class TestComputeAttentionBackward:
-    """Tests for fx_passes._compute_attention_backward function."""
+    """Tests for attention backward computation via FlexAttentionLegalization."""
 
     def test_backward_gradient_shapes(self):
         """Test that backward pass produces correct gradient shapes."""
         B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -610,7 +770,7 @@ class TestComputeAttentionBackward:
         grad_out_node = graph.placeholder("grad_out")
         grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
 
-        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+        grad_q, grad_k, grad_v = flex_pass._compute_attention_backward(
             graph,
             query_node,
             key_node,
@@ -640,7 +800,9 @@ class TestComputeAttentionBackward:
         """Test grad_value computation: grad_value = attn_weights^T @ grad_out."""
         B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -654,7 +816,7 @@ class TestComputeAttentionBackward:
         grad_out_node = graph.placeholder("grad_out")
         grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
 
-        _, _, grad_v = fx_passes._compute_attention_backward(
+        _, _, grad_v = flex_pass._compute_attention_backward(
             graph,
             query_node,
             key_node,
@@ -684,7 +846,7 @@ class TestComputeAttentionBackward:
         """Test backward pass against PyTorch autograd reference."""
         B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0 / (E**0.5)
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         # Create inputs with gradients
         query = torch.randn(B, H, L, E, requires_grad=True)
@@ -705,6 +867,8 @@ class TestComputeAttentionBackward:
         expected_grad_v = value.grad.clone()
 
         # Now test our implementation
+        flex_pass = FlexAttentionLegalization()
+
         graph = fx.Graph()
         query_node = graph.placeholder("query")
         query_node.meta = {"val": torch.empty(B, H, L, E)}
@@ -717,7 +881,7 @@ class TestComputeAttentionBackward:
         grad_out_node = graph.placeholder("grad_out")
         grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
 
-        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+        grad_q, grad_k, grad_v = flex_pass._compute_attention_backward(
             graph,
             query_node,
             key_node,
@@ -750,7 +914,9 @@ class TestComputeAttentionBackward:
         """Test backward pass preserves dtype."""
         B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
         query_node = graph.placeholder("query")
@@ -764,7 +930,7 @@ class TestComputeAttentionBackward:
         grad_out_node = graph.placeholder("grad_out")
         grad_out_node.meta = {"val": torch.empty(B, H, L, E, dtype=dtype)}
 
-        grad_q, grad_k, grad_v = fx_passes._compute_attention_backward(
+        grad_q, grad_k, grad_v = flex_pass._compute_attention_backward(
             graph,
             query_node,
             key_node,
@@ -797,7 +963,9 @@ class TestScoreModInlining:
     def test_inline_score_mod_creates_nodes(self):
         """Test that _inline_score_mod creates expected nodes in graph."""
         B, H, L, S, E = 1, 2, 4, 8, 16
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         # Create a simple score_mod that adds a bias
         class SimpleScoreMod(torch.nn.Module):
@@ -812,12 +980,12 @@ class TestScoreModInlining:
         scaled_scores.meta = {"val": torch.empty(B, H, L, S)}
 
         # Create index tensors
-        index_tensors = fx_passes._create_index_tensors(main_graph, shapes)
+        index_tensors = flex_pass._create_index_tensors(main_graph, shapes)
 
         gm = fx.GraphModule(torch.nn.Module(), main_graph)
 
         # Inline score_mod
-        final_scores = fx_passes._inline_score_mod(
+        final_scores = flex_pass._inline_score_mod(
             main_graph,
             gm,
             "score_mod",
@@ -839,7 +1007,9 @@ class TestScoreModInlining:
     def test_inline_score_mod_with_arithmetic(self):
         """Test score_mod inlining with arithmetic operations using indices."""
         B, H, L, S, E = 1, 2, 4, 8, 16
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         # Create a score_mod that uses indices in arithmetic (no tensor constants)
         class ArithmeticScoreMod(torch.nn.Module):
@@ -853,11 +1023,11 @@ class TestScoreModInlining:
         scaled_scores = main_graph.placeholder("scaled_scores")
         scaled_scores.meta = {"val": torch.empty(B, H, L, S)}
 
-        index_tensors = fx_passes._create_index_tensors(main_graph, shapes)
+        index_tensors = flex_pass._create_index_tensors(main_graph, shapes)
 
         gm = fx.GraphModule(torch.nn.Module(), main_graph)
 
-        final_scores = fx_passes._inline_score_mod(
+        final_scores = flex_pass._inline_score_mod(
             main_graph,
             gm,
             "score_mod",
@@ -879,10 +1049,12 @@ class TestScoreModInlining:
     def test_create_index_tensors_shapes(self):
         """Test that _create_index_tensors creates correctly shaped tensors."""
         B, H, L, S, E = 2, 4, 8, 16, 32
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
-        b_idx, h_idx, q_idx, kv_idx = fx_passes._create_index_tensors(graph, shapes)
+        b_idx, h_idx, q_idx, kv_idx = flex_pass._create_index_tensors(graph, shapes)
         graph.output((b_idx, h_idx, q_idx, kv_idx))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -897,10 +1069,12 @@ class TestScoreModInlining:
     def test_create_index_tensors_values(self):
         """Test that _create_index_tensors creates correct index values."""
         B, H, L, S, E = 3, 2, 4, 5, 8
-        shapes = fx_passes.AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
+
+        flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
-        b_idx, h_idx, q_idx, kv_idx = fx_passes._create_index_tensors(graph, shapes)
+        b_idx, h_idx, q_idx, kv_idx = flex_pass._create_index_tensors(graph, shapes)
         graph.output((b_idx, h_idx, q_idx, kv_idx))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 

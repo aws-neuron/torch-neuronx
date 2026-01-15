@@ -21,6 +21,11 @@ from torch_neuronx.neuron_dynamo_backend.decompositions import flex_attention_de
 class TestFlexAttentionVsSDPA:
     """Test suite comparing FlexAttention decomposition against SDPA"""
 
+    @pytest.fixture(autouse=True)
+    def set_seed(self):
+        """Set manual seed for reproducibility"""
+        torch.manual_seed(42)
+
     @pytest.fixture
     def basic_inputs(self):
         """Create basic test inputs"""

@@ -38,18 +38,30 @@ void copy_cpu_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blockin
     return;
   }
   int device = dst.device().index();
-  void* src_data_ptr = src.data_ptr();
   // Calculate offset based on tensor's storage offset
   size_t byte_offset = dst.storage_offset() * dst.element_size();
 
   if (!at::neuron::utils::IsSyncModeEnabled()) {
     void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), byte_offset);
-    auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
-        "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, byte_offset, size_bytes, device);
+
+    std::unique_ptr<at::neuron::WriteDirectKernelExecution> write_kernel;
+    bool needs_sync = !non_blocking;
+
+    if (src.numel() == 1) {
+      // Scalar path - value captured inline, no sync needed
+      write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+          "neuron::copy::cpu_to_neuron_scalar", src.item(), dst_ptr, byte_offset, src.scalar_type(),
+          device);
+      needs_sync = false;
+    } else {
+      write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+          "neuron::copy::cpu_to_neuron", src.data_ptr(), dst_ptr, byte_offset, size_bytes, device);
+    }
+
     auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
-    auto stream = at::neuron::getCurrentNeuronStream(device);
-    at::neuron::SubmitOperationContext(stream, std::move(context));
-    if (!non_blocking) {
+    at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(device),
+                                       std::move(context));
+    if (needs_sync) {
       at::neuron::synchronize(device);
     }
     return;
@@ -58,6 +70,7 @@ void copy_cpu_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   nrt_tensor_t* nrt_dst = get_nrt_tensor(dst, non_blocking);
   TORCH_CHECK(nrt_dst != nullptr, "Failed to get Neuron tensor handle");
 
+  void* src_data_ptr = src.data_ptr();
   nrt_copy_cpu_to_neuron(src_data_ptr, nrt_dst, byte_offset, size_bytes);
 }
 

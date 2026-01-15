@@ -76,17 +76,16 @@ class NeuronCompilerTest : public ::testing::Test {
  private:
   void SaveEnvironment() {
     original_path_ = getenv("PATH") ? std::string(getenv("PATH")) : "";
-    original_lnc_ = getenv("NEURON_RT_VIRTUAL_CORE_SIZE")
-                        ? std::string(getenv("NEURON_RT_VIRTUAL_CORE_SIZE"))
-                        : "";
+    original_lnc_ =
+        getenv("NEURON_LOGICAL_NC_CONFIG") ? std::string(getenv("NEURON_LOGICAL_NC_CONFIG")) : "";
   }
 
   void RestoreEnvironment() {
     setenv("PATH", original_path_.c_str(), 1);
     if (!original_lnc_.empty()) {
-      setenv("NEURON_RT_VIRTUAL_CORE_SIZE", original_lnc_.c_str(), 1);
+      setenv("NEURON_LOGICAL_NC_CONFIG", original_lnc_.c_str(), 1);
     } else {
-      unsetenv("NEURON_RT_VIRTUAL_CORE_SIZE");
+      unsetenv("NEURON_LOGICAL_NC_CONFIG");
     }
   }
 

@@ -165,6 +165,15 @@ class TestPad:
         "tensor_data, padding, value",
         [
             (torch.zeros(2, 3), (1, 1), 2),  # Zero-filled tensor
+            pytest.param(
+                torch.zeros(2, 3),
+                (1, -1),
+                2,  # Negative padding dimension
+                marks=pytest.mark.xfail(
+                    os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "0",
+                    reason="JAX does not allow negative padding dimensions",
+                ),
+            ),
             (
                 torch.tensor([[-1.0, -2.0], [-3.0, -4.0]]),
                 (1, 1, 1, 1),
@@ -190,13 +199,6 @@ class TestPad:
             assert result_neuron.device.type == "neuron"
             torch.testing.assert_close(result_neuron.cpu(), expected)
             assert_op_runs_on_neuron("aten::pad")
-
-    @assert_raises(ValueError, match="index can't contain negative values")
-    def test_pad_error_negative_padding_dimensions(self):
-        """Test padding only some dimensions"""
-        x_neuron = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], device="neuron")
-
-        torch.nn.functional.pad(x_neuron, (1, -1), mode="constant", value=0)
 
     @assert_raises(RuntimeError, match="Padding length must be divisible by 2")
     def test_pad_error_invalid_padding_length(self):

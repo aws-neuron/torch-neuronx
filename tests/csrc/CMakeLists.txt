@@ -98,6 +98,7 @@ add_neuron_test(NeuronResourceManagerTest core/utils/NeuronResourceManagerTest.c
 add_neuron_test(KernelExecutionTest core/KernelExecutionTest.cpp)
 add_neuron_test(NeuronDeviceTest core/NeuronDeviceTest.cpp)
 add_neuron_test(NeuronTensorImplTest core/NeuronTensorImplTest.cpp)
+add_neuron_test(StorageImplTest core/StorageImplTest.cpp)
 add_neuron_test(OperationContextTest core/OperationContextTest.cpp)
 add_neuron_test(OperationExecutionEngineTest core/OperationExecutionEngineTest.cpp)
 add_neuron_test(ErrorHandlerTest core/utils/ErrorHandlerTest.cpp)

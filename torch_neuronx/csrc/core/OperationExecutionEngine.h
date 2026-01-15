@@ -135,13 +135,12 @@ class OperationExecutionEngine {
   // Check if concatenation is enabled via environment variable
   bool IsConcatenationEnabled() const;
 
-  // Preprocessing helpers prologue attached with operations if needed
-  bool ProcessPreprocessingTask(OperationContext* operation) noexcept;
-
  protected:
   // Virtual for testing - allows mocking execution without real device operations
+  void ProcessPrepareTask(OperationContext* operation) noexcept;
+  bool ProcessPreprocessingTask(OperationContext* operation);
+  virtual void ProcessCompilationTask(OperationContext* operation);
   virtual void ProcessExecutionTask(OperationContext* operation) noexcept;
-  virtual void ProcessCompilationTask(OperationContext* operation) noexcept;
 };
 
 }  // namespace at::neuron

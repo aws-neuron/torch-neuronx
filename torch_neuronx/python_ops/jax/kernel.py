@@ -262,6 +262,7 @@ class JaxKernel(BaseNeuronKernel):
         )
         return values
 
+    @torch._dynamo.disable
     def __call__(
         self, *inputs: torch.Tensor, context: ExecutionContext | None = None, **kwargs
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -306,7 +307,7 @@ class JaxKernel(BaseNeuronKernel):
 
         if output_specs and all(_is_zero_shape(spec.shape) for spec in output_specs):
             # Build outputs (handles provided out tensors, resizing, and dtype expectations)
-            device = self.arg_processor.extract_device(inputs)
+            device = self.arg_processor.extract_device(inputs, kwargs)
             execution_tensors, expected_dtypes, provided_output = self._prepare_outputs(
                 output_specs, is_single, expected_dtypes, device, kwargs
             )
@@ -367,7 +368,7 @@ class JaxKernel(BaseNeuronKernel):
             )
 
         # Prepare outputs and capture expected dtypes
-        device = self.arg_processor.extract_device(inputs)
+        device = self.arg_processor.extract_device(inputs, kwargs)
         execution_tensors, expected_dtypes, provided_output = self._prepare_outputs(
             output_specs, is_single, expected_dtypes, device, kwargs
         )

@@ -259,7 +259,7 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
-    name = "BroadcastOpBuilderTest",
-    srcs = ["core/opbuilder/module_builder/BroadcastOpBuilderTest.cpp"],
-    deps = ["//:opbuilder"],
+    name = "NeuronMetricsTest",
+    srcs = ["core/metrics/NeuronMetricsTest.cpp"],
+    deps = ["//:runtime"],
 )

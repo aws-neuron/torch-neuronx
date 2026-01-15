@@ -8,6 +8,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 class TestTopK:
@@ -51,7 +52,9 @@ class TestTopK:
             # Should run on Neuron (default parameters: largest=True, dim=-1, supported dtypes)
             assert_op_runs_on_neuron("aten::topk")
 
-    @pytest.mark.xfail(reason="XLA implementation only supports last dimension")
+    @pytest.mark.xfail(
+        condition=not use_mlir_aten_ops(), reason="XLA implementation only supports last dimension"
+    )
     @pytest.mark.parametrize(
         "input_shape,dim,k",
         [
@@ -64,7 +67,7 @@ class TestTopK:
     def test_topk_non_last_dimension_fallback(self, input_shape, dim, k):
         """Test that topk on non-last dimensions runs on Neuron"""
         with track_neuron_ops():
-            input_tensor = torch.randn(input_shape, device="neuron")
+            input_tensor = torch.randn(input_shape, device="neuron", dtype=torch.float32)
 
             values, indices = torch.topk(input_tensor, k=k, dim=dim)
 
@@ -81,7 +84,56 @@ class TestTopK:
             # Should run on Neuron
             assert_op_runs_on_neuron("aten::topk")
 
-    @pytest.mark.xfail(reason="XLA implementation only supports largest=True")
+    @pytest.mark.xfail(
+        condition=not use_mlir_aten_ops(), reason="XLA implementation only supports last dimension"
+    )
+    def test_topk_dim_correctness_validation(self):
+        """Test that topk results are actually correct across different dimensions"""
+        with track_neuron_ops():
+            # Test with known values for easy verification
+            input_tensor = torch.tensor(
+                [[[9, 1, 5], [3, 7, 2]], [[4, 8, 6], [1, 3, 9]]],  # shape: (2, 2, 3)
+                dtype=torch.float32,
+                device="neuron",
+            )
+
+            k = 2
+
+            # Test dim=1 (middle dimension)
+            values, indices = torch.topk(input_tensor, k=k, dim=1)
+
+            # Check output shapes
+            expected_shape = list(input_tensor.shape)
+            expected_shape[1] = k
+            assert values.shape == torch.Size(expected_shape)
+            assert indices.shape == torch.Size(expected_shape)
+
+            # Check device
+            assert values.device.type == "neuron"
+            assert indices.device.type == "neuron"
+
+            # Expected for dim=1: top 2 across middle dimension
+            # For position [0,:,0]: [9,3] -> [9,3] at indices [0,1]
+            # For position [0,:,1]: [1,7] -> [7,1] at indices [1,0]
+            # For position [0,:,2]: [5,2] -> [5,2] at indices [0,1]
+            expected_values_dim1 = torch.tensor(
+                [[[9, 7, 5], [3, 1, 2]], [[4, 8, 9], [1, 3, 6]]],
+                dtype=torch.float32,
+                device="neuron",
+            )
+            expected_indices_dim1 = torch.tensor(
+                [[[0, 1, 0], [1, 0, 1]], [[0, 0, 1], [1, 1, 0]]], dtype=torch.int64, device="neuron"
+            )
+
+            torch.testing.assert_close(values, expected_values_dim1)
+            torch.testing.assert_close(indices, expected_indices_dim1)
+
+            assert_op_runs_on_neuron("aten::topk")
+
+    @pytest.mark.xfail(
+        condition=not use_mlir_aten_ops(),
+        reason="XLA implementation only supports largest=True",
+    )
     def test_topk_largest_false_fallback(self):
         """Test that topk with largest=False runs on Neuron"""
         with track_neuron_ops():
@@ -98,10 +150,17 @@ class TestTopK:
             assert values.device.type == "neuron"
             assert indices.device.type == "neuron"
 
+            # Expected: top 2 smallest values are 1.0 (index 1) and 2.0 (index 3)
+            expected_values = torch.tensor([[1.0, 2.0]], device="neuron")
+            expected_indices = torch.tensor([[1, 3]], dtype=torch.int64, device="neuron")
+
+            torch.testing.assert_close(values, expected_values)
+            torch.testing.assert_close(indices, expected_indices)
+
             # Should run on Neuron
             assert_op_runs_on_neuron("aten::topk")
 
-    @assert_raises(RuntimeError, match="selected index k out of range")
+    @assert_raises(RuntimeError, match="selected index k out of range|k not in range for dimension")
     def test_topk_k_too_large_fallback(self):
         """Test that topk with k > dimension size raises RuntimeError"""
         with track_neuron_ops():
@@ -202,6 +261,42 @@ class TestTopK:
             assert indices.device.type == "neuron"
 
             # Should run on Neuron (default parameters: largest=True, dim=-1, supported dtypes)
+            assert_op_runs_on_neuron("aten::topk")
+
+    def test_topk_sorted_false_ground_truth(self):
+        """Test topk with sorted=False parameter against CPU ground truth"""
+        with track_neuron_ops():
+            # Create input tensor
+            input_cpu = torch.randn(10, 5)
+            input_neuron = input_cpu.to("neuron")
+            k = 3
+
+            # Get CPU ground truth
+            cpu_values, cpu_indices = torch.topk(input_cpu, k=k, dim=-1, sorted=False)
+
+            # Test on Neuron device
+            neuron_values, neuron_indices = torch.topk(input_neuron, k=k, dim=-1, sorted=False)
+
+            # Since sorted=False, sort both results before comparing
+            cpu_values_sorted, cpu_sort_idx = torch.sort(cpu_values, dim=-1, descending=True)
+            cpu_indices_sorted = torch.gather(cpu_indices, -1, cpu_sort_idx)
+
+            neuron_values_sorted, neuron_sort_idx = torch.sort(
+                neuron_values.cpu(), dim=-1, descending=True
+            )
+            neuron_indices_sorted = torch.gather(neuron_indices.cpu(), -1, neuron_sort_idx)
+
+            # Compare sorted results
+            torch.testing.assert_close(
+                neuron_values_sorted, cpu_values_sorted, rtol=1e-5, atol=1e-5
+            )
+            torch.testing.assert_close(neuron_indices_sorted, cpu_indices_sorted)
+
+            # Check device
+            assert neuron_values.device.type == "neuron"
+            assert neuron_indices.device.type == "neuron"
+
+            # Should run on Neuron
             assert_op_runs_on_neuron("aten::topk")
 
     @pytest.mark.parametrize(

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import torch.nn as nn
@@ -9,9 +11,14 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
-from torch_neuronx.python_ops.embedding import EmbeddingDenseBackwardOp
 
-embedding_dense_backward = EmbeddingDenseBackwardOp()
+embedding_dense_backward = torch.ops.aten.embedding_dense_backward
+
+# MLIR path uses aten:: prefix for op names
+_USE_MLIR = os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
+_EMBEDDING_BACKWARD_OP = (
+    "aten::embedding_dense_backward" if _USE_MLIR else "embedding_dense_backward"
+)
 
 
 class TestEmbeddingDenseBackward:
@@ -50,7 +57,8 @@ class TestEmbeddingDenseBackward:
         loss_neuron.backward()
 
         torch.testing.assert_close(embedding_matrix_neuron.grad.cpu(), embedding_matrix.grad)
-        assert "embedding_dense_backward" in torch_neuronx.get_executed_ops()
+        executed_ops = torch_neuronx.get_executed_ops()
+        assert _EMBEDDING_BACKWARD_OP in executed_ops
 
     def test_embedding_dense_backward_with_single_elements(self):
         """Test embedding backward using single elements"""
@@ -75,7 +83,8 @@ class TestEmbeddingDenseBackward:
         loss_neuron.backward()
 
         torch.testing.assert_close(embedding_matrix_neuron.grad.cpu(), embedding_matrix.grad)
-        assert "embedding_dense_backward" in torch_neuronx.get_executed_ops()
+        executed_ops = torch_neuronx.get_executed_ops()
+        assert _EMBEDDING_BACKWARD_OP in executed_ops
 
     @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64, torch.float32])
     @pytest.mark.parametrize(
@@ -139,7 +148,7 @@ class TestEmbeddingDenseBackward:
             )
 
             # Verify that the operation was offloaded to CPU
-            assert "embedding_dense_backward" in torch_neuronx.get_fallback_ops()
+            assert "aten::embedding_dense_backward" in torch_neuronx.get_fallback_ops()
 
     def test_embedding_dense_backward_with_one_tensor_not_on_device(self):
         """Test embedding backward with one tensor not on device
@@ -164,7 +173,7 @@ class TestEmbeddingDenseBackward:
         )
 
         # Verify that the operation was offloaded to CPU
-        assert "embedding_dense_backward" in torch_neuronx.get_fallback_ops()
+        assert "aten::embedding_dense_backward" in torch_neuronx.get_fallback_ops()
 
     @assert_raises(
         RuntimeError,

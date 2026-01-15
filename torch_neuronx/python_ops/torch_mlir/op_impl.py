@@ -7,6 +7,7 @@ import torch
 
 from torch_neuronx.python_ops.base import CompilableOpImpl, ExecutionResult
 from torch_neuronx.python_ops.dtype_autocast import autocast_neuron
+from torch_neuronx.python_ops.jax.context import ExecutionContext
 
 from ..jax.handlers import OutputHandler
 from .kernel import TorchMlirKernel
@@ -40,14 +41,18 @@ class TorchMlirOpImpl(CompilableOpImpl):
         # Initialize handlers
         self.output_handler = OutputHandler()
 
-        # Create kernel
-        self.kernel = TorchMlirKernel(
-            torch_fn=torch_fn,
-            op_name=aten_op_name,
-            output_params=output_params,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-        )
+        # Check for preprocessing
+        self._uses_preprocessing = getattr(self.torch_fn, "uses_preprocessing", False)
+        if not self._uses_preprocessing:
+            self.kernel = TorchMlirKernel(
+                torch_fn=torch_fn,
+                op_name=aten_op_name,
+                output_params=output_params,
+                static_argnums=static_argnums,
+                static_argnames=static_argnames,
+            )
+        else:
+            self.kernel = None
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
         """Execute the operation.
@@ -59,21 +64,31 @@ class TorchMlirOpImpl(CompilableOpImpl):
         Returns:
             ExecutionResult with output tensor(s)
         """
+        if self._uses_preprocessing:
+            actual_torch_fn, args, kwargs = self.torch_fn(*args, **kwargs)
+
+            if self.kernel is None:
+                self.kernel = TorchMlirKernel(
+                    torch_fn=actual_torch_fn,
+                    op_name=self.aten_op_name,
+                    output_params=self.output_params,
+                    static_argnums=self.static_argnums,
+                    static_argnames=self.static_argnames,
+                )
+
+        exec_context = ExecutionContext(original_inputs=args, original_kwargs=kwargs.copy())
         # Use dtype autocast context
-        with autocast_neuron() as context:
-            # Process arguments
-            context.original_inputs = args
+        with autocast_neuron(cast_dtype_params=True) as context:
+            # Process arguments, excluding output parameters from casting
+            original_kwargs = kwargs
             args, kwargs, _ = context.process_args(args, kwargs, output_params=self.output_params)
 
-            # Check for empty tensors
-            if self._should_handle_empty(args):
-                result = self._handle_empty_tensors(args, kwargs, context)
-                if result is not None:
-                    return ExecutionResult(success=True, output=result)
+            # Validate output dtypes
+            context.validate_output_dtypes(original_kwargs)
 
             # Execute kernel
             try:
-                result = self.kernel(*args, context=context, **kwargs)
+                result = self.kernel(*args, context=exec_context, **kwargs)
 
                 return ExecutionResult(success=True, output=result)
             except Exception as e:

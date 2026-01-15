@@ -251,3 +251,24 @@ def _sleep(cycles: int) -> None:
     """
     # TODO: Implement _sleep for Neuron
     return
+
+
+def get_dynamo_metrics():
+    """Get all torch.compile compilation metrics with timing."""
+    import torch_neuronx
+
+    return torch_neuronx.get_dynamo_metrics()
+
+
+def reset_dynamo_metrics():
+    """Reset all torch.compile compilation metrics."""
+    import torch_neuronx
+
+    torch_neuronx.reset_dynamo_metrics()
+
+
+def is_bf16_supported() -> bool:
+    """
+    torch.cuda is patched to torch.neuron so bf16 is supported
+    """
+    return True

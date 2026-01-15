@@ -3,26 +3,28 @@
 import math
 
 import neuronxcc.nki.language as nl
+import torch
 from neuronxcc.nki.kernels.attention import flash_attn_bwd
 
+from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import suppress_specific_warnings
 
+wrapped_flash_attn_bw = wrap_nki(flash_attn_bwd)
 
+
+@nki_op("nki_kernels::scaled_dot_product_attention_backward_kernel", mutates_args={})
 def scaled_dot_product_attention_backward_kernel(
-    grad_out,
-    q,
-    k,
-    v,
-    out,
-    lse,
-    grad_q,
-    grad_k,
-    grad_v,
-    is_causal=False,
-    dropout_p=0.0,
-    scale=None,
-    seed=None,
-):
+    grad_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    is_causal: bool = False,
+    dropout_p: float = 0.0,
+    scale: float | None = None,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Wrapper for the NKI flash attention backward kernel.
 
@@ -33,16 +35,12 @@ def scaled_dot_product_attention_backward_kernel(
         v: Value tensor in NKI format (batch, heads, embed_dim, seq_len)
         out: Forward output (batch, heads, seq_len, embed_dim)
         lse: Log-sum-exp from forward (batch, heads, B_P_SIZE, n_tiles)
-        grad_q: Output gradient for Q (batch, heads, embed_dim, seq_len)
-        grad_k: Output gradient for K (batch, heads, embed_dim, seq_len)
-        grad_v: Output gradient for V (batch, heads, embed_dim, seq_len)
         is_causal: Whether causal masking was used
         dropout_p: Dropout probability
         scale: Softmax scale factor
         seed: Random seed for dropout
     """
     # Import here to avoid circular import
-    from torch_neuronx import TorchNeuronNKIKernel
     from torch_neuronx.utils import get_logical_neuron_cores
 
     # LNC sharding factor for NKI kernel based on available neuron cores
@@ -72,17 +70,10 @@ def scaled_dot_product_attention_backward_kernel(
     else:
         grid = (batch_size, num_heads)
 
-    traced_kernel = TorchNeuronNKIKernel(
-        func=getattr(flash_attn_bwd, "func", flash_attn_bwd),
-        grid=grid,
-        kernel_return=True,
-        return_tensor_overrides=(grad_q, grad_k, grad_v),
-    )
-
     # Prepare seed tensor - needs to be shape (1,) not (1, 1)
     seed_1d = seed.view(-1)[0:1] if seed is not None and seed.numel() > 0 else None
     with suppress_specific_warnings(["Block dimension is deprecated", "shadowing tile"]):
-        dq_ret, dk_ret, dv_ret = traced_kernel(
+        grad_q, grad_k, grad_v = wrapped_flash_attn_bw[grid](
             q,
             k,
             v_nki,
@@ -94,6 +85,5 @@ def scaled_dot_product_attention_backward_kernel(
             mixed_precision=True,
             dropout_p=dropout_p,
             softmax_scale=scale,
-            logit_bias_ref=None,
         )
     return grad_q, grad_k, grad_v

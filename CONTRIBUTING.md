@@ -5,7 +5,6 @@
 ```sh
 # Clone the repository
 git clone <repository-url>
-cd TorchNeuronEager
 
 # Install prerequisites
 # Installs necessary drivers and bazel (See BAZEL_BUILD.md)
@@ -14,9 +13,6 @@ cd TorchNeuronEager
 # Create and activate virtual environment
 uv venv
 source .venv/bin/activate
-
-# Install in editable mode for development
-uv pip install -e .
 
 #If permission are needed, execute below command
 chmod +x ./tools/*
@@ -127,7 +123,5 @@ There are two ways to find what ops to implement:
        --html-table \
        > ops.html
    ```
-
-2. **Run arbitrary PyTorch code**: Write the PyTorch code you want to be supported, run it with torch_neuronx, and get the list of unimplemented ops required to run that code without CPU fallback from `torch_neuronx_dump/MMDDHHMMSS_PID/offloaded_ops.txt` (or `$TORCH_NEURONX_DUMP/MMDDHHMMSS_PID/offloaded_ops.txt` if the environment variable is set)
 
 Once you pick the op to implement, follow [docs/new_op.md](docs/new_op.md) to implement it.

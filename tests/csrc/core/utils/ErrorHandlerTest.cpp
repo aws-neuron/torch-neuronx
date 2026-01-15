@@ -337,6 +337,17 @@ TEST_F(ErrorHandlerTest, GenerateErrorMessageEnhanced) {
   unsetenv("NEURON_ENHANCED_ERROR_HANDLING");
 }
 
+// Test error handler functionality
+TEST_F(ErrorHandlerTest, ErrorHandlerFunctionality) {
+  // Test that error handler is properly initialized
+  EXPECT_FALSE(error_handler_->IsEnhancedErrorHandlingEnabled());
+  EXPECT_FALSE(error_handler_->IsExecutionDumpingEnabled());
+
+  // Test recent errors is initially empty
+  auto recent_errors = error_handler_->GetRecentErrors();
+  EXPECT_TRUE(recent_errors.empty());
+}
+
 // Test get_recent_errors method
 TEST_F(ErrorHandlerTest, GetRecentErrors) {
   // Initially should have no recent errors
@@ -518,6 +529,26 @@ TEST_F(ErrorHandlerTest, MultipleErrorRecording) {
   EXPECT_EQ(recent_errors[0].operation_name, "op1");
   EXPECT_EQ(recent_errors[1].operation_name, "op2");
   EXPECT_EQ(recent_errors[2].operation_name, "op3");
+}
+
+TEST_F(ErrorHandlerTest, ErrorRecordingUpdatesRecentErrors) {
+  auto mock_op = create_mock_operation();
+
+  ErrorContext context;
+  context.operation_name = "test_op";
+  context.stream_id = 123;
+
+  // Initial recent errors should be empty
+  auto initial_errors = error_handler_->GetRecentErrors();
+  EXPECT_TRUE(initial_errors.empty());
+
+  // Record a compilation error
+  error_handler_->HandleCompilationError(mock_op.get(), "Compilation failed", context);
+
+  // Check recent errors were updated
+  auto updated_errors = error_handler_->GetRecentErrors();
+  EXPECT_EQ(updated_errors.size(), 1);
+  EXPECT_EQ(updated_errors[0].operation_name, "test_op");
 }
 
 // Test concurrent access (thread-safety)

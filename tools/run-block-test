@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# Block comparison script - compares ops-concat performance across all block types
+# Runs each block with and without TORCH_NEURONX_ENABLE_CONCATENATION
+#
+# Usage:
+#   ./run-block-test                    # Sweep all blocks
+#   ./run-block-test llama qwen3        # Run specific blocks
+#   ./run-block-test --profile          # Enable profiler trace export
+#
+# For custom configurations (batch_size, seq_len, etc.), use run_benchmarks.py directly.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_DIR="$SCRIPT_DIR/../tests/blocks/block_perf"
+
+# Default blocks and presets
+declare -A BLOCKS=(
+    ["llama"]="llama-7b"
+    ["qwen3_torchtitan"]="qwen3-8b"
+    ["gpt_oss"]="openai/gpt-oss-20b"
+    ["qwen3"]="qwen3-8b-1lyr"
+    ["rms_norm"]="custom"
+    ["rope"]="rope-gqa-32-8-torchtitan"
+)
+
+ENABLE_PROFILE=""
+FILTER_BLOCKS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --profile)
+            ENABLE_PROFILE="1"
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--profile] [block1 block2 ...]"
+            echo ""
+            echo "Compares ops-concat performance across transformer blocks."
+            echo "By default, sweeps all blocks: ${!BLOCKS[*]}"
+            echo ""
+            echo "Options:"
+            echo "  --profile    Enable torch profiler Chrome trace export"
+            echo ""
+            echo "Examples:"
+            echo "  $0                    # Run all blocks"
+            echo "  $0 llama qwen3        # Run only llama and qwen3"
+            echo "  $0 --profile llama    # Run llama with profiler traces"
+            echo ""
+            echo "For custom configs, use run_benchmarks.py directly."
+            exit 0
+            ;;
+        *)
+            FILTER_BLOCKS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Validate specified blocks
+for b in "${FILTER_BLOCKS[@]}"; do
+    if [[ -z "${BLOCKS[$b]}" ]]; then
+        echo "Error: Unknown block '$b'. Valid: ${!BLOCKS[*]}"
+        exit 1
+    fi
+done
+
+cd "$BENCH_DIR"
+
+echo "=============================================="
+echo "Block Ops-Concat Comparison"
+echo "=============================================="
+
+# Determine which blocks to run
+if [[ ${#FILTER_BLOCKS[@]} -gt 0 ]]; then
+    RUN_BLOCKS=("${FILTER_BLOCKS[@]}")
+else
+    RUN_BLOCKS=("${!BLOCKS[@]}")
+fi
+
+for block in "${RUN_BLOCKS[@]}"; do
+    preset="${BLOCKS[$block]}"
+    safe_preset="${preset//\//_}"
+
+    echo ""
+    echo "=== $block ($preset) ==="
+
+    # Build base command
+    BASE_CMD="python run_benchmarks.py --block $block --preset $preset"
+
+    # Without ops-concat
+    NO_CONCAT_LOG="${block}_${safe_preset}_no_concat.log"
+    RUN_CMD="$BASE_CMD"
+    [[ -n "$ENABLE_PROFILE" ]] && RUN_CMD="$RUN_CMD --trace_json ${block}_${safe_preset}_no_concat_trace.json"
+
+    echo "Without ops-concat -> $NO_CONCAT_LOG"
+    TORCH_NEURONX_ENABLE_CONCATENATION=0 $RUN_CMD 2>&1 | tee "$NO_CONCAT_LOG"
+
+    # With ops-concat
+    WITH_CONCAT_LOG="${block}_${safe_preset}_with_concat.log"
+    RUN_CMD="$BASE_CMD"
+    [[ -n "$ENABLE_PROFILE" ]] && RUN_CMD="$RUN_CMD --trace_json ${block}_${safe_preset}_with_concat_trace.json"
+
+    echo ""
+    echo "With ops-concat -> $WITH_CONCAT_LOG"
+    TORCH_NEURONX_ENABLE_CONCATENATION=1 $RUN_CMD 2>&1 | tee "$WITH_CONCAT_LOG"
+done
+
+echo ""
+echo "=============================================="
+echo "Logs saved to tests/blocks/block_perf/"
+[[ -n "$ENABLE_PROFILE" ]] && echo "Profiler traces: Open https://ui.perfetto.dev/ to view"
+echo "=============================================="

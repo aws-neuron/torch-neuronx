@@ -50,17 +50,11 @@ def torch_addmv(self, mat, vec, beta=1, alpha=1):
 
 @register_aten(
     ["aten::linalg_vector_norm", "aten::linalg_vector_norm.out"],
-    static_argnames=("ord", "dim", "keepdim"),
+    static_argnums=(1, 2, 3),
+    static_argnames=("dtype",),
 )
-def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False):
-    return torch.linalg.vector_norm(x, ord, dim, keepdim)
-
-
-@register_aten(
-    ["aten::_foreach_norm.Scalar", "aten::_foreach_norm.Scalar_out"], static_argnames=("ord",)
-)
-def torch_foreach_norm(tensors, ord=2):
-    return [torch.linalg.vector_norm(t, ord=ord) for t in tensors]
+def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
+    return torch.linalg.vector_norm(x, ord, dim, keepdim, dtype=dtype)
 
 
 @register_aten(["aten::linear"], use_torch_compile=True)
@@ -79,33 +73,6 @@ def torch_linear(input, weight, bias=None):
     return torch.nn.functional.linear(input, weight, bias)
 
 
-@register_aten(["aten::linear_backward"], use_torch_compile=True)
+@register_aten(["aten::linear_backward"], use_torch_compile=True, static_argnums=(3,))
 def torch_linear_backward(input, grad_output, weight, output_mask):
-    """
-    Compute gradients for linear layer backward pass.
-
-    Args:
-        input: Input tensor to linear layer, (shape: [..., in_features])
-        grad_output: Gradient tensor from the output, (shape: [..., out_features])
-        weight: Weight tensor of linear layer (shape: [out_features, in_features])
-        output_mask: Boolean mask indicating which gradients to compute
-
-    Returns:
-        Tuple of (grad_input, grad_weight, grad_bias)
-    """
-    grad_input = grad_output @ weight if output_mask[0] else None
-
-    grad_weight = None
-    if output_mask[1]:
-        batch_dims = "".join(chr(ord("a") + j) for j in range(input.ndim - 1))
-        grad_input_eq = f"{batch_dims}i,{batch_dims}j->ij"
-        grad_weight = torch.einsum(grad_input_eq, grad_output, input)
-
-    grad_bias = None
-    if output_mask[2]:
-        if grad_output.ndim > 1:
-            grad_bias = grad_output.sum(dim=tuple(range(grad_output.ndim - 1)))
-        else:
-            grad_bias = grad_output
-
-    return grad_input, grad_weight, grad_bias
+    return torch.ops.aten.linear_backward(input, grad_output, weight, output_mask)

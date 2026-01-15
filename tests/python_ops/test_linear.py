@@ -287,15 +287,7 @@ class TestLinearBackward:
             if bias_neuron is not None:
                 bias_neuron.grad = bias_neuron_grad
             # Verify operations ran on Neuron
-            if (
-                requires_grads == (False, False, True)
-                and grad_output.ndim == 1
-                and os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
-            ):
-                # Backward becomes no-op in this case and will not execute on Neuron
-                assert_op_did_not_run_on_neuron("aten::linear")
-            else:
-                assert_op_runs_on_neuron("aten::linear")
+            assert_op_runs_on_neuron("aten::linear")
 
         # Check that gradients match
         if requires_grads[0]:

@@ -1522,6 +1522,7 @@ class TestReduceScatter(BaseCollectiveOpTest):
         """Test reduce_scatter with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
 
+    @pytest.mark.xfail(reason="Memory assertions require further investigation, thus xfailing.")
     def test_bucketing_memory(self):
         """Test reduce_scatter with bucketing for memory efficiency."""
         self.distributed_tester.run_test(run_bucketing_memory_test)

@@ -5,12 +5,15 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"])
+@register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"], static_argnums=(1, 4))
 def torch_native_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     return torch.native_layer_norm(input, normalized_shape, weight, bias, eps)
 
 
-@register_aten(["aten::native_layer_norm_backward", "aten::native_layer_norm_backward.out"])
+@register_aten(
+    ["aten::native_layer_norm_backward", "aten::native_layer_norm_backward.out"],
+    static_argnums=(2, 7),
+)
 def torch_native_layer_norm_backward(
     grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
 ):
@@ -99,7 +102,7 @@ def torch_batch_norm_gather_stats_with_counts(
 
     # Avoid division by zero if all counts are zero
     total_count = torch.sum(counts)
-    total_count = torch.where(total_count == 0, torch.tensor(1.0), total_count)
+    total_count = torch.where(total_count == 0, 1.0, total_count)
 
     # Calculate global mean
     global_mean = torch.sum(means * counts.unsqueeze(-1), dim=0) / total_count
@@ -143,3 +146,15 @@ def torch_batch_norm_backward_reduce(
     grad_bias = sum_dy
 
     return sum_dy, sum_dy_xmu, grad_weight, grad_bias
+
+
+@register_aten(["aten::_fused_rms_norm"], static_argnums=(1, 3))
+def torch_fused_rms_norm(input, normalized_shape, weight=None, eps=1e-5):
+    return torch.ops.aten._fused_rms_norm(input, normalized_shape, weight, eps)
+
+
+@register_aten(["aten::_fused_rms_norm_backward"], static_argnums=(2, 5))
+def torch_fused_rms_norm_backward(grad_out, input, normalized_shape, rstd, weight, output_mask):
+    return torch.ops.aten._fused_rms_norm_backward(
+        grad_out, input, normalized_shape, rstd, weight, output_mask
+    )

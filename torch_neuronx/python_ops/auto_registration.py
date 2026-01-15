@@ -41,7 +41,7 @@ def register_implementation(aten_name: str, impl_class: type[OperationImplementa
     Called automatically by the @neuron_op decorator.
     """
     # TODO: Remove once MLIR support is added for these ops
-    mlir_unsupported_patterns = ("copy", "contiguous", "attention")
+    mlir_unsupported_patterns = ("copy", "contiguous", "attention", "nonzero", "index")
 
     should_register = not use_mlir_aten_ops() or any(
         pattern in aten_name for pattern in mlir_unsupported_patterns

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 
 import torch_neuronx
 from tests.pytorch_tests.clone_tests import clone_pytorch_tests
+from tests.utils.neuron_test_utils import track_neuron_ops
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -143,6 +145,9 @@ def _create_test_config(
 def _get_test_classes_from_module(test_module) -> list[str]:
     test_classes = []
     for name in dir(test_module):
+        if name.startswith("_"):
+            # Skip non-test classes
+            continue
         obj = getattr(test_module, name)
         if (
             isinstance(obj, type)
@@ -157,11 +162,25 @@ def _get_test_classes_from_module(test_module) -> list[str]:
     return test_classes
 
 
-def _apply_class_name_suffix(class_name: str, config: dict) -> str:
-    class_name_suffix = config.get("class_name_suffix")
-    if class_name_suffix is not None:
-        return class_name + class_name_suffix
-    return class_name
+def _apply_class_name_suffix(
+    test_module: object, class_name: str, config: dict
+) -> tuple[str, type]:
+    """Apply device-specific suffix to test class name and return the class."""
+    class_name_suffix_options = config.get("class_name_suffix_options")
+    if class_name_suffix_options is None:
+        return class_name, getattr(test_module, class_name)
+
+    for class_name_suffix in class_name_suffix_options:
+        try:
+            neuron_test_class_name = class_name + class_name_suffix
+            pytorch_test_class = getattr(test_module, neuron_test_class_name)
+            return neuron_test_class_name, pytorch_test_class
+        except AttributeError:
+            continue
+
+    # Fallback to base class if no suffixed version exists
+    logger.warning(f"No suffixed class found for {class_name}, using base class")
+    return class_name, getattr(test_module, class_name)
 
 
 def _process_test_class(
@@ -171,12 +190,10 @@ def _process_test_class(
     config: dict,
     sanity_pt_distributed_tests: bool = False,
 ) -> PytorchTestConfig:
-    # Apply suffix to class name
-    neuron_test_class_name = _apply_class_name_suffix(class_name, config)
-
-    # Get the actual class object
-    pytorch_test_class = getattr(test_module, neuron_test_class_name)
-
+    # Apply suffix to class name and get class object
+    neuron_test_class_name, pytorch_test_class = _apply_class_name_suffix(
+        test_module, class_name, config
+    )
     # Get all test methods
     test_methods = _get_test_methods_from_class(pytorch_test_class)
     logger.info(
@@ -245,9 +262,12 @@ def _process_single_test_configuration(
         raise FileNotFoundError(f"Expected test file not found: {test_file}")
 
     try:
+        # Add test directory to sys.path for relative imports within PyTorch tests
+        if str(test_dir) not in sys.path:
+            sys.path.insert(0, str(test_dir))
+
         # Add distributed test directory to sys.path to resolve import errors
         # Cloned PyTorch test files use relative imports like "import test_c10d_common"
-        # which fail unless the distributed directory is in Python's module search path
         distributed_dir = test_dir / "distributed"
         if distributed_dir.exists() and str(distributed_dir) not in sys.path:
             sys.path.insert(0, str(distributed_dir))
@@ -409,7 +429,7 @@ def _parse_test_configurations(
             {
                 "file": args.test_file_name,
                 "class": args.test_class_name,
-                "class_name_suffix": args.class_name_suffix,
+                "class_name_suffix_options": args.class_name_suffix_options,
                 "methods": test_method_list,
                 "xfail": [],
                 "skip_tests": [],
@@ -417,8 +437,111 @@ def _parse_test_configurations(
         ]
 
 
-def setup_pytorch_tests(spec_file="test_spec.json", sanity_pt_distributed_tests=False):
-    """Clone pytorch tests, import test module and instantiate the test class"""
+def _create_test_class_for_config(config: PytorchTestConfig) -> type:
+    """Create a single test class for a PytorchTestConfig."""
+    class_name = config.test_class_name
+    test_module = config.test_module
+    original_class = getattr(test_module, class_name)
+
+    def setup_class(cls):
+        cls.pytorch_test_class = original_class
+        cls.tracking_dir = Path(f"op_tracking_{class_name}")
+        cls.tracking_dir.mkdir(exist_ok=True)
+
+    def _run_pytorch_test(self, method_name):
+        test_instance = self.pytorch_test_class()
+        if hasattr(test_instance, "setUp"):
+            test_instance.setUp()
+        with track_neuron_ops():
+            try:
+                getattr(test_instance, method_name)()
+            except Exception as e:
+                logger.error(f"{method_name} failed: {e}")
+                raise
+            finally:
+                executed_ops = torch_neuronx.get_executed_ops()
+                fallback_ops = torch_neuronx.get_fallback_ops()
+                worker_id = os.environ.get("PYTEST_XDIST_WORKER", "main")
+                tracking_file = self.tracking_dir / f"ops_tracking_{worker_id}.json"
+                data = defaultdict(list)
+                if tracking_file.exists():
+                    with open(tracking_file) as f:
+                        data = json.load(f)
+                data["test_method"].append(method_name)
+                data["test_class"].append(class_name)
+                data["executed_ops"].append(executed_ops)
+                data["fallback_ops"].append(fallback_ops)
+                with open(tracking_file, "w") as f:
+                    json.dump(data, f)
+                if hasattr(test_instance, "tearDown"):
+                    test_instance.tearDown()
+
+    # Create class with setup_class and _run_pytorch_test
+    test_cls = type(
+        class_name,
+        (),
+        {
+            "setup_class": classmethod(setup_class),
+            "_run_pytorch_test": _run_pytorch_test,
+        },
+    )
+
+    # Add test methods
+    for method_name in config.test_methods:
+
+        def make_test(m_name):
+            def test_method(self):
+                self._run_pytorch_test(m_name)
+
+            test_method.__name__ = m_name
+            return test_method
+
+        setattr(test_cls, method_name, make_test(method_name))
+
+    # Apply xfail markers
+    for xfail in config.xfail:
+        xfail_kw = next(iter(xfail.keys()))
+        for m_name in config.test_methods:
+            if xfail_kw in m_name:
+                method = getattr(test_cls, m_name)
+                marked = pytest.mark.xfail(reason=xfail[xfail_kw]["reason"])(method)
+                setattr(test_cls, m_name, marked)
+
+    # Apply skip markers
+    for skip in config.skip_tests:
+        skip_kw = next(iter(skip.keys()))
+        for m_name in config.test_methods:
+            if skip_kw in m_name:
+                method = getattr(test_cls, m_name)
+                setattr(test_cls, m_name, pytest.mark.skip(reason=skip[skip_kw]["reason"])(method))
+
+    return test_cls
+
+
+def create_pytorch_test_wrappers(configs: list[PytorchTestConfig]) -> dict[str, type]:
+    """
+    Create wrapper classes for PyTorch tests, one per original test class.
+
+    Args:
+        configs: List of test configurations from setup_pytorch_tests
+    Returns:
+        Dict mapping class name to generated test class
+    """
+    return {config.test_class_name: _create_test_class_for_config(config) for config in configs}
+
+
+def setup_pytorch_tests(
+    spec_file="test_spec.json",
+    sanity_pt_distributed_tests=False,
+    class_name_filter=None,
+):
+    """Clone pytorch tests, import test module and instantiate the test class.
+
+    Args:
+        spec_file: JSON spec file name in tests/pytorch_tests/specs/
+        sanity_pt_distributed_tests: Enable sanity mode for distributed tests
+        class_name_filter: If provided, only process configs matching this class name.
+    """
     parser = argparse.ArgumentParser(description="Run pytorch tests in torch_neuronx environment")
     parser.add_argument(
         "--test-file-name",
@@ -476,6 +599,20 @@ def setup_pytorch_tests(spec_file="test_spec.json", sanity_pt_distributed_tests=
     test_configurations = _parse_test_configurations(args, test_config_json)
     if not test_configurations:
         raise ValueError("No test configurations found")
+
+    # Early filter by class name - filters JSON configs BEFORE importing test modules
+    if class_name_filter:
+        original_count = len(test_configurations)
+        test_configurations = [
+            cfg
+            for cfg in test_configurations
+            if cfg.get("class") and class_name_filter in cfg["class"]
+        ]
+        logger.info(
+            f"Filtered by '{class_name_filter}': {original_count} -> {len(test_configurations)}"
+        )
+        if not test_configurations:
+            raise ValueError(f"No test configurations found matching class '{class_name_filter}'")
 
     # Expand folder configurations into individual file configurations
     test_configurations = _expand_folder_configurations(test_configurations, test_dir, args)

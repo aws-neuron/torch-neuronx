@@ -1,6 +1,8 @@
 import jax.numpy as jnp
 import torch
 
+from torch_neuronx.utils import use_mlir_aten_ops
+
 from ...kernels.xla_kernel import TorchNeuronXLAKernel
 from ..base import ExecutionResult, OperationImplementation
 
@@ -41,6 +43,12 @@ class ScatterAddXLAImpl(OperationImplementation):
 
         self.kernel = TorchNeuronXLAKernel(compute_scatter_add, "scatter_add", static_argnums=(1,))
 
+    def can_handle(self, *args, **kwargs) -> bool:
+        """Only handle if MLIR is not enabled."""
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(*args, **kwargs)
+
     def _handle_empty_tensor(self, input, dim, index, src) -> ExecutionResult:
         """Handle empty tensor case for scatter_add (out-of-place)"""
         result = torch.zeros_like(input)
@@ -64,6 +72,11 @@ class ScatterAddInplaceXLAImpl(OperationImplementation):
             return input
 
         self.kernel = TorchNeuronXLAKernel(compute_scatter_add, "scatter_add_", static_argnums=(1,))
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(*args, **kwargs)
 
     def _handle_empty_tensor(self, input, dim, index, src) -> ExecutionResult:
         """Handle empty tensor case for scatter_add_ (in-place)"""
@@ -89,6 +102,11 @@ class ScatterAddOutXLAImpl(OperationImplementation):
         self.kernel = TorchNeuronXLAKernel(
             compute_scatter_add, "scatter_add.out", static_argnums=(1,)
         )
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(*args, **kwargs)
 
     def _handle_empty_tensor(self, input, dim, index, src, *, out=None) -> ExecutionResult:
         """Handle empty tensor case for scatter_add.out"""

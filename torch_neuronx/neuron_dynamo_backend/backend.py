@@ -3,14 +3,14 @@ Neuron backend implementation for torch.compile
 """
 
 import logging
+from collections.abc import Callable
 
 import torch
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
+from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
-
-# Import local utilities
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_current_timestamp,
     get_fx_graph_path,
@@ -19,15 +19,22 @@ from torch_neuronx.neuron_dynamo_backend.config import (
     managed_artifacts_directory,
     reset_timestamp,
 )
-
-# Import local decompositions
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
     convert_fx_to_stablehlo,
     save_mlir_bytecode,
 )
-from torch_neuronx.neuron_dynamo_backend.fx_passes import legalize_flex_attention_pass
+from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
+    post_aot_processing,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.pipelines.preprocessing_pipeline import preprocess_graph
+from torch_neuronx.neuron_dynamo_backend.metrics import (
+    NeuronCompilationMetrics,
+    record_compilation,
+)
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.io_utils import save_fx_graph_txt
 
 logger = logging.getLogger(__name__)
@@ -39,6 +46,7 @@ def _compile_fx_to_stablehlo(
     model_name: str,
     segment_id: str,
     preserve_artifacts: bool,
+    aliasing_info: AliasingInfo = None,
 ):
     """
     FX Graph to StableHLO conversion helper function.
@@ -58,7 +66,7 @@ def _compile_fx_to_stablehlo(
     logger.debug("--- Starting FX Graph -> StableHLO conversion ---")
 
     stablehlo_mlir, io_spec, cast_spec = convert_fx_to_stablehlo(
-        gm, example_inputs, preserve_artifacts=preserve_artifacts
+        gm, example_inputs, aliasing_info, preserve_artifacts=preserve_artifacts
     )
     logger.debug("FX Graph -> StableHLO completed")
 
@@ -97,7 +105,9 @@ def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
 
 
 # TODO (NF-19): move all FX->NEFF compilation into a single function
-def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options=None):
+def neuron_backend_fx_compiler(
+    gm: torch.fx.GraphModule, example_inputs, pre_processing_analysis_info=None, options=None
+):
     """
     Neuron compiler function that receives core Aten ops from AOTAutograd
 
@@ -120,7 +130,15 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
     """
 
     logger.debug("Applying FX graph transformations...")
-    gm = legalize_flex_attention_pass(gm, example_inputs)
+    post_aot_processing_result = post_aot_processing(gm)
+    gm = post_aot_processing_result.graph_module
+    mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
+    none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
+    aliasing_info = (
+        None
+        if pre_processing_analysis_info is None
+        else pre_processing_analysis_info.get("aliasing_analysis", None)
+    )
 
     logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
     logger.debug(
@@ -135,6 +153,14 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
 
     # Get model name from global variable
     model_name = get_model_name() if options is None else options.get("model_name", "model_default")
+
+    # Construct human-readable graph name from model_name and AOT compile ID
+    # get_aot_graph_name() returns: model__{aot_id}_{graph_type}_{nth}
+    # We replace generic "model" prefix with user's model_name
+    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
+    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
+    graph_name = f"{model_name}_{compile_id}"  # e.g., "LlamaForCausalLM_0_inference_0"
+
     logger.debug(f"Model name: {model_name}")
     logger.debug(f"Segment ID: {segment_id}")
 
@@ -150,12 +176,32 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
             save_fx_graph_txt(gm, graph_path)
 
             stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
-                gm, example_inputs, model_name, segment_id, preserve_artifacts
+                gm, example_inputs, model_name, segment_id, preserve_artifacts, aliasing_info
             )
-
             compile_graph = CompileGraph(stablehlo_mlir, model_name, segment_id, has_collectives)
             final_cache_key = compile_graph.compile()
-            executor = Executor(model_name, final_cache_key, io_spec, cast_spec, has_collectives)
+
+            # Record compilation metrics (stablehlo_to_neff timing populated lazily at sync)
+            record_compilation(
+                NeuronCompilationMetrics(
+                    graph_id=final_cache_key,
+                    graph_name=graph_name,
+                    model_name=model_name,
+                    has_collectives=has_collectives,
+                    graph_node_count=len(gm.graph.nodes),
+                    timestamp=segment_id,
+                )
+            )
+
+            executor = Executor(
+                model_name,
+                final_cache_key,
+                io_spec,
+                cast_spec,
+                has_collectives,
+                mutation_info=mutation_info,
+                none_output_info=none_output_info,
+            )
 
             # Create wrapper function that matches torch.compile expectations
             def execution_wrapper(*inputs):
@@ -163,6 +209,8 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
                 try:
                     return executor(*inputs)
                 except Exception as e:
+                    if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
+                        raise e from e
                     logger.error(f"Execution failed: {e}")
                     # Fallback to original execution for debugging
                     logger.warning("Falling back to original GraphModule execution")
@@ -174,6 +222,25 @@ def neuron_backend_fx_compiler(gm: torch.fx.GraphModule, example_inputs, options
             raise RuntimeError(
                 f"Neuron backend NEFF execution setup failed with unexpected error: {e}"
             ) from e
+
+
+def make_fw_compiler(
+    analysis_info: dict,
+    options=None,
+) -> Callable[[torch.fx.GraphModule, list[torch.Tensor]], any]:
+    """Create a forward compiler wrapper with custom aliasing information.
+
+    Args:
+        analysis_info: FX graph pre-processing info
+
+    Returns:
+        Callable: Wrapper function that invokes neuron_compiler with aliasing info
+    """
+
+    def wrapper(gm, example_inputs):
+        return neuron_backend_fx_compiler(gm, example_inputs, analysis_info, options)
+
+    return wrapper
 
 
 def create_neuron_backend(decompose_all: bool = False):
@@ -192,15 +259,17 @@ def create_neuron_backend(decompose_all: bool = False):
     """
 
     # TODO (NF-24): add explicit bw_compiler
-    decomposition_table = get_decomposition_table(decompose_all)
+    decomposition_table = get_decomposition_table()
 
     def neuron_backend_wrapper(gm, example_inputs, *, options=None):
         # Force dynamic=False for neuron backend
         if options is None:
             options = {}
         options.setdefault("dynamic", False)
+        gm, analysis_results = preprocess_graph(gm)
         aot_backend = aot_autograd(
-            fw_compiler=lambda gm, inputs: neuron_backend_fx_compiler(gm, inputs, options),
+            fw_compiler=make_fw_compiler(analysis_results, options=options),
+            keep_inference_input_mutations=True,  # Prevent Copy-back.
             decompositions=decomposition_table,
         )
         return aot_backend(gm, example_inputs)

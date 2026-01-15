@@ -14,6 +14,7 @@
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/compilation/CacheEntry.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 
 namespace at::neuron {
 
@@ -85,26 +86,6 @@ class CompilationCache {
   //   stream_id: Stream identifier for logging and debugging
   void GetOrCompileNeff(const CompilableKernelExecution& kernel_execution, uint32_t stream_id);
 
-  // Statistics about cache performance and resource usage.
-  struct CacheStats {
-    size_t total_entries;                              // Current number of cached entries
-    size_t cache_hits;                                 // Total cache hits since creation
-    size_t cache_misses;                               // Total cache misses since creation
-    double hit_rate;                                   // Hit rate (hits / total_requests)
-    size_t memory_usage_bytes;                         // Current memory usage in bytes
-    std::chrono::milliseconds total_compilation_time;  // Cumulative compilation time
-    size_t evictions_performed;                        // Total evictions performed
-    size_t max_cache_size_bytes;                       // Maximum allowed cache size
-    size_t max_cache_entries;                          // Maximum allowed cache entries
-    double memory_utilization_ratio;                   // Current memory usage ratio
-  };
-
-  // Returns comprehensive cache statistics.
-  //
-  // This method provides a snapshot of cache performance metrics including
-  // hit rates, memory usage, and eviction statistics. Thread-safe.
-  CacheStats GetStatistics() const;
-
   // Detailed information about a single cache entry.
   struct CacheEntryInfo {
     std::string cache_key;                                 // Unique cache identifier
@@ -133,6 +114,12 @@ class CompilationCache {
   //
   // Includes both NEFF data and metadata overhead. Thread-safe.
   size_t GetMemoryUsageBytes() const;
+
+  // Returns maximum cache size in bytes.
+  size_t GetMaxCacheSizeBytes() const { return max_cache_size_bytes_.load(); }
+
+  // Returns maximum number of cache entries.
+  size_t GetMaxCacheEntries() const { return max_cache_entries_.load(); }
 
   // Clears all cache entries and resets statistics.
   //

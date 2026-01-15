@@ -22,13 +22,13 @@ neuron_dynamo_backend environment variables:
         whether to preserve directory with compilation artifacts after execution is complete
     TORCH_NEURONX_DEBUG_DIR: str (default="/tmp/neuron_backend_<random string>")
         directory in which to save compilation artifacts
+    TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION: bool (default=False)
+        disables fallback execution on failure for neuron backend.
     TORCH_NEURONX_ENABLE_NKI_SDPA: bool (default=True)
         enables decomposing scaled_dot_product_attention to the NKI kernel if possible.
         currently, the decomposition happens only when seqlen % 2048 == 0 for queries.
     NEURON_CC_FLAGS: str (default="")
         flags passed to neuronx-cc call
-
-
 """
 
 from torch_neuronx.neuron_dynamo_backend.backend import (
@@ -44,6 +44,10 @@ from torch_neuronx.neuron_dynamo_backend.exceptions import (
     NEFFCompilationError,
     NEFFExecutionError,
 )
+from torch_neuronx.neuron_dynamo_backend.metrics import (
+    get_dynamo_metrics,
+    reset_dynamo_metrics,
+)
 from torch_neuronx.neuron_dynamo_backend.utils.io_utils import (
     fx_to_mlir_string,
     load_mlir,
@@ -58,10 +62,12 @@ __all__ = [
     "NEFFExecutionError",
     "create_neuron_backend",
     "fx_to_mlir_string",
+    "get_dynamo_metrics",
     "get_model_name",
     "get_rank",
     "load_mlir",
     "neuron_backend",
+    "reset_dynamo_metrics",
     "save_fx_as_mlir",
     "save_fx_graph_all_formats",
     "save_fx_graph_txt",

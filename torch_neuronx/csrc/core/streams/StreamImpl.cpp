@@ -32,9 +32,6 @@ extern "C" {
 namespace StreamConfig {
 // Timeout configurations
 constexpr auto kOperationTimeout = std::chrono::milliseconds(30000);
-constexpr auto kShutdownTimeout = std::chrono::seconds(5);
-constexpr auto kMonitoringInterval = std::chrono::seconds(5);
-constexpr auto kStatsLogInterval = std::chrono::seconds(60);
 
 // Thread configuration
 constexpr int kTotalWorkerThreads = 2;

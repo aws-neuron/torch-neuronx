@@ -10,7 +10,6 @@
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/ContiguousTranspose.h"
-#include "torch_neuronx/csrc/core/opbuilder/module_builder/BroadcastOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/EmptyOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/ReshapeOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/SliceOpBuilder.h"
@@ -92,24 +91,6 @@ std::string GenerateSliceCacheKey(const std::vector<int64_t>& input_shape,
   for (auto idx : start_indices) ss << idx << "_";
   ss << "end_";
   for (auto idx : end_indices) ss << idx << "_";
-  ss << element_type;
-  return ss.str();
-}
-
-/*
- * @brief Generate cache key for broadcast transformation
- */
-std::string GenerateBroadcastCacheKey(const std::vector<int64_t>& input_shape,
-                                      const std::vector<int64_t>& output_shape,
-                                      const std::vector<int64_t>& broadcast_dims,
-                                      const std::string& element_type) {
-  std::stringstream ss;
-  ss << "broadcast_";
-  for (auto s : input_shape) ss << s << "x";
-  ss << "_to_";
-  for (auto s : output_shape) ss << s << "x";
-  ss << "_dims_";
-  for (auto d : broadcast_dims) ss << d << "_";
   ss << element_type;
   return ss.str();
 }
@@ -318,67 +299,6 @@ std::string GenerateSlice(const std::vector<int64_t>& input_shape,
     return result;
   } catch (const std::exception& e) {
     TORCH_NEURONX_DEBUG("Failed to generate slice MLIR", "error=", e.what());
-    throw;
-  }
-}
-
-// ============================================================================
-// BROADCAST Implementation
-// ============================================================================
-
-std::string GenerateBroadcast(const std::vector<int64_t>& input_shape,
-                              const std::vector<int64_t>& output_shape,
-                              const std::vector<int64_t>& broadcast_dims,
-                              const std::string& element_type) {
-  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast", "input_shape_size=", input_shape.size(),
-                      "output_shape_size=", output_shape.size(), "element_type=", element_type);
-
-  // Generate cache key
-  std::string cache_key =
-      GenerateBroadcastCacheKey(input_shape, output_shape, broadcast_dims, element_type);
-
-  // Check cache
-  {
-    std::lock_guard<std::mutex> lock(g_mlir_cache_mutex);
-    auto it = g_mlir_cache.find(cache_key);
-    if (it != g_mlir_cache.end()) {
-      TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast: Cache HIT", "cache_key=", cache_key);
-      return it->second;
-    }
-  }
-
-  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast: Cache MISS", "cache_key=", cache_key);
-
-  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast: Preparing to build MLIR",
-                      "input_shape=", input_shape, "output_shape=", output_shape,
-                      "broadcast_dims=", broadcast_dims,
-                      "broadcast_dims.size()=", broadcast_dims.size(),
-                      "input_rank=", input_shape.size(), "output_rank=", output_shape.size());
-
-  try {
-    // Create BroadcastOpBuilder to generate MLIR
-    torch_neuronx::BroadcastOpBuilder builder(input_shape, output_shape, broadcast_dims,
-                                              element_type, true /* enable_verification */);
-
-    // Build and get MLIR module
-    auto mlir_module = builder.build();
-
-    // Convert MLIR module to string
-    std::string result = torch_neuronx::stablehlo_utils::moduleToString(mlir_module.get());
-
-    // Store in cache
-    {
-      std::lock_guard<std::mutex> lock(g_mlir_cache_mutex);
-      g_mlir_cache[cache_key] = result;
-      TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast: Cached MLIR", "cache_key=", cache_key,
-                          "cache_size=", g_mlir_cache.size());
-    }
-
-    TORCH_NEURONX_DEBUG("MlirGenerators::GenerateBroadcast: Successfully generated MLIR");
-
-    return result;
-  } catch (const std::exception& e) {
-    TORCH_NEURONX_DEBUG("Failed to generate broadcast MLIR", "error=", e.what());
     throw;
   }
 }

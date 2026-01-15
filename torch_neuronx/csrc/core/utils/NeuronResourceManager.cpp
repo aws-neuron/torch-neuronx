@@ -174,28 +174,6 @@ ResourceSemaphore& NeuronResourceManager::GetResourceSemaphore() {
   return *resource_semaphore_;
 }
 
-NeuronResourceManager::ResourceStats NeuronResourceManager::GetResourceStats() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  ResourceStats stats{};
-
-  // Get compilation cache statistics
-  if (compilation_cache_) {
-    try {
-      auto cache_entries = compilation_cache_->GetCacheEntries();
-      stats.compilation_cache_size = cache_entries.size();
-      // Estimate memory usage based on entry count (rough estimate)
-      stats.compilation_cache_memory = cache_entries.size() * 1024;
-    } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Failed to get compilation cache stats", "error=", e.what());
-      stats.compilation_cache_size = 0;
-      stats.compilation_cache_memory = 0;
-    }
-  }
-
-  return stats;
-}
-
 int NeuronResourceManager::GetMaxResourceSlots() {
   const char* env_value = std::getenv("NEURON_MAX_RESOURCE_SLOTS");
   if (env_value) {

@@ -106,7 +106,7 @@ class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
             self.assertEqual(comm_mode.get_total_counts(), 0)
             self.assertTrue(dist_out.placements[0].is_shard(dim=1))
             self.assertEqual(dist_out.full_tensor(), out)
-        assert_op_runs_on_neuron("aten::scaled_dot_product_attention")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
 
         out.sum().backward()
         with comm_mode, track_neuron_ops():

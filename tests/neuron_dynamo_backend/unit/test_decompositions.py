@@ -4,6 +4,7 @@
 Unit tests for neuron_dynamo_backend decompositions module
 """
 
+import itertools
 import math
 from unittest.mock import MagicMock, patch
 
@@ -18,42 +19,29 @@ from torch_neuronx.neuron_dynamo_backend import decompositions
 class TestDecompositionTable:
     """Test decomposition table functionality"""
 
-    def test_get_custom_decomposition_table(self):
-        """Test that custom decomposition table contains expected entries"""
-        custom_table = decompositions.get_custom_decomposition_table()
-
-        # Check that it returns a dictionary
-        assert isinstance(custom_table, dict)
+    def test_neuron_decompositions_contains_expected_entries(self):
+        """Test that neuron_decompositions contains expected entries"""
+        # Check that it's a dictionary
+        assert isinstance(decompositions.neuron_decompositions, dict)
 
         # Check that specific ops are in the table
-        assert torch.ops.aten.as_strided.default in custom_table
-        assert torch.ops.aten.scalar_tensor.default in custom_table
+        assert torch.ops.aten.as_strided.default in decompositions.neuron_decompositions
+        assert torch.ops.aten.scalar_tensor.default in decompositions.neuron_decompositions
+        assert torch.ops.aten.index_copy.default in decompositions.neuron_decompositions
 
         # Verify the functions are callable
-        assert callable(custom_table[torch.ops.aten.as_strided.default])
-        assert callable(custom_table[torch.ops.aten.scalar_tensor.default])
+        assert callable(decompositions.neuron_decompositions[torch.ops.aten.as_strided.default])
+        assert callable(decompositions.neuron_decompositions[torch.ops.aten.scalar_tensor.default])
 
     def test_get_decomposition_table_selective(self):
         """Test selective decomposition table includes only specified ops"""
-        decomp_table = decompositions.get_decomposition_table(decompose_all=False)
+        decomp_table = decompositions.get_decomposition_table()
 
         # Should contain our custom decompositions
         assert torch.ops.aten.as_strided.default in decomp_table
 
-        # Should be smaller than the full table
-        full_table = decomposition_table
-        assert len(decomp_table) <= len(full_table)
-
-    def test_get_decomposition_table_all(self):
-        """Test that decompose_all=True includes standard decompositions"""
-        decomp_table = decompositions.get_decomposition_table(decompose_all=True)
-
-        # Should contain our custom decompositions
-        assert torch.ops.aten.as_strided.default in decomp_table
-
-        # Should be at least as large as custom table
-        custom_table = decompositions.get_custom_decomposition_table()
-        assert len(decomp_table) >= len(custom_table)
+        # Should be the same as neuron_decompositions
+        assert decomp_table is decompositions.neuron_decompositions
 
 
 class TestCustomAsStridedDecomposition:
@@ -69,9 +57,7 @@ class TestCustomAsStridedDecomposition:
         stride = (4, 1)  # Skip every 4 elements for first dim, contiguous for second
         storage_offset = 0
 
-        result = decompositions.custom_as_strided_decomposition(
-            input_tensor, size, stride, storage_offset
-        )
+        result = decompositions.as_strided(input_tensor, size, stride, storage_offset)
 
         # Verify output shape
         assert result.shape == size
@@ -88,9 +74,7 @@ class TestCustomAsStridedDecomposition:
         stride = (2, 1)
         storage_offset = 1
 
-        result = decompositions.custom_as_strided_decomposition(
-            input_tensor, size, stride, storage_offset
-        )
+        result = decompositions.as_strided(input_tensor, size, stride, storage_offset)
 
         expected = torch.as_strided(input_tensor, size, stride, storage_offset)
         torch.testing.assert_close(result, expected)
@@ -103,9 +87,7 @@ class TestCustomAsStridedDecomposition:
         stride = (12, 4, 2)  # Original strides: (12, 4, 1), skip every other element in last dim
         storage_offset = 0
 
-        result = decompositions.custom_as_strided_decomposition(
-            input_tensor, size, stride, storage_offset
-        )
+        result = decompositions.as_strided(input_tensor, size, stride, storage_offset)
 
         expected = torch.as_strided(input_tensor, size, stride, storage_offset)
         torch.testing.assert_close(result, expected)
@@ -223,7 +205,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(2, 3, dtype=dtype)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -251,7 +233,7 @@ class TestIndexCopyDecomposition:
         source_shape[dim] = idx_size
         source = torch.ones(source_shape)
 
-        result = decompositions.index_copy_decomposition(input_tensor, dim, index, source)
+        result = decompositions.index_copy(input_tensor, dim, index, source)
         expected = input_tensor.index_copy(dim, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -263,7 +245,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.tensor([[float("nan"), 1.0, 2.0], [3.0, float("nan"), 5.0]])
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         # Use equal for NaN comparison
@@ -278,7 +260,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.tensor([[float("inf"), 1.0, float("-inf")], [3.0, 4.0, 5.0]])
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -289,7 +271,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1])
         source = torch.tensor([[99.0, 99.0]])
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         assert torch.isnan(result[0, 0]) and torch.isnan(expected[0, 0])
@@ -304,7 +286,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2]).to("neuron")
         source = torch.ones(2, 3).to("neuron")
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = torch.zeros(4, 3).index_copy(0, torch.tensor([0, 2]), torch.ones(2, 3))
 
         torch.testing.assert_close(result.to("cpu"), expected)
@@ -317,7 +299,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2]).to("neuron")
         source = torch.ones(2, 3, dtype=dtype).to("neuron")
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = torch.zeros(4, 3, dtype=dtype).index_copy(
             0, torch.tensor([0, 2]), torch.ones(2, 3, dtype=dtype)
         )
@@ -331,7 +313,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2, 4])
         source = torch.tensor([1.0, 2.0, 3.0])
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -342,7 +324,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(2, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -353,7 +335,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1, 3])
         source = torch.ones(3, 2)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 1, index, source)
+        result = decompositions.index_copy(input_tensor, 1, index, source)
         expected = input_tensor.index_copy(1, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -364,7 +346,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1, 3])
         source = torch.ones(2, 2, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 1, index, source)
+        result = decompositions.index_copy(input_tensor, 1, index, source)
         expected = input_tensor.index_copy(1, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -376,7 +358,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(3, 2)
 
-        result = decompositions.index_copy_decomposition(input_tensor, -1, index, source)
+        result = decompositions.index_copy(input_tensor, -1, index, source)
         expected = input_tensor.index_copy(-1, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -387,7 +369,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1, 3])
         source = torch.ones(2, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, -2, index, source)
+        result = decompositions.index_copy(input_tensor, -2, index, source)
         expected = input_tensor.index_copy(-2, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -399,7 +381,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(2, 3, dtype=torch.float64)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -410,7 +392,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(2, 3, dtype=torch.int32)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -422,7 +404,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([2])
         source = torch.ones(1, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -433,7 +415,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 1, 2])
         source = torch.ones(3, 4) * 5
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -444,7 +426,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([5, 1, 3])  # Out of order
         source = torch.arange(9, dtype=torch.float32).reshape(3, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -455,7 +437,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2])
         source = torch.ones(2, 2, 3, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 1, index, source)
+        result = decompositions.index_copy(input_tensor, 1, index, source)
         expected = input_tensor.index_copy(1, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -466,7 +448,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1])
         source = torch.ones(1, 3) * 99
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -482,7 +464,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 2, 4])
         source = torch.randn(3, 4, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 0, index, source)
+        result = decompositions.index_copy(input_tensor, 0, index, source)
         expected = input_tensor.index_copy(0, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -493,7 +475,7 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([1, 4])
         source = torch.ones(2, 2, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 1, index, source)
+        result = decompositions.index_copy(input_tensor, 1, index, source)
         expected = input_tensor.index_copy(1, index, source)
 
         torch.testing.assert_close(result, expected)
@@ -504,7 +486,122 @@ class TestIndexCopyDecomposition:
         index = torch.tensor([0, 3, 5])
         source = torch.ones(2, 3, 3)
 
-        result = decompositions.index_copy_decomposition(input_tensor, 2, index, source)
+        result = decompositions.index_copy(input_tensor, 2, index, source)
         expected = input_tensor.index_copy(2, index, source)
 
         torch.testing.assert_close(result, expected)
+
+
+class TestLinearBackwardDecomposition:
+    """Comprehensive tests for linear_backward decomposition"""
+
+    def _compute_reference_gradients(self, input_, weight_, grad_output_, output_mask):
+        """Compute reference gradients using PyTorch autograd for comparison"""
+        input_copy = input_.detach().clone().requires_grad_(output_mask[0])
+        weight_copy = weight_.detach().clone().requires_grad_(output_mask[1])
+        if output_mask[2]:
+            bias_copy = torch.zeros(
+                weight_.shape[0], device=weight_.device, dtype=weight_.dtype
+            ).requires_grad_(True)
+            output = torch.nn.functional.linear(input_copy, weight_copy, bias_copy)
+        else:
+            bias_copy = None
+            output = torch.nn.functional.linear(input_copy, weight_copy)
+        output.backward(grad_output_)
+        grad_input = input_copy.grad if output_mask[0] else None
+        grad_weight = weight_copy.grad if output_mask[1] else None
+        grad_bias = bias_copy.grad if output_mask[2] else None
+        return grad_input, grad_weight, grad_bias
+
+    def test_linear_backward_basic_functionality(self):
+        """Test basic linear backward decomposition functionality"""
+        torch.manual_seed(1)
+        batch_size, in_features, out_features = 3, 4, 5
+        input_ = torch.randn(batch_size, in_features)
+        weight_ = torch.randn(out_features, in_features)
+        grad_output_ = torch.randn(batch_size, out_features)
+        output_mask = [True, True, True]
+        result_grad_input, result_grad_weight, result_grad_bias = (
+            decompositions.linear_backward_decomposition(input_, grad_output_, weight_, output_mask)
+        )
+        ref_grad_input, ref_grad_weight, ref_grad_bias = self._compute_reference_gradients(
+            input_, weight_, grad_output_, output_mask
+        )
+
+        assert result_grad_input.shape == input_.shape
+        assert result_grad_weight.shape == weight_.shape
+        assert result_grad_bias.shape == (out_features,)
+        torch.testing.assert_close(result_grad_input, ref_grad_input, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(result_grad_weight, ref_grad_weight, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(result_grad_bias, ref_grad_bias, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "output_mask",
+        list(itertools.product([True, False], [True, False], [True, False])),
+    )
+    def test_linear_backward_output_mask_combinations(self, output_mask):
+        """Test different output_mask combinations"""
+        torch.manual_seed(1)
+        batch_size, in_features, out_features = 2, 3, 4
+        input_ = torch.randn(batch_size, in_features)
+        weight_ = torch.randn(out_features, in_features)
+        grad_output_ = torch.randn(batch_size, out_features)
+        result_grad_input, result_grad_weight, result_grad_bias = (
+            decompositions.linear_backward_decomposition(input_, grad_output_, weight_, output_mask)
+        )
+        if not output_mask[0]:
+            assert result_grad_input is None
+        else:
+            assert result_grad_input is not None
+            assert result_grad_input.shape == input_.shape
+        if not output_mask[1]:
+            assert result_grad_weight is None
+        else:
+            assert result_grad_weight is not None
+            assert result_grad_weight.shape == weight_.shape
+        if not output_mask[2]:
+            assert result_grad_bias is None
+        else:
+            assert result_grad_bias is not None
+            assert result_grad_bias.shape == (out_features,)
+
+    @pytest.mark.parametrize(
+        "dtype,rtol,atol",
+        [
+            (torch.float32, 1e-4, 1e-4),
+            (torch.float16, 1e-2, 1e-2),
+            (torch.bfloat16, 1e-2, 1e-2),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "input_shape,weight_shape,grad_output_shape",
+        [
+            ((4,), (5, 4), (5,)),  # 1D input
+            ((3, 4), (5, 4), (3, 5)),  # Basic 2D
+            ((2, 3, 4), (5, 4), (2, 3, 5)),  # 3D input
+            ((1, 2, 3, 4), (5, 4), (1, 2, 3, 5)),  # 4D input
+        ],
+    )
+    def test_linear_backward_dtypes_shapes(
+        self, dtype, rtol, atol, input_shape, weight_shape, grad_output_shape
+    ):
+        """Test linear backward with various tensor shapes"""
+        torch.manual_seed(1)
+        input_ = torch.randn(input_shape, dtype=dtype)
+        weight_ = torch.randn(weight_shape, dtype=dtype)
+        grad_output_ = torch.randn(grad_output_shape, dtype=dtype)
+        output_mask = [True, True, True]
+
+        result_grad_input, result_grad_weight, result_grad_bias = (
+            decompositions.linear_backward_decomposition(input_, grad_output_, weight_, output_mask)
+        )
+        ref_grad_input, ref_grad_weight, ref_grad_bias = self._compute_reference_gradients(
+            input_, weight_, grad_output_, output_mask
+        )
+
+        assert result_grad_input.shape == input_shape
+        assert result_grad_weight.shape == weight_shape
+        assert result_grad_bias.shape == (grad_output_shape[-1],)
+        torch.testing.assert_close(result_grad_input, ref_grad_input, rtol=rtol, atol=atol)
+        torch.testing.assert_close(result_grad_weight, ref_grad_weight, rtol=rtol, atol=atol)
+        torch.testing.assert_close(result_grad_bias, ref_grad_bias, rtol=rtol, atol=atol)

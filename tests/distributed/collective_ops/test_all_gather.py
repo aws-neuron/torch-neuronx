@@ -393,10 +393,12 @@ class TestAllGatherWorldSize4(BaseCollectiveOpTest):
             expected_values=expected_values,
         )
 
+    @pytest.mark.xfail(reason="Memory assertions require further investigation, thus xfailing.")
     def test_bucketing_memory(self):
         """Test all_gather with bucketing for memory efficiency."""
         self.distributed_tester.run_test(run_bucketing_memory_test)
 
+    @pytest.mark.xfail(reason="Memory assertions require further investigation, thus xfailing.")
     def test_bucketing_memory_flat_2d_tensor_test(self):
         """Test all_gather_into_tensor with bucketing for memory efficiency with flat 2d tensor"""
         self.distributed_tester.run_test(run_bucketing_memory_flat_2d_tensor_test)

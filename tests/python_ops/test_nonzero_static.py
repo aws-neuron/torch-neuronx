@@ -36,7 +36,8 @@ class TestNonzeroStatic:
             assert_op_runs_on_neuron("aten::nonzero_static")
 
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
         reason="Need to update the op logging for sync mode for short-circuited tests",
     )
     def test_nonzero_static_all_zeros(self, device):

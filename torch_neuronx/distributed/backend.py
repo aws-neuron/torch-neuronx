@@ -697,7 +697,6 @@ class ProcessGroupNeuron(ProcessGroup):
             input_tensor, reduce_scatter_options.reduceOp
         )
         world_size = len(replica_groups[0])
-        reduce_type = get_reduce_type(reduce_scatter_options.reduceOp)
         input_bytes = input_tensor.numel() * input_tensor.element_size()
 
         if _USE_SPLIT_REDUCE_SCATTER and input_bytes > _COLLECTIVE_BUCKETSIZE_BYTES:
@@ -785,6 +784,9 @@ class ProcessGroupNeuron(ProcessGroup):
         reduce_type = get_reduce_type(opts.reduceOp)
         non_empty_inputs, non_empty_outputs = _filter_empty_tensors(inputs, outputs)
         if len(non_empty_inputs) == 0:
+            return _ret_work(outputs)
+        if len(non_empty_inputs) == 1:
+            self._reduce_scatter_base(non_empty_outputs[0], non_empty_inputs[0], opts)
             return _ret_work(outputs)
 
         # Validate shape compatibility

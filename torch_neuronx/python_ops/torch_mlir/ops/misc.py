@@ -5,15 +5,26 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::embedding"])
+@register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
 def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
-    return torch.embedding(weights, indices, padding_idx, scale_grad_by_freq, sparse)
+    return torch.embedding(
+        weights, indices, padding_idx=padding_idx, scale_grad_by_freq=False, sparse=sparse
+    )
 
 
-@register_aten(["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"])
+@register_aten(
+    ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
+    static_argnums=(2, 3, 4),
+)
 def torch_embedding_dense_backward(
     grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
 ):
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(
+            "Expected tensor for argument #2 'indices' to have one of the following "
+            "scalar types: Long, Int; but got torch.FloatTensor instead "
+            "(while checking arguments for embedding_backward)"
+        )
     return torch.ops.aten.embedding_dense_backward(
         grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
     )
@@ -84,7 +95,7 @@ def torch_histc(
     range_min = min - 0.5 if min == max else min
     range_max = max + 0.5 if min == max else max
 
-    def efficient_histc(input, bins, range_min, range_max):
+    def efficient_histc(input, bins, range_min, range_max, out=None):
         data = input.flatten()
         # Linear interpolation
         bin_idx = ((data - range_min) * bins / (range_max - range_min)).to(torch.int32)
@@ -99,7 +110,11 @@ def torch_histc(
         counts = valid_matches.sum(dim=0, dtype=input.dtype)
         return counts
 
-    return efficient_histc, (input,), {"bins": bins, "range_min": range_min, "range_max": range_max}
+    return (
+        efficient_histc,
+        (input,),
+        {"bins": bins, "range_min": range_min, "range_max": range_max, "out": out},
+    )
 
 
 @register_aten(["aten::reflection_pad2d"])
@@ -110,3 +125,65 @@ def torch_reflection_pad2d(x, padding):
 @register_aten(["aten::replication_pad2d", "aten::replication_pad2d.out"])
 def torch_replication_pad2d(x, padding):
     return torch.nn.functional.pad(x, padding, mode="replicate")
+
+
+@register_aten(
+    ["aten::_scaled_dot_product_fused_attention_overrideable"], static_argnums=(4, 5, 6, 7)
+)
+def torch_sdpa_overridable(
+    query,
+    key,
+    value,
+    attn_bias=None,
+    dropout_p=0.0,
+    is_causal=False,
+    return_debug_mask=False,
+    scale=None,
+):
+    return torch.ops.aten._scaled_dot_product_fused_attention_overrideable(
+        query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale=scale
+    )
+
+
+@register_aten(
+    ["aten::_scaled_dot_product_fused_attention_overrideable_backward"],
+    static_argnums=(5, 10, 11, 12, 13, 16),
+)
+def torch_sdpa_overridable_backward(
+    grad_out,
+    query,
+    key,
+    value,
+    attn_bias,
+    grad_input_mask,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    scale=None,
+):
+    return torch.ops.aten._scaled_dot_product_fused_attention_overrideable_backward(
+        grad_out,
+        query,
+        key,
+        value,
+        attn_bias,
+        grad_input_mask,
+        out,
+        logsumexp,
+        cum_seq_q,
+        cum_seq_k,
+        max_q,
+        max_k,
+        dropout_p,
+        is_causal,
+        philox_seed,
+        philox_offset,
+        scale=scale,
+    )

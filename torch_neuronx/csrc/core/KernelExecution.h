@@ -378,8 +378,14 @@ class WriteDirectKernelExecution
     : public NeuronKernelExecutionTyped<KernelTypeEnum::kWrite, c10::DeviceType::CPU,
                                         c10::DeviceType::PrivateUse1> {
  public:
+  // Default write primitive
   WriteDirectKernelExecution(const std::string& op_name, void* src_ptr, void* dst_ptr,
                              size_t dst_offset_bytes, size_t dst_size_bytes, int device_id);
+
+  // Scalar-specific source buffer for write primitive
+  WriteDirectKernelExecution(const std::string& op_name, const c10::Scalar& scalar_value,
+                             void* dst_ptr, size_t dst_offset_bytes, c10::ScalarType dtype,
+                             int device_id);
 
   void Execute() const override;
 
@@ -389,6 +395,7 @@ class WriteDirectKernelExecution
  private:
   size_t dst_offset_bytes_;
   size_t dst_size_bytes_;
+  alignas(16) uint8_t inline_buffer_[16] = {};  // 16 bytes for complex128
 };
 
 class ReadDirectKernelExecution

@@ -264,6 +264,16 @@ def get_raw_torch_path(model_name: str | None = None) -> Path:
     return raw_dir / filename
 
 
+def get_err_mlir_path() -> Path:
+    base_dir = get_artifacts_directory()
+    rank = get_rank()
+    err_dir = base_dir / "torch_mlir_error" / f"proc_{rank}"
+    err_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = get_current_timestamp()
+    filename = f"{get_model_name().lower()}_{timestamp}.mlir"
+    return err_dir / filename
+
+
 def get_transformed_fx_path(model_name: str | None = None) -> Path:
     """
     Get the path for saving transformed fx graph artifacts (after collective transforms)

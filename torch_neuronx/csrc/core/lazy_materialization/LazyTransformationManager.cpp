@@ -54,85 +54,37 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
   TORCH_NEURONX_DEBUG("ProcessPrologueWithMlirMerge: Merging prologue with operation",
                       "op=", op_name);
 
-  /**
-   * Brief: Dummy Addresses are used in place of real addresses to ensure robust merge of
-   * modules in case inputs are repeated, which can cause dependency errors in
-   * OpConcatUtils merge APIs.
-   * **/
+  // Create slot vectors - each element's address serves as a unique identifier for merge API
+  // This replaces the old dummy address ranges with natural object addresses
+  size_t num_inputs = original_input_ptrs.size();
+  size_t num_outputs = original_output_ptrs.size();
 
-  // Define dummy address ranges to prevent collisions
-  // Each range can hold up to MAX_ADDRESSES_PER_RANGE addresses
-  const uintptr_t MAX_ADDRESSES_PER_RANGE = 0x10000;                  // 65536 addresses per range
-  const uintptr_t PROLOGUE_INPUT_BASE = 0 * MAX_ADDRESSES_PER_RANGE;  // Range 0: [0x00000, 0x10000)
-  const uintptr_t PROLOGUE_OUTPUT_BASE =
-      1 * MAX_ADDRESSES_PER_RANGE;                                  // Range 1: [0x10000, 0x20000)
-  const uintptr_t DIRECT_INPUT_BASE = 2 * MAX_ADDRESSES_PER_RANGE;  // Range 2: [0x20000, 0x30000)
-  const uintptr_t OPERATION_OUTPUT_BASE =
-      3 * MAX_ADDRESSES_PER_RANGE;  // Range 3: [0x30000, 0x40000)
+  std::vector<size_t> prologue_input_slots(num_inputs);
+  std::vector<size_t> prologue_output_slots(num_inputs);
+  std::vector<size_t> operation_input_slots(num_inputs);
+  std::vector<size_t> operation_output_slots(num_outputs);
 
-  // Assertions to ensure we don't exceed address range limits
-  TORCH_CHECK(original_input_ptrs.size() < MAX_ADDRESSES_PER_RANGE, "Too many operation inputs (",
-              original_input_ptrs.size(), ") - exceeds maximum of ", MAX_ADDRESSES_PER_RANGE - 1,
-              " for operation: ", op_name);
+  // Build address vectors from slot objects
+  std::vector<void*> prologue_input_addrs, prologue_output_addrs;
+  std::vector<void*> operation_input_addrs, operation_output_addrs;
 
-  TORCH_CHECK(original_output_ptrs.size() < MAX_ADDRESSES_PER_RANGE, "Too many operation outputs (",
-              original_output_ptrs.size(), ") - exceeds maximum of ", MAX_ADDRESSES_PER_RANGE - 1,
-              " for operation: ", op_name);
-
-  // Build mapping from original input index to prologue index
-  std::map<size_t, size_t> input_to_prologue_idx;
-  for (size_t i = 0; i < prologue_result.tasks.size(); ++i) {
-    size_t input_idx = prologue_result.tasks[i].input_index;
-    input_to_prologue_idx[input_idx] = i;
+  for (size_t i = 0; i < num_inputs; ++i) {
+    prologue_input_addrs.push_back(&prologue_input_slots[i]);
+    prologue_output_addrs.push_back(&prologue_output_slots[i]);
+    // Operation inputs connect to prologue outputs (same slot = data flows through)
+    operation_input_addrs.push_back(&prologue_output_slots[i]);
+  }
+  for (size_t i = 0; i < num_outputs; ++i) {
+    operation_output_addrs.push_back(&operation_output_slots[i]);
   }
 
-  // With order conservation, prologue inputs/outputs have same count as original inputs
-  // Step 1: Prologue inputs - dummy addresses [0x0, 0x1, 0x2, ...]
-  std::vector<void*> dummy_prologue_input_addrs;
-  for (size_t i = 0; i < original_input_ptrs.size(); ++i) {
-    dummy_prologue_input_addrs.push_back(reinterpret_cast<void*>(PROLOGUE_INPUT_BASE + i));
-  }
-
-  // Step 2: Prologue outputs - dummy addresses [0x10000, 0x10001, 0x10002, ...]
-  // With order conservation, prologue has same number of outputs as inputs
-  std::vector<void*> dummy_prologue_output_addrs;
-  for (size_t i = 0; i < original_input_ptrs.size(); ++i) {
-    dummy_prologue_output_addrs.push_back(reinterpret_cast<void*>(PROLOGUE_OUTPUT_BASE + i));
-  }
-
-  // Step 3: Operation inputs - hybrid dummy addresses
-  // Transformed inputs use prologue outputs [0x10000+idx]
-  // Non-transformed inputs use direct range [0x20000+i]
-  std::vector<void*> dummy_operation_input_addrs;
-  for (size_t i = 0; i < original_input_ptrs.size(); ++i) {
-    auto it = input_to_prologue_idx.find(i);
-    if (it != input_to_prologue_idx.end()) {
-      // Transformed: consume prologue output
-      size_t prologue_idx = it->second;
-      dummy_operation_input_addrs.push_back(
-          reinterpret_cast<void*>(PROLOGUE_OUTPUT_BASE + prologue_idx));
-    } else {
-      // Non-transformed: use separate direct range
-      dummy_operation_input_addrs.push_back(reinterpret_cast<void*>(DIRECT_INPUT_BASE + i));
-    }
-  }
-
-  // Step 4: Operation outputs - use dummy addresses [0x30000, 0x30001, 0x30002, ...]
-  std::vector<void*> dummy_operation_output_addrs;
-  for (size_t i = 0; i < original_output_ptrs.size(); ++i) {
-    dummy_operation_output_addrs.push_back(reinterpret_cast<void*>(OPERATION_OUTPUT_BASE + i));
-  }
-
-  // Perform merge using explicit dummy addresses with mapping capture
+  // Perform merge using slot addresses
   torch_neuronx::MergeMapping final_merge_mapping;
   std::string merged_mlir = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
-      prologue_result.prologue_mlir_str, original_mlir_str, dummy_prologue_input_addrs,
-      dummy_prologue_output_addrs, dummy_operation_input_addrs, dummy_operation_output_addrs,
-      &final_merge_mapping);
+      prologue_result.prologue_mlir_str, original_mlir_str, prologue_input_addrs,
+      prologue_output_addrs, operation_input_addrs, operation_output_addrs, &final_merge_mapping);
 
-  TORCH_CHECK(!merged_mlir.empty(),
-              "Failed to merge prologue with operation using dummy addresses for operation '",
-              op_name, "'");
+  TORCH_CHECK(!merged_mlir.empty(), "Failed to merge prologue with operation for '", op_name, "'");
 
   // With NONE transformations, every input has a transformation task, so input order is conserved.
   // Assert this invariant and use original pointers directly.

@@ -14,112 +14,6 @@ from torch_neuronx.utils import is_sync_mode_enabled
 
 
 @contextmanager
-def temporary_dump_directory():
-    """Create a temporary directory for torch_neuronx dumps and set the environment variable.
-
-    This ensures each test run has its own dump directory and doesn't collide with
-    other processes.
-
-    Yields:
-        str: Path to the temporary dump directory
-    """
-    # Save original env var if it exists
-    original_dump_dir = os.environ.get("TORCH_NEURONX_DUMP")
-
-    # Create temporary directory
-    temp_dir = tempfile.mkdtemp(prefix="torch_neuronx_dump_test_")
-
-    try:
-        # Set the environment variable
-        os.environ["TORCH_NEURONX_DUMP"] = temp_dir
-        yield temp_dir
-    finally:
-        # Restore original env var
-        if original_dump_dir is not None:
-            os.environ["TORCH_NEURONX_DUMP"] = original_dump_dir
-        else:
-            os.environ.pop("TORCH_NEURONX_DUMP", None)
-
-        # Clean up temp directory
-        import shutil
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def check_neuron_execution(dump_dir: str, op_name: str) -> tuple[bool, str]:
-    """Check if an operation executed on Neuron device vs CPU fallback.
-
-    Args:
-        dump_dir: Path to the torch_neuronx dump directory
-        op_name: Name of the operation to check (e.g., "scaled_dot_product_attention")
-
-    Returns:
-        Tuple of (success: bool, message: str)
-        - success is True if the op ran on Neuron (not offloaded)
-        - message describes what was found
-    """
-    import glob
-
-    # Find subdirectories in dump_dir (there should be one per process/run)
-    dump_subdirs = glob.glob(os.path.join(dump_dir, "*"))
-
-    if not dump_subdirs:
-        return False, f"No dump directories found in {dump_dir}"
-
-    # Use the most recent dump directory
-    latest_dump = max(dump_subdirs, key=os.path.getctime)
-
-    # Check used_ops.txt (not used_neuron_ops.txt)
-    used_ops_file = os.path.join(latest_dump, "used_ops.txt")
-    used_ops_content = ""
-    if os.path.exists(used_ops_file):
-        with open(used_ops_file) as f:
-            used_ops_content = f.read()
-
-    # Check offloaded_ops.txt
-    offloaded_ops_file = os.path.join(latest_dump, "offloaded_ops.txt")
-    offloaded_ops_content = ""
-    if os.path.exists(offloaded_ops_file):
-        with open(offloaded_ops_file) as f:
-            offloaded_ops_content = f.read()
-
-    # Check if op is in used_neuron_ops
-    op_in_used = op_name in used_ops_content
-    # Check if op is in offloaded_ops
-    op_in_offloaded = op_name in offloaded_ops_content
-
-    # Determine success and message
-    if op_in_offloaded:
-        return False, f"❌ {op_name} found in offloaded_ops.txt (running on CPU!)"
-    elif op_in_used:
-        return True, f"✓ {op_name} found in used_ops.txt (running on Neuron)"
-    elif not os.path.exists(used_ops_file) and not os.path.exists(offloaded_ops_file):
-        return False, f"⚠ No ops tracking files found in {latest_dump}"
-    else:
-        # Op not found in either file
-        # Check if any related ops are present
-        if "nki_" in used_ops_content:
-            # NKI kernels are logged with nki_ prefix
-            return True, "✓ NKI kernel execution detected (op may be part of NKI kernel)"
-        return False, f"⚠ {op_name} not found in either used_ops.txt or offloaded_ops.txt"
-
-
-def assert_runs_on_neuron(dump_dir: str, op_name: str):
-    """Assert that an operation runs on Neuron device (not CPU fallback).
-
-    Args:
-        dump_dir: Path to the torch_neuronx dump directory
-        op_name: Name of the operation to check
-
-    Raises:
-        AssertionError: If the operation doesn't run on Neuron
-    """
-    success, message = check_neuron_execution(dump_dir, op_name)
-    print(message)
-    assert success, f"Operation {op_name} did not run on Neuron: {message}"
-
-
-@contextmanager
 def track_neuron_ops():
     """Context manager that tracks operations executed within its scope.
 
@@ -216,9 +110,12 @@ def assert_op_runs_on_neuron(op_name: str):
     Raises:
         AssertionError: If the operation didn't run on Neuron
     """
-    ran_on_neuron, _, _ = check_op_runs_on_neuron(op_name)
+    ran_on_neuron, executed_ops, fallback_ops = check_op_runs_on_neuron(op_name)
     if not ran_on_neuron:
-        raise AssertionError(f"Operation {op_name} did not run on Neuron")
+        raise AssertionError(
+            f"Operation {op_name} did not run on Neuron.\n"
+            f"Executed: {executed_ops}\nFallback: {fallback_ops}"
+        )
 
 
 def get_executed_op_list() -> dict:

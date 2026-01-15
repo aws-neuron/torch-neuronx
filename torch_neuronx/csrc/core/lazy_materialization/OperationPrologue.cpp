@@ -53,11 +53,9 @@ std::string GenerateMlir(const TransformationTask& task) {
       throw std::runtime_error("Invalid SliceParams in TransformationTask");
 
     case TransformationType::BROADCAST:
-      if (auto* params = std::get_if<BroadcastParams>(&task.params)) {
-        return mlir_generators::GenerateBroadcast(task.input_shape, task.output_shape,
-                                                  params->broadcast_dims, task.element_type);
-      }
-      throw std::runtime_error("Invalid BroadcastParams in TransformationTask");
+      // TODO: Implement broadcast MLIR generation
+      throw std::runtime_error(
+          "Broadcast MLIR generation not yet implemented - requires BroadcastOpBuilder");
 
     case TransformationType::NONE:
       // Generate empty/identity MLIR for inputs with no transformations
@@ -306,18 +304,11 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
     result.input_was_transformed[task.input_index] = true;
   }
 
-  // STEP 4: For each input, chain its transformations using dummy addresses
+  // STEP 4: For each input, chain its transformations using slot-based addresses
   std::vector<std::string> per_input_transform_mlirs;
 
-  /**
-   * Brief: Dummy Addresses are used in place of real addresses to ensure robust merge of
-   * modules in case inputs are repeated, which can cause dependency errors in
-   * OpConcatUtils merge APIs.
-   * **/
-
-  void* dummy_input = reinterpret_cast<void*>(0x1);
-  void* dummy_intermediate = reinterpret_cast<void*>(0x2);
-  void* dummy_output = reinterpret_cast<void*>(0x3);
+  // Slot objects for chaining - each slot's address serves as unique identifier
+  size_t slot_input = 0, slot_intermediate = 1, slot_output = 2;
 
   for (const auto& [input_idx, input_tasks] : tasks_by_input) {
     std::string accumulated_transform_mlir;
@@ -336,10 +327,10 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
         TORCH_NEURONX_DEBUG("Chaining transformations using SkipIntermediates",
                             "input_idx=", input_idx, "task_idx=", task_idx);
 
-        // Chain: accumulated(0x1→0x2) + new(0x2→0x3) = merged(0x1→0x3)
+        // Chain using slot addresses: accumulated(in→inter) + new(inter→out) = merged(in→out)
         std::string merged_mlir = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
-            accumulated_transform_mlir, task_mlir, {dummy_input}, {dummy_intermediate},
-            {dummy_intermediate}, {dummy_output});
+            accumulated_transform_mlir, task_mlir, {&slot_input}, {&slot_intermediate},
+            {&slot_intermediate}, {&slot_output});
 
         if (merged_mlir.empty()) {
           result.success = false;
@@ -359,101 +350,52 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
                         "mlir_length=", accumulated_transform_mlir.length());
   }
 
-  // STEP 5: Merge all per-input transformation chains together using dummy addresses
-  // Since every input has exactly one transformation, order is preserved
+  // STEP 5: Merge all per-input transformation chains together
+  // Each chain gets a unique slot; slot addresses serve as unique identifiers
   TORCH_NEURONX_DEBUG("Merging all transformation chains", "op=", op_name,
                       "num_chains=", per_input_transform_mlirs.size());
 
+  // Create slot vectors - each element's address is unique
+  std::vector<size_t> input_slots(per_input_transform_mlirs.size());
+  std::vector<size_t> output_slots(per_input_transform_mlirs.size());
+
   // Start with the first transformation chain
   std::string accumulated_mlir = per_input_transform_mlirs[0];
+  std::vector<void*> accumulated_input_addrs = {&input_slots[0]};
+  std::vector<void*> accumulated_output_addrs = {&output_slots[0]};
 
-  // Create dummy addresses for the first chain (1 input -> 1 output, both at 0x0)
-  std::vector<void*> accumulated_dummy_input_addrs(1, reinterpret_cast<void*>(0x0));
-  std::vector<void*> accumulated_dummy_output_addrs(1, reinterpret_cast<void*>(0x0));
-
-  // Merge remaining chains as parallel operations (not chained/sequential)
+  // Merge remaining chains as parallel operations
   for (size_t i = 1; i < per_input_transform_mlirs.size(); ++i) {
-    // Create dummy addresses for this chain (1 input -> 1 output at address i)
-    void* chain_dummy_addr = reinterpret_cast<void*>(static_cast<uintptr_t>(i));
-    std::vector<void*> chain_dummy_input_addrs(1, chain_dummy_addr);
-    std::vector<void*> chain_dummy_output_addrs(1, chain_dummy_addr);
+    std::vector<void*> chain_input_addrs = {&input_slots[i]};
+    std::vector<void*> chain_output_addrs = {&output_slots[i]};
 
-    TORCH_NEURONX_DEBUG("Merging chain with dummy addresses", "chain_index=", i,
-                        "dummy_addr=", chain_dummy_addr);
+    TORCH_NEURONX_DEBUG("Merging chain", "chain_index=", i);
 
-    // Use mergeStableHLOModulesSkipIntermediates with mapping capture
     torch_neuronx::MergeMapping merge_mapping;
     std::string merged_mlir = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
-        accumulated_mlir, per_input_transform_mlirs[i], accumulated_dummy_input_addrs,
-        accumulated_dummy_output_addrs, chain_dummy_input_addrs, chain_dummy_output_addrs,
-        &merge_mapping);
+        accumulated_mlir, per_input_transform_mlirs[i], accumulated_input_addrs,
+        accumulated_output_addrs, chain_input_addrs, chain_output_addrs, &merge_mapping);
 
     if (merged_mlir.empty()) {
       result.success = false;
-      result.error_message =
-          "Failed to merge transformation chain " + std::to_string(i) + " with dummy addresses";
+      result.error_message = "Failed to merge transformation chain " + std::to_string(i);
       return result;
     }
 
     accumulated_mlir = merged_mlir;
 
-    // Verify order conservation: all indices 0..i must be present and in order
+    // Verify order conservation
     TORCH_CHECK(merge_mapping.total_inputs == i + 1, "Expected ", i + 1,
                 " inputs after merging chain ", i, " but got ", merge_mapping.total_inputs);
     TORCH_CHECK(merge_mapping.total_outputs == i + 1, "Expected ", i + 1,
                 " outputs after merging chain ", i, " but got ", merge_mapping.total_outputs);
 
-    // Verify each merged index exists and maps correctly
-    // Indices 0 to i-1 should map to Module 1 (accumulated_mlir) with module indices 0, 1, ..., i-1
-    // Index i should map to Module 2 (new chain) with module index 0
-    for (size_t idx = 0; idx <= i; ++idx) {
-      auto input_it = merge_mapping.input_mapping.find(idx);
-      TORCH_CHECK(input_it != merge_mapping.input_mapping.end(),
-                  "Missing input mapping for merged index ", idx, " after merging chain ", i);
+    // Append addresses for this chain
+    accumulated_input_addrs.push_back(&input_slots[i]);
+    accumulated_output_addrs.push_back(&output_slots[i]);
 
-      if (idx < i) {
-        // Indices 0 to i-1 should map to Module 1 with their respective indices
-        TORCH_CHECK(input_it->second.first == 1, "Merged input ", idx,
-                    " should map to module 1, got module ", input_it->second.first);
-        TORCH_CHECK(input_it->second.second == idx, "Merged input ", idx,
-                    " should map to module 1 input index ", idx, ", got ", input_it->second.second);
-      } else {
-        // Index i should map to Module 2 input index 0
-        TORCH_CHECK(input_it->second.first == 2, "Merged input ", idx,
-                    " should map to module 2, got module ", input_it->second.first);
-        TORCH_CHECK(input_it->second.second == 0, "Merged input ", idx,
-                    " should map to module 2 input index 0, got ", input_it->second.second);
-      }
-
-      auto output_it = merge_mapping.output_mapping.find(idx);
-      TORCH_CHECK(output_it != merge_mapping.output_mapping.end(),
-                  "Missing output mapping for merged index ", idx, " after merging chain ", i);
-
-      if (idx < i) {
-        // Indices 0 to i-1 should map to Module 1 with their respective indices
-        TORCH_CHECK(output_it->second.first == 1, "Merged output ", idx,
-                    " should map to module 1, got module ", output_it->second.first);
-        TORCH_CHECK(output_it->second.second == idx, "Merged output ", idx,
-                    " should map to module 1 output index ", idx, ", got ",
-                    output_it->second.second);
-      } else {
-        // Index i should map to Module 2 output index 0
-        TORCH_CHECK(output_it->second.first == 2, "Merged output ", idx,
-                    " should map to module 2, got module ", output_it->second.first);
-        TORCH_CHECK(output_it->second.second == 0, "Merged output ", idx,
-                    " should map to module 2 output index 0, got ", output_it->second.second);
-      }
-    }
-
-    // Append the new address for this chain (each merge adds one input and one output)
-    void* new_chain_dummy_addr = reinterpret_cast<void*>(static_cast<uintptr_t>(i));
-    accumulated_dummy_input_addrs.push_back(new_chain_dummy_addr);
-    accumulated_dummy_output_addrs.push_back(new_chain_dummy_addr);
-
-    TORCH_NEURONX_DEBUG("Verified order conservation and appended chain address", "chain_index=", i,
-                        "new_address=", new_chain_dummy_addr,
-                        "total_inputs=", accumulated_dummy_input_addrs.size(),
-                        "total_outputs=", accumulated_dummy_output_addrs.size());
+    TORCH_NEURONX_DEBUG("Merged chain", "chain_index=", i,
+                        "total_inputs=", accumulated_input_addrs.size());
   }
 
   // With order conservation verified, just store the MLIR

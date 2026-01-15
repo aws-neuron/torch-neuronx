@@ -9,6 +9,7 @@ import torch
 
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
+from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
 
 
@@ -497,3 +498,62 @@ class TestExecutor:
             mock_neuron_tensor.view.assert_called_once_with(torch.int32)
             # Verify output was upcasted
             mock_output.view.assert_called_once_with(torch.int64)
+
+    @pytest.mark.parametrize(
+        "non_none_positions,original_output_count",
+        [
+            ([0, 2], 4),
+            ([], 2),
+            ([0, 1], 2),
+            ([], 0),
+        ],
+    )
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_none_output_restoration_basic(
+        self, mock_current_device, mock_execute, non_none_positions, original_output_count
+    ):
+        """Test that None outputs are correctly restored in their original positions."""
+        mock_current_device.return_value = 0
+        mock_execute.return_value = None
+        none_output_info = NoneOutputInfo(
+            non_none_positions=non_none_positions,
+            original_output_count=original_output_count,
+            new_output_count=len(non_none_positions),
+        )
+
+        input_spec = TensorSpec(dtype=torch.float32, shape=(2, 3))
+        output_specs = tuple(
+            TensorSpec(dtype=torch.float32, shape=(2, 3))
+            for _ in range(none_output_info.new_output_count)
+        )
+        io_specs = FunctionIO(inputs=(input_spec,), outputs=output_specs)
+        cast_spec = [
+            TensorSpec(dtype=torch.float32, shape=(2, 3))
+            for _ in range(none_output_info.new_output_count)
+        ]
+
+        executor = Executor(
+            "test_graph", "test_cache_key", io_specs, cast_spec, none_output_info=none_output_info
+        )
+
+        input_tensor = MagicMock(spec=torch.Tensor)
+        input_tensor.device.type = "cpu"
+        input_tensor.dtype = torch.float32
+        mock_neuron_tensor = MagicMock(spec=torch.Tensor)
+        input_tensor.to.return_value = mock_neuron_tensor
+
+        mock_tensor_0 = MagicMock(name="tensor_0")
+        mock_tensor_1 = MagicMock(name="tensor_1")
+        all_mock_outputs = [mock_tensor_0, mock_tensor_1]
+        for mock_output in all_mock_outputs:
+            mock_output.dtype = torch.float32
+        result = executor(input_tensor)
+        assert (
+            len(result) == none_output_info.original_output_count
+        ), f"Output count does not match: {none_output_info.original_output_count=} {len(result)=}"
+        for i in range(len(result)):
+            if i in none_output_info.non_none_positions:
+                assert result[i] is not None
+            else:
+                assert result[i] is None

@@ -132,6 +132,15 @@ class TestXLAFullCompilationLegacy:
 class TestXLAFullCompilation:
     """Test XLA kernel compilation with async execution mode."""
 
+    def setup_method(self):
+        """Set env var to collect compilation stats/metrics"""
+        # Set env var to enable metrics collection
+        os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
+
+    def teardown_method(self):
+        """Reset environment variables."""
+        os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
+
     def test_compilation_caching(self):
         """Test that NEFF compilation is cached properly."""
 

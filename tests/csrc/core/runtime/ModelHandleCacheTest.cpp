@@ -54,6 +54,11 @@ class ModelHandleCacheTest : public ::testing::Test {
   std::vector<uint8_t> neff_bytes_;
 };
 
+TEST_F(ModelHandleCacheTest, InitialState) {
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 0);
+}
+
 TEST_F(ModelHandleCacheTest, GetOrLoadModelFirstTime) {
   nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
 
@@ -77,6 +82,9 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelFirstTime) {
   EXPECT_TRUE(model);
   EXPECT_TRUE(model->IsValid());
   EXPECT_EQ(model->get(), fake_model);
+
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelCacheHit) {
@@ -103,6 +111,9 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelCacheHit) {
   auto model2 = cache_->GetOrLoadModel(kernel, 0, 1);
   EXPECT_TRUE(model2);
   EXPECT_EQ(model1, model2);  // Should be the same shared_ptr
+
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
@@ -133,6 +144,9 @@ TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
   EXPECT_TRUE(model1);
   EXPECT_TRUE(model2);
   EXPECT_NE(model1, model2);  // Different devices = different models
+
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 2);
 }
 
 TEST_F(ModelHandleCacheTest, GetOrLoadModelWithCollectives) {

@@ -36,33 +36,36 @@ def torch_le(x, y, out=None):
     return torch.le(x, y, out=out) if out is not None else torch.le(x, y)
 
 
-@register_aten(["aten::clamp", "aten::clamp.out"])
+@register_aten(
+    ["aten::clamp", "aten::clamp.out", "aten::clamp.Tensor", "aten::clamp.Tensor_out"],
+)
 def torch_clamp(x, min=None, max=None):
-    return torch.clamp(x, min, max)
+    if min is None and max is None:
+        raise RuntimeError("torch.clamp: At least one of 'min' or 'max' must not be None")
+    return torch.clamp(x, min=min, max=max)
 
 
-@register_aten(["aten::clamp.Tensor", "aten::clamp.Tensor_out"])
-def torch_clamp_tensor(x, min=None, max=None):
-    return torch.clamp(x, min, max)
-
-
-@register_aten(["aten::clamp_max", "aten::clamp_max.out"])
+@register_aten(
+    [
+        "aten::clamp_max",
+        "aten::clamp_max.out",
+        "aten::clamp_max.Tensor",
+        "aten::clamp_max.Tensor_out",
+    ],
+)
 def torch_clamp_max(x, max):
     return torch.clamp_max(x, max)
 
 
-@register_aten(["aten::clamp_max.Tensor", "aten::clamp_max.Tensor_out"])
-def torch_clamp_max_tensor(x, max):
-    return torch.clamp_max(x, max)
-
-
-@register_aten(["aten::clamp_min", "aten::clamp_min.out"])
+@register_aten(
+    [
+        "aten::clamp_min",
+        "aten::clamp_min.out",
+        "aten::clamp_min.Tensor",
+        "aten::clamp_min.Tensor_out",
+    ],
+)
 def torch_clamp_min(x, min):
-    return torch.clamp_min(x, min)
-
-
-@register_aten(["aten::clamp_min.Tensor", "aten::clamp_min.Tensor_out"])
-def torch_clamp_min_tensor(x, min):
     return torch.clamp_min(x, min)
 
 
@@ -83,8 +86,13 @@ def torch_isneginf(x):
 
 @register_aten(["aten::isfinite"])
 def torch_isfinite(x):
+    """
+    torch.isfinite is getting decomposed before MLIR in fx graph,
+    therefore we wont be able to get stablehlo.isfinite in the HLO
+    """
     if x.dtype in INT_DTYPES:
         # Integers are always finite
         return torch.ones_like(x, dtype=torch.bool)
     else:
-        return torch.isfinite(x)
+        # For floating point: finite = not (nan or inf)
+        return ~(torch.isnan(x) | torch.isinf(x))

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from torch_neuronx.python_ops import io_tensor
+
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
 
@@ -110,7 +112,7 @@ class ToCopyNeuronImpl(OperationImplementation):
         if is_from_neuron and is_to_neuron:
             from .cast_policy import write_neuron_to_neuron
 
-            result = torch.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
+            result = io_tensor.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
             try:
                 # In case of D2D without CPU bounces, copies are not blocking.
                 write_neuron_to_neuron(result, self_tensor, non_blocking=True)
@@ -120,7 +122,7 @@ class ToCopyNeuronImpl(OperationImplementation):
 
         # Fallback: other combinations (e.g., CPU->CPU)
         # Use standard PyTorch semantics safely (CPU path won't hit neuron copy_ implementation)
-        result = torch.empty(
+        result = io_tensor.empty(
             self_tensor.shape, dtype=target_dtype, device=target_device, pin_memory=pin_memory
         )
         # Avoid recursion by not calling copy_ when either side is Neuron (already handled)
@@ -156,5 +158,5 @@ class ToCopyNeuronImpl(OperationImplementation):
             else (torch.device(device) if device is not None else self_tensor.device)
         )
         target_dtype = dtype if dtype is not None else self_tensor.dtype
-        empty = torch.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
+        empty = io_tensor.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
         return ExecutionResult(success=True, output=empty)

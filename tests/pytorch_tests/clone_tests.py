@@ -1,5 +1,6 @@
 import argparse
 import logging
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -63,7 +64,14 @@ def _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir):
 
 
 def clone_pytorch_tests(torch_version=None):
-    """Clone PyTorch tests directory"""
+    """Clone PyTorch tests directory.
+
+    Clones the test directory from PyTorch repository. If tests already exist,
+    checks version compatibility and re-clones if there's a mismatch.
+
+    Args:
+        torch_version: PyTorch version to clone. Auto-detects if not provided.
+    """
     if torch_version is None:
         torch_version = get_torch_version()
 
@@ -74,16 +82,28 @@ def clone_pytorch_tests(torch_version=None):
     script_path = Path(__file__).resolve()
     pytorch_tests_dir = script_path.parent
     test_dir = pytorch_tests_dir / "test"
+    version_file = test_dir / ".pytorch_version"
 
+    # Check if test_dir exists and has matching version
     if test_dir.exists():
-        logger.debug("Test directory already exists")
-        return
+        if version_file.exists():
+            stored_version = version_file.read_text().strip()
+            if stored_version == torch_version:
+                logger.debug(f"Test directory exists with matching version {torch_version}")
+                return
+            logger.info(f"Version mismatch: stored={stored_version}, current={torch_version}")
+        else:
+            logger.info("No version file found in existing test directory")
+        # Delete and re-clone
+        logger.info("Removing outdated test directory...")
+        shutil.rmtree(test_dir)
 
-    # Check if test directory exists, if not run setup script
-    logger.info(f"Test directory {test_dir} doesn't exist or is empty. Cloning pytorch tests...")
+    # Clone tests
+    logger.info(
+        f"Test directory {test_dir} doesn't exist. Cloning PyTorch {torch_version} tests..."
+    )
     try:
         _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir)
-
     except Exception as e:
         logger.exception(f"Setup script failed: {e}")
         raise RuntimeError(f"Failed to setup PyTorch tests: {e}") from e
@@ -93,6 +113,8 @@ def clone_pytorch_tests(torch_version=None):
             f"Setup script completed but test directory {test_dir} still doesn't exist"
         )
 
+    # Write version marker
+    version_file.write_text(torch_version)
     logger.info(f"PyTorch tests setup completed. Test directory: {test_dir}")
 
 

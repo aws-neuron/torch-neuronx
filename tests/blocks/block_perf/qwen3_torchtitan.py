@@ -61,6 +61,9 @@ def _apply_parallelism(block, tp_mesh, dp_mesh, parallelism_type):
         parallelize_module(block.block, tp_mesh, _get_tp_plan())
     elif parallelism_type == "fsdp" and dp_mesh:
         _apply_fsdp(block, dp_mesh)
+    elif parallelism_type == "none":
+        # No parallelism applied for single device
+        pass
 
 
 def create_config(preset_name, batch_size, seq_len):
@@ -80,12 +83,15 @@ def create_config(preset_name, batch_size, seq_len):
     }
 
     # Extract parallelism type from preset
-    if "tp" in preset_name:
+    if "tp_fsdp" in preset_name:
+        config["parallelism"] = "tp_fsdp"
+    elif "tp" in preset_name:
         config["parallelism"] = "tp"
     elif "fsdp" in preset_name:
         config["parallelism"] = "fsdp"
-    elif "tp_fsdp" in preset_name:
-        config["parallelism"] = "tp_fsdp"
+    else:
+        # Default to no parallelism for base preset
+        config["parallelism"] = "none"
 
     return config
 
@@ -108,8 +114,10 @@ def create_block(config, device, dtype=None, tp_mesh=None, dp_mesh=None):
     block = block.to(device, dtype=dtype) if dtype else block.to(device)
     block.eval()
 
-    parallelism = config.get("parallelism", "tp")
-    _apply_parallelism(block, tp_mesh, dp_mesh, parallelism)
+    # Only apply parallelism if tp_mesh or dp_mesh is provided (similar to llama)
+    parallelism = config.get("parallelism", "none")
+    if parallelism != "none" and (tp_mesh is not None or dp_mesh is not None):
+        _apply_parallelism(block, tp_mesh, dp_mesh, parallelism)
 
     return block
 
@@ -135,6 +143,7 @@ def count_flops(config):
 def get_presets():
     """Return available presets."""
     return [
+        "qwen3-8b",
         "qwen3-8b-tp",
         "qwen3-8b-fsdp",
         "qwen3-8b-tp_fsdp",

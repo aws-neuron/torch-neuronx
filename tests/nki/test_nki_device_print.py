@@ -3,13 +3,15 @@ import os
 import neuronxcc.nki.language as nl
 import pytest
 import torch
+from neuronxcc import nki
 
-from torch_neuronx import nki, nki_op
+from torch_neuronx import nki_op, wrap_nki
 
 # Use the test name as a namespace to avoid conflicts
 my_namespace = "TestNKIDevicePrint"
 
 
+@wrap_nki
 @nki.jit
 def nki_tensor_add_print(a_input, b_input):
     """NKI kernel to compute element-wise addition"""

@@ -57,28 +57,9 @@ class NeuronLogger {
            const char* file = nullptr, int line = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // OPERATOR_FALLBACK always goes to the fallback file (bypass log level check)
-    if (category == LogCategory::OPERATOR_FALLBACK) {
-      if (!fallback_file_.is_open()) {
-        initializeDumpFiles();
-      }
-      if (fallback_file_.is_open()) {
-        fallback_file_ << message << std::endl;
-        fallback_file_.flush();
-        return;  // Don't log to console or general log
-      }
-    }
-
-    // OPERATOR_EXECUTED always goes to the executed ops file (bypass log level check)
-    if (category == LogCategory::OPERATOR_EXECUTED) {
-      if (!executed_ops_file_.is_open()) {
-        initializeDumpFiles();
-      }
-      if (executed_ops_file_.is_open()) {
-        executed_ops_file_ << message << std::endl;
-        executed_ops_file_.flush();
-        return;  // Don't log to console or general log
-      }
+    // OPERATOR_FALLBACK and OPERATOR_EXECUTED - skip file dumping, just return
+    if (category == LogCategory::OPERATOR_FALLBACK || category == LogCategory::OPERATOR_EXECUTED) {
+      return;
     }
 
     // For general logging, check the log level
@@ -144,49 +125,9 @@ class NeuronLogger {
     }
   }
 
-  void initializeDumpFiles() {
-    // Get dump directory from environment variable or use default
-    const char* env_dump_dir = std::getenv("TORCH_NEURONX_DUMP");
-    std::string base_dir = env_dump_dir ? env_dump_dir : "./torch_neuronx_dump";
-
-    // Create base directory if it doesn't exist
-    mkdir(base_dir.c_str(), 0755);
-
-    // Get current timestamp in MMDDHHMMSS format
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    std::tm* tm = std::localtime(&time_t);
-
-    // Create timestamp-prefixed PID subdirectory (MMDDHHMMSS_PID)
-    std::stringstream pid_dir_stream;
-    pid_dir_stream << base_dir << "/" << std::setfill('0') << std::setw(2)
-                   << (tm->tm_mon + 1)                                  // MM
-                   << std::setfill('0') << std::setw(2) << tm->tm_mday  // DD
-                   << std::setfill('0') << std::setw(2) << tm->tm_hour  // HH
-                   << std::setfill('0') << std::setw(2) << tm->tm_min   // MM
-                   << std::setfill('0') << std::setw(2) << tm->tm_sec   // SS
-                   << "_" << getpid();                                  // _PID
-    std::string pid_dir = pid_dir_stream.str();
-    mkdir(pid_dir.c_str(), 0755);
-
-    // Open the fallback file in offloaded_ops subdirectory
-    std::stringstream fallback_filename_stream;
-    fallback_filename_stream << pid_dir << "/offloaded_ops.txt";
-    std::string fallback_filename = fallback_filename_stream.str();
-    fallback_file_.open(fallback_filename, std::ios::app);
-
-    // Open the executed ops file in used_ops subdirectory
-    std::stringstream executed_filename_stream;
-    executed_filename_stream << pid_dir << "/used_ops.txt";
-    std::string executed_filename = executed_filename_stream.str();
-    executed_ops_file_.open(executed_filename, std::ios::app);
-  }
-
   inline static LogLevel log_level_ = LogLevel::WARNING;
   bool log_to_file_ = false;
   std::ofstream log_file_;
-  std::ofstream fallback_file_;
-  std::ofstream executed_ops_file_;
   mutable std::mutex mutex_;
 };
 

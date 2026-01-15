@@ -3,6 +3,8 @@
 import jax.numpy as jnp
 import torch
 
+from torch_neuronx.utils import use_mlir_aten_ops
+
 from ...kernels.xla_kernel import TorchNeuronXLAKernel
 from ..base import ExecutionResult, OperationImplementation
 from .scatter_add_xla import ScatterGatherIndexHelper
@@ -24,6 +26,11 @@ class GatherXLAImpl(OperationImplementation):
             return input[input_indexes]
 
         self.kernel = TorchNeuronXLAKernel(compute_gather, "gather", static_argnums=(1,))
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(*args, **kwargs)
 
     def _handle_64bit_dtype(self, result, original_dtype):
         """Handle 64-bit dtype conversion"""
@@ -70,6 +77,11 @@ class GatherOutXLAImpl(GatherXLAImpl):
         else:
             result = torch.zeros(index.shape, dtype=input.dtype, device=input.device)
         return ExecutionResult(success=True, output=result)
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        if use_mlir_aten_ops():
+            return False
+        return super().can_handle(*args, **kwargs)
 
     def _execute_impl(self, input, dim, index, sparse_grad=False, *, out=None) -> ExecutionResult:
         try:

@@ -2,7 +2,34 @@
 
 Performance benchmarks for transformer blocks (currently supporting Llama).
 
-## Usage
+## Quick Start - Block Comparison Tool
+
+Use the `run-block-test` script to easily compare ops-concat performance across all block types:
+
+```bash
+# Run all blocks with and without ops-concat
+../../tools/run-block-test
+
+# Run specific blocks only
+../../tools/run-block-test llama qwen3
+
+# Enable profiler trace export
+../../tools/run-block-test --profile
+
+# Run specific blocks with profiling
+../../tools/run-block-test --profile llama qwen3
+
+# Get help
+../../tools/run-block-test --help
+```
+
+The script automatically runs each block twice - once with `TORCH_NEURONX_ENABLE_CONCATENATION=0` and once with `TORCH_NEURONX_ENABLE_CONCATENATION=1`, saving logs for comparison.
+
+**Available blocks:** llama, qwen3_torchtitan, gpt_oss, qwen3, rms_norm, rope
+
+**Output:** Logs are saved as `{block}_{preset}_no_concat.log` and `{block}_{preset}_with_concat.log`. When `--profile` is used, Chrome trace files are also generated for viewing at https://ui.perfetto.dev/
+
+## Advanced Usage
 
 ```bash
 # Default configuration (llama-7b preset)

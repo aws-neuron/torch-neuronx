@@ -126,3 +126,24 @@ create_test_classes(NeuronCommonTest, globals(), "my_test_spec.json")
 if __name__ == "__main__":
     pytest.main(["-vs", __file__])
 ```
+
+## Dynamo Tests
+
+Dynamo tests validate `torch.compile` functionality with the neuron backend.
+
+### Running Dynamo Tests
+
+```sh
+# Run all dynamo tests
+pytest tests/pytorch_tests/test_dynamo.py -v
+
+# Run with parallelization (recommended)
+pytest tests/pytorch_tests/test_dynamo.py -v -n 8
+```
+
+### Dynamo Test Configuration
+
+Dynamo tests use `specs/dynamo_spec.json` to control which PyTorch dynamo test files run. The framework:
+1. Applies neuron-specific patches (`dynamo/neuron_dynamo_patch.py`)
+2. Redirects backends (eager, inductor) to neuron
+3. Dynamically generates pytest methods for each PyTorch test

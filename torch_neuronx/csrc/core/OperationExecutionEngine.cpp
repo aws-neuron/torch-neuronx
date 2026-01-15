@@ -147,47 +147,53 @@ void OperationExecutionEngine::CompilationWorker() {
       OperationContext* operation = compilation_queue_.pop_front();
       lock.unlock();
 
-      if (!ProcessPreprocessingTask(operation)) {
-        continue;  // Error already handled
-      }
-
-      ProcessCompilationTask(operation);
-      NotifyExecutionReady();
+      ProcessPrepareTask(operation);
     }
   }
   TORCH_NEURONX_DEBUG("Compilation worker thread terminated");
 }
 
-void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operation) noexcept {
-  auto* stream = operation->stream;
-  // Set compilation start time
-  // TODO(rpsilva): Introduce a global metric collection
-  operation->compile_start = std::chrono::steady_clock::now();
-  // Get the compilable kernel
-  auto& kernel = operation->GetCompilableKernel();
-  const std::string& op_name = operation->GetOpName();
+void OperationExecutionEngine::ProcessPrepareTask(OperationContext* operation) noexcept {
   try {
-    int stream_id = stream->stream_id;
-    TORCH_NEURONX_DEBUG("Processing compilation task", "stream_id=", stream_id, "op=", op_name);
-    // Compile NEFF through shared compilation cache
-    compilation_cache_->GetOrCompileNeff(kernel, stream_id);
-
-    if (!kernel.HasCachedNeff()) {
-      throw torch_neuronx::CompilationRuntimeException("NEFF creation failed for operation: " +
-                                                       op_name);
+    if (ProcessPreprocessingTask(operation)) {
+      ProcessCompilationTask(operation);
     }
-
-    // Set compilation end time
-    operation->compile_end = std::chrono::steady_clock::now();
-
-    operation->MarkExecutionReady();
-    TORCH_NEURONX_DEBUG("Compilation task completed successfully", "stream_id=", stream_id,
-                        "op=", op_name);
   } catch (const torch_neuronx::CompilationRuntimeException& e) {
-    stream->HandleErrorWithCleanup(operation, e);
+    operation->stream->HandleErrorWithCleanup(operation, e);
   } catch (const std::exception& e) {
-    stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(e.what()));
+    operation->stream->HandleErrorWithCleanup(operation,
+                                              torch_neuronx::CompilationRuntimeException(e.what()));
   }
+  NotifyExecutionReady();
+}
+
+bool OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operation) {
+  const std::string& op_name = operation->GetOpName();
+  TORCH_NEURONX_DEBUG("Processing preprocessing task", "op=", op_name);
+  c10_neuron::lazy::LazyTransformationManager::ProcessOperationInputs(operation);
+  return true;
+}
+
+void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operation) {
+  auto* stream = operation->stream;
+  const std::string& op_name = operation->GetOpName();
+  int stream_id = stream->stream_id;
+
+  operation->compile_start = std::chrono::steady_clock::now();
+  auto& kernel = operation->GetCompilableKernel();
+
+  TORCH_NEURONX_DEBUG("Processing compilation task", "stream_id=", stream_id, "op=", op_name);
+  compilation_cache_->GetOrCompileNeff(kernel, stream_id);
+
+  if (!kernel.HasCachedNeff()) {
+    throw torch_neuronx::CompilationRuntimeException("NEFF creation failed for operation: " +
+                                                     op_name);
+  }
+
+  operation->compile_end = std::chrono::steady_clock::now();
+  operation->MarkExecutionReady();
+  TORCH_NEURONX_DEBUG("Compilation task completed successfully", "stream_id=", stream_id,
+                      "op=", op_name);
 }
 
 void OperationExecutionEngine::ExecutionWorker() {
@@ -242,7 +248,6 @@ void OperationExecutionEngine::ProcessExecutionTask(OperationContext* operation)
   try {
     TORCH_NEURONX_DEBUG("Processing execution task", "stream_id=", stream->stream_id,
                         "operation_name=", operation_name);
-    // TODO(rpsilva): Introduce a global metric collection
     operation->execute_start = std::chrono::steady_clock::now();
     operation->Execute();
     if (torch_neuronx::shouldLogExecuted(operation_name)) {
@@ -275,27 +280,6 @@ void OperationExecutionEngine::ProcessExecutionTask(OperationContext* operation)
     stream->HandleErrorWithCleanup(operation, e);
   } catch (const std::exception& e) {
     stream->HandleErrorWithCleanup(operation, torch_neuronx::ExecutionRuntimeException(e.what()));
-  }
-}
-
-bool OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operation) noexcept {
-  auto* stream = operation->stream;
-
-  try {
-    TORCH_NEURONX_DEBUG("Processing preprocessing task", "op=", operation->GetOpName());
-
-    c10_neuron::lazy::LazyTransformationManager::ProcessOperationInputs(operation);
-
-    // Transformations were applied if needed, kernel has been updated via MLIR merge
-    return true;
-
-  } catch (const torch_neuronx::CompilationRuntimeException& e) {
-    stream->HandleErrorWithCleanup(operation, e);
-    return false;
-  } catch (const std::exception& e) {
-    TORCH_NEURONX_DEBUG("preprocessing failed with=", e.what());
-    stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(e.what()));
-    return false;
   }
 }
 
@@ -401,5 +385,4 @@ bool OperationExecutionEngine::IsConcatenationEnabled() const {
   return concat_env && (std::string(concat_env) == "1" || std::string(concat_env) == "true" ||
                         std::string(concat_env) == "yes");
 }
-
 }  // namespace at::neuron

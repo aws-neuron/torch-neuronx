@@ -2,12 +2,15 @@ import logging
 import os
 from typing import Optional
 
+import neuronxcc.nki as nki
+import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 import pytest
 import torch
+import torch.nn as nn
 
-from torch_neuronx import nki, nki_op
+from torch_neuronx import nki_op, wrap_nki
 
 # Use the test name as a namespace to avoid conflicts
 my_namespace = "TestNKIDyamoIntegration"
@@ -17,6 +20,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+@wrap_nki
 @nki.jit
 def nki_tensor_add_kernel_(a_input, b_input):
     """NKI kernel for tensor addition"""
@@ -38,6 +42,7 @@ def nki_tensor_add_kernel_(a_input, b_input):
     return c_output
 
 
+@wrap_nki
 @nki.jit
 def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     """NKI kernel that computes multiplication and in_place add"""
@@ -58,6 +63,7 @@ def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     return c_output, a_input
 
 
+@wrap_nki
 @nki.jit
 def nki_scaled_add_inplace(a_input, scale, b_output: nt.mutable_tensor):
     """NKI kernel that computes scaled in_place add"""
@@ -153,6 +159,7 @@ def ref_aliased_with_constant_func(
         return scaled
 
 
+@wrap_nki
 @nki.jit
 def nki_aliased_kernel_with_constant(
     scale: float, out: nt.mutable_tensor, mode: str | None = None, input: torch.Tensor | None = None
@@ -250,3 +257,132 @@ class TestNKIDyamoIntegration:
         compiled_func(scale, out_neuron, mode, input_neuron)
 
         assert torch.allclose(out_neuron.cpu(), ref, rtol=1e-5, atol=1e-5)
+
+    def test_nki_multiout(self):
+        """Test multi-output NKI kernel"""
+
+        @wrap_nki
+        @nki.jit
+        def nki_multiout_add_kernel(
+            a_input: nl.ndarray,
+            b_input: nl.ndarray,
+            c_input: nl.ndarray,
+        ) -> tuple[nl.ndarray, nl.ndarray]:
+            assert a_input.shape == b_input.shape
+            assert a_input.shape == c_input.shape
+            assert a_input.shape[0] <= nl.tile_size.pmax
+
+            a_tile = nl.load(a_input)
+            b_tile = nl.load(b_input)
+            c_tile = nl.load(c_input)
+
+            ab_tile = nl.add(a_tile, b_tile)
+            ac_tile = nl.add(a_tile, c_tile)
+
+            ab_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
+            ac_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
+
+            nl.store(ab_output, value=ab_tile)
+            nl.store(ac_output, value=ac_tile)
+
+            return ab_output, ac_output
+
+        @nki_op("test_multi_return_kernel::nki_tensor_add_kernel_3")
+        def nki_tensor_add_kernel_3(
+            a_input: torch.Tensor,
+            b_input: torch.Tensor,
+            c_input: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return nki_multiout_add_kernel(a_input, b_input, c_input)
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, a, b, c):
+                return nki_tensor_add_kernel_3(a, b, c)
+
+        model = SimpleModel()
+        model = model.to("neuron:0")
+        model = torch.compile(model, backend="neuron", fullgraph=True)
+
+        a = torch.ones((4, 3), dtype=torch.bfloat16)
+        b = torch.ones((4, 3), dtype=torch.bfloat16)
+        c = torch.ones((4, 3), dtype=torch.bfloat16)
+
+        output = model(a.to("neuron:0"), b.to("neuron:0"), c.to("neuron:0"))
+
+        assert torch.allclose(output[0].to("cpu"), a + b)
+        assert torch.allclose(output[1].to("cpu"), b + c)
+
+    def test_model_with_cache_return_on_neuron(self):
+        """Test KV cache update with mutable tensors"""
+
+        @wrap_nki
+        @nki.jit
+        def write_kv_cache_at_batch_kernel(
+            k: nt.tensor,
+            v: nt.tensor,
+            k_prior: nt.mutable_tensor,
+            v_prior: nt.mutable_tensor,
+            batch_idx: nt.tensor,
+        ):
+            batch_idx = nl.load(batch_idx)
+
+            _, h, s, d = k.shape
+            _, v_h, v_s, v_d = v.shape
+
+            _, i_h, i_s, i_d = nl.mgrid[:1, :h, :s, :d]
+            _, v_i_h, v_i_s, v_i_d = nl.mgrid[:1, :v_h, :v_s, :v_d]
+
+            nisa.dma_copy(src=k, dst=k_prior[batch_idx, i_h, i_s, i_d], oob_mode=nisa.oob_mode.skip)
+            nisa.dma_copy(
+                src=v, dst=v_prior[batch_idx, v_i_h, v_i_s, v_i_d], oob_mode=nisa.oob_mode.skip
+            )
+
+            return k_prior, v_prior
+
+        @nki_op(
+            "test_cache_update_kernel::write_kv_cache_at_batch_kernel",
+            mutates_args={"k_prior", "v_prior"},
+        )
+        def write_kv_cache_at_batch(
+            k: torch.Tensor,
+            v: torch.Tensor,
+            k_prior: torch.Tensor,
+            v_prior: torch.Tensor,
+            batch_index: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return write_kv_cache_at_batch_kernel(k, v, k_prior, v_prior, batch_index)
+
+        class ModelWithCacheReturn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("k_prior", torch.zeros((1, 1, 256, 128), dtype=torch.bfloat16))
+                self.register_buffer("v_prior", torch.zeros((1, 1, 256, 128), dtype=torch.bfloat16))
+
+            def forward(self, k, v, batch_idx):
+                updated_k, updated_v = write_kv_cache_at_batch(
+                    k, v, self.k_prior, self.v_prior, batch_idx
+                )
+                return updated_k, updated_v
+
+        model = ModelWithCacheReturn()
+        model = model.to("neuron:0")
+        model = torch.compile(model, backend="neuron", fullgraph=True)
+
+        k = torch.ones((1, 1, 256, 128), dtype=torch.bfloat16)
+        v = torch.ones((1, 1, 256, 128), dtype=torch.bfloat16)
+
+        batch_idx = torch.tensor([0], dtype=torch.int32)
+
+        model(k.to("neuron:0"), v.to("neuron:0"), batch_idx.to("neuron:0"))
+
+        batch_idx = torch.tensor([1], dtype=torch.int32)
+
+        result = model(k.to("neuron:0"), v.to("neuron:0"), batch_idx.to("neuron:0"))
+
+        k, v = result[0].to("cpu"), result[1].to("cpu")
+
+        assert torch.all(k == 1)
+        assert torch.all(v == 1)

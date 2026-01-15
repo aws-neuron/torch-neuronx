@@ -12,10 +12,12 @@ aten_lib = torch.library.Library("aten", "IMPL")
 def _register_common_ops():
     """Register operations shared between legacy and MLIR paths."""
     from .gather import gather_neuron, gather_out_neuron
+    from .index import index_op
     from .native_multi_head_attention import (
         native_multi_head_attention_neuron,
         native_multi_head_attention_out_neuron,
     )
+    from .nonzero import nonzero_op, nonzero_static_op
     from .scaled_dot_product_fused_attention import (
         scaled_dot_product_fused_attention_overrideable_backward_meta,
         scaled_dot_product_fused_attention_overrideable_backward_neuron,
@@ -33,16 +35,17 @@ def _register_common_ops():
         "_native_multi_head_attention.out", native_multi_head_attention_out_neuron, "PrivateUse1"
     )
     # For training - without qkv and out projection - with dropout and LSE - for training
-    aten_lib.impl(
-        "_scaled_dot_product_fused_attention_overrideable",
-        scaled_dot_product_fused_attention_overrideable_neuron,
-        "PrivateUse1",
-    )
-    aten_lib.impl(
-        "_scaled_dot_product_fused_attention_overrideable_backward",
-        scaled_dot_product_fused_attention_overrideable_backward_neuron,
-        "PrivateUse1",
-    )
+    if not use_mlir_aten_ops():
+        aten_lib.impl(
+            "_scaled_dot_product_fused_attention_overrideable",
+            scaled_dot_product_fused_attention_overrideable_neuron,
+            "PrivateUse1",
+        )
+        aten_lib.impl(
+            "_scaled_dot_product_fused_attention_overrideable_backward",
+            scaled_dot_product_fused_attention_overrideable_backward_neuron,
+            "PrivateUse1",
+        )
 
     # We add for meta device because dtensor's sharding propagator runs
     # the aten op with meta device to get the output shapes and create
@@ -60,6 +63,24 @@ def _register_common_ops():
     # Register gather operation
     aten_lib.impl("gather", gather_neuron, "PrivateUse1")
     aten_lib.impl("gather.out", gather_out_neuron, "PrivateUse1")
+
+    # Register nonzero ops
+    aten_lib.impl("nonzero_static", nonzero_static_op, "PrivateUse1")
+    aten_lib.impl("nonzero_static.out", nonzero_static_op, "PrivateUse1")
+    aten_lib.impl("nonzero", nonzero_op, "PrivateUse1")
+    aten_lib.impl("nonzero.out", nonzero_op, "PrivateUse1")
+
+    # Register index op
+    aten_lib.impl("index.Tensor", index_op, "PrivateUse1")
+    aten_lib.impl("index.Tensor_out", index_op, "PrivateUse1")
+
+    if Version("2.9.0") <= TORCH_VERSION:
+        from .rms_norm import rms_norm_neuron
+
+        aten_lib.impl("rms_norm", rms_norm_neuron, "PrivateUse1")
+        # Also register for AutogradPrivateUse1 to ensure gradient tracking works
+        # when called through DTensor dispatch
+        aten_lib.impl("rms_norm", rms_norm_neuron, "AutogradPrivateUse1")
 
 
 def register_legacy_ops():
@@ -199,14 +220,6 @@ def register_legacy_ops():
     # Register common ops (attention, scatter, gather)
     _register_common_ops()
 
-    if Version("2.9.0") <= TORCH_VERSION:
-        from .rms_norm import rms_norm_neuron
-
-        aten_lib.impl("rms_norm", rms_norm_neuron, "PrivateUse1")
-        # Also register for AutogradPrivateUse1 to ensure gradient tracking works
-        # when called through DTensor dispatch
-        aten_lib.impl("rms_norm", rms_norm_neuron, "AutogradPrivateUse1")
-
     # Auto-register operations decorated with @neuron_op
     auto_register_neuron_ops(aten_lib)
 
@@ -238,7 +251,12 @@ def register_mlir_ops():
 
 def register_python_operations():
     """Main entry point for registering all Python operations."""
+    from .cpu_fallback_registrations import register_cpu_fallback_ops
+
     if use_mlir_aten_ops():
         register_mlir_ops()
     else:
         register_legacy_ops()
+
+    # Register CPU fallback ops (linalg, etc.)
+    register_cpu_fallback_ops(aten_lib)

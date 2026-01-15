@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-import numpy as _np
+import numpy as np
 import torch
 from neuronxcc.starfish.support import dtype as _ndt
 from packaging.version import Version
@@ -57,10 +57,10 @@ def get_logical_neuron_cores():
     """Get the Logical Neuron Cores (LNC) setting based on environment.
 
     Returns:
-        str: NEURON_RT_VIRTUAL_CORE_SIZE is specified, otherwise the default
+        str: NEURON_LOGICAL_NC_CONFIG is specified, otherwise the default
              for the instance type.
     """
-    return os.environ.get("NEURON_RT_VIRTUAL_CORE_SIZE", get_lnc_setting())
+    return os.environ.get("NEURON_LOGICAL_NC_CONFIG", get_lnc_setting())
 
 
 def get_worker_multiplier():
@@ -272,17 +272,17 @@ class MXFP8:
 
 _NUMPY_TO_TORCH_MAP: dict[object, torch.dtype] = {
     # floats
-    getattr(_np, "float32", object()): torch.float32,
-    getattr(_np, "float16", object()): torch.float16,
-    getattr(_np, "float64", object()): torch.float64,
+    getattr(np, "float32", object()): torch.float32,
+    getattr(np, "float16", object()): torch.float16,
+    getattr(np, "float64", object()): torch.float64,
     # ints
-    getattr(_np, "int32", object()): torch.int32,
-    getattr(_np, "int64", object()): torch.int64,
-    getattr(_np, "int16", object()): torch.int16,
-    getattr(_np, "int8", object()): torch.int8,
-    getattr(_np, "uint8", object()): torch.uint8,
+    getattr(np, "int32", object()): torch.int32,
+    getattr(np, "int64", object()): torch.int64,
+    getattr(np, "int16", object()): torch.int16,
+    getattr(np, "int8", object()): torch.int8,
+    getattr(np, "uint8", object()): torch.uint8,
     # bool
-    getattr(_np, "bool_", object()): torch.bool,
+    getattr(np, "bool_", object()): torch.bool,
 }
 
 
@@ -321,9 +321,9 @@ def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
             return torch.float8_e4m3fn
 
     # NumPy direct matches
-    if _np is not None:
+    if np is not None:
         # Handle np.dtype instances
-        if isinstance(nki_or_numpy_dtype, getattr(_np, "dtype", ())):  # type: ignore[arg-type]
+        if isinstance(nki_or_numpy_dtype, getattr(np, "dtype", ())):  # type: ignore[arg-type]
             # Normalize to the canonical scalar type (e.g., np.float32)
             kind = getattr(nki_or_numpy_dtype, "type", None)
             if kind in _NUMPY_TO_TORCH_MAP:
@@ -353,6 +353,50 @@ def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
 
     # Default fallback
     return torch.float32
+
+
+def map_torch_dtype_to_external(_dtype):
+    """Convert PyTorch dtype to Neuron dtype."""
+    from neuronxcc.starfish.support import dtype as neuron_dtype
+
+    torch_to_neuron_dtype = {
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.float16: np.float16,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
+        torch.int16: np.int16,
+        torch.int8: np.int8,
+        torch.uint8: np.uint8,
+        torch.uint16: np.uint16,
+        torch.uint32: np.uint32,
+        torch.uint64: np.uint64,
+        torch.bool: np.uint8,
+        torch.complex64: np.complex64,
+        torch.complex128: np.complex128,
+        torch.bfloat16: neuron_dtype.bfloat16,
+    }
+
+    if _dtype == getattr(torch, "float8_e4m3fn", None):
+        raise RuntimeError("float8_e4m3fn is not supported in neuronxcc. ")
+
+    if hasattr(torch, "float8_e5m2"):
+        torch_to_neuron_dtype[torch.float8_e5m2] = neuron_dtype.float8_e5m2
+
+    if hasattr(torch, "float8_e4m3fn"):
+        torch_to_neuron_dtype[torch.float8_e4m3fn] = neuron_dtype.float8_e4m3fn
+
+    if hasattr(torch, "float8_e4m3fnuz"):
+        torch_to_neuron_dtype[torch.float8_e4m3fnuz] = neuron_dtype.float8_e4m3fn
+
+    if hasattr(torch, "float8_e5m2fnuz"):
+        torch_to_neuron_dtype[torch.float8_e5m2fnuz] = neuron_dtype.float8_e5m2
+
+    if _dtype in torch_to_neuron_dtype:
+        return torch_to_neuron_dtype[_dtype]
+
+    # For other dtype that is common with numpy, use builtin pytorch to do the translation
+    return torch.empty(1, dtype=_dtype, device="cpu").numpy().dtype
 
 
 # ==================== Version Info ====================

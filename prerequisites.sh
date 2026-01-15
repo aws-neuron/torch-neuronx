@@ -1,43 +1,35 @@
 #!/bin/bash
-
-# Function to install Neuron components
 install_neuron() {
     echo "Installing Neuron driver, runtime and tools..."
 
-    # Configure Linux for Neuron repository updates
     . /etc/os-release
-    sudo tee /etc/apt/sources.list.d/neuron.list > /dev/null <<EOF
-deb https://apt.repos.neuron.amazonaws.com ${VERSION_CODENAME} main
-EOF
-    wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | sudo apt-key add -
 
-    # Update OS packages
+    wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | sudo gpg --dearmor -o /usr/share/keyrings/neuron.gpg
+
+    sudo tee /etc/apt/sources.list.d/neuron.list > /dev/null <<EOF
+deb [signed-by=/usr/share/keyrings/neuron.gpg] https://apt.repos.neuron.amazonaws.com ${VERSION_CODENAME} main
+EOF
+
+    sudo apt-get clean
     sudo apt-get update -y
 
-    # Install OS headers
     sudo apt-get install linux-headers-$(uname -r) -y
-
-    # Install git
     sudo apt-get install git -y
 
-    # install Neuron Driver
-    sudo apt-get install aws-neuronx-dkms=2.* -y
+    # Install/upgrade Neuron packages (latest available)
+    sudo apt-get install --upgrade aws-neuronx-dkms -y
+    sudo apt-get install --upgrade aws-neuronx-collectives -y
+    sudo apt-get install --upgrade aws-neuronx-runtime-lib -y
+    sudo apt-get install --upgrade aws-neuronx-tools -y
 
-    # Install Neuron Runtime
-    sudo apt-get install aws-neuronx-collectives=2.* -y
-    sudo apt-get install aws-neuronx-runtime-lib=2.* -y
-
-    # Install Neuron Tools
-    sudo apt-get install aws-neuronx-tools=2.* -y
-
-    # Add PATH
-    echo 'export PATH=/opt/aws/neuron/bin:$PATH' >> ~/.bashrc
+    # Add PATH (only if not already present)
+    if ! grep -q '/opt/aws/neuron/bin' ~/.bashrc; then
+        echo 'export PATH=/opt/aws/neuron/bin:$PATH' >> ~/.bashrc
+    fi
     export PATH=/opt/aws/neuron/bin:$PATH
-    export NRT_LOCAL_PATH=/opt/aws/neuron
 
     echo "Neuron installation completed."
 }
-
 # Function to install Neuron components on AL2023
 install_neuron_al2023() {
     echo "Installing Neuron driver, runtime and tools..."

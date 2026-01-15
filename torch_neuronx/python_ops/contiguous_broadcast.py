@@ -2,6 +2,7 @@ import torch
 
 from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+from torch_neuronx.utils import use_mlir_aten_ops
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -90,6 +91,9 @@ class ContiguousBroadcastImpl(OperationImplementation):
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
 
+        if self_tensor.is_complex():
+            return False
+
         # Only handle contiguous or preserve formats
         if memory_format is not None and (
             memory_format != torch.contiguous_format and memory_format != torch.preserve_format
@@ -111,30 +115,37 @@ class ContiguousBroadcastImpl(OperationImplementation):
         result = compute_broadcast_for_contiguous(shape, strides)
         return result is not None
 
-    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+    def _execute_impl_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using broadcast kernel."""
-        try:
-            expand_result = _prepare_broadcast_inputs(self_tensor)
-            if expand_result is None:
-                return ExecutionResult(
-                    success=False, error_msg="Failed to compute broadcast inputs"
-                )
+        expand_result = _prepare_broadcast_inputs(self_tensor)
+        if expand_result is None:
+            return ExecutionResult(success=False, error_msg="Failed to compute broadcast inputs")
 
-            expand_dims, base_view = expand_result
+        expand_dims, base_view = expand_result
 
-            kernel = self._get_kernel()
+        kernel = self._get_kernel()
+        target_shape = tuple(self_tensor.shape)
 
+        if use_mlir_aten_ops():
+            output = kernel(base_view, target_shape)
+        else:
             from .jax.context import ExecutionContext
 
-            target_shape = tuple(self_tensor.shape)
             exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
             output = kernel(base_view, target_shape, context=exec_ctx)
 
+        return output
+
+    def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute contiguous operation using broadcast kernel."""
+        try:
+            output = self._execute_impl_internal(self_tensor, memory_format=memory_format)
             if not output.is_contiguous():
                 return ExecutionResult(
                     success=False,
                     error_msg="Broadcast output not contiguous",
                 )
+
             return ExecutionResult(success=True, output=output)
 
         except Exception as e:
@@ -165,8 +176,6 @@ class ContiguousBroadcastJAXImpl(ContiguousBroadcastImpl):
     _kernel: JaxKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)
@@ -195,8 +204,6 @@ class ContiguousBroadcastMLIRImpl(ContiguousBroadcastImpl):
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        from torch_neuronx.utils import use_mlir_aten_ops
-
         if not use_mlir_aten_ops():
             return False
         return super().can_handle(self_tensor, memory_format)

@@ -2,7 +2,9 @@
   "test_configurations": [
     {
       "class": "TestNNDeviceType",
-      "class_name_suffix": "PRIVATEUSE1",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1"
+      ],
       "file": "test_nn.py",
       "xfail": [
         {
@@ -13,7 +15,9 @@
     },
     {
       "class": "TestLikeTensorCreation",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_tensor_creation_ops.py",
       "xfail": [
         {
@@ -24,7 +28,9 @@
     },
     {
       "class": "TestRandomTensorCreation",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_tensor_creation_ops.py",
       "xfail": [
         {
@@ -35,7 +41,9 @@
     },
     {
       "class": "TestTensorCreation",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_tensor_creation_ops.py",
       "xfail": [
         {
@@ -46,7 +54,9 @@
     },
     {
       "class": "TestViewOps",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_view_ops.py",
       "skip_tests": [
         {
@@ -69,7 +79,9 @@
     },
     {
       "class": "TestScatterGather",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_scatter_gather_ops.py",
       "xfail": [
         {
@@ -80,7 +92,9 @@
     },
     {
       "class": "TestBinaryUfuncs",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "test_binary_ufuncs.py",
       "methods": [
         "test_lerp_lowp_cpu_neuron_bfloat16",
@@ -139,7 +153,9 @@
     },
     {
       "class": "TestConvolutionNNDeviceType",
-      "class_name_suffix": "NEURON",
+      "class_name_suffix_options": [
+        "NEURON"
+      ],
       "file": "nn/test_convolution.py",
       "skip_tests": [
         {

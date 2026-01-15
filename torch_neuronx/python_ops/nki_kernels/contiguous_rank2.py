@@ -1,7 +1,45 @@
 """NKI kernel for rank-2 contiguous copy"""
 
+import neuronxcc.nki.typing as nt
+import torch
+from neuronxcc import nki
 
-def contiguous_rank2_kernel(src, dst, shape, src_strides, block_size, storage_offset):
+from torch_neuronx.nki_hop import nki_op, wrap_nki
+
+
+@wrap_nki
+@nki.jit
+def _traced_kernel(
+    src, dst: nt.mutable_tensor, outer_size, inner_size, src_outer_stride, storage_offset
+):
+    import neuronxcc.nki.isa as nisa
+    import neuronxcc.nki.language as nl
+
+    # src and dst are already 1D tensors from the caller
+    # Loop over the outer dimension
+    for i in nl.sequential_range(outer_size):
+        # Calculate source position accounting for storage offset and stride
+        src_start = storage_offset + i * src_outer_stride
+
+        # Calculate destination position (destination is contiguous)
+        dst_start = i * inner_size
+
+        # Copy inner_size elements from source to destination
+        nisa.dma_copy(
+            dst=dst[dst_start : dst_start + inner_size],
+            src=src[src_start : src_start + inner_size],
+        )
+
+
+@nki_op("nki_kernels::contiguous_rank2", mutates_args={})
+def contiguous_rank2_kernel(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    shape: list[int],
+    src_strides: list[int],
+    block_size: int,
+    storage_offset: int,
+) -> torch.Tensor:
     """
     Wrapper for RANK2 kernel with debug logging and parameter adaptation.
 
@@ -13,11 +51,6 @@ def contiguous_rank2_kernel(src, dst, shape, src_strides, block_size, storage_of
         block_size: Number of contiguous elements (should equal shape[1])
         storage_offset: Storage offset of the original tensor
     """
-    # Import here to avoid circular import
-    import torch
-
-    from torch_neuronx import TorchNeuronNKIKernel
-
     # Validate parameters
     if len(shape) != 2:
         raise ValueError(f"Expected rank-2 collapsed shape, got {len(shape)} dimensions")
@@ -73,26 +106,12 @@ def contiguous_rank2_kernel(src, dst, shape, src_strides, block_size, storage_of
             src_outer_stride *= element_size_multiplier
             storage_offset *= element_size_multiplier
 
-    # Create traced kernel
-    @TorchNeuronNKIKernel.trace
-    def _traced_kernel(src, dst, outer_size, inner_size, src_outer_stride, storage_offset):
-        import neuronxcc.nki.isa as nisa
-        import neuronxcc.nki.language as nl
-
-        # src and dst are already 1D tensors from the caller
-        # Loop over the outer dimension
-        for i in nl.sequential_range(outer_size):
-            # Calculate source position accounting for storage offset and stride
-            src_start = storage_offset + i * src_outer_stride
-
-            # Calculate destination position (destination is contiguous)
-            dst_start = i * inner_size
-
-            # Copy inner_size elements from source to destination
-            nisa.dma_copy(
-                dst=dst[dst_start : dst_start + inner_size],
-                src=src[src_start : src_start + inner_size],
-            )
-
     # Call the traced kernel
-    return _traced_kernel(src, dst, outer_size, inner_size, src_outer_stride, storage_offset)
+    return _traced_kernel(
+        src,
+        dst,
+        outer_size,
+        inner_size,
+        src_outer_stride,
+        storage_offset,
+    )
