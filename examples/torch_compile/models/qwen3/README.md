@@ -4,6 +4,7 @@ This example demonstrates running the TorchTitan Qwen3 8B model with tensor para
 
 ## Requirements
 ```
+tensorboard>=2.20.0
 torchtitan==0.2.0
 transformers==4.57.3
 ```
