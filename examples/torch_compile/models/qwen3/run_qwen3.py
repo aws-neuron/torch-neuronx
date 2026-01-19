@@ -558,7 +558,7 @@ def run_qwen3_generation(**kwargs):
 
     # Warm-up forward pass (triggers compilation)
     logger.info(f"Rank {rank}: Running warm-up forward pass...")
-    # warmup_output = run_neuron_forward(rank, compiled_model, input_tokens, run_number=1)
+    warmup_output = run_neuron_forward(rank, compiled_model, input_tokens, run_number=1)
     logger.info(f"Rank {rank}: Warm-up complete")
 
     # Synchronize all ranks before generation
