@@ -27,6 +27,8 @@ from transformers import (
     GenerationConfig,
 )
 
+import torch_neuronx
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -198,6 +200,7 @@ def run_qwen2_generation(**kwargs):
     """Test Qwen2 model generation."""
     model_size = kwargs.get("model_size", DEFAULT_MODEL_SIZE)
     max_seq_len = kwargs.get("max_seq_len", MAX_SEQ_LEN)
+    max_new_tokens = kwargs.get("max_new_tokens", MAX_NEW_TOKENS)
     prompt = kwargs.get("prompt", DEFAULT_PROMPT)
 
     model_id = get_model_id(model_size)
@@ -256,7 +259,7 @@ def run_qwen2_generation(**kwargs):
     model.forward = torch.compile(model.forward, backend="neuron", fullgraph=True, dynamic=False)
 
     gen_config = GenerationConfig(
-        max_length=max_seq_len,
+        max_length=max_seq_len+max_new_tokens,
         do_sample=False,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
