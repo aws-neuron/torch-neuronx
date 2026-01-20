@@ -97,9 +97,6 @@ def patch_deepseek_v3_for_neuron(model: nn.Module) -> nn.Module:
     model.register_buffer("rope_cos", cos, persistent=False)
     model.register_buffer("rope_sin", sin, persistent=False)
 
-    # Store original reshape_for_broadcast function
-    original_reshape_for_broadcast = ds_model.reshape_for_broadcast
-
     # Monkey-patch the apply_rotary_emb function
     def new_apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         """Neuron-compatible rotary embedding using real arithmetic."""
