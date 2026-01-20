@@ -4,6 +4,7 @@ and torch.compile with Neuron backend.
 """
 
 import argparse
+import dataclasses
 import logging
 import time
 
@@ -43,15 +44,16 @@ torch.set_default_dtype(torch.float32)
 
 def get_deepseek_v3_16b_args() -> DeepSeekV3ModelArgs:
     """Get model args for DeepSeek V3 16B model."""
-    return DeepSeekV3ModelArgs(
-        vocab_size=102400,
-        dim=2048,
-        inter_dim=10944,
-        moe_inter_dim=1408,
-        n_layers=27,
-        n_dense_layers=1,
-        n_heads=16,
-        moe_args=MoEArgs(
+    # Base arguments that should work with all versions
+    base_args = {
+        "vocab_size": 102400,
+        "dim": 2048,
+        "inter_dim": 10944,
+        "moe_inter_dim": 1408,
+        "n_layers": 27,
+        "n_dense_layers": 1,
+        "n_heads": 16,
+        "moe_args": MoEArgs(
             num_experts=64,
             num_shared_experts=2,
             top_k=6,
@@ -60,15 +62,30 @@ def get_deepseek_v3_16b_args() -> DeepSeekV3ModelArgs:
             score_before_experts=False,
             use_grouped_mm=False,  # Use for-loop for inference compatibility
         ),
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        attn_type="sdpa",  # Use SDPA for Neuron compatibility
-        attn_mask_type="causal",
-        mscale=0.70,
-    )
+        "q_lora_rank": 0,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+    }
+
+    # Optional arguments that may not exist in older versions
+    if dataclasses.is_dataclass(DeepSeekV3ModelArgs):
+        field_names = {f.name for f in dataclasses.fields(DeepSeekV3ModelArgs)}
+    else:
+        field_names = set()
+
+    optional_args = {
+        "attn_type": "sdpa",  # Use SDPA for Neuron compatibility
+        "attn_mask_type": "causal",
+        "mscale": 0.70,
+    }
+
+    for key, value in optional_args.items():
+        if key in field_names:
+            base_args[key] = value
+
+    return DeepSeekV3ModelArgs(**base_args)
 
 
 def get_model_args_from_hf(model_id: str) -> DeepSeekV3ModelArgs:
@@ -81,16 +98,17 @@ def get_model_args_from_hf(model_id: str) -> DeepSeekV3ModelArgs:
         num_shared_experts = getattr(hf_config, "n_shared_experts", 2)
         top_k = getattr(hf_config, "num_experts_per_tok", 6)
 
-        return DeepSeekV3ModelArgs(
-            dim=hf_config.hidden_size,
-            n_layers=hf_config.num_hidden_layers,
-            n_heads=hf_config.num_attention_heads,
-            vocab_size=hf_config.vocab_size,
-            inter_dim=getattr(hf_config, "intermediate_size", 10944),
-            moe_inter_dim=getattr(hf_config, "moe_intermediate_size", 1408),
-            n_dense_layers=getattr(hf_config, "first_k_dense_replace", 1),
-            norm_eps=getattr(hf_config, "rms_norm_eps", 1e-5),
-            moe_args=MoEArgs(
+        # Base arguments that should work with all versions
+        base_args = {
+            "dim": hf_config.hidden_size,
+            "n_layers": hf_config.num_hidden_layers,
+            "n_heads": hf_config.num_attention_heads,
+            "vocab_size": hf_config.vocab_size,
+            "inter_dim": getattr(hf_config, "intermediate_size", 10944),
+            "moe_inter_dim": getattr(hf_config, "moe_intermediate_size", 1408),
+            "n_dense_layers": getattr(hf_config, "first_k_dense_replace", 1),
+            "norm_eps": getattr(hf_config, "rms_norm_eps", 1e-5),
+            "moe_args": MoEArgs(
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
                 top_k=top_k,
@@ -99,16 +117,31 @@ def get_model_args_from_hf(model_id: str) -> DeepSeekV3ModelArgs:
                 score_before_experts=False,
                 use_grouped_mm=False,
             ),
-            q_lora_rank=getattr(hf_config, "q_lora_rank", 0),
-            kv_lora_rank=getattr(hf_config, "kv_lora_rank", 512),
-            qk_nope_head_dim=getattr(hf_config, "qk_nope_head_dim", 128),
-            qk_rope_head_dim=getattr(hf_config, "qk_rope_head_dim", 64),
-            v_head_dim=getattr(hf_config, "v_head_dim", 128),
-            rope_theta=getattr(hf_config, "rope_theta", 10000.0),
-            max_seq_len=getattr(hf_config, "max_position_embeddings", 4096),
-            attn_type="sdpa",
-            attn_mask_type="causal",
-        )
+            "q_lora_rank": getattr(hf_config, "q_lora_rank", 0),
+            "kv_lora_rank": getattr(hf_config, "kv_lora_rank", 512),
+            "qk_nope_head_dim": getattr(hf_config, "qk_nope_head_dim", 128),
+            "qk_rope_head_dim": getattr(hf_config, "qk_rope_head_dim", 64),
+            "v_head_dim": getattr(hf_config, "v_head_dim", 128),
+            "rope_theta": getattr(hf_config, "rope_theta", 10000.0),
+            "max_seq_len": getattr(hf_config, "max_position_embeddings", 4096),
+        }
+
+        # Optional arguments that may not exist in older versions
+        if dataclasses.is_dataclass(DeepSeekV3ModelArgs):
+            field_names = {f.name for f in dataclasses.fields(DeepSeekV3ModelArgs)}
+        else:
+            field_names = set()
+
+        optional_args = {
+            "attn_type": "sdpa",
+            "attn_mask_type": "causal",
+        }
+
+        for key, value in optional_args.items():
+            if key in field_names:
+                base_args[key] = value
+
+        return DeepSeekV3ModelArgs(**base_args)
     except Exception as e:
         logger.warning(f"Failed to load config from HF ({e}), using default 16B config")
         return get_deepseek_v3_16b_args()
