@@ -197,69 +197,29 @@ def get_model_args_from_hf(model_id: str) -> DeepSeekV3ModelArgs:
 def apply_tp_for_inference(
     model: nn.Module,
     tp_mesh: DeviceMesh,
+    skip_tp: bool = False,
 ):
-    """Apply tensor parallelism for DeepSeek V3 inference."""
-    # Global layers
-    # Note: For large vocab (102400), we replicate embeddings to avoid large
-    # collective operations that exceed Neuron's 40MB limit per collective.
-    # This trades memory for avoiding collective operation size limits.
-    parallelize_module(
-        model,
-        tp_mesh,
-        {
-            # Replicate embeddings to avoid large reduce_scatter
-            "tok_embeddings": NoParallel(use_local_output=False),
-            # No sequence parallelism since we replicate embeddings
-            "norm": NoParallel(use_local_output=False),
-            # Replicate output to avoid large all_gather
-            "output": NoParallel(use_local_output=False),
-        },
+    """Apply tensor parallelism for DeepSeek V3 inference.
+
+    Due to Neuron's 40MB collective operation size limit, we cannot use DTensor-based
+    TP on this model. The embedding layer alone is ~800MB which exceeds the limit.
+
+    When skip_tp=True, no tensor parallelism is applied and the model runs with
+    full replication on each device (data parallel style).
+    """
+    if skip_tp:
+        logger.info("Skipping tensor parallelism due to Neuron collective size limits")
+        return model
+
+    # Note: DTensor-based TP triggers all_reduce for parameter replication
+    # which exceeds Neuron's 40MB collective size limit for large weights.
+    # For now, we skip TP entirely. Future work could implement manual
+    # weight sharding without using DTensor collectives.
+
+    logger.warning(
+        "DTensor-based TP is not supported on Neuron due to collective size limits. "
+        "Running with replicated weights on each device."
     )
-
-    for transformer_block in model.layers.values():
-        # With replicated embeddings, inputs are Replicate() not Shard(1)
-        layer_plan = {
-            # No need for SequenceParallel on norms since we're not using SP
-            "attention_norm": NoParallel(use_local_output=False),
-            # MLA attention: wkv_a is not parallelized, wkv_b is column-wise
-            "attention.wkv_a": NoParallel(use_local_output=False),
-            "attention.wkv_b": ColwiseParallel(use_local_output=False),
-            "attention.kv_norm": NoParallel(use_local_output=False),
-            "attention.wo": RowwiseParallel(output_layouts=Replicate()),
-            "ffn_norm": NoParallel(use_local_output=False),
-        }
-
-        # Query projection (q_lora_rank=0 for 16B model)
-        if hasattr(transformer_block.attention, "wq"):
-            layer_plan["attention.wq"] = ColwiseParallel(use_local_output=False)
-        else:
-            # For models with q_lora_rank > 0
-            layer_plan.update(
-                {
-                    "attention.wq_a": NoParallel(use_local_output=False),
-                    "attention.wq_b": ColwiseParallel(use_local_output=False),
-                    "attention.q_norm": NoParallel(use_local_output=False),
-                }
-            )
-
-        # Dense FFN layers (layer 0 only for 16B)
-        if not transformer_block.moe_enabled:
-            layer_plan.update(
-                {
-                    "feed_forward.w1": ColwiseParallel(),
-                    "feed_forward.w2": RowwiseParallel(output_layouts=Replicate()),
-                    "feed_forward.w3": ColwiseParallel(),
-                }
-            )
-        # MoE layers: replicate for inference simplicity
-        # Expert parallelism requires more complex setup
-
-        parallelize_module(
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            parallelize_plan=layer_plan,
-        )
-
     return model
 
 
@@ -662,7 +622,10 @@ def create_deepseek_v3_model_with_tp(
     random_init: bool = False,
 ) -> nn.Module:
     """
-    Create DeepSeek V3 model: CPU (with weights) -> TP -> move to device.
+    Create DeepSeek V3 model: CPU (with weights) -> move to device.
+
+    Note: DTensor-based TP is disabled due to Neuron's 40MB collective size limit.
+    The model runs with replicated weights on each device.
     """
     torch.set_default_dtype(torch.float32)
 
@@ -679,14 +642,14 @@ def create_deepseek_v3_model_with_tp(
         logger.info(f"Rank {rank}: Using random initialization...")
         model.init_weights()
 
-    logger.info(f"Rank {rank}: Applying tensor parallelism...")
-    tp_start = time.time()
-    model = apply_tp_for_inference(model=model, tp_mesh=device_mesh)
-    logger.info(f"Rank {rank}: TP application took {time.time() - tp_start:.3f}s")
+    # Skip TP due to Neuron collective size limits
+    logger.info(f"Rank {rank}: Skipping TP (Neuron collective size limit)")
+    model = apply_tp_for_inference(model=model, tp_mesh=device_mesh, skip_tp=True)
 
     logger.info(f"Rank {rank}: Moving to {device}...")
     move_start = time.time()
-    move_dtensor_model_to_device(model, device)
+    # Since we skip TP, model has regular tensors, not DTensors
+    model = model.to(device)
     logger.info(f"Rank {rank}: Move to device took {time.time() - move_start:.3f}s")
 
     return model
@@ -760,8 +723,14 @@ def run_deepseek_v3_generation(**kwargs):
         logger.info(f"Rank {rank}: {prompt}")
         logger.info(f"Rank {rank}: ==============")
 
-    # Compile model
-    compiled_model = torch.compile(model, backend="neuron", fullgraph=True, dynamic=False)
+    # Compile model (or use eager mode)
+    no_compile = kwargs.get("no_compile", False)
+    if no_compile:
+        logger.info(f"Rank {rank}: Running in eager mode (no torch.compile)")
+        compiled_model = model
+    else:
+        logger.info(f"Rank {rank}: Compiling model with neuron backend...")
+        compiled_model = torch.compile(model, backend="neuron", fullgraph=True, dynamic=False)
 
     # Warm-up forward pass
     logger.info(f"Rank {rank}: Running warm-up forward pass...")
@@ -848,6 +817,12 @@ def parse_args():
         default=False,
         help="Use smaller debug model for testing (8 experts, 6 layers, fits in TP=4)",
     )
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        default=False,
+        help="Run in eager mode without torch.compile (for debugging)",
+    )
     return parser.parse_args()
 
 
@@ -862,4 +837,5 @@ if __name__ == "__main__":
         random_init=args.random_init or (args.hf_model_id is None),
         tokenizer_id=args.tokenizer_id,
         debug=args.debug,
+        no_compile=args.no_compile,
     )
