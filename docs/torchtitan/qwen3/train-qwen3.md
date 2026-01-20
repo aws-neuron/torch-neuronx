@@ -9,6 +9,8 @@ See Installation section in [README.md](../../../README.md)
 cd ~
 git clone https://github.com/pytorch/torchtitan.git
 cd torchtitan
+# Use a compatible version (has qwen3, no varlen dependency, no _ranks argument)
+git checkout e37f83f5
 git apply ~/torch-neuronx/docs/torchtitan/qwen3/TorchTitan.diff
 pip install -r requirements.txt
 pip install triton

@@ -1,8 +1,8 @@
 diff --git a/torchtitan/models/qwen3/infra/parallelize.py b/torchtitan/models/qwen3/infra/parallelize.py
-index 268e7d31..6b962eff 100644
+index 6b8dc3d5..f5b04ea1 100644
 --- a/torchtitan/models/qwen3/infra/parallelize.py
 +++ b/torchtitan/models/qwen3/infra/parallelize.py
-@@ -37,6 +37,7 @@ _op_sac_save_list = {
+@@ -37,12 +37,14 @@ _op_sac_save_list = {
      torch.ops.aten.mm.default,
      torch.ops.aten._scaled_dot_product_efficient_attention.default,
      torch.ops.aten._scaled_dot_product_flash_attention.default,
@@ -10,47 +10,44 @@ index 268e7d31..6b962eff 100644
      torch.ops._c10d_functional.reduce_scatter_tensor.default,
      # for low precision training, it's useful to always save
      # the result of max, since the absolute maximum is
-@@ -44,6 +45,7 @@ _op_sac_save_list = {
+     # used to compute the scaling factor for quantization.
      torch.ops.aten.max.default,
      torch._higher_order_ops.flex_attention,
-     torch.ops.torch_attn._varlen_attn,
 +    torch.ops.aten.linear.default,
  }
-
-
+ 
+ 
 diff --git a/torchtitan/tools/utils.py b/torchtitan/tools/utils.py
-index 0b1c78d0..f28dd12e 100644
+index 0b1c78d0..399f8642 100644
 --- a/torchtitan/tools/utils.py
 +++ b/torchtitan/tools/utils.py
-@@ -15,7 +15,7 @@ import torch
+@@ -15,6 +15,7 @@ import torch
  from torch._utils import _get_available_device_type, _get_device_module
-
+ 
  from torchtitan.tools.logging import logger
--
 +import torch_neuronx
-
+ 
+ 
  def has_cuda_capability(major: int, minor: int) -> bool:
-     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
-@@ -120,6 +120,9 @@ def get_peak_flops(device_name: str) -> int:
+@@ -120,6 +121,9 @@ def get_peak_flops(device_name: str) -> int:
      elif "l40s" in device_name:
          # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
          return 362e12
 +    elif "neuron" in device_name:
 +        # we assume lnc2 here
 +        return 157e12
-
+ 
      else:  # for other GPU types, assume A100
          logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
 diff --git a/torchtitan/train.py b/torchtitan/train.py
-index 03809dd0..6b952277 100644
+index 5cfab998..5a5cad5e 100644
 --- a/torchtitan/train.py
 +++ b/torchtitan/train.py
-@@ -33,6 +33,8 @@ from torchtitan.tools.profiling import (
+@@ -32,6 +32,7 @@ from torchtitan.tools.profiling import (
+     maybe_enable_memory_snapshot,
      maybe_enable_profiling,
  )
-
 +import torch_neuronx
-+
-
+ 
+ 
  class Trainer(torch.distributed.checkpoint.stateful.Stateful):
-     # core configs
