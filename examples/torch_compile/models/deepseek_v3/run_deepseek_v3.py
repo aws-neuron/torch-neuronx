@@ -31,6 +31,108 @@ import torch_neuronx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Neuron-compatible rotary embeddings (using real arithmetic instead of complex)
+# ============================================================================
+
+def apply_rotary_emb_real_paired(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Apply rotary embeddings using real arithmetic that matches complex RoPE.
+
+    This implements the same computation as complex RoPE:
+        x_complex = x[..., ::2] + i * x[..., 1::2]
+        y_complex = x_complex * (cos + i * sin)
+        y = interleave(y_complex.real, y_complex.imag)
+
+    But using only real arithmetic for Neuron compatibility.
+
+    Args:
+        x: Input tensor of shape (..., head_dim) where head_dim is even
+        cos: Cosine tensor of shape (seq_len, head_dim // 2) or broadcastable
+        sin: Sine tensor of shape (seq_len, head_dim // 2) or broadcastable
+
+    Returns:
+        Tensor with rotary embeddings applied, same shape as x
+    """
+    # x shape: typically (batch, seq_len, n_heads, head_dim)
+    # Split into even and odd indices (this pairs adjacent elements like complex)
+    x_even = x[..., ::2]  # x0, x2, x4, ... (real parts in complex view)
+    x_odd = x[..., 1::2]  # x1, x3, x5, ... (imag parts in complex view)
+
+    # Complex multiplication: (x_even + i*x_odd) * (cos + i*sin)
+    # = (x_even*cos - x_odd*sin) + i*(x_even*sin + x_odd*cos)
+    y_even = x_even * cos - x_odd * sin
+    y_odd = x_even * sin + x_odd * cos
+
+    # Interleave back: [y_even[0], y_odd[0], y_even[1], y_odd[1], ...]
+    y = torch.stack([y_even, y_odd], dim=-1).flatten(-2)
+
+    return y.type_as(x)
+
+
+def patch_deepseek_v3_for_neuron(model: nn.Module) -> nn.Module:
+    """Patch DeepSeek V3 model to use Neuron-compatible rotary embeddings.
+
+    The original TorchTitan DeepSeek V3 uses complex arithmetic for RoPE:
+        x = torch.view_as_complex(...)
+        y = torch.view_as_real(x * freqs_cis)
+
+    Neuron doesn't support complex operations with broadcasting, so we convert
+    to use real arithmetic that produces identical results.
+    """
+    import torchtitan.models.deepseek_v3.model.model as ds_model
+
+    # Store original freqs_cis (complex) and convert to cos/sin
+    original_freqs_cis = model.freqs_cis.clone()
+
+    # Extract cos and sin from complex exponentials
+    # freqs_cis shape: (seq_len, head_dim // 2), dtype: complex64
+    # e^(i*theta) = cos(theta) + i*sin(theta)
+    cos = original_freqs_cis.real.float()  # (seq_len, head_dim // 2)
+    sin = original_freqs_cis.imag.float()  # (seq_len, head_dim // 2)
+
+    # Replace the complex freqs_cis with cos/sin cache
+    model.register_buffer("rope_cos", cos, persistent=False)
+    model.register_buffer("rope_sin", sin, persistent=False)
+
+    # Store original reshape_for_broadcast function
+    original_reshape_for_broadcast = ds_model.reshape_for_broadcast
+
+    # Monkey-patch the apply_rotary_emb function
+    def new_apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        """Neuron-compatible rotary embedding using real arithmetic."""
+        # x shape: (batch, seq_len, n_heads, head_dim) where head_dim = qk_rope_head_dim
+        # freqs_cis is the original complex tensor, but we'll use our cos/sin instead
+
+        seq_len = x.shape[1]
+        ndim = x.ndim
+
+        # Get the cos/sin for this sequence length
+        cos = model.rope_cos[:seq_len]
+        sin = model.rope_sin[:seq_len]
+
+        # Ensure cos/sin are on same device as x
+        cos = cos.to(x.device, dtype=x.dtype)
+        sin = sin.to(x.device, dtype=x.dtype)
+
+        # Reshape for broadcasting: (seq_len, head_dim//2) -> (1, seq_len, 1, head_dim//2)
+        # to match x shape (batch, seq_len, n_heads, head_dim)
+        shape = [1] * ndim
+        shape[1] = seq_len  # seq_len dimension
+        shape[-1] = cos.shape[-1]  # head_dim // 2
+        cos = cos.view(*shape)
+        sin = sin.view(*shape)
+
+        return apply_rotary_emb_real_paired(x, cos, sin)
+
+    # Replace the module-level function
+    ds_model.apply_rotary_emb = new_apply_rotary_emb
+
+    logger.info("Patched DeepSeek V3 model with Neuron-compatible rotary embeddings")
+    return model
+
 BATCH_SIZE = 1
 NUM_TOKENS_TO_GENERATE = 20
 MAX_SEQ_LEN = 128
@@ -641,6 +743,10 @@ def create_deepseek_v3_model_with_tp(
     else:
         logger.info(f"Rank {rank}: Using random initialization...")
         model.init_weights()
+
+    # Patch model for Neuron compatibility (replace complex RoPE with real arithmetic)
+    logger.info(f"Rank {rank}: Patching model for Neuron-compatible rotary embeddings...")
+    model = patch_deepseek_v3_for_neuron(model)
 
     # Skip TP due to Neuron collective size limits
     logger.info(f"Rank {rank}: Skipping TP (Neuron collective size limit)")
