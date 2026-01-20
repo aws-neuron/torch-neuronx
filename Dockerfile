@@ -4,7 +4,7 @@ FROM public.ecr.aws/ubuntu/ubuntu:22.04_stable
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install basic dependencies and add deadsnakes PPA for Python 3.11
+# Install basic dependencies (using Python 3.10 which is default on Ubuntu 22.04)
 RUN apt-get update -y && \
     apt-get install -y \
     wget \
@@ -12,19 +12,13 @@ RUN apt-get update -y && \
     gnupg \
     lsb-release \
     software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update -y && \
-    apt-get install -y \
-    python3.11 \
-    python3.11-dev \
-    python3.11-distutils \
+    python3 \
+    python3-dev \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Create python symlink to Python 3.11 and install pip for Python 3.11
-RUN ln -s /usr/bin/python3.11 /usr/bin/python && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+# Create python symlink to Python 3.10
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # Configure Linux for Neuron repository updates
 RUN . /etc/os-release && \
@@ -38,7 +32,7 @@ RUN apt-get update -y
 RUN apt-get install -y \
     git \
     build-essential \
-    python3.11-venv \
+    python3-venv \
     python3-numpy \
     python3-setuptools \
     python3-wheel \
@@ -100,12 +94,31 @@ RUN python -m pip config set global.extra-index-url https://pip.repos.neuron.ama
 # Install compiler (will use PyPI for dependencies and Neuron repo for neuronx-cc)
 RUN python -m pip install neuronx-cc==2.20.*
 
-# Install additional dependencies for PyTorch CPU build
+# Install additional dependencies for PyTorch CPU build and C++ tests
 RUN apt-get update -y && \
     apt-get install -y \
     cmake \
     ninja-build \
+    libgtest-dev \
+    libgmock-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build and install GTest libraries
+RUN cd /usr/src/googletest && \
+    cmake . && \
+    make && \
+    cp lib/*.a /usr/lib/ 2>/dev/null || true
+
+# Install Bazelisk for Bazel builds
+RUN ARCH=$(uname -m) && \
+    case $ARCH in \
+        x86_64) BAZELISK_ARCH="linux-amd64" ;; \
+        aarch64|arm64) BAZELISK_ARCH="linux-arm64" ;; \
+    esac && \
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/bazelbuild/bazelisk/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') && \
+    curl -L -o /usr/local/bin/bazelisk "https://github.com/bazelbuild/bazelisk/releases/download/${LATEST_VERSION}/bazelisk-${BAZELISK_ARCH}" && \
+    chmod +x /usr/local/bin/bazelisk && \
+    ln -s /usr/local/bin/bazelisk /usr/local/bin/bazel
 
 # Install Python dependencies for PyTorch build
 RUN python -m pip install cmake ninja
@@ -131,21 +144,22 @@ ENV CMAKE_PREFIX_PATH=/usr/local
 # Build and install PyTorch from source (CPU-only)
 RUN python -m pip install --no-build-isolation -v -e .
 
-# Clone pytorch/xla repository for torchax
-RUN git clone https://github.com/pytorch/xla.git /code/torch_xla
+# Install torchax from PyPI (moved from pytorch/xla to google/torchax)
+RUN python -m pip install torchax
 
-# Install torchax from local repository
-RUN python -m pip install /code/torch_xla/torchax
+# Install JAX and jaxlib from PyPI (compatible versions)
+RUN pip install jax jaxlib
 
-# Install prebuilt jaxlib wheel (instead of building from source)
-RUN pip install jaxlib
+# Copy torch-neuronx source code
+COPY . /code/torch-neuronx
+WORKDIR /code/torch-neuronx
 
-# Clone JAX repository
-RUN git clone https://github.com/jax-ml/jax /code/jax
+# Set execute permissions for tools
+RUN chmod +x ./tools/*
 
-# Install JAX in editable mode
-WORKDIR /code/jax
-RUN pip install -e .
+# Build torch-neuronx with Bazel and install
+RUN ./tools/build
+RUN USE_BAZEL=1 python -m pip install --no-build-isolation -e .
 
 # Create and set working directory
 RUN mkdir -p /workspace
