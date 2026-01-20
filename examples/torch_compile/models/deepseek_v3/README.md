@@ -50,12 +50,26 @@ pip install -e .
 
 ## Usage
 
-### Basic Inference (Random Initialization)
+### Debug Model (Recommended for Testing)
 
-For testing compilation and model structure without pre-trained weights:
+For testing compilation and the inference flow with a smaller model that fits in TP=4 memory:
 
 ```bash
 torchrun --nproc-per-node 4 run_deepseek_v3.py \
+    --debug \
+    --prompt "The future of artificial intelligence is" \
+    --num-tokens 20 \
+    --max-seq-len 128
+```
+
+The debug model uses: 8 experts (instead of 64), 6 layers (instead of 27), and smaller dimensions.
+
+### Full 16B Model (Requires TP=8+)
+
+The full 16B model requires more memory. Use TP=8 or higher:
+
+```bash
+torchrun --nproc-per-node 8 run_deepseek_v3.py \
     --prompt "The future of artificial intelligence is" \
     --num-tokens 20 \
     --max-seq-len 128
@@ -82,6 +96,7 @@ torchrun --nproc-per-node 4 run_deepseek_v3.py \
 | `--prompt` | "The future of artificial intelligence is" | Input prompt for text generation |
 | `--hf-model-id` | None | HuggingFace model ID (optional, for loading weights) |
 | `--random-init` | False | Use random initialization instead of loading weights |
+| `--debug` | False | Use smaller debug model (8 experts, 6 layers) for testing |
 
 ## Tensor Parallelism
 
@@ -94,7 +109,7 @@ The script automatically applies tensor parallelism across available Neuron core
 
 ## Notes
 
-1. **Memory Requirements**: The 16B model requires significant memory. Use at least 4 Neuron cores for tensor parallelism.
+1. **Memory Requirements**: The full 16B model with 64 experts requires significant memory. Use TP=8+ for the full model, or use `--debug` for testing with TP=4.
 
 2. **Attention Type**: The script uses SDPA (Scaled Dot Product Attention) for Neuron compatibility instead of FlexAttention.
 
@@ -105,8 +120,9 @@ The script automatically applies tensor parallelism across available Neuron core
 ## Troubleshooting
 
 ### Out of Memory
+- Use `--debug` flag to test with a smaller model configuration
 - Reduce `--max-seq-len`
-- Increase tensor parallelism degree (more Neuron cores)
+- Use TP=8 or higher for the full 16B model (64 experts)
 
 ### Compilation Errors
 - Ensure TorchTitan and torch-neuronx versions are compatible

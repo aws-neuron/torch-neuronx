@@ -42,6 +42,53 @@ HF_TOKENIZER_ID = "deepseek-ai/deepseek-moe-16b-base"
 torch.set_default_dtype(torch.float32)
 
 
+def get_debug_model_args() -> DeepSeekV3ModelArgs:
+    """Get smaller debug model args for testing (fits in TP=4 memory)."""
+    # Debug model: 8 experts, 6 layers, smaller dimensions
+    # Roughly similar to TorchTitan's debugmodel configuration
+    base_args = {
+        "vocab_size": 102400,
+        "dim": 512,  # Reduced from 2048
+        "inter_dim": 1408,  # Reduced from 10944
+        "moe_inter_dim": 512,  # Reduced from 1408
+        "n_layers": 6,  # Reduced from 27
+        "n_dense_layers": 1,
+        "n_heads": 8,  # Reduced from 16
+        "moe_args": MoEArgs(
+            num_experts=8,  # Reduced from 64
+            num_shared_experts=2,
+            top_k=2,  # Reduced from 6
+            score_func="softmax",
+            route_norm=False,
+            score_before_experts=False,
+            use_grouped_mm=False,
+        ),
+        "q_lora_rank": 0,
+        "kv_lora_rank": 128,  # Reduced from 512
+        "qk_nope_head_dim": 64,  # Reduced from 128
+        "qk_rope_head_dim": 32,  # Reduced from 64
+        "v_head_dim": 64,  # Reduced from 128
+    }
+
+    # Optional arguments that may not exist in older versions
+    if dataclasses.is_dataclass(DeepSeekV3ModelArgs):
+        field_names = {f.name for f in dataclasses.fields(DeepSeekV3ModelArgs)}
+    else:
+        field_names = set()
+
+    optional_args = {
+        "attn_type": "sdpa",
+        "attn_mask_type": "causal",
+        "mscale": 0.70,
+    }
+
+    for key, value in optional_args.items():
+        if key in field_names:
+            base_args[key] = value
+
+    return DeepSeekV3ModelArgs(**base_args)
+
+
 def get_deepseek_v3_16b_args() -> DeepSeekV3ModelArgs:
     """Get model args for DeepSeek V3 16B model."""
     # Base arguments that should work with all versions
@@ -153,36 +200,33 @@ def apply_tp_for_inference(
 ):
     """Apply tensor parallelism for DeepSeek V3 inference."""
     # Global layers
+    # Note: For large vocab (102400), we replicate embeddings to avoid large
+    # collective operations that exceed Neuron's 40MB limit per collective.
+    # This trades memory for avoiding collective operation size limits.
     parallelize_module(
         model,
         tp_mesh,
         {
-            "tok_embeddings": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-            ),
-            "norm": SequenceParallel(),
-            "output": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Replicate(),
-                use_local_output=True,
-            ),
+            # Replicate embeddings to avoid large reduce_scatter
+            "tok_embeddings": NoParallel(use_local_output=False),
+            # No sequence parallelism since we replicate embeddings
+            "norm": NoParallel(use_local_output=False),
+            # Replicate output to avoid large all_gather
+            "output": NoParallel(use_local_output=False),
         },
     )
 
     for transformer_block in model.layers.values():
+        # With replicated embeddings, inputs are Replicate() not Shard(1)
         layer_plan = {
-            "attention_norm": SequenceParallel(),
-            "attention": PrepareModuleInput(
-                input_layouts=(Shard(1), Replicate(), None, None),
-                desired_input_layouts=(Replicate(), Replicate(), None, None),
-            ),
+            # No need for SequenceParallel on norms since we're not using SP
+            "attention_norm": NoParallel(use_local_output=False),
             # MLA attention: wkv_a is not parallelized, wkv_b is column-wise
             "attention.wkv_a": NoParallel(use_local_output=False),
             "attention.wkv_b": ColwiseParallel(use_local_output=False),
             "attention.kv_norm": NoParallel(use_local_output=False),
-            "attention.wo": RowwiseParallel(output_layouts=Shard(1)),
-            "ffn_norm": SequenceParallel(),
+            "attention.wo": RowwiseParallel(output_layouts=Replicate()),
+            "ffn_norm": NoParallel(use_local_output=False),
         }
 
         # Query projection (q_lora_rank=0 for 16B model)
@@ -202,26 +246,13 @@ def apply_tp_for_inference(
         if not transformer_block.moe_enabled:
             layer_plan.update(
                 {
-                    "feed_forward": PrepareModuleInput(
-                        input_layouts=(Shard(1),),
-                        desired_input_layouts=(Replicate(),),
-                    ),
                     "feed_forward.w1": ColwiseParallel(),
-                    "feed_forward.w2": RowwiseParallel(output_layouts=Shard(1)),
+                    "feed_forward.w2": RowwiseParallel(output_layouts=Replicate()),
                     "feed_forward.w3": ColwiseParallel(),
                 }
             )
-        else:
-            # MoE layers: replicate for inference simplicity
-            # Expert parallelism requires more complex setup
-            layer_plan.update(
-                {
-                    "moe": PrepareModuleInput(
-                        input_layouts=(Shard(1),),
-                        desired_input_layouts=(Replicate(),),
-                    ),
-                }
-            )
+        # MoE layers: replicate for inference simplicity
+        # Expert parallelism requires more complex setup
 
         parallelize_module(
             module=transformer_block,
@@ -673,9 +704,14 @@ def run_deepseek_v3_generation(**kwargs):
     max_seq_len = kwargs.get("max_seq_len", MAX_SEQ_LEN)
     random_init = kwargs.get("random_init", True)
     tokenizer_id = kwargs.get("tokenizer_id", HF_TOKENIZER_ID)
+    debug = kwargs.get("debug", False)
 
     # Get model args
-    if hf_model_id:
+    if debug:
+        logger.info(f"Rank {rank}: Using DEBUG model configuration (smaller for testing)")
+        model_args = get_debug_model_args()
+        model_name = "deepseek_v3_debug"
+    elif hf_model_id:
         model_args = get_model_args_from_hf(hf_model_id)
     else:
         model_args = get_deepseek_v3_16b_args()
@@ -806,6 +842,12 @@ def parse_args():
         default=True,
         help="Use random initialization instead of loading weights",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Use smaller debug model for testing (8 experts, 6 layers, fits in TP=4)",
+    )
     return parser.parse_args()
 
 
@@ -819,4 +861,5 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         random_init=args.random_init or (args.hf_model_id is None),
         tokenizer_id=args.tokenizer_id,
+        debug=args.debug,
     )
