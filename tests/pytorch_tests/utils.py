@@ -108,6 +108,7 @@ def _create_test_config(
     class_name: str,
     test_methods: list[str],
     config: dict,
+    collect_skipped_tests: bool = False,
 ) -> PytorchTestConfig:
     normalized_xfail = _normalize_xfail_format(config.get("xfail", []))
 
@@ -129,9 +130,13 @@ def _create_test_config(
                     f"Skipping test {test_name}: {skip_config.get('reason', default_skip_reason)}"
                 )
 
-        # Remove skipped tests from the methods list
-        test_methods = [method for method in test_methods if method not in skip_test_names]
-        logger.info(f"After applying skip_tests filter, {len(test_methods)} test methods remain")
+        # Remove skipped tests from the methods list unless collect_skipped_tests is True
+        # When True, tests remain in list and pytest.mark.skip is applied in test wrapper
+        if not collect_skipped_tests:
+            test_methods = [method for method in test_methods if method not in skip_test_names]
+            logger.info(
+                f"After applying skip_tests filter, {len(test_methods)} test methods remain"
+            )
 
     return PytorchTestConfig(
         test_module=test_module,
@@ -167,7 +172,7 @@ def _apply_class_name_suffix(
 ) -> tuple[str, type]:
     """Apply device-specific suffix to test class name and return the class."""
     class_name_suffix_options = config.get("class_name_suffix_options")
-    if class_name_suffix_options is None:
+    if not class_name_suffix_options:
         return class_name, getattr(test_module, class_name)
 
     for class_name_suffix in class_name_suffix_options:
@@ -189,6 +194,7 @@ def _process_test_class(
     specified_methods: list[str] | None,
     config: dict,
     sanity_pt_distributed_tests: bool = False,
+    collect_skipped_tests: bool = False,
 ) -> PytorchTestConfig:
     # Apply suffix to class name and get class object
     neuron_test_class_name, pytorch_test_class = _apply_class_name_suffix(
@@ -218,6 +224,7 @@ def _process_test_class(
         neuron_test_class_name,
         filtered_methods,
         config,
+        collect_skipped_tests,
     )
 
 
@@ -226,17 +233,27 @@ def _process_all_classes_in_module(
     specified_methods: list[str] | None,
     config: dict,
     sanity_pt_distributed_tests: bool = False,
+    collect_skipped_tests: bool = False,
 ) -> list[PytorchTestConfig]:
     test_configs = []
     test_classes = _get_test_classes_from_module(test_module)
+    skip_classes = config.get("skip_classes", [])
 
     logger.info(f"Found {len(test_classes)} test classes in module: {test_classes}")
 
     for class_name in test_classes:
+        if any(skip in class_name for skip in skip_classes):
+            logger.info(f"Skipping class {class_name} due to skip_classes config")
+            continue
         try:
             # Use the same _process_test_class function
             pytorch_test_config = _process_test_class(
-                test_module, class_name, specified_methods, config, sanity_pt_distributed_tests
+                test_module,
+                class_name,
+                specified_methods,
+                config,
+                sanity_pt_distributed_tests,
+                collect_skipped_tests,
             )
             test_configs.append(pytorch_test_config)
         except AttributeError as e:
@@ -250,6 +267,7 @@ def _process_single_test_configuration(
     config: dict,
     test_dir: Path,
     sanity_pt_distributed_tests: bool = False,
+    collect_skipped_tests: bool = False,
 ) -> list[PytorchTestConfig]:
     # Skip if distributed flag doesn't match
     test_file_name = config["file"]
@@ -277,34 +295,26 @@ def _process_single_test_configuration(
         relative_parts = ".".join(Path(test_file_name).with_suffix("").parts)
         module_import_path = f"{import_path}.{relative_parts}"
 
-        # Patch dtensor_fails before import
-        if "dtensor_ops" in module_import_path and module_import_path not in sys.modules:
-            spec = importlib.util.find_spec(module_import_path)
-            if spec and spec.origin:
-                with open(spec.origin) as f:
-                    code = f.read()
-                # Replace dtensor_fails set with empty set
-                modified_code = code.replace(
-                    "dtensor_fails = {", "dtensor_fails = set() if True else {"
-                )
-                from types import ModuleType
-
-                module = ModuleType(module_import_path)
-                module.__file__ = spec.origin
-                exec(compile(modified_code, spec.origin, "exec"), module.__dict__)
-                sys.modules[module_import_path] = module
-
         test_module = importlib.import_module(module_import_path)
 
         if test_class_name is None:
             # Process all test classes in the module
             return _process_all_classes_in_module(
-                test_module, specified_methods, config, sanity_pt_distributed_tests
+                test_module,
+                specified_methods,
+                config,
+                sanity_pt_distributed_tests,
+                collect_skipped_tests,
             )
         else:
             # Process single specified test class
             pytorch_test_config = _process_test_class(
-                test_module, test_class_name, specified_methods, config, sanity_pt_distributed_tests
+                test_module,
+                test_class_name,
+                specified_methods,
+                config,
+                sanity_pt_distributed_tests,
+                collect_skipped_tests,
             )
             return [pytorch_test_config]
 
@@ -424,12 +434,15 @@ def _parse_test_configurations(
 
     else:
         test_method_list = args.test_method_name.split(",") if args.test_method_name else None
+        class_name_suffix_options = (
+            args.class_name_suffix_options.split(",") if args.class_name_suffix_options else None
+        )
 
         return [
             {
                 "file": args.test_file_name,
                 "class": args.test_class_name,
-                "class_name_suffix_options": args.class_name_suffix_options,
+                "class_name_suffix_options": class_name_suffix_options,
                 "methods": test_method_list,
                 "xfail": [],
                 "skip_tests": [],
@@ -534,6 +547,7 @@ def setup_pytorch_tests(
     spec_file="test_spec.json",
     sanity_pt_distributed_tests=False,
     class_name_filter=None,
+    collect_skipped_tests=False,
 ):
     """Clone pytorch tests, import test module and instantiate the test class.
 
@@ -541,6 +555,7 @@ def setup_pytorch_tests(
         spec_file: JSON spec file name in tests/pytorch_tests/specs/
         sanity_pt_distributed_tests: Enable sanity mode for distributed tests
         class_name_filter: If provided, only process configs matching this class name.
+        collect_skipped_tests: If true, collect skipped tests (appear as skipped in report).
     """
     parser = argparse.ArgumentParser(description="Run pytorch tests in torch_neuronx environment")
     parser.add_argument(
@@ -556,12 +571,12 @@ def setup_pytorch_tests(
         help="PyTorch test class name to instantiate. Defaults to classes in test_spec.json",
     )
     parser.add_argument(
-        "--class-name-suffix",
+        "--class-name-suffix-options",
         type=str,
         default=None,
         help=(
-            "Suffix to append to model class names. Required for certain classes to run on neuron "
-            "device ('PRIVATEUSE1' or 'NEURON')"
+            "Comma-separated suffixes to try appending to model class names. Required for "
+            "certain classes to run on neuron device (e.g., 'PRIVATEUSE1,NEURON')"
         ),
     )
     parser.add_argument(
@@ -624,7 +639,12 @@ def setup_pytorch_tests(
     # Process all configurations
     test_configs = []
     for config in test_configurations:
-        configs = _process_single_test_configuration(config, test_dir, sanity_pt_distributed_tests)
+        configs = _process_single_test_configuration(
+            config,
+            test_dir,
+            sanity_pt_distributed_tests,
+            collect_skipped_tests,
+        )
         test_configs.extend(configs)
 
     if not test_configs:

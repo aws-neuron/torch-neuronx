@@ -17,7 +17,7 @@ def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, 
     static_argnums=(2, 3, 4),
 )
 def torch_embedding_dense_backward(
-    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq, out=None
 ):
     if indices.dtype not in (torch.int32, torch.int64):
         raise RuntimeError(
@@ -31,14 +31,14 @@ def torch_embedding_dense_backward(
 
 
 @register_aten(["aten::_softmax", "aten::_softmax.out"], static_argnums=(1, 2))
-def torch_softmax_internal(x, dim, half_to_float):
+def torch_softmax_internal(x, dim, half_to_float, out=None):
     if half_to_float:
         x = x.float()
     return torch.softmax(x, dim)
 
 
 @register_aten(["aten::_log_softmax", "aten::_log_softmax.out"], static_argnums=(1, 2))
-def torch_log_softmax_internal(x, dim, half_to_float):
+def torch_log_softmax_internal(x, dim, half_to_float, out=None):
     if half_to_float:
         x = x.float()
     return torch.log_softmax(x, dim)
@@ -57,7 +57,7 @@ def torch_log_softmax(x, dim, dtype=None):
 @register_aten(
     ["aten::_softmax_backward_data", "aten::_softmax_backward_data.out"], static_argnums=(2, 3)
 )
-def torch_softmax_backward_data(grad_output, output, dim, input_dtype):
+def torch_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
     return torch.ops.aten._softmax_backward_data(grad_output, output, dim, input_dtype)
 
 
@@ -65,13 +65,22 @@ def torch_softmax_backward_data(grad_output, output, dim, input_dtype):
     ["aten::_log_softmax_backward_data", "aten::_log_softmax_backward_data.out"],
     static_argnums=(2, 3),
 )
-def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype):
+def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
     return torch.ops.aten._log_softmax_backward_data(grad_output, output, dim, input_dtype)
 
 
-@register_aten(["aten::lerp", "aten::lerp.Scalar_out", "aten::lerp.Tensor_out"])
-def torch_lerp(start, end, weight):
-    return torch.lerp(start, end, weight)
+@register_aten(
+    [
+        "aten::lerp.Scalar",
+        "aten::lerp.Scalar_out",
+        "aten::lerp.Tensor",
+        "aten::lerp.Tensor_out",
+        "aten::lerp_.Scalar",
+        "aten::lerp_.Tensor",
+    ]
+)
+def torch_lerp(start, end, weight, out=None):
+    return torch.ops.aten.lerp(start, end, weight)
 
 
 @register_aten(
@@ -86,6 +95,12 @@ def torch_histc(
     input: torch.Tensor, bins: int = 100, min: float = 0.0, max: float = 0.0, out=None
 ) -> torch.Tensor:
     """Fast histogram using linear interpolation like PyTorch."""
+    if out is not None and input.dtype != out.dtype:
+        raise RuntimeError(
+            "torch.histogram: input tensor and hist tensor should have the same dtype, "
+            f"but got input {input.dtype} and hist {out.dtype}"
+        )
+
     # Handle auto range
     if min == 0.0 and max == 0.0 and input.numel() > 0:
         min = input.min().item()
@@ -117,73 +132,13 @@ def torch_histc(
     )
 
 
-@register_aten(["aten::reflection_pad2d"])
-def torch_reflection_pad2d(x, padding):
-    return torch.nn.functional.pad(x, padding, mode="reflect")
-
-
-@register_aten(["aten::replication_pad2d", "aten::replication_pad2d.out"])
-def torch_replication_pad2d(x, padding):
-    return torch.nn.functional.pad(x, padding, mode="replicate")
+@register_aten(["aten::threshold", "aten::threshold.out"], static_argnums=(1, 2))
+def torch_threshold(self, threshold, value):
+    return torch.nn.functional.threshold(self, threshold, value)
 
 
 @register_aten(
-    ["aten::_scaled_dot_product_fused_attention_overrideable"], static_argnums=(4, 5, 6, 7)
+    ["aten::threshold_backward", "aten::threshold_backward.grad_input"], static_argnums=(2,)
 )
-def torch_sdpa_overridable(
-    query,
-    key,
-    value,
-    attn_bias=None,
-    dropout_p=0.0,
-    is_causal=False,
-    return_debug_mask=False,
-    scale=None,
-):
-    return torch.ops.aten._scaled_dot_product_fused_attention_overrideable(
-        query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale=scale
-    )
-
-
-@register_aten(
-    ["aten::_scaled_dot_product_fused_attention_overrideable_backward"],
-    static_argnums=(5, 10, 11, 12, 13, 16),
-)
-def torch_sdpa_overridable_backward(
-    grad_out,
-    query,
-    key,
-    value,
-    attn_bias,
-    grad_input_mask,
-    out,
-    logsumexp,
-    cum_seq_q,
-    cum_seq_k,
-    max_q,
-    max_k,
-    dropout_p,
-    is_causal,
-    philox_seed,
-    philox_offset,
-    scale=None,
-):
-    return torch.ops.aten._scaled_dot_product_fused_attention_overrideable_backward(
-        grad_out,
-        query,
-        key,
-        value,
-        attn_bias,
-        grad_input_mask,
-        out,
-        logsumexp,
-        cum_seq_q,
-        cum_seq_k,
-        max_q,
-        max_k,
-        dropout_p,
-        is_causal,
-        philox_seed,
-        philox_offset,
-        scale=scale,
-    )
+def torch_threshold_backward(grad_output, self, threshold):
+    return torch.ops.aten.threshold_backward(grad_output, self, threshold)

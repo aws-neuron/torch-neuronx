@@ -75,6 +75,17 @@ def _getenv_path(key: str, default: Path | None) -> Path | None:
 
 
 def _getenv_flags(key: str, default: list[str]) -> list[str]:
+    """Get a list of flags from an environment variable.
+
+    Splits environment variable value on whitespace to produce a list.
+
+    Args:
+        key (str): Environment variable name.
+        default (list[str]): Default value if environment variable is not set.
+
+    Returns:
+        list[str]: List of flag strings.
+    """
     value = os.environ.get(key)
     if value is None:
         return default
@@ -83,6 +94,15 @@ def _getenv_flags(key: str, default: list[str]) -> list[str]:
 
 
 def _getenv_string(key: str, default: str | None) -> str | None:
+    """Get a string environment variable.
+
+    Args:
+        key (str): Environment variable name.
+        default (str | None): Default value if environment variable is not set.
+
+    Returns:
+        str | None: Environment variable value or default.
+    """
     value = os.environ.get(key)
     if value is None:
         return default

@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import torch
 
 from torch_neuronx.python_ops.jax.operation_registry import register_aten
-from torch_neuronx.python_ops.xla_ops.index_xla import convert_indices, index_checking
+from torch_neuronx.python_ops.legacy.xla_ops.index_xla import convert_indices, index_checking
 
 
 @register_aten(

@@ -21,16 +21,20 @@
 
 namespace {
 
-// Helper to validate and normalize memory format for Neuron operations
-c10::MemoryFormat validate_neuron_memory_format(c10::MemoryFormat format,
-                                                const std::string& op_name) {
-  TORCH_CHECK(format == c10::MemoryFormat::Contiguous || format == c10::MemoryFormat::Preserve,
-              op_name, ": Neuron tensors only support contiguous or preserve memory format");
-
-  if (format == c10::MemoryFormat::Preserve) {
-    format = c10::MemoryFormat::Contiguous;
+// Helper to get strides for a given memory format and size
+std::vector<int64_t> get_strides_for_memory_format(c10::IntArrayRef size,
+                                                   c10::MemoryFormat format) {
+  if (format == c10::MemoryFormat::ChannelsLast && size.size() == 4) {
+    // NHWC: stride order is (HWC, 1, WC, C) for dims (N, C, H, W)
+    auto c = size[1], h = size[2], w = size[3];
+    return {h * w * c, 1, w * c, c};
+  } else if (format == c10::MemoryFormat::ChannelsLast3d && size.size() == 5) {
+    // NDHWC: stride order for dims (N, C, D, H, W)
+    auto c = size[1], d = size[2], h = size[3], w = size[4];
+    return {d * h * w * c, 1, h * w * c, w * c, c};
   }
-  return format;
+  // Default: contiguous strides
+  return c10::TensorType::contiguousStridesOf(size);
 }
 
 // Helper to create Neuron storage
@@ -203,11 +207,12 @@ at::Tensor empty_neuron(c10::IntArrayRef size, c10::optional<at::ScalarType> dty
     torch_neuronx::markExecutedLogged(op_name);
   }
 
-  // Check memory format
   auto memory_format = memory_format_opt.value_or(c10::MemoryFormat::Contiguous);
-  memory_format = validate_neuron_memory_format(memory_format, op_name);
-  return empty_strided_neuron(size, c10::TensorType::contiguousStridesOf(size), dtype_opt,
-                              layout_opt, device_opt, pin_memory_opt);
+  if (memory_format == c10::MemoryFormat::Preserve) {
+    memory_format = c10::MemoryFormat::Contiguous;
+  }
+  auto strides = get_strides_for_memory_format(size, memory_format);
+  return empty_strided_neuron(size, strides, dtype_opt, layout_opt, device_opt, pin_memory_opt);
 }
 
 at::Tensor new_empty_neuron(const at::Tensor& self, at::IntArrayRef size,
@@ -285,9 +290,10 @@ const at::Tensor& resize_neuron(const at::Tensor& self, c10::IntArrayRef size,
   TORCH_CHECK(self.device().type() == c10::DeviceType::PrivateUse1,
               "resize_: expected neuron tensor, but got: ", self.device());
 
-  // Check memory format
   auto format = memory_format.value_or(c10::MemoryFormat::Contiguous);
-  format = validate_neuron_memory_format(format, "resize_");
+  if (format == c10::MemoryFormat::Preserve) {
+    format = c10::MemoryFormat::Contiguous;
+  }
 
   // Calculate new total elements and size
   int64_t new_nelements = c10::multiply_integers(size);
@@ -297,19 +303,9 @@ const at::Tensor& resize_neuron(const at::Tensor& self, c10::IntArrayRef size,
 
   resize_storage_neuron(self.unsafeGetTensorImpl(), new_size_bytes);
 
-  // Update sizes and strides
-  if (new_nelements > 0) {
-    self.unsafeGetTensorImpl()->set_sizes_contiguous(size);
-  } else {
-    // For zero-size tensors, manually compute strides
-    std::vector<int64_t> strides(size.size());
-    int64_t stride = 1;
-    for (int64_t i = size.size() - 1; i >= 0; --i) {
-      strides[i] = stride;
-      stride *= size[i];
-    }
-    self.unsafeGetTensorImpl()->set_sizes_and_strides(size, strides);
-  }
+  // Update sizes and strides based on memory format
+  auto strides = get_strides_for_memory_format(size, format);
+  self.unsafeGetTensorImpl()->set_sizes_and_strides(size, strides);
 
   return self;
 }
@@ -324,20 +320,20 @@ at::Tensor clone_neuron(const at::Tensor& src, c10::optional<c10::MemoryFormat> 
   TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
               "clone: expected neuron tensor, but got: ", src.device());
 
-  // Check memory format
   auto format = memory_format.value_or(c10::MemoryFormat::Preserve);
-  format = validate_neuron_memory_format(format, "clone");
+  if (format == c10::MemoryFormat::Preserve) {
+    format = c10::MemoryFormat::Contiguous;
+  }
 
   // Ensure source is contiguous to avoid Neuron->Neuron copy with layout change
   at::Tensor src_to_copy = src;
   if (!src.is_contiguous()) {
-    // Use the internal contiguous path to avoid dispatcher recursion and keep on device
     src_to_copy = torch_neuronx::ops::contiguous_internal(src, c10::MemoryFormat::Contiguous);
   }
 
-  auto cloned = empty_strided_neuron(src_to_copy.sizes(),
-                                     c10::TensorType::contiguousStridesOf(src_to_copy.sizes()),
-                                     src.scalar_type(), src.layout(), src.device(), c10::nullopt);
+  auto strides = get_strides_for_memory_format(src_to_copy.sizes(), format);
+  auto cloned = empty_strided_neuron(src_to_copy.sizes(), strides, src.scalar_type(), src.layout(),
+                                     src.device(), c10::nullopt);
 
   // Copy data
   cloned.copy_(src_to_copy);

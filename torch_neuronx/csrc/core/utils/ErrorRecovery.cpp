@@ -5,40 +5,26 @@
 #include "CPUFallbackExecutor.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
-#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
-
-extern "C" {
-#include <nrt/nrt.h>
-}
 
 namespace at::neuron {
 
-ErrorRecovery::ErrorRecovery() : fallback_enabled_(true), oom_recovery_enabled_(true) {
+ErrorRecovery::ErrorRecovery() : fallback_enabled_(true) {
   LoadConfiguration();
-  // Initialize CPU fallback executor
   cpu_fallback_executor_ = std::make_unique<CPUFallbackExecutor>();
 }
 
 ErrorRecovery::~ErrorRecovery() = default;
 
 void ErrorRecovery::LoadConfiguration() {
-  // Load configuration from environment variables
   const char* fallback_env = std::getenv("NEURON_FALLBACK_ENABLED");
   if (fallback_env) {
     fallback_enabled_ = (std::string(fallback_env) == "1" || std::string(fallback_env) == "true");
-  }
-
-  const char* oom_recovery_env = std::getenv("NEURON_OOM_RECOVERY_ENABLED");
-  if (oom_recovery_env) {
-    oom_recovery_enabled_ =
-        (std::string(oom_recovery_env) == "1" || std::string(oom_recovery_env) == "true");
   }
 }
 
 OperationContextResult ErrorRecovery::AttemptRecovery(
     OperationContext* op, const torch_neuronx::CompilationRuntimeException& e) {
-  // Compilation errors should only be pertinent for compilable kernels.
   auto* kernel = op->kernel_execution.get();
   TORCH_CHECK(kernel->RequiresCompilation(), "This operation requires a compilable kernel");
   return AttemptCompilableRecovery(op);
@@ -49,65 +35,70 @@ OperationContextResult ErrorRecovery::AttemptRecovery(
   if (operation->RequiresCompilation()) {
     return AttemptCompilableRecovery(operation);
   }
-  switch (operation->GetKernelType()) {
-    case KernelTypeEnum::kAlloc: {
-      auto& kernel = operation->GetKernel<KernelTypeEnum::kAlloc>();
-      return AttemptRecovery(kernel, e);
-    }
-    default:
-      return {};
-  }
+  return {};
 }
 
 OperationContextResult ErrorRecovery::AttemptCompilableRecovery(OperationContext* operation) {
   TORCH_CHECK(operation->RequiresCompilation(), "This operation requires a compilable kernel");
-  // As of now, we only support CPU fallback for compilable kernels.
+
+  // Handle concatenation failure first - invalidate cache and cleanup
+  // For concatenated operations, we fall back to op-by-op execution
+  if (operation->HasConcatenatedOperation() || operation->IsConcatenatedOperation()) {
+    RecoverConcatenationFailure(operation);
+    // For concatenated operations themselves, signal fallback and return success
+    // so the individual ops can be retried
+    if (operation->IsConcatenatedOperation() && !operation->HasConcatenatedOperation()) {
+      TORCH_NEURONX_DEBUG("Concatenated operation compilation failed, falling back to op-by-op",
+                          "stream_id=", operation->stream->stream_id,
+                          "op=", operation->GetOpName());
+      return OperationContextResult::CreateSuccess();
+    }
+  }
+
   if (!ShouldAttemptCpuFallback()) {
     return {};
   }
 
   auto* stream = operation->stream;
-  // In case of compilable failures, we need to ensure that all prior operations complete - as
-  // preceding operations may be pending execution.
   stream->WaitForPriorOperationsToComplete(operation);
   return ExecuteCpuFallback(operation);
 }
 
 bool ErrorRecovery::ShouldAttemptCpuFallback() { return fallback_enabled_; }
 
-bool ErrorRecovery::ShouldAttemptOOMRecovery(const torch_neuronx::ExecutionRuntimeException& e) {
-  if (!oom_recovery_enabled_) {
-    return false;
-  }
-  if (!e.HasNRTStatus()) {
-    return false;
-  }
-  size_t cached_blocks = c10_neuron::NeuronCachingAllocator::getCachedBlocks();
-  if (cached_blocks == 0 || e.GetNRTStatus() != NRT_RESOURCE) {
-    return false;
-  }
-  return true;
-}
-
 OperationContextResult ErrorRecovery::ExecuteCpuFallback(OperationContext* op) {
-  // Execute CPU fallback
-  auto result = cpu_fallback_executor_->ExecuteCpuFallback(op);
-
-  return result;
+  return cpu_fallback_executor_->ExecuteCpuFallback(op);
 }
 
-OperationContextResult ErrorRecovery::AttemptRecovery(
-    const AllocDirectKernelExecution& kernel, const torch_neuronx::ExecutionRuntimeException& e) {
-  if (!ShouldAttemptOOMRecovery(e)) {
-    return {};
+void RecoverConcatenationFailure(OperationContext* operation) {
+  if (!operation) {
+    TORCH_NEURONX_DEBUG("RecoverConcatenationFailure called with null operation");
+    return;
   }
 
-  try {
-    c10_neuron::NeuronCachingAllocator::emptyCache();
-    kernel.Execute();
-    return OperationContextResult::CreateSuccess();
-  } catch (const std::exception& e) {
-    return OperationContextResult::CreateError(e.what());
+  // Determine which operation to use for the callback
+  OperationContext* concat_op = nullptr;
+  ConcatenationState* state = nullptr;
+
+  if (operation->IsConcatenatedOperation()) {
+    // This IS the concatenated operation - use raw pointer to get state
+    // (concatenated ops use concatenation_state_raw_ to avoid circular reference)
+    concat_op = operation;
+    state = operation->concatenation_state_raw_;
+  } else if (operation->HasConcatenatedOperation()) {
+    // This is an individual cascading operation that has a concatenated operation
+    // (cascading ops use concatenation_state_ shared_ptr)
+    concat_op = operation->GetConcatenatedOperation();
+    state = operation->concatenation_state_.get();
+  }
+
+  if (state && concat_op) {
+    TORCH_NEURONX_DEBUG("Invoking concatenation failure callback",
+                        "concat_op=", concat_op->GetOpName());
+    state->InvokeFailureCallback(concat_op);
+  } else {
+    TORCH_NEURONX_DEBUG("No concatenation state or callback to invoke",
+                        "op=", operation->GetOpName());
   }
 }
 

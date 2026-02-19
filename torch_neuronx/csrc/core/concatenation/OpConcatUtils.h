@@ -59,9 +59,19 @@
 #include <unordered_set>
 #include <vector>
 
+#include "IrNode.h"
+#include "llvm/IR/Function.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AsmState.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 namespace torch_neuronx {
 
@@ -102,11 +112,13 @@ struct DependencyAnalysis {
   // Indices of common inputs between modules (module1_idx -> module2_idx)
   std::unordered_map<size_t, size_t> commonInputs;
 
-  // Dependencies: module1_output_idx -> module2_input_idx
-  std::unordered_map<size_t, size_t> module1ToModule2Deps;
+  // Dependencies: module1_output_idx -> [module2_input_idx, ...]
+  // Uses vector to support duplicate inputs (e.g., x + x where both inputs come from same output)
+  std::unordered_map<size_t, std::vector<size_t>> module1ToModule2Deps;
 
-  // Dependencies: module2_output_idx -> module1_input_idx
-  std::unordered_map<size_t, size_t> module2ToModule1Deps;
+  // Dependencies: module2_output_idx -> [module1_input_idx, ...]
+  // Uses vector to support duplicate inputs (e.g., x + x where both inputs come from same output)
+  std::unordered_map<size_t, std::vector<size_t>> module2ToModule1Deps;
 
   // Execution order: true if module1 should execute first, false if module2 first
   bool module1First = true;
@@ -226,7 +238,7 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModules(
     const std::vector<void*>& module2_input_addrs, const std::vector<void*>& module2_output_addrs,
     MergeMapping* mapping = nullptr, bool verify_output = true,
     const std::unordered_set<size_t>& module1_outputs_to_skip = {},
-    const std::unordered_set<size_t>& module2_outputs_to_skip = {});
+    const std::unordered_set<size_t>& module2_outputs_to_skip = {}, bool run_optimization = true);
 
 /**
  * @brief Enhanced interface to merge two StableHLO modules with dependency analysis
@@ -249,7 +261,7 @@ std::string mergeStableHLOModules(const std::string& mod_str1, const std::string
                                   const std::vector<void*>& module1_output_addrs,
                                   const std::vector<void*>& module2_input_addrs,
                                   const std::vector<void*>& module2_output_addrs,
-                                  bool verify_output = true);
+                                  bool verify_output = true, bool run_optimization = true);
 
 /**
  * @brief String-based wrapper for mergeModulesSkipIntermediates that skips intermediate outputs
@@ -311,7 +323,8 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesSkipIntermediates(
     mlir::ModuleOp module1, mlir::ModuleOp module2, mlir::MLIRContext* context,
     const std::vector<void*>& module1_input_addrs, const std::vector<void*>& module1_output_addrs,
     const std::vector<void*>& module2_input_addrs, const std::vector<void*>& module2_output_addrs,
-    const DependencyAnalysis& analysis, MergeMapping* mapping = nullptr, bool verify_output = true);
+    const DependencyAnalysis& analysis, MergeMapping* mapping = nullptr, bool verify_output = true,
+    bool run_optimization = true);
 
 /**
  * @brief SKIP INTERMEDIATES version of mergeStableHLOModulesWithTensors that treats dependencies as
@@ -339,6 +352,180 @@ MergeResult mergeStableHLOModulesWithTensorsSkipIntermediates(
     const std::vector<at::Tensor>& module1_inputs, const std::vector<at::Tensor>& module1_outputs,
     const std::vector<at::Tensor>& module2_inputs, const std::vector<at::Tensor>& module2_outputs,
     bool verify_output = true);
+
+std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensorsSkipIntermediates(
+    StableHloNode* node1, StableHloNode* node2, mlir::MLIRContext* context);
+
+/**
+ * @brief Safe merge of two StableHloNodes preserving all outputs
+ *
+ * Merges two StableHloNode objects using the safe merge strategy that
+ * preserves all outputs from both modules. Creates a new StableHloNode
+ * with the merged MLIR module and comprehensive tensor mappings.
+ *
+ * @param node1 First StableHloNode to merge
+ * @param node2 Second StableHloNode to merge
+ * @return Unique pointer to merged StableHloNode, nullptr on failure
+ */
+std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensors(StableHloNode* node1,
+                                                                StableHloNode* node2,
+                                                                mlir::MLIRContext* context);
+
+// ============================================================================
+// In-Order Module Merging APIs (Optimized for Sequential Execution)
+// ============================================================================
+//
+// These APIs are optimized for the common case where module execution order is
+// known at call time: module1 always executes before module2. This assumption
+// eliminates the need for bidirectional dependency analysis and circular
+// dependency detection.
+//
+// Key optimizations over general merging APIs:
+// 1. No circular dependency check needed (impossible by construction)
+// 2. No execution order determination (always module1 -> module2)
+// 3. Simplified dependency analysis (only check module1_output -> module2_input)
+// 4. Reduced computational overhead
+//
+// Use these APIs when you have sequential operations where the execution order
+// is guaranteed (e.g., consecutive operations in an eager execution trace).
+// ============================================================================
+
+/**
+ * @brief Optimized merge for sequential module execution (module1 before module2)
+ *
+ * This API merges two StableHLO modules assuming module1 always executes before
+ * module2. This assumption removes the need for bidirectional dependency analysis
+ * and circular dependency detection, making it more efficient for sequential
+ * operation concatenation.
+ *
+ * Key differences from mergeStableHLOModulesWithTensors:
+ * - No circular dependency check (impossible when order is known)
+ * - No execution order analysis (always module1 first)
+ * - Only checks module1_output -> module2_input dependencies
+ * - More efficient for sequential eager execution patterns
+ *
+ * @param mod_str1 MLIR text of first module (executes first)
+ * @param mod_str2 MLIR text of second module (executes second)
+ * @param module1_inputs Input tensors for module1 (ordered vector)
+ * @param module1_outputs Output tensors for module1 (ordered vector)
+ * @param module2_inputs Input tensors for module2 (ordered vector)
+ * @param module2_outputs Output tensors for module2 (ordered vector)
+ * @param verify_output Optional flag to enable/disable MLIR verification (default: true)
+ *
+ * @return MergeResult containing merged MLIR and correct tensor mappings
+ *
+ * @note This function assumes module1 outputs may feed into module2 inputs,
+ *       but module2 outputs NEVER feed into module1 inputs.
+ */
+MergeResult mergeStableHLOModulesWithTensorsInOrder(const std::string& mod_str1,
+                                                    const std::string& mod_str2,
+                                                    const std::vector<at::Tensor>& module1_inputs,
+                                                    const std::vector<at::Tensor>& module1_outputs,
+                                                    const std::vector<at::Tensor>& module2_inputs,
+                                                    const std::vector<at::Tensor>& module2_outputs,
+                                                    bool verify_output = true);
+
+/**
+ * @brief Skip intermediates version of in-order merge
+ *
+ * Combines the efficiency of in-order merging with intermediate output skipping.
+ * Module1 outputs consumed by module2 inputs are treated as intermediates and
+ * excluded from the final merged module outputs.
+ *
+ * @param mod_str1 MLIR text of first module (executes first)
+ * @param mod_str2 MLIR text of second module (executes second)
+ * @param module1_inputs Input tensors for module1 (ordered vector)
+ * @param module1_outputs Output tensors for module1 (ordered vector)
+ * @param module2_inputs Input tensors for module2 (ordered vector)
+ * @param module2_outputs Output tensors for module2 (ordered vector)
+ * @param verify_output Optional flag to enable/disable MLIR verification (default: true)
+ *
+ * @return MergeResult containing merged MLIR with intermediate outputs removed
+ */
+MergeResult mergeStableHLOModulesWithTensorsInOrderSkipIntermediates(
+    const std::string& mod_str1, const std::string& mod_str2,
+    const std::vector<at::Tensor>& module1_inputs, const std::vector<at::Tensor>& module1_outputs,
+    const std::vector<at::Tensor>& module2_inputs, const std::vector<at::Tensor>& module2_outputs,
+    bool verify_output = true);
+
+/**
+ * @brief StableHloNode version of in-order merge preserving all outputs
+ *
+ * Merges two StableHloNode objects assuming node1 executes before node2.
+ * Creates a new StableHloNode with the merged MLIR module and comprehensive
+ * tensor mappings. All outputs from both modules are preserved.
+ *
+ * @param node1 First StableHloNode to merge (executes first)
+ * @param node2 Second StableHloNode to merge (executes second)
+ * @param context MLIR context with required dialects loaded
+ * @return Unique pointer to merged StableHloNode, nullptr on failure
+ */
+std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensorsInOrder(StableHloNode* node1,
+                                                                       StableHloNode* node2,
+                                                                       mlir::MLIRContext* context);
+
+/**
+ * @brief StableHloNode version of in-order merge with intermediate skipping
+ *
+ * Merges two StableHloNode objects assuming node1 executes before node2,
+ * excluding intermediate outputs (node1 outputs consumed by node2 inputs).
+ *
+ * @param node1 First StableHloNode to merge (executes first)
+ * @param node2 Second StableHloNode to merge (executes second)
+ * @param context MLIR context with required dialects loaded
+ * @return Unique pointer to merged StableHloNode, nullptr on failure
+ */
+std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensorsInOrderSkipIntermediates(
+    StableHloNode* node1, StableHloNode* node2, mlir::MLIRContext* context);
+
+/**
+ * @brief Simplified dependency analysis for in-order module merging
+ *
+ * Analyzes dependencies assuming module1 always executes before module2.
+ * This is an optimized version of analyzeDependencies that:
+ * - Skips checking module2_output -> module1_input dependencies
+ * - Skips circular dependency detection
+ * - Always sets module1First = true
+ *
+ * @param module1_input_addrs Tensor addresses for module1 inputs
+ * @param module1_output_addrs Tensor addresses for module1 outputs
+ * @param module2_input_addrs Tensor addresses for module2 inputs
+ * @param module2_output_addrs Tensor addresses for module2 outputs (not used for dependency check)
+ *
+ * @return DependencyAnalysis with module1First always true and only module1->module2 deps
+ */
+DependencyAnalysis analyzeDependenciesInOrder(const std::vector<void*>& module1_input_addrs,
+                                              const std::vector<void*>& module1_output_addrs,
+                                              const std::vector<void*>& module2_input_addrs,
+                                              const std::vector<void*>& module2_output_addrs);
+
+/**
+ * @brief Low-level in-order module merge with MLIR context
+ *
+ * Core merge function for in-order module merging. Assumes module1 executes
+ * before module2, eliminating bidirectional dependency analysis.
+ *
+ * @param module1 First MLIR module to merge (executes first)
+ * @param module2 Second MLIR module to merge (executes second)
+ * @param context MLIR context with required dialects loaded
+ * @param module1_input_addrs Tensor addresses for module1 inputs
+ * @param module1_output_addrs Tensor addresses for module1 outputs
+ * @param module2_input_addrs Tensor addresses for module2 inputs
+ * @param module2_output_addrs Tensor addresses for module2 outputs
+ * @param mapping Optional pointer to capture mapping information
+ * @param verify_output Optional flag to enable/disable MLIR verification
+ * @param module1_outputs_to_skip Optional set of Module1 output indices to skip
+ * @param module2_outputs_to_skip Optional set of Module2 output indices to skip
+ *
+ * @return OwningOpRef to merged module on success
+ */
+mlir::OwningOpRef<mlir::ModuleOp> mergeModulesInOrder(
+    mlir::ModuleOp module1, mlir::ModuleOp module2, mlir::MLIRContext* context,
+    const std::vector<void*>& module1_input_addrs, const std::vector<void*>& module1_output_addrs,
+    const std::vector<void*>& module2_input_addrs, const std::vector<void*>& module2_output_addrs,
+    MergeMapping* mapping = nullptr, bool verify_output = true,
+    const std::unordered_set<size_t>& module1_outputs_to_skip = {},
+    const std::unordered_set<size_t>& module2_outputs_to_skip = {});
 
 }  // namespace torch_neuronx
 

@@ -10,11 +10,15 @@ bazel_dep(name = "rules_uv", version = "0.88.0")
 bazel_dep(name = "protobuf", version = "33.0-rc1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.1")
+bazel_dep(name = "xxhash", version = "0.8.3")
 
-# Configure Python toolchain to use Python 3.10
+# Configure Python toolchains for all supported versions
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.10")
-use_repo(python, "python_3_10")
+python.toolchain(python_version = "3.11")
+python.toolchain(python_version = "3.12")
+python.toolchain(python_version = "3.13")
+use_repo(python, "python_3_10", "python_3_11", "python_3_12", "python_3_13")
 
 # PyTorch local dependency setup
 torch_extension = use_extension("//bazel:torch_extension.bzl", "torch_extension")

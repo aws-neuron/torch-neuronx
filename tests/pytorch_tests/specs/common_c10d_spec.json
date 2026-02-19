@@ -12,6 +12,14 @@
         "test_subpg_gather_object",
         "test_subpg_broadcast_object"
       ],
+      "skip_tests": [
+        {
+          "reason": "Temporarily not supported send_recv. Error type - No backend type associated with device type neuron",
+          "tests": [
+            "test_send_recv_object_list"
+          ]
+        }
+      ],
       "xfail": [
         {
           "test_send_recv_object_list_neuron": {
@@ -41,18 +49,8 @@
           }
         },
         {
-          "test_unwaited": {
-            "reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"
-          }
-        },
-        {
           "test_reduce_scatter_tensor_coalesced": {
             "reason": "Pending investigation - error type - No backend type associated with device type neuron"
-          }
-        },
-        {
-          "test_wait_tensor": {
-            "reason": "Pending investigation - error type - Operation all_reduce is not implemented for Neuron"
           }
         }
       ]
@@ -156,16 +154,15 @@
       ],
       "xfail": [
         {
-          "reason": "Unsupported api signature, error - output shape [2] doesn't match the broadcast shape [1,2 ] ; root cause - ProcessGroupNeuron reduce_scatter_tensor_coalesced API requires outputs.shape[0] == input.shape[0] // world_size, e.g input shape (2, 2), output shape (1, 2), but nccl allows output shape (2,) as long as elements count matches",
+          "reason": "[TODO FIX post Beta] Process 0 terminated or timed out after 7200 seconds",
           "tests": [
-            "test_reduce_scatter_tensor_coalesced"
+            "test_unwaited"
           ]
         },
         {
-          "reason": "Inflight async work registry in currently unsupported",
+          "reason": "Unsupported api signature, error - output shape [2] doesn't match the broadcast shape [1,2 ] ; root cause - ProcessGroupNeuron reduce_scatter_tensor_coalesced API requires outputs.shape[0] == input.shape[0] // world_size, e.g input shape (2, 2), output shape (1, 2), but nccl allows output shape (2,) as long as elements count matches",
           "tests": [
-            "test_unwaited",
-            "test_wait_tensor"
+            "test_reduce_scatter_tensor_coalesced"
           ]
         },
         {
@@ -314,9 +311,38 @@
             "test_abort_in_destroy_multi_pgs",
             "test_abort_in_destroy_mixed_empty_pgs"
           ]
+        },
+        {
+          "reason": "Tests use c10d.ProcessGroupNCCL.Options() which does not exist on Neuron (NCCL is not used). The is_nccl_available() check at module level passes due to patching, but ProcessGroupNCCL class is not available.",
+          "tests": [
+            "test_destruct_before_terminate_pg",
+            "test_comm_split_group_mixed_backend",
+            "test_nan_assert_float64",
+            "test_shrink_group_flags",
+            "test_nan_assert_bfloat16",
+            "test_shrink_group_multiple_comms",
+            "test_nan_assert_float16",
+            "test_shrink_group_multiple_exclusions",
+            "test_nan_assert_float32",
+            "test_shrink_group_backend_properties",
+            "test_shrink_group_multiple_iterations",
+            "test_shrink_group_nccl_config",
+            "test_shrink_group_basic",
+            "test_shrink_group_performance",
+            "test_shrink_group_validation",
+            "test_shrink_group_vs_abort_reinit_performance"
+          ]
         }
       ],
       "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] setUp fails - AttributeError: 'function' object has no attribute '__wrapped__' - test_nan_assert_float16 not decorated",
+          "tests": [
+            "test_nan_check",
+            "test_extra_cuda_context_sync_ops",
+            "test_file_store_check"
+          ]
+        },
         {
           "reason": "Patching issue + unsupported feature - Error - ValueError: device_id neuron:1 is out of range. Please use a device index less than the number of accelerators available: 1. Two folds, 1. pathcing issue on device count 2. more importantly this is testing block_current_stream that not supported ",
           "tests": [

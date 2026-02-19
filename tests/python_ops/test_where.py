@@ -1,13 +1,15 @@
-"""Test that where operation is properly registered with PyTorch dispatcher."""
+"""Test that where operation is properly registered with PyTorch dispatcher.
+
+Note: where.ScalarOther, where.ScalarSelf, and where.Scalar are NOT registered
+because they are CompositeImplicitAutograd ops that decompose to where.self.
+This preserves the autograd chain.
+"""
 
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import (
-    assert_op_runs_on_neuron,
-    track_neuron_ops,
-)
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 DTYPES = [torch.bool, torch.float32, torch.float64, torch.int32, torch.int64]
 SHAPES = [(1,), (1, 8), (8, 15, 29), (15, 32, 64, 128)]
@@ -53,10 +55,31 @@ class TestWhereRegistration:
         # check correctness
         _assert_equal(out_neuron.cpu(), expected)
 
+    def test_where_autograd_self(self):
+        """Test that where.self preserves autograd."""
+        condition = torch.randn(3, 4) > 0.5
+        x = torch.randn(3, 4, device="neuron", requires_grad=True)
+        y = torch.randn(3, 4, device="neuron", requires_grad=True)
+        result = torch.where(condition.to("neuron"), x, y)
+
+        # Should have grad_fn (WhereBackward0)
+        assert result.grad_fn is not None
+        assert "Backward" in str(type(result.grad_fn))
+
+    def test_where_autograd_scalar_other(self):
+        """Test that where.ScalarOther preserves autograd via decomposition."""
+        condition = torch.randn(3, 4) > 0.5
+        x = torch.randn(3, 4, device="neuron", requires_grad=True)
+        result = torch.where(condition.to("neuron"), x, 0.5)
+
+        # Should have grad_fn from decomposed where.self
+        assert result.grad_fn is not None
+        assert "Backward" in str(type(result.grad_fn))
+
     @pytest.mark.parametrize("dtype", DTYPES)
     @pytest.mark.parametrize("shape", SHAPES)
     def test_where_scalar_input(self, dtype, shape):
-        """Test for input (second arg) as scalar"""
+        """Test for input (second arg) as scalar - decomposes to where.self"""
         condition = torch.randn(shape) > 0.5
         input = torch.randn(1).item()
         other = torch.randn(shape).to(dtype)
@@ -68,8 +91,8 @@ class TestWhereRegistration:
             other_neuron = other.to("neuron")
             out_neuron = torch.where(condition_neuron, input_neuron, other_neuron)
 
-            # check if op ran on neuron device
-            assert_op_runs_on_neuron("aten::where.ScalarSelf")
+            # ScalarSelf decomposes to where.self
+            assert_op_runs_on_neuron("aten::where.self")
 
         # check correctness
         _assert_equal(out_neuron.cpu(), expected)
@@ -77,7 +100,7 @@ class TestWhereRegistration:
     @pytest.mark.parametrize("dtype", DTYPES)
     @pytest.mark.parametrize("shape", SHAPES)
     def test_where_scalar_other(self, dtype, shape):
-        """Test for other (third arg) as scalar"""
+        """Test for other (third arg) as scalar - decomposes to where.self"""
         condition = torch.randn(shape) > 0.5
         input = torch.randn(shape).to(dtype)
         other = torch.rand(1).item()
@@ -89,15 +112,15 @@ class TestWhereRegistration:
             other_neuron = other  # scalar
             out_neuron = torch.where(condition_neuron, input_neuron, other_neuron)
 
-            # check if op ran on neuorn device
-            assert_op_runs_on_neuron("aten::where.ScalarOther")
+            # ScalarOther decomposes to where.self
+            assert_op_runs_on_neuron("aten::where.self")
 
         # check correctness
         _assert_equal(out_neuron.cpu(), expected)
 
     @pytest.mark.parametrize("shape", SHAPES)
     def test_where_scalar(self, shape):
-        """Test for input (second arg) and other (third arg) as scalar"""
+        """Test for input (second arg) and other (third arg) as scalar - decomposes to where.self"""
         condition = torch.randn(shape) > 0.5
         input = torch.rand(1).item()
         other = torch.rand(1).item()
@@ -109,8 +132,8 @@ class TestWhereRegistration:
             other_neuron = other  # scalar
             out_neuron = torch.where(condition_neuron, input_neuron, other_neuron)
 
-            # check if op ran on neuron device
-            assert_op_runs_on_neuron("aten::where.Scalar")
+            # Scalar decomposes to where.self
+            assert_op_runs_on_neuron("aten::where.self")
 
         # check correctness
         _assert_equal(out_neuron.cpu(), expected)
@@ -256,5 +279,5 @@ class TestWhereRegistration:
         tensor_cpu = torch.tensor([1], device="cpu")
         tensor_neuron = torch.randn(10, 5, device="neuron")
         condition_neuron = torch.randn(10, 5, device="neuron") > 0.5
-        torch.where(condition_neuron, tensor_neuron, tensor_cpu)
-        assert "aten::where.self" in torch_neuronx.get_fallback_ops()
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            torch.where(condition_neuron, tensor_neuron, tensor_cpu)

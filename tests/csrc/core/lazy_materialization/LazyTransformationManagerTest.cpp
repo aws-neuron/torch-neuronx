@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockNRT.h"
+#include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
@@ -18,6 +19,7 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
 using namespace torch_neuronx::testing;
+using namespace at::neuron::testing;
 
 namespace c10_neuron {
 namespace lazy {
@@ -101,11 +103,14 @@ const std::string kBmmOperationMLIR =
 std::unique_ptr<at::neuron::XLACompilableKernelExecution> CreateTestKernel(
     const std::string& op_name, const std::string& op_mlir, const std::vector<void*>& input_ptrs,
     const std::vector<void*>& output_ptrs,
+    const std::vector<at::neuron::TensorContext>& input_contexts,
+    const std::vector<at::neuron::TensorContext>& output_contexts,
     const std::vector<std::vector<TensorTransformation>>& transforms) {
   std::vector<uint8_t> hlo_bytes(op_mlir.begin(), op_mlir.end());
 
   auto kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
-      op_name, input_ptrs, output_ptrs, "test_cache_key", hlo_bytes,
+      op_name, create_fake_tensor_refs(input_ptrs), create_fake_tensor_refs(output_ptrs),
+      input_contexts, output_contexts, "test_cache_key", hlo_bytes,
       false,  // has_collectives
       0);     // device_id
 
@@ -124,6 +129,7 @@ std::unique_ptr<at::neuron::XLACompilableKernelExecution> CreateTestKernel(
 class LazyTransformationManagerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    mock_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
     mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
     ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
 
@@ -134,8 +140,10 @@ class LazyTransformationManagerTest : public ::testing::Test {
   void TearDown() override {
     ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
     LazyTransformationManager::ClearMergedOperationCache();
+    mock_session_.reset();
   }
 
+  std::unique_ptr<torch_neuronx::testing::MockNRTSession> mock_session_;
   torch_neuronx::testing::MockNRT* mock_nrt_;
 };
 
@@ -164,19 +172,19 @@ TEST_F(LazyTransformationManagerTest, MatmulWithSingleTranspose_OrderConservatio
 
   std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {}};
 
-  // Create kernel
-  auto kernel =
-      CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs, output_ptrs, transforms);
-
-  // Get pointer before moving
-  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
-
-  // Create operation context
+  // Create operation context with tensor contexts
   std::vector<at::neuron::TensorContext> input_contexts = {
       at::neuron::TensorContext::FromTensor(tensor0),
       at::neuron::TensorContext::FromTensor(tensor1)};
 
-  at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+  // Create kernel
+  auto kernel = CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs, output_ptrs,
+                                 input_contexts, {}, transforms);
+
+  // Get pointer before moving
+  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
+
+  at::neuron::OperationContext op_context(std::move(kernel));
 
   // Process inputs
   LazyTransformationManager::ProcessOperationInputs(&op_context);
@@ -228,12 +236,13 @@ TEST_F(LazyTransformationManagerTest, SameOpDifferentTransforms_DifferentCacheEn
 
     std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {}};
 
-    auto kernel =
-        CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs, output_ptrs, transforms);
     std::vector<at::neuron::TensorContext> input_contexts = {
         at::neuron::TensorContext::FromTensor(tensor0),
         at::neuron::TensorContext::FromTensor(tensor1)};
-    at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+
+    auto kernel = CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs, output_ptrs,
+                                   input_contexts, {}, transforms);
+    at::neuron::OperationContext op_context(std::move(kernel));
     LazyTransformationManager::ProcessOperationInputs(&op_context);
 
     // Should have 1 cache entry
@@ -264,12 +273,12 @@ TEST_F(LazyTransformationManagerTest, SameOpDifferentTransforms_DifferentCacheEn
   }
 })";
 
-    auto kernel =
-        CreateTestKernel("aten::mm", second_matmul_mlir, input_ptrs, output_ptrs, transforms);
     std::vector<at::neuron::TensorContext> input_contexts = {
         at::neuron::TensorContext::FromTensor(tensor0),
         at::neuron::TensorContext::FromTensor(tensor1)};
-    at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+    auto kernel = CreateTestKernel("aten::mm", second_matmul_mlir, input_ptrs, output_ptrs,
+                                   input_contexts, {}, transforms);
+    at::neuron::OperationContext op_context(std::move(kernel));
     LazyTransformationManager::ProcessOperationInputs(&op_context);
 
     // Should have 2 cache entries now (different transformations)
@@ -296,14 +305,15 @@ TEST_F(LazyTransformationManagerTest, CacheHit_SameTransforms) {
 
   std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {}};
 
-  auto kernel_first =
-      CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs_first, output_ptrs, transforms);
-  auto* kernel_ptr_first =
-      dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel_first.get());
   std::vector<at::neuron::TensorContext> input_contexts_first = {
       at::neuron::TensorContext::FromTensor(tensor0_first),
       at::neuron::TensorContext::FromTensor(tensor1_first)};
-  at::neuron::OperationContext op_context_first(std::move(kernel_first), input_contexts_first);
+
+  auto kernel_first = CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs_first,
+                                       output_ptrs, input_contexts_first, {}, transforms);
+  auto* kernel_ptr_first =
+      dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel_first.get());
+  at::neuron::OperationContext op_context_first(std::move(kernel_first));
   LazyTransformationManager::ProcessOperationInputs(&op_context_first);
 
   std::string first_mlir(kernel_ptr_first->GetHloBytes().begin(),
@@ -316,14 +326,15 @@ TEST_F(LazyTransformationManagerTest, CacheHit_SameTransforms) {
 
   std::vector<void*> input_ptrs_second = {tensor0_second.data_ptr(), tensor1_second.data_ptr()};
 
-  auto kernel_second = CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs_second,
-                                        output_ptrs, transforms);
-  auto* kernel_ptr_second =
-      dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel_second.get());
   std::vector<at::neuron::TensorContext> input_contexts_second = {
       at::neuron::TensorContext::FromTensor(tensor0_second),
       at::neuron::TensorContext::FromTensor(tensor1_second)};
-  at::neuron::OperationContext op_context_second(std::move(kernel_second), input_contexts_second);
+
+  auto kernel_second = CreateTestKernel("aten::mm", kMatmulOperationMLIR, input_ptrs_second,
+                                        output_ptrs, input_contexts_second, {}, transforms);
+  auto* kernel_ptr_second =
+      dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel_second.get());
+  at::neuron::OperationContext op_context_second(std::move(kernel_second));
   LazyTransformationManager::ProcessOperationInputs(&op_context_second);
 
   std::string second_mlir(kernel_ptr_second->GetHloBytes().begin(),
@@ -357,13 +368,14 @@ TEST_F(LazyTransformationManagerTest, BothInputsTransformed_OrderAndDtypePreserv
 
   std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {transform1}};
 
-  auto kernel =
-      CreateTestKernel("add_default", kAddOperationMLIR, input_ptrs, output_ptrs, transforms);
-  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
   std::vector<at::neuron::TensorContext> input_contexts = {
       at::neuron::TensorContext::FromTensor(tensor0),
       at::neuron::TensorContext::FromTensor(tensor1)};
-  at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+
+  auto kernel = CreateTestKernel("add_default", kAddOperationMLIR, input_ptrs, output_ptrs,
+                                 input_contexts, {}, transforms);
+  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
+  at::neuron::OperationContext op_context(std::move(kernel));
   LazyTransformationManager::ProcessOperationInputs(&op_context);
 
   std::string merged_mlir(kernel_ptr->GetHloBytes().begin(), kernel_ptr->GetHloBytes().end());
@@ -412,13 +424,14 @@ TEST_F(LazyTransformationManagerTest, MixedTransformation_OneTransformedOneDirec
 
   std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {}};
 
-  auto kernel =
-      CreateTestKernel("concat", kConcatOperationMLIR, input_ptrs, output_ptrs, transforms);
-  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
   std::vector<at::neuron::TensorContext> input_contexts = {
       at::neuron::TensorContext::FromTensor(tensor0),
       at::neuron::TensorContext::FromTensor(tensor1)};
-  at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+
+  auto kernel = CreateTestKernel("concat", kConcatOperationMLIR, input_ptrs, output_ptrs,
+                                 input_contexts, {}, transforms);
+  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
+  at::neuron::OperationContext op_context(std::move(kernel));
   LazyTransformationManager::ProcessOperationInputs(&op_context);
 
   std::string merged_mlir(kernel_ptr->GetHloBytes().begin(), kernel_ptr->GetHloBytes().end());
@@ -467,12 +480,14 @@ TEST_F(LazyTransformationManagerTest, DifferentDtype_BFloat16) {
     pos += 4;
   }
 
-  auto kernel = CreateTestKernel("aten::mm", bf16_matmul_mlir, input_ptrs, output_ptrs, transforms);
-  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
   std::vector<at::neuron::TensorContext> input_contexts = {
       at::neuron::TensorContext::FromTensor(tensor0),
       at::neuron::TensorContext::FromTensor(tensor1)};
-  at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+
+  auto kernel = CreateTestKernel("aten::mm", bf16_matmul_mlir, input_ptrs, output_ptrs,
+                                 input_contexts, {}, transforms);
+  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
+  at::neuron::OperationContext op_context(std::move(kernel));
   LazyTransformationManager::ProcessOperationInputs(&op_context);
 
   std::string merged_mlir(kernel_ptr->GetHloBytes().begin(), kernel_ptr->GetHloBytes().end());
@@ -503,13 +518,14 @@ TEST_F(LazyTransformationManagerTest, ThreeDimensionalTensor_Transpose) {
 
   std::vector<std::vector<TensorTransformation>> transforms = {{transform0}, {}};
 
-  auto kernel =
-      CreateTestKernel("aten::bmm", kBmmOperationMLIR, input_ptrs, output_ptrs, transforms);
-  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
   std::vector<at::neuron::TensorContext> input_contexts = {
       at::neuron::TensorContext::FromTensor(tensor0),
       at::neuron::TensorContext::FromTensor(tensor1)};
-  at::neuron::OperationContext op_context(std::move(kernel), input_contexts);
+
+  auto kernel = CreateTestKernel("aten::bmm", kBmmOperationMLIR, input_ptrs, output_ptrs,
+                                 input_contexts, {}, transforms);
+  auto* kernel_ptr = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel.get());
+  at::neuron::OperationContext op_context(std::move(kernel));
   LazyTransformationManager::ProcessOperationInputs(&op_context);
 
   std::string merged_mlir(kernel_ptr->GetHloBytes().begin(), kernel_ptr->GetHloBytes().end());

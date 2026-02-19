@@ -28,7 +28,7 @@ const PlatformConfig& GetPlatformConfig() {
   static const std::unordered_map<std::string, PlatformConfig> platform_configs = {
       {"inf1", {"inf1", "1"}},  {"trn1", {"trn1", "1"}}, {"trn1n", {"trn1", "1"}},
       {"inf2", {"trn1", "1"}},  {"trn2", {"trn2", "2"}}, {"trn2n", {"trn2", "2"}},
-      {"trn2u", {"trn2", "2"}}, {"trn3", {"trn3", "2"}}};
+      {"trn2u", {"trn2", "2"}}, {"trn3", {"trn3", "2"}}, {"trn3u", {"trn3", "2"}}};
 
   std::string instance = GetInstanceType();
   auto it = platform_configs.find(instance);
@@ -66,6 +66,8 @@ std::string GetInstanceType() {
         return "trn2u";
       case NRT_INSTANCE_TRN3:
         return "trn3";
+      case NRT_INSTANCE_TRN3PDS98:
+        return "trn3u";
       default:
         throw std::runtime_error(
             "Unknown Neuron instance family: " + std::to_string(instance_info.family) +
@@ -91,7 +93,7 @@ std::string GetLogicalNeuronCores() {
 
 bool IsSyncModeEnabled() {
   static bool is_sync_mode_enabled = []() {
-    const char* sync_mode = std::getenv("TORCH_NEURONX_SYNC_MODE");
+    const char* sync_mode = std::getenv("NEURON_LAUNCH_BLOCKING");
     return sync_mode != nullptr && strcmp(sync_mode, "1") == 0;
   }();
   return is_sync_mode_enabled;

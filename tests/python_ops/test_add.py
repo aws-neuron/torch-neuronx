@@ -126,10 +126,9 @@ class TestAddRegistration:
         a = torch.ones(16, 16, dtype=torch.float32).to("neuron")
         b = torch.ones(16, 16, dtype=torch.float32)  # CPU
 
-        c = a + b
-        assert c.device.type == "neuron"
-        expected = torch.ones(16, 16, dtype=torch.float32) * 2
-        torch.testing.assert_close(c.cpu(), expected)
+        # Should raise RuntimeError for non-scalar cross-device operation
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            _ = a + b
 
     def test_add_small_tensor(self):
         """Test that small tensors work with XLA implementation."""

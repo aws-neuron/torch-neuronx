@@ -12,7 +12,7 @@
 #include "torch_neuronx/csrc/core/concatenation/OpConcatUtils.h"
 #include "torch_neuronx/csrc/core/opbuilder/utility/StableHloUtils.h"
 
-class StableHloUtilsTest : public ::testing::Test {
+class OpConcatUtilsTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // Module with 1 input, 1 output (for independent scenarios)
@@ -75,7 +75,7 @@ module @jit__lambda2 {
 // ============================================================================
 
 // Test Scenario 1: Independent modules
-TEST_F(StableHloUtilsTest, MergeIndependentModules) {
+TEST_F(OpConcatUtilsTest, MergeIndependentModules) {
   // Create mock tensor addresses for independent modules
   auto mod1_inputs = createMockAddresses({100});   // module1 input: tensor at address 100
   auto mod1_outputs = createMockAddresses({200});  // module1 output: tensor at address 200
@@ -83,7 +83,8 @@ TEST_F(StableHloUtilsTest, MergeIndependentModules) {
   auto mod2_outputs = createMockAddresses({400});  // module2 output: tensor at address 400
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_independent, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_independent, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.find("submain1") != std::string::npos);
@@ -105,7 +106,7 @@ TEST_F(StableHloUtilsTest, MergeIndependentModules) {
 }
 
 // Test Scenario 2: Common inputs
-TEST_F(StableHloUtilsTest, MergeModulesWithCommonInputs) {
+TEST_F(OpConcatUtilsTest, MergeModulesWithCommonInputs) {
   // Create mock tensor addresses where modules share input tensors
   auto mod1_inputs = createMockAddresses({100, 101});  // module1 inputs: a, b
   auto mod1_outputs = createMockAddresses({200});      // module1 output: c = a + b
@@ -113,7 +114,8 @@ TEST_F(StableHloUtilsTest, MergeModulesWithCommonInputs) {
   auto mod2_outputs = createMockAddresses({300});      // module2 output: e = a * d
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.find("submain1") != std::string::npos);
@@ -134,7 +136,7 @@ TEST_F(StableHloUtilsTest, MergeModulesWithCommonInputs) {
 }
 
 // Test Scenario 3: Direct dependencies
-TEST_F(StableHloUtilsTest, MergeModulesWithDependencies) {
+TEST_F(OpConcatUtilsTest, MergeModulesWithDependencies) {
   // Create mock tensor addresses where module1 output becomes module2 input
   auto mod1_inputs = createMockAddresses({100, 101});  // module1 inputs: a, b
   auto mod1_outputs = createMockAddresses({200});      // module1 output: c = a + b
@@ -142,7 +144,8 @@ TEST_F(StableHloUtilsTest, MergeModulesWithDependencies) {
   auto mod2_outputs = createMockAddresses({300});      // module2 output: e = c * d
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.find("submain1") != std::string::npos);
@@ -163,7 +166,7 @@ TEST_F(StableHloUtilsTest, MergeModulesWithDependencies) {
 }
 
 // Test Scenario 4: Mixed (common inputs + dependencies)
-TEST_F(StableHloUtilsTest, MergeMixedModules) {
+TEST_F(OpConcatUtilsTest, MergeMixedModules) {
   // Create mock tensor addresses with both common inputs and dependencies
   auto mod1_inputs = createMockAddresses({100, 101});  // module1 inputs: a, b
   auto mod1_outputs = createMockAddresses({200});      // module1 output: c = a + b
@@ -171,7 +174,8 @@ TEST_F(StableHloUtilsTest, MergeMixedModules) {
   auto mod2_outputs = createMockAddresses({300});      // module2 output: e = a * c
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.find("submain1") != std::string::npos);
@@ -192,7 +196,7 @@ TEST_F(StableHloUtilsTest, MergeMixedModules) {
 }
 
 // Test Scenario 5: Module2->Module1 dependency (module2 executes first)
-TEST_F(StableHloUtilsTest, MergeModule2ToModule1Dependency) {
+TEST_F(OpConcatUtilsTest, MergeModule2ToModule1Dependency) {
   // Create mock tensor addresses where module2 output becomes module1 input
   // This creates analysis.module1First = false, ensuring module2 executes before module1
   auto mod1_inputs = createMockAddresses({200, 101});  // module1 inputs: c (from mod2), b
@@ -201,7 +205,8 @@ TEST_F(StableHloUtilsTest, MergeModule2ToModule1Dependency) {
   auto mod2_outputs = createMockAddresses({200});      // module2 output: c = a * 2
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.find("submain1") != std::string::npos);
@@ -234,7 +239,7 @@ TEST_F(StableHloUtilsTest, MergeModule2ToModule1Dependency) {
 }
 
 // Regression test for recursive function calls
-TEST_F(StableHloUtilsTest, MergedMLIRContainsStableHLOOperations) {
+TEST_F(OpConcatUtilsTest, MergedMLIRContainsStableHLOOperations) {
   // This test ensures that merged MLIR contains actual StableHLO operations,
   // not recursive function calls
   auto mod1_inputs = createMockAddresses({100});
@@ -243,7 +248,8 @@ TEST_F(StableHloUtilsTest, MergedMLIRContainsStableHLOOperations) {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_independent, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_independent, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(result.empty());
 
@@ -290,7 +296,7 @@ TEST_F(StableHloUtilsTest, MergedMLIRContainsStableHLOOperations) {
 // ============================================================================
 
 // Test dependency analysis function directly
-TEST_F(StableHloUtilsTest, DependencyAnalysis) {
+TEST_F(OpConcatUtilsTest, DependencyAnalysis) {
   // Test independent modules
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({200});
@@ -318,14 +324,20 @@ TEST_F(StableHloUtilsTest, DependencyAnalysis) {
       torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
   EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::DIRECT_DEPS);
   EXPECT_FALSE(analysis.module1ToModule2Deps.empty());
-  EXPECT_EQ(analysis.module1ToModule2Deps[0], 0);  // module1_output[0] -> module2_input[0]
+
+  // Verify dependency map now uses vectors
+  ASSERT_TRUE(analysis.module1ToModule2Deps.find(0) != analysis.module1ToModule2Deps.end())
+      << "Should have dependency from output 0";
+  const auto& deps = analysis.module1ToModule2Deps.at(0);
+  ASSERT_EQ(deps.size(), 1) << "Output 0 should map to 1 input";
+  EXPECT_EQ(deps[0], 0) << "Output 0 should map to input 0";
 }
 
 // ============================================================================
 // Section 3: Error Handling and Edge Cases
 // ============================================================================
 
-TEST_F(StableHloUtilsTest, MergeWithInvalidModule) {
+TEST_F(OpConcatUtilsTest, MergeWithInvalidModule) {
   std::string invalid_mlir = "invalid mlir syntax";
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({200});
@@ -333,13 +345,14 @@ TEST_F(StableHloUtilsTest, MergeWithInvalidModule) {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string result = torch_neuronx::mergeStableHLOModules(
-      mlir1_independent, invalid_mlir, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_independent, invalid_mlir, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_TRUE(result.empty());
 }
 
 // Test circular dependencies - should throw runtime_error
-TEST_F(StableHloUtilsTest, CircularDependenciesThrowsException) {
+TEST_F(OpConcatUtilsTest, CircularDependenciesThrowsException) {
   // Create mock tensor addresses with circular dependencies:
   // module1 output -> module2 input AND module2 output -> module1 input
   auto mod1_inputs = createMockAddresses({100, 300});  // module1 inputs: a, d (d from mod2)
@@ -351,13 +364,14 @@ TEST_F(StableHloUtilsTest, CircularDependenciesThrowsException) {
   EXPECT_THROW(
       {
         torch_neuronx::mergeStableHLOModules(mlir1_two_input, mlir2_two_input, mod1_inputs,
-                                             mod1_outputs, mod2_inputs, mod2_outputs);
+                                             mod1_outputs, mod2_inputs, mod2_outputs,
+                                             /*verify_output=*/true, /*run_optimization=*/false);
       },
       std::runtime_error);
 }
 
 // Test circular dependency detection in analyzeDependencies function directly
-TEST_F(StableHloUtilsTest, AnalyzeDependenciesCircularThrowsException) {
+TEST_F(OpConcatUtilsTest, AnalyzeDependenciesCircularThrowsException) {
   // Create circular dependency scenario:
   // module1 output (200) -> module2 input (200)
   // module2 output (300) -> module1 input (300)
@@ -373,7 +387,7 @@ TEST_F(StableHloUtilsTest, AnalyzeDependenciesCircularThrowsException) {
 }
 
 // Test that the exception message is correct
-TEST_F(StableHloUtilsTest, CircularDependencyExceptionMessage) {
+TEST_F(OpConcatUtilsTest, CircularDependencyExceptionMessage) {
   auto mod1_inputs = createMockAddresses({100, 300});
   auto mod1_outputs = createMockAddresses({200});
   auto mod2_inputs = createMockAddresses({200, 101});
@@ -392,7 +406,7 @@ TEST_F(StableHloUtilsTest, CircularDependencyExceptionMessage) {
 }
 
 // Test mismatched tensor address counts (should throw exceptions)
-TEST_F(StableHloUtilsTest, MismatchedTensorAddressCounts) {
+TEST_F(OpConcatUtilsTest, MismatchedTensorAddressCounts) {
   // Subtest 1: Empty addresses when module expects inputs
   auto empty_addrs = createMockAddresses({});
   auto normal_outputs = createMockAddresses({200});
@@ -402,7 +416,8 @@ TEST_F(StableHloUtilsTest, MismatchedTensorAddressCounts) {
   EXPECT_THROW(
       {
         torch_neuronx::mergeStableHLOModules(mlir1_independent, mlir2_independent, empty_addrs,
-                                             normal_outputs, normal_inputs, normal_outputs2);
+                                             normal_outputs, normal_inputs, normal_outputs2,
+                                             /*verify_output=*/true, /*run_optimization=*/false);
       },
       std::runtime_error);
 
@@ -416,7 +431,8 @@ TEST_F(StableHloUtilsTest, MismatchedTensorAddressCounts) {
       {
         torch_neuronx::mergeStableHLOModules(mlir1_two_input, mlir2_two_input, too_few_inputs,
                                              normal_outputs_common, normal_inputs_common,
-                                             normal_outputs_common2);
+                                             normal_outputs_common2, /*verify_output=*/true,
+                                             /*run_optimization=*/false);
       },
       std::runtime_error);
 
@@ -427,7 +443,8 @@ TEST_F(StableHloUtilsTest, MismatchedTensorAddressCounts) {
   EXPECT_THROW(
       {
         torch_neuronx::mergeStableHLOModules(mlir1_independent, mlir2_independent, too_many_inputs,
-                                             normal_outputs, normal_inputs, normal_outputs2);
+                                             normal_outputs, normal_inputs, normal_outputs2,
+                                             /*verify_output=*/true, /*run_optimization=*/false);
       },
       std::runtime_error);
 
@@ -438,13 +455,14 @@ TEST_F(StableHloUtilsTest, MismatchedTensorAddressCounts) {
   EXPECT_THROW(
       {
         torch_neuronx::mergeStableHLOModules(mlir1_independent, mlir2_independent, normal_inputs,
-                                             too_many_outputs, normal_inputs, normal_outputs2);
+                                             too_many_outputs, normal_inputs, normal_outputs2,
+                                             /*verify_output=*/true, /*run_optimization=*/false);
       },
       std::runtime_error);
 }
 
 // Test modules with no inputs
-TEST_F(StableHloUtilsTest, ModulesWithNoInputs) {
+TEST_F(OpConcatUtilsTest, ModulesWithNoInputs) {
   std::string mlir_no_inputs = R"(
 module @jit__lambda {
   func.func public @main() -> tensor<f32> {
@@ -460,9 +478,9 @@ module @jit__lambda {
   auto normal_inputs = createMockAddresses({300});     // Normal module inputs
   auto normal_outputs = createMockAddresses({400});    // Normal module outputs
 
-  std::string result =
-      torch_neuronx::mergeStableHLOModules(mlir_no_inputs, mlir1_independent, empty_inputs,
-                                           no_input_outputs, normal_inputs, normal_outputs);
+  std::string result = torch_neuronx::mergeStableHLOModules(
+      mlir_no_inputs, mlir1_independent, empty_inputs, no_input_outputs, normal_inputs,
+      normal_outputs, /*verify_output=*/true, /*run_optimization=*/false);
 
   if (!result.empty()) {
     // If merge succeeds, verify the structure
@@ -483,7 +501,7 @@ module @jit__lambda {
 }
 
 // Test modules with no outputs
-TEST_F(StableHloUtilsTest, ModulesWithNoOutputs) {
+TEST_F(OpConcatUtilsTest, ModulesWithNoOutputs) {
   std::string mlir_no_outputs = R"(
 module @jit__lambda {
   func.func public @main(%arg0: tensor<f32>) -> () {
@@ -498,9 +516,9 @@ module @jit__lambda {
   auto normal_inputs = createMockAddresses({300});     // Normal module inputs
   auto normal_outputs = createMockAddresses({400});    // Normal module outputs
 
-  std::string result =
-      torch_neuronx::mergeStableHLOModules(mlir_no_outputs, mlir1_independent, no_output_inputs,
-                                           empty_outputs, normal_inputs, normal_outputs);
+  std::string result = torch_neuronx::mergeStableHLOModules(
+      mlir_no_outputs, mlir1_independent, no_output_inputs, empty_outputs, normal_inputs,
+      normal_outputs, /*verify_output=*/true, /*run_optimization=*/false);
 
   if (!result.empty()) {
     // If merge succeeds, verify the structure
@@ -524,7 +542,7 @@ module @jit__lambda {
 // Section 4: Real-world Examples
 // ============================================================================
 
-TEST_F(StableHloUtilsTest, ReadInputFile) {
+TEST_F(OpConcatUtilsTest, ReadInputFile) {
   std::string filename = "input_inc_1.mlir";
   std::ifstream file(filename);
 
@@ -544,7 +562,8 @@ TEST_F(StableHloUtilsTest, ReadInputFile) {
     auto mlir2_outputs = createMockAddresses({4000});  // mlir2_independent output
 
     std::string result = torch_neuronx::mergeStableHLOModules(
-        content, mlir2_independent, file_inputs, file_outputs, mlir2_inputs, mlir2_outputs);
+        content, mlir2_independent, file_inputs, file_outputs, mlir2_inputs, mlir2_outputs,
+        /*verify_output=*/true, /*run_optimization=*/false);
     EXPECT_FALSE(result.empty());
 
     // Verify input/output counts with real file
@@ -566,7 +585,7 @@ TEST_F(StableHloUtilsTest, ReadInputFile) {
 }
 
 // Test the specific transpose + matmul example
-TEST_F(StableHloUtilsTest, TransposeMatmulFusionExample) {
+TEST_F(OpConcatUtilsTest, TransposeMatmulFusionExample) {
   // MLIR for transpose operation: tensor<8192x8192xbf16> -> tensor<8192x8192xbf16>
   std::string transpose_mlir = R"(
 module @jit_transpose_fn attributes {jax.uses_shape_polymorphism = false, mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
@@ -599,7 +618,8 @@ module @jit__aten_mm attributes {jax.uses_shape_polymorphism = false, mhlo.num_p
 
   // Test merging transpose and matmul operations with dependency
   std::string result = torch_neuronx::mergeStableHLOModules(
-      transpose_mlir, matmul_mlir, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      transpose_mlir, matmul_mlir, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   // Verify merge succeeded and produced non-empty result
 
@@ -682,7 +702,7 @@ module @jit__aten_mm attributes {jax.uses_shape_polymorphism = false, mhlo.num_p
 }
 
 // Test the specific transpose + matmul example
-TEST_F(StableHloUtilsTest, WrongTransposeMatmulFusionExample) {
+TEST_F(OpConcatUtilsTest, WrongTransposeMatmulFusionExample) {
   // MLIR for transpose operation: tensor<8192x8192xbf16> -> tensor<8192x8192xbf16>
   std::string transpose_mlir = R"(
 module @jit_transpose_fn attributes {jax.uses_shape_polymorphism = false, mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
@@ -721,14 +741,16 @@ module @jit__aten_mm attributes {jax.uses_shape_polymorphism = false, mhlo.num_p
   EXPECT_THROW(
       {
         torch_neuronx::mergeStableHLOModules(transpose_mlir, matmul_mlir, mod1_inputs, mod1_outputs,
-                                             mod2_inputs, mod2_outputs);
+                                             mod2_inputs, mod2_outputs, /*verify_output=*/true,
+                                             /*run_optimization=*/false);
       },
       std::runtime_error);
 
   // Also test that the error message contains the expected type mismatch information
   try {
     torch_neuronx::mergeStableHLOModules(transpose_mlir, matmul_mlir, mod1_inputs, mod1_outputs,
-                                         mod2_inputs, mod2_outputs);
+                                         mod2_inputs, mod2_outputs, /*verify_output=*/true,
+                                         /*run_optimization=*/false);
     FAIL() << "Expected std::runtime_error to be thrown";
   } catch (const std::runtime_error& e) {
     std::string error_msg = e.what();
@@ -753,7 +775,7 @@ module @jit__aten_mm attributes {jax.uses_shape_polymorphism = false, mhlo.num_p
 // ============================================================================
 
 // Test concatenating a merged module with a single (non-merged) module
-TEST_F(StableHloUtilsTest, ConcatMergedModuleWithSingleModule) {
+TEST_F(OpConcatUtilsTest, ConcatMergedModuleWithSingleModule) {
   // Test concatenating a merged module with a single module
 
   // Step 1: Create a merged module from two independent modules
@@ -784,7 +806,8 @@ module @jit_module2 {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "Initial merge should succeed";
   EXPECT_TRUE(merged12.find("stablehlo.add") != std::string::npos);
@@ -809,7 +832,8 @@ module @jit_module3 {
 
   // Concatenate the merged module with the single module
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs);
+      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Merging merged module with single module should succeed";
 
@@ -838,7 +862,7 @@ module @jit_module3 {
 }
 
 // Test iterative concatenation with COMMON_INPUTS scenario
-TEST_F(StableHloUtilsTest, IterativeConcatenationCommonInputs) {
+TEST_F(OpConcatUtilsTest, IterativeConcatenationCommonInputs) {
   // Test iterative concatenation with common inputs scenario
 
   // Step 1: Create first merged module with common inputs
@@ -849,7 +873,8 @@ TEST_F(StableHloUtilsTest, IterativeConcatenationCommonInputs) {
   auto mod2_outputs = createMockAddresses({300});      // e
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "First merge with common inputs should succeed";
 
@@ -875,7 +900,8 @@ module @jit_module3 {
   auto mod3_outputs = createMockAddresses({400});               // g
 
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs);
+      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Iterative merge with common inputs should succeed";
 
@@ -904,7 +930,7 @@ module @jit_module3 {
 }
 
 // Test iterative concatenation with DIRECT_DEPS scenario
-TEST_F(StableHloUtilsTest, IterativeConcatenationDirectDeps) {
+TEST_F(OpConcatUtilsTest, IterativeConcatenationDirectDeps) {
   // Test iterative concatenation with direct dependencies scenario
 
   // Step 1: Create first merged module with direct dependency
@@ -915,7 +941,8 @@ TEST_F(StableHloUtilsTest, IterativeConcatenationDirectDeps) {
   auto mod2_outputs = createMockAddresses({300});      // e
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "First merge with direct dependency should succeed";
 
@@ -938,7 +965,8 @@ module @jit_module3 {
   auto mod3_outputs = createMockAddresses({400});               // g
 
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs);
+      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Iterative merge with direct dependency should succeed";
 
@@ -967,7 +995,7 @@ module @jit_module3 {
 }
 
 // Test iterative concatenation with MIXED scenario (common inputs + dependencies)
-TEST_F(StableHloUtilsTest, IterativeConcatenationMixed) {
+TEST_F(OpConcatUtilsTest, IterativeConcatenationMixed) {
   // Test iterative concatenation with mixed scenario (common inputs + dependencies)
 
   // Step 1: Create first merged module with mixed scenario
@@ -978,7 +1006,8 @@ TEST_F(StableHloUtilsTest, IterativeConcatenationMixed) {
   auto mod2_outputs = createMockAddresses({300});      // e
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "First merge with mixed scenario should succeed";
 
@@ -1002,7 +1031,8 @@ module @jit_module3 {
   auto mod3_outputs = createMockAddresses({400});           // g
 
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs);
+      merged12, module3, merged12_inputs, merged12_outputs, mod3_inputs, mod3_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Iterative merge with mixed scenario should succeed";
 
@@ -1032,7 +1062,7 @@ module @jit_module3 {
 }
 
 // Test complex iterative concatenation covering all 4 scenarios in sequence
-TEST_F(StableHloUtilsTest, IterativeConcatenationAllScenarios) {
+TEST_F(OpConcatUtilsTest, IterativeConcatenationAllScenarios) {
   // This test demonstrates that our system can handle all 4 dependency scenarios
   // in a complex iterative concatenation sequence
 
@@ -1063,7 +1093,8 @@ module @jit_mod2 {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string merged_independent = torch_neuronx::mergeStableHLOModules(
-      mod1, mod2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mod1, mod2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, /*verify_output=*/true,
+      /*run_optimization=*/false);
 
   EXPECT_FALSE(merged_independent.empty()) << "INDEPENDENT merge should succeed";
 
@@ -1083,9 +1114,9 @@ module @jit_mod3 {
   auto mod3_inputs = createMockAddresses({100});  // Share input with first module
   auto mod3_outputs = createMockAddresses({500});
 
-  std::string merged_common =
-      torch_neuronx::mergeStableHLOModules(merged_independent, mod3, merged_indep_inputs,
-                                           merged_indep_outputs, mod3_inputs, mod3_outputs);
+  std::string merged_common = torch_neuronx::mergeStableHLOModules(
+      merged_independent, mod3, merged_indep_inputs, merged_indep_outputs, mod3_inputs,
+      mod3_outputs, /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged_common.empty()) << "COMMON_INPUTS merge should succeed";
 
@@ -1106,7 +1137,8 @@ module @jit_mod4 {
   auto mod4_outputs = createMockAddresses({600});
 
   std::string merged_deps = torch_neuronx::mergeStableHLOModules(
-      merged_common, mod4, merged_common_inputs, merged_common_outputs, mod4_inputs, mod4_outputs);
+      merged_common, mod4, merged_common_inputs, merged_common_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged_deps.empty()) << "DIRECT_DEPS merge should succeed";
 
@@ -1126,7 +1158,8 @@ module @jit_mod5 {
   auto mod5_outputs = createMockAddresses({700});
 
   std::string final_mixed = torch_neuronx::mergeStableHLOModules(
-      merged_deps, mod5, merged_deps_inputs, merged_deps_outputs, mod5_inputs, mod5_outputs);
+      merged_deps, mod5, merged_deps_inputs, merged_deps_outputs, mod5_inputs, mod5_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_mixed.empty()) << "MIXED merge should succeed";
 
@@ -1168,7 +1201,7 @@ module @jit_mod5 {
 // ============================================================================
 
 // Test concatenating two merged modules together
-TEST_F(StableHloUtilsTest, ConcatTwoMergedModules) {
+TEST_F(OpConcatUtilsTest, ConcatTwoMergedModules) {
   // Test concatenating two merged modules together
 
   // Create first pair of modules and merge them
@@ -1199,7 +1232,8 @@ module @jit_module2 {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "First merge should succeed";
 
@@ -1231,7 +1265,8 @@ module @jit_module4 {
   auto mod4_outputs = createMockAddresses({800});
 
   std::string merged34 = torch_neuronx::mergeStableHLOModules(
-      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs);
+      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged34.empty()) << "Second merge should succeed";
 
@@ -1243,7 +1278,8 @@ module @jit_module4 {
 
   // Concatenate the two merged modules
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      merged12, merged34, merged12_inputs, merged12_outputs, merged34_inputs, merged34_outputs);
+      merged12, merged34, merged12_inputs, merged12_outputs, merged34_inputs, merged34_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Merging two merged modules should succeed";
 
@@ -1286,7 +1322,7 @@ module @jit_module4 {
 }
 
 // Test complex iterative concatenation: merge 1+2, merge 3+4, merge 12+34, merge 5+6, merge 1234+56
-TEST_F(StableHloUtilsTest, ComplexIterativeConcatenation) {
+TEST_F(OpConcatUtilsTest, ComplexIterativeConcatenation) {
   // Test complex iterative concatenation: merge 1+2, merge 3+4, merge 12+34, merge 5+6, merge
   // 1234+56
 
@@ -1358,7 +1394,8 @@ module @jit_module6 {
   auto mod2_outputs = createMockAddresses({400});
 
   std::string merged12 = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged12.empty()) << "Step 1: module1 + module2 merge should succeed";
   EXPECT_TRUE(merged12.find("stablehlo.add") != std::string::npos)
@@ -1373,7 +1410,8 @@ module @jit_module6 {
   auto mod4_outputs = createMockAddresses({800});
 
   std::string merged34 = torch_neuronx::mergeStableHLOModules(
-      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs);
+      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged34.empty()) << "Step 2: module3 + module4 merge should succeed";
   EXPECT_TRUE(merged34.find("stablehlo.subtract") != std::string::npos)
@@ -1388,7 +1426,8 @@ module @jit_module6 {
   auto merged34_outputs = createMockAddresses({600, 800});
 
   std::string merged1234 = torch_neuronx::mergeStableHLOModules(
-      merged12, merged34, merged12_inputs, merged12_outputs, merged34_inputs, merged34_outputs);
+      merged12, merged34, merged12_inputs, merged12_outputs, merged34_inputs, merged34_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged1234.empty()) << "Step 3: merged12 + merged34 merge should succeed";
   EXPECT_TRUE(merged1234.find("stablehlo.add") != std::string::npos)
@@ -1407,7 +1446,8 @@ module @jit_module6 {
   auto mod6_outputs = createMockAddresses({1200});
 
   std::string merged56 = torch_neuronx::mergeStableHLOModules(
-      module5, module6, mod5_inputs, mod5_outputs, mod6_inputs, mod6_outputs);
+      module5, module6, mod5_inputs, mod5_outputs, mod6_inputs, mod6_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(merged56.empty()) << "Step 4: module5 + module6 merge should succeed";
   EXPECT_TRUE(merged56.find("stablehlo.maximum") != std::string::npos)
@@ -1421,9 +1461,9 @@ module @jit_module6 {
   auto merged56_inputs = createMockAddresses({900, 1100});
   auto merged56_outputs = createMockAddresses({1000, 1200});
 
-  std::string final_merged =
-      torch_neuronx::mergeStableHLOModules(merged1234, merged56, merged1234_inputs,
-                                           merged1234_outputs, merged56_inputs, merged56_outputs);
+  std::string final_merged = torch_neuronx::mergeStableHLOModules(
+      merged1234, merged56, merged1234_inputs, merged1234_outputs, merged56_inputs,
+      merged56_outputs, /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_merged.empty()) << "Step 5: Final merge should succeed";
 
@@ -1477,7 +1517,7 @@ module @jit_module6 {
 }
 
 // Test concatenating two merged modules with common inputs
-TEST_F(StableHloUtilsTest, ConcatTwoMergedModulesCommonInputs) {
+TEST_F(OpConcatUtilsTest, ConcatTwoMergedModulesCommonInputs) {
   // Test concatenating two merged modules with common inputs
 
   // Step 1: Create MergedA = Module1 + Module2 (independent)
@@ -1508,7 +1548,8 @@ module @jit_module2 {
   auto mod2_outputs = createMockAddresses({400});  // d
 
   std::string mergedA = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedA.empty()) << "MergedA creation should succeed";
 
@@ -1541,7 +1582,8 @@ module @jit_module4 {
   auto mod4_outputs = createMockAddresses({700});  // g
 
   std::string mergedB = torch_neuronx::mergeStableHLOModules(
-      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs);
+      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedB.empty()) << "MergedB creation should succeed";
 
@@ -1556,7 +1598,8 @@ module @jit_module4 {
 
   // Merge MergedA + MergedB with common input 'a'
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs);
+      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Final merge with common inputs should succeed";
 
@@ -1590,7 +1633,7 @@ module @jit_module4 {
 }
 
 // Test concatenating two merged modules with direct dependencies
-TEST_F(StableHloUtilsTest, ConcatTwoMergedModulesDirectDeps) {
+TEST_F(OpConcatUtilsTest, ConcatTwoMergedModulesDirectDeps) {
   // Test concatenating two merged modules with direct dependencies
 
   // Step 1: Create MergedA = Module1 + Module2 (independent)
@@ -1621,7 +1664,8 @@ module @jit_module2 {
   auto mod2_outputs = createMockAddresses({400});  // d
 
   std::string mergedA = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedA.empty()) << "MergedA creation should succeed";
 
@@ -1654,7 +1698,8 @@ module @jit_module4 {
   auto mod4_outputs = createMockAddresses({700});  // g
 
   std::string mergedB = torch_neuronx::mergeStableHLOModules(
-      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs);
+      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedB.empty()) << "MergedB creation should succeed";
 
@@ -1669,7 +1714,8 @@ module @jit_module4 {
 
   // Merge MergedA + MergedB with dependency 'd'
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs);
+      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Final merge with direct dependency should succeed";
 
@@ -1702,7 +1748,7 @@ module @jit_module4 {
 }
 
 // Test concatenating two merged modules with mixed scenario (common inputs + dependencies)
-TEST_F(StableHloUtilsTest, ConcatTwoMergedModulesMixed) {
+TEST_F(OpConcatUtilsTest, ConcatTwoMergedModulesMixed) {
   // Test concatenating two merged modules with mixed scenario (common inputs + dependencies)
 
   // Step 1: Create MergedA = Module1 + Module2 (with common input)
@@ -1732,7 +1778,8 @@ module @jit_module2 {
   auto mod2_outputs = createMockAddresses({300});      // e
 
   std::string mergedA = torch_neuronx::mergeStableHLOModules(
-      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedA.empty()) << "MergedA creation should succeed";
 
@@ -1765,7 +1812,8 @@ module @jit_module4 {
   auto mod4_outputs = createMockAddresses({500});  // g
 
   std::string mergedB = torch_neuronx::mergeStableHLOModules(
-      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs);
+      module3, module4, mod3_inputs, mod3_outputs, mod4_inputs, mod4_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(mergedB.empty()) << "MergedB creation should succeed";
 
@@ -1780,7 +1828,8 @@ module @jit_module4 {
 
   // Merge MergedA + MergedB with mixed scenario
   std::string final_result = torch_neuronx::mergeStableHLOModules(
-      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs);
+      mergedA, mergedB, mergedA_inputs, mergedA_outputs, mergedB_inputs, mergedB_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   EXPECT_FALSE(final_result.empty()) << "Final merge with mixed scenario should succeed";
 
@@ -1818,7 +1867,7 @@ module @jit_module4 {
 // ============================================================================
 
 // Test mapping correctness for Module1->Module2 dependency (module1 executes first)
-TEST_F(StableHloUtilsTest, MappingTestModule1ToModule2Dependency) {
+TEST_F(OpConcatUtilsTest, MappingTestModule1ToModule2Dependency) {
   // Module1: f(a, b) -> c, Module2: g(c, d) -> e
   auto mod1_inputs = createMockAddresses({100, 101});  // a, b
   auto mod1_outputs = createMockAddresses({200});      // c
@@ -1862,7 +1911,7 @@ TEST_F(StableHloUtilsTest, MappingTestModule1ToModule2Dependency) {
 }
 
 // Test mapping correctness for Module2->Module1 dependency (module2 executes first)
-TEST_F(StableHloUtilsTest, MappingTestModule2ToModule1Dependency) {
+TEST_F(OpConcatUtilsTest, MappingTestModule2ToModule1Dependency) {
   // Module2: f(a) -> b, Module1: g(b, c) -> d
   auto mod1_inputs = createMockAddresses({200, 101});  // b (from mod2), c
   auto mod1_outputs = createMockAddresses({300});      // d
@@ -1904,7 +1953,7 @@ TEST_F(StableHloUtilsTest, MappingTestModule2ToModule1Dependency) {
 }
 
 // Test mapping correctness for common inputs scenario
-TEST_F(StableHloUtilsTest, MappingTestCommonInputs) {
+TEST_F(OpConcatUtilsTest, MappingTestCommonInputs) {
   // Module1: f(a, b) -> c, Module2: g(a, d) -> e (share input 'a')
   auto mod1_inputs = createMockAddresses({100, 101});  // a, b
   auto mod1_outputs = createMockAddresses({200});      // c
@@ -1948,7 +1997,7 @@ TEST_F(StableHloUtilsTest, MappingTestCommonInputs) {
 }
 
 // Test mapping correctness for mixed scenario (common inputs + dependencies)
-TEST_F(StableHloUtilsTest, MappingTestMixedScenario) {
+TEST_F(OpConcatUtilsTest, MappingTestMixedScenario) {
   // Module1: f(a, b) -> c, Module2: g(a, c) -> e (share 'a' + use 'c')
   auto mod1_inputs = createMockAddresses({100, 101});  // a, b
   auto mod1_outputs = createMockAddresses({200});      // c
@@ -1988,6 +2037,36 @@ TEST_F(StableHloUtilsTest, MappingTestMixedScenario) {
   EXPECT_EQ(mapping.output_mapping[1], std::make_pair(2, size_t(0)))
       << "Output 1 should be module2 output 0";
 }
+
+// ============================================================================
+// Section 7a: StableHloUtils Test Fixture for Tensor-Based Tests
+// ============================================================================
+
+class StableHloUtilsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // Module with 2 inputs, 1 output for tensor-based tests
+    mlir1_two_input = R"(
+module @jit__lambda {
+  func.func public @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+    return %0 : tensor<f32>
+  }
+}
+)";
+
+    mlir2_two_input = R"(
+module @jit__lambda2 {
+  func.func public @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+    %0 = stablehlo.multiply %arg0, %arg1 : tensor<f32>
+    return %0 : tensor<f32>
+  }
+}
+)";
+  }
+
+  std::string mlir1_two_input, mlir2_two_input;
+};
 
 // Test tensor address verification through 2-stage merge mapping using real tensors
 // This test catches the bug where duplicate addresses appear in final outputs
@@ -2120,6 +2199,317 @@ TEST_F(StableHloUtilsTest, TensorAddressExactMatch) {
       << "Final output 1 should be tensor r2";
   EXPECT_EQ(result_final.merged_outputs[2].data_ptr(), r3.data_ptr())
       << "Final output 2 should be tensor r3";
+}
+
+// ============================================================================
+// Section 8: In-Order Module Merging Tests
+// ============================================================================
+
+// Test in-order merge with independent modules
+TEST_F(OpConcatUtilsTest, InOrderMergeIndependentModules) {
+  // Create mock tensor addresses for independent modules
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  // Use analyzeDependenciesInOrder instead of analyzeDependencies
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::INDEPENDENT);
+  EXPECT_TRUE(analysis.module1First) << "In-order merge always has module1 first";
+  EXPECT_TRUE(analysis.commonInputs.empty());
+  EXPECT_TRUE(analysis.module1ToModule2Deps.empty());
+  // In-order analysis doesn't check module2->module1 dependencies
+  EXPECT_TRUE(analysis.module2ToModule1Deps.empty());
+}
+
+// Test in-order merge with direct dependencies
+TEST_F(OpConcatUtilsTest, InOrderMergeWithDependencies) {
+  // Module1 output becomes module2 input (valid for in-order)
+  auto mod1_inputs = createMockAddresses({100, 101});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({200, 102});  // Uses mod1 output
+  auto mod2_outputs = createMockAddresses({300});
+
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::DIRECT_DEPS);
+  EXPECT_TRUE(analysis.module1First);
+  EXPECT_FALSE(analysis.module1ToModule2Deps.empty());
+
+  // Verify dependency map
+  ASSERT_TRUE(analysis.module1ToModule2Deps.find(0) != analysis.module1ToModule2Deps.end());
+  EXPECT_EQ(analysis.module1ToModule2Deps.at(0)[0], 0);
+}
+
+// Test in-order merge with common inputs
+TEST_F(OpConcatUtilsTest, InOrderMergeCommonInputs) {
+  auto mod1_inputs = createMockAddresses({100, 101});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({100, 102});  // Shares input 100
+  auto mod2_outputs = createMockAddresses({300});
+
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::COMMON_INPUTS);
+  EXPECT_TRUE(analysis.module1First);
+  EXPECT_FALSE(analysis.commonInputs.empty());
+  EXPECT_EQ(analysis.commonInputs[0], 0);  // module1[0] == module2[0]
+}
+
+// Test in-order merge with mixed scenario
+TEST_F(OpConcatUtilsTest, InOrderMergeMixedScenario) {
+  auto mod1_inputs = createMockAddresses({100, 101});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({100, 200});  // Shares 100, uses output 200
+  auto mod2_outputs = createMockAddresses({300});
+
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::MIXED);
+  EXPECT_TRUE(analysis.module1First);
+  EXPECT_FALSE(analysis.commonInputs.empty());
+  EXPECT_FALSE(analysis.module1ToModule2Deps.empty());
+}
+
+// Test mergeStableHLOModulesWithTensorsInOrder preserves all outputs
+TEST_F(OpConcatUtilsTest, InOrderMergePreservesAllOutputs) {
+  // Create real tensors
+  at::Tensor a = at::randn({4});
+  at::Tensor b = at::randn({4});
+  at::Tensor c = at::randn({4});  // Output from op1
+  at::Tensor d = at::randn({4});
+  at::Tensor e = at::randn({4});  // Output from op2
+
+  std::vector<at::Tensor> op1_inputs = {a, b};
+  std::vector<at::Tensor> op1_outputs = {c};
+  std::vector<at::Tensor> op2_inputs = {c, d};  // Uses op1's output
+  std::vector<at::Tensor> op2_outputs = {e};
+
+  auto result = torch_neuronx::mergeStableHLOModulesWithTensorsInOrder(
+      mlir1_two_input, mlir2_two_input, op1_inputs, op1_outputs, op2_inputs, op2_outputs);
+
+  ASSERT_TRUE(result.success) << "In-order merge should succeed";
+  EXPECT_EQ(result.mapping.total_inputs, 3)
+      << "Should have 3 inputs (a, b, d) - c is internal dependency";
+  EXPECT_EQ(result.mapping.total_outputs, 2) << "Should have 2 outputs (c, e) - both preserved";
+
+  // Verify outputs are preserved
+  EXPECT_EQ(result.merged_outputs.size(), 2);
+  EXPECT_EQ(result.merged_outputs[0].data_ptr(), c.data_ptr());
+  EXPECT_EQ(result.merged_outputs[1].data_ptr(), e.data_ptr());
+}
+
+// Test mergeStableHLOModulesWithTensorsInOrderSkipIntermediates
+TEST_F(OpConcatUtilsTest, InOrderMergeSkipIntermediates) {
+  // Create real tensors
+  at::Tensor a = at::randn({4});
+  at::Tensor b = at::randn({4});
+  at::Tensor c = at::randn({4});  // Intermediate output from op1
+  at::Tensor d = at::randn({4});
+  at::Tensor e = at::randn({4});  // Final output from op2
+
+  std::vector<at::Tensor> op1_inputs = {a, b};
+  std::vector<at::Tensor> op1_outputs = {c};
+  std::vector<at::Tensor> op2_inputs = {c, d};  // Uses op1's output (c becomes intermediate)
+  std::vector<at::Tensor> op2_outputs = {e};
+
+  auto result = torch_neuronx::mergeStableHLOModulesWithTensorsInOrderSkipIntermediates(
+      mlir1_two_input, mlir2_two_input, op1_inputs, op1_outputs, op2_inputs, op2_outputs);
+
+  ASSERT_TRUE(result.success) << "In-order merge with skip intermediates should succeed";
+  EXPECT_EQ(result.mapping.total_inputs, 3) << "Should have 3 inputs (a, b, d)";
+  EXPECT_EQ(result.mapping.total_outputs, 1)
+      << "Should have 1 output (e) - intermediate c is skipped";
+
+  // Verify only final output is present
+  EXPECT_EQ(result.merged_outputs.size(), 1);
+  EXPECT_EQ(result.merged_outputs[0].data_ptr(), e.data_ptr());
+}
+
+// Test that in-order merge doesn't check module2->module1 dependencies
+// (which would be impossible in sequential execution)
+TEST_F(OpConcatUtilsTest, InOrderMergeIgnoresReverseDependencies) {
+  // This scenario WOULD be a circular dependency in regular merge,
+  // but in-order merge simply ignores module2->module1 direction
+  // because module2 executes AFTER module1 by definition
+
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({100});  // module2 output has same address as module1
+                                                   // input
+
+  // In regular analyzeDependencies, this might detect a reverse dependency
+  // But in analyzeDependenciesInOrder, we don't check module2 outputs -> module1 inputs
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  // Should be INDEPENDENT because we don't check reverse dependencies
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::INDEPENDENT);
+  EXPECT_TRUE(analysis.module1First);
+  EXPECT_TRUE(analysis.module2ToModule1Deps.empty())
+      << "In-order merge should not populate module2->module1 deps";
+}
+
+// Test in-order merge performance advantage: no circular dependency check needed
+TEST_F(OpConcatUtilsTest, InOrderMergeNoCircularDependencyCheck) {
+  // In regular merge, having both directions of dependencies would throw.
+  // But in in-order merge, we only check module1->module2, so even if
+  // addresses appear "circular", it won't throw because we don't check the other direction.
+
+  auto mod1_inputs = createMockAddresses({100, 300});  // Note: 300 appears in mod2 outputs
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({200, 101});  // Note: 200 is mod1 output
+  auto mod2_outputs = createMockAddresses({300});      // Note: 300 appears in mod1 inputs
+
+  // In regular analyzeDependencies, this would throw "Circular dependencies detected"
+  EXPECT_THROW(
+      { torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs); },
+      std::runtime_error);
+
+  // But in analyzeDependenciesInOrder, we only check module1->module2, so no throw
+  EXPECT_NO_THROW({
+    auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs,
+                                                              mod2_inputs, mod2_outputs);
+
+    // Should detect the forward dependency
+    EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::DIRECT_DEPS);
+    EXPECT_FALSE(analysis.module1ToModule2Deps.empty());
+    // But module2ToModule1Deps should be empty (not checked)
+    EXPECT_TRUE(analysis.module2ToModule1Deps.empty());
+  });
+}
+
+// Test in-order merge with mergeModulesInOrder low-level function
+TEST_F(OpConcatUtilsTest, MergeModulesInOrderBasic) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged = torch_neuronx::mergeModulesInOrder(
+      *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, &mapping);
+
+  ASSERT_TRUE(merged) << "mergeModulesInOrder should succeed";
+
+  auto main_func = merged->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_func);
+  EXPECT_EQ(main_func.getNumArguments(), 2);
+  EXPECT_EQ(main_func.getNumResults(), 2);
+}
+
+// Test in-order merge with duplicate inputs (x + x scenario)
+TEST_F(OpConcatUtilsTest, InOrderMergeDuplicateInputs) {
+  auto mod1_inputs = createMockAddresses({100, 101});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({200, 200});  // Both inputs are the same (duplicate)
+  auto mod2_outputs = createMockAddresses({300});
+
+  auto analysis = torch_neuronx::analyzeDependenciesInOrder(mod1_inputs, mod1_outputs, mod2_inputs,
+                                                            mod2_outputs);
+
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::DIRECT_DEPS);
+
+  // Verify both duplicate inputs are tracked
+  auto dep_it = analysis.module1ToModule2Deps.find(0);
+  ASSERT_NE(dep_it, analysis.module1ToModule2Deps.end());
+  EXPECT_EQ(dep_it->second.size(), 2) << "Should track both duplicate input indices";
+}
+
+// Test for duplicate input handling (bug fix for x + x scenario)
+TEST_F(OpConcatUtilsTest, HandlesDuplicateInputs) {
+  // Test the bug fix for operations with duplicate inputs (e.g., x + x)
+  // Bug: Operations like "add(x, x)" were producing 50% of expected value
+  // because dependency tracking wasn't handling duplicate input indices
+
+  // Module1: f(a, b) -> c = a + b
+  std::string module1 = R"(
+module @jit_module1 {
+  func.func public @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+    return %0 : tensor<f32>
+  }
+}
+)";
+
+  // Module2: g(c) -> d = c + c  (DUPLICATE INPUTS - both inputs are the same tensor)
+  std::string module2 = R"(
+module @jit_module2 {
+  func.func public @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+    return %0 : tensor<f32>
+  }
+}
+)";
+
+  // Create addresses: Module2 uses Module1's output TWICE (duplicate inputs)
+  auto mod1_inputs = createMockAddresses({100, 101});  // a, b
+  auto mod1_outputs = createMockAddresses({200});      // c
+  auto mod2_inputs = createMockAddresses({200, 200});  // c, c (BOTH inputs point to same address!)
+  auto mod2_outputs = createMockAddresses({300});      // d
+
+  // This should succeed with the bug fix
+  std::string result = torch_neuronx::mergeStableHLOModules(
+      module1, module2, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
+
+  EXPECT_FALSE(result.empty()) << "Merge with duplicate inputs should succeed";
+
+  // Parse and verify structure
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+
+  auto merged_module = mlir::parseSourceString<mlir::ModuleOp>(result, &context);
+  ASSERT_TRUE(merged_module) << "Merged MLIR with duplicate inputs should be parseable";
+
+  auto main_func = merged_module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_func) << "Should have main function";
+
+  // Expected: 2 inputs (a, b), 2 outputs (c, d)
+  // 'c' is used twice by module2 but only appears once in the output
+  EXPECT_EQ(main_func.getNumArguments(), 2) << "Should have 2 inputs";
+  EXPECT_EQ(main_func.getNumResults(), 2) << "Should have 2 outputs";
+
+  // Verify both operations are present
+  EXPECT_TRUE(result.find("stablehlo.add") != std::string::npos) << "Should contain add operations";
+
+  // Verify dependency was correctly tracked
+  auto analysis =
+      torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+  EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::DIRECT_DEPS);
+  EXPECT_TRUE(analysis.module1First) << "Module1 should execute first";
+
+  // CRITICAL: Verify that BOTH duplicate inputs are tracked in the dependency map
+  ASSERT_EQ(analysis.module1ToModule2Deps.size(), 1) << "Should have one output with dependencies";
+
+  // The bug fix: module1's output 0 should map to BOTH of module2's inputs (indices 0 and 1)
+  auto dep_it = analysis.module1ToModule2Deps.find(0);
+  ASSERT_NE(dep_it, analysis.module1ToModule2Deps.end()) << "Should find dependency for output 0";
+
+  const std::vector<size_t>& input_indices = dep_it->second;
+  EXPECT_EQ(input_indices.size(), 2) << "Output 0 should map to 2 input indices (duplicate inputs)";
+
+  // Verify both input indices (0 and 1) are in the dependency vector
+  EXPECT_NE(std::find(input_indices.begin(), input_indices.end(), 0), input_indices.end())
+      << "Should have dependency to input index 0";
+  EXPECT_NE(std::find(input_indices.begin(), input_indices.end(), 1), input_indices.end())
+      << "Should have dependency to input index 1";
 }
 
 int main(int argc, char** argv) {

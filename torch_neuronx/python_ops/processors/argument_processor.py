@@ -5,9 +5,7 @@ import os
 
 import torch
 
-from torch_neuronx.kernels.type_converter import TypeConverter
-from torch_neuronx.python_ops.jax.compilation.jax_compiler import JaxCompiler
-from torch_neuronx.utils import is_sync_mode_enabled
+from torch_neuronx.utils import convert_for_neuron, is_stablehlo_enabled, is_sync_mode_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +37,24 @@ class ArgumentProcessor:
         """Set static_argnums."""
         self._static_argnums = value
 
+    def preprocess_kwargs(self, kwargs: dict) -> dict:
+        """Preprocess kwargs by converting non-static int/float to tensors."""
+        if not kwargs:
+            return kwargs
+
+        processed_kwargs = {}
+        for key, value in kwargs.items():
+            if key not in self.static_argnames and (type(value) is int or type(value) is float):
+                if type(value) is int:
+                    processed_kwargs[key] = torch.tensor(value, dtype=torch.int32, device="neuron")
+                else:
+                    processed_kwargs[key] = torch.tensor(
+                        value, dtype=torch.float32, device="neuron"
+                    )
+            else:
+                processed_kwargs[key] = value
+        return processed_kwargs
+
     def preprocess_inputs(self, inputs: tuple, scalar_to_tensor: bool = False) -> tuple:
         """Preprocess inputs for Neuron compatibility.
 
@@ -59,23 +75,33 @@ class ArgumentProcessor:
         # 2. OR TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
         # 3. OR sync mode is enabled
         prologue_disabled = (
-            not JaxCompiler.is_stablehlo_enabled()
+            not is_stablehlo_enabled()
             or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false")
             or is_sync_mode_enabled()
         )
 
+        # Determine target device from first non-scalar tensor
+        target_device = None
+        for inp in inputs:
+            if isinstance(inp, torch.Tensor) and inp.ndim > 0:
+                target_device = inp.device
+                break
+
         def preprocess_value(inp):
             """preprocess a single input"""
             if isinstance(inp, torch.Tensor):
+                # Move CPU scalar tensors to target device (matches CUDA semantics)
+                if target_device and inp.device.type == "cpu" and inp.ndim == 0:
+                    inp = inp.to(target_device)
                 # Make tensor contiguous if prologue is disabled and tensor is not contiguous
                 if prologue_disabled and not inp.is_contiguous():
                     inp = inp.contiguous()
-                return TypeConverter.convert_for_neuron(inp)
+                return convert_for_neuron(inp)
             elif isinstance(inp, (list | tuple)):
                 return tuple(preprocess_value(item) for item in inp)
             elif isinstance(inp, torch.dtype):
                 # Map torch.dtype to ScalarType enum values as defined in
-                # c10/core/ScalarType.h for MLIR lowring
+                # c10/core/ScalarType.h for MLIR lowering
                 return ArgumentProcessor._get_scalar_type_value(inp)
             elif scalar_to_tensor and isinstance(inp, int):
                 return torch.tensor(inp, dtype=torch.int32, device="neuron")
@@ -138,26 +164,29 @@ class ArgumentProcessor:
 
         for i, inp in enumerate(inputs):
             if isinstance(inp, torch.Tensor):
-                input_dict[f"input{tensor_idx}"] = TypeConverter.convert_for_neuron(to_device(inp))
+                input_dict[f"input{tensor_idx}"] = convert_for_neuron(to_device(inp))
                 tensor_idx += 1
             elif inp is not None and i not in self.static_argnums:
                 if isinstance(inp, list | tuple):
                     # Handle tuple of tensors and mixed structures for ops like index_put, index
                     for val in inp:
                         if isinstance(val, torch.Tensor):
-                            input_dict[f"input{tensor_idx}"] = TypeConverter.convert_for_neuron(
-                                to_device(val)
-                            )
+                            input_dict[f"input{tensor_idx}"] = convert_for_neuron(to_device(val))
                             tensor_idx += 1
-                        elif isinstance(val, float | int):
-                            scalar_tensor = torch.tensor(val, device=device)
-                            scalar_tensor = TypeConverter.convert_for_neuron(scalar_tensor)
+                        elif isinstance(val, float):
+                            scalar_tensor = torch.tensor(val, dtype=torch.float32, device=device)
+                            input_dict[f"input{tensor_idx}"] = scalar_tensor
+                            tensor_idx += 1
+                        elif isinstance(val, int):
+                            scalar_tensor = torch.tensor(val, dtype=torch.int32, device=device)
                             input_dict[f"input{tensor_idx}"] = scalar_tensor
                             tensor_idx += 1
                 else:
                     # Convert non-static scalars to tensors
-                    scalar_tensor = torch.tensor(inp, device=device)
-                    scalar_tensor = TypeConverter.convert_for_neuron(scalar_tensor)
+                    if isinstance(inp, float):
+                        scalar_tensor = torch.tensor(inp, dtype=torch.float32, device=device)
+                    else:
+                        scalar_tensor = torch.tensor(inp, dtype=torch.int32, device=device)
                     input_dict[f"input{tensor_idx}"] = scalar_tensor
                     tensor_idx += 1
             # Static arguments are baked into compilation

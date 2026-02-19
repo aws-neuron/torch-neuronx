@@ -1,6 +1,8 @@
 """Neuron-specific patches for PyTorch dynamo tests."""
 
 import functools
+import os
+from contextlib import nullcontext
 
 import torch._dynamo
 
@@ -54,6 +56,7 @@ def patch_torch_compile_backend():
         # Redirect real backends to neuron
         if backend in redirect_backends:
             backend = "neuron"
+
         # Preserve test/debug backends and callable backends
         kwargs["dynamic"] = False
         return original_compile(model, backend=backend, **kwargs)
@@ -100,21 +103,9 @@ def patch_torch_cuda_to_neuron():
     torch.cuda = torch.neuron
     torch_neuronx.neuron.amp = torch.amp
     torch.cuda.amp.common = cuda_module.amp.common
-
-
-def patch_torch_rng_functions_to_neuron():
-    import torch
-
-    state = torch.zeros((1,), dtype=torch.float32)
-
-    def get_rng_state():
-        return state
-
-    def set_rng_state(t: torch.Tensor):
-        state = t  # noqa: F841
-
-    torch.neuron.get_rng_state = get_rng_state
-    torch.neuron.set_rng_state = set_rng_state
+    torch.cuda.streams = torch_neuronx.streams
+    # Set the cuda version to ensure no rocm
+    torch.version.cuda = "neuron"
 
 
 def patch_torch_stream_context_to_neuron():
@@ -144,6 +135,41 @@ def patch_pin_memory_utils():
     torch.neuron._pin_memory_utils = None
 
 
+def get_context_for_class(class_name):
+    """
+    Some test classes require dynamo config patches to be on that
+    seem to get ignored when we import the module, add them here
+    """
+    if class_name == "TestAOTCompile":
+        return torch._dynamo.config.patch(enable_aot_compile=True)
+    return nullcontext()
+
+
+def patch_device_for_fx_namespace():
+    """
+    PatchDevice doesn't get recogized within fx graphs, patch it into python builtins
+    so it gets recognized
+    """
+    import builtins
+
+    builtins.device = torch.device
+
+
+def patch_minifier_gen_test_code():
+    """Fix _gen_test_code to handle empty codegen_config()."""
+    import torch._dynamo.test_minifier_common as tmc
+
+    original_gen = tmc.MinifierTestBase._gen_test_code
+
+    def patched_gen(self, run_code, repro_after, repro_level):
+        code = original_gen(self, run_code, repro_after, repro_level)
+        # Remove lines that are just "." from empty codegen_config()
+        lines = [line for line in code.split("\n") if line.strip() != "."]
+        return "\n".join(lines)
+
+    tmc.MinifierTestBase._gen_test_code = patched_gen
+
+
 def apply_dynamo_patches():
     """Apply all patches needed for dynamo tests."""
     pre_run_patches()
@@ -160,8 +186,6 @@ def apply_dynamo_patches():
 
     patch_torch_cuda_to_neuron()
 
-    patch_torch_rng_functions_to_neuron()
-
     patch_torch_stream_context_to_neuron()
 
     patch_device_capability()
@@ -169,3 +193,10 @@ def apply_dynamo_patches():
     patch_tensor_types()
 
     patch_pin_memory_utils()
+
+    patch_device_for_fx_namespace()
+
+    patch_minifier_gen_test_code()
+
+    # Ensure retain device is set
+    os.environ["TORCH_NEURONX_RETAIN_DEVICE_MODE"] = "1"

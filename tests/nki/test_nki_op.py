@@ -15,7 +15,6 @@ class TestNKIJitDecorator:
     def test_simple_add_kernel(self):
         """Test a simple addition kernel with @nki.jit."""
 
-        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -28,7 +27,7 @@ class TestNKIJitDecorator:
 
         @nki_op("test::nki_add", mutates_args={"y"})
         def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            add_kernel(x1, x2, y)
+            wrap_nki(add_kernel)(x1, x2, y)
 
         x1 = torch.randn(128, device="neuron")
         x2 = torch.randn(128, device="neuron")
@@ -42,7 +41,6 @@ class TestNKIJitDecorator:
     def test_scale_kernel(self):
         """Test scaling kernel with @nki.jit."""
 
-        @wrap_nki
         @nki.jit
         def scale_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
@@ -54,13 +52,13 @@ class TestNKIJitDecorator:
 
         @nki_op("test::nki_scale", mutates_args={"y"})
         def nki_scale(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
-            scale_kernel(x, y, scale)
+            wrap_nki(scale_kernel)(x, y, scale)
 
         x = torch.randn(128, device="neuron")
         y = torch.empty(128, device="neuron")
         scale = 3.0
 
-        scale_kernel(x, y, scale)
+        nki_scale(x, y, scale)
 
         expected = x * scale
         assert torch.allclose(y.cpu(), expected.cpu())
@@ -72,7 +70,6 @@ class TestNKIOpRegistration:
     def test_basic_op_registration(self):
         """Test basic op registration with in-place mutation."""
 
-        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -85,7 +82,7 @@ class TestNKIOpRegistration:
 
         @nki_op("test::nki_add", mutates_args={"y"})
         def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            add_kernel(x1, x2, y)
+            wrap_nki(add_kernel)(x1, x2, y)
 
         x1 = torch.randn(128, device="neuron")
         x2 = torch.randn(128, device="neuron")
@@ -115,7 +112,6 @@ class TestNKIOpRegistration:
     def test_different_dtypes(self):
         """Test NKI ops with different data types."""
 
-        @wrap_nki
         @nki.jit
         def copy_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -127,7 +123,7 @@ class TestNKIOpRegistration:
         @nki_op("test::dtype_test", mutates_args={})
         def dtype_test(x: torch.Tensor) -> torch.Tensor:
             y = torch.empty(64, device="neuron", dtype=dtype)
-            copy_kernel(x, y)
+            wrap_nki(copy_kernel)(x, y)
             return y
 
         dtypes = [torch.float32, torch.float16]
@@ -141,7 +137,6 @@ class TestNKIOpRegistration:
     def test_multiple_ops_in_graph(self):
         """Test multiple NKI ops in the same graph."""
 
-        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -152,7 +147,6 @@ class TestNKIOpRegistration:
             nl.store(y[0:128], value=y_tile)
             return y
 
-        @wrap_nki
         @nki.jit
         def mul_kernel(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
@@ -165,13 +159,13 @@ class TestNKIOpRegistration:
         @nki_op("test::multi_add", mutates_args={})
         def multi_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
             y = torch.empty_like(x1)
-            add_kernel(x1, x2, y)
+            wrap_nki(add_kernel)(x1, x2, y)
             return y
 
         @nki_op("test::multi_mul", mutates_args={})
         def multi_mul(x: torch.Tensor, scale: float) -> torch.Tensor:
             y = torch.empty_like(x)
-            mul_kernel(x, y, scale)
+            wrap_nki(mul_kernel)(x, y, scale)
             return y
 
         def combined_fn(x1, x2, scale):
@@ -190,7 +184,6 @@ class TestNKIOpRegistration:
     def test_nki_op_forward_backward(self):
         """Test NKI op with forward and backward pass."""
 
-        @wrap_nki
         @nki.jit
         def add_kernel(x, y, output: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -204,7 +197,7 @@ class TestNKIOpRegistration:
         @nki_op("test::add_fwd", mutates_args={})
         def add_fwd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             output = torch.empty_like(x)
-            add_kernel(x, y, output)
+            wrap_nki(add_kernel)(x, y, output)
             return output
 
         @add_fwd.register_autograd
@@ -234,7 +227,6 @@ class TestNKIOpRegistration:
     def test_nki_op_with_autocast(self):
         """Test NKI op works with autocast enabled."""
 
-        @wrap_nki
         @nki.jit
         def add_kernel(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -247,7 +239,7 @@ class TestNKIOpRegistration:
 
         @nki_op("test::autocast_add", mutates_args={"y"})
         def autocast_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            add_kernel(x1, x2, y)
+            wrap_nki(add_kernel)(x1, x2, y)
 
         x1 = torch.randn(128, device="neuron")
         x2 = torch.randn(128, device="neuron")
@@ -280,7 +272,7 @@ class TestTorchCompileIntegration:
         @nki_op("test::add_one", mutates_args={})
         def add_one(x: torch.Tensor) -> torch.Tensor:
             y = torch.empty_like(x)
-            add_one_kernel(x, y)
+            wrap_nki(add_one_kernel)(x, y)
             return y
 
         @torch.compile

@@ -52,4 +52,7 @@ class NeuronHooksInterface : public at::PrivateUse1HooksInterface {
 // Get the singleton instance of NeuronHooksInterface
 at::PrivateUse1HooksInterface* get_neuron_hooks();
 
+// Get the default generator for a Neuron device
+const at::Generator& getDefaultNeuronGenerator(c10::DeviceIndex device_index = -1);
+
 }  // namespace torch_neuronx

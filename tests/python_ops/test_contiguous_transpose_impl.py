@@ -14,30 +14,27 @@ from tests.utils.neuron_test_utils import get_cache_size
 class TestContiguousTranspose:
     """Test class for contiguous transpose operations"""
 
-    def test_contiguous_transpose_uses_jax_kernel(self, monkeypatch):
-        """Transpose case should use the transpose kernel (JAX or MLIR), not the generic copy."""
+    def test_contiguous_transpose_uses_mlir_kernel(self, monkeypatch):
+        """Transpose case should use the transpose kernel (MLIR), not the generic copy."""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_transpose import (
-            ContiguousTransposeJAXImpl,
-            ContiguousTransposeMLIRImpl,
-        )
+        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
 
         transpose_called = {"count": 0}
         generic_called = {"count": 0}
 
-        for impl_class in [ContiguousTransposeJAXImpl, ContiguousTransposeMLIRImpl]:
-            orig_get_kernel = impl_class._get_kernel
+        impl_class = ContiguousTransposeMLIRImpl
+        orig_get_kernel = impl_class._get_kernel
 
-            def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-                k = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            k = orig_get_kernel(self)
 
-                def wrapper(*args, **kwargs):
-                    transpose_called["count"] += 1
-                    return k(*args, **kwargs)
+            def wrapper(*args, **kwargs):
+                transpose_called["count"] += 1
+                return k(*args, **kwargs)
 
-                return wrapper
+            return wrapper
 
-            monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
         orig_generic = contiguous_mod.contiguous_generic_kernel
 
@@ -59,33 +56,30 @@ class TestContiguousTranspose:
         assert torch.allclose(y, y_view)
 
         # Validate paths taken
-        assert transpose_called["count"] >= 1, "Expected JAX/MLIR transpose kernel to be invoked"
+        assert transpose_called["count"] >= 1, "Expected MLIR transpose kernel to be invoked"
         assert generic_called["count"] == 0, "Generic fallback should not be used for transpose"
 
     def test_contiguous_non_permutation_uses_generic(self, monkeypatch):
-        """Non-permutation view should use generic path, NOT JAX/MLIR transpose kernel"""
+        """Non-permutation view should use generic path, NOT MLIR transpose kernel"""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_transpose import (
-            ContiguousTransposeJAXImpl,
-            ContiguousTransposeMLIRImpl,
-        )
+        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
 
         transpose_called = {"count": 0}
         generic_called = {"count": 0}
 
-        for impl_class in [ContiguousTransposeJAXImpl, ContiguousTransposeMLIRImpl]:
-            orig_get_kernel = impl_class._get_kernel
+        impl_class = ContiguousTransposeMLIRImpl
+        orig_get_kernel = impl_class._get_kernel
 
-            def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-                k = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            k = orig_get_kernel(self)
 
-                def wrapper(*args, **kwargs):
-                    transpose_called["count"] += 1
-                    return k(*args, **kwargs)
+            def wrapper(*args, **kwargs):
+                transpose_called["count"] += 1
+                return k(*args, **kwargs)
 
-                return wrapper
+            return wrapper
 
-            monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
         orig_generic = contiguous_mod.contiguous_generic_kernel
 
@@ -110,7 +104,7 @@ class TestContiguousTranspose:
         # Validate paths taken
         assert (
             transpose_called["count"] == 0
-        ), "JAX/MLIR transpose kernel should not be used for non-permutation"
+        ), "MLIR transpose kernel should not be used for non-permutation"
         assert generic_called["count"] >= 1, "Generic fallback should handle non-permutation views"
 
     def test_contiguous_transpose_2d_and_autograd(self):
@@ -180,30 +174,27 @@ class TestContiguousTranspose:
 
     def test_incorrect_fallback_to_generic_kernel(self, monkeypatch):
         """Test incorrect fallback to generic kernel"""
-        from torch_neuronx.python_ops.contiguous_transpose import (
-            ContiguousTransposeJAXImpl,
-            ContiguousTransposeMLIRImpl,
-        )
+        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
 
         compile_called = {"count": 0}
 
-        for impl_class in [ContiguousTransposeJAXImpl, ContiguousTransposeMLIRImpl]:
-            orig_get_kernel = impl_class._get_kernel
+        impl_class = ContiguousTransposeMLIRImpl
+        orig_get_kernel = impl_class._get_kernel
 
-            def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-                kernel = orig_get_kernel(self)
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
+            kernel = orig_get_kernel(self)
 
-                def wrapper(*args, **kwargs):
-                    orig_cache_size = get_cache_size(kernel)
-                    result = kernel(*args, **kwargs)
-                    updated_cache_size = get_cache_size(kernel)
-                    if updated_cache_size > orig_cache_size:
-                        compile_called["count"] += 1
-                    return result
+            def wrapper(*args, **kwargs):
+                orig_cache_size = get_cache_size(kernel)
+                result = kernel(*args, **kwargs)
+                updated_cache_size = get_cache_size(kernel)
+                if updated_cache_size > orig_cache_size:
+                    compile_called["count"] += 1
+                return result
 
-                return wrapper
+            return wrapper
 
-            monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
+        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
 
         def mock_contiguous_generic_kernel(
             src, dst, shape, src_strides, dst_strides, src_storage_offset=0

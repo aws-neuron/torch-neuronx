@@ -6,7 +6,7 @@ from ..operation_registry import register_aten
 
 
 @register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"], static_argnums=(1, 4))
-def torch_native_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+def torch_native_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5, out=None):
     return torch.native_layer_norm(input, normalized_shape, weight, bias, eps)
 
 
@@ -43,7 +43,7 @@ def torch_batch_norm_backward_elemt(
 
 
 @register_aten(["aten::batch_norm_stats", "aten::batch_norm_stats.out"], static_argnames=("eps",))
-def torch_batch_norm_stats(input, eps):
+def torch_batch_norm_stats(input, eps, out=None):
     """Compute batch normalization statistics (mean and inverse std)."""
 
     # Reduction axes: all except channel dimension (index 1)
@@ -60,7 +60,7 @@ def torch_batch_norm_stats(input, eps):
 
 
 @register_aten(["aten::batch_norm_elemt", "aten::batch_norm_elemt.out"])
-def torch_batch_norm_elemt(input, weight, bias, mean, invstd, eps):
+def torch_batch_norm_elemt(input, weight, bias, mean, invstd, eps, out=None):
     """Element-wise batch normalization."""
     # Reshape statistics to broadcast with input (add dimensions for spatial dims)
     shape = [1] * input.ndim
@@ -121,7 +121,7 @@ def torch_batch_norm_gather_stats_with_counts(
 
 @register_aten(["aten::batch_norm_backward_reduce", "aten::batch_norm_backward_reduce.out"])
 def torch_batch_norm_backward_reduce(
-    grad_output, input, mean, invstd, weight, input_g, weight_g, bias_g
+    grad_output, input, mean, invstd, weight, input_g, weight_g, bias_g, out=None
 ):
     """Backward pass reduction for batch normalization."""
     # Reduction axes: all except channel dimension (index 1)
@@ -143,7 +143,7 @@ def torch_batch_norm_backward_reduce(
 
     # Compute gradients (always compute, return based on flags)
     grad_weight = torch.sum(grad_output * xhat, dim=reduction_axes, keepdim=False)
-    grad_bias = sum_dy
+    grad_bias = sum_dy.clone()
 
     return sum_dy, sum_dy_xmu, grad_weight, grad_bias
 

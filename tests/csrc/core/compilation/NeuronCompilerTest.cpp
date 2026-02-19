@@ -28,26 +28,19 @@ class MockCompilerHelper {
  public:
   static std::string CreateMockScript(const std::string& temp_dir, int exit_code,
                                       const std::string& output_content = "") {
-    std::string script_path = temp_dir + "/python";
+    std::string script_path = temp_dir + "/neuronx-cc";
     std::ofstream script(script_path);
 
-    // Mock python script that handles -m torch_neuronx.kernels.neuronx_cc_wrapper calls
+    // Mock neuronx-cc script
     script << "#!/bin/bash\n";
-    script << "# Mock python that handles neuronx_cc_wrapper module calls\n";
-    script << "if [[ \"$1\" == \"-m\" ]] && [[ \"$2\" == "
-              "\"torch_neuronx.kernels.neuronx_cc_wrapper\" ]]; then\n";
-    script << "  # Remove the -m and module name, process remaining args\n";
-    script << "  shift 2\n";
+    script << "# Mock neuronx-cc compiler\n";
     if (exit_code == 0 && !output_content.empty()) {
-      script << "  for ((i=1; i<=$#; i++)); do\n"
-             << "    [[ \"${!i}\" == \"--output\" ]] && { j=$((i+1)); echo -n '" << output_content
+      script << "for ((i=1; i<=$#; i++)); do\n"
+             << "  [[ \"${!i}\" == \"--output\" ]] && { j=$((i+1)); echo -n '" << output_content
              << "' > \"${!j}\"; break; }\n"
-             << "  done\n";
+             << "done\n";
     }
-    script << "  exit " << exit_code << "\n";
-    script << "else\n";
-    script << "  exit 1\n";
-    script << "fi\n";
+    script << "exit " << exit_code << "\n";
     script.close();
 
     chmod(script_path.c_str(), 0755);
@@ -165,23 +158,17 @@ TEST_F(NeuronCompilerTest, CompileHloToNeff_EmptyHloSucceedsIfCompilerAcceptsIt)
 }
 
 TEST_F(NeuronCompilerTest, CompileHloToNeff_UsesConfigForLogicalCores) {
-  // Create mock python that verifies --lnc 1 is in args
-  std::string path = temp_dir_ + "/python";
+  // Create mock neuronx-cc that verifies --lnc 1 is in args
+  std::string path = temp_dir_ + "/neuronx-cc";
   std::ofstream f(path);
   f << "#!/bin/bash\n"
-    << "if [[ \"$1\" == \"-m\" ]] && [[ \"$2\" == \"torch_neuronx.kernels.neuronx_cc_wrapper\" ]]; "
-       "then\n"
-    << "  shift 2\n"
-    << "  if [[ \"$*\" == *\"--lnc 1\"* ]]; then\n"
-    << "    for ((i=1; i<=$#; i++)); do\n"
-    << "      if [[ \"${!i}\" == \"--output\" ]]; then\n"
-    << "        j=$((i+1)); echo -n 'lnc1_neff' > \"${!j}\"; break\n"
-    << "      fi\n"
-    << "    done\n"
-    << "    exit 0\n"
-    << "  else\n"
-    << "    exit 1\n"
-    << "  fi\n"
+    << "if [[ \"$*\" == *\"--lnc 1\"* ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'lnc1_neff' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
     << "else\n"
     << "  exit 1\n"
     << "fi\n";
@@ -199,23 +186,17 @@ TEST_F(NeuronCompilerTest, CompileHloToNeff_UsesConfigForLogicalCores) {
 }
 
 TEST_F(NeuronCompilerTest, CompileHloToNeff_PassesAdditionalArgs) {
-  // Mock python that verifies specific args are present
-  std::string path = temp_dir_ + "/python";
+  // Mock neuronx-cc that verifies specific args are present
+  std::string path = temp_dir_ + "/neuronx-cc";
   std::ofstream f(path);
   f << "#!/bin/bash\n"
-    << "if [[ \"$1\" == \"-m\" ]] && [[ \"$2\" == \"torch_neuronx.kernels.neuronx_cc_wrapper\" ]]; "
-       "then\n"
-    << "  shift 2\n"
-    << "  if [[ \"$*\" == *\"--verbose\"* ]] && [[ \"$*\" == *\"--debug\"* ]]; then\n"
-    << "    for ((i=1; i<=$#; i++)); do\n"
-    << "      if [[ \"${!i}\" == \"--output\" ]]; then\n"
-    << "        j=$((i+1)); echo -n 'args_passed' > \"${!j}\"; break\n"
-    << "      fi\n"
-    << "    done\n"
-    << "    exit 0\n"
-    << "  else\n"
-    << "    exit 1\n"
-    << "  fi\n"
+    << "if [[ \"$*\" == *\"--verbose\"* ]] && [[ \"$*\" == *\"--debug\"* ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'args_passed' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
     << "else\n"
     << "  exit 1\n"
     << "fi\n";
@@ -232,23 +213,17 @@ TEST_F(NeuronCompilerTest, CompileHloToNeff_PassesAdditionalArgs) {
 }
 
 TEST_F(NeuronCompilerTest, CompileHloToNeff_PassesOptimizationLevel) {
-  // Mock python that verifies -O2 is in args
-  std::string path = temp_dir_ + "/python";
+  // Mock neuronx-cc that verifies -O2 is in args
+  std::string path = temp_dir_ + "/neuronx-cc";
   std::ofstream f(path);
   f << "#!/bin/bash\n"
-    << "if [[ \"$1\" == \"-m\" ]] && [[ \"$2\" == \"torch_neuronx.kernels.neuronx_cc_wrapper\" ]]; "
-       "then\n"
-    << "  shift 2\n"
-    << "  if [[ \"$*\" == *\"-O2\"* ]]; then\n"
-    << "    for ((i=1; i<=$#; i++)); do\n"
-    << "      if [[ \"${!i}\" == \"--output\" ]]; then\n"
-    << "        j=$((i+1)); echo -n 'O2_neff' > \"${!j}\"; break\n"
-    << "      fi\n"
-    << "    done\n"
-    << "    exit 0\n"
-    << "  else\n"
-    << "    exit 1\n"
-    << "  fi\n"
+    << "if [[ \"$*\" == *\"-O2\"* ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'O2_neff' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
     << "else\n"
     << "  exit 1\n"
     << "fi\n";

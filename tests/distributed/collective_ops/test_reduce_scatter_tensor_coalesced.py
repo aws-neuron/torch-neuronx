@@ -26,6 +26,10 @@ def run_basic_reduce_scatter_coalesced_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    # Per pytorch documentation + warning: need to call wait_tensor
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     sum_of_ranks = sum(range(1, world_size + 1))
 
     expected1 = torch.ones(2, 3) * sum_of_ranks
@@ -50,6 +54,9 @@ def run_different_reduce_ops_test(rank, world_size, kwargs):
     outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
         inputs, reduce_op_str, world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     # Calculate expected values based on reduce_op
     if reduce_op == dist.ReduceOp.SUM:
@@ -92,6 +99,9 @@ def run_different_dtypes_reduce_scatter_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     assert outputs[0].dtype == dtype
     assert outputs[1].dtype == dtype
 
@@ -119,6 +129,9 @@ def run_same_shape_multiple_tensors_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     sum_of_ranks = sum(range(1, world_size + 1))
     for idx in range(num_tensors):
         expected = torch.ones(shape) * (sum_of_ranks + idx * world_size)
@@ -140,13 +153,16 @@ def run_empty_tensor_mixed_reduce_scatter_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     sum_of_ranks = sum(range(1, world_size + 1))
     expected1 = torch.ones(2, 3) * sum_of_ranks
     expected3 = torch.ones(4, 3) * (sum_of_ranks + 2 * world_size)
 
-    assert torch.allclose(outputs[0].cpu(), expected1)
+    assert torch.allclose(outputs[0].cpu(), expected1), f"Output 0 mismatch on rank {rank}"
     assert outputs[1].numel() == 0
-    assert torch.allclose(outputs[2].cpu(), expected3)
+    assert torch.allclose(outputs[2].cpu(), expected3), f"Output 2 mismatch on rank {rank}"
 
 
 def run_large_tensors_reduce_scatter_test(rank, world_size, kwargs):
@@ -162,6 +178,9 @@ def run_large_tensors_reduce_scatter_test(rank, world_size, kwargs):
     outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
         inputs, "sum", world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     assert outputs[0].shape == (1000, 100)
     assert outputs[1].shape == (500, 100)
@@ -186,6 +205,9 @@ def run_three_tensors_different_sizes_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     sum_of_ranks = sum(range(1, world_size + 1))
     expected1 = torch.ones(2, 5) * sum_of_ranks
     expected2 = torch.ones(4, 5) * (sum_of_ranks + world_size)
@@ -207,6 +229,8 @@ def run_single_tensor_test(rank, world_size, kwargs):
         input_neuron, "sum", world_size, default_group.group_name
     )
 
+    _c10d_functional.wait_tensor(output)
+
     sum_of_ranks = sum(range(1, world_size + 1))
     expected = torch.ones(5, 8) * sum_of_ranks
 
@@ -227,6 +251,9 @@ def run_multi_dimensional_test(rank, world_size, kwargs):
         inputs, "sum", world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     sum_of_ranks = sum(range(1, world_size + 1))
     expected1 = torch.ones(2, 3, 4, 5) * sum_of_ranks
     expected2 = torch.ones(4, 3, 4, 5) * (sum_of_ranks + world_size)
@@ -245,6 +272,9 @@ def run_single_tensor_coalesced_test(rank, world_size, kwargs):
     outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
         inputs, "sum", world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     sum_of_ranks = sum(range(1, world_size + 1))
     expected = torch.ones(4, 5) * sum_of_ranks
@@ -269,6 +299,9 @@ def run_group_reduce_scatter_coalesced_test(rank, world_size, kwargs):
             inputs, "sum", group_size, group_name
         )
 
+        for out in outputs:
+            _c10d_functional.wait_tensor(out)
+
         expected1 = torch.ones(2, 3) * 3  # 1 + 2
         expected2 = torch.ones(3, 3) * 5  # 2 + 3
 
@@ -290,6 +323,9 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
         inputs, "sum", world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     sum_of_ranks = sum(range(1, world_size + 1))
 
@@ -341,6 +377,9 @@ def run_bucketing_memory_test(rank, world_size, kwargs):
         outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
             inputs, "sum", world_size, default_group.group_name
         )
+
+        for out in outputs:
+            _c10d_functional.wait_tensor(out)
 
         sum_of_ranks = sum(range(1, world_size + 1))
         expected1 = torch.ones(tensor_size // world_size, 3, dtype=torch.float32) * sum_of_ranks

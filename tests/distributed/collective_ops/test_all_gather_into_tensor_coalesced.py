@@ -25,6 +25,10 @@ def run_basic_coalesced_test(rank, world_size, kwargs):
         inputs, world_size, default_group.group_name
     )
 
+    # Per pytorch documentation + warning: need to call wait_tensor
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     # Verify results
     # For input1: each rank contributes [2, 3] tensor, total should be [world_size*2, 3]
     expected1 = torch.cat([torch.ones(2, 3) * (i + 1) for i in range(world_size)], dim=0)
@@ -49,6 +53,9 @@ def run_different_dtypes_coalesced_test(rank, world_size, kwargs):
     outputs = _c10d_functional.all_gather_into_tensor_coalesced(
         inputs, world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     # Verify dtype is preserved
     assert outputs[0].dtype == dtype
@@ -78,6 +85,9 @@ def run_mixed_shapes_test(rank, world_size, kwargs):
         inputs, world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     # Verify each output
     for idx, shape in enumerate(shapes):
         expected = torch.cat([torch.ones(shape) * (i + idx + 1) for i in range(world_size)], dim=0)
@@ -98,6 +108,9 @@ def run_empty_tensor_mixed_test(rank, world_size, kwargs):
     outputs = _c10d_functional.all_gather_into_tensor_coalesced(
         inputs, world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     # Verify non-empty tensors
     expected1 = torch.cat([torch.ones(2, 3) * (i + 1) for i in range(world_size)], dim=0)
@@ -121,6 +134,9 @@ def run_large_tensors_coalesced_test(rank, world_size, kwargs):
     outputs = _c10d_functional.all_gather_into_tensor_coalesced(
         inputs, world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     # Verify shapes
     assert outputs[0].shape == (world_size * 1000, 100)
@@ -149,6 +165,9 @@ def run_with_special_values_test(rank, world_size, kwargs):
         inputs, world_size, default_group.group_name
     )
 
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
+
     # Verify inf values are preserved
     assert torch.isinf(outputs[0][0, 0])
     assert torch.isinf(outputs[0][0, 1])
@@ -168,6 +187,8 @@ def run_single_tensor_test(rank, world_size, kwargs):
     output = _c10d_functional.all_gather_into_tensor(
         input_neuron, world_size, default_group.group_name
     )
+
+    _c10d_functional.wait_tensor(output)
 
     # Verify result
     expected = torch.cat([torch.ones(3, 4) * (i + 1) for i in range(world_size)], dim=0)
@@ -190,6 +211,9 @@ def run_group_coalesced_test(rank, world_size, kwargs):
 
     if rank <= 1:
         outputs = _c10d_functional.all_gather_into_tensor_coalesced(inputs, group_size, group_name)
+
+        for out in outputs:
+            _c10d_functional.wait_tensor(out)
 
         # Verify results for ranks in group
         expected1 = torch.cat([torch.ones(2, 3) * (i + 1) for i in range(group_size)], dim=0)
@@ -215,6 +239,9 @@ def run_5gb_tensor_test(rank, world_size, kwargs):
     outputs = _c10d_functional.all_gather_into_tensor_coalesced(
         inputs, world_size, default_group.group_name
     )
+
+    for out in outputs:
+        _c10d_functional.wait_tensor(out)
 
     # Verify results
     expected1 = torch.cat(
@@ -247,6 +274,9 @@ def run_bucketing_memory_test(rank, world_size, kwargs):
         outputs = _c10d_functional.all_gather_into_tensor_coalesced(
             inputs, world_size, default_group.group_name
         )
+
+        for out in outputs:
+            _c10d_functional.wait_tensor(out)
 
         expected1 = torch.cat([torch.ones(tensor_size) for _ in range(world_size)], dim=0)
         expected2 = torch.cat([torch.ones(tensor_size) * 2 for _ in range(world_size)], dim=0)
@@ -281,6 +311,9 @@ def run_bucketing_memory_flat_2d_tensor_test(rank, world_size, kwargs):
         outputs = _c10d_functional.all_gather_into_tensor_coalesced(
             inputs, world_size, default_group.group_name
         )
+
+        for out in outputs:
+            _c10d_functional.wait_tensor(out)
 
         expected1 = torch.cat([torch.ones(1, tensor_size) for _ in range(world_size)], dim=0)
         expected2 = torch.cat([torch.ones(1, tensor_size) * 2 for _ in range(world_size)], dim=0)

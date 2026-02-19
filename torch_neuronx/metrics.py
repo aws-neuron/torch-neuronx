@@ -14,7 +14,7 @@ Usage:
     met.clear_all()
 
     # Get specific counter value
-    value = met.get_counter_value("CompilationCache.Hits")
+    value = met.get_counter_value("CompilationCache.InMemoryHits")
 
     # Disable metrics collection (for performance-critical code)
     met.set_enabled(False)

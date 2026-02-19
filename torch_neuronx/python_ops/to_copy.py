@@ -1,11 +1,13 @@
 """Python implementation of aten::_to_copy for Neuron.
 
 This mirrors the policy of copy_ but avoids recursion by never calling copy_.
-It uses direct NRT helpers for CPU<->Neuron transfers and a tiny JAX kernel
-for <=32-bit Neuron-to-Neuron dtype casts, bouncing to CPU only for 64-bit.
+It uses direct NRT helpers for CPU<->Neuron transfers for <=32-bit Neuron-to-Neuron
+dtype casts, bouncing to CPU only for 64-bit.
 """
 
 from __future__ import annotations
+
+import logging
 
 import torch
 
@@ -14,8 +16,10 @@ from torch_neuronx.python_ops import io_tensor
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
 
+logger = logging.getLogger(__name__)
 
-@neuron_op("aten::_to_copy", disable_dtype_autocast=True)
+
+@neuron_op("aten::_to_copy", disable_dtype_autocast=True, priority=50)
 class ToCopyNeuronImpl(OperationImplementation):
     def can_handle(
         self,
@@ -30,12 +34,14 @@ class ToCopyNeuronImpl(OperationImplementation):
         out=None,
         **kwargs,
     ) -> bool:
-        # Handle when either source or destination involves Neuron
+        # Resolve target device and dtype
         dst_device = (
             device
             if isinstance(device, torch.device)
             else (torch.device(device) if device is not None else self_tensor.device)
         )
+
+        # Handle all neuron-to-neuron and CPU<->Neuron transfers
         return self_tensor.device.type == "neuron" or dst_device.type == "neuron"
 
     def _execute_impl(
@@ -113,6 +119,16 @@ class ToCopyNeuronImpl(OperationImplementation):
             from .cast_policy import write_neuron_to_neuron
 
             result = io_tensor.empty(self_tensor.shape, dtype=target_dtype, device=target_device)
+            logger.debug(
+                f"Using NRT API based copy for neuron-to-neuron _to_copy: "
+                f"src_shape={tuple(self_tensor.shape)}, "
+                f"src_dtype={self_tensor.dtype}, "
+                f"src_device={self_tensor.device}, "
+                f"dst_shape={tuple(result.shape)}, "
+                f"dst_dtype={result.dtype}, "
+                f"dst_device={result.device}, "
+                f"non_blocking={non_blocking}"
+            )
             try:
                 # In case of D2D without CPU bounces, copies are not blocking.
                 write_neuron_to_neuron(result, self_tensor, non_blocking=True)

@@ -28,7 +28,14 @@ _current_timestamp = None
 
 
 def get_rank() -> int:
-    """Get the current process rank"""
+    """Get the current process rank.
+
+    Returns the distributed rank if torch.distributed is initialized,
+    otherwise returns the current Neuron device ID.
+
+    Returns:
+        int: Process rank or device ID.
+    """
     return (
         torch.distributed.get_rank()
         if torch.distributed.is_initialized()
@@ -37,7 +44,14 @@ def get_rank() -> int:
 
 
 def get_local_rank() -> int:
-    """Get current process rank within local node"""
+    """Get the current process rank within the local node.
+
+    Returns the node-local rank if torch.distributed is initialized,
+    otherwise returns the current Neuron device ID.
+
+    Returns:
+        int: Local process rank or device ID.
+    """
     return (
         torch.distributed.get_node_local_rank()
         if torch.distributed.is_initialized()
@@ -46,7 +60,14 @@ def get_local_rank() -> int:
 
 
 def get_world_size() -> int:
-    """Get number of processes"""
+    """Get the total number of processes in the distributed group.
+
+    Returns the distributed world size if torch.distributed is initialized,
+    otherwise returns the number of available Neuron devices.
+
+    Returns:
+        int: Number of processes or devices.
+    """
     return (
         torch.distributed.get_world_size()
         if torch.distributed.is_initialized()
@@ -55,16 +76,23 @@ def get_world_size() -> int:
 
 
 def get_local_world_size() -> int:
-    """Get number of processes within local node"""
+    """Get the number of processes within the local node.
+
+    Reads from LOCAL_WORLD_SIZE environment variable if set,
+    otherwise returns the number of available Neuron devices.
+
+    Returns:
+        int: Number of local processes or devices.
+    """
     return _getenv_int("LOCAL_WORLD_SIZE", torch.neuron.device_count())
 
 
 def get_current_timestamp() -> str:
-    """
-    Get or create timestamp for current compilation
+    """Get or create timestamp for current compilation
 
-    Returns the same timestamp for all artifacts in a single compilation.
-    Uses microsecond precision to handle graph breaks that occur in quick succession.
+    Returns:
+        str: Same timestamp for all artifacts in a single compilation.
+             Uses microsecond precision to handle graph breaks that occur in quick succession.
     """
     global _current_timestamp
     if _current_timestamp is None:
@@ -80,8 +108,7 @@ def reset_timestamp():
 
 @contextmanager
 def managed_artifacts_directory():
-    """
-    Context manager for artifact directory management.
+    """Context manager for artifact directory management.
 
     Gets the artifacts directory and ensures cleanup if
     TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS is False.
@@ -100,8 +127,7 @@ def managed_artifacts_directory():
 
 @lru_cache(maxsize=1)
 def get_artifacts_directory() -> Path:
-    """
-    Get the artifacts directory from environment variable or default
+    """Get the artifacts directory from environment variable or default
 
     Priority:
     1. TORCH_NEURONX_DEBUG_DIR environment variable
@@ -121,8 +147,7 @@ def get_artifacts_directory() -> Path:
 
 
 def cleanup_compilation_artifacts(temp_dir: Path, preserve: bool = True):
-    """
-    Clean up temporary compilation artifacts
+    """Clean up temporary compilation artifacts
 
     Args:
         temp_dir: Temporary directory to clean up
@@ -140,8 +165,7 @@ def cleanup_compilation_artifacts(temp_dir: Path, preserve: bool = True):
 
 
 def get_fx_graph_path(model_name: str | None = None) -> Path:
-    """
-    Get the path for saving FX graph artifacts
+    """Get the path for saving FX graph artifacts
 
     Structure: fx_graphs/proc_{rank}/{model_name}_{timestamp}.fx.txt
 
@@ -167,8 +191,7 @@ def get_fx_graph_path(model_name: str | None = None) -> Path:
 
 
 def get_stablehlo_path(model_name: str | None = None) -> Path:
-    """
-    Get the path for saving StableHLO artifacts
+    """Get the path for saving StableHLO artifacts
 
     Structure: stablehlo/proc_{rank}/{model_name}_{timestamp}.stablehlo.mlir
 
@@ -194,11 +217,12 @@ def get_stablehlo_path(model_name: str | None = None) -> Path:
 
 
 def get_neuronx_cc_working_dir() -> Path:
-    """
-    Get the path in which to run neuronx-cc
+    """Get the working directory path for neuronx-cc compiler invocation.
+
+    Creates the directory structure: {artifacts_dir}/neuronx_cc/proc_{rank}/
 
     Returns:
-        Path: working directory path
+        Path: Working directory path for neuronx-cc.
     """
     base_dir = get_artifacts_directory()
     rank = get_rank()
@@ -208,8 +232,7 @@ def get_neuronx_cc_working_dir() -> Path:
 
 
 def get_neff_path(model_name: str | None = None) -> Path:
-    """
-    Get the path for saving NEFF artifacts
+    """Get the path for saving NEFF artifacts
 
     Structure: neff/proc_{rank}/{model_name}_{timestamp}.neff
 
@@ -235,16 +258,15 @@ def get_neff_path(model_name: str | None = None) -> Path:
 
 
 def get_raw_torch_path(model_name: str | None = None) -> Path:
-    """
-    Get the path for saving RAW Torch IR artifacts
+    """Get the path for saving RAW Torch IR artifacts.
 
-    Structure: raw/proc_{rank}/{model_name}_{timestamp}.torch_raw.mlir
+    Structure: {artifacts_dir}/raw/proc_{rank}/{model_name}_{timestamp}.torch_raw.mlir
 
     Args:
-        model_name: Optional model name, uses current model name if not provided
+        model_name (str | None): Model name for filename. Uses current model name if None.
 
     Returns:
-        Path: Full path to RAW Torch IR file
+        Path: Full path to RAW Torch IR file.
     """
     base_dir = get_artifacts_directory()
     rank = get_rank()
@@ -265,6 +287,13 @@ def get_raw_torch_path(model_name: str | None = None) -> Path:
 
 
 def get_err_mlir_path() -> Path:
+    """Get the path for saving MLIR error artifacts.
+
+    Creates the directory structure: {artifacts_dir}/torch_mlir_error/proc_{rank}/
+
+    Returns:
+        Path: Full path to error MLIR file.
+    """
     base_dir = get_artifacts_directory()
     rank = get_rank()
     err_dir = base_dir / "torch_mlir_error" / f"proc_{rank}"
@@ -275,16 +304,17 @@ def get_err_mlir_path() -> Path:
 
 
 def get_transformed_fx_path(model_name: str | None = None) -> Path:
-    """
-    Get the path for saving transformed fx graph artifacts (after collective transforms)
+    """Get the path for saving transformed FX graph artifacts.
 
-    Structure: transformed_fx/proc_{rank}/{model_name}_{timestamp}.transformed.fx.txt
+    Creates artifacts after collective transforms are applied.
+    Structure:
+        {artifacts_dir}/transformed_fx/proc_{rank}/{model_name}_{timestamp}.transformed.fx.txt
 
     Args:
-        model_name: Optional model name, uses current model name if not provided
+        model_name (str | None): Model name for filename. Uses current model name if None.
 
     Returns:
-        Path: Full path to transformed fx graph file
+        Path: Full path to transformed FX graph file.
     """
     base_dir = get_artifacts_directory()
     rank = get_rank()
@@ -305,14 +335,22 @@ def get_transformed_fx_path(model_name: str | None = None) -> Path:
 
 
 def set_model_name(name: str):
-    """Set the current model name for NEFF file naming"""
+    """Set the current model name for NEFF file naming
+
+    Args:
+        name (str): Name for the module.
+    """
     global _current_model_name
     _current_model_name = name
     logger.debug(f"Model name set to: {name}")
 
 
 def get_model_name() -> str:
-    """Get the current model name"""
+    """Get the current model name
+
+    Returns:
+        str: Name of current model
+    """
     global _current_model_name
     if _current_model_name is None:
         _current_model_name = "model_default"

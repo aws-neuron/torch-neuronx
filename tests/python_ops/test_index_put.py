@@ -53,6 +53,30 @@ class TestIndexPut:
 
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
 
+    def test_index_put_scalar_indices(self, device):
+        """Test index_put with scalar indices (reproduces distributed test issue)."""
+        with track_neuron_ops():
+            # Create tensor matching distributed test error log
+            x = torch.randn(2, 4, 8, dtype=torch.float32, device=device)
+
+            # Scalar indices as in the error log
+            indices = [
+                torch.tensor(0, dtype=torch.int64, device=device),
+                torch.tensor(1, dtype=torch.int64, device=device),
+                torch.tensor(2, dtype=torch.int64, device=device),
+            ]
+
+            # Scalar value
+            value = torch.tensor(5.0, dtype=torch.float32, device=device)
+
+            # This should not crash with MLIR lowering error
+            result = torch.index_put(x, indices, value)
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::index_put")
+
+            # Verify the value was set correctly
+            assert result[0, 1, 2].item() == 5.0
+
     # TODO add a test case for list indices
     def test_index_put_basic(self, device):
         """Test basic index_put functionality."""
@@ -206,3 +230,32 @@ class TestIndexPut:
             result = torch.index_put(x, indices, values)
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("aten::index_put")
+
+    def test_index_put_negative_index_with_backward(self, device):
+        """Test with negative indices"""
+        with track_neuron_ops():
+            x = torch.zeros(4, 4, 4, dtype=torch.float32, device=device, requires_grad=True)
+
+            # Creates pattern: (None, None, tensor([-2], dtype=int64))
+            idx = torch.tensor([-2], dtype=torch.int64, device=device)
+            indices = [None, None, idx]
+
+            values = torch.ones(4, 4, 1, dtype=torch.float32, device=device, requires_grad=True)
+
+            result = torch.ops.aten.index_put(x, indices, values)
+            loss = result.sum()
+            loss.backward()
+            assert x.grad is not None
+            assert values.grad is not None
+            assert_op_runs_on_neuron("aten::index_put")
+
+    def test_index_put_bool_int_mixed_multi_values(self, device):
+        """Test index_put with boolean and integer indices with multiple values"""
+        with track_neuron_ops():
+            x = torch.zeros((3, 4), device=device)
+            indices = (
+                torch.tensor([True, False, True], device=device),
+                torch.tensor([0], device=device),
+            )
+            values = torch.tensor([1.0, 2.0], device=device)
+            self._track_and_compare(x, indices, values)

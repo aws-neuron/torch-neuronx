@@ -55,6 +55,9 @@ void markFallbackLogged(const std::string& op_name);
 bool shouldLogExecuted(const std::string& op_name);
 void markExecutedLogged(const std::string& op_name);
 
+// Helper function to log operation execution once
+void logOperationExecuted(const std::string& op_name);
+
 // Functions to get tracked operations for testing
 std::unordered_set<std::string> getFallbackOps();
 std::unordered_set<std::string> getExecutedOps();

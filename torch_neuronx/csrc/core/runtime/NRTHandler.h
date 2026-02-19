@@ -1,6 +1,7 @@
 #pragma once
 
 #include <c10/core/Device.h>
+#include <c10/core/Stream.h>
 #include <torch/torch.h>
 
 #include <chrono>
@@ -53,41 +54,42 @@ class NRTHandler {
   NRTHandler& operator=(NRTHandler&&) = delete;
 
   /**
-   * Execute a compilable kernel using NRT
+   * Dispatch a compilable kernel using NRT for execution
    *
-   * @param hlo_kernel The compilable kernel to execute
-   * @param op_name Operation name for logging
+   * @param model The loaded NRT model
+   * @param inputs Input tensor pointers
+   * @param outputs Output tensor pointers
    * @param config Execution configuration
-   * @return ExecutionResult indicating success/failure and timing
+   * @param err_tracker Error tracker pointer for nrt-async mode (nullptr for nrt-sync)
+   * @param sequence_id Output sequence number for nrt-async mode (nullptr for nrt-sync)
+   * @param stream_id Stream ID for queue selection in nrt-async mode
    */
-  static void PrepareAndExecuteModel(nrt::Model* model, const std::vector<nrt_tensor_t*>& inputs,
+  static void DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>& model,
+                                     const std::vector<nrt_tensor_t*>& inputs,
                                      const std::vector<nrt_tensor_t*>& outputs,
-                                     const ExecutionConfig& config);
+                                     const ExecutionConfig& config,
+                                     nrt::ErrorTrackerHandle* err_tracker = nullptr,
+                                     nrt::SequenceId* sequence_id = nullptr,
+                                     c10::StreamId stream_id = 0);
 
   /**
    * Get or load model from cache
    */
-  static nrt::Model* GetOrLoadModel(const CompilableKernelExecution& compilable_kernel,
-                                    const ExecutionConfig& config);
+  static std::shared_ptr<nrt::ModelHandle> GetOrLoadModel(
+      const CompilableKernelExecution& compilable_kernel, const ExecutionConfig& config);
 
  private:
   /**
    * Prepare input tensor set from compilable kernel
    */
   static void PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
-                                    nrt::TensorSet& input_set);
+                                    nrt::TensorSetPtr& input_set);
 
   /**
    * Prepare output tensor set from compilable kernel
    */
   static void PrepareOutputTensorSet(const std::vector<nrt_tensor_t*>& outputs,
-                                     nrt::TensorSet& output_set);
-
-  /**
-   * Execute model with proper resource management
-   */
-  static void ExecuteModel(const std::shared_ptr<nrt::Model>& model, nrt::TensorSet& input_set,
-                           nrt::TensorSet& output_set, const ExecutionConfig& config);
+                                     nrt::TensorSetPtr& output_set);
 };
 
 }  // namespace at::neuron

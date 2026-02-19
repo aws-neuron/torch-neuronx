@@ -56,7 +56,8 @@ class CPUFallbackExecutor {
    * Transfer tensors from CPU device to Neuron
    */
   virtual void TransferTensorsFromCpuToNeuron(const std::vector<torch::Tensor>& cpu_results,
-                                              const std::vector<nrt_tensor_t*>& data_ptrs);
+                                              const std::vector<nrt_tensor_t*>& data_ptrs,
+                                              const std::vector<TensorContext>& tensor_contexts);
 
   /**
    * Transfer tensors from Neuron device to CPU

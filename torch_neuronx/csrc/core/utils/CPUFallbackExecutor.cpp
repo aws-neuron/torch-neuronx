@@ -84,8 +84,8 @@ std::vector<torch::Tensor> CPUFallbackExecutor::TransferTensorsToCpu(
       auto cpu_tensor = CreateCpuTensorLike(context);
       TORCH_CHECK(cpu_tensor.is_contiguous(), "Destination CPU tensor must be contiguous");
       nrt_tensor_t* data_ptr = data_ptrs[i];
-      torch_neuronx::utils::nrt_copy_neuron_to_cpu(data_ptr, cpu_tensor.data_ptr(),
-                                                   0 /* Tensor is already sliced */,
+      size_t offset_bytes = context.storage_offset * context.element_size;
+      torch_neuronx::utils::nrt_copy_neuron_to_cpu(data_ptr, cpu_tensor.data_ptr(), offset_bytes,
                                                    context.get_size_bytes());
       cpu_tensors.emplace_back(std::move(cpu_tensor));
     } catch (const std::exception& e) {
@@ -250,8 +250,8 @@ void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
   const auto& input_contexts = fallback_ctx.tensor_metadata;
   const auto cpu_inputs = TransferTensorsToCpu(src_ptrs, input_contexts);
 
-  // Create CPU output tensors using TensorContext
-  const auto& output_contexts = operation->output_tensors_context;
+  // Create CPU output tensors using TensorContext from kernel
+  const auto output_contexts = hlo_kernel.GetOutputContexts();
   std::vector<torch::Tensor> cpu_outputs;
   cpu_outputs.reserve(output_contexts.size());
   for (const auto& context : output_contexts) {
@@ -261,8 +261,8 @@ void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
   // Execute on CPU with native PyTorch out parameter handling
   const auto cpu_results =
       ExecuteOperationOnCpu(operation->GetOpName(), cpu_inputs, cpu_outputs, operation);
-  // Transfer results back using data pointers from context
-  TransferTensorsFromCpuToNeuron(cpu_results, dst_ptrs);
+  // Transfer results back using data pointers and contexts
+  TransferTensorsFromCpuToNeuron(cpu_results, dst_ptrs, output_contexts);
   TORCH_NEURONX_DEBUG("CPU fallback execution completed", "operation=", operation->GetOpName());
 }
 
@@ -404,7 +404,8 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
 }
 
 void CPUFallbackExecutor::TransferTensorsFromCpuToNeuron(
-    const std::vector<torch::Tensor>& cpu_results, const std::vector<nrt_tensor_t*>& data_ptrs) {
+    const std::vector<torch::Tensor>& cpu_results, const std::vector<nrt_tensor_t*>& data_ptrs,
+    const std::vector<TensorContext>& tensor_contexts) {
   TORCH_CHECK(data_ptrs.size() == cpu_results.size(), "Mismatch output tensor sizes (",
               data_ptrs.size(), ") and (", cpu_results.size(), ")");
 
@@ -415,8 +416,9 @@ void CPUFallbackExecutor::TransferTensorsFromCpuToNeuron(
     try {
       TORCH_CHECK(cpu_result.is_contiguous(), "CPU result tensor must be contiguous");
       size_t size_bytes = cpu_result.numel() * cpu_result.element_size();
-      torch_neuronx::utils::nrt_copy_cpu_to_neuron(cpu_result.data_ptr(), data_ptr,
-                                                   0 /* Tensor is already sliced */, size_bytes);
+      size_t offset_bytes = tensor_contexts[i].storage_offset * tensor_contexts[i].element_size;
+      torch_neuronx::utils::nrt_copy_cpu_to_neuron(cpu_result.data_ptr(), data_ptr, offset_bytes,
+                                                   size_bytes);
 
       TORCH_NEURONX_DEBUG("Copied CPU result to Neuron output tensor", "index=", i,
                           "final_shape=", cpu_result.sizes());

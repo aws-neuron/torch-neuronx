@@ -45,8 +45,7 @@ class TestNKIV2:
 
         @nki_op("test::add_v2", mutates_args={"y"})
         def add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrapped_kernel = wrap_nki(add_kernel)
-            return wrapped_kernel(x1, x2, y)
+            return wrap_nki(add_kernel)(x1, x2, y)
 
         x1, x2, y = sample_tensors_2d
         expected = x1 + x2
@@ -58,16 +57,15 @@ class TestNKIV2:
         assert torch.allclose(result.cpu(), expected.cpu(), atol=1e-5)
         # Note: y mutation not tested as aliasing is not supported in NKI V2 yet
 
-    @pytest.mark.xfail(reason="NKI library doesn't support trace with FakeTensors")
     def test_nki_v2_with_torch_compile(self, sample_tensors_2d):
         """Test NKI V2 kernel with torch.compile."""
         from torch_neuronx import nki_op, wrap_nki
 
         @nki.jit
         def mul_kernel(x1, x2, y):
-            x1_sbuf = nl.ndarray(x1.size(), x1.dtype, nl.sbuf)
-            x2_sbuf = nl.ndarray(x2.size(), x2.dtype, nl.sbuf)
-            y_sbuf = nl.ndarray(y.size(), y.dtype, nl.sbuf)
+            x1_sbuf = nl.ndarray(x1.shape, x1.dtype, nl.sbuf)
+            x2_sbuf = nl.ndarray(x2.shape, x2.dtype, nl.sbuf)
+            y_sbuf = nl.ndarray(y.shape, y.dtype, nl.sbuf)
 
             nisa.dma_copy(x1_sbuf, x1)
             nisa.dma_copy(x2_sbuf, x2)
@@ -77,8 +75,7 @@ class TestNKIV2:
 
         @nki_op("test::mul_v2", mutates_args={"y"})
         def mul(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrapped_kernel = wrap_nki(mul_kernel)
-            return wrapped_kernel(x1, x2, y)
+            return wrap_nki(mul_kernel)(x1, x2, y)
 
         x1, x2, y = sample_tensors_2d
         expected = x1 * x2
@@ -127,8 +124,7 @@ class TestNKIV2:
 
         @nki_op("test::copy_v2", mutates_args={"y"})
         def copy_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrapped_kernel = wrap_nki(copy_kernel)
-            return wrapped_kernel(x, y)
+            return wrap_nki(copy_kernel)(x, y)
 
         # Test with different dtypes
         for dtype in [torch.float32, torch.float16]:
@@ -141,6 +137,49 @@ class TestNKIV2:
             assert torch.allclose(result.cpu(), x.cpu(), atol=1e-5)
             assert result.dtype == dtype
             # Note: y mutation not tested as aliasing is not supported in NKI V2 yet
+
+    def test_nki_kernel_opts(self, sample_tensors_2d):
+        from nki._enums import OptLevel
+        from nki.compiler.backends.neuron.CompileOpts import AllocatorType
+
+        from torch_neuronx import nki_op, wrap_nki
+        from torch_neuronx.nki_hop import kernel_registry
+
+        @nki.jit(
+            enable_const_rewrite=True,
+            opt_level=OptLevel.skip_middle_end,
+            allocator_type=AllocatorType.auto_spill,
+        )
+        def add_kernel(x1, x2):
+            y = nl.ndarray(x1.shape, x1.dtype, nl.shared_hbm)
+            x1_sbuf = nl.ndarray(x1.shape, x1.dtype, nl.sbuf)
+            x2_sbuf = nl.ndarray(x2.shape, x2.dtype, nl.sbuf)
+            y_sbuf = nl.ndarray(y.shape, y.dtype, nl.sbuf)
+
+            nisa.dma_copy(x1_sbuf, x1)
+            nisa.dma_copy(x2_sbuf, x2)
+            nisa.tensor_tensor(y_sbuf, x1_sbuf, x2_sbuf, nl.add)
+            nisa.dma_copy(y, y_sbuf)
+            return y
+
+        wrapped = wrap_nki(add_kernel)
+        wrapped_kernel = kernel_registry.get_kernel(wrapped.kernel_idx)
+        assert wrapped_kernel.opts.enable_const_rewrite
+        assert wrapped_kernel.opts.opt_level == OptLevel.skip_middle_end
+        assert wrapped_kernel.opts.allocator_type == AllocatorType.auto_spill
+
+        @nki_op("test::kernel_opts_add", mutates_args={"y"})
+        def add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return wrap_nki(add_kernel)(x1, x2, y)
+
+        x1, x2, y = sample_tensors_2d
+        expected = x1 + x2
+
+        # Call the kernel
+        result = add(x1, x2, y)
+
+        # Check that result has correct values
+        assert torch.allclose(result.cpu(), expected.cpu(), atol=1e-5)
 
 
 if __name__ == "__main__":

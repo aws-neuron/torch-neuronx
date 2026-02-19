@@ -115,9 +115,6 @@ class TestCloneRegistration:
             assert x.data_ptr() != y.data_ptr()
             assert_op_runs_on_neuron("aten::clone")
 
-    @pytest.mark.xfail(
-        reason="slice value comparision does not give correct result due to neff execution bug"
-    )
     def test_clone_special_values(self, device):
         """Test clone with special float values"""
         with track_neuron_ops():
@@ -260,4 +257,29 @@ class TestCloneRegistration:
             y = x.conj()
             z = y.clone()
             assert z.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::clone")
+
+    @pytest.mark.parametrize("memory_format", [torch.channels_last, torch.contiguous_format])
+    def test_clone_channels_last_memory_format(self, device, memory_format):
+        """Test clone with ChannelsLast memory format (4D NHWC)"""
+        with track_neuron_ops():
+            x = torch.randn(2, 3, 4, 5, device=device)
+            y = x.clone(memory_format=memory_format)
+
+            assert y.device.type == "neuron"
+            assert torch.equal(x, y)
+            assert x.data_ptr() != y.data_ptr()
+            if memory_format == torch.channels_last:
+                assert y.is_contiguous(memory_format=torch.channels_last)
+            assert_op_runs_on_neuron("aten::clone")
+
+    def test_clone_channels_last_3d_memory_format(self, device):
+        """Test clone with ChannelsLast3d memory format (5D NDHWC)"""
+        with track_neuron_ops():
+            x = torch.randn(2, 3, 4, 5, 6, device=device)
+            y = x.clone(memory_format=torch.channels_last_3d)
+
+            assert y.device.type == "neuron"
+            assert torch.equal(x, y)
+            assert y.is_contiguous(memory_format=torch.channels_last_3d)
             assert_op_runs_on_neuron("aten::clone")

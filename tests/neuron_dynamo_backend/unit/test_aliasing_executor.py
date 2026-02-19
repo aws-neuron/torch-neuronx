@@ -541,6 +541,159 @@ class TestComplexPatterns:
 
 
 # ============================================================================
+# TEST CLASS: AliasingInfo Data Structure
+# ============================================================================
+
+
+class TestAliasingInfo:
+    """Tests for AliasingInfo data structure."""
+
+    def test_empty_aliasing_info(self):
+        """Test newly created AliasingInfo is empty."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+
+        assert len(aliasing_info) == 0
+        assert list(aliasing_info) == []
+
+    def test_add_single_alias(self):
+        """Test adding a single aliasing relationship."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=[], output_index=1)
+
+        assert len(aliasing_info) == 1
+        assert aliasing_info.output_to_input == {1: 0}
+
+    def test_add_multiple_aliases(self):
+        """Test adding multiple aliasing relationships."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=[], output_index=0)
+        aliasing_info.add(parameter_number=1, parameter_index=[], output_index=1)
+        aliasing_info.add(parameter_number=2, parameter_index=[], output_index=2)
+
+        assert len(aliasing_info) == 3
+        assert aliasing_info.output_to_input == {0: 0, 1: 1, 2: 2}
+
+    def test_get_input_index_returns_correct_mapping(self):
+        """Test get_input_index returns correct input index for aliased output."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=5, parameter_index=[], output_index=10)
+
+        assert aliasing_info.get_input_index(10) == 5
+
+    def test_get_input_index_returns_none_for_non_aliased(self):
+        """Test get_input_index returns None for non-aliased outputs."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=[], output_index=2)
+
+        assert aliasing_info.get_input_index(0) is None
+        assert aliasing_info.get_input_index(1) is None
+        assert aliasing_info.get_input_index(99) is None
+
+    def test_get_input_index_empty_aliasing_info(self):
+        """Test get_input_index returns None when no aliases exist."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+
+        assert aliasing_info.get_input_index(0) is None
+
+    def test_add_duplicate_raises_error_for_conflicting_input(self):
+        """Test adding conflicting alias for same output raises ValueError."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=[], output_index=0)
+
+        with pytest.raises(ValueError, match="Output 0 already aliases input 0"):
+            aliasing_info.add(parameter_number=1, parameter_index=[], output_index=0)
+
+    def test_iteration(self):
+        """Test that AliasingInfo can be iterated over."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=[], output_index=0)
+        aliasing_info.add(parameter_number=1, parameter_index=[0], output_index=1)
+
+        aliases_list = list(aliasing_info)
+
+        assert len(aliases_list) == 2
+        assert aliases_list[0].parameter_number == 0
+        assert aliases_list[0].parameter_index == []
+        assert aliases_list[0].output_index == 0
+        assert aliases_list[1].parameter_number == 1
+        assert aliases_list[1].parameter_index == [0]
+        assert aliases_list[1].output_index == 1
+
+    def test_parameter_index_none(self):
+        """Test alias with None parameter_index."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=0, parameter_index=None, output_index=0)
+
+        alias = next(iter(aliasing_info))
+        assert alias.parameter_index is None
+
+
+# ============================================================================
+# TEST CLASS: Retain Device Mode with Mutations
+# ============================================================================
+
+
+class TestRetainDeviceMutation:
+    """Test for retain_device mode with mutated outputs."""
+
+    def test_retain_device_copies_mutated_output_to_original_input(self, device, monkeypatch):
+        """
+        Test that when retain_device=True and an output is aliased to an input,
+        the mutated output is copied back to the original input tensor.
+        """
+        monkeypatch.setenv("TORCH_NEURONX_RETAIN_DEVICE_MODE", "1")
+
+        class InplaceMutationModel(nn.Module):
+            def forward(self, x):
+                x.add_(10)
+                return x
+
+        model = InplaceMutationModel()
+        model.eval()
+        model.to(device)
+
+        x_cpu = torch.randn(4, 4)
+        expected = x_cpu + 10
+
+        x = x_cpu.clone()
+
+        result = compile_and_run(model, x, fullgraph=True)
+
+        # With retain_device + mutation: result should be on CPU
+        assert result.device.type == "cpu", f"Expected CPU, got {result.device.type}"
+
+        torch.testing.assert_close(
+            x,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Original input tensor was not updated via copy_()",
+        )
+
+        torch.testing.assert_close(
+            result, expected, atol=1e-5, rtol=1e-5, msg="Mutated output value mismatch"
+        )
+
+
+# ============================================================================
 # RUN TESTS
 # ============================================================================
 

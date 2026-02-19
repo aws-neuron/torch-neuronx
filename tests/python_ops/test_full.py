@@ -167,10 +167,7 @@ class TestFull:
             result = torch.full(shape, fill_value, device="neuron")
             assert result.shape == expected_cpu.shape
             assert result.numel() == 0
-            if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1":
-                assert_op_does_not_run("aten::full")
-            else:
-                assert_op_runs_on_neuron("aten::full")
+            assert_op_runs_on_neuron("aten::full")
 
     def test_full_layout_strided(self):
         """Test full with strided layout (default)."""

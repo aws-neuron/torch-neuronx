@@ -8,9 +8,8 @@ import torch
 
 from torch_neuronx.python_ops.base import CompilableOpImpl, ExecutionResult
 from torch_neuronx.python_ops.dtype_autocast import autocast_neuron
+from torch_neuronx.python_ops.shared import ExecutionContext, ReductionOps
 
-from .config import ReductionOps
-from .context import ExecutionContext
 from .handlers import EmptyTensorHandler, OutputHandler
 from .kernel import JaxKernel
 from .registry import get_jax_function

@@ -23,21 +23,19 @@ def test_copy_neuron_to_cpu_basic():
     torch.testing.assert_close(cpu_source, cpu_result)
 
 
-@pytest.mark.skipif(
-    os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") != "1",
-    reason="Error message for Neuron execution only",
-)
-@assert_raises(RuntimeError, match="must be contiguous")
-def test_copy_neuron_to_cpu_non_contiguous_fails():
-    """Test that non-contiguous CPU destination fails"""
+def test_copy_neuron_to_cpu_non_contiguous_dst():
+    """Test that non-contiguous CPU destination works"""
     # Create a neuron tensor with data
     cpu_source = torch.randn(4, 4)
     neuron_tensor = torch.empty(4, 4, device="neuron:0")
     neuron_tensor.copy_(cpu_source)
 
     # Create non-contiguous CPU tensor with matching size
-    cpu_tensor = torch.empty(4, 4).transpose(0, 1)
+    cpu_base = torch.empty(4, 4)
+    cpu_tensor = cpu_base.transpose(0, 1)
 
     assert not cpu_tensor.is_contiguous()
 
     cpu_tensor.copy_(neuron_tensor)
+
+    torch.testing.assert_close(cpu_tensor, cpu_source)

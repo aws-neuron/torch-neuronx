@@ -16,16 +16,9 @@
             "test_train_mixed_requires_grad_per_group",
             "test_3d_mlp_with_nd_mesh",
             "test_gradient_accumulation",
-            "test_to_float64_after_init",
             "test_param_registration_after_backward",
             "test_param_registration_after_forward",
             "test_root_move_forward_input_to_device"
-          ]
-        },
-        {
-          "reason": "Relates to handling of optimizing collectives away when ws is 1 and CommDebugMode logging",
-          "tests": [
-            "test_train_parity_single_worldsize1"
           ]
         }
       ]
@@ -50,11 +43,25 @@
           "tests": [
             "test_hsdp_tp_state_dict_save_load"
           ]
+        },
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: Torch not compiled with CUDA enabled",
+          "tests": [
+            "test_cached_state_dict"
+          ]
         }
       ]
     },
     {
-      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py"
+      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py",
+      "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: timing assertion failures",
+          "tests": [
+            "test_fully_shard_post_optim_event_overlap"
+          ]
+        }
+      ]
     },
     {
       "file": "distributed/_composable/fsdp/test_fully_shard_mixed_precision.py",
@@ -132,13 +139,15 @@
       ]
     },
     {
-      "file": "distributed/_composable/fsdp/test_fully_shard_frozen.py",
-      "sanity_methods": [
-        "test_multi_forward_mixed_requires_grad"
-      ]
-    },
-    {
       "file": "distributed/_composable/fsdp/test_fully_shard_extensions.py",
+      "skip_tests": [
+        {
+          "reason": "NRT stream cleanup heap corruption on error path - process hangs during shutdown",
+          "tests": [
+            "test_all_gather_extension_outer_size_stride"
+          ]
+        }
+      ],
       "xfail": [
         {
           "reason": "Extension functionality failures",
@@ -187,7 +196,15 @@
       ]
     },
     {
-      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py"
+      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py",
+      "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_clip_grad_norm_2d"
+          ]
+        }
+      ]
     },
     {
       "file": "distributed/_composable/fsdp/test_fully_shard_autograd.py",

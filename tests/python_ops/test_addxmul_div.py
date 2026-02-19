@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises
 from torch_neuronx.python_ops.compilation.cache import CompilationCache
 from torch_neuronx.python_ops.kernel_cache import kernel_cache_size
 from torch_neuronx.utils import is_sync_mode_enabled
@@ -13,7 +13,7 @@ from torch_neuronx.utils import is_sync_mode_enabled
 class TestAddCompositeOp:
     @pytest.mark.parametrize(
         "composite_func, func_name",
-        [(torch.addcmul, "aten::addcmul.out"), (torch.addcdiv, "aten::addcdiv.out")],
+        [(torch.addcmul, "aten::addcmul"), (torch.addcdiv, "aten::addcdiv")],
     )
     def test_basic_composite_func(self, composite_func, func_name):
         """Test basic addcmul/addcdiv operation with same-sized tensors"""
@@ -29,11 +29,36 @@ class TestAddCompositeOp:
         )
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
-        assert func_name not in torch_neuronx.get_fallback_ops()
+        assert_op_runs_on_neuron(func_name)
 
     @pytest.mark.parametrize(
         "composite_func, func_name",
         [(torch.addcmul, "aten::addcmul.out"), (torch.addcdiv, "aten::addcdiv.out")],
+    )
+    def test_composite_func_out_variant(self, composite_func, func_name):
+        """Test addcmul/addcdiv out variant operations"""
+        device = "neuron"
+        input = torch.randn(3, 3)
+        tensor1 = torch.randn(3, 3)
+        tensor2 = torch.randn(3, 3)
+        out = torch.empty(3, 3)
+        value = 2.0
+
+        out_cpu = composite_func(input, tensor1, tensor2, value=value, out=out.clone())
+        out_neuron = composite_func(
+            input.to(device),
+            tensor1.to(device),
+            tensor2.to(device),
+            value=value,
+            out=torch.empty(3, 3, device=device),
+        )
+
+        torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+        assert_op_runs_on_neuron(func_name)
+
+    @pytest.mark.parametrize(
+        "composite_func, func_name",
+        [(torch.addcmul, "aten::addcmul"), (torch.addcdiv, "aten::addcdiv")],
     )
     def test_addcmul_broadcasting(self, composite_func, func_name):
         """Test addcmul with broadcasting"""
@@ -46,11 +71,11 @@ class TestAddCompositeOp:
         out_neuron = composite_func(input.to(device), tensor1.to(device), tensor2.to(device))
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
-        assert func_name not in torch_neuronx.get_fallback_ops()
+        assert_op_runs_on_neuron(func_name)
 
     @pytest.mark.parametrize(
         "composite_func, func_name",
-        [(torch.addcmul, "aten::addcmul.out"), (torch.addcdiv, "aten::addcdiv.out")],
+        [(torch.addcmul, "aten::addcmul"), (torch.addcdiv, "aten::addcdiv")],
     )
     def test_composite_func_different_dtypes(self, composite_func, func_name):
         """Test addcmul/addcdiv with different dtypes"""
@@ -64,7 +89,7 @@ class TestAddCompositeOp:
 
         # Relaxed tolerances (1e-6) to handle minor discrepancies between CPU and Neuron
         torch.testing.assert_close(out_neuron.cpu(), out_cpu, rtol=1e-6, atol=1e-6)
-        assert func_name not in torch_neuronx.get_fallback_ops()
+        assert_op_runs_on_neuron(func_name)
 
     @pytest.mark.parametrize("composite_func", [torch.addcmul, torch.addcdiv])
     @pytest.mark.parametrize("value", [2, 0.5])
@@ -85,8 +110,8 @@ class TestAddCompositeOp:
     @pytest.mark.parametrize("composite_func", [torch.addcmul, torch.addcdiv])
     @assert_raises(
         RuntimeError,
-        match="Expected all tensors to be on the same device, "
-        "but found at least two devices, neuron:0 and cpu!",
+        match=r"(Non-scalar tensor arg2 is on cpu device, expected neuron|"
+        r"Expected all tensors to be on the same device)",
     )
     def test_composite_func_with_tensor_not_on_device(self, composite_func):
         """Test composite_func when one tensor is not on device"""
@@ -103,7 +128,7 @@ class TestAddCompositeOp:
 
     @pytest.mark.parametrize(
         "composite_func, func_name",
-        [(torch.addcmul, "aten::addcmul.out"), (torch.addcdiv, "aten::addcdiv.out")],
+        [(torch.addcmul, "aten::addcmul"), (torch.addcdiv, "aten::addcdiv")],
     )
     def test_composite_func_with_zero_dim_tensor(self, composite_func, func_name):
         """Test composite_func with zero-dimensional tensors executes on Neuron"""
@@ -116,11 +141,11 @@ class TestAddCompositeOp:
         out_neuron = composite_func(input.to(device), tensor1.to(device), tensor2.to(device))
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
-        assert func_name not in torch_neuronx.get_fallback_ops()
+        assert_op_runs_on_neuron(func_name)
 
     @pytest.mark.parametrize(
         "composite_func, func_name",
-        [(torch.addcmul, "aten::addcmul.out"), (torch.addcdiv, "aten::addcdiv.out")],
+        [(torch.addcmul, "aten::addcmul"), (torch.addcdiv, "aten::addcdiv")],
     )
     def test_composite_func_with_empty_tensor(self, composite_func, func_name):
         """Test composite_func with empty tensor"""
@@ -133,7 +158,7 @@ class TestAddCompositeOp:
         out_neuron = composite_func(input.to(device), tensor1.to(device), tensor2.to(device))
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
-        assert func_name not in torch_neuronx.get_fallback_ops()
+        assert_op_runs_on_neuron(func_name)
 
     @pytest.mark.parametrize("composite_func", [torch.addcmul, torch.addcdiv])
     @assert_raises(TypeError, match="argument 'value' must be Number, not Tensor")

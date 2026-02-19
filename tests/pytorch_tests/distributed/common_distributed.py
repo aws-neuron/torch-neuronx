@@ -159,14 +159,25 @@ def create_test_classes(base_class, module_globals, spec_file="test_spec.json"):
         for method_name in all_test_methods:
             if method_name not in test_methods_set:
 
-                def create_skip_method(name):
+                def create_skip_method(name, original_method):
                     @pytest.mark.skip(reason=f"Method {name} not in filtered test methods")
                     def skipped_method(self):
                         pass
 
+                    # Preserve __wrapped__ attribute if it exists on the original method
+                    # This is needed for parametrized tests that access __wrapped__ in setUp
+                    if hasattr(original_method, "__wrapped__"):
+                        skipped_method.__wrapped__ = original_method.__wrapped__
+                    else:
+                        # Set __wrapped__ to the original method itself as fallback
+                        skipped_method.__wrapped__ = original_method
+
                     return skipped_method
 
-                setattr(neuron_test_class, method_name, create_skip_method(method_name))
+                original_method = getattr(neuron_test_class, method_name)
+                setattr(
+                    neuron_test_class, method_name, create_skip_method(method_name, original_method)
+                )
 
         for xfail in config["xfail"]:
             method_name = next(iter(xfail.keys()))

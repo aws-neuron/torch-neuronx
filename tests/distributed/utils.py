@@ -44,6 +44,27 @@ def distributed_context(master_addr, master_port, rank: int, world_size: int, pr
         dist.destroy_process_group()
 
 
+_BASE_MASTER_PORT = 29500
+_PORTS_PER_WORKER = 256
+
+
+def _get_worker_port(process_index: int) -> str:
+    """Find a free port within this worker's dedicated range."""
+    start = _BASE_MASTER_PORT + process_index * _PORTS_PER_WORKER
+    end = start + _PORTS_PER_WORKER
+    for port in range(start, end):
+        try:
+            sock = socket.socket()
+            # Allow binding to ports in TIME_WAIT state, matching PyTorch TCPStore's behavior
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", port))
+            sock.close()
+            return str(port)
+        except OSError:
+            continue
+    raise RuntimeError(f"No free port in range [{start}, {end}) for worker {process_index}")
+
+
 class DistributedTester:
     def __init__(
         self,
@@ -61,7 +82,7 @@ class DistributedTester:
 
         error_queue = mp.get_context("spawn").Queue()
         master_addr = "localhost"
-        master_port = get_free_port()
+        master_port = _get_worker_port(self.process_index)
         try:
             mp.spawn(
                 self._worker,
@@ -75,11 +96,12 @@ class DistributedTester:
             while not error_queue.empty():
                 errors.append(error_queue.get())
             if errors:
-                rank, error, tb = errors[0]  # Get first error
-                msg = f"\n=== Error From Rank {rank} ===\n Error: {error}\n Traceback: {tb}"
+                errors.sort(key=lambda e: e[0])  # Sort by rank
+                rank, error, tb = errors[0]  # Get lowest rank error
+                msg = f"\n=== Error From Rank {rank} ===\n" f" Error: {error}\n Traceback: {tb}"
 
                 # Re-raise the exception in main process so pytest capture it
-                # Rasie from None to remove unnecessary traceback from main process
+                # Raise from None to remove unnecessary traceback from main process
                 raise RuntimeError(msg) from None
             else:
                 raise e

@@ -21,10 +21,20 @@ class NonzeroMLIRImpl(OperationImplementation):
         """Initialize the nonzero kernel"""
         super().__init__()
 
-        self.kernel = TorchMlirKernel(nonzero_with_count, "aten::nonzero")
+        self.kernel = TorchMlirKernel(
+            nonzero_with_count, "aten::nonzero", static_argnames=("size", "with_count")
+        )
 
     def can_handle(self, tensor, out=None):
         return tensor.device.type == "neuron"
+
+    def _handle_empty_tensor(self, tensor, *, out=None) -> ExecutionResult:
+        """Handle empty tensor - return empty (0, ndim) tensor."""
+        result = torch.empty((0, tensor.ndim), dtype=torch.int64, device=tensor.device)
+        if out is not None:
+            out.resize_(result.shape)
+            out.copy_(result)
+        return ExecutionResult(success=True, output=result)
 
     def _execute_impl(self, tensor: torch.Tensor, *, out=None) -> ExecutionResult:
         """Execute nonzero kernel and return result indices."""

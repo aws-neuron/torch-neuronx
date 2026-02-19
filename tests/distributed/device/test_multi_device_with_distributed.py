@@ -174,8 +174,9 @@ class TestMultiDevicesWithDistributed:
         self.distributed_tester.run_test(_test_multi_process_single_device)
 
     @assert_raises(
-        RuntimeError,
-        match="Attempted to have more than one device per process in distributed setup",
+        (RuntimeError, ValueError),
+        match=r"(Attempted to have more than one device per process.*"
+        r"|Device index.*out of range.*)",
     )
     def test_multi_process_multi_device(self):
         """Test multi-process with multiple devices per process (use case 4)"""

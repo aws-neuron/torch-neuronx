@@ -10,6 +10,9 @@ import torch.distributed as dist
 from torch.fx import GraphModule, Node
 
 from torch_neuronx.neuron_dynamo_backend.fx.passes import collective_legalization
+from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
+    CollectiveLegalization,
+)
 
 
 class TestGetProcessGroupRanks:
@@ -45,8 +48,8 @@ class TestGetProcessGroupRanks:
         assert result == [0]  # Should return single rank for non-distributed case
 
 
-class TestNeuronReplicaGroupsLegalization:
-    """Test neuron_replica_groups_legalization function"""
+class TestCollectiveLegalization:
+    """Test CollectiveLegalization pass"""
 
     def create_mock_fx_node(self, op_name, args):
         """Helper to create a mock FX node"""
@@ -77,12 +80,13 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([node])
 
         # Apply legalization
-        result_gm = collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        result = pass_instance(gm)
 
         # Verify the group argument was transformed
         assert node.args[2] == "[[0, 1, 2, 3]]"
         gm.recompile.assert_called_once()
-        assert result_gm is gm
+        assert result.modified is True
 
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_all_gather_legalization(self, mock_get_ranks):
@@ -98,7 +102,8 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([node])
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        pass_instance(gm)
 
         # Verify the group argument was transformed (group_index=2 for all_gather)
         assert node.args[2] == "[[0, 2, 4, 6]]"
@@ -117,7 +122,8 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([node])
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        pass_instance(gm)
 
         # Verify the group argument was transformed (group_index=3 for reduce_scatter)
         assert node.args[3] == "[[1, 3, 5, 7]]"
@@ -136,7 +142,8 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([node])
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        pass_instance(gm)
 
         # Verify the group argument was transformed (group_index=3 for all_to_all)
         assert node.args[3] == "[[0, 1]]"
@@ -145,7 +152,7 @@ class TestNeuronReplicaGroupsLegalization:
     def test_multiple_collective_ops_legalization(self, mock_get_ranks):
         """Test legalization of multiple collective operations"""
         # Mock different return values for different calls
-        mock_get_ranks.side_effect = [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1], [0, 1], [2, 3], [2, 3]]
+        mock_get_ranks.side_effect = [[0, 1, 2, 3], [0, 1], [2, 3]]
 
         # Create multiple collective operation nodes
         all_reduce_node = self.create_mock_fx_node(
@@ -162,7 +169,8 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([all_reduce_node, all_gather_node, reduce_scatter_node])
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        pass_instance(gm)
 
         # Verify all operations were transformed
         assert all_reduce_node.args[2] == "[[0, 1, 2, 3]]"
@@ -184,11 +192,12 @@ class TestNeuronReplicaGroupsLegalization:
         original_args = regular_node.args
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        result = pass_instance(gm)
 
         # Verify non-collective nodes weren't modified
         assert regular_node.args == original_args
-        gm.recompile.assert_called_once()
+        assert result.modified is False
 
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_unknown_collective_op_ignored(self, mock_get_ranks):
@@ -202,11 +211,13 @@ class TestNeuronReplicaGroupsLegalization:
         original_args = node.args
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        result = pass_instance(gm)
 
         # Verify unknown operation wasn't modified
         assert node.args == original_args
         mock_get_ranks.assert_not_called()
+        assert result.modified is False
 
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_args_modification_preserves_other_args(self, mock_get_ranks):
@@ -220,7 +231,8 @@ class TestNeuronReplicaGroupsLegalization:
         gm = self.create_mock_graph_module([node])
 
         # Apply legalization
-        collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        pass_instance(gm)
 
         # Verify only group argument (index 2) was modified
         assert node.args[0] == "input_tensor"  # Unchanged
@@ -231,6 +243,22 @@ class TestNeuronReplicaGroupsLegalization:
 
 class TestCollectiveTransformsIntegration:
     """Integration tests for collective transforms functionality"""
+
+    def create_mock_fx_node(self, op_name, args):
+        """Helper to create a mock FX node"""
+        node = MagicMock()
+        node.op = "call_function"
+        node.target = op_name
+        node.args = args
+        return node
+
+    def create_mock_graph_module(self, nodes):
+        """Helper to create a mock GraphModule with given nodes"""
+        gm = MagicMock(spec=GraphModule)
+        gm.graph = MagicMock()
+        gm.graph.nodes = nodes
+        gm.recompile = MagicMock()
+        return gm
 
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_end_to_end_transformation(self, mock_get_ranks):
@@ -270,7 +298,8 @@ class TestCollectiveTransformsIntegration:
         )
 
         # Apply transformation
-        result_gm = collective_legalization.legalize_replica_groups(gm)
+        pass_instance = CollectiveLegalization()
+        result = pass_instance(gm)
 
         # Verify transformations
         assert all_reduce_node.args[2] == "[[0, 1, 2, 3]]"
@@ -282,48 +311,39 @@ class TestCollectiveTransformsIntegration:
 
         # Verify graph was recompiled
         gm.recompile.assert_called_once()
-        assert result_gm is gm
-
-    def create_mock_fx_node(self, op_name, args):
-        """Helper to create a mock FX node"""
-        node = MagicMock()
-        node.op = "call_function"
-        node.target = op_name
-        node.args = args
-        return node
-
-    def create_mock_graph_module(self, nodes):
-        """Helper to create a mock GraphModule with given nodes"""
-        gm = MagicMock(spec=GraphModule)
-        gm.graph = MagicMock()
-        gm.graph.nodes = nodes
-        gm.recompile = MagicMock()
-        return gm
+        assert result.modified is True
 
 
 class TestCollectiveOpsMapping:
     """Test the collective operations to group index mapping"""
 
-    def test_collective_ops_to_group_index_completeness(self):
-        """Test that all expected collective operations are mapped"""
-        # Access the mapping from the module
-        ops_mapping = collective_legalization.legalize_replica_groups.__code__.co_consts
+    @patch.object(collective_legalization, "_get_process_group_ranks")
+    def test_all_supported_ops_are_legalized(self, mock_get_ranks):
+        """Test that all expected collective operations are handled"""
+        mock_get_ranks.return_value = [0, 1]
 
-        # Find the dictionary in constants (it should be there as a constant)
-        for const in ops_mapping:
-            if isinstance(const, dict) and "_c10d_functional.all_reduce.default" in const:
-                break
+        # Test each supported op
+        supported_ops = [
+            ("_c10d_functional.all_reduce.default", 2),
+            ("_c10d_functional.all_gather_into_tensor.default", 2),
+            ("_c10d_functional.reduce_scatter_tensor.default", 3),
+            ("_c10d_functional.all_to_all_single.default", 3),
+        ]
 
-        # If we can't access the mapping directly, test the expected operations
-        expected_ops = {
-            "_c10d_functional.all_reduce.default": 2,
-            "_c10d_functional.all_gather_into_tensor.default": 2,
-            "_c10d_functional.reduce_scatter_tensor.default": 3,
-            "_c10d_functional.all_to_all_single.default": 3,
-        }
+        for op_name, group_index in supported_ops:
+            args = ["arg"] * (group_index + 1)
+            args[group_index] = "test_group"
 
-        # This test verifies the conceptual mapping exists
-        # In a real implementation, you might access the actual mapping
-        for op_name, expected_index in expected_ops.items():
-            # The group index should be correct for each operation type
-            assert expected_index in [2, 3], f"Invalid group index for {op_name}"
+            node = MagicMock()
+            node.op = "call_function"
+            node.target = op_name
+            node.args = tuple(args)
+
+            gm = MagicMock(spec=GraphModule)
+            gm.graph.nodes = [node]
+
+            pass_instance = CollectiveLegalization()
+            result = pass_instance(gm)
+
+            assert node.args[group_index] == "[[0, 1]]", f"Failed for {op_name}"
+            assert result.modified is True

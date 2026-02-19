@@ -31,6 +31,8 @@ neuron_dynamo_backend environment variables:
         flags passed to neuronx-cc call
 """
 
+# Register MegaCache artifact type for torch.compiler.save/load_cache_artifacts()
+from torch_neuronx.neuron_dynamo_backend import cache_artifact as _cache_artifact
 from torch_neuronx.neuron_dynamo_backend.backend import (
     create_neuron_backend,
     neuron_backend,
@@ -58,7 +60,6 @@ from torch_neuronx.neuron_dynamo_backend.utils.io_utils import (
 )
 
 __all__ = [
-    "NEFFCompilationError",
     "NEFFExecutionError",
     "create_neuron_backend",
     "fx_to_mlir_string",

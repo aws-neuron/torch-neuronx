@@ -1,6 +1,9 @@
 # Neuron device module for PyTorch
 # This module is accessed as torch.neuron and provides device-specific functionality
 
+# Import memory module to enable torch.neuron.memory.* access
+from torch_neuronx import memory  # noqa: F401
+
 
 def is_initialized() -> bool:
     """Check if the Neuron runtime has been initialized."""
@@ -90,14 +93,100 @@ def _is_in_bad_fork() -> bool:
 
 def manual_seed_all(seed: int) -> None:
     """Set seed for all neuron devices."""
-    # Neuron devices use CPU's RNG (see NeuronHooksInterface::getDefaultGenerator)
-    # CPU RNG is already seeded by torch.manual_seed() before calling this
-    # No device-specific seeding needed
-    _ = int(seed)  # Validate seed format
+    import torch_neuronx
+
+    seed = int(seed)
+    for i in range(device_count()):
+        default_generator = torch_neuronx._C._get_default_generator(i)
+        default_generator.manual_seed(seed)
 
 
 def manual_seed(seed: int) -> None:
-    _ = int(seed)  # Validate seed format
+    """Set seed for the current neuron device."""
+    import torch_neuronx
+
+    seed = int(seed)
+    idx = current_device()
+    default_generator = torch_neuronx._C._get_default_generator(idx)
+    default_generator.manual_seed(seed)
+
+
+def seed() -> None:
+    """Set the seed for generating random numbers to a random number for the current device."""
+    import torch_neuronx
+
+    idx = current_device()
+    default_generator = torch_neuronx._C._get_default_generator(idx)
+    default_generator.seed()
+
+
+def seed_all() -> None:
+    """Set the seed for generating random numbers to a random number on all devices."""
+    import torch_neuronx
+
+    random_seed = 0
+    for i in range(device_count()):
+        default_generator = torch_neuronx._C._get_default_generator(i)
+        if i == 0:
+            default_generator.seed()
+            random_seed = default_generator.initial_seed()
+        else:
+            default_generator.manual_seed(random_seed)
+
+
+def initial_seed() -> int:
+    """Return the current random seed of the current device."""
+    import torch_neuronx
+
+    idx = current_device()
+    default_generator = torch_neuronx._C._get_default_generator(idx)
+    return default_generator.initial_seed()
+
+
+def get_rng_state(device=None):
+    """Get the RNG state for a Neuron device.
+
+    Args:
+        device: Device index or torch.device (default: current device)
+
+    Returns:
+        ByteTensor containing the RNG state
+    """
+    import torch
+
+    import torch_neuronx
+
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("neuron", device)
+    idx = device.index if device is not None else None
+    if idx is None:
+        idx = current_device()
+    default_generator = torch_neuronx._C._get_default_generator(idx)
+    return default_generator.get_state()
+
+
+def set_rng_state(state, device=None):
+    """Set the RNG state for a Neuron device.
+
+    Args:
+        state: ByteTensor containing the desired RNG state
+        device: Device index or torch.device (default: current device)
+    """
+    import torch
+
+    import torch_neuronx
+
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("neuron", device)
+    idx = device.index if device is not None else None
+    if idx is None:
+        idx = current_device()
+    default_generator = torch_neuronx._C._get_default_generator(idx)
+    default_generator.set_state(state)
 
 
 # Import device class from main module to avoid duplication
@@ -219,8 +308,9 @@ def reset_peak_memory_stats(device=None):
     Args:
         device: Device index (optional)
     """
-    # TODO: Implement Neuron memory stats reset
-    pass
+    import torch_neuronx
+
+    torch_neuronx.reset_peak_memory_stats(device)
 
 
 def memory_stats(device=None):
@@ -230,10 +320,93 @@ def memory_stats(device=None):
         device: Device index (optional)
 
     Returns:
-        dict: Memory statistics
+        dict: Memory statistics including allocated_bytes, reserved_bytes, active_bytes, etc.
     """
-    # TODO: Implement comprehensive Neuron memory statistics
-    return {}
+    import torch_neuronx
+
+    return torch_neuronx.memory_stats(device)
+
+
+def memory_allocated(device=None):
+    """Return current memory occupied by tensors in bytes.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        int: Current allocated bytes
+    """
+    import torch_neuronx
+
+    return torch_neuronx.memory_allocated(device)
+
+
+def max_memory_allocated(device=None):
+    """Return peak memory occupied by tensors in bytes since last reset.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        int: Peak allocated bytes
+    """
+    import torch_neuronx
+
+    return torch_neuronx.max_memory_allocated(device)
+
+
+def memory_reserved(device=None):
+    """Return current memory held in the caching allocator's pool in bytes.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        int: Current reserved bytes
+    """
+    import torch_neuronx
+
+    return torch_neuronx.memory_reserved(device)
+
+
+def max_memory_reserved(device=None):
+    """Return peak memory held in the caching allocator's pool in bytes.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        int: Peak reserved bytes
+    """
+    import torch_neuronx
+
+    return torch_neuronx.max_memory_reserved(device)
+
+
+def reset_accumulated_memory_stats(device=None):
+    """Reset accumulated memory statistics for Neuron device.
+
+    Args:
+        device: Device index (optional)
+    """
+    import torch_neuronx
+
+    torch_neuronx.reset_accumulated_memory_stats(device)
+
+
+def memory_summary(device=None, abbreviated=False):
+    """Return a human-readable summary of memory usage for a device.
+
+    Args:
+        device: Device index (optional)
+        abbreviated: If True, return a shorter summary
+
+    Returns:
+        str: Formatted memory summary
+    """
+    import torch_neuronx
+
+    return torch_neuronx.memory_summary(device, abbreviated)
 
 
 def empty_cache():

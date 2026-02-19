@@ -10,6 +10,7 @@
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/utils/TempDirectory.h"
 
 using namespace at::neuron;
 using ::testing::_;
@@ -17,11 +18,24 @@ using ::testing::Return;
 
 class MockNeuronKernelExecution : public CompilableKernelExecution {
  public:
+  // Static counter to track total compilations across all instances
+  static std::atomic<int>& GetCompileCounter() {
+    static std::atomic<int> compile_counter{0};
+    return compile_counter;
+  }
+
+  static void ResetCompileCounter() { GetCompileCounter().store(0); }
+
   MockNeuronKernelExecution(const std::string& cache_key)
       : CompilableKernelExecution(cache_key, "", "", false) {}
 
+  MockNeuronKernelExecution(const std::string& cache_key, const std::vector<uint8_t>& hlo_bytes)
+      : CompilableKernelExecution(cache_key, "", "", false), hlo_bytes_(hlo_bytes) {}
+
   // Mock compilation that returns dummy NEFF data
   std::vector<uint8_t> CompileToNeff() const override {
+    // Increment compile counter to track when actual compilation occurs
+    GetCompileCounter()++;
     // Simulate compilation time
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     // Return dummy NEFF data based on cache key for uniqueness
@@ -30,6 +44,12 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
     neff_data.assign(neff_content.begin(), neff_content.end());
     return neff_data;
   }
+
+  // Return HLO bytes for persistent cache key computation
+  const std::vector<uint8_t>& GetHloBytes() const override { return hlo_bytes_; }
+
+ private:
+  std::vector<uint8_t> hlo_bytes_;
 };
 
 class CompilationCacheTest : public ::testing::Test {
@@ -38,13 +58,56 @@ class CompilationCacheTest : public ::testing::Test {
     // Enable metrics for testing
     at::neuron::metrics::SetMetricsEnabled(true);
 
+    // Save and clear cache env vars to ensure clean test state
+    SaveEnvVar("TORCH_NEURONX_NEFF_CACHE_DIR");
+    SaveEnvVar("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR");
+    SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+
+    // Create temp directories for persistent and local cache
+    temp_dir_ = std::make_unique<TempDirectory>("compilation_cache_test_");
+    local_cache_dir_ = std::make_unique<TempDirectory>("compilation_cache_local_test_");
+
+    // Enable caching with temp directory
+    setenv("TORCH_NEURONX_NEFF_CACHE_DIR", temp_dir_->path().c_str(), 1);
+    setenv("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR", local_cache_dir_->path().c_str(), 1);
+    unsetenv("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+
     cache_ = std::make_unique<CompilationCache>();
     torch_neuronx::SetMockInstanceType("trn1");
   }
 
-  void TearDown() override { cache_->Clear(); }
+  void TearDown() override {
+    cache_->Clear();
+    cache_.reset();
+    temp_dir_.reset();
+    local_cache_dir_.reset();
+    RestoreEnvVars();
+  }
 
+  void SaveEnvVar(const char* name) {
+    const char* value = std::getenv(name);
+    if (value) {
+      saved_env_vars_[name] = value;
+    }
+  }
+
+  void RestoreEnvVars() {
+    for (const auto& [name, value] : saved_env_vars_) {
+      setenv(name.c_str(), value.c_str(), 1);
+    }
+    // Unset any vars that weren't originally set
+    for (const char* name : {"TORCH_NEURONX_NEFF_CACHE_DIR", "TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR",
+                             "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+      if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
+        unsetenv(name);
+      }
+    }
+  }
+
+  std::unique_ptr<TempDirectory> temp_dir_;
+  std::unique_ptr<TempDirectory> local_cache_dir_;
   std::unique_ptr<CompilationCache> cache_;
+  std::map<std::string, std::string> saved_env_vars_;
 };
 
 // Test basic cache functionality
@@ -176,8 +239,12 @@ class LimitedCompilationCacheTest : public ::testing::Test {
  protected:
   void SetUpWithLimits(size_t max_entries, size_t max_size_mb) {
     // Save original environment variables
-    original_max_size_ = getenv("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
-    original_max_entries_ = getenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
+    SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
+    SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
+    SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+
+    // Disable persistent caching for in-memory cache tests
+    setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
 
     // Set test-specific limits
     setenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES", std::to_string(max_entries).c_str(), 1);
@@ -190,24 +257,32 @@ class LimitedCompilationCacheTest : public ::testing::Test {
 
   void TearDown() override {
     cache_.reset();
+    RestoreEnvVars();
+  }
 
-    // Restore original environment variables
-    if (original_max_size_) {
-      setenv("NEURON_COMPILATION_CACHE_MAX_SIZE_MB", original_max_size_, 1);
-    } else {
-      unsetenv("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
+  void SaveEnvVar(const char* name) {
+    const char* value = std::getenv(name);
+    if (value) {
+      saved_env_vars_[name] = value;
     }
+  }
 
-    if (original_max_entries_) {
-      setenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES", original_max_entries_, 1);
-    } else {
-      unsetenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
+  void RestoreEnvVars() {
+    for (const auto& [name, value] : saved_env_vars_) {
+      setenv(name.c_str(), value.c_str(), 1);
+    }
+    // Unset any vars that weren't originally set
+    for (const char* name :
+         {"NEURON_COMPILATION_CACHE_MAX_SIZE_MB", "NEURON_COMPILATION_CACHE_MAX_ENTRIES",
+          "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+      if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
+        unsetenv(name);
+      }
     }
   }
 
   std::unique_ptr<CompilationCache> cache_;
-  const char* original_max_size_ = nullptr;
-  const char* original_max_entries_ = nullptr;
+  std::map<std::string, std::string> saved_env_vars_;
 };
 
 TEST_F(LimitedCompilationCacheTest, SmallCacheEntriesEviction) {
@@ -624,9 +699,9 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   ThrowingMockKernelExecution failing_kernel("failing_key");
   EXPECT_THROW(cache_->GetOrCompileNeff(failing_kernel, stream_id), std::runtime_error);
 
-  // Cache should still be in a valid state
+  // Cache should still be in a valid state — failed entry is now cached too
   auto keys_after = cache_->GetAllCacheKeys();
-  EXPECT_EQ(keys_after.size(), 1);  // Should still have the successful entry
+  EXPECT_EQ(keys_after.size(), 2);  // successful + failed entry
 
   // Should be able to access the successful entry
   MockNeuronKernelExecution successful_kernel2("successful_key");
@@ -639,7 +714,7 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   EXPECT_TRUE(new_kernel.HasCachedNeff());
 
   auto final_keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(final_keys.size(), 2);
+  EXPECT_EQ(final_keys.size(), 3);  // successful + failed + new
 }
 
 TEST_F(LimitedCompilationCacheTest, CacheConsistencyAfterEviction) {
@@ -941,16 +1016,20 @@ TEST_F(CompilationCacheTest, ExceptionSafetyDuringCompilation) {
   // All threads should have caught exceptions
   EXPECT_EQ(exceptions_caught.load(), num_threads);
 
-  // Cache should be clean (no pending compilations left)
+  // Cache should have the failed entry cached
   auto keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(keys.size(), 0);
+  EXPECT_EQ(keys.size(), 1);
 
-  // Should be able to compile successfully after failures
-  MockNeuronKernelExecution successful_kernel(cache_key);
+  // Retrying the same key should fast-fail from cached failed entry
+  FailingKernelExecution retry_kernel(cache_key);
+  EXPECT_THROW(cache_->GetOrCompileNeff(retry_kernel, 999), std::runtime_error);
+
+  // A different key should compile successfully
+  MockNeuronKernelExecution successful_kernel("different_key");
   cache_->GetOrCompileNeff(successful_kernel, 999);
 
   auto final_keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(final_keys.size(), 1);
+  EXPECT_EQ(final_keys.size(), 2);  // failed + successful
 }
 
 TEST_F(LimitedCompilationCacheTest, ConcurrentEvictionAndAccess) {
@@ -990,6 +1069,344 @@ TEST_F(LimitedCompilationCacheTest, ConcurrentEvictionAndAccess) {
   // First entry should remain accessible through smart pointer even if evicted
   EXPECT_GT(successful_accesses.load(), 0);
   EXPECT_TRUE(neff_ptr && !neff_ptr->empty());
+}
+
+// Persistent Cache Integration Tests
+// These tests verify persistent cache behavior integrated with CompilationCache
+
+TEST_F(CompilationCacheTest, PersistentCacheWritesToDisk) {
+  // Verify that compiled NEFFs are written to the persistent cache directory
+  uint32_t stream_id = 1;
+  const std::string cache_key = "persistent_write_test_key";
+
+  MockNeuronKernelExecution kernel_exec(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec, stream_id);
+  EXPECT_TRUE(kernel_exec.HasCachedNeff());
+
+  // Verify that the cache directory now contains files
+  bool found_files = false;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(temp_dir_->path())) {
+    if (entry.is_regular_file()) {
+      found_files = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_files) << "Expected persistent cache files in " << temp_dir_->path();
+}
+
+TEST_F(CompilationCacheTest, PersistentCacheHitAfterInMemoryCacheMiss) {
+  // Test that data can be retrieved from persistent cache after in-memory cache is cleared
+  uint32_t stream_id = 1;
+  const std::string cache_key = "persistent_recovery_test_key";
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First compile - should trigger actual compilation
+  MockNeuronKernelExecution kernel_exec1(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+  EXPECT_TRUE(kernel_exec1.HasCachedNeff());
+  auto original_neff = kernel_exec1.GetCachedNeff();
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Clear in-memory cache only (preserve persistent cache)
+  cache_->ClearInMemoryCache();
+
+  // Request same key - should load from persistent cache
+  MockNeuronKernelExecution kernel_exec2(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  EXPECT_TRUE(kernel_exec2.HasCachedNeff());
+
+  // Verify no additional compilation occurred - data came from disk
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Verify data matches what was originally compiled
+  EXPECT_EQ(original_neff, kernel_exec2.GetCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, ClearPersistentCachePreservesInMemoryCache) {
+  using namespace at::neuron::metrics;
+  // Test that ClearPersistentCache only clears persistent cache while preserving in-memory cache
+  uint32_t stream_id = 1;
+  const std::string cache_key = "clear_persistent_test_key";
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First compile - populates both in-memory and persistent cache
+  MockNeuronKernelExecution kernel_exec1(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+  EXPECT_TRUE(kernel_exec1.HasCachedNeff());
+  auto original_neff = kernel_exec1.GetCachedNeff();
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Access again to trigger in-memory cache hit
+  MockNeuronKernelExecution kernel_exec1b(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec1b, stream_id);
+
+  // Verify in-memory cache has the entry
+  auto keys_before = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_before.size(), 1);
+  EXPECT_TRUE(keys_before.count(cache_key) > 0);
+
+  // Store in-memory cache metric value before clearing persistent cache
+  auto* arena = NeuronMetricsArena::Get();
+  auto* in_memory_hits_counter = arena->GetCounter("CompilationCache.InMemoryHits");
+  ASSERT_NE(in_memory_hits_counter, nullptr);
+  uint64_t in_memory_hits_before = in_memory_hits_counter->Value();
+  EXPECT_GT(in_memory_hits_before, 0);
+
+  // Clear persistent cache only (preserve in-memory cache)
+  cache_->ClearPersistentCache();
+
+  // Verify in-memory cache still has the entry
+  auto keys_after = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys_after.size(), 1);
+  EXPECT_TRUE(keys_after.count(cache_key) > 0);
+
+  // Verify in-memory cache metrics are preserved
+  uint64_t in_memory_hits_after = in_memory_hits_counter->Value();
+  EXPECT_EQ(in_memory_hits_after, in_memory_hits_before);
+
+  // Request same key - should hit in-memory cache (no recompilation)
+  MockNeuronKernelExecution kernel_exec2(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  EXPECT_TRUE(kernel_exec2.HasCachedNeff());
+  EXPECT_EQ(original_neff, kernel_exec2.GetCachedNeff());
+
+  // Verify no additional compilation - in-memory cache hit
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, ClearInMemoryCachePreservesPersistentCacheMetrics) {
+  using namespace at::neuron::metrics;
+
+  // Test that ClearInMemoryCache resets in-memory cache metrics but preserves persistent metrics
+  uint32_t stream_id = 1;
+
+  // Compile an entry
+  MockNeuronKernelExecution kernel_exec1("inmem_clear_metrics_key");
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+
+  // Access again to trigger in-memory cache hit
+  MockNeuronKernelExecution kernel_exec2("inmem_clear_metrics_key");
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+
+  // Verify in-memory cache metrics
+  auto* arena = NeuronMetricsArena::Get();
+  auto* in_memory_hits = arena->GetCounter("CompilationCache.InMemoryHits");
+  ASSERT_NE(in_memory_hits, nullptr);
+  ASSERT_GE(in_memory_hits->Value(), 0);
+
+  // Clear in-memory to force persistent lookup
+  cache_->ClearInMemoryCache();
+
+  // Verify in-memory cache metrics are cleared
+  EXPECT_EQ(in_memory_hits->Value(), 0);
+
+  // Access again for persistent hit
+  MockNeuronKernelExecution kernel_exec3("inmem_clear_metrics_key");
+  cache_->GetOrCompileNeff(kernel_exec3, stream_id);
+
+  // Store the persistent hits before in-memory cache clear
+  auto* persistent_hits_counter = arena->GetCounter("CompilationCache.PersistentHits");
+  ASSERT_NE(persistent_hits_counter, nullptr);
+  uint64_t persistent_hits_value_before = persistent_hits_counter->Value();
+  EXPECT_GT(persistent_hits_value_before, 0);
+
+  // Clear in-memory caches
+  cache_->ClearInMemoryCache();
+
+  // Verify persistent cache metrics are not cleared by ClearInMemoryCache
+  uint64_t persistent_hits_value_after = persistent_hits_counter->Value();
+  EXPECT_EQ(persistent_hits_value_after, persistent_hits_value_before);
+}
+
+TEST_F(CompilationCacheTest, ClearAllCachesResetsAllMetrics) {
+  using namespace at::neuron::metrics;
+
+  // Test that Clear() resets all cache metrics
+  uint32_t stream_id = 1;
+
+  // Compile entries to populate metrics
+  MockNeuronKernelExecution kernel_exec1("full_clear_key");
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+
+  // Access again for in-memory hit
+  MockNeuronKernelExecution kernel_exec2("full_clear_key");
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+
+  // Clear in-memory to force persistent lookup
+  cache_->ClearInMemoryCache();
+
+  // Access again for persistent hit
+  MockNeuronKernelExecution kernel_exec3("full_clear_key");
+  cache_->GetOrCompileNeff(kernel_exec3, stream_id);
+
+  auto* arena = NeuronMetricsArena::Get();
+
+  // Verify metrics exist and have values
+  auto* in_memory_hits = arena->GetCounter("CompilationCache.InMemoryHits");
+  auto* persistent_hits = arena->GetCounter("CompilationCache.PersistentHits");
+  auto* total_compilations = arena->GetCounter("CompilationCache.TotalCompilations");
+  ASSERT_NE(in_memory_hits, nullptr);
+  ASSERT_NE(persistent_hits, nullptr);
+  ASSERT_NE(total_compilations, nullptr);
+
+  // Clear all caches
+  cache_->Clear();
+
+  // Verify all metrics are cleared
+  EXPECT_EQ(in_memory_hits->Value(), 0);
+  EXPECT_EQ(persistent_hits->Value(), 0);
+  EXPECT_EQ(total_compilations->Value(), 0);
+}
+
+TEST_F(CompilationCacheTest, PersistentCacheSurvivesCacheRecreation) {
+  // Test that persistent cache survives CompilationCache destruction/recreation
+  uint32_t stream_id = 1;
+  const std::string cache_key = "persistent_survival_test_key";
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // Compile and store with first cache instance
+  {
+    MockNeuronKernelExecution kernel_exec(cache_key);
+    cache_->GetOrCompileNeff(kernel_exec, stream_id);
+    EXPECT_TRUE(kernel_exec.HasCachedNeff());
+  }
+
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Destroy and recreate cache (same temp directory)
+  cache_.reset();
+  cache_ = std::make_unique<CompilationCache>();
+
+  // Request same key - should load from persistent cache (not recompile)
+  MockNeuronKernelExecution kernel_exec2(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  EXPECT_TRUE(kernel_exec2.HasCachedNeff());
+
+  // Verify no additional compilation occurred - data came from disk
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, MultipleCacheKeysPersisted) {
+  // Test that multiple cache keys are properly persisted
+  uint32_t stream_id = 1;
+  std::vector<std::string> cache_keys = {"persist_key_1", "persist_key_2", "persist_key_3"};
+  std::vector<std::vector<uint8_t>> original_neffs;
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // Compile multiple entries
+  for (const auto& key : cache_keys) {
+    MockNeuronKernelExecution kernel_exec(key);
+    cache_->GetOrCompileNeff(kernel_exec, stream_id);
+    EXPECT_TRUE(kernel_exec.HasCachedNeff());
+    original_neffs.push_back(kernel_exec.GetCachedNeff());
+  }
+
+  // Verify 3 compilations occurred
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 3);
+
+  // Clear in-memory cache only (preserve persistent cache)
+  cache_->ClearInMemoryCache();
+
+  // Verify all entries can be recovered from persistent cache
+  for (size_t i = 0; i < cache_keys.size(); ++i) {
+    MockNeuronKernelExecution kernel_exec(cache_keys[i]);
+    cache_->GetOrCompileNeff(kernel_exec, stream_id);
+    EXPECT_TRUE(kernel_exec.HasCachedNeff());
+    EXPECT_EQ(original_neffs[i], kernel_exec.GetCachedNeff());
+  }
+
+  // Verify no additional compilations - all data came from persistent cache
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 3);
+}
+
+TEST_F(CompilationCacheTest, PersistentCacheDisabledWhenEnvVarSet) {
+  // Test that persistent caching is disabled when env var is set
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First, re-initialize with persistent caching disabled
+  cache_.reset();
+  setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "1", 1);
+  cache_ = std::make_unique<CompilationCache>();
+
+  uint32_t stream_id = 1;
+  const std::string cache_key = "disabled_persist_test_key";
+
+  // Compile
+  MockNeuronKernelExecution kernel_exec1(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+  EXPECT_TRUE(kernel_exec1.HasCachedNeff());
+
+  auto cached_neff1 = kernel_exec1.GetCachedNeff();
+
+  // Clear in-memory cache only (persistent cache is disabled anyway)
+  cache_->ClearInMemoryCache();
+
+  // Request same key - should trigger recompilation since persistent cache is disabled
+  MockNeuronKernelExecution kernel_exec2(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  EXPECT_TRUE(kernel_exec2.HasCachedNeff());
+
+  // Both should still have matching data (same mock compilation)
+  EXPECT_EQ(cached_neff1, kernel_exec2.GetCachedNeff());
+
+  // Verify 2 compilations occurred
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2);
+
+  // Restore env var for other tests
+  unsetenv("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+}
+
+TEST_F(CompilationCacheTest, ConcurrentPersistentCacheAccess) {
+  // Test concurrent access to persistent cache
+  const int num_threads = 4;
+  const std::string cache_key = "concurrent_persist_test_key";
+  uint32_t stream_id = 1;
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First, compile and populate persistent cache
+  MockNeuronKernelExecution initial_exec(cache_key);
+  cache_->GetOrCompileNeff(initial_exec, stream_id);
+  auto original_neff = initial_exec.GetCachedNeff();
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Clear in-memory cache only (preserve persistent cache)
+  cache_->ClearInMemoryCache();
+
+  // Launch multiple threads to access from persistent cache concurrently
+  std::vector<std::future<std::vector<uint8_t>>> futures;
+  for (int i = 0; i < num_threads; ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      MockNeuronKernelExecution kernel_exec(cache_key);
+      cache_->GetOrCompileNeff(kernel_exec, i + 1);
+      return kernel_exec.GetCachedNeff();
+    }));
+  }
+
+  // Collect results
+  std::vector<std::vector<uint8_t>> results;
+  for (auto& future : futures) {
+    results.push_back(future.get());
+  }
+
+  // All results should match the original
+  for (size_t i = 0; i < results.size(); ++i) {
+    EXPECT_EQ(original_neff, results[i]);
+  }
+
+  // Verify no additional compilations - all data came from persistent cache
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
 }
 
 TEST_F(CompilationCacheTest, CentralizedMetricsHitMissTracking) {
@@ -1051,6 +1468,537 @@ TEST_F(CompilationCacheTest, CentralizedMetricsCompilationTracking) {
       NeuronMetricsArena::Get()->GetMetric("CompilationCache.Test.CompilationTime");
   ASSERT_NE(arena_metric, nullptr);
   EXPECT_GE(arena_metric->TotalSamples(), 3);
+}
+
+TEST_F(CompilationCacheTest, SameCacheKeyDifferentIRBytesCacheMiss) {
+  // Test that same cache key with different IR bytes produces different persistent cache entries
+  // This simulates what happens when torch-mlir or neuronxcc version changes
+  uint32_t stream_id = 1;
+  const std::string cache_key = "version_test_key";
+  std::vector<uint8_t> ir_v1 = {0x01, 0x02, 0x03};  // "Version 1" IR
+  std::vector<uint8_t> ir_v2 = {0x04, 0x05, 0x06};  // "Version 2" IR
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // Compile with IR version 1
+  MockNeuronKernelExecution kernel_exec_v1(cache_key, ir_v1);
+  cache_->GetOrCompileNeff(kernel_exec_v1, stream_id);
+  EXPECT_TRUE(kernel_exec_v1.HasCachedNeff());
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Clear in-memory cache to force persistent cache lookup
+  cache_->ClearInMemoryCache();
+
+  // Compile with IR version 2 (simulates toolchain version change)
+  MockNeuronKernelExecution kernel_exec_v2(cache_key, ir_v2);
+  cache_->GetOrCompileNeff(kernel_exec_v2, stream_id);
+  EXPECT_TRUE(kernel_exec_v2.HasCachedNeff());
+
+  // Should have compiled again because IR bytes are different
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2)
+      << "Expected recompilation when IR bytes change (simulating toolchain version change)";
+}
+
+TEST_F(CompilationCacheTest, SameCacheKeySameIRBytesCacheHit) {
+  // Test that same cache key with same IR bytes produces persistent cache hit
+  uint32_t stream_id = 1;
+  const std::string cache_key = "same_ir_test_key";
+  std::vector<uint8_t> ir_bytes = {0x01, 0x02, 0x03, 0x04};
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First compile
+  MockNeuronKernelExecution kernel_exec1(cache_key, ir_bytes);
+  cache_->GetOrCompileNeff(kernel_exec1, stream_id);
+  EXPECT_TRUE(kernel_exec1.HasCachedNeff());
+  auto original_neff = kernel_exec1.GetCachedNeff();
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Clear in-memory cache to force persistent cache lookup
+  cache_->ClearInMemoryCache();
+
+  // Second request with same IR bytes - should be persistent cache hit
+  MockNeuronKernelExecution kernel_exec2(cache_key, ir_bytes);
+  cache_->GetOrCompileNeff(kernel_exec2, stream_id);
+  EXPECT_TRUE(kernel_exec2.HasCachedNeff());
+
+  // Should NOT have compiled again - persistent cache hit
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1)
+      << "Expected persistent cache hit when IR bytes are the same";
+
+  // Results should match
+  EXPECT_EQ(original_neff, kernel_exec2.GetCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, InMemoryCacheKeyDifferentFromPersistentKey) {
+  // Test that in-memory cache uses simple key while persistent uses IR-aware key
+  // Same cache_key should hit in-memory cache even with different IR bytes
+  uint32_t stream_id = 1;
+  const std::string cache_key = "memory_vs_persistent_key";
+  std::vector<uint8_t> ir_v1 = {0xAA, 0xBB};
+  std::vector<uint8_t> ir_v2 = {0xCC, 0xDD};
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // Compile with IR version 1
+  MockNeuronKernelExecution kernel_exec_v1(cache_key, ir_v1);
+  cache_->GetOrCompileNeff(kernel_exec_v1, stream_id);
+  EXPECT_TRUE(kernel_exec_v1.HasCachedNeff());
+  auto v1_neff = kernel_exec_v1.GetCachedNeff();
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Without clearing in-memory cache, request with different IR bytes
+  // Should still hit in-memory cache (keyed by cache_key only)
+  MockNeuronKernelExecution kernel_exec_v2(cache_key, ir_v2);
+  cache_->GetOrCompileNeff(kernel_exec_v2, stream_id);
+  EXPECT_TRUE(kernel_exec_v2.HasCachedNeff());
+
+  // Should not have compiled again - in-memory cache hit
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1)
+      << "Expected in-memory cache hit (keyed by cache_key only)";
+
+  // Results should match (from in-memory cache)
+  EXPECT_EQ(v1_neff, kernel_exec_v2.GetCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, VersionChangeInvalidatesPersistentCacheOnly) {
+  // Test that toolchain version change causes persistent cache miss but in-memory works
+  uint32_t stream_id = 1;
+  const std::string cache_key = "version_invalidation_test";
+  std::vector<uint8_t> old_ir = {0x10, 0x20, 0x30};  // Old toolchain IR
+  std::vector<uint8_t> new_ir = {0x40, 0x50, 0x60};  // New toolchain IR
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // Simulate old toolchain compilation
+  MockNeuronKernelExecution old_kernel(cache_key, old_ir);
+  cache_->GetOrCompileNeff(old_kernel, stream_id);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Simulate process restart (destroy and recreate cache)
+  cache_.reset();
+  cache_ = std::make_unique<CompilationCache>();
+
+  // Simulate new toolchain version - different IR for same operation
+  MockNeuronKernelExecution new_kernel(cache_key, new_ir);
+  cache_->GetOrCompileNeff(new_kernel, stream_id);
+
+  // Should recompile because persistent cache key includes IR hash
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2)
+      << "Expected recompilation after toolchain version change";
+}
+
+// =============================================================================
+// Compilation File Lock Tests with Persistent Cache
+// =============================================================================
+
+TEST_F(CompilationCacheTest, FileLockPreventsMultipleCompilations) {
+  // Test that file locking prevents multiple threads from compiling the same key
+  // Only one thread should compile, others should wait and read from cache
+  const std::string cache_key = "file_lock_test_key";
+  const int num_threads = 4;
+
+  // Reset compile counter for this test
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::vector<std::future<std::vector<uint8_t>>> futures;
+
+  // Launch multiple threads trying to compile the same key concurrently
+  for (int i = 0; i < num_threads; ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      MockNeuronKernelExecution kernel_exec(cache_key);
+      cache_->GetOrCompileNeff(kernel_exec, i + 1);
+      return kernel_exec.GetCachedNeff();
+    }));
+  }
+
+  // Collect results
+  std::vector<std::vector<uint8_t>> results;
+  for (auto& future : futures) {
+    results.push_back(future.get());
+  }
+
+  // All results should be identical (same compilation result)
+  for (size_t i = 1; i < results.size(); ++i) {
+    EXPECT_EQ(results[0], results[i]);
+  }
+
+  // Only one compilation should have occurred due to file locking
+  // Other threads should have waited for the lock, then read from persistent cache
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1)
+      << "Expected exactly 1 compilation, but got "
+      << MockNeuronKernelExecution::GetCompileCounter().load()
+      << ". File locking should prevent duplicate compilations.";
+}
+
+TEST_F(CompilationCacheTest, FileLockWithSlowCompilation) {
+  // Test that file locking works correctly with slow compilations
+  // Threads should wait for the lock and then read from cache
+  const std::string cache_key = "slow_compile_lock_test";
+  const int num_threads = 3;
+
+  // Create a mock that takes significant time to compile
+  class SlowCompileMock : public MockNeuronKernelExecution {
+   public:
+    SlowCompileMock(const std::string& key) : MockNeuronKernelExecution(key) {}
+
+    std::vector<uint8_t> CompileToNeff() const override {
+      GetCompileCounter()++;
+      // Simulate long compilation (200ms)
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::vector<uint8_t> neff_data;
+      std::string content = "SLOW_NEFF_" + GetCacheKey();
+      neff_data.assign(content.begin(), content.end());
+      return neff_data;
+    }
+  };
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::vector<std::future<std::vector<uint8_t>>> futures;
+  std::atomic<int> threads_started{0};
+
+  // Launch threads with slight stagger to ensure they all compete for the lock
+  for (int i = 0; i < num_threads; ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      threads_started++;
+      SlowCompileMock kernel_exec(cache_key);
+      cache_->GetOrCompileNeff(kernel_exec, i + 1);
+      return kernel_exec.GetCachedNeff();
+    }));
+    // Small delay to stagger thread starts (but they'll still compete for lock)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  // Wait for all threads to start
+  while (threads_started.load() < num_threads) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // Collect results
+  std::vector<std::vector<uint8_t>> results;
+  for (auto& future : futures) {
+    results.push_back(future.get());
+  }
+
+  // All results should match
+  for (size_t i = 1; i < results.size(); ++i) {
+    EXPECT_EQ(results[0], results[i]);
+  }
+
+  // Only 1 compilation should occur
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, FileLockWithDifferentKeys) {
+  // Test that different cache keys can compile concurrently (different lock files)
+  const int num_keys = 4;
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::vector<std::future<std::vector<uint8_t>>> futures;
+
+  // Launch threads with different keys - they should not block each other
+  for (int i = 0; i < num_keys; ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      std::string unique_key = "different_key_" + std::to_string(i);
+      MockNeuronKernelExecution kernel_exec(unique_key);
+      cache_->GetOrCompileNeff(kernel_exec, i + 1);
+      return kernel_exec.GetCachedNeff();
+    }));
+  }
+
+  // Collect results
+  std::vector<std::vector<uint8_t>> results;
+  for (auto& future : futures) {
+    results.push_back(future.get());
+  }
+
+  // All results should be different (different keys)
+  for (size_t i = 0; i < results.size(); ++i) {
+    for (size_t j = i + 1; j < results.size(); ++j) {
+      EXPECT_NE(results[i], results[j]);
+    }
+  }
+
+  // All 4 compilations should occur (different lock files)
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), num_keys);
+}
+
+TEST_F(CompilationCacheTest, FileLocksReadFromCacheAfterFirstCompile) {
+  // Test second thead reads from persistent cache after first thread compiles with lock.
+
+  const std::string cache_key = "sequential_lock_test";
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::atomic<bool> thread_a_acquired_lock{false};
+  std::atomic<bool> thread_a_compilation_done{false};
+  std::atomic<bool> thread_b_started{false};
+  std::vector<uint8_t> thread_a_result;
+  std::vector<uint8_t> thread_b_result;
+
+  // Thread A: Acquires lock and compiles (with longer compilation time)
+  class SlowFirstCompile : public MockNeuronKernelExecution {
+   public:
+    std::atomic<bool>& acquired_flag_;
+    std::atomic<bool>& done_flag_;
+
+    SlowFirstCompile(const std::string& key, std::atomic<bool>& acquired, std::atomic<bool>& done)
+        : MockNeuronKernelExecution(key), acquired_flag_(acquired), done_flag_(done) {}
+
+    std::vector<uint8_t> CompileToNeff() const override {
+      acquired_flag_ = true;
+      GetCompileCounter()++;
+      // Simulate compilation time
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      done_flag_ = true;
+      std::vector<uint8_t> neff_data;
+      std::string content = "FIRST_COMPILE_" + GetCacheKey();
+      neff_data.assign(content.begin(), content.end());
+      return neff_data;
+    }
+  };
+
+  std::thread thread_a([&]() {
+    SlowFirstCompile kernel_exec(cache_key, thread_a_acquired_lock, thread_a_compilation_done);
+    cache_->GetOrCompileNeff(kernel_exec, 1);
+    thread_a_result = kernel_exec.GetCachedNeff();
+  });
+
+  // Wait for Thread A to start compilation (acquire lock)
+  while (!thread_a_acquired_lock.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // Thread B: Starts after Thread A has the lock, should wait then read from cache
+  std::thread thread_b([&]() {
+    thread_b_started = true;
+    MockNeuronKernelExecution kernel_exec(cache_key);
+    cache_->GetOrCompileNeff(kernel_exec, 2);
+    thread_b_result = kernel_exec.GetCachedNeff();
+  });
+
+  // Wait for both threads to complete
+  thread_a.join();
+  thread_b.join();
+
+  // Verify Thread B waited for Thread A (started before compilation was done)
+  EXPECT_TRUE(thread_b_started.load());
+
+  // Both should have the same result
+  EXPECT_EQ(thread_a_result, thread_b_result);
+
+  // Only 1 compilation should have occurred (Thread B read from cache)
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, FileLockRecoveryAfterCompilationFailure) {
+  // Test that lock is properly released even if compilation fails
+  // Next thread should be able to acquire lock and compile
+  const std::string cache_key = "lock_failure_recovery_test";
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  // First, a compilation that fails
+  class FailingCompile : public MockNeuronKernelExecution {
+   public:
+    FailingCompile(const std::string& key) : MockNeuronKernelExecution(key) {}
+
+    std::vector<uint8_t> CompileToNeff() const override {
+      throw std::runtime_error("Compilation failed intentionally");
+    }
+  };
+
+  // Thread 1: Fails compilation (should release lock on exception)
+  std::thread thread_fail([&]() {
+    FailingCompile kernel_exec(cache_key);
+    try {
+      cache_->GetOrCompileNeff(kernel_exec, 1);
+    } catch (const std::runtime_error&) {
+      // Expected
+    }
+  });
+  thread_fail.join();
+
+  // Thread 2: Same key should fast-fail from cached failed entry (no recompilation)
+  std::thread thread_retry([&]() {
+    MockNeuronKernelExecution kernel_exec(cache_key);
+    EXPECT_THROW(cache_->GetOrCompileNeff(kernel_exec, 2), std::runtime_error);
+  });
+  thread_retry.join();
+
+  // No successful compilations should have occurred
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 0);
+
+  // Thread 3: A different key should compile successfully (lock was released)
+  std::thread thread_success([&]() {
+    MockNeuronKernelExecution kernel_exec("different_lock_key");
+    cache_->GetOrCompileNeff(kernel_exec, 3);
+    EXPECT_TRUE(kernel_exec.HasCachedNeff());
+  });
+  thread_success.join();
+
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, FileLockStressTestManyThreadsSameKey) {
+  // Stress test: Many threads trying to compile the same key
+  const std::string cache_key = "stress_lock_test";
+  const int num_threads = 16;
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::vector<std::future<std::vector<uint8_t>>> futures;
+
+  for (int i = 0; i < num_threads; ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      MockNeuronKernelExecution kernel_exec(cache_key);
+      cache_->GetOrCompileNeff(kernel_exec, i + 1);
+      return kernel_exec.GetCachedNeff();
+    }));
+  }
+
+  // Collect results
+  std::vector<std::vector<uint8_t>> results;
+  for (auto& future : futures) {
+    results.push_back(future.get());
+  }
+
+  // All results should match
+  for (size_t i = 1; i < results.size(); ++i) {
+    EXPECT_EQ(results[0], results[i]);
+  }
+
+  // Only 1 compilation should occur
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1)
+      << "Stress test: Expected 1 compilation, got "
+      << MockNeuronKernelExecution::GetCompileCounter().load();
+}
+
+TEST_F(CompilationCacheTest, LockFilesWrittenToLocalCacheDir) {
+  // Test that lock files are created in the local cache directory
+  uint32_t stream_id = 1;
+  const std::string cache_key = "local_cache_dir_test_key";
+
+  // Verify local cache dir exists and is empty or contains only expected directories
+  EXPECT_TRUE(std::filesystem::exists(local_cache_dir_->fs_path()));
+
+  // Compile something to trigger lock file creation
+  MockNeuronKernelExecution kernel_exec(cache_key);
+  cache_->GetOrCompileNeff(kernel_exec, stream_id);
+  EXPECT_TRUE(kernel_exec.HasCachedNeff());
+
+  // Verify that the locks subdirectory was created in local cache dir
+  std::filesystem::path locks_dir = local_cache_dir_->fs_path() / "locks";
+  EXPECT_TRUE(std::filesystem::exists(locks_dir))
+      << "Expected locks directory at: " << locks_dir.string();
+
+  // Check that lock files exist
+  bool found_lock_related = false;
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(local_cache_dir_->fs_path())) {
+    if (entry.path().string().find("lock") != std::string::npos ||
+        entry.path().string().find(".lock") != std::string::npos) {
+      found_lock_related = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_lock_related);
+}
+
+TEST_F(CompilationCacheTest, FailedEntryFastFailsWithoutRecompilation) {
+  // Verify that a failed compilation is cached and subsequent attempts
+  // fail immediately without triggering another compilation.
+  class ThrowingKernel : public CompilableKernelExecution {
+   public:
+    static std::atomic<int>& CompileCount() {
+      static std::atomic<int> count{0};
+      return count;
+    }
+    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    std::vector<uint8_t> CompileToNeff() const override {
+      CompileCount()++;
+      throw std::runtime_error("bad input");
+    }
+  };
+
+  ThrowingKernel::CompileCount().store(0);
+  uint32_t stream_id = 1;
+
+  // First attempt: compilation runs and fails
+  ThrowingKernel kernel1("fail_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(kernel1, stream_id), std::runtime_error);
+  EXPECT_EQ(ThrowingKernel::CompileCount().load(), 1);
+
+  // Second attempt: should fast-fail from cache, no recompilation
+  MockNeuronKernelExecution kernel2("fail_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(kernel2, stream_id), std::runtime_error);
+  EXPECT_EQ(ThrowingKernel::CompileCount().load(), 1);  // Still 1
+}
+
+TEST_F(CompilationCacheTest, FailedEntryPreservesErrorMessage) {
+  class ThrowingKernel : public CompilableKernelExecution {
+   public:
+    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    std::vector<uint8_t> CompileToNeff() const override {
+      throw std::runtime_error("specific error: invalid flag --xyz");
+    }
+  };
+
+  ThrowingKernel kernel("msg_test_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(kernel, 1), std::runtime_error);
+
+  // Verify the cached entry preserves the error message
+  auto entry = cache_->GetEntry("msg_test_key");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_TRUE(entry->IsFailed());
+  EXPECT_THAT(entry->GetFailureMessage(),
+              ::testing::HasSubstr("specific error: invalid flag --xyz"));
+}
+
+TEST_F(CompilationCacheTest, FailedEntryDoesNotAffectOtherKeys) {
+  class ThrowingKernel : public CompilableKernelExecution {
+   public:
+    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    std::vector<uint8_t> CompileToNeff() const override {
+      throw std::runtime_error("compilation failed");
+    }
+  };
+
+  uint32_t stream_id = 1;
+
+  // Fail one key
+  ThrowingKernel failing("bad_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(failing, stream_id), std::runtime_error);
+
+  // A different key should compile successfully
+  MockNeuronKernelExecution good("good_key");
+  cache_->GetOrCompileNeff(good, stream_id);
+  EXPECT_TRUE(good.HasCachedNeff());
+
+  // The failed key should still fast-fail
+  MockNeuronKernelExecution retry("bad_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(retry, stream_id), std::runtime_error);
+}
+
+TEST_F(CompilationCacheTest, FailedEntryClearedOnCacheClear) {
+  class ThrowingKernel : public CompilableKernelExecution {
+   public:
+    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    std::vector<uint8_t> CompileToNeff() const override {
+      throw std::runtime_error("compilation failed");
+    }
+  };
+
+  // Cache a failure
+  ThrowingKernel kernel("clear_test_key");
+  EXPECT_THROW(cache_->GetOrCompileNeff(kernel, 1), std::runtime_error);
+  EXPECT_EQ(cache_->GetAllCacheKeys().size(), 1);
+
+  // Clear should remove it
+  cache_->ClearInMemoryCache();
+  EXPECT_EQ(cache_->GetAllCacheKeys().size(), 0);
 }
 
 int main(int argc, char** argv) {

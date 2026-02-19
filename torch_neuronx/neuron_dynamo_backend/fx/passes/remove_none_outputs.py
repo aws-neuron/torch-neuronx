@@ -29,13 +29,34 @@ class RemoveNoneOutputs(PassBase):
         self.result: NoneOutputInfo | None = None
 
     def _normalize_outputs(self, output_node: torch.fx.Node) -> list[torch.fx.Node | None]:
-        """Convert output node args to a list of output nodes."""
+        """Convert output node arguments to a normalized list.
+
+        Handles both single outputs and tuple/list outputs by converting
+        them to a consistent list format.
+
+        Args:
+            output_node (torch.fx.Node): The graph's output node.
+
+        Returns:
+            list[torch.fx.Node | None]: List of output nodes (may contain None).
+        """
         outputs = output_node.args[0]
         if not isinstance(outputs, (list | tuple)):
             return [outputs]
         return list(outputs)
 
     def call(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        """Execute the pass to remove None outputs from the graph.
+
+        Filters out None values from the graph's output tuple and records
+        metadata about the original positions for later restoration.
+
+        Args:
+            gm (torch.fx.GraphModule): Graph module to transform.
+
+        Returns:
+            PassResult: Result containing modified graph and modified=True.
+        """
         logger.debug("Starting remove_none_outputs_pass")
         output_node = gm.graph.output_node()
         outputs = self._normalize_outputs(output_node)

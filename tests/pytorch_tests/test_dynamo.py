@@ -1,10 +1,14 @@
 import logging
 import re
+import unittest
 
 import pytest
 
 import torch_neuronx
-from tests.pytorch_tests.dynamo.neuron_dynamo_patch import apply_dynamo_patches
+from tests.pytorch_tests.dynamo.neuron_dynamo_patch import (
+    apply_dynamo_patches,
+    get_context_for_class,
+)
 from tests.pytorch_tests.utils import setup_pytorch_tests
 
 # Apply patches before test discovery
@@ -15,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PYTORCH_TEST_CONFIGS = setup_pytorch_tests(spec_file="dynamo_spec.json")
+PYTORCH_TEST_CONFIGS = setup_pytorch_tests(spec_file="dynamo_spec.json", collect_skipped_tests=True)
 
 
 def get_method_name(config, test):
@@ -35,15 +39,27 @@ class TestPytorchDynamoWrapper:
             cls.pytorch_test_classes[config.test_class_name] = test_class
 
     def _run_pytorch_test(self, class_name, method_name):
-        test_instance = self.pytorch_test_classes[class_name]()
-        if hasattr(test_instance, "setUp"):
-            test_instance.setUp()
-        try:
-            method = getattr(test_instance, method_name)
-            method()
-        finally:
-            if hasattr(test_instance, "tearDown"):
-                test_instance.tearDown()
+        with get_context_for_class(class_name):
+            test_instance = self.pytorch_test_classes[class_name]()
+            if hasattr(test_instance, "setUp"):
+                test_instance.setUp()
+            try:
+                method = getattr(test_instance, method_name)
+                expecting_failure = getattr(method, "__unittest_expecting_failure__", False)
+                try:
+                    method()
+                except unittest.SkipTest as e:
+                    pytest.skip(str(e))
+                except Exception:
+                    if expecting_failure:
+                        pytest.xfail("unittest.expectedFailure")
+                    raise
+                else:
+                    if expecting_failure:
+                        pytest.fail("Expected test to fail but it passed")
+            finally:
+                if hasattr(test_instance, "tearDown"):
+                    test_instance.tearDown()
 
 
 for config in PYTORCH_TEST_CONFIGS:

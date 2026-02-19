@@ -12,7 +12,7 @@ them with subsequent operations for better performance.
 NOTE: These tests require the following environment variables to be set:
     os.environ["TORCH_NEURONX_ENABLE_PRLOLOGUE"] = "1"
     os.environ["TORCH_NEURONX_ENABLE_STABLEHLO"] = "1"
-    os.environ["TORCH_NEURONX_SYNC_MODE"] = "1"
+    os.environ["NEURON_LAUNCH_BLOCKING"] = "1"
 These must be set BEFORE running the tests to ensure lazy materialization
 optimizations work correctly and the tests validate the intended behavior.
 """
@@ -32,7 +32,7 @@ class TestLazyMaterializationOps:
     """Test suite for lazy materialization correctness on operations."""
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -80,7 +80,7 @@ class TestLazyMaterializationOps:
             ), "Matmul with transpose produced incorrect results for bfloat16"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -128,7 +128,7 @@ class TestLazyMaterializationOps:
             ), "Matmul with slice produced incorrect results for bfloat16"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -228,7 +228,7 @@ class TestLazyMaterializationOps:
         ), "Gradient for b does not match between Neuron and CPU"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -322,7 +322,7 @@ class TestLazyMaterializationEdgeCases:
         assert torch.allclose(result_neuron.cpu(), result_cpu, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -363,7 +363,7 @@ class TestLazyMaterializationEdgeCases:
         ), "Chained operations produced incorrect results"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -422,7 +422,7 @@ class TestLazyMaterializationEdgeCases:
             ), "Concat with same tensor transpose produced incorrect results for bfloat16"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
@@ -483,7 +483,7 @@ class TestLazyMaterializationEdgeCases:
         ), "ones_like with non-contiguous input produced incorrect results"
 
     @pytest.mark.skipif(
-        os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1"
+        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(

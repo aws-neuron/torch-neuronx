@@ -133,6 +133,10 @@ class TestMLIRTorchDtypeMapping:
         assert MLIR_TO_TORCH_DTYPE["complex<f32>"] == torch.complex64
         assert MLIR_TO_TORCH_DTYPE["complex<f64>"] == torch.complex128
 
+    def test_mlir_to_torch_dtype_quant_types(self):
+        """Test quantized dtype mappings"""
+        assert MLIR_TO_TORCH_DTYPE["f8E5M2"] == torch.float8_e5m2
+
 
 class TestParseMlirType:
     """Test _parse_mlir_type function"""
@@ -188,27 +192,26 @@ class TestComputeCacheKey:
     def test_compute_cache_key_success(self, mock_parse_io):
         """Test successful cache key computation"""
         mock_stablehlo_mlir = MagicMock()
-        mock_bytecode_buffer = MagicMock()
-        mock_stablehlo_bytes = b"mock_stablehlo_bytes"
+        mock_stablehlo_mlir.operation.attributes = {}
+        mock_stablehlo_mlir.operation.print = MagicMock(
+            side_effect=lambda file, enable_debug_info: file.write("module {}")
+        )
 
         input_spec = TensorSpec(shape=(2, 3), dtype=torch.float32)
         output_spec = TensorSpec(shape=(2, 4), dtype=torch.float32)
         mock_io_specs = FunctionIO(inputs=(input_spec,), outputs=(output_spec,))
         mock_parse_io.return_value = mock_io_specs
 
-        with patch("io.BytesIO", return_value=mock_bytecode_buffer):
-            mock_bytecode_buffer.getvalue.return_value = mock_stablehlo_bytes
+        result = compute_cache_key(mock_stablehlo_mlir)
 
-            result = compute_cache_key(mock_stablehlo_mlir)
-
-            assert isinstance(result, str)
-            assert len(result) == 16
-            mock_stablehlo_mlir.operation.write_bytecode.assert_called_once()
+        assert isinstance(result, str)
+        assert len(result) == 64
 
     @patch("torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils.parse_module_io")
     def test_compute_cache_key_failure(self, mock_parse_io):
         """Test cache key computation error handling"""
         mock_stablehlo_mlir = MagicMock()
+        mock_stablehlo_mlir.operation.attributes = {}
         mock_parse_io.side_effect = RuntimeError("Parse failed")
 
         with pytest.raises(RuntimeError, match="Failed to generate cache key"):
@@ -218,21 +221,41 @@ class TestComputeCacheKey:
     def test_compute_cache_key_deterministic(self, mock_parse_io):
         """Test cache key determinism"""
         mock_stablehlo_mlir = MagicMock()
-        mock_bytecode_buffer = MagicMock()
-        mock_stablehlo_bytes = b"identical_bytes"
+        mock_stablehlo_mlir.operation.attributes = {}
+        mock_stablehlo_mlir.operation.print = MagicMock(
+            side_effect=lambda file, enable_debug_info: file.write("module {}")
+        )
 
         input_spec = TensorSpec(shape=(2, 3), dtype=torch.float32)
         output_spec = TensorSpec(shape=(2, 4), dtype=torch.float32)
         mock_io_specs = FunctionIO(inputs=(input_spec,), outputs=(output_spec,))
         mock_parse_io.return_value = mock_io_specs
 
-        with patch("io.BytesIO", return_value=mock_bytecode_buffer):
-            mock_bytecode_buffer.getvalue.return_value = mock_stablehlo_bytes
+        result1 = compute_cache_key(mock_stablehlo_mlir)
+        result2 = compute_cache_key(mock_stablehlo_mlir)
 
-            result1 = compute_cache_key(mock_stablehlo_mlir)
-            result2 = compute_cache_key(mock_stablehlo_mlir)
+        assert result1 == result2
 
-            assert result1 == result2
+    @patch("torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils.parse_module_io")
+    def test_compute_cache_key_uses_explicit_no_debug_info(self, mock_parse_io):
+        """Test that print is called with enable_debug_info=False"""
+        mock_stablehlo_mlir = MagicMock()
+        mock_stablehlo_mlir.operation.attributes = {}
+        mock_stablehlo_mlir.operation.print = MagicMock(
+            side_effect=lambda file, enable_debug_info: file.write("module {}")
+        )
+
+        input_spec = TensorSpec(shape=(2, 3), dtype=torch.float32)
+        output_spec = TensorSpec(shape=(2, 4), dtype=torch.float32)
+        mock_io_specs = FunctionIO(inputs=(input_spec,), outputs=(output_spec,))
+        mock_parse_io.return_value = mock_io_specs
+
+        compute_cache_key(mock_stablehlo_mlir)
+
+        # Verify print was called with enable_debug_info=False
+        mock_stablehlo_mlir.operation.print.assert_called()
+        call_kwargs = mock_stablehlo_mlir.operation.print.call_args
+        assert call_kwargs[1]["enable_debug_info"] is False
 
 
 class TestParseModuleIO:
@@ -450,12 +473,11 @@ class TestNegativeCases:
             parse_module_io(mock_module)
 
     @patch("torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils.parse_module_io")
-    def test_compute_cache_key_bytecode_failure(self, mock_parse_io):
-        """Test compute_cache_key when bytecode writing fails"""
+    def test_compute_cache_key_print_failure(self, mock_parse_io):
+        """Test compute_cache_key when print fails"""
         mock_stablehlo_mlir = MagicMock()
-        mock_stablehlo_mlir.operation.write_bytecode.side_effect = RuntimeError(
-            "Bytecode write failed"
-        )
+        mock_stablehlo_mlir.operation.attributes = {}
+        mock_stablehlo_mlir.operation.print.side_effect = RuntimeError("Print failed")
 
         input_spec = TensorSpec(shape=(2, 3), dtype=torch.float32)
         output_spec = TensorSpec(shape=(2, 4), dtype=torch.float32)
@@ -469,21 +491,20 @@ class TestNegativeCases:
     def test_compute_cache_key_empty_io_specs(self, mock_parse_io):
         """Test compute_cache_key with empty I/O specs"""
         mock_stablehlo_mlir = MagicMock()
-        mock_bytecode_buffer = MagicMock()
-        mock_stablehlo_bytes = b"mock_bytes"
+        mock_stablehlo_mlir.operation.attributes = {}
+        mock_stablehlo_mlir.operation.print = MagicMock(
+            side_effect=lambda file, enable_debug_info: file.write("module {}")
+        )
 
         # Empty I/O specs
         mock_io_specs = FunctionIO(inputs=(), outputs=())
         mock_parse_io.return_value = mock_io_specs
 
-        with patch("io.BytesIO", return_value=mock_bytecode_buffer):
-            mock_bytecode_buffer.getvalue.return_value = mock_stablehlo_bytes
+        result = compute_cache_key(mock_stablehlo_mlir)
 
-            result = compute_cache_key(mock_stablehlo_mlir)
-
-            # Should still work with empty specs
-            assert isinstance(result, str)
-            assert len(result) == 16
+        # Should still work with empty specs
+        assert isinstance(result, str)
+        assert len(result) == 64
 
     def test_tensor_spec_extreme_values(self):
         """Test TensorSpec with extreme dimension values"""

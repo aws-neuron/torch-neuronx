@@ -16,26 +16,81 @@ class TestPad:
     """Test cases for pad operation"""
 
     @pytest.mark.parametrize(
-        "mode",
+        "mode,expected_op",
         [
-            "constant",  # Fill with constant value
-            "reflect",  # Mirror values at boundaries
-            "replicate",  # Repeat edge values
-            "circular",  # Wrap around values
+            ("constant", "aten::constant_pad_nd"),
+            ("reflect", "aten::reflection_pad2d"),  # For 4D tensors
+            ("replicate", "aten::replication_pad2d"),  # For 4D tensors
+            ("circular", "aten::copy_"),  # dispatched to new_empty and copy_
         ],
     )
-    def test_pad_all_modes_run_on_neuron(self, mode):
-        """Test that all pad modes run on Neuron without CPU fallback"""
+    def test_pad_decomposition_to_correct_ops(self, mode, expected_op):
+        """Test that pad decomposes to the correct specific operations"""
         with track_neuron_ops():
-            x_cpu = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            x_cpu = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True)
             x_neuron = x_cpu.to("neuron")
             x_cpu_4d = x_cpu.unsqueeze(0).unsqueeze(1)
             x_neuron_4d = x_neuron.unsqueeze(0).unsqueeze(1)
+
+            result_cpu = torch.nn.functional.pad(x_cpu_4d, (1, 1, 1, 1), mode=mode)
             result_neuron = torch.nn.functional.pad(x_neuron_4d, (1, 1, 1, 1), mode=mode)
-            expected = torch.nn.functional.pad(x_cpu_4d, (1, 1, 1, 1), mode=mode)
+
             assert result_neuron.device.type == "neuron"
-            torch.testing.assert_close(result_neuron.cpu(), expected)
-            assert_op_runs_on_neuron("aten::pad")
+            torch.testing.assert_close(result_neuron.cpu(), result_cpu)
+
+            # Check that both have grad_fn (autograd chain preserved)
+            assert result_cpu.grad_fn is not None, f"CPU {mode} pad should have grad_fn"
+            assert result_neuron.grad_fn is not None, f"Neuron {mode} pad should have grad_fn"
+
+            # Check that grad_fn names match (same autograd operation)
+            assert (
+                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
+            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
+
+            # Check that the specific decomposed operation runs, not aten::pad
+            assert_op_runs_on_neuron(expected_op)
+
+    @pytest.mark.parametrize(
+        "mode,tensor_shape,padding,expected_op",
+        [
+            # Constant mode
+            ("constant", (2, 3), (1, 1, 1, 1), "aten::constant_pad_nd"),
+            ("constant", (3,), (2, 3), "aten::constant_pad_nd"),
+            ("constant", (2, 3, 4, 5), (1, 2, 1, 2), "aten::constant_pad_nd"),
+            # 1D padding (3D tensors)
+            ("reflect", (1, 1, 4), (2, 2), "aten::reflection_pad1d"),
+            ("replicate", (1, 1, 4), (2, 2), "aten::replication_pad1d"),
+            # 2D padding (4D tensors)
+            ("reflect", (1, 1, 3, 3), (1, 1, 1, 1), "aten::reflection_pad2d"),
+            ("replicate", (1, 1, 3, 3), (1, 1, 1, 1), "aten::replication_pad2d"),
+            # 3D padding (5D tensors)
+            ("reflect", (1, 1, 2, 3, 4), (1, 1, 1, 1, 1, 1), "aten::reflection_pad3d"),
+            ("replicate", (1, 1, 2, 3, 4), (1, 1, 1, 1, 1, 1), "aten::replication_pad3d"),
+        ],
+    )
+    def test_pad_all_modes_and_dimensions(self, mode, tensor_shape, padding, expected_op):
+        """Test all padding modes with different tensor dimensions"""
+        with track_neuron_ops():
+            x_cpu = torch.randn(*tensor_shape, requires_grad=True)
+            x_neuron = x_cpu.to("neuron")
+
+            value = 5.0 if mode == "constant" else None
+            result_cpu = torch.nn.functional.pad(x_cpu, padding, mode=mode, value=value)
+            result_neuron = torch.nn.functional.pad(x_neuron, padding, mode=mode, value=value)
+
+            assert result_neuron.device.type == "neuron"
+            torch.testing.assert_close(result_neuron.cpu(), result_cpu)
+
+            # Check that both have grad_fn (autograd chain preserved)
+            assert result_cpu.grad_fn is not None, f"CPU {mode} pad should have grad_fn"
+            assert result_neuron.grad_fn is not None, f"Neuron {mode} pad should have grad_fn"
+
+            # Check that grad_fn names match (same autograd operation)
+            assert (
+                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
+            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
+
+            assert_op_runs_on_neuron(expected_op)
 
     @pytest.mark.parametrize(
         "padding,value",
@@ -47,39 +102,25 @@ class TestPad:
     def test_pad_constant_variations(self, padding, value):
         """Test constant padding with different patterns and values"""
         with track_neuron_ops():
-            x_cpu = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            x_cpu = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
             x_neuron = x_cpu.to("neuron")
 
+            result_cpu = torch.nn.functional.pad(x_cpu, padding, mode="constant", value=value)
             result_neuron = torch.nn.functional.pad(x_neuron, padding, mode="constant", value=value)
-            expected = torch.nn.functional.pad(x_cpu, padding, mode="constant", value=value)
 
             assert result_neuron.device.type == "neuron"
-            torch.testing.assert_close(result_neuron.cpu(), expected)
-            assert_op_runs_on_neuron("aten::pad")
+            torch.testing.assert_close(result_neuron.cpu(), result_cpu)
 
-    @pytest.mark.parametrize(
-        "tensor_data, padding",
-        [
-            (torch.tensor([1.0, 2.0, 3.0]), (2, 3)),  # 1D tensor
-            (
-                torch.tensor([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]),
-                (1, 1, 1, 1, 1, 1),
-            ),  # 3D tensor
-            (torch.randn(2, 3, 4, 5), (1, 2, 1, 2)),  # 4D tensor
-        ],
-    )
-    def test_pad_tensor_dimensions(self, tensor_data, padding):
-        """Test padding tensors of different dimensions"""
-        with track_neuron_ops():
-            x_cpu = tensor_data
-            x_neuron = x_cpu.to("neuron")
+            # Check that both have grad_fn (autograd chain preserved)
+            assert result_cpu.grad_fn is not None, "CPU constant pad should have grad_fn"
+            assert result_neuron.grad_fn is not None, "Neuron constant pad should have grad_fn"
 
-            result_neuron = torch.nn.functional.pad(x_neuron, padding, mode="constant", value=0)
-            expected = torch.nn.functional.pad(x_cpu, padding, mode="constant", value=0)
+            # Check that grad_fn names match (same autograd operation)
+            assert (
+                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
+            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
 
-            assert result_neuron.device.type == "neuron"
-            torch.testing.assert_close(result_neuron.cpu(), expected)
-            assert_op_runs_on_neuron("aten::pad")
+            assert_op_runs_on_neuron("aten::constant_pad_nd")
 
     def test_pad_asymmetric(self):
         """Test asymmetric padding"""

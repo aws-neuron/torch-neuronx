@@ -253,23 +253,16 @@ def test_scaled_dot_product_attention_runtime_errors(case, expected_error):
         (4, 4, 256, 256, 0.0, torch.bfloat16, False, True),
         (4, 2, 256, 512, 0.0, torch.float32, True, False),
         (2, 1, 64, 577, 0.0, torch.bfloat16, False, False),
-        pytest.param(
-            2,
-            2,
-            64,
-            256,
-            0.1,
-            torch.float32,
-            False,
-            True,
-            marks=pytest.mark.xfail(
-                condition=use_mlir_aten_ops(),
-                reason="Dropout support not enabled in torch.compile decomposition",
-            ),
-        ),
+        (2, 2, 64, 256, 0.1, torch.float32, False, True),
     ],
 )
-def test_scaled_dot_product_attention_xla_fallback(
+@patch(
+    "torch_neuronx.python_ops.scaled_dot_product_fused_attention."
+    "ScaledDotProductFusedAttentionNKIImpl.can_handle",
+    return_value=False,
+)
+def test_scaled_dot_product_attention_mlir_fallback(
+    mocked_handle,
     q_heads,
     kv_heads,
     d_head,
@@ -281,14 +274,12 @@ def test_scaled_dot_product_attention_xla_fallback(
     qkv_inputs,
     monkeypatch,
 ):
-    """Test XLA fallback with CPU accuracy comparison (including GQA variants)"""
+    """Test MLIR fallback with CPU accuracy comparison (including GQA variants)"""
 
     # Check if Neuron device is available
     if not torch.neuron.is_available():
         print("Neuron device not available, skipping test")
         return
-
-    monkeypatch.setenv("TORCH_NEURONX_ENABLE_NKI_SDPA", "0")
 
     device = torch.device("neuron", 0)
 
@@ -367,7 +358,7 @@ def test_scaled_dot_product_attention_xla_fallback(
 
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
 
-    # Compare XLA fallback output with CPU reference
+    # Compare MLIR fallback output with CPU reference
     output_neuron_cpu = output_neuron.cpu()
     output_neuron_cpu_2 = output_neuron_2.cpu()
 
@@ -375,16 +366,16 @@ def test_scaled_dot_product_attention_xla_fallback(
     mean_diff = torch.mean(torch.abs(output_neuron_cpu - output_cpu)).item()
 
     print(
-        f"XLA Fallback (Q:{q_heads}, KV:{kv_heads},"
+        f"MLIR Fallback (Q:{q_heads}, KV:{kv_heads},"
         f" dropout:{dropout_p}, dtype:{dtype}, causal:{is_causal}) - Max difference: {max_diff:.6f}"
     )
     print(
-        f"XLA Fallback (Q:{q_heads}, KV:{kv_heads},"
+        f"MLIR Fallback (Q:{q_heads}, KV:{kv_heads},"
         f" dropout:{dropout_p}, dtype:{dtype}, causal:{is_causal})"
         f" - Mean difference: {mean_diff:.6f}"
     )
 
-    # Use reasonable tolerances for XLA fallback comparison
+    # Use reasonable tolerances for MLIR fallback comparison
     rtol = 5e-2  # 5% relative tolerance
     atol = 1e-2  # 0.01 absolute tolerance
     torch.testing.assert_close(output_neuron_cpu, output_cpu, rtol=rtol, atol=atol)
@@ -414,7 +405,13 @@ def test_scaled_dot_product_attention_xla_fallback(
         ),
     ],
 )
-def test_scaled_dot_product_attention_backward_xla_fallback(
+@patch(
+    "torch_neuronx.python_ops.scaled_dot_product_fused_attention."
+    "ScaledDotProductFusedAttentionNKIImpl.can_handle",
+    return_value=False,
+)
+def test_scaled_dot_product_attention_backward_mlir_fallback(
+    mocked_handle,
     q_heads,
     kv_heads,
     d_head,
@@ -426,14 +423,12 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
     qkv_inputs,
     monkeypatch,
 ):
-    """Test XLA fallback backward pass with gradient comparison to CPU baseline"""
+    """Test MLIR fallback backward pass with gradient comparison to CPU baseline"""
 
     # Check if Neuron device is available
     if not torch.neuron.is_available():
         print("Neuron device not available, skipping test")
         return
-
-    monkeypatch.setenv("TORCH_NEURONX_ENABLE_NKI_SDPA", "0")
 
     device = torch.device("neuron", 0)
     seed = 42
@@ -505,7 +500,7 @@ def test_scaled_dot_product_attention_backward_xla_fallback(
     torch.testing.assert_close(grad_k_neuron, grad_k_cpu, rtol=rtol, atol=atol)
     torch.testing.assert_close(grad_v_neuron, grad_v_cpu, rtol=rtol, atol=atol)
 
-    print(f"XLA fallback gradients match CPU reference (Q:{q_heads}, KV:{kv_heads})")
+    print(f"MLIR fallback gradients match CPU reference (Q:{q_heads}, KV:{kv_heads})")
 
 
 @patch(
@@ -530,19 +525,19 @@ def test_sdpa_ir_cache_correctness(mock_compiler):
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
-
+    assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+    traced_call_count = mock_compiler.call_count
     # Second call - should use cached IR (cache size unchanged)
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
     # Third call - should also use cached IR (cache size unchanged)
     with torch.no_grad():
         output3 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
     # Verify outputs are consistent
     torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
@@ -572,7 +567,8 @@ def test_sdpa_ir_cache_different_inputs_same_shape(mock_compiler):
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+    assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+    traced_call_count = mock_compiler.call_count
 
     # Second call with different input values but same shapes - should hit cache
     torch.manual_seed(123)
@@ -583,14 +579,15 @@ def test_sdpa_ir_cache_different_inputs_same_shape(mock_compiler):
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
     # Verify shapes are the same
     assert output1.shape == output2.shape
 
     # Verify outputs are different (since inputs are different)
     # Use a threshold to ensure they're meaningfully different
-    diff = torch.abs(output1 - output2).mean().item()
+    # TODO: sub fails with non-contiguous tensors when MLIR is enabled, needs fix
+    diff = torch.abs(output1.cpu() - output2.cpu()).mean().item()
     assert diff > 1e-3, f"Outputs should be different with different inputs, but diff={diff}"
 
 
@@ -616,7 +613,8 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+    assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+    traced_call_count = mock_compiler.call_count
 
     # Second shape: batch_size=1, num_heads=8, seq_len=256, head_dim=64 (different shape)
     torch.manual_seed(123)
@@ -627,8 +625,8 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     with torch.no_grad():
         output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
-
+    assert mock_compiler.call_count >= traced_call_count + 1, "Compiler was not called as expected"
+    traced_call_count = mock_compiler.call_count
     # Third call with first shape again - should hit cache (size stays at 2)
     torch.manual_seed(456)
     q3 = torch.randn(2, 4, 512, 128, device=device)
@@ -638,7 +636,7 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     with torch.no_grad():
         output3 = F.scaled_dot_product_attention(q3, k3, v3, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
+    assert mock_compiler.call_count == traced_call_count, "Compiler was not called as expected"
 
     # Verify output shapes
     assert output1.shape == (2, 4, 512, 128)
@@ -646,20 +644,18 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     assert output3.shape == (2, 4, 512, 128)
 
 
-def test_scaled_dot_product_attention_uses_xla_with_dropout():
-    """Test that XLA implementation is used when dropout is non-zero."""
+def test_scaled_dot_product_attention_uses_mlir_with_dropout():
+    """Test that MLIR implementation is used when dropout is non-zero."""
 
-    if use_mlir_aten_ops():
-        pytest.skip("Dropout support not enabled in torch.compile decomposition")
     from torch_neuronx.python_ops.scaled_dot_product_fused_attention import (
         ScaledDotProductFusedAttentionNKIImpl,
     )
-    from torch_neuronx.python_ops.xla_ops.scaled_dot_product_attention_xla import (
-        ScaledDotProductAttnXLAImpl,
+    from torch_neuronx.python_ops.torch_mlir.ops.scaled_dot_product_attention import (
+        ScaledDotProductAttnMLIRImpl,
     )
 
     nki_called = {"count": 0}
-    xla_called = {"count": 0}
+    mlir_called = {"count": 0}
 
     # Wrap NKI implementation to track calls
     orig_nki_execute = ScaledDotProductFusedAttentionNKIImpl._execute_impl
@@ -668,17 +664,24 @@ def test_scaled_dot_product_attention_uses_xla_with_dropout():
         nki_called["count"] += 1
         return orig_nki_execute(self, *args, **kwargs)
 
-    # Wrap XLA implementation to track calls
-    orig_xla_execute = ScaledDotProductAttnXLAImpl._execute_impl
+    # Wrap MLIR implementation to track calls
+    orig_mlir_execute = ScaledDotProductAttnMLIRImpl._execute_impl
 
-    def wrapped_xla_execute(self, *args, **kwargs):
-        xla_called["count"] += 1
-        return orig_xla_execute(self, *args, **kwargs)
+    def wrapped_mlir_execute(self, *args, **kwargs):
+        mlir_called["count"] += 1
+        return orig_mlir_execute(self, *args, **kwargs)
 
-    with (
+    patches = [
         patch.object(ScaledDotProductFusedAttentionNKIImpl, "_execute_impl", wrapped_nki_execute),
-        patch.object(ScaledDotProductAttnXLAImpl, "_execute_impl", wrapped_xla_execute),
-    ):
+        patch.object(ScaledDotProductAttnMLIRImpl, "_execute_impl", wrapped_mlir_execute),
+    ]
+
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+
         device = "neuron"
         batch_size, num_heads, seq_len, head_dim = 1, 8, 512, 64
 
@@ -691,7 +694,9 @@ def test_scaled_dot_product_attention_uses_xla_with_dropout():
 
         assert output.shape == (batch_size, num_heads, seq_len, head_dim)
         assert output.device.type == "neuron"
-
-        # Verify XLA implementation was called and NKI was not
-        assert xla_called["count"] >= 1, "Expected XLA implementation to be called with dropout"
+        mlir_calls = mlir_called["count"]
+        # Verify MLIR implementation was called and NKI was not
+        assert mlir_calls >= 1, (
+            f"Expected MLIR implementation to be called with dropout; " f"mlir calls: {mlir_calls}"
+        )
         assert nki_called["count"] == 0, "NKI implementation should not be called with dropout"

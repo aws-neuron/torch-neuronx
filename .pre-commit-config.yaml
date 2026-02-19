@@ -4,8 +4,7 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|
-                 ^torch_neuronx/protos/
+        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/
       - id: ruff-format
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.0
@@ -17,11 +16,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|
-                 ^torch_neuronx/protos/
+        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/|\.diff$
       - id: end-of-file-fixer
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|
-                 ^torch_neuronx/protos/
+        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/
       - id: check-yaml
       - id: check-added-large-files
       - id: pretty-format-json
