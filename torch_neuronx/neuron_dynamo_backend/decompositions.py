@@ -5,8 +5,9 @@ Custom decompositions for torch.compile neuron backend
 This module contains custom decompositions that avoid operations
 that cause issues in the torch-mlir to StableHLO conversion pipeline.
 
+See docs/decompositions.md for a guide on adding new decompositions.
 See https://github.com/pytorch/pytorch/blob/main/torch/_decomp/decompositions.py
-for existing decompositions.
+for PyTorch's built-in decompositions.
 """
 
 import logging
@@ -16,6 +17,7 @@ from typing import ParamSpec, TypeVar
 
 import torch
 import torch._decomp as decomp
+import torch.nn.functional as F  # noqa: N812
 from neuronxcc.nki.kernels import flash_attn_bwd, flash_fwd
 from neuronxcc.nki.kernels.attention import FlashConfig
 from torch._decomp import get_decompositions
@@ -37,15 +39,24 @@ wrapped_flash_bwd = wrap_nki(flash_attn_bwd)
 # for ops that are not supported by the backend (yet)
 neuron_decompositions = get_decompositions(
     [
+        aten.logsumexp,
+        aten.squeeze.dims,
+        aten.binary_cross_entropy,
+        aten.native_batch_norm_backward,
+        aten.nansum,
+        aten.addr,
         aten._unsafe_index,
         aten._unsafe_index_put,
         aten.split,
         aten.split_with_sizes,
         aten.unbind,
+        aten.replication_pad1d,
         aten.replication_pad2d,
+        aten.replication_pad3d,
+        aten.reflection_pad1d,
         aten.reflection_pad2d,
+        aten.reflection_pad3d,
         aten.embedding,
-        aten.embedding_dense_backward,
         aten.native_layer_norm_backward,
         aten.nll_loss_backward,
         aten.clamp_min,
@@ -56,6 +67,20 @@ neuron_decompositions = get_decompositions(
         aten.fill.Scalar,
         aten.fill.Tensor,
         aten.index_add,
+        aten.native_dropout_backward,
+        aten.gelu_backward,
+        aten.threshold_backward,
+        aten._log_softmax_backward_data,
+        aten._softmax_backward_data,
+        aten.select_backward,
+        aten.slice_backward,
+        aten.softplus_backward,
+        aten.index_select_backward,
+        aten.col2im,  # accuracy mismatch on neuron, pending NCF-486
+        aten.lerp,
+        aten.elu,
+        aten.elu_backward,
+        aten.silu,
     ]
 )
 
@@ -63,89 +88,27 @@ neuron_decompositions = get_decompositions(
 def register_decomposition(
     ops: torch._ops.OperatorBase | list[torch._ops.OperatorBase],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Register a decomposition function for one or more ATen operators.
+
+    Decorator that registers a function as the decomposition for the specified
+    operators in the Neuron decomposition table. Guards against duplicate
+    registrations.
+
+    Args:
+        ops (torch._ops.OperatorBase | list[torch._ops.OperatorBase]): Single
+            operator or list of operators to decompose.
+
+    Returns:
+        Callable: Decorator that registers the decorated function.
+
+    Raises:
+        ValueError: If any operator is already registered in neuron_decompositions.
+    """
     for op in ops if isinstance(ops, list) else [ops]:
         # Guards against duplicates
         if op in neuron_decompositions:
             raise ValueError(f"Duplicate decomposition registration for: {op}")
     return decomp.register_decomposition(ops, neuron_decompositions)
-
-
-def flex_attention_decomposition(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    score_mod: Callable | None = None,
-    block_mask: torch.Tensor | None = None,
-    scale: float | None = None,
-    enable_gqa: bool = False,
-    return_lse: bool = False,
-    chunk_size: int = 512,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    CPU-friendly decomposition of FlexAttention with chunked matmuls.
-    Args:
-        query: (B, H_q, L, E)
-        key:   (B, H_kv, S, E)
-        value: (B, H_kv, S, E)
-        score_mod: Optional[Callable(scores, b, h, q_idx, k_idx)]
-        block_mask: Optional[bool tensor] mask of shape (B, 1, L, S) or (1, 1, L, S)
-        scale: optional scaling factor (default 1/sqrt(E))
-        enable_gqa: enable grouped-query attention
-        return_lse: if True, return (output, logsumexp)
-        chunk_size: how many query tokens to process at once (controls memory/cache use)
-    """
-    B, H_q, L, E = query.shape
-    _, H_kv, S, _ = key.shape
-    device = query.device
-    dtype = query.dtype
-    scale = scale if scale is not None else (1.0 / (E**0.5))
-    # Grouped Query Attention (expand K/V if needed)
-    if enable_gqa and H_q != H_kv:
-        assert H_q % H_kv == 0, "H_q must be multiple of H_kv for GQA"
-        repeat_factor = H_q // H_kv
-        key = key.unsqueeze(2).expand(B, H_kv, repeat_factor, S, E).reshape(B, H_q, S, E)
-        value = value.unsqueeze(2).expand(B, H_kv, repeat_factor, S, E).reshape(B, H_q, S, E)
-    outputs = []
-    lse_chunks = [] if return_lse else None
-    # Iterate over query chunks
-    for q_start in range(0, L, chunk_size):
-        q_end = min(q_start + chunk_size, L)
-        q_chunk = query[:, :, q_start:q_end, :]  # (B, H, chunk, E)
-        # (B, H, chunk, S)
-        scores = torch.matmul(q_chunk, key.transpose(-2, -1)) * scale
-        # Optional score modification hook
-        if score_mod is not None:
-            b = torch.arange(B, device=device, dtype=torch.int32).view(B, 1, 1, 1)
-            h = torch.arange(H_q, device=device, dtype=torch.int32).view(1, H_q, 1, 1)
-            q_idx = torch.arange(q_start, q_end, device=device, dtype=torch.int32).view(
-                1, 1, q_end - q_start, 1
-            )
-            k_idx = torch.arange(S, device=device, dtype=torch.int32).view(1, 1, 1, S)
-            scores = score_mod(scores, b, h, q_idx, k_idx)
-        # Optional block mask
-        if block_mask is not None:
-            # Expect mask shape (B, 1, L, S) or (1, 1, L, S)
-            mask_slice = block_mask[..., q_start:q_end, :]
-            scores = scores.masked_fill(~mask_slice, float("-inf"))
-        # Numerically stable softmax
-        max_score = scores.max(dim=-1, keepdim=True).values
-        exp_scores = torch.exp(scores - max_score)
-        denom = exp_scores.sum(dim=-1, keepdim=True)
-        attn_weights = exp_scores / denom
-        # Weighted sum over values
-        output_chunk = torch.matmul(attn_weights, value)  # (B, H, chunk, E)
-        outputs.append(output_chunk)
-        if return_lse:
-            lse_chunk = max_score.squeeze(-1) + torch.log(denom.squeeze(-1))
-            lse_chunks.append(lse_chunk)
-        # Free intermediate memory
-        del q_chunk, scores, exp_scores, denom, attn_weights
-    # Concatenate chunks
-    output = torch.cat(outputs, dim=2)
-    if return_lse:
-        lse = torch.cat(lse_chunks, dim=2)
-        return output, lse
-    return output
 
 
 @register_decomposition([aten.as_strided.default])
@@ -211,6 +174,21 @@ def as_strided(input_tensor, size, stride, storage_offset=0):
 
 @register_decomposition([aten.topk.default])
 def topk_decomposition(x, k, dim=-1, largest=True, sorted=True):
+    """Decompose topk for non-standard dimension or parameter combinations.
+
+    Handles cases where dim is not the last dimension or when largest=False
+    by transposing, applying topk, and transposing back.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        k (int): Number of top elements to return.
+        dim (int): Dimension to sort along. Defaults to -1.
+        largest (bool): If True, return largest elements. Defaults to True.
+        sorted (bool): If True, return sorted elements. Defaults to True.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (values, indices) tensors.
+    """
     # Normalize dim to positive index
     if dim < 0:
         dim = x.ndim + dim
@@ -258,21 +236,21 @@ def scaled_dot_product_attention_decomposition(
     enable_gqa: bool = False,
     philox_seed: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Decomposition of scaled_dot_product_attention into basic ops.
+    """Decompose scaled_dot_product_attention into basic ops.
 
     Args:
-        query: (B, H, L, E) or (B, L, H, E) depending on layout
-        key: (B, H, S, E) or (B, S, H, E)
-        value: (B, H, S, E) or (B, S, H, E)
-        attn_mask: Optional attention mask
-        dropout_p: Dropout probability
-        is_causal: Whether to apply causal masking
-        scale: Optional scale factor (default: 1/sqrt(E))
-        enable_gqa: Enable grouped-query attention
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H, S, E).
+        attn_mask (torch.Tensor | None): Optional attention mask.
+        dropout_p (float): Dropout probability.
+        is_causal (bool): Whether to apply causal masking.
+        scale (float | None): Scale factor. Defaults to 1/sqrt(E).
+        enable_gqa (bool): Enable grouped-query attention.
+        philox_seed (torch.Tensor | None): Random seed for dropout.
 
     Returns:
-        Attention output tensor, lse
+        tuple[torch.Tensor, torch.Tensor]: (attention_output, logsumexp).
     """
     # Get dimensions - assume (B, H, L, E) layout
     B, q_heads, L, E = query.shape
@@ -314,16 +292,15 @@ def scaled_dot_product_attention_decomposition(
     lse = max_scores.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
     lse = lse.to(torch.float32)
 
-    # TODO: Add dropout support
-    # Need to generate consistent mask across fwd and bwd
-    # philox_seed will have to be materialized in the bwd to generate the same mask
-    # which makes the graph data-dependent
-    if dropout_p > 0.0:
-        attn_weights, _ = torch.ops.aten.native_dropout.default(attn_weights, dropout_p, train=True)
+    dropout_mask = None
+    if dropout_p > 0:
+        attn_weights, dropout_mask = torch.ops.aten.native_dropout.default(
+            attn_weights, dropout_p, train=True
+        )
 
     output = torch.matmul(attn_weights, value)
 
-    return (output, lse)
+    return (output, lse, dropout_mask)
 
 
 @register_decomposition([aten._scaled_dot_product_fused_attention_overrideable.default])
@@ -337,11 +314,23 @@ def sdpa_fused_overrideable(
     return_debug_mask: bool = False,
     scale: float | None = None,
 ):
-    """
-    Decomposition for _scaled_dot_product_fused_attention_overrideable.
+    """Decompose _scaled_dot_product_fused_attention_overrideable.
 
-    This op returns multiple outputs but we only need the attention output.
-    The other outputs are for debugging/backward pass.
+    Routes to NKI SDPA kernel when possible, otherwise falls back to
+    the standard decomposition.
+
+    Args:
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, D).
+        value (torch.Tensor): Value tensor of shape (B, H, S, D).
+        attn_bias (torch.Tensor | None): Optional attention bias.
+        dropout_p (float): Dropout probability.
+        is_causal (bool): Whether to apply causal masking.
+        return_debug_mask (bool): Whether to return debug mask.
+        scale (float | None): Scale factor. Defaults to 1/sqrt(E).
+
+    Returns:
+        tuple: (attention_output, logsumexp, philox_seed, philox_offset, debug_mask).
     """
     B, H, L, E = query.shape
     S = key.shape[-2]
@@ -367,6 +356,7 @@ def sdpa_fused_overrideable(
     # Attn_bias is not yet supported
     can_use_nki_sdpa = can_use_nki_sdpa and attn_bias is None
     can_use_nki_sdpa = can_use_nki_sdpa and nki_attention_enabled
+    can_use_nki_sdpa = can_use_nki_sdpa and dropout_p == 0
 
     # Detect GQA
     _, kv_heads, _, _ = key.shape
@@ -433,7 +423,7 @@ def sdpa_fused_overrideable(
             pass
 
     # Fallback to manual decomposition
-    output, logsumexp = scaled_dot_product_attention_decomposition(
+    output, logsumexp, dropout_mask = scaled_dot_product_attention_decomposition(
         query,
         key,
         value,
@@ -444,6 +434,10 @@ def sdpa_fused_overrideable(
         enable_gqa=True,
         philox_seed=philox_seed,
     )
+
+    # directly pass the dropout mask to the backward FX graph
+    # via the philox_seed parameter
+    philox_seed = dropout_mask
 
     return (
         output,
@@ -467,7 +461,20 @@ def _can_use_nki_flash_attention_backward(
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
 ) -> bool:
-    """Check NKI flash attention contraints"""
+    """Check if NKI flash attention backward kernel can be used.
+
+    Args:
+        grad_out (torch.Tensor): Gradient of attention output.
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H, S, E).
+        lse (torch.Tensor): Logsumexp from forward pass.
+        attn_bias (torch.Tensor | None): Optional attention bias.
+        dropout_p (float): Dropout probability.
+
+    Returns:
+        bool: True if NKI kernel constraints are satisfied.
+    """
     if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
         return False
 
@@ -479,6 +486,8 @@ def _can_use_nki_flash_attention_backward(
     if key.shape != value.shape:
         return False
     if L % 512 != 0 or S % 512 != 0:
+        return False
+    if dropout_p > 0:
         return False
     return not E > 128
 
@@ -496,7 +505,24 @@ def compute_attention_backward_decomposition(
     mixed_precision: bool,
     philox_seed: torch.Tensor | None = None,
 ):
-    """Torch decomposition for attention backward compute"""
+    """Compute attention backward pass using torch decomposition.
+
+    Args:
+        grad_out (torch.Tensor): Gradient of attention output.
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H, S, E).
+        attn_bias (torch.Tensor): Attention bias tensor.
+        lse (torch.Tensor): Logsumexp from forward pass.
+        scale (float): Attention scale factor.
+        is_causal (bool): Whether to apply causal masking.
+        dropout_p (float): Dropout probability.
+        mixed_precision (bool): Whether to use mixed precision.
+        philox_seed (torch.Tensor | None): Random seed for dropout.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (grad_query, grad_key, grad_value).
+    """
     orig_dtype = query.dtype
     acc_dtype = torch.float32 if mixed_precision else orig_dtype
 
@@ -521,17 +547,27 @@ def compute_attention_backward_decomposition(
 
     probs = torch.exp(logits - lse.unsqueeze(-1))
 
-    # TODO: Add dropout support
-    # Need to generate consistent mask across fwd and bwd
-    # philox_seed will have to be materialized in the bwd to generate the same mask
-    # which makes the graph data-dependent
-    if dropout_p > 0.0:
-        pass
+    # use the dropout mask passed to the backwards FX graph
+    # via the philox_seed parameter
+    dropout_mask = philox_seed
+    masked_probs = probs
+    if dropout_mask is not None:
+        if dropout_p == 1:
+            masked_probs = probs * dropout_mask
+        else:
+            masked_probs = probs * dropout_mask * (1 / (1 - dropout_p))
 
-    grad_v = probs.transpose(-2, -1) @ grad_out
+    grad_v = masked_probs.transpose(-2, -1) @ grad_out
     grad_out_v = grad_out @ value.transpose(-2, -1)
-    sum_reduction = (grad_out_v * probs).sum(dim=-1, keepdim=True)
-    ds = probs * (grad_out_v - sum_reduction) * scale
+    grad_out_mask = grad_out_v
+    if dropout_mask is not None:
+        if dropout_p == 1:
+            grad_out_mask = grad_out_v * dropout_mask
+        else:
+            grad_out_mask = grad_out_v * dropout_mask * (1 / (1 - dropout_p))
+
+    sum_reduction = (grad_out_mask * probs).sum(dim=-1, keepdim=True)
+    ds = probs * (grad_out_mask - sum_reduction) * scale
 
     if is_causal:
         seq_len_q, seq_len_k = ds.shape[-2:]
@@ -553,7 +589,20 @@ def compute_attention_backward_decomposition(
 
 
 def _prepare_backward_inputs(query, key, value, orig_k_shape, scale):
-    """Prepare common inputs for backward pass."""
+    """Prepare common inputs for attention backward pass.
+
+    Handles GQA key/value expansion and scale calculation.
+
+    Args:
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H_kv, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H_kv, S, E).
+        orig_k_shape (tuple): Original key shape before any expansion.
+        scale (float | None): Scale factor, computed if None.
+
+    Returns:
+        tuple: (B, q_heads, L, E, S, orig_kv_heads, scale, is_gqa, key, value).
+    """
     B, q_heads, L, E = query.shape
     _, kv_heads, S, _ = key.shape
     orig_kv_heads = orig_k_shape[1]
@@ -573,7 +622,21 @@ def _prepare_backward_inputs(query, key, value, orig_k_shape, scale):
 
 
 def _reduce_gqa_gradients(grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, s, e):
-    """Reduce gradients for GQA back to original KV shapes."""
+    """Reduce GQA gradients back to original KV shapes.
+
+    Args:
+        grad_k (torch.Tensor): Key gradient tensor.
+        grad_v (torch.Tensor): Value gradient tensor.
+        is_gqa (bool): Whether grouped-query attention was used.
+        b (int): Batch size.
+        orig_kv_heads (int): Original number of KV heads.
+        q_heads (int): Number of query heads.
+        s (int): Sequence length.
+        e (int): Head dimension.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (grad_k, grad_v) with original shapes.
+    """
     if is_gqa:
         repeat_factor = q_heads // orig_kv_heads
         grad_k = grad_k.view(b, orig_kv_heads, repeat_factor, s, e).sum(dim=2)
@@ -603,7 +666,32 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
     philox_offset: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Decomposition for scaled_dot_product_fused_attention_overrideable backward."""
+    """Decompose scaled_dot_product_fused_attention_overrideable backward.
+
+    Routes to NKI kernel when possible, otherwise uses torch decomposition.
+
+    Args:
+        grad_out (torch.Tensor): Gradient of attention output.
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H, S, E).
+        attn_bias (torch.Tensor | None): Optional attention bias.
+        grad_input_mask (list[bool] | None): Mask for which gradients to compute.
+        out (torch.Tensor | None): Forward pass output.
+        logsumexp (torch.Tensor | None): Logsumexp from forward pass.
+        cum_seq_q (torch.Tensor | None): Cumulative sequence lengths for queries.
+        cum_seq_k (torch.Tensor | None): Cumulative sequence lengths for keys.
+        max_q (int | None): Maximum query sequence length.
+        max_k (int | None): Maximum key sequence length.
+        dropout_p (float): Dropout probability.
+        is_causal (bool): Whether causal masking was applied.
+        philox_seed (torch.Tensor | None): Random seed from forward pass.
+        philox_offset (torch.Tensor | None): Random offset from forward pass.
+        scale (float | None): Scale factor used in forward pass.
+
+    Returns:
+        tuple: (grad_query, grad_key, grad_value, grad_attn_bias).
+    """
     can_use_nki = _can_use_nki_flash_attention_backward(
         grad_out, query, key, value, logsumexp, attn_bias, dropout_p
     )
@@ -719,11 +807,17 @@ def scalar_tensor(
     device=None,
     pin_memory=None,
 ):
-    """
-    Decomposition for scalar_tensor that avoids device argument issues.
+    """Decompose scalar_tensor to full() for better StableHLO support.
 
-    scalar_tensor creates a 0-d tensor from a scalar value. We decompose it to
-    full() which is better supported in the torch-mlir StableHLO lowering.
+    Args:
+        value: Scalar value to convert to tensor.
+        dtype: Optional dtype for the tensor.
+        layout: Tensor layout (unused).
+        device: Target device.
+        pin_memory: Whether to pin memory (unused).
+
+    Returns:
+        torch.Tensor: 0-dimensional tensor containing the scalar value.
     """
     # Use full with empty shape to create a scalar tensor
     return torch.full((), value, dtype=dtype, device=device)
@@ -733,10 +827,16 @@ def scalar_tensor(
 def index_copy(
     input: torch.Tensor, dim: int, index: torch.Tensor, source: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Decompose index_copy into functional scatter for AOT Autograd compatibility.
+    """Decompose index_copy into functional scatter.
 
-    index_copy copies values from source into input at positions specified by index along dim.
+    Args:
+        input (torch.Tensor): Input tensor to copy into.
+        dim (int): Dimension along which to index.
+        index (torch.Tensor): Indices of elements to copy.
+        source (torch.Tensor): Source tensor to copy from.
+
+    Returns:
+        torch.Tensor: Result with source values scattered into input.
     """
     if dim < 0:
         dim = input.dim() + dim
@@ -754,18 +854,16 @@ def nonzero_with_count(
     fill_value: int = -1,
     with_count: bool = False,
 ) -> tuple[torch.Tensor, int]:
-    """Custom decomposition for nonzero and nonzero_static
+    """Find nonzero elements with fixed output size.
 
     Args:
-        tensor: input tensor
-        size: fixed size on output tensor. If there are fewer nonzero elements
-            than the specified size, then indices will be padded with ``fill_value``
-        fill_value: padding value
-        with_count: return number of nonzero element or not. Default to False to support
-            nonzero_static. When set to True, will allow torch.nonzero to do a slice
-            on the output hence avoid recompilation.
+        tensor (torch.Tensor): Input tensor to find nonzero elements.
+        size (int): Fixed output size. Pads with fill_value if fewer nonzeros.
+        fill_value (int): Padding value for unused slots. Defaults to -1.
+        with_count (bool): If True, return count of nonzero elements.
 
-    Reference https://github.com/jax-ml/jax/blob/43d1d0a177f0cc79977e84b2e648fab560531e08/jax/_src/numpy/lax_numpy.py#L3624
+    Returns:
+        tuple[torch.Tensor, int]: (indices, count) if with_count, else just indices.
     """
     # Match safe_nonzero JAX implementation exactly
     mask = tensor != 0
@@ -843,6 +941,17 @@ def nonzero_static_decomposition(
     fill_value: int = -1,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
+    """Decompose nonzero_static to nonzero_with_count.
+
+    Args:
+        tensor (torch.Tensor): Input tensor to find nonzero elements.
+        size (int): Maximum number of nonzero elements to return.
+        fill_value (int): Value to fill unused slots. Defaults to -1.
+        out (torch.Tensor | None): Optional output tensor.
+
+    Returns:
+        tuple[torch.Tensor, int]: (indices, count) of nonzero elements.
+    """
     return nonzero_with_count(tensor, size=size, fill_value=fill_value)
 
 
@@ -906,48 +1015,864 @@ def linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
     return result
 
 
+def index_put_decomposition(input, indices, values, accumulate=False):
+    """
+    Decomposition of aten.index_put that handles negative indices and boolean masks
+
+    This function decomposes index_put into simpler operations (torch.where or torch.scatter)
+
+    Args:
+        input (torch.Tensor): The tensor to be modified.
+        indices (tuple[torch.Tensor | None, ...]): A tuple of index tensors or None values.
+            - None represents a full slice (:) for that dimension
+            - Boolean tensors are converted to integer indices via nonzero()
+            - Integer tensors specify explicit indices (negative values supported)
+            - Lists/tuples are converted to tensors
+        values (torch.Tensor): Values to place into the tensor at the specified indices.
+            Must be broadcastable to the shape of the indexed region.
+        accumulate (bool, optional): If True, values are added to existing values
+            using scatter_add. If False, values replace existing values using scatter.
+            Defaults to False.
+
+    Returns:
+        torch.Tensor: A new tensor with values placed at the specified indices.
+
+    Raises:
+        IndexError: If indices are out of bounds after negative index normalization.
+        IndexError: If index tensors cannot be broadcast together.
+        IndexError: If values cannot be broadcast to the indexed region shape.
+    """
+
+    def try_get_where_mask(x, indices, values):
+        """
+        Returns prepared mask if operation can use torch.where
+        and returns None otherwise
+        """
+        if values.numel() != 1 or accumulate:
+            return None
+
+        num_defined_indices = 0
+        mask = None
+
+        for index in indices:
+            if index is not None:
+                if hasattr(index, "dtype") and index.dtype == torch.bool:
+                    if mask is not None:
+                        return None
+                    mask = index
+                    for j in range(index.ndim):
+                        if index.shape[j] != x.shape[num_defined_indices + j]:
+                            return None
+                    num_defined_indices += index.ndim
+                else:
+                    return None
+            else:
+                num_defined_indices += 1
+
+        if mask is None:
+            return None
+
+        if mask.ndim < x.ndim:
+            for _ in range(x.ndim - mask.ndim):
+                mask = mask.unsqueeze(-1)
+
+        return mask
+
+    if (mask := try_get_where_mask(input, indices, values)) is not None:
+        return torch.where(mask, values.to(input.dtype), input)
+
+    if (
+        any(isinstance(idx, torch.Tensor) and idx.dtype == torch.bool for idx in indices)
+        and values.numel() == 1
+    ):
+        bool_info = None
+        int_info = None
+
+        for i, idx in enumerate(indices):
+            if isinstance(idx, torch.Tensor):
+                if idx.dtype == torch.bool and idx.dim() == 1:
+                    bool_info = (i, idx)
+                elif idx.dtype in (torch.int32, torch.int64):
+                    int_info = (i, idx)
+
+        if bool_info and int_info:
+            bool_dim, bool_idx = bool_info
+            int_dim, int_idx = int_info
+            int_idx = torch.where(int_idx < 0, int_idx + input.shape[int_dim], int_idx)
+
+            k = bool_idx.sum()
+            m = int_idx.numel()
+
+            arange = torch.arange(input.shape[int_dim], device=input.device)
+
+            # broadcast mask: for k==1 or m==1 cases
+            int_mask = torch.zeros(input.shape[int_dim], dtype=torch.bool, device=input.device)
+            int_mask = int_mask.scatter(0, int_idx.flatten(), True)
+            mask_broadcast = bool_idx.unsqueeze(1) & int_mask.unsqueeze(0)
+
+            # paired mask: for k==m case
+            cumsum = torch.cumsum(bool_idx.to(torch.int64), dim=0) - 1
+            cumsum = torch.clamp(cumsum, min=0, max=m - 1)
+            int_idx_selected = int_idx.flatten()[cumsum]  # index, not expand
+            mask_paired = bool_idx.unsqueeze(1) & (arange == int_idx_selected.unsqueeze(1))
+
+            # select mask based on k == m
+            mask = torch.where(k == m, mask_paired, mask_broadcast)
+
+            if bool_dim > int_dim:
+                mask = mask.T
+
+            for _ in range(2, input.dim()):
+                mask = mask.unsqueeze(-1)
+            mask = mask.expand(input.shape)
+
+            values = values.to(input.dtype).expand(input.shape)
+            if accumulate:
+                return torch.where(mask, input + values, input)
+            return torch.where(mask, values, input)
+
+    def convert_indices(indices, device):
+        for index in indices:
+            if index is None:
+                yield index
+            elif isinstance(index, list | tuple):
+                yield torch.tensor(index, device=device)
+            elif isinstance(index, torch.Tensor) and index.dtype == torch.bool:
+                raise RuntimeError(
+                    "Boolean index_put is not supported in torch.compile on Neuron. "
+                    "Boolean indices require nonzero() which produces dynamic shapes."
+                )
+            else:
+                yield index
+
+    converted_indices = convert_indices(indices, input.device)
+
+    # normalize negative indices
+    normalized_indices = []
+    for i, idx in enumerate(converted_indices):
+        if idx is None:
+            normalized_indices.append(None)
+        elif isinstance(idx, torch.Tensor):
+            if idx.dtype in (torch.int32, torch.int64):
+                dim_size = input.shape[i]
+                idx = torch.where(idx < 0, idx + dim_size, idx)
+            if idx.dim() == 0:
+                idx = idx.unsqueeze(0)
+            normalized_indices.append(idx)
+        else:
+            normalized_indices.append(idx)
+
+    # separate indexed dims from kept dims
+    indexed_dims = []  # list of (dim_index, index_tensor)
+    for i, idx in enumerate(normalized_indices):
+        if idx is not None:
+            indexed_dims.append((i, idx))
+
+    if len(indexed_dims) == 0:
+        return input
+
+    indexed_positions = [d for d, _ in indexed_dims]
+    indexed_dim_set = set(indexed_positions)
+    kept_dims = [d for d in range(input.dim()) if d not in indexed_dim_set]
+
+    # broadcast index tensors
+    idx_tensors = [idx for _, idx in indexed_dims]
+
+    if len(idx_tensors) > 1:
+        try:
+            broadcast_shape = torch.broadcast_shapes(*[t.shape for t in idx_tensors])
+        except RuntimeError as e:
+            shapes_str = ", ".join([str(list(t.shape)) for t in idx_tensors])
+            raise IndexError(
+                f"shape mismatch: indexing tensors could not be broadcast together "
+                f"with shapes {shapes_str}"
+            ) from e
+        broadcasted = [t.expand(broadcast_shape) for t in idx_tensors]
+    else:
+        broadcast_shape = list(idx_tensors[0].shape)
+        broadcasted = idx_tensors
+
+    broadcast_shape = list(broadcast_shape)
+
+    # determine output shape based on indexing pattern
+    # rules:
+    # i. Adjacent indexed dims: broadcast shape replaces them in-place
+    # ii. Non-adjacent indexed dims: broadcast shape goes to front
+
+    are_adjacent = (
+        all(
+            indexed_positions[i + 1] - indexed_positions[i] == 1
+            for i in range(len(indexed_positions) - 1)
+        )
+        if len(indexed_positions) > 1
+        else True
+    )
+
+    if are_adjacent:
+        # build shape with broadcast dims at position of first indexed dim
+        expected_shape = []
+        broadcast_inserted = False
+        for d in range(input.dim()):
+            if d in indexed_dim_set:
+                if not broadcast_inserted:
+                    expected_shape.extend(broadcast_shape)
+                    broadcast_inserted = True
+                # skip subsequent indexed dims
+            else:
+                expected_shape.append(input.shape[d])
+        first_indexed_pos = indexed_positions[0]
+    else:
+        # non-adjacent: broadcast shape at front, then kept dims
+        kept_shape = [input.shape[d] for d in kept_dims]
+        expected_shape = broadcast_shape + kept_shape
+        # broadcast dims are at front
+        first_indexed_pos = 0
+
+    # broadcast values to expected shape
+    values = values.to(input.dtype)
+
+    if values.numel() == 1:
+        values = values.expand(expected_shape)
+    elif list(values.shape) == expected_shape:
+        pass
+    else:
+        try:
+            values = values.expand(expected_shape)
+        except RuntimeError:
+            raise IndexError(
+                f"shape mismatch: value tensor of shape {list(values.shape)} "
+                f"cannot be broadcast to indexing result of shape {expected_shape}"
+            ) from None
+
+    # compute strides
+    strides = []
+    for i in range(input.dim()):
+        stride = 1
+        for j in range(i + 1, input.dim()):
+            stride *= input.shape[j]
+        strides.append(stride)
+
+    # build linear index tensor
+    flat_idx = torch.zeros(expected_shape, dtype=torch.int64, device=input.device)
+
+    # add contribution from indexed dimensions
+    for idx_num, (dim, _) in enumerate(indexed_dims):
+        idx_tensor = broadcasted[idx_num]
+
+        # reshape index tensor to align with expected_shape
+        if are_adjacent:
+            # broadcast dims are at first_indexed_pos
+            # idx_tensor has shape broadcast_shape, needs to be at position first_indexed_pos
+            shape = [1] * len(expected_shape)
+            for i, s in enumerate(broadcast_shape):
+                shape[first_indexed_pos + i] = s
+        else:
+            # broadcast dims are at front
+            shape = [1] * len(expected_shape)
+            for i, s in enumerate(broadcast_shape):
+                shape[i] = s
+
+        idx_reshaped = idx_tensor.view(shape).expand(expected_shape)
+        flat_idx = flat_idx + idx_reshaped.to(torch.int64) * strides[dim]
+
+    # add contribution from kept dimensions (full slices)
+    for kept_idx, dim in enumerate(kept_dims):
+        arange = torch.arange(input.shape[dim], dtype=torch.int64, device=input.device)
+
+        # find position of this kept dim in expected_shape
+        if are_adjacent:
+            # count kept dims before this one
+            kept_before = sum(1 for d in kept_dims[:kept_idx] if d < first_indexed_pos)
+            # position is either before broadcast (if dim < first_indexed_pos)
+            # or after broadcast (if dim > last indexed pos)
+            if dim < first_indexed_pos:
+                pos = kept_before
+            else:
+                pos = first_indexed_pos + len(broadcast_shape) + (kept_idx - kept_before)
+        else:
+            # kept dims come after broadcast dims
+            pos = len(broadcast_shape) + kept_idx
+
+        shape = [1] * len(expected_shape)
+        shape[pos] = input.shape[dim]
+        arange = arange.view(shape)
+        flat_idx = flat_idx + arange * strides[dim]
+
+    # handle empty indices
+    if flat_idx.numel() == 0:
+        return input
+
+    # flatten and scatter
+    flat_input = input.flatten()
+    flat_values = values.flatten()
+    flat_idx = flat_idx.flatten()
+
+    if accumulate:
+        result = torch.scatter_add(flat_input, 0, flat_idx, flat_values)
+    else:
+        result = torch.scatter(flat_input, 0, flat_idx, flat_values)
+
+    return result.reshape(input.shape)
+
+
 @register_decomposition([aten.sigmoid_backward.default])
 def sigmoid_backward_decomposition(grad_output, output):
-    """Decomposition for sigmoid_backward into primitive ops"""
+    """Decompose sigmoid_backward into primitive ops.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the output.
+        output (torch.Tensor): Output from forward pass (sigmoid(x)).
+
+    Returns:
+        torch.Tensor: Gradient with respect to input.
+    """
     return grad_output * (output * (1 - output))
+
+
+@register_decomposition([aten.silu_backward.default])
+def silu_backward_decomposition(grad_output, x):
+    """Decompose silu_backward into primitive ops.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the output.
+        x (torch.Tensor): Input tensor from forward pass.
+
+    Returns:
+        torch.Tensor: Gradient with respect to input.
+    """
+    sigmoid_x = torch.sigmoid(x)
+    return grad_output * sigmoid_x * (1 + x * (1 - sigmoid_x))
+
+
+@register_decomposition([aten.embedding_dense_backward.default])
+def embedding_dense_backward_decomposition(
+    grad_output: torch.Tensor,
+    indices: torch.Tensor,
+    num_weights: int,
+    padding_idx: int,
+    scale_grad_by_freq: bool,
+) -> torch.Tensor:
+    """Decompose embedding_dense_backward using one-hot + tensordot."""
+    embed_dim = grad_output.shape[-1]
+    indices_flat = indices.reshape(-1).to(torch.int64)
+    grad_flat = grad_output.reshape(-1, embed_dim)
+
+    # Handle scale_grad_by_freq
+    if scale_grad_by_freq:
+        one_hot_counts = torch.nn.functional.one_hot(indices_flat, num_weights).to(grad_flat.dtype)
+        counts = one_hot_counts.sum(dim=0)
+        counts = torch.clamp(counts, min=1.0)
+        scale = 1.0 / counts
+        grad_flat = grad_flat * scale[indices_flat].unsqueeze(-1)
+
+    # Zero out gradients for padding positions
+    if padding_idx >= 0:
+        mask = (indices_flat != padding_idx).unsqueeze(-1).to(grad_flat.dtype)
+        grad_flat = grad_flat * mask
+
+    # scatter-add
+    indices_one_hot = torch.nn.functional.one_hot(indices_flat, num_weights).to(grad_flat.dtype)
+    grad_weight = torch.tensordot(indices_one_hot, grad_flat, dims=([0], [0]))
+
+    return grad_weight
 
 
 @register_decomposition([aten.linear_backward])
 def linear_backward_decomposition(input_, grad_output_, weight_, output_mask):
-    """
-    Decompose linear backwards pass (linear forward pass: y = xA^t + b)
+    """Decompose linear backward pass into matmul and tensordot.
 
-    :param input_: input (x)
-    :param grad_output_: output gradient (dy)
-    :param weight_: weight (A)
-    :param output_mask: mask of 3 bools:
-        output_mask[0] - whether to return input gradient
-        output_mask[1] - whether to return weight gradient
-        output_mask[2] - whether to return bias gradient
-    """
+    Linear forward: y = xA^T + b
 
+    Args:
+        input_ (torch.Tensor): Input tensor (x).
+        grad_output_ (torch.Tensor): Output gradient (dy).
+        weight_ (torch.Tensor): Weight matrix (A).
+        output_mask (list[bool]): Which gradients to compute:
+            [0] input gradient, [1] weight gradient, [2] bias gradient.
+
+    Returns:
+        tuple: (grad_input, grad_weight, grad_bias), None for masked outputs.
+    """
     grad_input = None
     grad_weight = None
     grad_bias = None
     if output_mask[0]:
         grad_input = torch.matmul(grad_output_, weight_)
-    if output_mask[1]:
-        contract_dims = [tuple(range(grad_output_.ndim - 1)), tuple(range(grad_output_.ndim - 1))]
-        grad_weight = torch.tensordot(grad_output_, input_, dims=contract_dims)
-    if output_mask[2]:
+    if output_mask[1] or output_mask[2]:
+        # Must compute both grad_weight and grad_bias together to match PyTorch meta registration
+        batch_dims = "".join(chr(ord("a") + j) for j in range(input_.ndim - 1))
+        einsum_eq = f"{batch_dims}i,{batch_dims}j->ij"
+        grad_weight = torch.einsum(einsum_eq, grad_output_, input_)
         if grad_output_.ndim == 1:
             grad_bias = grad_output_.clone()
         else:
-            dims_to_reduce = tuple(range(grad_output_.ndim - 1))
-            grad_bias = torch.sum(grad_output_, dim=dims_to_reduce, keepdim=False)
+            grad_bias = torch.sum(grad_output_, dim=tuple(range(grad_output_.ndim - 1)))
     return (grad_input, grad_weight, grad_bias)
 
 
-def get_decomposition_table(decompose_all: bool = False) -> dict:
+@register_decomposition([aten._foreach_pow.Scalar])
+def _foreach_pow_scalar(tensors, exponent):
+    """Decompose _foreach_pow.Scalar into individual pow operations"""
+    return [torch.pow(t, exponent) for t in tensors]
+
+
+@register_decomposition([aten.__rshift__.Scalar])
+def rshift_scalar_decomp(x, shift):
+    """Decompose right shift into floor division by power of 2"""
+    divisor = 2**shift
+    return torch.div(x, divisor, rounding_mode="floor").to(x.dtype)
+
+
+@register_decomposition([aten.as_strided_scatter.default])
+def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
+    """Decompose as_strided_scatter to index_copy"""
+    # Ensure contiguous to match clone() semantics
+    input = input.contiguous()
+    input_flat = input.flatten()
+    src_flat = src.flatten()
+
+    # Compute linear indices for strided view
+    idx = input.new_zeros(size, dtype=torch.long)
+
+    for dim, s in enumerate(size):
+        arange = torch.arange(s, dtype=torch.long, device=input.device)
+        view_shape = [1] * len(size)
+        view_shape[dim] = -1
+        idx = idx + arange.view(view_shape) * stride[dim]
+
+    flat_indices = idx.flatten() + storage_offset
+
+    result_flat = input_flat.index_copy(0, flat_indices, src_flat)
+    return result_flat.reshape(input.shape)
+
+
+@register_decomposition([aten._grouped_mm.default])
+def grouped_mm_decomposition(a, b, offs):
+    """Decompose grouped matmul for torch.compile/MLIR paths.
+
+    2D x 2D: a (d1, t), b (t, d2), offs (g,) -> (g, d1, d2) - calls NKI kernel
+    2D x 3D: a (t, d1), b (g, d1, d2), offs (g,) -> (t, d2) - decomposes to primitives
     """
-    Get the complete decomposition table for the Neuron backend.
+    # 2D x 2D case - call NKI kernel
+    if a.dim() == 2 and b.dim() == 2:
+        from torch_neuronx.python_ops.nki_kernels.grouped_mm import grouped_mm_2d_2d_nki
+
+        return grouped_mm_2d_2d_nki(a, b, offs)
+
+    # 2D x 3D case - decompose to primitives
+    if a.dim() == 2 and b.dim() == 3:
+        from torch_neuronx.utils import get_gmm_align
+
+        t, d1 = a.shape
+        g, _, d2 = b.shape
+        align = get_gmm_align()
+
+        b_index = (offs[:, None] // align <= torch.arange(t // align, device=a.device)).sum(0)
+        b_index = torch.clamp(b_index, 0, g - 1)
+        a_batched = a.reshape(t // align, align, d1)
+        b_batched = b[b_index]
+        r_batched = a_batched @ b_batched
+        return r_batched.reshape(t, d2)
+
+    return NotImplemented
+
+
+def _validate_convolution_inputs(
+    input,
+    weight,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+):
+    """Common validation for convolution operations using PyTorch-style checks."""
+    k = input.ndim
+    weight_dim = weight.ndim
+    dim = weight_dim - 2
+
+    if dim <= 0:
+        raise RuntimeError("weight should have at least three dimensions")
+
+    if groups <= 0:
+        raise RuntimeError("non-positive groups is not supported")
+
+    if any(p < 0 for p in padding):
+        raise RuntimeError("negative padding is not supported")
+
+    if transposed and any(p < 0 for p in output_padding):
+        raise RuntimeError("negative output_padding is not supported")
+
+    if any(s <= 0 for s in stride):
+        raise RuntimeError("non-positive stride is not supported")
+
+    if any(d <= 0 for d in dilation):
+        raise RuntimeError("dilation should be greater than zero")
+
+    if weight_dim != k:
+        raise RuntimeError(
+            f"Expected {weight_dim}-dimensional input for {weight_dim}-dimensional weight "
+            f"{list(weight.shape)}, but got {k}-dimensional input of size "
+            f"{list(input.shape)} instead"
+        )
+
+    if weight.shape[0] < groups:
+        raise RuntimeError(
+            f"Given groups={groups}, expected weight to be at least {groups} "
+            f"at dimension 0, but got weight of size {list(weight.shape)} instead"
+        )
+
+    if weight.shape[0] % groups != 0:
+        raise RuntimeError(
+            f"Given groups={groups}, expected weight to be divisible by {groups} "
+            f"at dimension 0, but got weight of size {list(weight.shape)} instead"
+        )
+
+    if not transposed:
+        expected_input_channels = weight.shape[1] * groups
+        if input.shape[1] != expected_input_channels:
+            raise RuntimeError(
+                f"Given groups={groups}, weight of size {list(weight.shape)}, "
+                f"expected input{list(input.shape)} to have {expected_input_channels} channels, "
+                f"but got {input.shape[1]} channels instead"
+            )
+
+        for i in range(2, k):
+            input_size = input.shape[i] + 2 * padding[i - 2]
+            kernel_size = dilation[i - 2] * (weight.shape[i] - 1) + 1
+            if input_size < kernel_size:
+                raise RuntimeError(
+                    f"Calculated padded input size per channel: ({input_size}). "
+                    f"Kernel size: ({kernel_size}). Kernel size can't be greater than "
+                    f"actual input size"
+                )
+    else:
+        expected_input_channels = weight.shape[0]
+        if input.shape[1] != expected_input_channels:
+            raise RuntimeError(
+                f"Given transposed=True, weight of size {list(weight.shape)}, "
+                f"expected input{list(input.shape)} to have {expected_input_channels} channels, "
+                f"but got {input.shape[1]} channels instead"
+            )
+
+
+def _validate_convolution_backward_inputs(
+    grad_output,
+    input,
+    weight,
+    bias_sizes,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+):
+    """Validate inputs for convolution backward operation."""
+    _validate_convolution_inputs(
+        input, weight, stride, padding, dilation, transposed, output_padding, groups
+    )
+    if grad_output.ndim != input.ndim:
+        raise RuntimeError(
+            f"Expected input and grad_output to have the same number of dimensions, "
+            f"got: {input.ndim} and {grad_output.ndim}"
+        )
+
+
+def _tuple(x: list | tuple | int, ndim: int):
+    """Convert x to a tuple of length ndim."""
+    if isinstance(x, int):
+        return (x,) * ndim
+    # Convert to tuple, defaulting empty to zeros
+    t = tuple(int(v) for v in x) if len(x) else (0,) * ndim
+    # If shorter than ndim, repeat the last element to fill
+    if len(t) < ndim:
+        return t + (t[-1],) * (ndim - len(t))
+    return t
+
+
+@register_decomposition([aten.convolution_backward])
+def torch_convolution_backward_overrideable(
+    grad_output,
+    input,
+    weight,
+    bias_sizes,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+    output_mask,
+    **kwargs,
+):
+    dtype = input.dtype
+    ndim = input.ndim - 2  # spatial dimensions (1, 2, or 3)
+
+    stride = _tuple(stride, ndim)
+    padding = _tuple(padding, ndim)
+    dilation = _tuple(dilation, ndim)
+    output_padding = _tuple(output_padding, ndim)
+
+    _validate_convolution_backward_inputs(
+        grad_output,
+        input,
+        weight,
+        bias_sizes,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    )
+
+    n, cin = input.shape[:2]
+    cout = weight.shape[0] if not transposed else weight.shape[1]
+    spatial_in = input.shape[2:]
+    spatial_out = grad_output.shape[2:]
+    kernel_size = weight.shape[2:]
+
+    need_gi = bool(output_mask[0]) if len(output_mask) > 0 else True
+    need_gw = bool(output_mask[1]) if len(output_mask) > 1 else True
+    need_gb = bool(output_mask[2]) if len(output_mask) > 2 else True
+
+    grad_input = grad_weight = grad_bias = None
+
+    # Select conv functions based on ndim
+    conv_fn = [F.conv1d, F.conv2d, F.conv3d][ndim - 1]
+    conv_transpose_fn = [
+        F.conv_transpose1d,
+        F.conv_transpose2d,
+        F.conv_transpose3d,
+    ][ndim - 1]
+
+    # --- grad_input ---
+    if need_gi:
+        if not transposed:
+            # Compute output_padding to match input spatial size
+            # output_size = (input_size - 1) * stride - 2 * padding +
+            # dilation * (kernel - 1) + 1 + output_padding
+            grad_input_output_padding = tuple(
+                max(
+                    0,
+                    spatial_in[i]
+                    - (
+                        (spatial_out[i] - 1) * stride[i]
+                        - 2 * padding[i]
+                        + dilation[i] * (kernel_size[i] - 1)
+                        + 1
+                    ),
+                )
+                for i in range(ndim)
+            )
+            grad_input = conv_transpose_fn(
+                grad_output,
+                weight,
+                bias=None,
+                stride=stride,
+                padding=padding,
+                output_padding=grad_input_output_padding,
+                groups=groups,
+                dilation=dilation,
+            ).to(dtype)
+        else:
+            # transposed conv: grad_input = conv(grad_output, weight)
+            grad_input = conv_fn(
+                grad_output,
+                weight,
+                bias=None,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            ).to(dtype)
+
+    # --- grad_bias ---
+    if need_gb and bias_sizes is not None and len(bias_sizes) > 0:
+        reduce_dims = (0, *tuple(range(2, input.ndim)))
+        grad_bias = grad_output.sum(dim=reduce_dims).to(dtype)
+
+    # --- grad_weight ---
+    if need_gw:
+        cin_per_group = cin // groups
+        cout_per_group = cout // groups
+        is_depthwise = groups == cin and cin == cout and cin_per_group == 1
+
+        if not transposed:
+            if is_depthwise:
+                # Depthwise convolution: use grouped conv trick for efficiency
+                # Reshape: [N, C, *spatial] -> [C, N, *spatial] -> [1, C*N, *spatial]
+                x_big = input.transpose(0, 1).reshape(1, cin * n, *spatial_in)
+                k_big = grad_output.transpose(0, 1).reshape(cin * n, 1, *spatial_out).contiguous()
+
+                dw_big = conv_fn(
+                    x_big, k_big, bias=None, stride=1, padding=padding, dilation=1, groups=cin * n
+                )
+
+                # Subsample by dilation and slice to kernel_size
+                if ndim == 1:
+                    dw_big = dw_big[:, :, :: dilation[0]]
+                    dw_big = dw_big[:, :, : kernel_size[0]]
+                elif ndim == 2:
+                    dw_big = dw_big[:, :, :: dilation[0], :: dilation[1]]
+                    dw_big = dw_big[:, :, : kernel_size[0], : kernel_size[1]]
+                else:
+                    dw_big = dw_big[:, :, :: dilation[0], :: dilation[1], :: dilation[2]]
+                    dw_big = dw_big[:, :, : kernel_size[0], : kernel_size[1], : kernel_size[2]]
+
+                # Reshape to [C, N, *K], sum over N -> [C, *K], then unsqueeze -> [C, 1, *K]
+                dw_cnk = dw_big.reshape(cin, n, *kernel_size)
+                grad_weight = dw_cnk.sum(dim=1).unsqueeze(1).to(dtype)
+            else:
+                # General grouped convolution
+                dw_groups = []
+                for g in range(groups):
+                    x_g = input[:, g * cin_per_group : (g + 1) * cin_per_group]
+                    dy_g = grad_output[:, g * cout_per_group : (g + 1) * cout_per_group]
+
+                    x_t = x_g.transpose(0, 1).contiguous()
+                    dy_t = dy_g.transpose(0, 1).contiguous()
+
+                    dw_g = conv_fn(x_t, dy_t, bias=None, stride=1, padding=padding, dilation=stride)
+
+                    # Subsample by dilation and slice to kernel_size
+                    if ndim == 1:
+                        dw_g = dw_g[:, :, :: dilation[0]]
+                        dw_g = dw_g[:, :, : kernel_size[0]]
+                    elif ndim == 2:
+                        dw_g = dw_g[:, :, :: dilation[0], :: dilation[1]]
+                        dw_g = dw_g[:, :, : kernel_size[0], : kernel_size[1]]
+                    else:
+                        dw_g = dw_g[:, :, :: dilation[0], :: dilation[1], :: dilation[2]]
+                        dw_g = dw_g[:, :, : kernel_size[0], : kernel_size[1], : kernel_size[2]]
+
+                    dw_groups.append(dw_g.transpose(0, 1))
+
+                grad_weight = torch.cat(dw_groups, dim=0).to(dtype)
+        else:
+            # Transposed conv: weight is [Cin, Cout/groups, *kernel_size]
+            dw_groups = []
+            for g in range(groups):
+                x_g = input[:, g * cin_per_group : (g + 1) * cin_per_group]
+                dy_g = grad_output[:, g * cout_per_group : (g + 1) * cout_per_group]
+
+                x_t = x_g.transpose(0, 1).contiguous()
+                dy_t = dy_g.transpose(0, 1).contiguous()
+
+                dw_g = conv_fn(dy_t, x_t, bias=None, stride=1, padding=padding, dilation=stride)
+
+                # Subsample by dilation and slice to kernel_size
+                if ndim == 1:
+                    dw_g = dw_g[:, :, :: dilation[0]]
+                    dw_g = dw_g[:, :, : kernel_size[0]]
+                elif ndim == 2:
+                    dw_g = dw_g[:, :, :: dilation[0], :: dilation[1]]
+                    dw_g = dw_g[:, :, : kernel_size[0], : kernel_size[1]]
+                else:
+                    dw_g = dw_g[:, :, :: dilation[0], :: dilation[1], :: dilation[2]]
+                    dw_g = dw_g[:, :, : kernel_size[0], : kernel_size[1], : kernel_size[2]]
+
+                dw_groups.append(dw_g.transpose(0, 1))
+
+            grad_weight = torch.cat(dw_groups, dim=0).to(dtype)
+
+    return grad_input, grad_weight, grad_bias
+
+
+@register_decomposition([aten.value_selecting_reduction_backward.default])
+def value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
+    """Decompose value_selecting_reduction_backward into scatter.
+
+    Args:
+        grad (torch.Tensor): Upstream gradient (shape of reduced output).
+        dim (int): Dimension along which the forward reduction was performed.
+        indices (torch.Tensor): Indices of selected values from the forward pass.
+        sizes (list[int]): Shape of the original input tensor before reduction.
+        keepdim (bool): Whether the forward op preserved the reduced dimension.
 
     Returns:
-        Decomposition table for the backend
+        torch.Tensor: Gradient with respect to the original input.
+    """
+    if dim < 0:
+        dim = len(sizes) + dim
+    grad_input = torch.zeros(sizes, dtype=grad.dtype, device=grad.device)
+    if not keepdim and len(sizes) > 0:
+        grad = grad.unsqueeze(dim)
+        indices = indices.unsqueeze(dim)
+    return grad_input.scatter(dim, indices, grad)
+
+
+@register_decomposition([aten.histc.default])
+def histc_decomposition(input, bins=100, min=0, max=0):
+    """Decompose histc into basic ops
+
+    Matches PyTorch's histc behavior:
+    - Values in [min, max] are binned
+    - Values < min or > max are ignored
+    - Values exactly at max go to the last bin
+    """
+    if max == min:
+        min = input.min().item()
+        max = input.max().item()
+
+        # Handle edge case where all values are identical
+        if max == min:
+            # When all values are identical, PyTorch puts all counts in the middle bin
+            hist = torch.zeros(bins, dtype=torch.float32, device=input.device)
+            hist[bins // 2] = float(input.numel())
+            return hist
+
+    bin_width = (max - min) / bins
+
+    # Calculate bin indices
+    bin_indices_float = (input - min) / bin_width
+    bin_indices = bin_indices_float.long()
+
+    # Create mask for values in valid range [min, max]
+    # This filters out values < min or > max
+    in_range_mask = (input >= min) & (input <= max)
+
+    # Clamp indices to valid range [0, bins-1]
+    bin_indices = torch.clamp(bin_indices, 0, bins - 1)
+
+    # Create ones tensor with same dtype as input, but zero out entries that are out of range
+    ones = torch.ones_like(bin_indices, dtype=input.dtype)
+    ones = torch.where(in_range_mask, ones, torch.zeros_like(ones))
+
+    # Scatter add - histogram must match dtype of ones for scatter_add
+    hist = torch.zeros(bins, dtype=input.dtype, device=input.device)
+    result = torch.scatter_add(hist, 0, bin_indices.flatten(), ones.flatten())
+
+    return result
+
+
+@register_decomposition([aten.argsort.default, aten.argsort.stable])
+def argsort_decomposition(input, dim=-1, descending=False, stable=False):
+    """Decompose argsort to sort"""
+    return torch.sort(input, dim=dim, descending=descending, stable=stable)[1]
+
+
+def get_decomposition_table(decompose_all: bool = False) -> dict:
+    """Get the decomposition table for the Neuron backend.
+
+    Args:
+        decompose_all (bool): Unused, kept for API compatibility.
+
+    Returns:
+        dict: Mapping of ATen ops to their decomposition functions.
     """
     return neuron_decompositions
+
+
+def get_compile_decomposition_table() -> dict:
+    """Decomposition table for torch.compile (adds compile-only decompositions).
+
+    This is needed for situations where we want a decomposition specifically
+    for the torch.compile path but not the eager path.
+    """
+    return {
+        **neuron_decompositions,
+        aten.index_put.default: index_put_decomposition,
+    }

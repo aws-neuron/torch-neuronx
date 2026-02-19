@@ -121,7 +121,7 @@ class ErrorHandler {
                                               const torch_neuronx::CompilationRuntimeException& e);
 
   /**
-   * Handle execution errors with recovery strategies and exception tracking
+   * Handle execution errors with exception tracking
    * @param op The operation that failed
    * @param e The execution exception
    * @return OperationContextResult indicating success (recovery) or error
@@ -144,6 +144,13 @@ class ErrorHandler {
    * @return Readable error description
    */
   std::string ClassifyNrtError(const torch_neuronx::ExecutionRuntimeException& e) const;
+
+  /**
+   * Classify an NRT status code to human-readable error description
+   * @param nrt_status The NRT status code
+   * @return Readable error description
+   */
+  std::string ClassifyNrtError(NRT_STATUS nrt_status) const;
 
   /**
    * Generate comprehensive error message with context

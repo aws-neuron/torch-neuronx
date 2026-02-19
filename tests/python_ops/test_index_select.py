@@ -39,12 +39,10 @@ class TestIndexSelect:
         input_neuron = input.to(device)
         indices = torch.tensor([0, 2])
 
-        with track_neuron_ops():
-            # When indices are not on device, can_handle returns False
-            # Operation should fall back to CPU
-            _ = torch.index_select(input_neuron, dim=0, index=indices)
-            # Verify that the operation was offloaded to CPU
-            assert_op_falls_back_on_cpu("aten::index_select")
+        # When indices are not on device, can_handle returns False
+        # Operation should fail as it does for GPU if no fallback is active
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            torch.index_select(input_neuron, dim=0, index=indices)
 
     def test_index_select_scalar_index(self):
         """Test index select with scalar index tensor"""
@@ -73,9 +71,11 @@ class TestIndexSelect:
 
     @assert_raises(
         TypeError if use_mlir_aten_ops() else ValueError,
-        match=re.escape("index_select(): Expected dtype int32 or int64 for index")
-        if use_mlir_aten_ops()
-        else "indices must have an integer type",
+        match=(
+            re.escape("index_select(): Expected dtype int32 or int64 for index")
+            if use_mlir_aten_ops()
+            else "indices must have an integer type"
+        ),
     )
     def test_index_select_with_index_dtype_float(self):
         """Test index select with index dtype float"""
@@ -90,9 +90,11 @@ class TestIndexSelect:
 
     @assert_raises(
         IndexError,
-        match=re.escape("index_select(): Index is supposed to be a vector")
-        if use_mlir_aten_ops()
-        else re.escape("index_select(): Expected 1-D index tensor, got dim=2"),
+        match=(
+            re.escape("index_select(): Index is supposed to be a vector")
+            if use_mlir_aten_ops()
+            else re.escape("index_select(): Expected 1-D index tensor, got dim=2")
+        ),
     )
     def test_index_select_with_incorrect_indices_size(self):
         """Test index select with incorrect indices size"""

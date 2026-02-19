@@ -34,6 +34,9 @@ set(TORCH_INCLUDE_DIRS "${TORCH_PATH}/include" "${TORCH_PATH}/include/torch/csrc
 set(TORCH_LIBRARY_DIRS "${TORCH_PATH}/lib")
 set(TORCH_LIBRARIES "torch" "torch_cpu" "c10" "torch_python")
 
+# Kineto headers for profiler integration (libkineto.h, ActivityType.h, IActivityProfiler.h)
+set(KINETO_INCLUDE_DIRS "${TORCH_PATH}/include/kineto")
+
 # Set NRT include and library paths
 set(NRT_INCLUDE_DIRS "${NRT_PATH}/include")
 set(NRT_LIBRARY_DIRS "${NRT_PATH}/lib")
@@ -167,6 +170,26 @@ set_target_properties(stream PROPERTIES
     LINK_FLAGS "-Wl,--whole-archive"
 )
 
+# Distributed library
+set(DISTRIBUTED_SOURCES
+    torch_neuronx/csrc/distributed/NeuronWork.cpp
+    torch_neuronx/csrc/distributed/NeuronWatchdog.cpp
+)
+
+set(DISTRIBUTED_HEADERS
+    torch_neuronx/csrc/distributed/NeuronWork.h
+    torch_neuronx/csrc/distributed/NeuronWatchdog.h
+)
+
+add_library(distributed STATIC ${DISTRIBUTED_SOURCES})
+target_link_libraries(distributed stream ${TORCH_LIBRARIES} ${NRT_LIBRARIES})
+target_include_directories(distributed PRIVATE ${TORCH_INCLUDE_DIRS} ${NRT_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+
+set_target_properties(distributed PROPERTIES
+    COMPILE_FLAGS "-fvisibility=default"
+    LINK_FLAGS "-Wl,--whole-archive"
+)
+
 # ATen Neuron library
 set(ATEN_NEURON_SOURCES
     torch_neuronx/csrc/aten/CopyKernel.cpp
@@ -205,11 +228,19 @@ set_target_properties(aten_neuron PROPERTIES
 )
 
 # Main extension library
+# Note: Profiler sources are included directly in EXTENSION_SOURCES below
+# to avoid static library linking issues
 set(EXTENSION_SOURCES
     torch_neuronx/csrc/core/NeuronBindings.cpp
     torch_neuronx/csrc/core/NeuronGuardImpl.cpp
     torch_neuronx/csrc/aten/SdpBackendSelection.cpp
     torch_neuronx/csrc/amp/autocast_mode.cpp
+    # Profiler sources (compiled directly to ensure proper linking)
+    torch_neuronx/csrc/profiler/Profiler.cpp
+    torch_neuronx/csrc/profiler/Session.cpp
+    torch_neuronx/csrc/profiler/Registration.cpp
+    torch_neuronx/csrc/profiler/TorchStubs.cpp
+    torch_neuronx/csrc/profiler/NConfigParser.cpp
 )
 
 add_library(_C SHARED ${EXTENSION_SOURCES})
@@ -218,6 +249,7 @@ target_link_libraries(_C
     core
     internal_ops
     stream
+    distributed
     aten_neuron
     -Wl,--no-whole-archive
     ${TORCH_LIBRARIES}
@@ -225,7 +257,13 @@ target_link_libraries(_C
     stdc++fs
 )
 
-target_include_directories(_C PRIVATE ${TORCH_INCLUDE_DIRS} ${NRT_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+target_include_directories(_C PRIVATE
+    ${TORCH_INCLUDE_DIRS}
+    ${KINETO_INCLUDE_DIRS}
+    ${NRT_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/torch_neuronx/csrc/profiler
+)
 
 set_target_properties(_C PROPERTIES
     PREFIX ""

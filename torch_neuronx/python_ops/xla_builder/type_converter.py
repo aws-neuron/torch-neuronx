@@ -6,10 +6,9 @@ import numpy as np
 import torch
 
 from torch_neuronx.protos.xla.xla_data_pb2 import PrimitiveType
-from torch_neuronx.type_converter_base import BaseTypeConverter
 
 
-class XLABuilderTypeConverter(BaseTypeConverter):
+class XLABuilderTypeConverter:
     """Handles type conversions between PyTorch and JAX/NumPy types."""
 
     TORCH_TO_PRIMITIVE_DTYPE: ClassVar[dict] = {
@@ -49,8 +48,6 @@ class XLABuilderTypeConverter(BaseTypeConverter):
         PrimitiveType.C128: torch.complex128,
         PrimitiveType.F8E5M2: torch.float8_e5m2,
     }
-
-    # # torch_to_jax_dtype is inherited from BaseTypeConverter
 
     @classmethod
     def primitive_to_torch_dtype(cls, primitive_dtype: PrimitiveType) -> torch.dtype:

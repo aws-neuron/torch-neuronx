@@ -4,7 +4,6 @@ import torch
 
 from .base import ExecutionResult, Operation, OperationImplementation
 from .nki_kernels.native_multi_head_attn_mid import native_multi_head_attn_mid_kernel_with_grid
-from .xla_ops.scaled_dot_product_attention_xla import ScaledDotProductAttnXLAImpl
 
 
 class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
@@ -123,78 +122,14 @@ class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
             return ExecutionResult(success=False, error_msg=str(e))
 
 
-class NativeMultiHeadAttnMidXLAImpl(ScaledDotProductAttnXLAImpl):
-    """XLA implementation for Mid operation with transposed inputs"""
-
-    def __init__(self, op_name: str):
-        super().__init__(op_name)
-        # Set flag to return single tensor instead of tuple
-        self._returns_single_tensor = True
-
-    def can_handle(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        use_causal_mask: bool = False,
-        dropout_p: float = 0.0,
-        training: bool = False,
-        out: torch.Tensor | None = None,
-    ) -> bool:
-        """Check if XLA implementation can handle Mid operation parameters"""
-        # Call parent with mapped parameter names
-        return super().can_handle(
-            query,
-            key,
-            value,
-            is_causal=use_causal_mask,
-            dropout_p=dropout_p,
-        )
-
-    def execute(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        use_causal_mask: bool = False,
-        dropout_p: float = 0.0,
-        training: bool = False,
-        out: torch.Tensor | None = None,
-    ) -> ExecutionResult:
-        """Execute with input transposition for Mid format"""
-        # Transpose inputs from Mid format (batch, heads, embed_dim, seq_len)
-        # to standard format (batch, heads, seq_len, embed_dim)
-        q_transposed = query.transpose(-2, -1)
-        k_transposed = key.transpose(-2, -1)
-        v_transposed = value.transpose(-2, -1)
-        # Call base XLA implementation with mapped parameter names
-        result = super().execute(
-            q_transposed,
-            k_transposed,
-            v_transposed,
-            is_causal=use_causal_mask,  # Map parameter name
-            dropout_p=dropout_p,
-        )
-
-        if not result.success:
-            return result
-
-        # Output is already in correct format (batch, heads, seq_len, embed_dim)
-        if out is not None:
-            out.copy_(result.output)
-            return ExecutionResult(success=True, output=out)
-
-        return result
-
-
 class NativeMultiHeadAttnMidOp(Operation):
     """Native multi-head attention middle operation with NKI implementation"""
 
     def _setup_implementations(self):
         self._implementations.append(NativeMultiHeadAttnMidNKIImpl())
-        self._implementations.append(NativeMultiHeadAttnMidXLAImpl(self.op_name))
+        from .torch_mlir.ops.native_multi_head_attn_mid import NativeMultiHeadAttnMidMLIRImpl
+
+        self._implementations.append(NativeMultiHeadAttnMidMLIRImpl(self.op_name))
 
     @property
     def op_name(self) -> str:

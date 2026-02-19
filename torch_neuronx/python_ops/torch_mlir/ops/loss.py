@@ -15,6 +15,8 @@ def nll_loss(
     ignore_index: int,
 ):
     """NLL loss forward using PyTorch decomposition."""
+    if input.dim() == 1 and target.dim() == 1 and target.size(0) != 1:
+        raise ValueError("For 1D input, 1D target must have size 1")
     return torch.ops.aten.nll_loss_forward(input, target, weight, reduction, ignore_index)
 
 

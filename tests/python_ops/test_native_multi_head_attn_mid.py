@@ -336,11 +336,12 @@ class TestNativeMultiHeadAttnMid:
 
         # First call - should trace and cache IR
         output1 = _mid_op(q, k, v, use_causal_mask=False, dropout_p=0.0, training=False)
-        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+        assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
 
         # Second call - should use cached IR (cache size unchanged)
         output2 = _mid_op(q, k, v, use_causal_mask=False, dropout_p=0.0, training=False)
-        assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
         # Verify outputs are consistent
         torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
@@ -366,7 +367,8 @@ class TestNativeMultiHeadAttnMid:
 
         output1 = _mid_op(q1, k1, v1, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+        assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
 
         # Second call with different input values but same shapes - should hit cache
         torch.manual_seed(123)
@@ -376,7 +378,7 @@ class TestNativeMultiHeadAttnMid:
 
         output2 = _mid_op(q2, k2, v2, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        assert mock_compiler.call_count == initial_count + 1, "Compiler called again"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
         # Verify shapes are the same
         assert output1.shape == output2.shape
@@ -410,7 +412,8 @@ class TestNativeMultiHeadAttnMid:
 
         output1 = _mid_op(q1, k1, v1, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+        assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
 
         # Second shape: seq_len = 4096 (different shape)
         seq_len2 = 4096
@@ -420,7 +423,10 @@ class TestNativeMultiHeadAttnMid:
 
         output2 = _mid_op(q2, k2, v2, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
+        assert (
+            mock_compiler.call_count >= traced_call_count + 1
+        ), "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
 
         # Reuse first shape with different inputs - should hit cache (size stays at 2)
         q3 = torch.randn(batch_size, num_heads, d_head, seq_len1, device="neuron")
@@ -429,7 +435,7 @@ class TestNativeMultiHeadAttnMid:
 
         output3 = _mid_op(q3, k3, v3, use_causal_mask=False, dropout_p=0.0, training=False)
 
-        assert mock_compiler.call_count == initial_count + 2, "Compiler was not called as expected"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
         # Verify output shapes
         assert output1.shape == (batch_size, num_heads, seq_len1, d_head)

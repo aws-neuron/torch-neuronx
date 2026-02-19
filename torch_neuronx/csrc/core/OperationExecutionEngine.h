@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -12,7 +14,7 @@
 #include <vector>
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
-#include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
+#include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 namespace at::neuron {
 
@@ -21,48 +23,11 @@ class CompilationCache;
 class ModelHandleCache;
 class ConcatenationEngine;
 
-// Priority levels for task execution
-enum class TaskPriority { HIGH = 0, DEFAULT = 1, LOW = 2 };
+// Default queue depth configuration for concatenation
+constexpr int64_t DEFAULT_QUEUE_LOW_THRESHOLD = 15;
 
-inline TaskPriority BucketizePriority(int priority) {
-  if (priority < 0) {
-    return TaskPriority::HIGH;
-  } else if (priority > 0) {
-    return TaskPriority::LOW;
-  }
-  return TaskPriority::DEFAULT;
-}
-
-// Priority-based queue that maintains bucketed queues of priority levels
-// Tasks are processed in priority order, with FIFO ordering within each priority level
-template <typename T>
-class PriorityQueue {
- public:
-  // Check if any tasks are queued
-  bool empty() const;
-
-  // Get total number of tasks across all priority levels
-  size_t size() const;
-
-  // Add task to the back of the appropriate priority queue
-  void push_back(T task);
-
-  // Add task to the front of the appropriate priority queue
-  // Used when promoting deferred tasks to preserve submission order
-  void push_front(T task);
-
-  // Pop and return the highest priority task
-  // Caller must ensure !empty() before calling
-  T pop_front();
-
- private:
-  // Select the respective queue based on priority
-  std::deque<T>& GetQueueForPriority(int priority);
-
-  std::deque<T> high_;
-  std::deque<T> default_;
-  std::deque<T> low_;
-};
+// Default max inflight requests per XU (hardware queue depth limit)
+constexpr int kDefaultMaxInflightPerXU = 8;
 
 // Global execution engine that manages compilation and execution threads across all streams
 class OperationExecutionEngine {
@@ -72,8 +37,7 @@ class OperationExecutionEngine {
 
   // Constructor and destructor (now public since managed by NeuronResourceManager)
   OperationExecutionEngine(CompilationCache* compilation_cache,
-                           ModelHandleCache* model_handle_cache, int64_t queue_low_threshold = 10,
-                           int64_t queue_target_depth = 50);
+                           ModelHandleCache* model_handle_cache);
   ~OperationExecutionEngine();
 
   // Deleted copy/move constructors and assignment operators
@@ -91,7 +55,18 @@ class OperationExecutionEngine {
   // Execution queue depth management
   int64_t GetExecutionQueueDepth() const { return execution_queue_depth_.load(); }
   int64_t GetQueueLowThreshold() const { return queue_low_threshold_; }
-  int64_t GetQueueTargetDepth() const { return queue_target_depth_; }
+
+  // Check if concatenation is enabled via environment variable
+  bool IsConcatenationEnabled() const;
+
+  // Check if async NRT mode is enabled
+  bool IsNRTAsyncModeEnabled() const { return nrt_async_mode_enabled_; }
+
+  // Set async NRT mode (for testing purposes)
+  void SetAsyncModeEnabled(bool enabled) { nrt_async_mode_enabled_ = enabled; }
+
+  // Handle concatenation failure - called by StreamImpl during error handling
+  void HandleConcatenationFailure(OperationContext* operation);
 
  private:
   // Worker threads
@@ -106,7 +81,7 @@ class OperationExecutionEngine {
   std::condition_variable concatenation_cv_;
   bool concatenation_enabled_{false};
 
-  PriorityQueue<OperationContext*> compilation_queue_;
+  std::deque<OperationContext*> compilation_queue_;
 
   mutable std::mutex compilation_mutex_;
   std::condition_variable compilation_cv_;
@@ -118,29 +93,60 @@ class OperationExecutionEngine {
   // Shutdown coordination
   std::atomic<bool> shutdown_requested_{false};
 
+  bool nrt_async_mode_enabled_{false};
+
   // Shared resources (accessed through resource manager)
   CompilationCache* compilation_cache_{nullptr};
   ModelHandleCache* model_handle_cache_{nullptr};
 
   // Execution queue depth tracking for dynamic buffering
-  std::atomic<int64_t> execution_queue_depth_{0};
   int64_t queue_low_threshold_;
-  int64_t queue_target_depth_;
 
   // Worker thread implementations
   void ConcatenationWorker();
   void CompilationWorker();
   void ExecutionWorker();
+  void AsyncExecutionWorker();
 
-  // Check if concatenation is enabled via environment variable
-  bool IsConcatenationEnabled() const;
+  // Async execution helpers
+  bool HasPendingAsyncOperations() const { return pending_async_ops_count_.load() > 0; }
+
+  // Check and process completions for all devices
+  void CheckCompletions() noexcept;
+
+  // Process a single async execution task (schedule without waiting)
+  void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
+
+  // Async scheduling helpers
+  bool ScheduleDeviceOperation(OperationContext* op, StreamImpl* stream,
+                               KernelTypeEnum kernel_type);
+  bool ScheduleHostOperation(OperationContext* op, StreamImpl* stream);
+  void ProcessAsyncErrors(StreamImpl* stream, c10::DeviceIndex device_idx);
+
+  // Preprocessing helpers prologue attached with operations if needed
+  void ProcessPreprocessingTask(OperationContext* operation);
+
+  // Execute operation, handling concatenation logic internally
+  void ExecuteOperation(OperationContext* operation);
+
+  // Handle execution when operation has a concatenated operation
+  void ExecuteConcatenatedOperation(OperationContext* operation);
+
+  // Handle execution failure for concatenated operations
+  // Returns true if this was a concatenated op failure that requires retry
+  bool HandleConcatenatedExecutionFailure(OperationContext* operation,
+                                          const std::string& error_msg);
 
  protected:
-  // Virtual for testing - allows mocking execution without real device operations
   void ProcessPrepareTask(OperationContext* operation) noexcept;
-  bool ProcessPreprocessingTask(OperationContext* operation);
   virtual void ProcessCompilationTask(OperationContext* operation);
   virtual void ProcessExecutionTask(OperationContext* operation) noexcept;
+  void ProcessCompletions(StreamImpl* stream, const nrt::CompletionState& completion_state);
+  void DecrementExecutionQueueDepth();
+  std::atomic<int64_t> execution_queue_depth_{0};
+
+  // Track pending async operations count to avoid expensive iteration
+  std::atomic<int> pending_async_ops_count_{0};
 };
 
 }  // namespace at::neuron

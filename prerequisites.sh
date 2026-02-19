@@ -121,6 +121,18 @@ fi
 
 echo "Using: $(bazel version)"
 
+# Install patchelf (required for wheel builds)
+echo "=== patchelf Installation ==="
+if ! command -v patchelf &> /dev/null; then
+    echo "patchelf is not installed. Installing..."
+    if [[ "$ID" == "amzn" && "$VERSION_ID" == "2023" ]]; then
+        sudo dnf install -y patchelf
+    else
+        sudo apt-get install -y patchelf
+    fi
+fi
+echo "Using: $(patchelf --version)"
+
 # Install EFA (optional)
 read -p "Do you want to install EFA driver? (y/n): " install_efa_choice
 if [[ $install_efa_choice =~ ^[Yy]$ ]]; then

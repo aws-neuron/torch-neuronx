@@ -1,9 +1,11 @@
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <thread>
 #include <vector>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
@@ -11,6 +13,10 @@
 
 using namespace at::neuron;
 using namespace std::chrono_literals;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 // Test ResourceSemaphore
 class ResourceSemaphoreTest : public ::testing::Test {
@@ -281,6 +287,11 @@ TEST_F(ResourceGuardTest, RAIIBehavior) {
 class NeuronResourceManagerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Set up NRT mock to return 1 device
+    auto* nrt_mock = torch_neuronx::testing::MockNRT::GetInstance();
+    ON_CALL(*nrt_mock, nrt_get_visible_vnc_count(_))
+        .WillByDefault(DoAll(SetArgPointee<0>(1), Return(NRT_SUCCESS)));
+
     // Get singleton instance
     manager_ = &NeuronResourceManager::Instance();
   }

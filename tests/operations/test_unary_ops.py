@@ -11,6 +11,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 class TestUnaryOps:
@@ -907,3 +908,311 @@ class TestUnaryOps:
         torch.testing.assert_close(
             log_softmax_result.cpu(), log_of_softmax.cpu(), rtol=1e-3, atol=1e-3
         )
+
+    # Test softplus operation
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_runs_on_neuron(self, device):
+        """Test that softplus runs on Neuron"""
+        if not torch.neuron.is_available():
+            pytest.skip("Neuron device not available")
+
+        with track_neuron_ops():
+            input_tensor = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=device)
+            result = torch.nn.functional.softplus(input_tensor)
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::softplus")
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_basic(self, device):
+        """Test basic softplus operation."""
+        input_tensor = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+
+        assert result.device.type == "neuron"
+        expected = torch.nn.functional.softplus(input_tensor)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_2d(self, device):
+        """Test softplus on 2D tensor."""
+        input_tensor = torch.randn(4, 5)
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+
+        assert result.device.type == "neuron"
+        expected = torch.nn.functional.softplus(input_tensor)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_3d(self, device):
+        """Test softplus on 3D tensor."""
+        input_tensor = torch.randn(2, 3, 4)
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+
+        assert result.device.type == "neuron"
+        expected = torch.nn.functional.softplus(input_tensor)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_nd(self, device):
+        """Test softplus on tensors with different dimensions."""
+        test_shapes = [
+            (10,),  # 1D
+            (5, 5),  # 2D
+            (3, 4, 5),  # 3D
+            (2, 3, 4, 5),  # 4D
+        ]
+
+        for shape in test_shapes:
+            input_tensor = torch.randn(shape)
+            neuron_input = input_tensor.to(device)
+
+            result = torch.nn.functional.softplus(neuron_input)
+            expected = torch.nn.functional.softplus(input_tensor)
+
+            assert result.device.type == "neuron"
+            assert result.shape == shape
+            torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_with_beta(self, device):
+        """Test softplus with different beta values."""
+        input_tensor = torch.randn(4, 5)
+        neuron_input = input_tensor.to(device)
+
+        for beta in [0.5, 1.0, 2.0, 5.0]:
+            result = torch.nn.functional.softplus(neuron_input, beta=beta)
+
+            assert result.device.type == "neuron"
+            expected = torch.nn.functional.softplus(input_tensor, beta=beta)
+            torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_with_threshold(self, device):
+        """Test softplus with different threshold values."""
+        input_tensor = torch.randn(4, 5) * 10  # Larger values to test threshold
+        neuron_input = input_tensor.to(device)
+
+        for threshold in [10.0, 20.0, 50.0]:
+            result = torch.nn.functional.softplus(neuron_input, threshold=threshold)
+
+            assert result.device.type == "neuron"
+            expected = torch.nn.functional.softplus(input_tensor, threshold=threshold)
+            torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_with_beta_and_threshold(self, device):
+        """Test softplus with both beta and threshold parameters."""
+        input_tensor = torch.randn(4, 5) * 5
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input, beta=2.0, threshold=15.0)
+
+        assert result.device.type == "neuron"
+        expected = torch.nn.functional.softplus(input_tensor, beta=2.0, threshold=15.0)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_different_dtypes(self, device):
+        """Test softplus with different data types."""
+        for dtype in [torch.float32, torch.float16]:
+            input_tensor = torch.randn(4, 5, dtype=dtype)
+            neuron_input = input_tensor.to(device)
+
+            result = torch.nn.functional.softplus(neuron_input)
+            expected = torch.nn.functional.softplus(input_tensor)
+
+            assert result.device.type == "neuron"
+            assert result.dtype == dtype
+            torch.testing.assert_close(
+                result.cpu(),
+                expected,
+                rtol=1e-3 if dtype == torch.float16 else 1e-4,
+                atol=1e-3 if dtype == torch.float16 else 1e-4,
+            )
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_module(self, device):
+        """Test torch.nn.Softplus module."""
+        input_tensor = torch.randn(4, 5)
+        neuron_input = input_tensor.to(device)
+
+        # Test with default parameters
+        softplus_module = torch.nn.Softplus().to(device)
+        result = softplus_module(neuron_input)
+
+        softplus_module_cpu = torch.nn.Softplus()
+        expected = softplus_module_cpu(input_tensor)
+
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_module_with_params(self, device):
+        """Test torch.nn.Softplus module with beta and threshold."""
+        input_tensor = torch.randn(4, 5) * 5
+        neuron_input = input_tensor.to(device)
+
+        # Test with custom parameters
+        softplus_module = torch.nn.Softplus(beta=2.0, threshold=15.0).to(device)
+        result = softplus_module(neuron_input)
+
+        softplus_module_cpu = torch.nn.Softplus(beta=2.0, threshold=15.0)
+        expected = softplus_module_cpu(input_tensor)
+
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_large(self, device):
+        """Test softplus on larger tensor."""
+        input_tensor = torch.randn(100, 100)
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_all_negative(self, device):
+        """Test softplus on tensor with all negative values."""
+        input_tensor = -torch.abs(torch.randn(10, 10)) - 1.0
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        # Softplus of negative values should be small positive numbers
+        assert torch.all(result.cpu() > 0)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_all_positive(self, device):
+        """Test softplus on tensor with all positive values."""
+        input_tensor = torch.abs(torch.randn(10, 10)) + 1.0
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        # For large positive values, softplus(x) ≈ x
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_zeros(self, device):
+        """Test softplus on tensor with all zeros."""
+        input_tensor = torch.zeros(10, 10)
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        # softplus(0) = ln(2) ≈ 0.6931
+        expected_value = math.log(2)
+        torch.testing.assert_close(
+            result.cpu(), torch.full_like(input_tensor, expected_value), rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_empty(self, device):
+        """Test softplus on empty tensor."""
+        input_tensor = torch.tensor([])
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        assert result.shape == torch.Size([0])
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_threshold_behavior(self, device):
+        """Test softplus threshold behavior (returns x when beta*x > threshold)."""
+        # For default beta=1 and threshold=20, when x > 20, softplus(x) ≈ x
+        input_tensor = torch.tensor([25.0, 30.0, 50.0, 100.0])
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+        expected = torch.nn.functional.softplus(input_tensor)
+
+        assert result.device.type == "neuron"
+        # For large values, result should be approximately equal to input
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(result.cpu(), input_tensor, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_mathematical_definition(self, device):
+        """Test softplus against mathematical definition: softplus(x) = ln(1 + exp(x))."""
+        input_tensor = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
+        neuron_input = input_tensor.to(device)
+
+        result = torch.nn.functional.softplus(neuron_input)
+
+        # Manual calculation: ln(1 + exp(x))
+        expected_manual = torch.log(1 + torch.exp(input_tensor))
+
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), expected_manual, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    def test_softplus_backward_compatibility(self, device):
+        """Test backward compatibility with different ways to call softplus."""
+        input_tensor = torch.randn(4, 5)
+        neuron_input = input_tensor.to(device)
+
+        # Different ways to call softplus
+        result1 = torch.nn.functional.softplus(neuron_input)
+        result2 = torch.nn.Softplus()(neuron_input)
+
+        # All should produce the same result
+        torch.testing.assert_close(result1.cpu(), result2.cpu(), rtol=1e-4, atol=1e-4)

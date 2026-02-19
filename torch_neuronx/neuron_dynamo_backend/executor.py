@@ -10,8 +10,13 @@ import torch
 import torch_neuronx
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
+from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
+    FunctionIO,
+    RandomInputInfo,
+    TensorSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +40,21 @@ class Executor:
         io_spec: FunctionIO,
         cast_spec: list[TensorSpec],
         has_collectives: bool = False,
+        retain_device: bool = False,
         mutation_info: AliasingInfo | None = None,
         none_output_info: NoneOutputInfo | None = None,
     ):
-        """
-        Initialize executor with cache key and I/O specifications.
+        """Initialize executor with cache key and I/O specifications.
 
         Args:
-            graph_name: Name of graph
-            cache_key: Cache key from compilation phase. Handle for executor.
-            io_spec: Input/output specifications from StableHLO.
-            cast_spec: Output specifications for final dtype.
-            has_collectives: Whether graph contains collective operations (default: False)
-            none_output_info: metadata on FX graph output spec
+            graph_name (str): Human-readable name for the graph.
+            cache_key (str): Cache key from compilation phase, used as execution handle.
+            io_spec (FunctionIO): Input/output specifications from StableHLO.
+            cast_spec (list[TensorSpec]): Output specifications for final dtype casting.
+            has_collectives (bool): Whether graph contains collective operations.
+            retain_device (bool): Whether to cast results back to the input device (default: False)
+            mutation_info (AliasingInfo | None): Input-output mutation relationships.
+            none_output_info (NoneOutputInfo | None): Metadata for None output restoration.
         """
         self.graph_name = graph_name
         self.cache_key = cache_key
@@ -57,6 +64,8 @@ class Executor:
         self.mutation_info = mutation_info
         self.none_output_info = none_output_info
 
+        self.retain_device = retain_device
+
         logger.debug(
             f"Executor initialized: cache_key={cache_key}, has_collectives={has_collectives}"
         )
@@ -65,30 +74,42 @@ class Executor:
         )
 
     def _prepare_inputs(self, inputs, device_id):
-        """
-        Prepare inputs for execution, handling device transfer and dtype conversion.
+        """Prepare inputs for execution with device transfer and dtype conversion.
 
         Neuron hardware doesn't support 64-bit dtypes natively. This method:
         - Converts Python scalars to scalar tensors
         - Transfers CPU tensors to neuron device
+          (unless TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY=1)
         - Downcasts 64-bit dtypes (int64, uint64, float64) to 32-bit equivalents
         - Handles scalar tensors by reshaping before view operation
 
         Args:
-            inputs: Iterable of input tensors and scalars
-            device_id: Target neuron device ID
+            inputs (Iterable): Input tensors and scalars.
+            device_id (int): Target neuron device ID.
 
         Yields:
-            torch.Tensor: Prepared inputs as tensors
+            torch.Tensor: Prepared inputs as tensors on neuron device.
+
+        Raises:
+            RuntimeError: If CPU tensors are provided and
+                          TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY=1.
         """
         device_str = f"neuron:{device_id}"
+        disable_cpu_autocopy = _getenv_bool("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", False)
 
-        for inp in inputs:
+        for i, inp in enumerate(inputs):
             # Convert Python scalars to scalar tensors
             if not isinstance(inp, torch.Tensor):
                 tensor = torch.tensor(inp, device=device_str)
+            elif inp.device.type == "cpu":
+                if disable_cpu_autocopy:
+                    raise RuntimeError(
+                        f"Input tensor at index {i} is on cpu device, expected neuron. "
+                        "Move tensor to Neuron device first with tensor.to('neuron')"
+                    )
+                tensor = inp.to(device_str)
             else:
-                tensor = inp.to(device_str) if inp.device.type == "cpu" else inp
+                tensor = inp
 
             if tensor.dtype in self.INT_64_TO_32:
                 if tensor.dim() == 0:
@@ -100,15 +121,14 @@ class Executor:
             yield tensor
 
     def _process_outputs(self, outputs):
-        """
-        Process execution outputs, handling dtype upcasting and alias filtering.
+        """Process execution outputs with dtype upcasting and alias filtering.
 
         Neuron hardware operates on 32-bit dtypes, so this method restores
         original 64-bit dtypes where needed. Aliased outputs are skipped since
         they were written directly to input buffers during execution.
 
         Args:
-            outputs: List of output tensors from graph execution.
+            outputs (list[torch.Tensor]): Output tensors from graph execution.
 
         Yields:
             torch.Tensor: Processed tensors with dtypes matching cast_spec.
@@ -148,22 +168,20 @@ class Executor:
         yield from tensors
 
     def _allocate_output(self, i, out, neuron_inputs, device_str):
-        """
-        Allocate a single output buffer for graph execution.
+        """Allocate a single output buffer for graph execution.
 
         For aliased outputs (in-place mutations), reuses the corresponding input
         buffer so mutations are visible to the caller. For non-aliased outputs,
         allocates a new empty tensor.
 
         Args:
-            i: Output index in io_spec.outputs.
-            out: TensorSpec for this output (shape, dtype).
-            neuron_inputs: List of prepared input tensors.
-            device_str: Target device string (e.g., "neuron:0").
+            i (int): Output index in io_spec.outputs.
+            out (TensorSpec): Tensor specification for this output.
+            neuron_inputs (list[torch.Tensor]): List of prepared input tensors.
+            device_str (str): Target device string (e.g., "neuron:0").
 
         Returns:
-            torch.Tensor: Either a reused input buffer (aliased) or a newly
-                allocated empty tensor (non-aliased).
+            torch.Tensor: Reused input buffer or newly allocated empty tensor.
         """
         if self.mutation_info is not None:
             mutated_output_to_input = dict(
@@ -179,37 +197,109 @@ class Executor:
             return neuron_inputs[mutated_output_to_input[i]]
         return torch.empty(out.shape, dtype=out.dtype, device=device_str)
 
-    def __call__(self, *inputs) -> tuple[torch.Tensor, ...]:
+    def _cast_output_device(self, original_inputs, outputs):
         """
-        Execute the compiled graph using cache-based execution.
-
-        Workflow:
-        1. Validate input count matches specs
-        2. Prepare inputs (device transfer + dtype downcast)
-        3. Allocate output buffers with 32-bit dtypes
-        4. Execute compiled graph via C++ runtime
-        5. Process outputs (dtype upcast to match specs)
+        Cast output tensors to the same device as the original inputs when
+        retain_device=True is set.
 
         Args:
-            *inputs: Input tensors matching io_spec.inputs
+            original_inputs: The original input tensors passed to the executor.
+            outputs: The output tensors from the graph execution.
+
+        Yields:
+            torch.Tensor: Output tensors cast to the same device as the inputs.
+        """
+        output_device = None
+
+        # Identify the input device type
+        for inp in original_inputs:
+            if inp is None or not isinstance(inp, torch.Tensor):
+                continue
+            if output_device is None:
+                output_device = inp.device.type
+            elif inp.device.type != output_device:
+                raise NEFFExecutionError(
+                    f"cannot mix input devices with TORCH_NEURONX_RETAIN_DEVICE_MODE=1, "
+                    f"got {output_device} and {inp.device.type}"
+                )
+
+        for i, output in enumerate(outputs):
+            if (
+                output is not None
+                and output_device is not None
+                and output.device.type != output_device
+            ):
+                if self.mutation_info:
+                    # mutations need to be propagated back to cpu inputs
+                    # that were automatically cast to neuron
+                    # SEE: test_retain_device_copies_mutated_output_to_original_input in
+                    # test_aliasing_executor.py
+                    input_idx = self.mutation_info.get_input_index(i)
+                    if input_idx is not None:
+                        original_input = original_inputs[input_idx]
+                        yield original_input.copy_(output.to(original_input.device))
+                        continue
+                yield output.to(output_device)
+            else:
+                yield output
+
+    def _generate_random_inputs(
+        self, random_input_info: RandomInputInfo, device_str: str
+    ) -> list[torch.Tensor]:
+        """Generate random mask inputs for dropout operations.
+
+        Args:
+            random_input_info: Metadata about random inputs needed
+            device_str: Target device string (e.g., "neuron:0")
 
         Returns:
-            tuple[torch.Tensor, ...]: Output tensors on neuron device with dtypes
-                                      matching cast_spec.
+            List of random tensor inputs
+        """
+        return [op.sample(device_str) for op in random_input_info.ops]
+
+    def __call__(self, *inputs) -> tuple[torch.Tensor, ...]:
+        """Execute the compiled graph using cache-based execution.
+
+        Workflow:
+        1. Validate input count matches io_spec.inputs
+        2. Prepare inputs (device transfer + dtype downcast)
+        3. Generate random inputs for dropout masks if needed
+        4. Allocate output buffers with 32-bit dtypes
+        5. Execute compiled graph via C++ runtime
+        6. Process outputs (dtype upcast to match specs)
+
+        Args:
+            *inputs: Input tensors matching io_spec.inputs.
+
+        Returns:
+            tuple[torch.Tensor, ...]: Output tensors on Neuron device with dtypes
+                matching cast_spec.
 
         Raises:
-            NEFFExecutionError: If input count doesn't match expected count
+            NEFFExecutionError: If input count doesn't match expected count.
         """
         logger.debug(f"Executor invoked: cache_key={self.cache_key}")
 
-        if len(inputs) != len(self.io_spec.inputs):
+        random_input_count = 0
+        if self.io_spec.random_input_info:
+            random_input_count = (
+                self.io_spec.random_input_info.new_input_count
+                - self.io_spec.random_input_info.original_input_count
+            )
+        if len(inputs) != (len(self.io_spec.inputs) - random_input_count):
             raise NEFFExecutionError(
-                f"Expected {len(self.io_spec.inputs)} inputs, " f"got {len(inputs)}"
+                f"Expected {len(self.io_spec.inputs)} inputs, got {len(inputs)}"
             )
 
         device_id = torch.neuron.current_device()
         device_str = f"neuron:{device_id}"
         neuron_inputs = list(self._prepare_inputs(inputs, device_id))
+
+        # Generate and append random inputs for dropout masks
+        if self.io_spec.random_input_info:
+            random_inputs = self._generate_random_inputs(self.io_spec.random_input_info, device_str)
+            neuron_inputs.extend(random_inputs)
+            logger.debug(f"Added {len(random_inputs)} random inputs for dropout masks")
 
         neuron_outputs = [
             self._allocate_output(i, out, neuron_inputs, device_str)
@@ -225,4 +315,9 @@ class Executor:
             self.has_collectives,
         )
 
-        return tuple(self._process_outputs(neuron_outputs))
+        outputs = tuple(self._process_outputs(neuron_outputs))
+
+        if self.retain_device:
+            return tuple(self._cast_output_device(inputs, outputs))
+        else:
+            return outputs

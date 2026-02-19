@@ -48,6 +48,6 @@ if [[ "$PYTEST_ARGS" == *"tests/huggingface"* ]]; then
     echo "Running: $ECHO_PREFIX $PYTEST_ARGS --ignore=tests/tmp"
     exec "${PY_CMD_PREFIX[@]}" $PYTEST_ARGS --ignore=tests/tmp
 else
-    echo "Running: $ECHO_PREFIX $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface"
-    exec "${PY_CMD_PREFIX[@]}" $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface
+    echo "Running: $ECHO_PREFIX $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface --ignore=tests/vertical"
+    exec "${PY_CMD_PREFIX[@]}" $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface --ignore=tests/vertical
 fi

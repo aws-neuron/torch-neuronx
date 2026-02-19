@@ -1,8 +1,6 @@
 import torch
 
-from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
-from torch_neuronx.utils import use_mlir_aten_ops
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -126,13 +124,11 @@ class ContiguousBroadcastImpl(OperationImplementation):
         kernel = self._get_kernel()
         target_shape = tuple(self_tensor.shape)
 
-        if use_mlir_aten_ops():
-            output = kernel(base_view, target_shape)
-        else:
-            from .jax.context import ExecutionContext
+        from .shared.context import ExecutionContext
 
-            exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
-            output = kernel(base_view, target_shape, context=exec_ctx)
+        exec_ctx = ExecutionContext(original_inputs=(base_view, target_shape), original_kwargs={})
+
+        output = kernel(base_view, target_shape, context=exec_ctx)
 
         return output
 
@@ -170,42 +166,12 @@ class ContiguousBroadcastImpl(OperationImplementation):
 
 
 @neuron_op("aten::contiguous", priority=95)  # lower priority than ContiguousTransposeImpl
-class ContiguousBroadcastJAXImpl(ContiguousBroadcastImpl):
-    """JAX implementation for broadcast-based contiguous operation."""
-
-    _kernel: JaxKernel | None = None
-
-    def can_handle(self, self_tensor, memory_format=None) -> bool:
-        if use_mlir_aten_ops():
-            return False
-        return super().can_handle(self_tensor, memory_format)
-
-    def __init__(self):
-        super().__init__()
-        if ContiguousBroadcastJAXImpl._kernel is None:
-
-            def expand_fn(x, target_shape):
-                import jax.numpy as jnp
-
-                return jnp.broadcast_to(x, target_shape)
-
-            ContiguousBroadcastJAXImpl._kernel = JaxKernel(
-                expand_fn, op_name="aten::contiguous", static_argnums=(1,)
-            )
-
-    def _get_kernel(self):
-        return ContiguousBroadcastJAXImpl._kernel
-
-
-@neuron_op("aten::contiguous", priority=95)  # lower priority than ContiguousTransposeImpl
 class ContiguousBroadcastMLIRImpl(ContiguousBroadcastImpl):
     """MLIR implementation for broadcast-based contiguous operation."""
 
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        if not use_mlir_aten_ops():
-            return False
         return super().can_handle(self_tensor, memory_format)
 
     def __init__(self):

@@ -42,12 +42,8 @@ generate_ld_library_path() {
         torch_lib_path="$workspace_dir/$pytorch_path/lib"
     fi
 
-    # Additional library paths relative to workspace
-    cuda_runtime_path="$workspace_dir/.venv/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
-    cuda_cupti_path="$workspace_dir/.venv/lib/python3.10/site-packages/nvidia/cuda_cupti/lib"
-
     # Construct the full LD_LIBRARY_PATH
-    echo "$torch_lib_path:$cuda_runtime_path:$cuda_cupti_path:${LD_LIBRARY_PATH:-}"
+    echo "$torch_lib_path:${LD_LIBRARY_PATH:-}"
 }
 
 # Function to print test results summary
@@ -71,6 +67,7 @@ VERBOSE=false
 CLEAN=false
 TEST_TARGET=""
 TEST_ENV_ARGS=()
+TEST_EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -86,24 +83,33 @@ while [[ $# -gt 0 ]]; do
             TEST_ENV_ARGS+=("$1")
             shift
             ;;
+        --runs_per_test=*|--cache_test_results=*|--test_timeout=*|--test_filter=*)
+            TEST_EXTRA_ARGS+=("$1")
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS] [TEST_TARGET]"
             echo ""
             echo "Options:"
-            echo "  -v, --verbose           Show verbose test output"
-            echo "  -c, --clean             Clean before testing"
-            echo "  --test_env=VAR=VALUE    Pass environment variable to test (can be used multiple times)"
-            echo "  -h, --help              Show this help message"
+            echo "  -v, --verbose                Show verbose test output"
+            echo "  -c, --clean                  Clean before testing"
+            echo "  --test_env=VAR=VALUE         Pass environment variable to test (can be used multiple times)"
+            echo "  --runs_per_test=N            Run each test N times"
+            echo "  --cache_test_results=no      Force re-run tests (ignore cache)"
+            echo "  --test_timeout=SECONDS       Set test timeout"
+            echo "  --test_filter=PATTERN         Filter tests by pattern"
+            echo "  -h, --help                   Show this help message"
             echo ""
             echo "Examples:"
-            echo "  $0                                                  # Run all C++ tests"
-            echo "  $0 //tests/csrc:NeuronDeviceTest                    # Run specific test"
-            echo "  $0 -v                                               # Run all tests with verbose output"
-            echo "  $0 -c //tests/csrc:all                              # Clean and run all tests"
-            echo "  $0 --test_env=TORCH_NEURONX_LOG_LEVEL=3 //tests/... # Run with debug logging"
+            echo "  $0                                                        # Run all C++ tests"
+            echo "  $0 //tests/csrc:NeuronDeviceTest                          # Run specific test"
+            echo "  $0 -v                                                     # Run all tests with verbose output"
+            echo "  $0 -c //tests/csrc:all                                    # Clean and run all tests"
+            echo "  $0 --test_env=TORCH_NEURONX_LOG_LEVEL=3 //tests/...       # Run with debug logging"
+            echo "  $0 --runs_per_test=10 --cache_test_results=no //tests/... # Run 10 times, no cache"
             echo ""
             echo "Environment Variables:"
-            echo "  PYTORCH_LOCAL_PATH    Path to PyTorch installation (default: .venv/lib/python3.10/site-packages/torch)"
+            echo "  PYTORCH_LOCAL_PATH    Path to PyTorch installation (default: .venv/lib/python-<version>/site-packages/torch)"
             exit 0
             ;;
         *)
@@ -118,7 +124,10 @@ if [ -z "$TEST_TARGET" ]; then
     TEST_TARGET="//:cpp_unit_tests"
 fi
 
-# Generate dynamic LD_LIBRARY_PATH
+# Set Python version (default from .python-version)
+PYTHON_VERSION="${PYTHON_VERSION:-$(cat .python-version)}"
+
+# Generate dynamic LD_LIBRARY_PATH (after PYTORCH_LOCAL_PATH is set)
 DYNAMIC_LD_LIBRARY_PATH=$(generate_ld_library_path "$PROJECT_ROOT")
 
 print_header "Configuration"
@@ -135,13 +144,19 @@ if [ "$CLEAN" = true ]; then
     bazel clean
 fi
 
-# Set up environment variables for PyTorch
-export PYTORCH_LOCAL_PATH="${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}"
-
 print_header "Running Tests"
 
 # Build Bazel command
 BAZEL_CMD="bazel test"
+
+BAZEL_CMD="$BAZEL_CMD --@rules_python//python/config_settings:python_version=$PYTHON_VERSION"
+BAZEL_CMD="$BAZEL_CMD --action_env=PYTHON_VERSION=$PYTHON_VERSION"
+
+# Set PYTHONHOME so tests that call Py_Initialize() can find the hermetic stdlib
+PYTHON_VERSION_UNDERSCORE="${PYTHON_VERSION//./_}"
+BAZEL_OUTPUT_BASE=$(bazel info output_base 2>/dev/null)
+PYTHONHOME=$(echo "$BAZEL_OUTPUT_BASE"/external/rules_python++python+python_${PYTHON_VERSION_UNDERSCORE}_*/)
+PYTHONHOME="${PYTHONHOME%/}"  # strip trailing slash
 
 # Add verbose flag if requested
 if [ "$VERBOSE" = true ]; then
@@ -153,8 +168,18 @@ fi
 # Add the dynamic LD_LIBRARY_PATH to the test environment
 BAZEL_CMD="$BAZEL_CMD --test_env=LD_LIBRARY_PATH=\"$DYNAMIC_LD_LIBRARY_PATH\""
 
+# Set PYTHONHOME for tests that embed Python via Py_Initialize()
+if [ -d "$PYTHONHOME" ]; then
+    BAZEL_CMD="$BAZEL_CMD --test_env=PYTHONHOME=$PYTHONHOME"
+fi
+
 # Add any --test_env arguments passed to the script
 for arg in "${TEST_ENV_ARGS[@]}"; do
+    BAZEL_CMD="$BAZEL_CMD $arg"
+done
+
+# Add any extra bazel arguments
+for arg in "${TEST_EXTRA_ARGS[@]}"; do
     BAZEL_CMD="$BAZEL_CMD $arg"
 done
 

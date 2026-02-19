@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import assert_raises, requires_nrt_streams
 
 
 class TestStreamCreation:
@@ -45,6 +45,7 @@ class TestStreamCreation:
         assert stream is not None
         assert stream.device.type == "neuron"
 
+    @requires_nrt_streams
     def test_stream_equality(self):
         """Test stream equality comparison."""
         stream1 = torch.neuron.Stream()
@@ -57,6 +58,7 @@ class TestStreamCreation:
         assert stream1 == stream1
         assert stream2 == stream2
 
+    @requires_nrt_streams
     def test_stream_hash(self):
         """Test stream hashing for use in sets/dicts."""
         stream1 = torch.neuron.Stream()
@@ -98,6 +100,7 @@ class TestStreamCreation:
         # Should contain useful information
         assert "Stream" in repr_str or "neuron" in repr_str.lower()
 
+    @requires_nrt_streams
     def test_multiple_stream_creation(self):
         """Test creating multiple streams doesn't interfere."""
         streams = []
@@ -113,6 +116,7 @@ class TestStreamCreation:
             for j in range(i + 1, len(streams)):
                 assert streams[i] != streams[j]
 
+    @requires_nrt_streams
     def test_stream_creation_sequential_safety(self):
         """Test creating multiple streams sequentially is safe."""
         streams = []
@@ -132,3 +136,14 @@ class TestStreamCreation:
 
         # All streams should be unique
         assert len(set(streams)) == len(streams)
+
+    def test_single_stream_mode_default(self):
+        """Test that single-stream mode routes all streams to default stream."""
+        default_stream = torch_neuronx.default_stream()
+        streams = [torch.neuron.Stream() for _ in range(5)]
+
+        # All created streams should be the default stream in single-stream mode
+        for stream in streams:
+            assert (
+                stream == default_stream
+            ), "Single-stream mode should route all streams to default"

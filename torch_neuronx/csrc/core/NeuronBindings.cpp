@@ -3,7 +3,9 @@
 #include <c10/core/Device.h>
 #include <c10/core/DeviceType.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
+#include <torch/csrc/Generator.h>
 #include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/extension.h>
 #include <torch/library.h>
 
@@ -13,6 +15,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -25,10 +28,12 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 // Include device management
+#include "torch_neuronx/csrc/core/NeuronBarrier.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronGuardImpl.h"
 #include "torch_neuronx/csrc/core/NeuronHooksInterface.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
+#include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
@@ -37,16 +42,20 @@
 #include "torch_neuronx/csrc/Stream.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
-#include "torch_neuronx/csrc/core/streams/StreamManager.h"
 // Metrics
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+// Include Distributed Work and Watchdog (for async collective completion tracking)
+#include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
+#include "torch_neuronx/csrc/distributed/NeuronWork.h"
 // Copy helpers
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
+// Runtime utilities (including profiling)
+#include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 // Operation execution
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
-// Slice utilities
-#include "torch_neuronx/csrc/utils/SliceUtils.h"
+// Profiler mapping collector
+#include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
 // Lazy transformation management
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistration.h"
@@ -54,17 +63,43 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/TypeUtils.h"
 // Internal operations
 #include "torch_neuronx/csrc/ops/InternalOps.h"
+#include "torch_neuronx/csrc/profiler/Registration.h"
 
 // Include Neuron Runtime headers
 extern "C" {
 #include <nrt/nrt.h>
 #include <nrt/nrt_experimental.h>
+#include <nrt/nrt_profile.h>
 }
 
 namespace torch_neuronx {
 
 // Forward declarations
 bool are_python_ops_registered();
+
+// Helper function to convert c10d::OpType to CollectiveDirectKernelExecution::CollectiveType
+at::neuron::CollectiveDirectKernelExecution::CollectiveType ConvertOpTypeToCollectiveType(
+    c10d::OpType op_type) {
+  using CollectiveType = at::neuron::CollectiveDirectKernelExecution::CollectiveType;
+  switch (op_type) {
+    case c10d::OpType::ALLGATHER:
+    case c10d::OpType::_ALLGATHER_BASE:
+      return CollectiveType::kAllGather;
+    case c10d::OpType::ALLREDUCE:
+      return CollectiveType::kAllReduce;
+    case c10d::OpType::REDUCE_SCATTER:
+      return CollectiveType::kReduceScatter;
+    case c10d::OpType::ALLTOALL:
+    case c10d::OpType::ALLTOALL_BASE:
+      return CollectiveType::kAllToAll;
+    case c10d::OpType::BROADCAST:
+      return CollectiveType::kBroadcast;
+    case c10d::OpType::REDUCE:
+      return CollectiveType::kReduce;
+    default:
+      TORCH_CHECK(false, "Unsupported collective operation type: ", static_cast<int>(op_type));
+  }
+}
 
 // Helper struct to hold input transformation processing results
 struct InputTransformationResult {
@@ -134,6 +169,27 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
 // Track slice tensors per tensor set for cleanup
 static std::unordered_map<nrt_tensor_set_t*, std::vector<nrt_tensor_t*>> slice_tensors_map;
 static std::mutex slice_tensors_mutex;
+
+// Prepares the tensors for kernel execution
+std::pair<std::vector<at::neuron::TensorDataRef>, std::vector<at::neuron::TensorContext>>
+PrepareKernelTensors(const std::vector<torch::Tensor>& tensors) {
+  std::vector<at::neuron::TensorDataRef> refs;
+  std::vector<at::neuron::TensorContext> contexts;
+  refs.reserve(tensors.size());
+  contexts.reserve(tensors.size());
+
+  for (const auto& t : tensors) {
+    if (!t.is_contiguous()) {
+      throw std::runtime_error("Cannot process non-contiguous tensors");
+    }
+    void* ptr = const_cast<void*>(t.storage().data());
+    contexts.push_back(at::neuron::TensorContext::FromTensor(t));
+    auto tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(ptr);
+    refs.emplace_back(std::move(tensor_ptr), ptr);
+  }
+
+  return {std::move(refs), std::move(contexts)};
+}
 
 // Whitelist of view operations that only manipulate metadata
 static const std::unordered_set<std::string> VIEW_OPS_WHITELIST = {
@@ -223,21 +279,9 @@ struct __attribute__((visibility("hidden"))) NeuronDeviceProperties {
 // Forward declarations
 static void neuron_cleanup_atexit();
 
-// Global initialization state
-static bool g_initialized = false;
-static std::mutex g_init_mutex;
-
-// Check if runtime is initialized
-bool is_initialized() {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-  return g_initialized;
-}
-
 // Runtime initialization
 void neuron_init() {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-
-  if (g_initialized) {
+  if (c10_neuron::is_initialized()) {
     return;
   }
 
@@ -291,7 +335,9 @@ void neuron_init() {
     }
   }
 
-  g_initialized = true;
+  at::neuron::InitializeStreamPools();
+
+  c10_neuron::set_initialized(true);
 
   // Register cleanup function
   std::atexit(neuron_cleanup_atexit);
@@ -299,7 +345,7 @@ void neuron_init() {
 
 // Maybe initialize - this is what native functions should call
 void maybe_lazy_init() {
-  if (!is_initialized()) {
+  if (!c10_neuron::is_initialized()) {
     neuron_init();
   }
 }
@@ -409,7 +455,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", &torch_neuronx::as_strided_neuron);
   m.impl("_reshape_alias", &torch_neuronx::_reshape_alias_neuron);
   m.impl("select_backward", &torch_neuronx::select_backward_neuron);
-  m.impl("slice_backward", &torch_neuronx::slice_backward_neuron);
   m.impl("argsort.stable", &torch_neuronx::argsort_stable_neuron);
   // Set Operations
   // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml#L8031-L8078
@@ -434,6 +479,19 @@ void set_python_ops_registered(bool registered) { g_python_ops_registered = regi
 
 bool are_python_ops_registered() { return g_python_ops_registered; }
 
+// Contiguous implementation for AutogradPrivateUse1
+at::Tensor contiguous_autograd_neuron(const at::Tensor& self, c10::MemoryFormat memory_format) {
+  if (self.unsafeGetTensorImpl()->is_python_dispatch()) {
+    // During dynamo tracing, just return a clone or the tensor itself
+    if (self.is_contiguous(memory_format)) {
+      return self;
+    }
+    return at::clone(self, memory_format);
+  }
+
+  return torch_neuronx::ops::contiguous_internal(self, memory_format);
+}
+
 // Simple autograd fallback that redispatches to the actual implementation
 // This prevents the CPU fallback warning for operations that have implementations
 void autograd_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys,
@@ -454,6 +512,12 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 // Register autograd fallback that just redispatches
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&torch_neuronx::autograd_fallback>());
+}
+
+// Register specific implementations for AutogradPrivateUse1
+// contiguous gets its own implementation to avoid going through the fallback dispatch
+TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+  m.impl("contiguous", &torch_neuronx::contiguous_autograd_neuron);
 }
 
 // Register autocast fallback
@@ -483,6 +547,19 @@ at::Tensor call_python_contiguous_op(const at::Tensor& self, c10::MemoryFormat m
 
 }  // namespace torch_neuronx
 
+namespace {
+// Helper function for PYBIND11 bindings to extract and validate nrt_inspect_config_t from Python
+// capsule Using anonymous namespace to keep it file-local without polluting global namespace
+static nrt_inspect_config_t* extract_inspect_config_from_capsule(
+    const py::capsule& config_capsule) {
+  nrt_inspect_config_t* options = static_cast<nrt_inspect_config_t*>(config_capsule.get_pointer());
+  if (!options) {
+    throw std::runtime_error("Invalid config capsule");
+  }
+  return options;
+}
+}  // anonymous namespace
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Initialize the logger
@@ -505,6 +582,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("_register_device", &torch_neuronx::register_neuron_device,
         "Register neuron as a device type in PyTorch");
+  m.def("_register_profiler", &at::neuron::registerNeuronProfiler,
+        "Register Neuron profiler with libkineto");
   m.def("_set_python_ops_registered", &torch_neuronx::set_python_ops_registered,
         "Set flag indicating Python operations are registered");
   m.def(
@@ -523,80 +602,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Raw NRT memory operations for CPU fallback
   m.def(
       "_nrt_copy_raw_to_cpu",
-      [](const at::Tensor& src, at::Tensor& dst, int device_id, bool non_blocking = false) {
-        TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
-                    "Expected Neuron tensor, got ", src.device());
-        TORCH_CHECK(dst.device().is_cpu(), "Destination tensor must be on CPU, got ", dst.device());
-
-        void* dst_data_ptr = dst.data_ptr();
-        size_t src_offset = src.storage_offset() * src.element_size();
-        size_t size = dst.nbytes();
-
-        if (!at::neuron::utils::IsSyncModeEnabled()) {
-          void* src_ptr = at::neuron::utils::GetBaseTensorPtr(src.data_ptr(), src_offset);
-          auto read_kernel = std::make_unique<at::neuron::ReadDirectKernelExecution>(
-              "neuron::copy::neuron_to_cpu", src_ptr, dst_data_ptr, src_offset, size, device_id);
-          auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
-          auto current_stream = at::neuron::getCurrentNeuronStream(device_id);
-          at::neuron::SubmitOperationContext(current_stream, std::move(context));
-          if (!non_blocking) {
-            at::neuron::synchronize(device_id);
-          }
-          return;
-        }
-
-        // Perform the copy
-        auto storage_impl = src.storage().unsafeGetStorageImpl();
-        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
-        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
-        torch_neuronx::utils::nrt_copy_neuron_to_cpu(nrt_tensor, dst_data_ptr, src_offset, size);
+      [](const at::Tensor& src, at::Tensor& dst, bool non_blocking = false) {
+        torch_neuronx::utils::copy_neuron_to_cpu(src, dst, non_blocking);
       },
       "Copy raw data from Neuron device to CPU tensor");
 
   m.def(
       "_nrt_copy_cpu_to_raw",
-      [](const at::Tensor& src, const at::Tensor& dst, int device_id, bool non_blocking = false) {
-        TORCH_CHECK(src.device().is_cpu(), "Source tensor must be on CPU, got ", src.device());
-        TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
-                    "Destination tensor must be on Neuron device, got ", dst.device());
-        TORCH_CHECK(dst.is_contiguous(), "Destination tensor must be contiguous");
-
-        void* src_data_ptr = src.data_ptr();
-        size_t size = src.nbytes();
-        size_t dst_offset = dst.storage_offset() * dst.element_size();
-
-        auto storage_impl = dst.storage().unsafeGetStorageImpl();
-        auto neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage_impl);
-
-        if (!at::neuron::utils::IsSyncModeEnabled()) {
-          void* dst_ptr = at::neuron::utils::GetBaseTensorPtr(dst.data_ptr(), dst_offset);
-
-          std::unique_ptr<at::neuron::WriteDirectKernelExecution> write_kernel;
-          bool needs_sync = !non_blocking;
-
-          if (src.numel() == 1) {
-            // Scalar path - value captured inline, no sync needed
-            write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
-                "neuron::copy::cpu_to_neuron_scalar", src.item(), dst_ptr, dst_offset,
-                src.scalar_type(), device_id);
-            needs_sync = false;
-          } else {
-            // Buffer path
-            write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
-                "neuron::copy::cpu_to_neuron", src_data_ptr, dst_ptr, dst_offset, size, device_id);
-          }
-
-          auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
-          at::neuron::SubmitOperationContext(at::neuron::getCurrentNeuronStream(device_id),
-                                             std::move(context));
-          if (needs_sync) {
-            at::neuron::synchronize(device_id);
-          }
-          return;
-        }
-
-        nrt_tensor_t* nrt_tensor = neuron_storage->neuron_tensor();
-        torch_neuronx::utils::nrt_copy_cpu_to_neuron(src_data_ptr, nrt_tensor, dst_offset, size);
+      [](const at::Tensor& src, at::Tensor& dst, bool non_blocking = false) {
+        torch_neuronx::utils::copy_cpu_to_neuron(src, dst, non_blocking);
       },
       "Copy raw data from CPU tensor to Neuron device");
 
@@ -648,7 +662,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("dst_neuron"), py::arg("non_blocking") = false);
 
   m.def("version", []() { return "0.1.0"; });
-  m.def("_is_neuron_runtime_initialized", &torch_neuronx::is_initialized,
+  m.def(
+      "_get_default_generator",
+      [](c10::DeviceIndex device_index) -> py::object {
+        return py::reinterpret_steal<py::object>(THPGenerator_initDefaultGenerator(
+            torch_neuronx::getDefaultNeuronGenerator(device_index)));
+      },
+      "Get the default generator for a Neuron device", py::arg("device_index") = -1);
+  m.def("_is_neuron_runtime_initialized", &c10_neuron::is_initialized,
         "Check if the runtime is initialized");
   m.def("_neuron_init", &torch_neuronx::neuron_init, "Initialize Neuron runtime");
   m.def("_neuron_getDeviceCount", &torch_neuronx::neuron_getDeviceCount,
@@ -679,6 +700,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "_vnc_count", []() { return c10_neuron::vnc_count(); },
       "Get the number of visible neuron cores");
+  m.def(
+      "_reset_vnc_count", []() { c10_neuron::reset_vnc_count(); },
+      "Reset the cached vnc count so it re-queries NRT");
 
   // Stream management functions
   m.def(
@@ -917,13 +941,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "_nrt_barrier",
       [](py::int_ device_id, py::int_ global_device_id, py::int_ global_device_count) {
-        torch_neuronx::maybe_lazy_init();
-        at::neuron::synchronize(global_device_id);
-        NRT_STATUS status = nrt_barrier(device_id, global_device_id, global_device_count);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to execute the device barrier " +
-                                   std::to_string(status));
-        }
+        nrt_barrier_impl(device_id, global_device_id, global_device_count);
       },
       "Execute barrier across all the devices", py::arg("device_id"), py::arg("global_device_id"),
       py::arg("global_device_count"));
@@ -1027,16 +1045,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::dict result;
 
         // Get counter values from centralized metrics
-        auto hits_data = metrics_arena->GetCounter("CompilationCache.Hits");
-        auto misses_data = metrics_arena->GetCounter("CompilationCache.Misses");
+        auto in_memory_hits_data = metrics_arena->GetCounter("CompilationCache.InMemoryHits");
+        auto in_memory_misses_data = metrics_arena->GetCounter("CompilationCache.InMemoryMisses");
+        auto persistent_hits_data = metrics_arena->GetCounter("CompilationCache.PersistentHits");
+        auto persistent_misses_data =
+            metrics_arena->GetCounter("CompilationCache.PersistentMisses");
         auto evictions_data = metrics_arena->GetCounter("CompilationCache.Evictions");
         auto total_compilations_data =
             metrics_arena->GetCounter("CompilationCache.TotalCompilations");
 
-        int64_t cache_hits = hits_data ? hits_data->Value() : 0;
-        int64_t cache_misses = misses_data ? misses_data->Value() : 0;
+        int64_t in_memory_hits = in_memory_hits_data ? in_memory_hits_data->Value() : 0;
+        int64_t in_memory_misses = in_memory_misses_data ? in_memory_misses_data->Value() : 0;
+        int64_t persistent_hits = persistent_hits_data ? persistent_hits_data->Value() : 0;
+        int64_t persistent_misses = persistent_misses_data ? persistent_misses_data->Value() : 0;
         int64_t evictions = evictions_data ? evictions_data->Value() : 0;
         int64_t total_compilations = total_compilations_data ? total_compilations_data->Value() : 0;
+
+        // Compute aggregate hits/misses for backward compatibility
+        int64_t cache_hits = in_memory_hits + persistent_hits;
+        int64_t cache_misses = in_memory_misses + persistent_misses;
+
+        size_t total_entries = cache.GetCacheSize();
 
         // Get metric data for timing and memory
         auto compilation_time_metric = metrics_arena->GetMetric("CompilationCache.CompilationTime");
@@ -1068,7 +1097,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             max_cache_size_bytes > 0 ? (double)current_memory_usage / max_cache_size_bytes : 0.0;
 
         // Populate result dictionary
-        result["total_entries"] = total_compilations;
+        result["total_entries"] = total_entries;
+        result["in_memory_hits"] = in_memory_hits;
+        result["in_memory_misses"] = in_memory_misses;
+        result["persistent_hits"] = persistent_hits;
+        result["persistent_misses"] = persistent_misses;
         result["cache_hits"] = cache_hits;
         result["cache_misses"] = cache_misses;
         result["hit_rate"] = hit_rate;
@@ -1076,6 +1109,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["total_compilation_time_ms"] =
             total_compilation_time_us / 1000.0;  // Convert µs to ms
         result["evictions_performed"] = evictions;
+        result["total_compilations"] = total_compilations;
         result["max_cache_size_bytes"] = max_cache_size_bytes;
         result["max_cache_entries"] = max_cache_entries;
         result["memory_utilization_ratio"] = memory_utilization_ratio;
@@ -1090,7 +1124,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         cache.Clear();
       },
       "Clear the compilation cache");
-
+  m.def(
+      "_clear_compilation_memory_cache",
+      []() {
+        auto& cache = at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
+        cache.ClearInMemoryCache();
+      },
+      "Clear the compilation cache");
   m.def(
       "_get_compilation_cache_entries",
       []() -> py::list {
@@ -1216,6 +1256,52 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       [](bool enabled) { at::neuron::metrics::SetMetricsEnabled(enabled); },
       "Enable or disable metrics collection at runtime", py::arg("enabled"));
 
+  // ============================================================================
+  // Memory Statistics Bindings
+  // ============================================================================
+
+  m.def(
+      "_get_memory_stats",
+      [](int device_index) -> py::dict {
+        auto stats =
+            at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetMemoryStats(device_index);
+
+        auto statToDict = [](const at::neuron::metrics::MemoryStatInfo& stat) {
+          py::dict d;
+          d["current"] = stat.current;
+          d["peak"] = stat.peak;
+          d["allocated"] = stat.allocated;
+          d["freed"] = stat.freed;
+          return d;
+        };
+
+        py::dict result;
+        result["allocated_bytes"] = statToDict(stats.allocated_bytes);
+        result["reserved_bytes"] = statToDict(stats.reserved_bytes);
+        result["active_bytes"] = statToDict(stats.active_bytes);
+        result["num_alloc_retries"] = stats.num_alloc_retries;
+        result["num_ooms"] = stats.num_ooms;
+        result["num_tensor_frees"] = stats.num_tensor_frees;
+        result["allocation_requests"] = stats.allocation_requests;
+        return result;
+      },
+      "Get memory statistics for a device", py::arg("device_index"));
+
+  m.def(
+      "_reset_peak_memory_stats",
+      [](int device_index) {
+        at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().ResetPeakStats(device_index);
+      },
+      "Reset peak memory statistics", py::arg("device_index"));
+
+  m.def(
+      "_reset_accumulated_memory_stats",
+      [](int device_index) {
+        at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().ResetAccumulatedStats(
+            device_index);
+      },
+      "Reset accumulated memory statistics", py::arg("device_index"));
+
   m.def(
       "_submit_xla_task_to_pipeline",
       [](const std::string& op_name, const std::vector<torch::Tensor>& inputs,
@@ -1237,17 +1323,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             reinterpret_cast<const uint8_t*>(ir_str.data()),
             reinterpret_cast<const uint8_t*>(ir_str.data()) + ir_str.size());
 
-        // Store tensor metadata as TensorContext
-        std::vector<at::neuron::TensorContext> input_tensors_context;
-        input_tensors_context.reserve(inputs.size());
-        for (const auto& tensor : inputs) {
-          input_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
+        // Convert Python CPU fallback context to C++ struct
+        at::neuron::CPUFallbackContext fallback_ctx =
+            at::neuron::utils::ConvertToCPUFallbackContext(cpu_fallback_context);
+
+        int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, outputs);
+
+        // Extract tensor data with contiguity validation
+        auto [input_refs, input_contexts] =
+            torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
+        auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(outputs);
+
+        auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
+            op_name, std::move(input_refs), std::move(output_refs), input_contexts, output_contexts,
+            cache_key, ir_bytes, has_collectives, device_id);
+
+        if (transform_result.has_input_transforms) {
+          xla_kernel->SetInputTransformations(std::move(transform_result.kernel_transforms));
         }
 
-        std::vector<at::neuron::TensorContext> output_tensors_context;
-        output_tensors_context.reserve(outputs.size());
-        for (const auto& tensor : outputs) {
-          output_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
+        auto context = std::make_unique<at::neuron::OperationContext>(
+            std::move(xla_kernel), python_stack_trace, std::move(fallback_ctx));
+        at::neuron::SubmitOperationContext(stream, std::move(context));
+      },
+      "Submit XLA task with pre-lowered IR for asynchronous execution", py::arg("op_name"),
+      py::arg("inputs"), py::arg("outputs"), py::arg("lowered_ir_bytes"), py::arg("stream"),
+      py::arg("cache_key"), py::arg("python_stack_trace"), py::arg("has_collectives"),
+      py::arg("cpu_fallback_context") = py::none());
+
+  // Submit collective operation for asynchronous execution
+  m.def(
+      "_submit_collective_task_to_pipeline",
+      [](const std::string& op_name, const std::vector<torch::Tensor>& inputs,
+         const std::vector<torch::Tensor>& outputs, int64_t op_type, int64_t reduce_op,
+         const std::vector<std::vector<int>>& replica_groups, py::object stream_obj,
+         const std::string& python_stack_trace,
+         const py::object& cpu_fallback_context = py::none()) {
+        // Process input transformations (has_collectives=true makes non-contiguous inputs
+        // contiguous)
+        auto transform_result =
+            torch_neuronx::ProcessInputTransformations(op_name, inputs, /*has_collectives=*/true);
+
+        // Resolve stream
+        at::neuron::NeuronStream stream;
+        if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
+          stream = THNPStream_Unpack(stream_obj.ptr());
+        } else {
+          stream = at::neuron::getCurrentNeuronStream();
         }
 
         // Convert Python CPU fallback context to C++ struct
@@ -1255,27 +1377,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             at::neuron::utils::ConvertToCPUFallbackContext(cpu_fallback_context);
 
         int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, outputs);
-        // Process tensors with slicing - updates fallback_ctx.tensor_data_ptrs in-place
-        std::vector<void*> src_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
-            transform_result.final_inputs, fallback_ctx, stream, device_id);
-        std::vector<void*> dst_ptrs =
-            at::neuron::utils::ProcessTensorsWithSlicing(outputs, fallback_ctx, stream, device_id);
 
-        auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
-            op_name, src_ptrs, dst_ptrs, cache_key, ir_bytes, has_collectives, device_id);
+        // Extract tensor data with contiguity validation
+        auto [input_refs, input_contexts] =
+            torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
+        auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(outputs);
 
-        if (transform_result.has_input_transforms) {
-          xla_kernel->SetInputTransformations(std::move(transform_result.kernel_transforms));
-        }
+        // Convert c10d::OpType to CollectiveType
+        auto collective_type =
+            torch_neuronx::ConvertOpTypeToCollectiveType(static_cast<c10d::OpType>(op_type));
 
+        // Extract dtype from input tensors
+        TORCH_CHECK(!transform_result.final_inputs.empty(),
+                    "Collective operation requires at least one input tensor");
+        c10::ScalarType dtype = transform_result.final_inputs[0].scalar_type();
+
+        // Create CollectiveDirectKernelExecution with v3 constructor signature
+        auto collective_kernel = std::make_unique<at::neuron::CollectiveDirectKernelExecution>(
+            op_name, collective_type, std::move(input_refs), std::move(output_refs), input_contexts,
+            output_contexts, dtype,
+            c10d::ReduceOp(static_cast<c10d::ReduceOp::RedOpType>(reduce_op)), replica_groups,
+            device_id);
+
+        // Create and submit OperationContext
         auto context = std::make_unique<at::neuron::OperationContext>(
-            std::move(xla_kernel), input_tensors_context, output_tensors_context,
-            python_stack_trace, std::move(fallback_ctx));
+            std::move(collective_kernel), python_stack_trace, std::move(fallback_ctx));
+
         at::neuron::SubmitOperationContext(stream, std::move(context));
       },
-      "Submit XLA task with pre-lowered IR for asynchronous execution", py::arg("op_name"),
-      py::arg("inputs"), py::arg("outputs"), py::arg("lowered_ir_bytes"), py::arg("stream"),
-      py::arg("cache_key"), py::arg("python_stack_trace"), py::arg("has_collectives"),
+      "Submit collective operation for asynchronous execution", py::arg("op_name"),
+      py::arg("inputs"), py::arg("outputs"), py::arg("op_type"), py::arg("reduce_op"),
+      py::arg("replica_groups"), py::arg("stream"), py::arg("python_stack_trace"),
       py::arg("cpu_fallback_context") = py::none());
 
   // torch.compile: compile StableHLO to NEFF and store in cache
@@ -1297,8 +1429,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // Create OperationContext for compilation
         std::vector<at::neuron::TensorContext> empty_input_context;
         std::vector<at::neuron::TensorContext> empty_output_context;
-        auto context = std::make_unique<at::neuron::OperationContext>(
-            std::move(compile_kernel), empty_input_context, empty_output_context, "");
+        auto context =
+            std::make_unique<at::neuron::OperationContext>(std::move(compile_kernel), "");
 
         // Submit for compilation via proper stream infrastructure
         auto stream = at::neuron::getCurrentNeuronStream();
@@ -1323,54 +1455,75 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // Extract device_id from tensors
         int target_device_id = c10_neuron::GetTargetDeviceId(inputs, outputs);
 
-        // Create empty fallback context
-        at::neuron::CPUFallbackContext fallback_ctx;
+        // Extract tensor data with contiguity validation
+        auto [input_refs, input_contexts] = torch_neuronx::PrepareKernelTensors(inputs);
+        auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(outputs);
 
-        // Get tensor data pointers with slicing support
-        std::vector<void*> input_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
-            inputs, fallback_ctx, stream, target_device_id);
-        std::vector<void*> output_ptrs = at::neuron::utils::ProcessTensorsWithSlicing(
-            outputs, fallback_ctx, stream, target_device_id);
-
-        // Create NeffDirectKernelExecution with NEFF bytes
         auto kernel = std::make_unique<at::neuron::NeffDirectKernelExecution>(
-            graph_name, cache_key, input_ptrs, output_ptrs, target_device_id, has_collectives);
-
-        // Store tensor metadata
-        std::vector<at::neuron::TensorContext> input_tensors_context;
-        input_tensors_context.reserve(inputs.size());
-        for (const auto& tensor : inputs) {
-          input_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
-        }
-
-        std::vector<at::neuron::TensorContext> output_tensors_context;
-        output_tensors_context.reserve(outputs.size());
-        for (const auto& tensor : outputs) {
-          output_tensors_context.push_back(at::neuron::TensorContext::FromTensor(tensor));
-        }
+            graph_name, cache_key, std::move(input_refs), std::move(output_refs), input_contexts,
+            output_contexts, target_device_id, has_collectives);
 
         // Create and submit operation context
-        auto context = std::make_unique<at::neuron::OperationContext>(
-            std::move(kernel), input_tensors_context, output_tensors_context, "",
-            std::move(fallback_ctx));
+        auto context = std::make_unique<at::neuron::OperationContext>(std::move(kernel), "");
         at::neuron::SubmitOperationContext(stream, std::move(context));
       },
       "Execute compiled graph using cache key", py::arg("graph_name"), py::arg("cache_key"),
       py::arg("inputs"), py::arg("outputs"), py::arg("has_collectives"));
 
+  // torch.compile MegaCache: write NEFF to persistent cache
+  m.def(
+      "put_neff_cache",
+      [](const std::string& key, py::bytes neff_bytes) -> bool {
+        at::neuron::PersistentCacheBackend cache;
+
+        std::string_view neff_str = neff_bytes.cast<std::string_view>();
+        // Copy required: Put() takes const ref, needs owned data
+        std::vector<uint8_t> neff_vec(neff_str.begin(), neff_str.end());
+
+        return cache.Put(key, neff_vec);
+      },
+      "Write NEFF to persistent cache", py::arg("key"), py::arg("neff_bytes"));
+
+  // torch.compile MegaCache: read NEFF from persistent cache
+  m.def(
+      "get_neff_cache",
+      [](const std::string& key) -> py::object {
+        at::neuron::PersistentCacheBackend cache;
+
+        auto result = cache.Get(key);
+        if (result.has_value()) {
+          return py::bytes(reinterpret_cast<const char*>(result->data()), result->size());
+        }
+        return py::none();
+      },
+      "Read NEFF from persistent cache, returns None if not found", py::arg("key"));
+
+  // torch.compile MegaCache: get NEFF info from in-memory compilation cache
+  m.def(
+      "get_neff_info",
+      [](const std::string& cache_key) -> py::object {
+        auto& cache = at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
+        auto entry = cache.GetEntry(cache_key);
+        if (!entry) {
+          return py::none();
+        }
+        return py::make_tuple(entry->persistent_cache_key,
+                              py::bytes(reinterpret_cast<const char*>(entry->neff_bytes.data()),
+                                        entry->neff_bytes.size()));
+      },
+      "Get (persistent_key, neff_bytes) from compilation cache, returns None if not found",
+      py::arg("cache_key"));
+
   // Register cleanup function that runs during module destruction
   // This happens before Python's atexit handlers and before C++ destructors
   static auto cleanup_streams_func = +[]() {
     try {
-      // Synchronize all devices to ensure pending operations complete
-      // This runs while Python services are still available for C++ -> Python calls
-      auto& manager = at::neuron::NeuronResourceManager::Instance().GetStreamManager();
-      int device_count = torch_neuronx::neuron_getDeviceCount();
-      for (int device_idx = 0; device_idx < device_count; ++device_idx) {
-        manager.SynchronizeDevice(device_idx);
+      auto devices = c10_neuron::get_visible_device_indices();
+      // Synchronize all initialized devices to ensure pending operations complete
+      for (auto device : devices) {
+        at::neuron::synchronize(device);
       }
     } catch (const std::exception& e) {
-      // Log error but don't throw during cleanup
       std::cerr << "Warning: Stream cleanup failed during module destruction: " << e.what()
                 << std::endl;
     } catch (...) {
@@ -1379,7 +1532,277 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     }
   };
 
+  // Profiler mapping collector functions
+  m.def(
+      "_set_profiler_mapping_enabled",
+      [](bool enabled) { at::neuron::ProfilerMappingCollector::Instance().SetEnabled(enabled); },
+      "Enable/disable profiler mapping collection", py::arg("enabled"));
+
+  m.def(
+      "_get_profiler_mappings",
+      []() -> py::dict {
+        auto mappings = at::neuron::ProfilerMappingCollector::Instance().GetAndClear();
+        py::list data;
+        for (const auto& [seq_id, fw_ids] : mappings) {
+          py::list fw_list;
+          for (const auto& fw_id : fw_ids) {
+            py::dict fw_dict;
+            fw_dict["seq_nr"] = fw_id.seq_nr;
+            fw_dict["th_id"] = fw_id.th_id;
+            fw_dict["stream_id"] = fw_id.stream_id;
+            fw_dict["os_tid"] = fw_id.os_tid;
+            fw_list.append(fw_dict);
+          }
+          py::dict entry;
+          entry["nrta_seq_id"] = seq_id;
+          entry["framework_op_exec_ids"] = fw_list;
+          data.append(entry);
+        }
+        py::dict result;
+        result["version"] = 1;
+        result["data"] = data;
+        return result;
+      },
+      "Get and clear profiler mappings (nrta_sequence_id -> framework_op_exec_ids)");
+
+  // NRT profiling functions
+
+  m.def(
+      "_nrt_inspect_stop", []() -> int { return static_cast<int>(at::neuron::nrt::StopInspect()); },
+      "Stop NRT profiling/tracing");
+
+  m.def(
+      "_nrt_inspect_config_allocate",
+      []() -> py::capsule {
+        nrt_inspect_config_t* options = nullptr;
+        NRT_STATUS status = at::neuron::nrt::AllocateInspectConfig(&options);
+        if (status != NRT_SUCCESS) {
+          throw std::runtime_error("Failed to allocate NRT inspect config. Status: " +
+                                   std::to_string(status));
+        }
+        // Return as a PyCapsule with automatic cleanup using wrapper function
+        return py::capsule(options, "nrt_inspect_config_t", [](void* ptr) {
+          nrt_inspect_config_t* config = static_cast<nrt_inspect_config_t*>(ptr);
+          if (config) {
+            at::neuron::nrt::FreeInspectConfig(config);
+          }
+        });
+      },
+      "Allocate NRT inspect config structure");
+
+  m.def(
+      "_nrt_inspect_config_set_defaults",
+      [](py::capsule config_capsule) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(at::neuron::nrt::SetInspectConfigDefaults(options));
+      },
+      "Set NRT inspect config to defaults", py::arg("config_capsule"));
+
+  m.def(
+      "_nrt_inspect_config_set_output_dir",
+      [](py::capsule config_capsule, const std::string& output_dir) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(
+            at::neuron::nrt::SetInspectConfigOutputDir(options, output_dir.c_str()));
+      },
+      "Set NRT inspect output directory", py::arg("config_capsule"), py::arg("output_dir"));
+
+  m.def(
+      "_nrt_inspect_config_set_capture_enabled_for_nc",
+      [](py::capsule config_capsule, uint32_t nc_idx, bool enabled) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(
+            at::neuron::nrt::SetInspectConfigCaptureEnabledForNC(options, nc_idx, enabled));
+      },
+      "Enable/disable capture for specific NeuronCore", py::arg("config_capsule"),
+      py::arg("nc_idx"), py::arg("enabled"));
+
+  m.def(
+      "_nrt_inspect_config_set_capture_enabled_for_event_type_string",
+      [](py::capsule config_capsule, const std::string& event_type, bool enabled) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(at::neuron::nrt::SetInspectConfigCaptureEnabledForEventType(
+            options, event_type.c_str(), enabled));
+      },
+      "Enable/disable capture for specific event type", py::arg("config_capsule"),
+      py::arg("event_type"), py::arg("enabled"));
+
+  m.def(
+      "_nrt_inspect_config_set_enable_inspect",
+      [](py::capsule config_capsule, bool enable_inspect) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(
+            at::neuron::nrt::SetInspectConfigEnableInspect(options, enable_inspect));
+      },
+      "Enable/disable inspect profiling", py::arg("config_capsule"), py::arg("enable_inspect"));
+
+  m.def(
+      "_nrt_inspect_config_set_device_profile_mode",
+      [](py::capsule config_capsule, int device_profile_mode) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(
+            at::neuron::nrt::SetInspectConfigDeviceProfileMode(options, device_profile_mode));
+      },
+      "Set device profile mode for inspect profiling", py::arg("config_capsule"),
+      py::arg("device_profile_mode"));
+
+  m.def(
+      "_nrt_inspect_config_get_all_activity_types",
+      []() -> py::list {
+        const char** activity_types = nullptr;
+        size_t count = 0;
+        NRT_STATUS status = at::neuron::nrt::GetAllActivityTypes(&activity_types, &count);
+        if (status != NRT_SUCCESS) {
+          throw std::runtime_error("Failed to get all activity types. Status: " +
+                                   std::to_string(status));
+        }
+
+        py::list result;
+        for (size_t i = 0; i < count; ++i) {
+          result.append(py::str(activity_types[i]));
+        }
+
+        // Clean up allocated memory using wrapper function
+        at::neuron::nrt::FreeActivityTypes(activity_types, count);
+
+        return result;
+      },
+      "Get all available activity types");
+
+  m.def(
+      "_nrt_inspect_begin_with_options",
+      [](py::capsule config_capsule) -> int {
+        nrt_inspect_config_t* options = extract_inspect_config_from_capsule(config_capsule);
+        return static_cast<int>(at::neuron::nrt::BeginInspectWithOptions(options));
+      },
+      "Begin NRT profiling with configuration options", py::arg("config_capsule"));
+
   // Create a capsule that will call cleanup_streams_func when the module is destroyed
   auto cleanup_capsule = py::capsule(cleanup_streams_func);
   m.add_object("_stream_cleanup_capsule", cleanup_capsule);
+
+  // ============== Distributed Bindings ==============
+  // NeuronWork class for tracking async collective operations
+  // Inherit from c10d::Work and use intrusive_ptr so PyTorch's distributed
+  // code can cast NeuronWork back to c10d::Work when needed
+  py::class_<torch_neuronx::distributed::NeuronWork, c10d::Work,
+             c10::intrusive_ptr<torch_neuronx::distributed::NeuronWork>>(m, "NeuronWork")
+      .def(py::init([](const std::string& pg_uid, const std::string& pg_desc, int device_index,
+                       int rank, const std::string& op_type, uint64_t seq_num,
+                       std::vector<at::Tensor> outputs, bool enable_timing, float timeout_ms,
+                       py::object stream_obj) {
+             at::Device device(c10::DeviceType::PrivateUse1, device_index);
+             at::neuron::NeuronStream* stream_ptr = nullptr;
+             at::neuron::NeuronStream stream;
+             if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
+               stream = THNPStream_Unpack(stream_obj.ptr());
+               stream_ptr = &stream;
+             }
+             return c10::make_intrusive<torch_neuronx::distributed::NeuronWork>(
+                 pg_uid, pg_desc, device, rank, op_type, seq_num, std::move(outputs), enable_timing,
+                 timeout_ms, stream_ptr);
+           }),
+           py::arg("pg_uid"), py::arg("pg_desc"), py::arg("device_index"), py::arg("rank"),
+           py::arg("op_type"), py::arg("seq_num"), py::arg("outputs") = std::vector<at::Tensor>(),
+           py::arg("enable_timing") = false, py::arg("timeout_ms") = 300000.0f,
+           py::arg("stream") = py::none())
+      .def("is_completed", &torch_neuronx::distributed::NeuronWork::isCompleted,
+           "Check if work has completed (non-blocking)")
+      .def(
+          "wait",
+          [](torch_neuronx::distributed::NeuronWork& self, int64_t timeout_ms) {
+            if (timeout_ms < 0) {
+              return self.wait();
+            }
+            return self.wait(std::chrono::milliseconds(timeout_ms));
+          },
+          "Block until work completes", py::arg("timeout_ms") = -1)
+      .def("synchronize", &torch_neuronx::distributed::NeuronWork::synchronize,
+           "Make current stream wait for this work")
+      .def(
+          "get_future",
+          [](torch_neuronx::distributed::NeuronWork& self)
+              -> std::shared_ptr<torch::jit::PythonFutureWrapper> {
+            return std::make_shared<torch::jit::PythonFutureWrapper>(self.getFuture());
+          },
+          "Get future for async completion tracking")
+      .def(
+          "record_start_event",
+          [](torch_neuronx::distributed::NeuronWork& self, py::object stream_obj) {
+            at::neuron::NeuronStream* stream_ptr = nullptr;
+            at::neuron::NeuronStream stream;
+            if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
+              stream = THNPStream_Unpack(stream_obj.ptr());
+              stream_ptr = &stream;
+            }
+            self.recordStartEvent(stream_ptr);
+          },
+          "Record start event for timing", py::arg("stream") = py::none())
+      .def(
+          "record_end_event",
+          [](torch_neuronx::distributed::NeuronWork& self, py::object stream_obj) {
+            at::neuron::NeuronStream* stream_ptr = nullptr;
+            at::neuron::NeuronStream stream;
+            if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
+              stream = THNPStream_Unpack(stream_obj.ptr());
+              stream_ptr = &stream;
+            }
+            self.recordEndEvent(stream_ptr);
+          },
+          "Record end event for completion tracking", py::arg("stream") = py::none())
+      .def("stash", &torch_neuronx::distributed::NeuronWork::stash,
+           "Stash tensors to keep them alive until work completes", py::arg("tensors"))
+      .def("unstash_tensors", &torch_neuronx::distributed::NeuronWork::unstashTensors,
+           "Release stashed tensor references")
+      .def("register_with_tensors", &torch_neuronx::distributed::NeuronWork::registerWithTensors,
+           "Register work with output tensors for wait_tensor() support")
+      .def("get_sequence_number", &torch_neuronx::distributed::NeuronWork::getSequenceNumber,
+           "Get operation sequence number")
+      .def("get_op_type", &torch_neuronx::distributed::NeuronWork::getOpType, "Get operation type")
+      .def(
+          "get_device",
+          [](const torch_neuronx::distributed::NeuronWork& self) {
+            return self.getDevice().index();
+          },
+          "Get device index")
+      .def(
+          "check_timeout",
+          [](torch_neuronx::distributed::NeuronWork& self, std::optional<int64_t> timeout_ms) {
+            std::optional<std::chrono::milliseconds> timeout;
+            if (timeout_ms.has_value()) {
+              timeout = std::chrono::milliseconds(timeout_ms.value());
+            }
+            return self.checkTimeout(timeout);
+          },
+          "Check if work has timed out", py::arg("timeout_ms") = py::none())
+      .def("result", &torch_neuronx::distributed::NeuronWork::result, "Get output tensors")
+      .def("get_duration", &torch_neuronx::distributed::NeuronWork::getDuration,
+           "Get operation duration (requires timing enabled)")
+      .def_property_readonly(
+          "_end_event",
+          [](const torch_neuronx::distributed::NeuronWork& self) {
+            // Use THNPEvent_Wrap as in Stream.cpp line 162
+            at::neuron::NeuronEvent event = self.getEndEvent();
+            return py::reinterpret_steal<py::object>(THNPEvent_Wrap(std::move(event)));
+          },
+          "Get end event for external synchronization")
+      .def_property_readonly(
+          "_stream",
+          [](const torch_neuronx::distributed::NeuronWork& self) {
+            // Use THNPStream_Wrap as in Stream.cpp line 473
+            at::neuron::NeuronStream stream = self.getStream();
+            return py::reinterpret_steal<py::object>(THNPStream_Wrap(stream));
+          },
+          "Get stream this work runs on");
+
+  // NeuronWatchdog class for monitoring async operations
+  py::class_<torch_neuronx::distributed::NeuronWatchdog,
+             std::unique_ptr<torch_neuronx::distributed::NeuronWatchdog>>(m, "NeuronWatchdog")
+      .def(py::init<>())
+      .def("start", &torch_neuronx::distributed::NeuronWatchdog::start, "Start watchdog thread")
+      .def("stop", &torch_neuronx::distributed::NeuronWatchdog::stop, "Stop watchdog thread")
+      .def("notify", &torch_neuronx::distributed::NeuronWatchdog::notify,
+           "Notify watchdog of new work")
+      .def("enqueue_work", &torch_neuronx::distributed::NeuronWatchdog::enqueueWork,
+           "Add work to monitoring queue", py::arg("work"));
 }

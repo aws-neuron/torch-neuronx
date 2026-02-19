@@ -439,4 +439,89 @@ std::string CreateMetricReport(const std::vector<std::string>& counter_names,
   return ss.str();
 }
 
+// =============================================================================
+// Memory Statistics Helper Functions implementation
+// =============================================================================
+
+void RecordNewAllocation(int device_id, size_t size_bytes) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.allocated_bytes.increase(size_bytes);
+  stats.active_bytes.increase(size_bytes);
+}
+
+void RecordDeallocation(int device_id, size_t size_bytes) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_tensor_frees.fetch_add(1, std::memory_order_relaxed);
+  stats.active_bytes.decrease(size_bytes);
+  stats.allocated_bytes.decrease(size_bytes);
+}
+
+// =============================================================================
+// DeviceMemoryStatsRegistry implementation
+// =============================================================================
+
+DeviceMemoryStatsRegistry& DeviceMemoryStatsRegistry::Instance() {
+  static DeviceMemoryStatsRegistry instance;
+  return instance;
+}
+
+DeviceMemoryStats& DeviceMemoryStatsRegistry::GetDeviceStats(int device_index) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Grow vector if needed
+  if (device_index >= static_cast<int>(device_stats_.size())) {
+    device_stats_.resize(device_index + 1);
+  }
+
+  // Create stats for device if not exists
+  if (!device_stats_[device_index]) {
+    device_stats_[device_index] = std::make_unique<DeviceMemoryStats>();
+  }
+
+  return *device_stats_[device_index];
+}
+
+DeviceMemoryStatsInfo DeviceMemoryStatsRegistry::GetMemoryStats(int device_index) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Return zeros if device not initialized
+  if (device_index >= static_cast<int>(device_stats_.size()) || !device_stats_[device_index]) {
+    return DeviceMemoryStatsInfo{};
+  }
+
+  const auto& stats = *device_stats_[device_index];
+
+  return DeviceMemoryStatsInfo{{stats.allocated_bytes.current.load(std::memory_order_relaxed),
+                                stats.allocated_bytes.peak.load(std::memory_order_relaxed),
+                                stats.allocated_bytes.allocated.load(std::memory_order_relaxed),
+                                stats.allocated_bytes.freed.load(std::memory_order_relaxed)},
+                               {stats.reserved_bytes.current.load(std::memory_order_relaxed),
+                                stats.reserved_bytes.peak.load(std::memory_order_relaxed),
+                                stats.reserved_bytes.allocated.load(std::memory_order_relaxed),
+                                stats.reserved_bytes.freed.load(std::memory_order_relaxed)},
+                               {stats.active_bytes.current.load(std::memory_order_relaxed),
+                                stats.active_bytes.peak.load(std::memory_order_relaxed),
+                                stats.active_bytes.allocated.load(std::memory_order_relaxed),
+                                stats.active_bytes.freed.load(std::memory_order_relaxed)},
+                               stats.num_alloc_retries.load(std::memory_order_relaxed),
+                               stats.num_ooms.load(std::memory_order_relaxed),
+                               stats.num_tensor_frees.load(std::memory_order_relaxed),
+                               stats.allocation_requests.load(std::memory_order_relaxed)};
+}
+
+void DeviceMemoryStatsRegistry::ResetPeakStats(int device_index) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (device_index < static_cast<int>(device_stats_.size()) && device_stats_[device_index]) {
+    device_stats_[device_index]->reset_peak();
+  }
+}
+
+void DeviceMemoryStatsRegistry::ResetAccumulatedStats(int device_index) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (device_index < static_cast<int>(device_stats_.size()) && device_stats_[device_index]) {
+    device_stats_[device_index]->reset_counters();
+    device_stats_[device_index]->reset_accumulated();
+  }
+}
+
 }  // namespace at::neuron::metrics

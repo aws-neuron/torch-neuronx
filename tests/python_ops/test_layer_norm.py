@@ -236,8 +236,14 @@ class TestLayerNormOperations:
                 )  # Without kernel, should lower to native_layer_norm
 
         # Verify outputs with appropriate tolerances
-        rtol = 1e-2 if test_case.dtype in [torch.float16, torch.bfloat16] else 1e-4
-        atol = 1e-2 if test_case.dtype in [torch.float16, torch.bfloat16] else 1e-4
+        # Torch decomp for native_layer_norm's forward and backward promote bf16 to f32
+        # So we relax the tolerance for bf16 tests
+        if test_case.dtype == torch.bfloat16:
+            rtol, atol = 0.05, 0.05
+        elif test_case.dtype == torch.float16:
+            rtol, atol = 1e-2, 1e-2
+        else:
+            rtol, atol = 1e-4, 1e-4
 
         assert output_neuron.dtype == input_neuron.dtype
 
@@ -337,8 +343,14 @@ class TestLayerNormOperations:
             assert_op_runs_on_neuron("native_layer_norm")
 
         # Verify outputs with appropriate tolerances
-        rtol = 1e-2 if test_case.dtype in [torch.float16, torch.bfloat16] else 1e-4
-        atol = 1e-2 if test_case.dtype in [torch.float16, torch.bfloat16] else 1e-4
+        # Torch decomp for native_layer_norm's forward and backward promote bf16 to f32
+        # So we relax the tolerance for bf16 tests
+        if test_case.dtype == torch.bfloat16:
+            rtol, atol = 0.05, 0.05
+        elif test_case.dtype == torch.float16:
+            rtol, atol = 1e-2, 1e-2
+        else:
+            rtol, atol = 1e-4, 1e-4
 
         assert native_out_neuron.dtype == input_neuron.dtype
 

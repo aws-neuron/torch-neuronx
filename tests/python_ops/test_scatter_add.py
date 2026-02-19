@@ -5,7 +5,6 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
-from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -161,29 +160,27 @@ class TestScatterAdd:
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu, rtol=1e-4, atol=1e-4)
 
-    @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
-        wraps=convert_fx_to_stablehlo,
-    )
-    def test_scatter_add_nki_kernel_used(self, mock_compiler):
+    @patch("torch_neuronx.python_ops.scatter_add.ScatterAddNKIImpl._execute_kernel")
+    def test_scatter_add_nki_kernel_used(self, mock_nki_kernel):
         """Verify NKI kernel is used for 2D tensors with dim=0"""
-        initial_count = mock_compiler.call_count
+        mock_nki_kernel.return_value = torch.zeros(3, 4, dtype=torch.float32, device="neuron")
 
         # 2D tensor, dim=0, float32 - NKI should handle this
         input_neuron = torch.zeros(3, 4, dtype=torch.float32, device="neuron")
         index_tensor = torch.tensor([0, 2], device="neuron")
         index_neuron = index_tensor.unsqueeze(1).expand(-1, 4)
         src_neuron = torch.randn(2, 4, dtype=torch.float32, device="neuron")
+
         with torch.no_grad(), track_neuron_ops():
             torch.scatter_add(input_neuron, 0, index_neuron, src_neuron)
             assert_op_runs_on_neuron("aten::scatter_add")
 
-        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+        assert mock_nki_kernel.call_count == 1, "NKI kernel was not called exactly once"
 
     @patch("torch_neuronx.python_ops.scatter_add.ScatterAddNKIImpl.can_handle", return_value=False)
-    def test_scatter_add_jax_fallback(self, mocked_handle):
-        """Verify JAX fallback when NKI can't handle the input"""
-        # Force JAX fallback for a case NKI would normally handle
+    def test_scatter_add_mlir_fallback(self, mocked_handle):
+        """Verify MLIR fallback when NKI can't handle the input"""
+        # Force MLIR fallback for a case NKI would normally handle
         input_cpu = torch.zeros(3, 4, dtype=torch.float32)
         index_cpu = torch.tensor([[0, 1, 2, 1], [2, 0, 1, 0]])
         src_cpu = torch.randn(2, 4, dtype=torch.float32)
@@ -191,7 +188,7 @@ class TestScatterAdd:
         # CPU reference
         result_cpu = torch.scatter_add(input_cpu, 0, index_cpu, src_cpu)
 
-        # Neuron with JAX fallback
+        # Neuron with MLIR fallback
         input_neuron = input_cpu.clone().to("neuron")
         index_neuron = index_cpu.to("neuron")
         src_neuron = src_cpu.to("neuron")

@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import torch.fx as fx
+from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 # ============== Graph Capture Infrastructure ==============
@@ -39,3 +40,14 @@ def get_aot_graphs(model: torch.nn.Module, *inputs) -> CapturedGraphs:
     with torch.no_grad():
         compiled(*inputs)
     return captured
+
+
+def create_capture_compiler(captured_gm_holder: list):
+    """Creates a compiler function that captures the graph module."""
+
+    def capture_compiler(gm: torch.fx.GraphModule, example_inputs):
+        captured_gm_holder.clear()
+        captured_gm_holder.append(gm)
+        return make_boxed_func(gm.forward)
+
+    return capture_compiler

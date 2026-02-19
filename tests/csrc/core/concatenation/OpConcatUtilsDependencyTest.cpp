@@ -57,7 +57,9 @@ TEST(OpConcatUtilsDependencyTest, SharedStorageAddressShouldNotBeCommonInput) {
   // Verify correct dependency detection
   EXPECT_EQ(analysis.module1ToModule2Deps.size(), 1)
       << "Should detect one dependency: module1 output[0] -> module2 input[0]";
-  EXPECT_EQ(analysis.module1ToModule2Deps[0], 0)
+  ASSERT_EQ(analysis.module1ToModule2Deps[0].size(), 1)
+      << "Output 0 should map to exactly one input";
+  EXPECT_EQ(analysis.module1ToModule2Deps[0][0], 0)
       << "Dependency should map output index 0 to input index 0";
 
   // Verify NO false common input detection
@@ -155,7 +157,9 @@ TEST(OpConcatUtilsDependencyTest, MixedScenarioWithDistinctCommonAndDependency) 
   // Verify dependency detection
   EXPECT_EQ(analysis.module1ToModule2Deps.size(), 1)
       << "Should detect one dependency (module1 output feeds module2 input)";
-  EXPECT_EQ(analysis.module1ToModule2Deps[0], 1)
+  ASSERT_EQ(analysis.module1ToModule2Deps[0].size(), 1)
+      << "Output 0 should map to exactly one input";
+  EXPECT_EQ(analysis.module1ToModule2Deps[0][0], 1)
       << "Dependency should map module1 output[0] to module2 input[1]";
 
   // Verify correct scenario classification

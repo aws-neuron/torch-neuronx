@@ -7,9 +7,9 @@ import torch
 
 from torch_neuronx.python_ops.base import CompilableOpImpl, ExecutionResult
 from torch_neuronx.python_ops.dtype_autocast import autocast_neuron
-from torch_neuronx.python_ops.jax.context import ExecutionContext
+from torch_neuronx.python_ops.shared import ExecutionContext
 
-from ..jax.handlers import OutputHandler
+from ..handlers.output import BaseOutputHandler
 from .kernel import TorchMlirKernel
 
 logger = logging.getLogger(__name__)
@@ -39,10 +39,11 @@ class TorchMlirOpImpl(CompilableOpImpl):
         self.static_argnames = static_argnames or ()
 
         # Initialize handlers
-        self.output_handler = OutputHandler()
+        self.output_handler = BaseOutputHandler()
 
         # Check for preprocessing
         self._uses_preprocessing = getattr(self.torch_fn, "uses_preprocessing", False)
+        self._postprocess_fn = None
         if not self._uses_preprocessing:
             self.kernel = TorchMlirKernel(
                 torch_fn=torch_fn,
@@ -65,7 +66,14 @@ class TorchMlirOpImpl(CompilableOpImpl):
             ExecutionResult with output tensor(s)
         """
         if self._uses_preprocessing:
-            actual_torch_fn, args, kwargs = self.torch_fn(*args, **kwargs)
+            preprocess_result = self.torch_fn(*args, **kwargs)
+
+            # check if postprocess function is provided
+            if len(preprocess_result) == 4:
+                actual_torch_fn, args, kwargs, self._postprocess_fn = preprocess_result
+            else:
+                actual_torch_fn, args, kwargs = preprocess_result
+                self._postprocess_fn = None
 
             if self.kernel is None:
                 self.kernel = TorchMlirKernel(
@@ -77,28 +85,37 @@ class TorchMlirOpImpl(CompilableOpImpl):
                 )
 
         exec_context = ExecutionContext(original_inputs=args, original_kwargs=kwargs.copy())
-        # Use dtype autocast context
-        with autocast_neuron(cast_dtype_params=True) as context:
-            # Process arguments, excluding output parameters from casting
-            original_kwargs = kwargs
-            args, kwargs, _ = context.process_args(args, kwargs, output_params=self.output_params)
 
-            # Validate output dtypes
-            context.validate_output_dtypes(original_kwargs)
+        # Apply dtype autocast only if not disabled
+        if not self.DISABLE_DTYPE_AUTOCAST:
+            # Use dtype autocast context
+            with autocast_neuron(cast_dtype_params=True) as context:
+                # Process arguments, excluding output parameters from casting
+                original_kwargs = kwargs
+                args, kwargs, _ = context.process_args(
+                    args, kwargs, output_params=self.output_params
+                )
 
-            # Execute kernel
-            try:
-                result = self.kernel(*args, context=exec_context, **kwargs)
+                # Validate output dtypes
+                context.validate_output_dtypes(original_kwargs)
 
-                return ExecutionResult(success=True, output=result)
-            except Exception as e:
-                # Do not fall back for user/input contract errors; match PyTorch behavior
-                error_traceback = traceback.format_exc()
-                if isinstance(e, IndexError | ValueError | TypeError):
-                    raise
-                error_message = f"{e!s}\n{error_traceback}"
-                logger.debug(f"Execution failed: {error_message}")
-                return ExecutionResult(success=False, error_msg=error_message)
+        # Execute kernel
+        try:
+            result = self.kernel(*args, context=exec_context, **kwargs)
+
+            # Apply postprocessing if available
+            if self._postprocess_fn is not None:
+                result = self._postprocess_fn(result)
+
+            return ExecutionResult(success=True, output=result)
+        except Exception as e:
+            # Do not fall back for user/input contract errors; match PyTorch behavior
+            error_traceback = traceback.format_exc()
+            if isinstance(e, IndexError | ValueError | TypeError):
+                raise
+            error_message = f"{e!s}\n{error_traceback}"
+            logger.debug(f"Execution failed: {error_message}")
+            return ExecutionResult(success=False, error_msg=error_message)
 
     def _execute_impl(self):
         pass

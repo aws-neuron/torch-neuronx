@@ -11,10 +11,6 @@ import torch
 
 from .base import AttentionOpImpl, ExecutionResult, Operation
 from .nki_kernels.scaled_dot_product_attention import scaled_dot_product_attention_kernel
-from .xla_ops.scaled_dot_product_attention_backward_xla import (
-    ScaledDotProductAttentionBackwardXLAImpl,
-)
-from .xla_ops.scaled_dot_product_attention_xla import ScaledDotProductAttnXLAImpl
 
 
 class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
@@ -188,7 +184,9 @@ class ScaledDotProductFusedAttentionOp(Operation):
 
     def _setup_implementations(self):
         self._implementations.append(ScaledDotProductFusedAttentionNKIImpl())
-        self._implementations.append(ScaledDotProductAttnXLAImpl(self.op_name))
+        from .torch_mlir.ops.scaled_dot_product_attention import ScaledDotProductAttnMLIRImpl
+
+        self._implementations.append(ScaledDotProductAttnMLIRImpl(self.op_name))
 
     @property
     def op_name(self) -> str:
@@ -407,7 +405,11 @@ class ScaledDotProductAttentionBackwardOp(Operation):
 
     def _setup_implementations(self):
         self._implementations.append(ScaledDotProductAttentionBackwardNKIImpl())
-        self._implementations.append(ScaledDotProductAttentionBackwardXLAImpl(self.op_name))
+        from .torch_mlir.ops.scaled_dot_product_attention import (
+            ScaledDotProductAttnBackwardMLIRImpl,
+        )
+
+        self._implementations.append(ScaledDotProductAttnBackwardMLIRImpl(self.op_name))
 
     @property
     def op_name(self) -> str:

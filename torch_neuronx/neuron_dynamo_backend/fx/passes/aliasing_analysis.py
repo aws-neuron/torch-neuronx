@@ -96,7 +96,6 @@ class AliasingAnalysis(PassBase):
         "expand_as",
     }
 
-    # TODO: Add support for NKI-kernel operand-output-aliasing.
     INPLACE_METHODS: ClassVar[set[str]] = {
         "add_",
         "sub_",
@@ -192,6 +191,74 @@ class AliasingAnalysis(PassBase):
         """Determine if a node mutates a tensor in-place."""
         return self._is_setitem_operation(node) or self._is_inplace_method(node)
 
+    def _is_custom_op_with_mutations(self, node: Node) -> bool:
+        """Check if node is a custom op with mutable arguments."""
+        if node.op != "call_function":
+            return False
+        target = node.target
+        # Check if it's an OpOverload with a schema
+        if not hasattr(target, "_schema"):
+            return False
+        schema = target._schema
+        # Check if any argument has is_write=True
+        return any(arg.alias_info and arg.alias_info.is_write for arg in schema.arguments)
+
+    def _get_custom_op_mutated_inputs(
+        self,
+        node: Node,
+        alias_chain: dict[Node, Node],
+        input_nodes: set[Node],
+        input_nodes_list: list[Node],
+        input_names_list: list[str],
+    ) -> list[int]:
+        """Extract mutated input indices from custom op with mutable arguments.
+
+        Custom ops can specify mutable arguments via schema annotations like
+        Tensor(a!) which sets alias_info.is_write=True.
+
+        Args:
+            node: The custom op call node
+            alias_chain: Current alias chain for tracing
+            input_nodes: Set of input placeholder nodes
+            input_nodes_list: Ordered list of input placeholder nodes
+            input_names_list: Ordered list of input names for logging
+
+        Returns:
+            List of input placeholder indices that are mutated by this op
+        """
+        mutated = []
+        target = node.target
+        if not hasattr(target, "_schema"):
+            return mutated
+
+        schema = target._schema
+
+        # Get the args from the node
+        args = node.args
+        kwargs = node.kwargs
+
+        # Find arguments with is_write=True
+        for i, schema_arg in enumerate(schema.arguments):
+            if schema_arg.alias_info and schema_arg.alias_info.is_write:
+                # Get the actual tensor node for this argument
+                arg_name = schema_arg.name
+                tensor_node = args[i] if i < len(args) else kwargs.get(arg_name)
+
+                if tensor_node is not None and isinstance(tensor_node, Node):
+                    # Trace back to root placeholder
+                    root_input = self._find_root_input(tensor_node, alias_chain, input_nodes)
+                    if root_input is not None and root_input in input_nodes:
+                        placeholder_idx = input_nodes_list.index(root_input)
+                        if placeholder_idx not in mutated:
+                            mutated.append(placeholder_idx)
+                            logger.debug(
+                                f"Custom op mutation detected: input[{placeholder_idx}] "
+                                f"({input_names_list[placeholder_idx]}) via "
+                                f"schema arg '{arg_name}' (is_write=True)"
+                            )
+
+        return mutated
+
     def _extract_placeholder_name(self, node: Node) -> str | None:
         """
         Convert Dynamo's mangled placeholder target names to human-readable names.
@@ -225,7 +292,17 @@ class AliasingAnalysis(PassBase):
         return target.rstrip("_") if target else node.name
 
     def _get_mutated_tensor(self, node: Node) -> Node | None:
-        """Get the tensor being mutated by an in-place operation."""
+        """Get the tensor being mutated by an in-place operation.
+
+        For setitem and in-place method calls, returns the tensor
+        that is being modified.
+
+        Args:
+            node (Node): An in-place mutation node.
+
+        Returns:
+            Node | None: Mutated tensor node, or None if not applicable.
+        """
         if not node.args:
             return None
 
@@ -238,7 +315,16 @@ class AliasingAnalysis(PassBase):
         return None
 
     def _get_aliasing_source(self, node: Node) -> Node | None:
-        """Get the source tensor for an aliasing operation."""
+        """Get the source tensor for an aliasing operation.
+
+        For view/reshape operations, returns the tensor being viewed.
+
+        Args:
+            node (Node): An aliasing operation node.
+
+        Returns:
+            Node | None: Source tensor node, or None if not applicable.
+        """
         if not node.args:
             return None
 
@@ -251,6 +337,19 @@ class AliasingAnalysis(PassBase):
         alias_chain: dict[Node, Node],
         input_nodes: set[Node],
     ) -> Node | None:
+        """Trace a node back to its root input placeholder.
+
+        Follows the alias chain and aliasing operations to find the
+        original input that a node derives from.
+
+        Args:
+            node (Node): Starting node to trace from.
+            alias_chain (dict[Node, Node]): Mapping of nodes to their alias sources.
+            input_nodes (set[Node]): Set of input placeholder nodes.
+
+        Returns:
+            Node | None: Root input node if found, None otherwise.
+        """
         if node in input_nodes:
             return node
 
@@ -468,6 +567,21 @@ class AliasingAnalysis(PassBase):
                     if source_node is not None:
                         alias_chain[node] = source_node
                         logger.debug(f"Alias: {node.name} -> {source_node.name}")
+
+                # Handle custom ops with mutable arguments (pre-AOT - NKI)
+                elif self._is_custom_op_with_mutations(node):
+                    logger.debug(f"Custom op with mutations detected: {node.name}")
+                    custom_op_mutated = self._get_custom_op_mutated_inputs(
+                        node,
+                        alias_chain,
+                        input_nodes,
+                        input_nodes_list,
+                        input_names_list,
+                    )
+                    logger.debug(f"Custom op mutated inputs: {custom_op_mutated}")
+                    for idx in custom_op_mutated:
+                        if idx not in mutated_input_indices:
+                            mutated_input_indices.append(idx)
 
             # -----------------------------------------------------------------
             # Find output node and analyze explicit outputs

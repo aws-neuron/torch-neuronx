@@ -16,6 +16,7 @@
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/NeuronHooksInterface.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 // Forward declare the registration function
 namespace torch_neuronx {
@@ -44,20 +45,25 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
     EXPECT_CALL(*mock_nrt_, nrt_close()).WillRepeatedly(Return());
 
     // Set up mock expectations for tensor allocation
+    static std::atomic<uintptr_t> tensor_counter{0x12345678};
+    static std::atomic<uintptr_t> va_counter{0x87654321};
+
     EXPECT_CALL(*mock_nrt_, nrt_tensor_allocate(_, _, _, _, _))
         .WillRepeatedly([](nrt_tensor_placement_t placement, int32_t logical_nc_id, size_t size,
                            const char* name, nrt_tensor_t** tensor) {
-          // Create a fake tensor pointer - just use a non-null value
-          *tensor = reinterpret_cast<nrt_tensor_t*>(0x12345678);
+          // Create unique fake tensor pointers
+          *tensor = reinterpret_cast<nrt_tensor_t*>(tensor_counter.fetch_add(0x1000));
           return NRT_SUCCESS;
         });
 
     // Set up mock expectations for tensor operations
     EXPECT_CALL(*mock_nrt_, nrt_tensor_free(_)).WillRepeatedly(Return());
-    EXPECT_CALL(*mock_nrt_, nrt_tensor_get_size(_))
-        .WillRepeatedly(Return(1024));  // Return some default size
+    EXPECT_CALL(*mock_nrt_, nrt_tensor_get_size(_)).WillRepeatedly(Return(1024));
     EXPECT_CALL(*mock_nrt_, nrt_tensor_get_va(_))
-        .WillRepeatedly(Return(reinterpret_cast<void*>(0x87654321)));  // Return fake VA
+        .WillRepeatedly(::testing::Invoke([](const nrt_tensor* tensor) -> void* {
+          // Return unique VA for each call
+          return reinterpret_cast<void*>(va_counter.fetch_add(0x1000));
+        }));
 
     // Set up mock expectations for tensor copy operations
     EXPECT_CALL(*mock_nrt_, nrt_tensor_copy(_, _, _, _, _)).WillRepeatedly(Return(NRT_SUCCESS));
@@ -66,6 +72,9 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
 
     // Register neuron device to ensure proper initialization
     torch_neuronx::register_neuron_device();
+
+    at::neuron::InitializeStreamPools();
+    at::neuron::NeuronResourceManager::Instance();
   }
 
   void TearDown() override {

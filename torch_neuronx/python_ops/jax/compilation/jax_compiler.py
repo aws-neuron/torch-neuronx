@@ -8,7 +8,8 @@ from typing import Any
 import jax
 import torch
 
-from ..config import CompilationConfig
+from torch_neuronx.python_ops.shared import CompilationConfig
+
 from ..type_converter import JaxTypeConverter
 
 logger = logging.getLogger(__name__)

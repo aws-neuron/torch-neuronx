@@ -9,8 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch.fx.passes.pass_manager import PassManager
 
+from tests.neuron_dynamo_backend.unit.utils.test_utils import get_aot_graphs
 from torch_neuronx.neuron_dynamo_backend import backend
+from torch_neuronx.neuron_dynamo_backend.fx.passes.dynamic_shape_analysis import (
+    DynamicShapeAnalysis,
+)
 
 
 class TestCompileFxToStablehlo:
@@ -70,7 +75,11 @@ class TestCompileFxToStablehlo:
 
         # Verify function calls
         mock_convert_fx.assert_called_once_with(
-            mock_gm, example_inputs, None, preserve_artifacts=preserve_artifacts
+            mock_gm,
+            example_inputs,
+            None,
+            preserve_artifacts=preserve_artifacts,
+            random_input_info=None,
         )
 
         # Verify save operations
@@ -79,6 +88,87 @@ class TestCompileFxToStablehlo:
         assert args[0] is mock_stablehlo_mlir
         assert isinstance(args[1], Path)
         assert str(args[1]).endswith(".stablehlo.mlir")
+
+    def _run_dynamic_shape_analysis(self, gm: torch.fx.GraphModule):
+        """Fixture providing a function to run DynamicShapeAnalysis pass."""
+        dynamic_shape_analysis = DynamicShapeAnalysis()
+        pm = PassManager(passes=[dynamic_shape_analysis])
+        pm(gm)
+        return dynamic_shape_analysis
+
+    def test_compile_dynamic_shape(self):
+        # Create a simple model that returns a constant tensor
+        class ConstantModel(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        model = ConstantModel()
+        input_tensor = torch.ones(3, 4, dtype=torch.float32)
+        torch._dynamo.decorators.mark_dynamic(input_tensor, 0)
+
+        # Get graph
+        gm = get_aot_graphs(model, input_tensor).post_aot_forward_graph
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r".*Dynamic shapes detected in the model, but torch-neuronx requires static "
+                r"shapes\. Found 1 dynamic dimension\(s\): \[s77\].*"
+            ),
+        ):
+            self._run_dynamic_shape_analysis(gm)
+
+    def test_compile_non_dynamic_shape(self):
+        # Create a simple model that returns a constant tensor
+        class ConstantModel(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        model = ConstantModel()
+        input_tensor = torch.ones(3, 4, dtype=torch.float32)
+
+        # Get graph
+        gm = get_aot_graphs(model, input_tensor).post_aot_forward_graph
+
+        # Expected to pass
+        self._run_dynamic_shape_analysis(gm)
+
+    @patch("torch_neuronx.neuron_dynamo_backend.backend.save_mlir_bytecode")
+    @patch("torch_neuronx.neuron_dynamo_backend.config.get_artifacts_directory")
+    @patch("torch_neuronx.neuron_dynamo_backend.config.get_stablehlo_path")
+    def test_compile_fx_to_stablehlo_with_no_output(
+        self, mock_get_stablehlo_path, mock_get_artifacts_dir, mock_save_mlir
+    ):
+        """Test FX to StableHLO compilation with real GraphModule"""
+
+        class IndexModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, x, t):
+                return ()
+
+        from torch.fx import symbolic_trace
+
+        gm = symbolic_trace(IndexModel())
+        example_inputs = [10, torch.ones(1)]
+        model_name = "test_model"
+        segment_id = "test_seg"
+        preserve_artifacts = False
+
+        mock_get_artifacts_dir.return_value = self.temp_dir
+        mock_get_stablehlo_path.return_value = self.temp_dir / "artifacts.stablehlo.mlir"
+
+        with pytest.raises(
+            ValueError,
+            match="No outputs found in the module, expected at least one output, "
+            "modify your code to have at least one output.",
+        ):
+            backend._compile_fx_to_stablehlo(
+                gm, example_inputs, model_name, segment_id, preserve_artifacts, None
+            )
+        # Verify save operations
+        mock_save_mlir.assert_not_called()
 
 
 class TestDebugDirectoryCreationAndPopulation:
@@ -486,7 +576,7 @@ class TestNeuronBackendFxCompiler:
 class TestCreateNeuronBackend:
     """Test create_neuron_backend factory function"""
 
-    @patch("torch_neuronx.neuron_dynamo_backend.backend.get_decomposition_table")
+    @patch("torch_neuronx.neuron_dynamo_backend.backend.get_compile_decomposition_table")
     def test_create_neuron_backend(self, mock_get_decomp_table):
         """Test creating neuron backend"""
         mock_decomp_table = {"decomp1": "func1", "decomp2": "func2"}

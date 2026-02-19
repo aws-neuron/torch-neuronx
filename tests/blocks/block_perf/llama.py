@@ -3,6 +3,7 @@
 import torch
 from block_def.llama import LlamaConfig, LlamaTransformerBlock
 from torch.distributed._tensor import Replicate, Shard
+from torch.distributed.tensor import distribute_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     PrepareModuleInput,
@@ -220,4 +221,11 @@ def parallelize_block(transformer_block, tp_mesh):
     parallelize_module(
         module=transformer_block, device_mesh=tp_mesh, parallelize_plan=layer_tp_plan
     )
+    # After parallelize_module, manually distribute the buffer
+    if hasattr(transformer_block.attention, "rope_cache"):
+        transformer_block.attention.rope_cache = distribute_tensor(
+            transformer_block.attention.rope_cache,
+            device_mesh=tp_mesh,
+            placements=[Replicate()],
+        )
     return transformer_block

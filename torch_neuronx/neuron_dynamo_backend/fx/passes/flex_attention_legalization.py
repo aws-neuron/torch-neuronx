@@ -45,6 +45,7 @@ class FlexAttentionLegalization(PassBase):
         super().__init__()
         self._forward_score_mod_name: str | None = None
         self._forward_score_mod_module: fx.GraphModule | None = None
+        self._forward_mask_mod_module: fx.GraphModule | None = None
 
     @property
     def name(self) -> str:
@@ -386,6 +387,64 @@ class FlexAttentionLegalization(PassBase):
                     qparams={},
                 )
 
+    def _map_node_args(self, node_args: tuple, value_map: dict[fx.Node, fx.Node]) -> list:
+        """Map node arguments through value_map, handling both Node and non-Node args."""
+        return [value_map[arg] if isinstance(arg, fx.Node) else arg for arg in node_args]
+
+    def _map_node_kwargs(self, node_kwargs: dict, value_map: dict[fx.Node, fx.Node]) -> dict:
+        """Map node kwargs through value_map, handling both Node and non-Node values."""
+        return {k: value_map[v] if isinstance(v, fx.Node) else v for k, v in node_kwargs.items()}
+
+    def _create_node_from_op(
+        self,
+        graph: fx.Graph,
+        gm: fx.GraphModule,
+        node: fx.Node,
+        new_args: tuple,
+        new_kwargs: dict,
+        module_prefix: str,
+    ) -> fx.Node:
+        """Create a new node in the graph based on the operation type."""
+        if node.op == "get_attr":
+            # Copy the attribute from submodule to main module
+            attr_name = node.target
+            # Get the parent module by traversing the graph module hierarchy
+            parent_module = gm
+            for part in module_prefix.split(".")[:-1]:
+                if part:
+                    parent_module = getattr(parent_module, part)
+
+            attr_value = getattr(parent_module, attr_name)
+            new_attr_name = f"_inlined_{module_prefix}_{attr_name}".replace(".", "_")
+            setattr(gm, new_attr_name, attr_value)
+            new_node = graph.get_attr(new_attr_name)
+
+            # Set metadata based on actual tensor value
+            if isinstance(attr_value, torch.Tensor):
+                new_node.meta = {
+                    "val": torch.empty(
+                        attr_value.shape, dtype=attr_value.dtype, device=attr_value.device
+                    ),
+                    "tensor_meta": TensorMetadata(
+                        shape=attr_value.shape,
+                        dtype=attr_value.dtype,
+                        requires_grad=attr_value.requires_grad,
+                        stride=attr_value.stride(),
+                        memory_format=(
+                            torch.contiguous_format
+                            if attr_value.is_contiguous()
+                            else torch.preserve_format
+                        ),
+                        is_quantized=attr_value.is_quantized,
+                        qparams={},
+                    ),
+                }
+            return new_node
+
+        # Generic handling for call_function, call_method, call_module
+        method = getattr(graph, node.op)
+        return method(node.target, args=new_args, kwargs=new_kwargs)
+
     def _inline_score_mod(
         self,
         graph: fx.Graph,
@@ -399,13 +458,10 @@ class FlexAttentionLegalization(PassBase):
         """Inline score_mod submodule operations into the main graph."""
         logger.debug(f"Inlining score_mod submodule: {score_mod_name}")
 
-        b_idx, h_idx, q_idx, kv_idx = index_tensors
-        score_mod_graph = score_mod_module.graph
-
         # Build value map from placeholders to actual args
         value_map = {}
-        placeholders = [n for n in score_mod_graph.nodes if n.op == "placeholder"]
-        actual_args = [scaled_scores, b_idx, h_idx, q_idx, kv_idx]
+        placeholders = [n for n in score_mod_module.graph.nodes if n.op == "placeholder"]
+        actual_args = [scaled_scores, *index_tensors]
 
         for placeholder, actual_value in zip(placeholders, actual_args, strict=False):
             value_map[placeholder] = actual_value
@@ -413,77 +469,105 @@ class FlexAttentionLegalization(PassBase):
         final_scores = scaled_scores
 
         # Copy all non-placeholder, non-output nodes from score_mod graph
-        for score_mod_node in score_mod_graph.nodes:
+        for score_mod_node in score_mod_module.graph.nodes:
             if score_mod_node.op == "placeholder":
                 continue
-            elif score_mod_node.op == "output":
+
+            if score_mod_node.op == "output":
                 final_scores = value_map[score_mod_node.args[0]]
-                continue
-            else:
-                # Map args through value_map
-                new_args = []
-                for arg in score_mod_node.args:
-                    if isinstance(arg, fx.Node):
-                        new_args.append(value_map[arg])
-                    else:
-                        new_args.append(arg)
+                break
 
-                new_kwargs = {}
-                for k, v in score_mod_node.kwargs.items():
-                    if isinstance(v, fx.Node):
-                        new_kwargs[k] = value_map[v]
-                    else:
-                        new_kwargs[k] = v
+            # Map args and kwargs through value_map
+            new_args = tuple(self._map_node_args(score_mod_node.args, value_map))
+            new_kwargs = self._map_node_kwargs(score_mod_node.kwargs, value_map)
 
-                # Create the new node in our graph
-                if score_mod_node.op == "call_function":
-                    new_node = graph.call_function(
-                        score_mod_node.target, args=tuple(new_args), kwargs=new_kwargs
-                    )
-                elif score_mod_node.op == "call_method":
-                    new_node = graph.call_method(
-                        score_mod_node.target, args=tuple(new_args), kwargs=new_kwargs
-                    )
-                elif score_mod_node.op == "call_module":
-                    new_node = graph.call_module(
-                        score_mod_node.target, args=tuple(new_args), kwargs=new_kwargs
-                    )
-                elif score_mod_node.op == "get_attr":
-                    # Copy the attribute from score_mod submodule to main module
-                    attr_name = score_mod_node.target
-                    attr_value = getattr(score_mod_module, attr_name)
-                    new_attr_name = f"_inlined_{score_mod_name}_{attr_name}"
-                    setattr(gm, new_attr_name, attr_value)
-                    new_node = graph.get_attr(new_attr_name)
+            # Create the new node in our graph
+            new_node = self._create_node_from_op(
+                graph, gm, score_mod_node, new_args, new_kwargs, score_mod_name
+            )
 
-                    # Set metadata based on actual tensor value
-                    if isinstance(attr_value, torch.Tensor):
-                        new_node.meta = {
-                            "val": torch.empty(attr_value.shape, dtype=attr_value.dtype),
-                            "tensor_meta": TensorMetadata(
-                                shape=attr_value.shape,
-                                dtype=attr_value.dtype,
-                                requires_grad=False,
-                                stride=attr_value.stride(),
-                                memory_format=torch.contiguous_format,
-                                is_quantized=False,
-                                qparams={},
-                            ),
-                        }
-                    value_map[score_mod_node] = new_node
-                    continue
-                else:
-                    raise RuntimeError(f"Unsupported node op: {score_mod_node.op}")
+            # Copy and fix metadata
+            if score_mod_node.meta:
+                new_node.meta = score_mod_node.meta.copy()
+                self._fix_score_mod_metadata(new_node, score_mod_node, scaled_scores, shapes)
 
-                # Copy and fix metadata
-                if score_mod_node.meta:
-                    new_node.meta = score_mod_node.meta.copy()
-                    self._fix_score_mod_metadata(new_node, score_mod_node, scaled_scores, shapes)
-
-                value_map[score_mod_node] = new_node
+            value_map[score_mod_node] = new_node
 
         logger.debug("Successfully inlined score_mod operations")
         return final_scores
+
+    def _apply_combined_mask_score_mod(
+        self,
+        graph: fx.Graph,
+        gm: fx.GraphModule,
+        mask_mod_module: fx.GraphModule,
+        scores: fx.Node,
+        index_tensors: tuple[fx.Node, fx.Node, fx.Node, fx.Node],
+        shapes: AttentionShapes,
+    ) -> fx.Node:
+        """Apply mask_mod by combining it with score using torch.where pattern."""
+        logger.debug("Applying combined mask_mod with score_mod pattern")
+
+        # Build value map from placeholders to actual args (mask_mod takes b, h, q_idx, kv_idx)
+        value_map = {}
+        placeholders = [n for n in mask_mod_module.graph.nodes if n.op == "placeholder"]
+
+        for placeholder, actual_value in zip(placeholders, index_tensors, strict=False):
+            value_map[placeholder] = actual_value
+
+        mask_result = None
+
+        # Copy all non-placeholder, non-output nodes from mask_mod graph
+        for mask_mod_node in mask_mod_module.graph.nodes:
+            if mask_mod_node.op == "placeholder":
+                continue
+
+            if mask_mod_node.op == "output":
+                mask_result = value_map[mask_mod_node.args[0]]
+                break
+
+            # Map args and kwargs through value_map
+            new_args = tuple(self._map_node_args(mask_mod_node.args, value_map))
+            new_kwargs = self._map_node_kwargs(mask_mod_node.kwargs, value_map)
+
+            # Create the new node in our graph
+            new_node = self._create_node_from_op(
+                graph, gm, mask_mod_node, new_args, new_kwargs, "mask_mod"
+            )
+
+            # Copy metadata
+            if mask_mod_node.meta:
+                new_node.meta = mask_mod_node.meta.copy()
+
+            value_map[mask_mod_node] = new_node
+
+        # Now apply the mask using torch.where pattern: torch.where(mask, score, -inf)
+        if mask_result:
+            neg_inf = graph.call_function(
+                torch.ops.aten.full_like.default,
+                args=(scores,),
+                kwargs={"fill_value": float("-inf")},
+            )
+            self._add_metadata_to_node(
+                neg_inf,
+                shape=[shapes.B, shapes.H_q, shapes.L, shapes.S],
+                dtype=scores.meta["val"].dtype,
+            )
+
+            masked_scores = graph.call_function(
+                torch.ops.aten.where.self, args=(mask_result, scores, neg_inf)
+            )
+            self._add_metadata_to_node(
+                masked_scores,
+                shape=[shapes.B, shapes.H_q, shapes.L, shapes.S],
+                dtype=scores.meta["val"].dtype,
+            )
+
+            logger.debug("Successfully applied combined mask_mod with score_mod pattern")
+            return masked_scores
+
+        logger.warning("mask_mod did not produce a result, returning original scores")
+        return scores
 
     # =========================================================================
     # Sort Replacement
@@ -562,6 +646,11 @@ class FlexAttentionLegalization(PassBase):
         """Legalize a flex_attention forward node."""
         logger.debug(f"Legalizing flex_attention forward node: {node.name}")
 
+        # Use local variables to avoid state carryover between nodes
+        forward_score_mod_name = None
+        forward_score_mod_module = None
+        forward_mask_mod_module = None
+
         if len(node.args) < 9:
             logger.warning(f"Unexpected number of args: {len(node.args)}, skipping")
             return False
@@ -571,13 +660,24 @@ class FlexAttentionLegalization(PassBase):
         key = node.args[1]
         value = node.args[2]
         score_mod_node = node.args[3]
+        block_mask_node = node.args[4]
         scale = node.args[5]
 
         # Get score_mod info
         if score_mod_node is not None and hasattr(score_mod_node, "target"):
-            self._forward_score_mod_name = score_mod_node.target
-            self._forward_score_mod_module = getattr(gm, self._forward_score_mod_name, None)
-            logger.debug(f"Found score_mod: {self._forward_score_mod_name}")
+            forward_score_mod_name = score_mod_node.target
+            forward_score_mod_module = getattr(gm, forward_score_mod_name, None)
+            logger.debug(f"Found score_mod: {forward_score_mod_name}")
+
+        # Get mask_mod from block_mask if present
+        if (
+            isinstance(block_mask_node, tuple)
+            and len(block_mask_node) > 12
+            and hasattr(block_mask_node[12], "target")
+        ):
+            mask_fn_node = block_mask_node[12]
+            forward_mask_mod_module = getattr(gm, mask_fn_node.target, None)
+            logger.debug(f"Found mask_mod in block_mask: {mask_fn_node.target}")
 
         # Get shape information
         if "val" not in query.meta or "val" not in key.meta:
@@ -609,22 +709,34 @@ class FlexAttentionLegalization(PassBase):
                 graph, query, key_expanded, scale, shapes, query_dtype
             )
 
-            # Apply score_mod if provided
+            # Apply score_mod and mask_mod if provided
             query_device = query.meta["val"].device
             index_tensors = self._create_index_tensors(graph, shapes, query_device)
 
-            if self._forward_score_mod_module is not None:
+            final_scores = scaled_scores
+
+            # Apply score_mod first if provided
+            if forward_score_mod_module is not None:
                 final_scores = self._inline_score_mod(
                     graph,
                     gm,
-                    self._forward_score_mod_name,
-                    self._forward_score_mod_module,
-                    scaled_scores,
+                    forward_score_mod_name,
+                    forward_score_mod_module,
+                    final_scores,
                     index_tensors,
                     shapes,
                 )
-            else:
-                final_scores = scaled_scores
+
+            # Apply mask_mod by combining it with score_mod pattern
+            if forward_mask_mod_module is not None:
+                final_scores = self._apply_combined_mask_score_mod(
+                    graph,
+                    gm,
+                    forward_mask_mod_module,
+                    final_scores,
+                    index_tensors,
+                    shapes,
+                )
 
             # Compute softmax
             attn_weights, _, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
@@ -638,6 +750,12 @@ class FlexAttentionLegalization(PassBase):
                 shape=[shapes.B, shapes.H_q, shapes.L, shapes.E],
                 dtype=query_dtype,
             )
+
+        # Store for backward pass only at the end after successful legalization
+        # This ensures we only store the most recent forward pass info
+        self._forward_score_mod_name = forward_score_mod_name
+        self._forward_score_mod_module = forward_score_mod_module
+        self._forward_mask_mod_module = forward_mask_mod_module
 
         # Replace users of the flex_attention node
         self._replace_flex_forward_users(graph, node, output)
@@ -706,9 +824,12 @@ class FlexAttentionLegalization(PassBase):
                 graph, query, key_expanded, scale, shapes, query_dtype
             )
 
-            # Apply score_mod if available
+            # Apply score_mod and mask_mod if available
             index_tensors = self._create_index_tensors(graph, shapes)
 
+            final_scores = scaled_scores
+
+            # Apply score_mod first if available
             if self._forward_score_mod_module is not None:
                 logger.debug(f"Applying score_mod in backward: {self._forward_score_mod_name}")
                 final_scores = self._inline_score_mod(
@@ -716,12 +837,22 @@ class FlexAttentionLegalization(PassBase):
                     gm,
                     self._forward_score_mod_name,
                     self._forward_score_mod_module,
-                    scaled_scores,
+                    final_scores,
                     index_tensors,
                     shapes,
                 )
-            else:
-                final_scores = scaled_scores
+
+            # Apply mask_mod if available
+            if self._forward_mask_mod_module is not None:
+                logger.debug("Applying mask_mod in backward pass")
+                final_scores = self._apply_combined_mask_score_mod(
+                    graph,
+                    gm,
+                    self._forward_mask_mod_module,
+                    final_scores,
+                    index_tensors,
+                    shapes,
+                )
 
             # Recompute softmax
             attn_weights, _, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)

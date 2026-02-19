@@ -2,31 +2,28 @@ import contextlib
 import inspect
 import logging
 import threading
-from abc import abstractmethod
 from collections.abc import Callable, Generator, Iterable, Sequence
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 from torch._dynamo import allow_in_graph
-from torch._dynamo.variables.constant import ConstantVariable
 from torch._library.custom_ops import custom_op
 from torch._library.infer_schema import infer_schema
 from torch._ops import HigherOrderOperator
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake_temporarily
 from torch.fx.experimental.proxy_tensor import (
     ProxyTorchDispatchMode,
     disable_proxy_modes_tracing,
     track_tensor_tree,
 )
-from typing_extensions import Never
 
 from .nki_kernel import TorchNeuronNKIKernel
 from .utils import map_external_dtype_to_torch
 
 if TYPE_CHECKING:
-    from torch._dynamo.symbolic_convert import InstructionTranslator
     from torch._subclasses.functional_tensor import BaseFunctionalizeAPI
 # Type alias for NKI grid
 NKIGridType = tuple[int, ...] | list[int]
@@ -55,7 +52,7 @@ def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
 
 class NKIRegistry:
     id_to_kernel: ClassVar[dict[int, "TorchNeuronNKIKernel"]] = {}
-    kernel_to_id: ClassVar[dict["TorchNeuronNKIKernel", int]] = {}
+    kernel_func_to_id: ClassVar[dict["Callable", int]] = {}
     kernel_arg_names: ClassVar[dict[int, list[str]]] = {}
     kernel_default_args: ClassVar[dict[int, dict[str, Any]]] = {}
     """
@@ -76,20 +73,20 @@ class NKIRegistry:
         # Returns index on the table
         if kernel_default_args is None:
             kernel_default_args = {}
-
-        if kernel in self.kernel_to_id:
-            return self.kernel_to_id[kernel]
+        func = kernel.func
+        if kernel in self.kernel_func_to_id:
+            return self.kernel_func_to_id[kernel]
 
         idx = len(self.id_to_kernel)
         self.id_to_kernel[idx] = kernel
-        self.kernel_to_id[kernel] = idx
+        self.kernel_func_to_id[func] = idx
         self.kernel_arg_names[idx] = kernel_arg_names
         self.kernel_default_args[idx] = kernel_default_args
         return idx
 
     def get_kernel(self, idx: int) -> "TorchNeuronNKIKernel":
         # Returns the NKI kernel at the given index
-        assert idx in self.id_to_kernel
+        assert idx in self.id_to_kernel, f"{idx} not in kernel registry"
         return self.id_to_kernel[idx]
 
     def get_kernel_arg_names(self, idx: int) -> list[str]:
@@ -101,6 +98,7 @@ class NKIRegistry:
         return self.kernel_default_args[idx]
 
     def add_constant_args(self, args: dict[str, Any], hash_key: int):
+        assert hash_key != -1
         self.constant_args[hash_key] = args
 
     def get_constant_args(self, hash_key: int) -> dict[str, Any]:
@@ -111,7 +109,7 @@ class NKIRegistry:
     def reset_table(self) -> None:
         # Resets the table
         self.id_to_kernel = {}
-        self.kernel_to_id = {}
+        self.kernel_func_to_id = {}
         self.kernel_arg_names = {}
         self.kernel_default_args = {}
         self.constant_args = {}
@@ -126,7 +124,7 @@ def merge_tensor_constant_args(
     # Merges tensor args with constant args
     kernel_arg_names = kernel_registry.get_kernel_arg_names(kernel_idx)
     constant_args = kernel_registry.get_constant_args(constant_args_key)
-    tensor_args_dict = dict(zip(arg_names, args, strict=False))
+    tensor_args_dict = merge_names_and_args(arg_names, args)
     merged = {}
     for name in kernel_arg_names:
         if name in tensor_args_dict:
@@ -134,6 +132,10 @@ def merge_tensor_constant_args(
         else:
             merged[name] = constant_args[name]
     return merged
+
+
+def merge_names_and_args(arg_names: Sequence[str], args: Sequence[Any]):
+    return dict(zip(arg_names, args))  # noqa: B905
 
 
 # TODO: rename here and fx_importer to avoid confusion (e.g. NKIKernelHOP)
@@ -167,6 +169,27 @@ nki_kernel_wrapper = NKIKernelWrapper()
 nki_kernel_wrapper = allow_in_graph(nki_kernel_wrapper)
 
 
+def get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key):
+    kernel = kernel_registry.get_kernel(kernel_idx)
+    if constant_args_key == -1:
+        merged_args = merge_names_and_args(arg_names, args)
+    else:
+        merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
+    # NKI-790: NKI V2 doesn't support FakeTensors yet.
+    # Use Meta-tensors instead as a temporary workaround.
+    # TODO: revert to FakeTensor once the issue is resolved.
+    with unset_fake_temporarily():
+        meta_args = {}
+        for k, arg in merged_args.items():
+            if isinstance(arg, FakeTensor):
+                meta_tensor = torch.empty(arg.shape, dtype=arg.dtype, device="meta")
+                meta_args[k] = meta_tensor
+            else:
+                meta_args[k] = arg
+        dconfig = kernel[grid].dump_config(**meta_args)
+    return dconfig
+
+
 @nki_kernel_wrapper.py_impl(torch._C.DispatchKey.Meta)
 def nki_kernel_wrapper_meta(
     *,
@@ -178,9 +201,7 @@ def nki_kernel_wrapper_meta(
     arg_names: Sequence[str],
     constant_args_key: int,
 ):
-    kernel = kernel_registry.get_kernel(kernel_idx)
-    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
-    dconfig = kernel[grid].dump_config(**merged_args)
+    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return_types = dconfig.return_types
 
     if len(return_types) == 1:
@@ -191,6 +212,28 @@ def nki_kernel_wrapper_meta(
             torch.empty(rtype[1], dtype=map_external_dtype_to_torch(rtype[0]), device="meta")
             for rtype in return_types
         )
+
+
+def get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key):
+    kernel = kernel_registry.get_kernel(kernel_idx)
+    if constant_args_key == -1:
+        tensor_args = []
+        tensor_arg_names = []
+        constant_args = {}
+        for idx, name in enumerate(arg_names):
+            arg = args[idx]
+            if isinstance(arg, torch.Tensor):
+                tensor_args.append(arg)
+                tensor_arg_names.append(name)
+            else:
+                constant_args[name] = arg
+        constant_args_key = kernel._generate_hash_key(constant_args)
+        kernel_registry.add_constant_args(constant_args, constant_args_key)
+    else:
+        tensor_args = args
+        tensor_arg_names = arg_names
+    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
+    return dconfig, tensor_args, tensor_arg_names, constant_args_key
 
 
 @nki_kernel_wrapper.py_impl(DispatchKey.CompositeExplicitAutograd)
@@ -204,9 +247,13 @@ def nki_kernel_wrapper_dense(
     arg_names: Sequence[str],
     constant_args_key: int,
 ):
-    kernel = kernel_registry.get_kernel(kernel_idx)
-    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
-    dconfig = kernel[grid].dump_config(**merged_args)
+    (
+        dconfig,
+        tensor_args,
+        tensor_arg_names,
+        constant_args_key,
+    ) = get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key)
+
     backend_config = str(dconfig.dumped_config)
     operand_output_aliases = dconfig.operand_output_aliases
     return_types = dconfig.return_types
@@ -219,13 +266,13 @@ def nki_kernel_wrapper_dense(
         grid=grid,
         backend_config=backend_config,
         operand_output_aliases=operand_output_aliases,
-        args=args,
-        arg_names=arg_names,
+        args=tensor_args,
+        arg_names=tensor_arg_names,
         constant_args_key=constant_args_key,
         return_types=return_types,
     )
 
-    return nki_op_fn(*args)
+    return nki_op_fn(*tensor_args)
 
 
 @nki_kernel_wrapper.py_impl(FakeTensorMode)
@@ -240,12 +287,9 @@ def nki_kernel_wrapper_fake_tensor_mode(
     arg_names: Sequence[str],
     constant_args_key: int,
 ) -> Any:
+    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
+    return_types = dconfig.return_types
     with mode:
-        kernel = kernel_registry.get_kernel(kernel_idx)
-        merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
-        dconfig = kernel[grid].dump_config(**merged_args)
-        return_types = dconfig.return_types
-
         if len(return_types) == 1:
             return torch.empty(
                 return_types[0][1], dtype=map_external_dtype_to_torch(return_types[0][0])
@@ -269,18 +313,22 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     arg_names: Sequence[str],
     constant_args_key: int,
 ):
+    (
+        dconfig,
+        tensor_args,
+        tensor_arg_names,
+        constant_args_key,
+    ) = get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key)
     node_args = {
         "kernel_idx": kernel_idx,
         "grid": grid,
         "backend_config": backend_config,
         "operand_output_aliases": operand_output_aliases,
-        "args": args,
-        "arg_names": arg_names,
+        "args": tensor_args,
+        "arg_names": tensor_arg_names,
         "constant_args_key": constant_args_key,
     }
-    merged_args = merge_tensor_constant_args(kernel_idx, args, arg_names, constant_args_key)
-    kernel = kernel_registry.get_kernel(kernel_idx)
-    dconfig = kernel[grid].dump_config(**merged_args)
+
     node_args["backend_config"] = str(dconfig.dumped_config)
     node_args["operand_output_aliases"] = dconfig.operand_output_aliases
     with disable_proxy_modes_tracing():
@@ -295,9 +343,8 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
         nki_kernel_wrapper,
         (),
         proxy_args,
-        name=kernel.__name__ + "_proxy",
+        name=kernel_registry.get_kernel(kernel_idx).__name__ + "_proxy",
     )
-    # Attach backend_config and operand_output_aliases metadata
 
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
 
@@ -316,12 +363,8 @@ def nki_kernel_wrapper_functionalize(
     unwrapped_args = [
         ctx.unwrap_tensors(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
     ]
-    merged_args = merge_tensor_constant_args(
-        kernel_idx, unwrapped_args, arg_names, constant_args_key
-    )
-    kernel = kernel_registry.get_kernel(kernel_idx)
-    dconfig = kernel[grid].dump_config(**merged_args)
-
+    dconfig = get_dumped_config(kernel_idx, grid, unwrapped_args, arg_names, constant_args_key)
+    backend_config = str(dconfig.dumped_config)
     with ctx.redispatch_to_next():
         unwrapped_outputs = nki_kernel_wrapper(
             kernel_idx=kernel_idx,
@@ -363,164 +406,7 @@ nki_kernel_wrapper.fallthrough(DispatchKey.AutogradCUDA)
 nki_kernel_wrapper.fallthrough(DispatchKey.AutogradCPU)
 
 
-class NKIHOPifier:
-    """Orchestrator for converting a user-defined nki kernel into a call
-    to the nki_kernel_wrapper HOP.
-    """
-
-    @abstractmethod
-    def raise_unsupported(self, msg: str) -> Never:
-        return
-
-    @abstractmethod
-    def is_callable(self, maybe_callable: Any) -> bool:
-        return
-
-    @abstractmethod
-    def get_value(self, val: Any) -> Any:
-        return
-
-    @abstractmethod
-    def call_hop(  # type: ignore[no-untyped-def]
-        self,
-        variable,
-        grids,
-        combined_args: Sequence[Any],
-        tx: Optional["InstructionTranslator"],
-    ) -> Optional["ConstantVariable"]:
-        return
-
-    def init_variable(
-        self,
-        wrapper: "TraceableNKIKernelWrapper",
-        kernel: "TorchNeuronNKIKernel",
-        kernel_idx: int | None,
-        grid: Optional["NKIGridType"],
-        kernel_arg_names: list[str],
-        kernel_default_args: dict[str, Any],
-    ) -> None:
-        assert kernel is not None
-
-        wrapper.kernel_idx = kernel_registry.add_kernel(
-            kernel, kernel_arg_names, kernel_default_args
-        )
-        wrapper.kernel = kernel_registry.get_kernel(wrapper.kernel_idx)
-        wrapper.kernel_default_args = kernel_registry.get_kernel_default_args(wrapper.kernel_idx)
-        assert kernel_idx is None or wrapper.kernel_idx == kernel_idx
-
-        # pyrefly: ignore [bad-assignment]
-        wrapper.grid = grid
-        wrapper.kernel_arg_names = kernel_registry.get_kernel_arg_names(wrapper.kernel_idx)
-
-    def call_getitem(
-        self,
-        wrapper: "TraceableNKIKernelWrapper",
-        grid: "NKIGridType",
-    ) -> "TraceableNKIKernelWrapper":
-        return type(wrapper)(
-            kernel=wrapper.kernel,
-            kernel_idx=wrapper.kernel_idx,
-            grid=grid,
-            kernel_arg_names=wrapper.kernel_arg_names,
-            kernel_default_args=wrapper.kernel_default_args,
-        )
-
-    def call_run(
-        self,
-        wrapper: "TraceableNKIKernelWrapper",
-        args: Sequence[Any],
-        kwargs: dict[str, Any],
-        tx: Optional["InstructionTranslator"],
-    ) -> Optional["ConstantVariable"]:
-        if "grid" not in kwargs:
-            self.raise_unsupported("NKI kernel requires to be called with a grid")
-        grid = kwargs.pop("grid")
-
-        return self.call_nki_kernel(
-            type(wrapper)(
-                kernel=wrapper.kernel,
-                kernel_idx=wrapper.kernel_idx,
-                grid=grid,
-                kernel_arg_names=wrapper.kernel_arg_names,
-                kernel_default_args=wrapper.kernel_default_args,
-            ),
-            args,
-            kwargs,
-            tx,
-        )
-
-    def call_nki_kernel(
-        self,
-        wrapper: "TraceableNKIKernelWrapper",
-        args: Sequence[Any],
-        kwargs: dict[str, Any],
-        tx: Optional["InstructionTranslator"],
-    ) -> Optional["ConstantVariable"]:
-        # Both for grid's meta as well as for the kernel, we need combined
-        # args and kwargs combined and normalized
-        # pyrefly: ignore  # missing-attribute
-        combined_args_dict = {**dict(zip(wrapper.kernel_arg_names, args, strict=False)), **kwargs}
-        # Add default args for missing parameters
-        for arg_name in wrapper.kernel_arg_names:
-            if arg_name not in combined_args_dict:
-                combined_args_dict[arg_name] = wrapper.kernel_default_args[arg_name]
-        # Convert to list in order of kernel_arg_names
-        combined_args = tuple(combined_args_dict[name] for name in wrapper.kernel_arg_names)
-
-        assert wrapper.grid is not None
-
-        return self.call_hop(wrapper, wrapper.grid, combined_args, tx)
-
-
-class TracingNKIHOPifier(NKIHOPifier):
-    def raise_unsupported(self, msg: str) -> Never:
-        raise RuntimeError(msg)
-
-    def is_callable(self, maybe_callable: Any) -> bool:
-        return callable(maybe_callable)
-
-    def get_value(self, val: Any) -> Any:
-        return val
-
-    def call_hop(
-        self,
-        wrapper: "TraceableNKIKernelWrapper",
-        grid: "NKIGridType",
-        combined_args: Sequence[Any],
-        tx: Optional["InstructionTranslator"] = None,
-    ) -> None:
-        assert isinstance(wrapper.kernel_idx, int)
-
-        tensor_args = []
-        tensor_arg_names = []
-        constant_args = {}
-        for idx, name in enumerate(wrapper.kernel_arg_names):
-            arg = combined_args[idx]
-            if isinstance(arg, torch.Tensor):
-                tensor_args.append(arg)
-                tensor_arg_names.append(name)
-            else:
-                constant_args[name] = arg
-        hash_key = wrapper.kernel._generate_hash_key(constant_args)
-        kernel_registry.add_constant_args(constant_args, hash_key)
-        return nki_kernel_wrapper(
-            kernel_idx=wrapper.kernel_idx,
-            grid=grid,  # type: ignore[arg-type]
-            backend_config="",
-            operand_output_aliases={},
-            args=tensor_args,
-            arg_names=tensor_arg_names,
-            constant_args_key=hash_key,
-        )
-
-
-tracing_nki_hopifier_singleton = TracingNKIHOPifier()
-
-
-class TraceableNKIKernelWrapper:
-    kernel: "TorchNeuronNKIKernel"
-    kernel_idx: int | None
-    grid: Optional["NKIGridType"]
+class NKIHOPCaller:
     kernel_arg_names: list[str]
     kernel_default_args: dict[str, Any]
     _is_nki_kernel: bool
@@ -528,34 +414,59 @@ class TraceableNKIKernelWrapper:
 
     def __init__(
         self,
-        kernel: Callable,
         kernel_idx: int | None,
         grid: Optional["NKIGridType"],
         kernel_arg_names: list[str],
         kernel_default_args: dict[str, Any],
     ) -> None:
-        # pyrefly: ignore  # bad-assignment
-        self.kernel = None
-        self.kernel_idx = None
-        self.grid = []
-        tracing_nki_hopifier_singleton.init_variable(
-            self, kernel, kernel_idx, grid, kernel_arg_names, kernel_default_args
-        )
-        assert self.kernel is not None
+        self.kernel_idx = kernel_idx
+        self.grid = [] if grid is None else grid
+        self.kernel_arg_names = kernel_arg_names
+        self.kernel_default_args = kernel_default_args
 
-    def __getitem__(self, grid: "NKIGridType") -> "TraceableNKIKernelWrapper":
-        from neuronxcc.nki.compiler.backends.neuron.dimensions import serialize_dims
-
-        return tracing_nki_hopifier_singleton.call_getitem(self, serialize_dims(grid))
-
-    def run(self, *args: Sequence[Any], **kwargs: dict[str, Any]) -> Any:
-        return tracing_nki_hopifier_singleton.call_run(self, args, kwargs, None)
+    def __getitem__(self, grid: "NKIGridType") -> "NKIHOPCaller":
+        grid = tuple(map(int, grid))
+        return NKIHOPCaller(self.kernel_idx, grid, self.kernel_arg_names, self.kernel_default_args)
 
     def __call__(self, *args: Sequence[Any], **kwargs: dict[str, Any]) -> Any:
-        return tracing_nki_hopifier_singleton.call_nki_kernel(self, args, kwargs, None)
+        combined_args_dict = {**merge_names_and_args(self.kernel_arg_names, args), **kwargs}
+        # Add default args for missing parameters
+        for arg_name in self.kernel_arg_names:
+            if arg_name not in combined_args_dict:
+                combined_args_dict[arg_name] = self.kernel_default_args[arg_name]
+        # Convert to list in order of kernel_arg_names
+        combined_args = tuple(combined_args_dict[name] for name in self.kernel_arg_names)
+
+        return nki_kernel_wrapper(
+            kernel_idx=self.kernel_idx,
+            grid=self.grid,
+            backend_config="",
+            operand_output_aliases={},
+            args=combined_args,
+            arg_names=self.kernel_arg_names,
+            constant_args_key=-1,
+        )
 
 
-def wrap_nki(nki_kernel) -> Any:
+# This will execute the kernel registration during tracing
+# and fold it to the constant kernel idx.
+@torch._dynamo.assume_constant_result
+def register_kernel_to_torch(func, arg_names, kernel_default_args, use_old_nki=False, **kwargs):
+    if use_old_nki:
+        # Use V2 for nki library-based kernels
+        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV1
+
+        target_class = TorchNeuronNKIKernelV1
+    else:
+        # Use V1 for neuronxcc-based kernels
+        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV2
+
+        target_class = TorchNeuronNKIKernelV2
+    nki_kernel = target_class.trace(func, **kwargs)
+    return kernel_registry.add_kernel(nki_kernel, arg_names, kernel_default_args)
+
+
+def wrap_nki(nki_kernel, **kwargs) -> Any:
     """Allows capture of a nki kernel into a graph via torch.compile
 
     These technologies perform Dispatcher-based tracing (via
@@ -565,37 +476,26 @@ def wrap_nki(nki_kernel) -> Any:
 
     """
 
-    # Detect which NKI library was used based on the kernel's module
-    kernel_module = nki_kernel.__class__.__module__
-
-    if "neuronxcc" in kernel_module:
-        # Use V1 for neuronxcc-based kernels
-        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV1
-
-        target_class = TorchNeuronNKIKernelV1
-    else:
-        # Use V2 for nki library-based kernels
-        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV2
-
-        target_class = TorchNeuronNKIKernelV2
-
-    if not isinstance(nki_kernel, target_class):
-        new_kernel = target_class.__new__(target_class)
-        new_kernel.__dict__.update(nki_kernel.__dict__)
-        new_kernel.func_name = nki_kernel.func.__name__
-        new_kernel.enable_cache = True
-        new_kernel.func.__neuron_kernel_interface_kernel_cache__ = {}
-        nki_kernel = new_kernel
-
     # get list of argument names from nki_func
     sig = nki_kernel.sign
     arg_names = list(sig.parameters.keys())
+    opts_kwargs = {
+        field.name: getattr(nki_kernel.opts, field.name)
+        for field in fields(nki_kernel.opts)
+        if field.name not in kwargs
+    }
+    kwargs = {**opts_kwargs, **kwargs}
     kernel_default_args = {
         name: param.default
         for name, param in sig.parameters.items()
         if param.default is not inspect.Parameter.empty
     }
-    return TraceableNKIKernelWrapper(nki_kernel, None, [], arg_names, kernel_default_args)
+    use_old_nki = "neuronxcc" in nki_kernel.__class__.__module__
+    kernel_idx = register_kernel_to_torch(
+        nki_kernel.func, arg_names, kernel_default_args, use_old_nki, **kwargs
+    )
+
+    return NKIHOPCaller(kernel_idx, [], arg_names, kernel_default_args)
 
 
 def nki_op(

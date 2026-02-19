@@ -4,11 +4,12 @@
 #include <cstdlib>
 #include <memory>
 
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
-#include "torch_neuronx/csrc/core/streams/StreamManager.h"
 
 namespace {
 // Resource configuration constants
@@ -164,11 +165,6 @@ OperationExecutionEngine& NeuronResourceManager::GetOperationExecutionEngine() {
   return *operation_execution_engine_;
 }
 
-StreamManager& NeuronResourceManager::GetStreamManager() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return *stream_manager_;
-}
-
 ResourceSemaphore& NeuronResourceManager::GetResourceSemaphore() {
   std::lock_guard<std::mutex> lock(mutex_);
   return *resource_semaphore_;
@@ -199,14 +195,10 @@ NeuronResourceManager::NeuronResourceManager() {
     model_handle_cache_ = std::make_unique<ModelHandleCache>();
     TORCH_NEURONX_DEBUG("ModelHandleCache initialized");
 
-    // Initialize global execution manager
+    // Initialize global execution engine
     operation_execution_engine_ = std::make_unique<OperationExecutionEngine>(
         compilation_cache_.get(), model_handle_cache_.get());
     TORCH_NEURONX_DEBUG("OperationExecutionEngine initialized");
-
-    // Initialize stream manager
-    stream_manager_ = std::make_unique<StreamManager>(operation_execution_engine_.get());
-    TORCH_NEURONX_DEBUG("StreamManager initialized");
 
     // Initialize resource semaphore for future thread pool usage
     int max_slots = GetMaxResourceSlots();
@@ -218,7 +210,37 @@ NeuronResourceManager::NeuronResourceManager() {
   }
 }
 
-NeuronResourceManager::~NeuronResourceManager() = default;
+NeuronResourceManager::~NeuronResourceManager() {
+  // Shutdown execution engine first (stops worker threads)
+  if (operation_execution_engine_) {
+    operation_execution_engine_->Shutdown();
+  }
+  // Now safe to cleanup stream pools
+  CleanupStreamPools();
+}
+
+c10_neuron::NrtTensorPool& NeuronResourceManager::GetTensorPool(int device) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (tensor_pools_.empty()) {
+    int count = c10_neuron::device_count();
+    if (count <= 0) {
+      throw std::runtime_error("No Neuron devices available");
+    }
+    tensor_pools_.resize(count);
+  }
+
+  if (device < 0 || device >= static_cast<int>(tensor_pools_.size())) {
+    throw std::runtime_error("Invalid device: " + std::to_string(device));
+  }
+
+  auto& pool = tensor_pools_[device];
+  if (!pool) {
+    pool = std::make_unique<c10_neuron::NrtTensorPool>(device);
+  }
+
+  return *pool;
+}
 
 bool ResourceSemaphore::TryAcquireImmediate() {
   // Precondition: mutex_ is held by calling thread

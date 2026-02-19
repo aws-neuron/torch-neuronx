@@ -1,219 +1,115 @@
-"""
-Test functional collective operations with torch.compile
-
-This script tests the functional collective operations with the Neuron backend.
-
-Usage:
-    # Set artifacts directory (optional, defaults to neuron_backend_artifacts/)
-    export TORCH_NEURONX_DEBUG_DIR=./test_artifacts/functional_collectives
-
-    # Run with pytest
-    pytest tests/neuron_dynamo_backend/component/collectives/test_functional_collectives.py
-
-* trn1 takes 2, 8, 16, 32 as --nproc_per_node
-"""
-
-import logging
-import os
-import sys
-
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-from torch.distributed.device_mesh import DeviceMesh
 
 from tests.distributed.collective_ops.base_collective_op import BaseCollectiveOpTest
-
-# Import the neuron backend
-from tests.distributed.utils import DistributedTester
 from torch_neuronx.neuron_dynamo_backend import set_model_name
 
-# Setup logging
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-# Disable verbose logging for cleaner output
-torch._logging.set_logs(
-    # aot_graphs=True,
-    # graph_code=True,
-    # graph_breaks=True
-)
-
-torch._dynamo.config.automatic_dynamic_shapes = False
+@pytest.fixture(autouse=True)
+def reset_dynamo():
+    """Reset dynamo compilation cache before each test"""
+    torch._dynamo.reset()
 
 
-# Define collective operations to test with their configurations
-# Each entry: (name, callable, kwargs, needs_world_size_tensor)
+# Define functional collective operations to test
 COLLECTIVE_OPERATIONS = [
-    # Reduction operations with different reduce ops
-    # Note: PyTorch functional collectives use "sum", "avg", "product", "min", "max"
-    ("all_reduce_sum", lambda x, mesh: funcol.all_reduce(x, reduceOp="sum", group=mesh), {}, False),
-    ("all_reduce_avg", lambda x, mesh: funcol.all_reduce(x, reduceOp="avg", group=mesh), {}, False),
-    # ("all_reduce_product", lambda x, mesh: funcol.all_reduce(x, reduceOp="product", group=mesh), \
-    #   {}, False),  # NOTE: not supported by neuronx-cc
-    ("all_reduce_min", lambda x, mesh: funcol.all_reduce(x, reduceOp="min", group=mesh), {}, False),
-    ("all_reduce_max", lambda x, mesh: funcol.all_reduce(x, reduceOp="max", group=mesh), {}, False),
-    (
-        "all_gather_tensor",
-        lambda x, mesh: funcol.all_gather_tensor(x, gather_dim=0, group=mesh),
-        {},
-        False,
-    ),
-    # TODO: Not implemented yet
-    # ("broadcast", lambda x, mesh: funcol.broadcast(x, src=0, group=mesh), {}, False),
+    ("all_reduce_sum", lambda x, mesh: funcol.all_reduce(x, reduceOp="sum", group=mesh)),
+    ("all_reduce_avg", lambda x, mesh: funcol.all_reduce(x, reduceOp="avg", group=mesh)),
+    ("all_reduce_min", lambda x, mesh: funcol.all_reduce(x, reduceOp="min", group=mesh)),
+    ("all_reduce_max", lambda x, mesh: funcol.all_reduce(x, reduceOp="max", group=mesh)),
+    ("all_gather_tensor", lambda x, mesh: funcol.all_gather_tensor(x, gather_dim=0, group=mesh)),
     (
         "reduce_scatter_tensor",
-        lambda x, mesh: funcol.reduce_scatter_tensor(x, "sum", scatter_dim=0, group=(mesh, 0)),
-        {},
-        True,
+        lambda x, mesh: funcol.reduce_scatter_tensor(x, "sum", scatter_dim=0, group=mesh),
     ),
-    # Coalesced operations (take lists)
-    # ("all_reduce_coalesced", lambda x, \
-    #   mesh: funcol.all_reduce_coalesced([x], reduceOp="sum", group=mesh)[0], {}, False),
-    # ("all_gather_into_tensor_coalesced", lambda x, \
-    #   mesh: funcol.all_gather_into_tensor_coalesced([x], group=mesh)[0], {}, False),
-    # ("reduce_scatter_tensor_coalesced", lambda x, \
-    #   mesh: funcol.reduce_scatter_tensor_coalesced([x], "sum", scatter_dim=[0], group=mesh)[0], \
-    #   {}, True),
+    (
+        "all_reduce_coalesced",
+        lambda x, mesh: funcol.all_reduce_coalesced([x], reduceOp="sum", group=mesh)[0],
+    ),
+    (
+        "all_gather_into_tensor_coalesced",
+        lambda x, mesh: funcol.all_gather_into_tensor_coalesced([x], group=mesh)[0],
+    ),
+    (
+        "reduce_scatter_tensor_coalesced",
+        lambda x, mesh: funcol.reduce_scatter_tensor_coalesced(
+            [x], "sum", scatter_dim=[0], group=mesh
+        )[0],
+    ),
+    # (
+    #     "all_to_all",
+    #     lambda x, mesh: funcol.all_to_all_single(
+    #         x, output_split_sizes=None, input_split_sizes=None, group=mesh
+    #     ),
+    # ),
 ]
 
 
-def _run_single_collective(collective_config, rank, world_size, device_mesh, device):
+def _test_single_collective(
+    collective_name, collective_fn, rank, world_size, process_group, device
+):
     """Test a single collective operation"""
-    func_name, collective_fn, kwargs, needs_world_size_tensor = collective_config
+    set_model_name(f"{collective_name}_rank{rank}")
 
-    logger.debug(f"Rank {rank}: Testing {func_name}...")
+    x = torch.tensor([rank + 1.0, rank + 2.0, rank + 3.0, rank + 4.0] * world_size, device=device)
 
-    # Set model name for artifact tracking
-    set_model_name(f"{func_name}_rank{rank}")
+    eager_result = collective_fn(x.clone(), process_group)
+    compiled_fn = torch.compile(lambda t: collective_fn(t, process_group), backend="neuron")
+    compiled_result = compiled_fn(x.clone())
 
-    # Create appropriate test tensor based on the operation
-    if needs_world_size_tensor:
-        # These need tensors divisible by world_size
-        x = torch.tensor(
-            [rank + 1.0, rank + 2.0, rank + 3.0, rank + 4.0] * world_size, device=device
-        )
-    else:
-        # Standard tensor for other operations
-        x = torch.tensor([rank + 1.0, rank + 2.0, rank + 3.0, rank + 4.0], device=device)
+    torch.neuron.synchronize()
 
-    logger.debug(f"Rank {rank}: Initial tensor for {func_name}: {x}")
+    torch.testing.assert_close(eager_result.cpu(), compiled_result.cpu(), atol=1e-5, rtol=1e-4)
 
-    # Create a wrapper function that applies the collective and post-processing
-    def wrapper(tensor):
-        result = tensor.clone()
-        # Apply the collective operation
-        collective_result = collective_fn(result, device_mesh)
-        # Add post-processing operations to test graph continuity
-        collective_result = collective_result + 1.0
-        collective_result = collective_result * 2.0
-        return collective_result
 
-    try:
-        # Test eager execution
-        logger.debug(f"Rank {rank}: Testing eager {func_name}...")
-        eager_result = wrapper(x)
-        logger.debug(f"Rank {rank}: Eager {func_name} result: {eager_result}")
+def run_permute_tensor_test(rank, world_size, kwargs):
+    """Test permute_tensor collective operation with torch.compile"""
+    device = torch.neuron.current_device()
+    process_group = dist.group.WORLD
 
-        # Test torch.compile
-        logger.debug(f"Rank {rank}: Testing compiled {func_name}...")
-        compiled_func = torch.compile(wrapper, backend="neuron")
-        compiled_result = compiled_func(x)
-        logger.debug(f"Rank {rank}: Compiled {func_name} result: {compiled_result}")
+    set_model_name(f"permute_tensor_rank{rank}")
 
-        # Verify results match
-        if torch.allclose(eager_result, compiled_result, atol=1e-5):
-            logger.debug(
-                f"Rank {rank}: {func_name} results match - functional collective "
-                f"works with torch.compile!"
-            )
-            return "SUCCESS"
-        else:
-            logger.error(f"Rank {rank}: {func_name} results don't match")
-            logger.debug(f"Rank {rank}: Eager: {eager_result}")
-            logger.debug(f"Rank {rank}: Compiled: {compiled_result}")
-            return "MISMATCH"
+    x = torch.tensor([rank + 1.0, rank + 2.0, rank + 3.0, rank + 4.0] * world_size, device=device)
+    permutation = list(range(world_size))
+    permutation.reverse()
 
-    except Exception as e:
-        logger.error(f"Rank {rank}: {func_name} test failed: {e}")
-        import traceback
+    cpu_pg = dist.new_group(backend="gloo")
+    eager_result = funcol.permute_tensor(x.cpu(), permutation, group=cpu_pg)
+    compiled_fn = torch.compile(
+        lambda t: funcol.permute_tensor(t, permutation, group=process_group), backend="neuron"
+    )
+    compiled_result = compiled_fn(x.clone())
 
-        traceback.print_exc()
-        return f"FAILED: {e!s}"
+    torch.neuron.synchronize()
+
+    torch.testing.assert_close(eager_result, compiled_result.cpu(), atol=1e-5, rtol=0)
 
 
 def run_functional_collectives_test(rank, world_size, kwargs):
-    """Test all relevant functional collective operations with torch.compile"""
-
-    logger.debug(f"=== Rank {rank}/{world_size}: Testing Functional Collective Operations ===")
-    logger.debug("Using backend: neuron_backend")
-
-    # List the operations we're testing
-    if rank == 0:
-        logger.debug("Testing the following functional collective operations:")
-        for i, (op_name, _, _, _) in enumerate(COLLECTIVE_OPERATIONS, 1):
-            logger.debug(f"  {i:2d}. {op_name}")
-
+    """Test all functional collective operations with torch.compile"""
     device = torch.device(f"neuron:{rank}")
-    # Create device mesh like TorchTitan does
-    device_mesh = DeviceMesh("neuron", list(range(world_size)))
-    logger.debug(f"Rank {rank}: Created device mesh: {device_mesh}, using device: {device}")
+    process_group = dist.group.WORLD
 
-    # Test results tracking
-    results = {}
-
-    # Test each functional collective
-    for collective_config in COLLECTIVE_OPERATIONS:
-        func_name = collective_config[0]
-        try:
-            result = _run_single_collective(
-                collective_config, rank, world_size, device_mesh, device
-            )
-            results[func_name] = result
-
-            # Synchronize between tests
-            dist.barrier()
-
-        except Exception as e:
-            logger.error(f"Rank {rank}: Failed to test {func_name}: {e}")
-            results[func_name] = f"SETUP_FAILED: {e!s}"
-
-    # Print summary
-    if rank == 0:
-        logger.info("\n" + "=" * 80)
-        logger.info("FUNCTIONAL COLLECTIVES + TORCH.COMPILE TEST SUMMARY")
-        logger.info("=" * 80)
-
-        success_count = 0
-        total_count = len(results)
-
-        for func_name, status in results.items():
-            logger.info(f"{func_name:35} | {status}")
-            if status == "SUCCESS":
-                success_count += 1
-
-        logger.info("=" * 80)
-        logger.info(
-            f"SUCCESS RATE: {success_count}/{total_count} ({100*success_count/total_count:.1f}%)"
+    for collective_name, collective_fn in COLLECTIVE_OPERATIONS:
+        _test_single_collective(
+            collective_name, collective_fn, rank, world_size, process_group, device
         )
-        logger.info("=" * 80)
-
-    # Note: Don't call dist.destroy_process_group() here - DistributedTester handles cleanup
-    logger.info(f"Rank {rank}: Test complete")
+        dist.barrier(device_ids=[rank])
 
 
 class TestFunctionalCollectives(BaseCollectiveOpTest):
-    """Test class for functional collectives component tests using DistributedTester."""
+    """Test class for functional collectives unit tests using DistributedTester."""
 
     @pytest.mark.multi_device
-    def test_functional_collectives(self):
+    def test_compile_functional_collectives(self, monkeypatch):
         """Test functional collective operations with torch.compile."""
+        monkeypatch.setenv("TORCH_NEURONX_MLIR_ATEN_OPS", "1")
         self.distributed_tester.run_test(run_functional_collectives_test)
 
-
-if __name__ == "__main__":
-    import pytest
-
-    pytest.main(["-vs", __file__])
+    @pytest.mark.multi_device
+    def test_compile_permute_tensor(self, monkeypatch):
+        """Test permute_tensor collective operation with torch.compile."""
+        monkeypatch.setenv("TORCH_NEURONX_MLIR_ATEN_OPS", "1")
+        self.distributed_tester.run_test(run_permute_tensor_test)

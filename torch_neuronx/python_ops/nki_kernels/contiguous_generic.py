@@ -27,8 +27,7 @@ def contiguous_generic_kernel(
     cpu_buffer = torch.empty(storage_size, dtype=src.dtype, device="cpu")
 
     # Copy entire storage from Neuron to CPU using raw NRT operations
-    device_id = src.device.index
-    _C._nrt_copy_raw_to_cpu(src, cpu_buffer, device_id, non_blocking)
+    _C._nrt_copy_raw_to_cpu(src, cpu_buffer, non_blocking)
 
     # Create strided view on CPU buffer matching source layout
     # Use the provided storage offset
@@ -42,7 +41,6 @@ def contiguous_generic_kernel(
 
     # Copy contiguous result back to Neuron device
     # The destination tensor is already allocated and contiguous
-    device_id = dst.device.index
-    _C._nrt_copy_cpu_to_raw(cpu_contiguous, dst, device_id, non_blocking)
+    _C._nrt_copy_cpu_to_raw(cpu_contiguous, dst, non_blocking)
 
     return dst

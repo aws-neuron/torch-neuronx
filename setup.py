@@ -164,6 +164,42 @@ if is_building:
                         # Run custom extension
                         build_ext.run(self)
 
+                def _fix_rpath(self, so_path):
+                    """Fix RPATH to find torch libs at runtime.
+
+                    Bazel adds its internal cache paths to RUNPATH, which don't exist
+                    when the wheel is installed. We replace them with:
+                    - $ORIGIN/../torch/lib: finds torch libs relative to _C.so
+                    - /opt/aws/neuron/lib: finds NRT libs at standard location
+                    """
+                    new_rpath = "$ORIGIN/../torch/lib:/opt/aws/neuron/lib"
+
+                    # Check if patchelf is available
+                    patchelf = shutil.which("patchelf")
+                    if not patchelf:
+                        raise RuntimeError(
+                            "patchelf is required to build wheels but was not found.\n"
+                            "Please install patchelf on your system."
+                        )
+
+                    # Make file writable (Bazel outputs are read-only)
+                    so_path = Path(so_path)
+                    so_path.chmod(so_path.stat().st_mode | 0o200)
+
+                    try:
+                        subprocess.run(
+                            [patchelf, "--set-rpath", new_rpath, str(so_path)],
+                            check=True,
+                            capture_output=True,
+                        )
+                        print(f"Fixed RPATH on {so_path}: {new_rpath}")
+                    except subprocess.CalledProcessError as e:
+                        raise RuntimeError(
+                            f"Failed to fix RPATH on {so_path}.\n"
+                            f"patchelf stderr: {e.stderr.decode() if e.stderr else 'none'}\n"
+                            f"The wheel will not work without this fix."
+                        ) from e
+
                 def build_extension(self, ext: Extension) -> None:
                     """
                     This method is called by setuptools to build a single extension.
@@ -179,11 +215,17 @@ if is_building:
                     build_dir.mkdir(parents=True, exist_ok=True)
 
                     # Prepare the Bazel command
+                    python_version = (
+                        os.environ.get("PYTHON_VERSION")
+                        or Path(".python-version").read_text().strip()
+                    )
                     bazel_argv = [
                         "bazel",
                         "build",
                         ext.bazel_target,
                         f"--symlink_prefix={os.path.join(self.build_temp, 'bazel-')}",
+                        f"--@rules_python//python/config_settings:python_version={python_version}",
+                        f"--action_env=PYTHON_VERSION={python_version}",
                     ]
 
                     # Set env variable for pytorch local path
@@ -217,6 +259,9 @@ if is_building:
 
                         shutil.copy2(str(bazel_extension), str(target_extension))
                         print(f"Copied Bazel extension: {bazel_extension} -> {target_extension}")
+
+                        # Fix RPATH - Bazel sets incorrect paths, we need torch/lib relative path
+                        self._fix_rpath(target_extension)
                     else:
                         raise RuntimeError(f"Bazel extension not found at {bazel_extension}")
 

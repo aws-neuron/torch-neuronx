@@ -3,6 +3,7 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 def get_matmul_output_shape(a: torch.Tensor, b: torch.Tensor) -> torch.Size:
@@ -105,8 +106,13 @@ class TestMatmul:
             y = torch.randn(*shape2, device=device)
 
             result = torch.matmul(x, y)
-            # Check for either addmv or addmv_ (inplace variant)
-            assert_op_runs_on_neuron("addmv")
+            # Ideally x @ y should be dispatched to aten::mv
+            # addmv is used when we do torch.addmv(bias_tensor, matrix, vector)
+            # non-MLIR path does not have aten::mv registered, so was dispatched to addmv
+            if use_mlir_aten_ops():
+                assert_op_runs_on_neuron("aten::mv")
+            else:
+                assert_op_runs_on_neuron("addmv")
 
             # Verify against CPU computation
             expected = torch.matmul(x.cpu(), y.cpu())
@@ -165,7 +171,13 @@ class TestMatmul:
             y = torch.randn(*shape2, device=device)
 
             result = x @ y
-            assert_op_runs_on_neuron("addmv")
+            # Ideally x @ y should be dispatched to aten::mv
+            # addmv is used when we do torch.addmv(bias_tensor, matrix, vector)
+            # non-MLIR path does not have aten::mv registered, so was dispatched to addmv
+            if use_mlir_aten_ops():
+                assert_op_runs_on_neuron("aten::mv")
+            else:
+                assert_op_runs_on_neuron("addmv")
 
             # Verify against CPU computation
             expected = torch.matmul(x.cpu(), y.cpu())
@@ -234,7 +246,13 @@ class TestMatmul:
             out = torch.empty(expected_shape, device=device)
             torch.matmul(x, y, out=out)
             assert out.device.type == "neuron"
-            assert_op_runs_on_neuron("addmv")
+            # Ideally x @ y should be dispatched to aten::mv
+            # addmv is used when we do torch.addmv(bias_tensor, matrix, vector)
+            # non-MLIR path does not have aten::mv registered, so was dispatched to addmv
+            if use_mlir_aten_ops():
+                assert_op_runs_on_neuron("aten::mv.out")
+            else:
+                assert_op_runs_on_neuron("addmv")
 
             # Verify against CPU computation
             expected = torch.matmul(x.cpu(), y.cpu())
@@ -291,8 +309,7 @@ class TestMatmul:
         Test matmul with different data types (gets lowered to mm).
 
         For int32 and int64 dtypes, error observed is:
-        ERROR    torch_neuronx.python_ops.jax.op_impl:op_impl.py:143 Execution failed:
-        NEFF compilation failed with return code 70.
+        Execution failed: NEFF compilation failed with return code 70.
         Error: 2025-09-08T20:18:38Z [TEN404] (jit(_aten_matmul)/jit(main)/dot_general_dot.3)
         Internal tensorizer error: LegalizeType:int64/uint64/int32/uint32 matmult is not supported!
 

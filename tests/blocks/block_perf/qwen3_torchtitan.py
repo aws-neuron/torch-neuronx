@@ -82,7 +82,6 @@ def create_config(preset_name, batch_size, seq_len):
         "seq_len": seq_len,
     }
 
-    # Extract parallelism type from preset
     if "tp_fsdp" in preset_name:
         config["parallelism"] = "tp_fsdp"
     elif "tp" in preset_name:
@@ -90,7 +89,6 @@ def create_config(preset_name, batch_size, seq_len):
     elif "fsdp" in preset_name:
         config["parallelism"] = "fsdp"
     else:
-        # Default to no parallelism for base preset
         config["parallelism"] = "none"
 
     return config
@@ -147,6 +145,7 @@ def get_presets():
         "qwen3-8b-tp",
         "qwen3-8b-fsdp",
         "qwen3-8b-tp_fsdp",
+        "qwen3-8b-singlecore",  # Pure compute baseline, no distributed
     ]
 
 

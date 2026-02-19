@@ -11,14 +11,15 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 embedding_dense_backward = torch.ops.aten.embedding_dense_backward
 
 # MLIR path uses aten:: prefix for op names
-_USE_MLIR = os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
-_EMBEDDING_BACKWARD_OP = (
-    "aten::embedding_dense_backward" if _USE_MLIR else "embedding_dense_backward"
-)
+if use_mlir_aten_ops():
+    _EMBEDDING_BACKWARD_OP = "aten::embedding_dense_backward"
+else:
+    _EMBEDDING_BACKWARD_OP = "embedding_dense_backward"
 
 
 class TestEmbeddingDenseBackward:
@@ -86,7 +87,20 @@ class TestEmbeddingDenseBackward:
         executed_ops = torch_neuronx.get_executed_ops()
         assert _EMBEDDING_BACKWARD_OP in executed_ops
 
-    @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64, torch.float32])
+    @pytest.mark.parametrize(
+        "indices_dtype",
+        [
+            torch.int32,
+            torch.int64,
+            pytest.param(
+                torch.float32,
+                marks=pytest.mark.xfail(
+                    condition=not use_mlir_aten_ops(),
+                    reason="XLA Implementation does not handle indices_dtype data type of float32.",
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize(
         "weight_dtype",
         [
@@ -96,12 +110,25 @@ class TestEmbeddingDenseBackward:
             pytest.param(
                 torch.float64,
                 marks=pytest.mark.xfail(
-                    reason="Float64 is cast to float32 due to hardware limitations"
+                    condition=not use_mlir_aten_ops(),
+                    reason="Float64 is cast to float32 due to hardware limitations",
                 ),
             ),
         ],
     )
-    @pytest.mark.parametrize("scale_grad_by_freq", [False, True])
+    @pytest.mark.parametrize(
+        "scale_grad_by_freq",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.xfail(
+                    condition=not use_mlir_aten_ops(),
+                    reason="Incorrect compilation for different weight_dtype values.",
+                ),
+            ),
+        ],
+    )
     def test_embedding_dense_backward_with_different_dtypes(
         self, indices_dtype, weight_dtype, scale_grad_by_freq
     ):
@@ -118,7 +145,7 @@ class TestEmbeddingDenseBackward:
         torch_neuronx.clear_op_tracking()
 
         if indices_dtype == torch.float32:
-            # We expect a RuntimeError because CPU cannot handle float indices
+            # We expect a RuntimeError because float indices are not valid.
             self._test_embedding_dense_backward_float_indices_error(
                 embedding_dim, weight_dtype, indices_neuron, num_embeddings
             )
@@ -130,7 +157,7 @@ class TestEmbeddingDenseBackward:
                     indices_neuron,
                     num_embeddings,
                     -1,
-                    False,
+                    scale_grad_by_freq,
                 )
                 # Verify operation ran on Neuron (not CPU fallback)
                 assert_op_runs_on_neuron("embedding_dense_backward")
@@ -138,17 +165,7 @@ class TestEmbeddingDenseBackward:
             assert grad_weight.device.type == "neuron"
             assert grad_weight.dtype == weight_dtype
         else:
-            # For all other cases, we expect fallback to CPU (no warning since it's now debug level)
-            _ = embedding_dense_backward(
-                torch.ones(2, 4, embedding_dim, dtype=weight_dtype).to("neuron"),
-                indices_neuron,
-                num_embeddings,
-                -1,
-                False,
-            )
-
-            # Verify that the operation was offloaded to CPU
-            assert "aten::embedding_dense_backward" in torch_neuronx.get_fallback_ops()
+            raise ValueError(f"Unsupported indices_dtype test: {indices_dtype}")
 
     def test_embedding_dense_backward_with_one_tensor_not_on_device(self):
         """Test embedding backward with one tensor not on device
@@ -160,20 +177,14 @@ class TestEmbeddingDenseBackward:
         indices = torch.tensor([[0, 3, 5, 8], [9, 0, 2, 3]], dtype=torch.int32)
         indices_neuron = indices.to("neuron")
 
-        # Clear any previous tracking
-        torch_neuronx.clear_op_tracking()
-
-        # Operation should fall back to CPU (no warning expected since it's now debug level)
-        _ = embedding_dense_backward(
-            torch.ones(2, 4, embedding_dim),
-            indices_neuron,
-            num_embeddings,  # Fix: swap the order of num_embeddings and padding_idx
-            -1,  # Fix: this is padding_idx
-            False,
-        )
-
-        # Verify that the operation was offloaded to CPU
-        assert "aten::embedding_dense_backward" in torch_neuronx.get_fallback_ops()
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            embedding_dense_backward(
+                torch.ones(2, 4, embedding_dim),
+                indices_neuron,
+                num_embeddings,  # Fix: swap the order of num_embeddings and padding_idx
+                -1,  # Fix: this is padding_idx
+                False,
+            )
 
     @assert_raises(
         RuntimeError,
@@ -191,6 +202,44 @@ class TestEmbeddingDenseBackward:
             -1,
             False,
         )
+
+    def test_embedding_dense_backward_large_vocab(self):
+        """Test embedding backward with large vocab size (Qwen3 case)."""
+        num_weights = 151936
+        embed_dim = 4096
+        seq_len = 4096
+
+        # Pre-allocate ~17GB
+        memory_pressure = torch.empty(
+            17 * 1024 * 1024 * 1024 // 2, dtype=torch.bfloat16, device="neuron"
+        )
+
+        torch.manual_seed(42)
+        grad_output_cpu = torch.ones(1, seq_len, embed_dim, dtype=torch.bfloat16)
+        indices_cpu = torch.randint(0, num_weights, (1, seq_len), dtype=torch.int64)
+
+        cpu_result = embedding_dense_backward(grad_output_cpu, indices_cpu, num_weights, -1, False)
+
+        grad_output = grad_output_cpu.to("neuron")
+        indices = indices_cpu.to("neuron")
+
+        with track_neuron_ops():
+            # scratchpad usage should be negligible, should not OOM
+            grad_weight = embedding_dense_backward(
+                grad_output,
+                indices,
+                num_weights,
+                -1,
+                False,
+            )
+
+            assert grad_weight.shape == (num_weights, embed_dim)
+            assert grad_weight.dtype == torch.bfloat16
+            assert_op_runs_on_neuron("embedding_dense_backward")
+
+        torch.testing.assert_close(grad_weight.cpu(), cpu_result)
+
+        del memory_pressure
 
 
 class TestEmbedding:

@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-@wrap_nki
 @nki.jit
 def nki_tensor_add_kernel_(a_input, b_input):
     """NKI kernel for tensor addition"""
@@ -42,7 +41,6 @@ def nki_tensor_add_kernel_(a_input, b_input):
     return c_output
 
 
-@wrap_nki
 @nki.jit
 def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     """NKI kernel that computes multiplication and in_place add"""
@@ -63,7 +61,6 @@ def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
     return c_output, a_input
 
 
-@wrap_nki
 @nki.jit
 def nki_scaled_add_inplace(a_input, scale, b_output: nt.mutable_tensor):
     """NKI kernel that computes scaled in_place add"""
@@ -84,20 +81,20 @@ def nki_scaled_add_inplace(a_input, scale, b_output: nt.mutable_tensor):
 @nki_op(f"{my_namespace}::add_op", mutates_args={})
 def nki_add_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     grid = [a.shape[0] // 128, b.shape[1] // 512]
-    return nki_tensor_add_kernel_[grid](a, b)
+    return wrap_nki(nki_tensor_add_kernel_)[grid](a, b)
 
 
 @nki_op(f"{my_namespace}::add_inplace_and_mul", mutates_args={"a"})
 def nki_add_inplace_and_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     grid = [a.shape[0] // 128, b.shape[1] // 512]
-    e, _ = nki_add_alias_mul[grid](a, b)
+    e, _ = wrap_nki(nki_add_alias_mul)[grid](a, b)
     return e
 
 
 @nki_op(f"{my_namespace}::scaled_add_inplace", mutates_args={"b"})
 def nki_scaled_add_inplace_op(a: torch.Tensor, scale: float, b: torch.Tensor) -> torch.Tensor:
     grid = [a.shape[0] // 128, b.shape[1] // 512]
-    return nki_scaled_add_inplace[grid](a, scale, b)
+    return wrap_nki(nki_scaled_add_inplace)[grid](a, scale, b)
 
 
 def nki_func(a, b):
@@ -159,7 +156,6 @@ def ref_aliased_with_constant_func(
         return scaled
 
 
-@wrap_nki
 @nki.jit
 def nki_aliased_kernel_with_constant(
     scale: float, out: nt.mutable_tensor, mode: str | None = None, input: torch.Tensor | None = None
@@ -190,10 +186,10 @@ def nki_aliased_with_constant_op(
     scale: float, out: torch.Tensor, mode: str | None, input: torch.Tensor | None = None
 ) -> torch.Tensor:
     grid = [out.shape[0] // 128, out.shape[1] // 512]
-    nki_aliased_kernel_with_constant[grid](scale, out, mode, input)
+    wrap_nki(nki_aliased_kernel_with_constant)[grid](scale, out, mode, input)
 
 
-class TestNKIDyamoIntegration:
+class TestNKIOPIntegration:
     def test_nki_func_compiled(self):
         """Test nki_func with neuron backend"""
         a = torch.rand((256, 1024), dtype=torch.float32)
@@ -261,7 +257,6 @@ class TestNKIDyamoIntegration:
     def test_nki_multiout(self):
         """Test multi-output NKI kernel"""
 
-        @wrap_nki
         @nki.jit
         def nki_multiout_add_kernel(
             a_input: nl.ndarray,
@@ -293,7 +288,7 @@ class TestNKIDyamoIntegration:
             b_input: torch.Tensor,
             c_input: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return nki_multiout_add_kernel(a_input, b_input, c_input)
+            return wrap_nki(nki_multiout_add_kernel)(a_input, b_input, c_input)
 
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -318,7 +313,6 @@ class TestNKIDyamoIntegration:
     def test_model_with_cache_return_on_neuron(self):
         """Test KV cache update with mutable tensors"""
 
-        @wrap_nki
         @nki.jit
         def write_kv_cache_at_batch_kernel(
             k: nt.tensor,
@@ -353,7 +347,7 @@ class TestNKIDyamoIntegration:
             v_prior: torch.Tensor,
             batch_index: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return write_kv_cache_at_batch_kernel(k, v, k_prior, v_prior, batch_index)
+            return wrap_nki(write_kv_cache_at_batch_kernel)(k, v, k_prior, v_prior, batch_index)
 
         class ModelWithCacheReturn(nn.Module):
             def __init__(self):
@@ -386,3 +380,95 @@ class TestNKIDyamoIntegration:
 
         assert torch.all(k == 1)
         assert torch.all(v == 1)
+
+
+class TestNKINativeIntegration:
+    def test_nki_func_compiled(self):
+        """Test nki_func with neuron backend using native kernel calls"""
+        a = torch.rand((256, 1024), dtype=torch.float32)
+        b = torch.rand((256, 1024), dtype=torch.float32)
+
+        def nki_native_func(a, b):
+            c = a * 2
+            d = b + 3
+            grid = [a.shape[0] // 128, b.shape[1] // 512]
+            e = wrap_nki(nki_tensor_add_kernel_)[grid](c, d)
+            return e * c
+
+        compiled_func = torch.compile(nki_native_func, backend="neuron", fullgraph=True)
+        ref = ref_func(a, b)
+        result = compiled_func(a.to("neuron"), b.to("neuron")).to("cpu")
+        assert result.shape == ref.shape
+        assert result.dtype == ref.dtype
+        assert torch.allclose(result, ref, rtol=1e-5, atol=1e-5)
+
+    def test_aliased_func_compiled(self):
+        """Test aliased_func with neuron backend using native kernel calls"""
+        a = torch.rand((256, 1024), dtype=torch.float32)
+        b = torch.rand((256, 1024), dtype=torch.float32)
+
+        def nki_native_aliased_func(a, b):
+            c = a * 2
+            d = b + 3
+            grid = [a.shape[0] // 128, b.shape[1] // 512]
+            e, _ = wrap_nki(nki_add_alias_mul)[grid](c, d)
+            return e + c
+
+        compiled_alias = torch.compile(nki_native_aliased_func, backend="neuron", fullgraph=True)
+        ref = ref_aliased_func(a, b)
+        result = compiled_alias(a.to("neuron"), b.to("neuron")).to("cpu")
+        assert result.shape == ref.shape
+        assert result.dtype == ref.dtype
+        assert torch.allclose(result, ref, rtol=1e-5, atol=1e-5)
+
+    def test_nki_scaled_add_inplace(self):
+        """Test nki_scaled_add_inplace with neuron backend using native kernel calls"""
+        a = torch.rand((256, 1024), dtype=torch.float32)
+        b = torch.rand((256, 1024), dtype=torch.float32)
+        scale = 2.5
+
+        def nki_native_scaled_add_func(a, b, scale):
+            c = a * 2
+            d = b.clone()
+            grid = [a.shape[0] // 128, b.shape[1] // 512]
+            wrap_nki(nki_scaled_add_inplace)[grid](c, scale, d)
+            return d
+
+        compiled_func = torch.compile(nki_native_scaled_add_func, backend="neuron", fullgraph=True)
+        ref = ref_scaled_add_func(a, b, scale)
+        result = compiled_func(a.to("neuron"), b.to("neuron"), scale).to("cpu")
+        assert result.shape == ref.shape
+        assert result.dtype == ref.dtype
+        assert torch.allclose(result, ref, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "mode,has_input",
+        [
+            ("multiply", True),
+            ("multiply", False),
+            (None, True),
+            (None, False),
+        ],
+    )
+    def test_nki_aliased_with_constant(self, mode, has_input):
+        """
+        Test nki_aliased_kernel_with_constant with different optional parameter
+        combinations using native kernel calls
+        """
+        out = torch.ones((256, 1024), dtype=torch.float32)
+        input_tensor = torch.rand((256, 1024), dtype=torch.float32) if has_input else None
+        out_neuron = out.clone().to("neuron")
+        input_neuron = input_tensor.clone().to("neuron") if has_input else None
+        scale = 2.5
+
+        ref = ref_aliased_with_constant_func(scale, out, mode, input_tensor)
+
+        def nki_native_aliased_with_constant(scale, out, mode, input):
+            grid = [out.shape[0] // 128, out.shape[1] // 512]
+            wrap_nki(nki_aliased_kernel_with_constant)[grid](scale, out, mode, input)
+
+        compiled_func = torch.compile(
+            lambda *args: nki_native_aliased_with_constant(*args), backend="neuron", fullgraph=True
+        )
+        compiled_func(scale, out_neuron, mode, input_neuron)
+        assert torch.allclose(out_neuron.cpu(), ref, rtol=1e-5, atol=1e-5)

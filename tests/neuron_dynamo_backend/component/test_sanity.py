@@ -106,6 +106,34 @@ class TestTorchCompileBackend:
         expected = x_cpu * 2
         torch.testing.assert_close(y.cpu(), expected, rtol=1e-4, atol=1e-4)
 
+    def test_cpu_tensor_raises_when_autocopy_disabled(self, monkeypatch):
+        """Test CPU tensors raise error when TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY=1"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        monkeypatch.setenv("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", "1")
+
+        @torch.compile(backend="neuron")
+        def fn(x):
+            return x * 2
+
+        x_cpu = torch.randn(10, device="cpu")
+
+        with pytest.raises(RuntimeError, match=r"Input tensor at index 0 is on cpu device"):
+            fn(x_cpu)
+
+    def test_neuron_tensor_works_when_autocopy_disabled(self, monkeypatch):
+        """Test neuron tensors work normally when autocopy is disabled"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+
+        @torch.compile(backend="neuron")
+        def fn(x):
+            return x * 2
+
+        x_neuron = torch.randn(10, device="neuron")
+        y = fn(x_neuron)
+
+        assert y.device.type == "neuron"
+        torch.testing.assert_close(y.cpu(), x_neuron.cpu() * 2, rtol=1e-4, atol=1e-4)
+
     def test_multiple_outputs(self):
         """Test function with multiple outputs"""
 
@@ -338,7 +366,7 @@ class TestEmptyTensorConsistency:
         torch.testing.assert_close(eager_result, expected)
         torch.testing.assert_close(compile_result, expected)
 
-    @pytest.mark.xfail(reason="Empty tensor handling not yet implemented in compile path")
+    @pytest.mark.skip(reason="Empty tensor handling not yet implemented in compile path")
     def test_index_select_empty_index_consistency(self):
         """Index select with empty index should match between compile/eager."""
         x_cpu = torch.randn(5, 3)

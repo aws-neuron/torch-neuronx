@@ -15,10 +15,12 @@ class CacheEntryTest : public ::testing::Test {
   void SetUp() override {
     // Create test data
     test_neff_data_ = {0x01, 0x02, 0x03, 0x04, 0x05};
+    test_persistent_key_ = "test_persistent_key";
     compilation_time_ = std::chrono::milliseconds(100);
   }
 
   std::vector<uint8_t> test_neff_data_;
+  std::string test_persistent_key_;
   std::chrono::milliseconds compilation_time_;
 };
 
@@ -31,7 +33,7 @@ TEST_F(CacheEntryTest, DefaultConstruction) {
 }
 
 TEST_F(CacheEntryTest, ConstructionWithData) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   EXPECT_EQ(entry.neff_bytes, test_neff_data_);
   EXPECT_EQ(entry.access_count.load(), 0);
@@ -48,7 +50,7 @@ TEST_F(CacheEntryTest, CopyAndMoveDisabled) {
 }
 
 TEST_F(CacheEntryTest, AccessTracking) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   auto initial_last_used = entry.last_used_time;
   auto initial_access_count = entry.access_count.load();
@@ -66,7 +68,7 @@ TEST_F(CacheEntryTest, AccessTracking) {
 }
 
 TEST_F(CacheEntryTest, MultipleAccessUpdates) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   // Perform multiple access updates
   for (int i = 1; i <= 5; ++i) {
@@ -80,7 +82,7 @@ TEST_F(CacheEntryTest, MultipleAccessUpdates) {
 }
 
 TEST_F(CacheEntryTest, ConcurrentAccessUpdates) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   const int num_threads = 10;
   const int accesses_per_thread = 100;
@@ -192,7 +194,7 @@ TEST_F(CacheEntryIntegrationTest, NeffBytesPtrLifecycle) {
   std::vector<uint8_t> test_data = {0x01, 0x02, 0x03, 0x04};
 
   // Create a CacheEntry and verify it can be managed properly
-  auto entry = std::make_shared<CacheEntry>(test_data, std::chrono::milliseconds(50));
+  auto entry = std::make_shared<CacheEntry>(test_data, "test_key", std::chrono::milliseconds(50));
 
   EXPECT_EQ(entry->neff_bytes, test_data);
   EXPECT_EQ(entry->compilation_time.count(), 50);
@@ -210,7 +212,7 @@ TEST_P(CacheEntryDataSizeTest, DifferentDataSizes) {
   size_t data_size = GetParam();
   std::vector<uint8_t> data(data_size, 0xAB);
 
-  CacheEntry entry(data, std::chrono::milliseconds(10));
+  CacheEntry entry(data, "test_key", std::chrono::milliseconds(10));
 
   EXPECT_EQ(entry.neff_bytes.size(), data_size);
   EXPECT_EQ(entry.neff_bytes, data);
@@ -232,7 +234,7 @@ TEST_P(CacheEntryCompilationTimeTest, DifferentCompilationTimes) {
   int time_ms = GetParam();
   std::chrono::milliseconds comp_time(time_ms);
 
-  CacheEntry entry(test_neff_data_, comp_time);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, comp_time);
 
   EXPECT_EQ(entry.compilation_time, comp_time);
   EXPECT_EQ(entry.compilation_time.count(), time_ms);
@@ -247,7 +249,7 @@ INSTANTIATE_TEST_SUITE_P(CompilationTimeVariants, CacheEntryCompilationTimeTest,
                                            ));
 
 TEST_F(CacheEntryTest, LargeAccessCount) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   // Set access count to near maximum
   uint64_t large_count = std::numeric_limits<uint64_t>::max() - 10;
@@ -259,7 +261,7 @@ TEST_F(CacheEntryTest, LargeAccessCount) {
 }
 
 TEST_F(CacheEntryTest, TimeConsistency) {
-  CacheEntry entry(test_neff_data_, compilation_time_);
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
 
   auto created_time = entry.created_time;
   auto initial_last_used = entry.last_used_time;
@@ -277,7 +279,7 @@ TEST_F(CacheEntryTest, TimeConsistency) {
 
 TEST_F(CacheEntryTest, EmptyDataHandling) {
   std::vector<uint8_t> empty_data;
-  CacheEntry entry(empty_data, std::chrono::milliseconds(0));
+  CacheEntry entry(empty_data, "", std::chrono::milliseconds(0));
 
   EXPECT_TRUE(entry.neff_bytes.empty());
   EXPECT_EQ(entry.neff_bytes.size(), 0);
@@ -286,6 +288,36 @@ TEST_F(CacheEntryTest, EmptyDataHandling) {
   // Should still track access properly
   entry.UpdateAccess();
   EXPECT_EQ(entry.access_count.load(), 1);
+}
+
+TEST_F(CacheEntryTest, FailedEntryConstruction) {
+  auto entry = CacheEntry::Failed("test_key", "compilation error: bad input");
+
+  EXPECT_TRUE(entry->IsFailed());
+  EXPECT_EQ(entry->GetFailureMessage(), "compilation error: bad input");
+  EXPECT_TRUE(entry->neff_bytes.empty());
+  EXPECT_EQ(entry->created_time, entry->last_used_time);
+}
+
+TEST_F(CacheEntryTest, SuccessfulEntryIsNotFailed) {
+  CacheEntry entry(test_neff_data_, test_persistent_key_, compilation_time_);
+
+  EXPECT_FALSE(entry.IsFailed());
+  EXPECT_TRUE(entry.GetFailureMessage().empty());
+}
+
+TEST_F(CacheEntryTest, DefaultEntryIsNotFailed) {
+  CacheEntry entry;
+
+  EXPECT_FALSE(entry.IsFailed());
+  EXPECT_TRUE(entry.GetFailureMessage().empty());
+}
+
+TEST_F(CacheEntryTest, FailedEntryAccessTracking) {
+  auto entry = CacheEntry::Failed("test_key", "error");
+
+  entry->UpdateAccess();
+  EXPECT_EQ(entry->access_count.load(), 1);
 }
 
 int main(int argc, char** argv) {

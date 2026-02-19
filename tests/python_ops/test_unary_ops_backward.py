@@ -7,6 +7,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 # Define wrapper functions for ops that need additional parameters
@@ -27,16 +28,17 @@ def pow_wrapper(x):
 UNARY_OPS = [
     # Elementwise unary ops: (op_func, op_name, backward_op_name)
     (torch.log, "aten::log", None),
-    (torch.sigmoid, "aten::sigmoid", None),
+    (torch.sigmoid, "aten::sigmoid", "aten::sigmoid_backward"),
     (torch.sin, "aten::sin", None),
     (torch.cos, "aten::cos", None),
     (F.silu, "aten::silu", "aten::silu_backward"),
     (torch.exp, "aten::exp", None),
     (torch.abs, "aten::abs", None),
     (torch.relu, "aten::relu", None),
-    (F.gelu, "aten::gelu", None),
+    (F.gelu, "aten::gelu", "aten::gelu_backward"),
     (torch.sqrt, "aten::sqrt", None),
     (torch.neg, "aten::neg", None),
+    (F.softplus, "aten::softplus", "aten::softplus_backward"),
     # Wrappers for unary ops that need extra arguments
     (softmax_wrapper, "aten::softmax", "aten::_softmax_backward_data"),
     (log_softmax_wrapper, "aten::log_softmax", "aten::_log_softmax_backward_data"),
@@ -48,6 +50,9 @@ UNARY_OPS = [
 XFAIL_OPS = {
     # "op_name": "Reason for failure",
 }
+if not use_mlir_aten_ops():
+    XFAIL_OPS["aten::softplus"] = "aten::softplus only supported using dynamo decompositions"
+    XFAIL_OPS["aten::gelu"] = "aten::gelu only supported using dynamo decompositions"
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")

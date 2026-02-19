@@ -7,11 +7,17 @@ from ..operation_registry import register_aten
 
 @register_aten(["aten::abs", "aten::abs.out"])
 def torch_abs(x, out=None):
+    """StableHlo.abs does not support unsigned dtype
+
+    Reference: https://openxla.org/stablehlo/spec#abs_uint8_decomp
+    """
+    if x.dtype == torch.uint8:
+        return x
     return torch.abs(x)
 
 
 @register_aten(["aten::neg", "aten::neg.out"])
-def torch_neg(x):
+def torch_neg(x, out=None):
     return torch.neg(x)
 
 
@@ -48,7 +54,9 @@ def torch_log(x, out=None):
 
 @register_aten(["aten::erf", "aten::erf.out"])
 def torch_erf(x, out=None):
-    return torch.erf(x)
+    # Handle NaN case: erf(NaN) should return NaN
+    result = torch.erf(x)
+    return torch.where(torch.isnan(x), x, result)
 
 
 @register_aten(["aten::erfinv", "aten::erfinv.out"])
@@ -91,10 +99,10 @@ def torch_trunc(x, out=None):
 
 
 @register_aten(["aten::sign", "aten::sign.out"])
-def torch_sign(x):
+def torch_sign(x, out=None):
     return torch.sign(x)
 
 
 @register_aten(["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"])
-def torch_reciprocal(a):
+def torch_reciprocal(a, out=None):
     return torch.reciprocal(a)

@@ -14,8 +14,6 @@ from typing import Any
 import torch
 import torch.library
 
-from torch_neuronx.utils import use_mlir_aten_ops
-
 from .base import (
     BinaryOperation,
     ComparisonOperation,
@@ -40,15 +38,7 @@ def register_implementation(aten_name: str, impl_class: type[OperationImplementa
 
     Called automatically by the @neuron_op decorator.
     """
-    # TODO: Remove once MLIR support is added for these ops
-    mlir_unsupported_patterns = ("copy", "contiguous", "attention", "nonzero", "index")
-
-    should_register = not use_mlir_aten_ops() or any(
-        pattern in aten_name for pattern in mlir_unsupported_patterns
-    )
-
-    if should_register:
-        _NEURON_OPS_REGISTRY[aten_name]["implementations"].append(impl_class)
+    _NEURON_OPS_REGISTRY[aten_name]["implementations"].append(impl_class)
 
 
 def neuron_op(
@@ -298,19 +288,15 @@ def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
         def wrapper(self, *args, **kwargs):
             # Call the operation with out=self to ensure in-place modification
             kwargs["out"] = self
-            operation(self, *args, **kwargs)
-            return self
+            result = operation(self, *args, **kwargs)
+            if result is None:
+                return result
+            else:
+                return self
     else:
         # Standard wrapper - just pass everything through
         def wrapper(*args, **kwargs):
-            result = operation(*args, **kwargs)
-            # torch-mlir ops will always return tuple as output
-            if isinstance(result, tuple):
-                # PyTorch expects single Tensor object as output if there is only single output
-                # Otherwise, it expects tuple of Tensors
-                return result if len(result) > 1 else result[0]
-            else:
-                return result
+            return operation(*args, **kwargs)
 
     wrapper.__name__ = f"{op_name.replace('.', '_').replace(':', '_')}_neuron"
 
@@ -329,6 +315,12 @@ def discover_all_implementations(package_name: str = "torch_neuronx.python_ops")
     ):
         # Skip __pycache__ and test modules
         if "__pycache__" in modname or "test" in modname:
+            continue
+
+        # Skip legacy and JAX packages
+        if ".legacy" in modname or modname.endswith(".legacy"):
+            continue
+        if ".jax" in modname or modname.endswith(".jax"):
             continue
 
         try:

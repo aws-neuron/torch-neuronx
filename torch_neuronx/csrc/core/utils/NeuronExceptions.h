@@ -21,18 +21,24 @@ class CompilationRuntimeException : public std::runtime_error {
 // Base exception for execution-time errors (inference, NRT operations, etc.)
 class ExecutionRuntimeException : public std::runtime_error {
   std::optional<NRT_STATUS> nrt_status_;
+  std::optional<uint64_t> seq_id_;
 
  public:
   explicit ExecutionRuntimeException(const std::string& message)
-      : std::runtime_error(message), nrt_status_(std::nullopt) {}
+      : std::runtime_error(message), nrt_status_(std::nullopt), seq_id_(std::nullopt) {}
 
   ExecutionRuntimeException(const std::string& message, NRT_STATUS status)
-      : std::runtime_error(message), nrt_status_(status) {}
+      : std::runtime_error(message), nrt_status_(status), seq_id_(std::nullopt) {}
+
+  ExecutionRuntimeException(uint64_t seq_id, NRT_STATUS status)
+      : std::runtime_error("Async execution error"), nrt_status_(status), seq_id_(seq_id) {}
 
   bool HasNRTStatus() const { return nrt_status_.has_value(); }
+  bool HasSeqId() const { return seq_id_.has_value(); }
 
   // Ensure HasNRTStatus() prior to retrieving it.
   NRT_STATUS GetNRTStatus() const { return nrt_status_.value(); }
+  uint64_t GetSeqId() const { return seq_id_.value(); }
 };
 
 // Type trait to check if a type is a Neuron runtime exception

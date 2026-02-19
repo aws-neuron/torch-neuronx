@@ -2,10 +2,25 @@
 Context manager for handling unsupported dtypes (float64, int64) on Neuron hardware.
 """
 
+import logging
 from contextlib import contextmanager
 from typing import Any
 
 import torch
+from torch._logging import warning_once
+
+logger = logging.getLogger(__name__)
+
+
+def _warn_dtype_cast_once(dtype_name: str) -> None:
+    """Show one-time warning about dtype casting."""
+    target_dtype = "float32" if dtype_name == "float64" else "int32"
+    warning_once(
+        logger,
+        f"Neuron backend does not support {dtype_name}. Automatically casting to {target_dtype}. "
+        f"Consider using {target_dtype} directly for better performance until native "
+        f"{dtype_name} support is added.",
+    )
 
 
 class DtypeAutocastContext:
@@ -52,8 +67,10 @@ class DtypeAutocastContext:
         if isinstance(value, torch.Tensor) and value.ndim != 0 and self._should_cast(value.dtype):
             if value.dtype == torch.float64:
                 had_float64 = True
+                _warn_dtype_cast_once("float64")
             elif value.dtype == torch.int64:
                 had_int64 = True
+                _warn_dtype_cast_once("int64")
             return value.to(self._get_target_dtype(value.dtype)), had_float64, had_int64
         elif isinstance(value, tuple | list) and any(isinstance(v, torch.Tensor) for v in value):
             # Handle tuple/list of tensors
@@ -62,8 +79,10 @@ class DtypeAutocastContext:
                 if isinstance(v, torch.Tensor) and self._should_cast(v.dtype):
                     if v.dtype == torch.float64:
                         had_float64 = True
+                        _warn_dtype_cast_once("float64")
                     elif v.dtype == torch.int64:
                         had_int64 = True
+                        _warn_dtype_cast_once("int64")
                     new_value.append(v.to(self._get_target_dtype(v.dtype)))
                 else:
                     new_value.append(v)
@@ -71,8 +90,10 @@ class DtypeAutocastContext:
         elif isinstance(value, torch.dtype) and self.cast_dtype_params:
             # Handle dtype kwarg
             if value == torch.float64 and self.cast_float64:
+                _warn_dtype_cast_once("float64")
                 return torch.float32, True, False
             elif value == torch.int64 and self.cast_int64:
+                _warn_dtype_cast_once("int64")
                 return torch.int32, False, True
 
         return value, had_float64, had_int64

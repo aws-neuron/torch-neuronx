@@ -7,8 +7,8 @@ import jax
 import torch
 
 from torch_neuronx.python_ops.handlers import BaseEmptyTensorHandler
+from torch_neuronx.python_ops.shared import IndexOps, ReductionOps
 
-from ..config import IndexOps, ReductionOps
 from ..type_converter import JaxTypeConverter
 
 logger = logging.getLogger(__name__)

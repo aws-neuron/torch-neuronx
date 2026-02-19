@@ -13,7 +13,6 @@ def register_aten(
     static_argnums: tuple[int, ...] | None = None,
     static_argnames: tuple[str, ...] | None = None,
     uses_preprocessing: bool = False,
-    use_torch_compile: bool = True,
 ):
     """
     Decorator that registers torch-mlir implementations for ATen operations.
@@ -55,7 +54,6 @@ def register_aten(
                 "static_argnums": static_argnums,
                 "static_argnames": static_argnames,
                 "uses_preprocessing": uses_preprocessing,
-                "use_torch_compile": use_torch_compile,
             }
 
             # Phase 1: Add to torch-mlir registry immediately
@@ -69,7 +67,6 @@ def register_aten(
         # Mark function with metadata
         func._aten_operations = operations
         func.uses_preprocessing = uses_preprocessing
-        func.use_torch_compile = use_torch_compile
 
         return func
 

@@ -6,18 +6,36 @@ import traceback
 from collections.abc import Callable
 
 import torch
+from torch._C._distributed_c10d import OpType, ReduceOp
 
 from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
-from torch_neuronx.kernels.type_converter import TypeConverter
-from torch_neuronx.utils import is_sync_mode_enabled
+from torch_neuronx.neuron import current_stream, default_stream
+from torch_neuronx.utils import convert_for_neuron, is_host_cc_enabled, is_sync_mode_enabled
 
 from ..compilation import CompilationCache, HloCompiler
 from ..processors import ArgumentProcessor
 from .compilation import XLABuilderCompiler
 
 logger = logging.getLogger(__name__)
+
+# Mapping from op_name to torch.distributed OpType
+_OP_NAME_TO_COLLECTIVE_TYPE = {
+    "all_gather": OpType.ALLGATHER,
+    "all_reduce": OpType.ALLREDUCE,
+    "reduce_scatter": OpType.REDUCE_SCATTER,
+    "all_to_all": OpType.ALLTOALL,
+}
+
+# Mapping from reduce string to torch.distributed ReduceOp
+_REDUCE_STR_TO_OP = {
+    "SUM": ReduceOp.SUM,
+    "AVG": ReduceOp.AVG,
+    "MIN": ReduceOp.MIN,
+    "MAX": ReduceOp.MAX,
+    "PRODUCT": ReduceOp.PRODUCT,
+}
 
 
 class XLABuilderKernel(BaseNeuronKernel):
@@ -109,18 +127,27 @@ class XLABuilderKernel(BaseNeuronKernel):
         # need to handle the case where the kernel is created after impl.execute call
         if cpu_fallback_context is None:
             cpu_fallback_context = {"original_inputs": list(inputs), "original_kwargs": {}}
-        #  TODO (kvshbg) - remove sync flow once async CRs are merged
         if is_sync_mode_enabled():
             self._execute_sync(cache_key, processed_inputs, input_dict, kwargs, output_tensors)
         else:
-            self._execute_async(
-                cache_key,
-                processed_inputs,
-                tuple(input_dict.values()),
-                kwargs,
-                output_tensors,
-                cpu_fallback_context,
-            )
+            # For collective operations on non-default stream, use direct host API path
+            # which doesn't require HLO compilation
+            if self.has_collectives and not self._is_default_stream() and is_host_cc_enabled():
+                self._execute_collective_direct(
+                    tuple(input_dict.values()),
+                    kwargs,
+                    output_tensors,
+                    cpu_fallback_context,
+                )
+            else:
+                self._execute_async(
+                    cache_key,
+                    processed_inputs,
+                    tuple(input_dict.values()),
+                    kwargs,
+                    output_tensors,
+                    cpu_fallback_context,
+                )
 
         # Apply dtype corrections and return
         return self._finalize_outputs(output_tensors, is_single_output)
@@ -245,7 +272,7 @@ class XLABuilderKernel(BaseNeuronKernel):
             is_single_output = True
 
         for out in output:
-            converted.append(TypeConverter.convert_for_neuron(out))
+            converted.append(convert_for_neuron(out))
             converted[-1]._expected_dtype = out.dtype
         return converted[0] if is_single_output else tuple(converted)
 
@@ -294,3 +321,126 @@ class XLABuilderKernel(BaseNeuronKernel):
 
         # Add static kwargs
         return self.arg_processor.add_static_to_cache_key(base_key, kwargs)
+
+    def _is_default_stream(self) -> bool:
+        """Check if current stream is the default stream.
+
+        Returns:
+            True if current stream is the default stream, False otherwise.
+        """
+        return current_stream() == default_stream()
+
+    def _get_collective_op_type(self) -> OpType:
+        """Map op_name to c10d::OpType enum value.
+
+        Returns:
+            c10d::OpType enum value corresponding to this operation.
+
+        Raises:
+            ValueError: If op_name is not a recognized collective operation.
+        """
+        op_type = _OP_NAME_TO_COLLECTIVE_TYPE.get(self.op_name)
+        if op_type is None:
+            raise ValueError(f"Unknown collective operation: {self.op_name}")
+        return op_type
+
+    def _get_reduce_op(self, kwargs: dict) -> ReduceOp:
+        """Get reduce operation from kwargs, mapped to c10d::ReduceOp enum value.
+
+        Args:
+            kwargs: Keyword arguments containing 'reduce' key for reduce operations.
+
+        Returns:
+            c10d::ReduceOp enum value. Defaults to SUM if not specified.
+        """
+        reduce_str = kwargs.get("reduce", "SUM")
+        return _REDUCE_STR_TO_OP.get(reduce_str, ReduceOp.SUM)
+
+    def _execute_collective_direct(
+        self,
+        non_static_inputs: tuple,
+        kwargs: dict,
+        output_tensors: tuple,
+        cpu_fallback_context,
+    ) -> None:
+        """Execute collective operation directly via host API (no HLO compilation).
+
+        Bypasses XLA compilation and submits collective directly to runtime.
+        Used for collective operations on non-default streams.
+        """
+        stack_trace = ""
+        if os.environ.get("TORCH_NEURONX_ENABLE_STACK_TRACE", "0") == "1":
+            stack_trace = "".join(traceback.format_list(traceback.extract_stack()[:-2]))
+
+        op_type = self._get_collective_op_type()
+        reduce_op = self._get_reduce_op(kwargs)
+        replica_groups = kwargs.get("replica_groups", [])
+
+        # AVG not supported by NRT - convert to SUM + post-divide
+        needs_avg_divide = reduce_op == ReduceOp.AVG
+        if needs_avg_divide:
+            reduce_op = ReduceOp.SUM
+            # Extract world_size from the divisor tensor appended by prepare_avg_inputs()
+            # and strip it from inputs so it's not passed to the collective operation
+            world_size = int(non_static_inputs[-1].item())
+            non_static_inputs = non_static_inputs[:-1]
+
+        def submit(inputs, outputs):
+            """Submit collective task to pipeline."""
+            try:
+                _C._submit_collective_task_to_pipeline(
+                    self.op_name,
+                    inputs,
+                    outputs,
+                    op_type,
+                    reduce_op,
+                    replica_groups,
+                    None,
+                    stack_trace,
+                    cpu_fallback_context,
+                )
+            except RuntimeError as e:
+                raise RuntimeError(f"Collective direct execution failed: {e}") from e
+
+        # Single output - simple path
+        if len(output_tensors) == 1:
+            # Concatenate multiple inputs if needed (e.g., reduce_scatter)
+            if len(non_static_inputs) > 1:
+                tensors = [t for t in non_static_inputs if t.dim() > 0]
+                inputs = (
+                    (torch.cat(tensors, dim=0),)
+                    if tensors
+                    else (torch.stack(list(non_static_inputs), dim=0),)
+                )
+            else:
+                inputs = non_static_inputs
+            submit(inputs, output_tensors)
+            if needs_avg_divide:
+                output_tensors[0].div_(world_size)
+            return
+
+        # Multiple outputs (coalesced ops) - check if shapes match
+        same_shape = all(t.shape == output_tensors[0].shape for t in output_tensors)
+        if same_shape:
+            # Stack for efficiency
+            if len(non_static_inputs) > 1:
+                tensors = [t for t in non_static_inputs if t.dim() > 0]
+                inputs = (
+                    (torch.cat(tensors, dim=0),)
+                    if tensors
+                    else (torch.stack(list(non_static_inputs), dim=0),)
+                )
+            else:
+                inputs = non_static_inputs
+            stacked = torch.stack(output_tensors, dim=0)
+            submit(inputs, (stacked,))
+            if needs_avg_divide:
+                stacked.div_(world_size)
+            for i, out in enumerate(output_tensors):
+                out.copy_(stacked[i])
+        else:
+            # Different shapes - process individually
+            for inp, out in zip(non_static_inputs, output_tensors, strict=False):
+                submit((inp,), (out,))
+                if needs_avg_divide:
+                    out.div_(world_size)

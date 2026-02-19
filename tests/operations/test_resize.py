@@ -197,3 +197,27 @@ class TestResize:
             )
 
             assert_op_runs_on_neuron("aten::resize_")
+
+    @pytest.mark.parametrize("memory_format", [torch.channels_last, torch.contiguous_format])
+    def test_resize_channels_last_memory_format(self, memory_format):
+        """Test resize with ChannelsLast memory format (4D NHWC)"""
+        with track_neuron_ops():
+            device = torch.device("neuron")
+            x = torch.empty(2, 3, 4, 5, device=device)
+            x.resize_(2, 4, 6, 8, memory_format=memory_format)
+
+            assert x.shape == (2, 4, 6, 8)
+            if memory_format == torch.channels_last:
+                assert x.is_contiguous(memory_format=torch.channels_last)
+            assert_op_runs_on_neuron("aten::resize_")
+
+    def test_resize_channels_last_3d_memory_format(self):
+        """Test resize with ChannelsLast3d memory format (5D NDHWC)"""
+        with track_neuron_ops():
+            device = torch.device("neuron")
+            x = torch.empty(2, 3, 4, 5, 6, device=device)
+            x.resize_(2, 4, 3, 5, 7, memory_format=torch.channels_last_3d)
+
+            assert x.shape == (2, 4, 3, 5, 7)
+            assert x.is_contiguous(memory_format=torch.channels_last_3d)
+            assert_op_runs_on_neuron("aten::resize_")

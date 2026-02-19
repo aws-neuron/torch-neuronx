@@ -19,18 +19,23 @@ def _autoload():
 
 import torch
 
+# Store reference to real torch.device before any test framework patches it
+_real_torch_device = torch.device
+
 # Import build-time configuration (generated during wheel build)
 try:
     from ._build_config import (
         DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED,
         DEFAULT_MLIR_ATEN_OPS,
+        DEFAULT_RETAIN_DEVICE_MODE,
         DEFAULT_SYNC_MODE,
     )
 except ImportError:
     # Fallback if _build_config.py doesn't exist (e.g., editable install)
     DEFAULT_SYNC_MODE = "0"  # Dev default
     DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED = "1"
-    DEFAULT_MLIR_ATEN_OPS = "0"
+    DEFAULT_MLIR_ATEN_OPS = "1"
+    DEFAULT_RETAIN_DEVICE_MODE = "0"
 
 # For some reason log level is being set to TRACE without this
 if "JAX_LOGGING_LEVEL" not in os.environ:
@@ -38,13 +43,27 @@ if "JAX_LOGGING_LEVEL" not in os.environ:
 
 # Set defaults from build-time configuration
 # Users can still override these at runtime
-os.environ.setdefault("TORCH_NEURONX_SYNC_MODE", DEFAULT_SYNC_MODE)
+os.environ.setdefault("NEURON_LAUNCH_BLOCKING", DEFAULT_SYNC_MODE)
 os.environ.setdefault(
     "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED
 )
 
 # Set default for aten ops lowering
 os.environ.setdefault("TORCH_NEURONX_MLIR_ATEN_OPS", DEFAULT_MLIR_ATEN_OPS)
+
+# Set default for executor retain device
+os.environ.setdefault("TORCH_NEURONX_RETAIN_DEVICE_MODE", DEFAULT_RETAIN_DEVICE_MODE)
+
+# Set default for legacy neff
+os.environ.setdefault("NEURON_RT_ALLOW_LEGACY_NEFF", "1")
+
+# Set defaults for async nrt execution
+os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
+os.environ.setdefault("TORCH_NEURONX_ENABLE_ASYNC_NRT", "1")
+
+# Set default for host-cc
+os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
+os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
@@ -53,6 +72,7 @@ try:
     from . import _C
 
     _C._register_device()
+    _C._register_profiler()
 
     # Wrap neuron C extensions with torch._dynamo.disable since they can't be traced.
     import inspect
@@ -73,13 +93,27 @@ except ImportError as e:
 
 # Import the neuron submodule
 # Import and register Python operations
-from . import distributed, neuron, python_ops
+# Import profiling functionality
+from . import distributed, neuron, profiling, python_ops
+
+# Import memory apis
+from .memory import (
+    max_memory_allocated,
+    max_memory_reserved,
+    memory_allocated,
+    memory_reserved,
+    memory_stats,
+    memory_summary,
+    reset_accumulated_memory_stats,
+    reset_peak_memory_stats,
+)
 
 # Import torch.compile metrics APIs
 from .neuron_dynamo_backend.metrics import get_dynamo_metrics, reset_dynamo_metrics
 
 # Import NKI kernel support
 from .nki_hop import nki_op, wrap_nki
+from .profiling import NeuronProfiler
 
 # Import stream and event classes
 from .streams import Event, Stream
@@ -259,7 +293,7 @@ def _get_device_index(device, optional=False, allow_cpu=False):
     if isinstance(device, str):
         device = torch.device(device)
 
-    if isinstance(device, torch.device):
+    if isinstance(device, _real_torch_device):
         if device.type != "neuron":
             raise ValueError(f"Expected neuron device, got {device.type}")
         return device.index if device.index is not None else current_device()

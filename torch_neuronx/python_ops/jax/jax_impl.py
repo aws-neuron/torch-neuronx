@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
-from torch_neuronx.python_ops import op_base
+from torch_neuronx.python_ops.legacy import op_base
 
 from . import reimplement as jax_reimplement
 from .operation_registry import register_aten

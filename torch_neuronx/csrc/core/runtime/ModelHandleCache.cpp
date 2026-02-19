@@ -1,10 +1,8 @@
 #include "ModelHandleCache.h"
 
-#include <algorithm>
 #include <iomanip>
 #include <sstream>
 
-#include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 
 namespace at::neuron {
@@ -25,76 +23,37 @@ std::string ModelHandleCache::GenerateCacheKey(const std::vector<uint8_t>& neff_
   return oss.str();
 }
 
-std::shared_ptr<ModelHandleCache::CacheEntry> ModelHandleCache::TryCacheLookup(
-    const std::string& cache_key) const {
+std::shared_ptr<nrt::ModelHandle> ModelHandleCache::GetModel(const std::string& cache_key) const {
   std::shared_lock<std::shared_mutex> lock(cache_mutex_);
 
   const auto it = cache_.find(cache_key);
   if (it != cache_.end() && it->second) {
     TORCH_NEURONX_DEBUG("Model handle cache hit, cache_key=", cache_key);
-    return it->second;
+    return it->second->model;
   }
 
   TORCH_NEURONX_DEBUG("Model handle cache miss, cache_key=", cache_key);
   return nullptr;
 }
 
-std::shared_ptr<at::neuron::nrt::Model> ModelHandleCache::GetOrLoadModel(
-    const CompilableKernelExecution& kernel_execution, int device_index, int num_cores) {
-  // Extract collective information from kernel execution
-  bool has_collectives = kernel_execution.HasCollectives();
-  const std::vector<uint8_t>& neff_bytes = kernel_execution.GetCachedNeff();
-  std::string cache_key = GenerateCacheKey(neff_bytes, device_index);
+std::shared_ptr<nrt::ModelHandle> ModelHandleCache::StoreModel(
+    const std::string& cache_key, std::shared_ptr<nrt::ModelHandle> model, int device_index,
+    bool has_collectives) {
+  std::unique_lock<std::shared_mutex> lock(cache_mutex_);
 
-  TORCH_NEURONX_DEBUG("Looking up model handle", "cache_key=", cache_key, "device=", device_index,
-                      "cores=", num_cores, "collectives=", has_collectives);
-
-  // Try cache lookup first
-  auto cached_entry = TryCacheLookup(cache_key);
-  if (cached_entry) {
-    return cached_entry->model;
+  // Double-checked: another thread may have stored it first
+  const auto it = cache_.find(cache_key);
+  if (it != cache_.end() && it->second) {
+    TORCH_NEURONX_DEBUG("Model was loaded by another thread, using cached version",
+                        "cache_key=", cache_key);
+    return it->second->model;
   }
 
-  // Cache miss - need to load the model
-  TORCH_NEURONX_DEBUG("Loading new model", "cache_key=", cache_key,
-                      "neff_size=", neff_bytes.size());
+  auto entry = std::make_shared<CacheEntry>(std::move(model), device_index, has_collectives);
+  cache_.emplace(cache_key, entry);
 
-  // Create a new Model instance and load the NEFF
-  auto model = std::make_shared<at::neuron::nrt::Model>();
-
-  try {
-    if (has_collectives) {
-      model->LoadCollectives(neff_bytes, device_index, num_cores);
-    } else {
-      model->Load(neff_bytes, device_index, num_cores);
-    }
-  } catch (const std::exception& e) {
-    throw std::runtime_error(
-        "Failed to load model - " + std::string(e.what()) + " [cache_key=" + cache_key +
-        ", device=" + std::to_string(device_index) + ", cores=" + std::to_string(num_cores) +
-        ", has_collectives=" + (has_collectives ? "true" : "false") + "]");
-  }
-
-  TORCH_NEURONX_DEBUG("Model loaded successfully", "cache_key=", cache_key);
-
-  // Store in cache with optimized double-checked locking
-  {
-    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-    // Check if another thread loaded it in the meantime
-    const auto it = cache_.find(cache_key);
-    if (it != cache_.end() && it->second) {
-      TORCH_NEURONX_DEBUG("Model was loaded by another thread, using cached version",
-                          "cache_key=", cache_key);
-      return it->second->model;
-    }
-
-    // Create and store new entry using emplace for efficiency
-    auto entry = std::make_shared<CacheEntry>(model, device_index, has_collectives);
-    cache_.emplace(cache_key, entry);
-
-    TORCH_NEURONX_DEBUG("Model cached", "cache_key=", cache_key, "total_entries=", cache_.size());
-    return model;
-  }
+  TORCH_NEURONX_DEBUG("Model cached", "cache_key=", cache_key, "total_entries=", cache_.size());
+  return entry->model;
 }
 
 std::vector<ModelHandleCache::CacheEntryInfo> ModelHandleCache::GetCacheEntries() const {

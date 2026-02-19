@@ -401,7 +401,7 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with dtype mismatch. Error thrown by torch directly"""
         self.distributed_tester.run_test(run_dtype_mismatch_test)
 
-    @assert_raises(RuntimeError, match=r".*Operation all_to_all is not implemented for Neuron.*")
+    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
     def test_different_devices_error(self):
         """Test alltoall with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -453,7 +453,6 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
         [
             {
                 "partial_group": [0, 2, 4, 6],
-                "NEURON_LOGICAL_NC_CONFIG": "1",
             },
             {
                 "partial_group": [2, 3, 4, 5],

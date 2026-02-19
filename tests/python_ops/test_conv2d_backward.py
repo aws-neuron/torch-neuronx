@@ -35,6 +35,21 @@ TEST_CONFIGS = [
         "convolution_backward",
         id="bias_True",
     ),
+    # Test valid padding with asymmetric spatial dimensions
+    # for tuple expansion bug
+    pytest.param(
+        {
+            "in_channels": 1,
+            "out_channels": 1,
+            "kernel_size": (1, 4),
+            "stride": 1,
+            "padding": 0,
+            "bias": False,
+        },
+        (1, 1, 1, 10),
+        "convolution_backward",
+        id="valid_padding_asymmetric_spatial",
+    ),
     # Test different kernel sizes
     pytest.param(
         {"in_channels": 3, "out_channels": 2, "kernel_size": 1, "stride": 1, "padding": 0},
@@ -130,6 +145,10 @@ TEST_CONFIGS = [
         (2, 3, 10, 10),
         "convolution_backward",
         id="dilation_2",
+        marks=pytest.mark.xfail(
+            condition=not use_mlir_aten_ops(),
+            reason="dilation=2 not supported without torch-mlir aten ops",
+        ),
     ),
     pytest.param(
         {
@@ -169,11 +188,16 @@ class TestConv2dBackwardRegistration:
 
         input = torch.randn(input_shape, dtype=torch.float32, requires_grad=True).to("neuron")
         kernel_size = config["kernel_size"]
+        # Handle tuple or int kernel_size
+        if isinstance(kernel_size, int):
+            kernel_h, kernel_w = kernel_size, kernel_size
+        else:
+            kernel_h, kernel_w = kernel_size
         in_channels = config["in_channels"]
         out_channels = config["out_channels"]
         groups = config.get("groups", 1)
         weight = torch.randn(
-            out_channels, in_channels // groups, kernel_size, kernel_size, dtype=torch.float32
+            out_channels, in_channels // groups, kernel_h, kernel_w, dtype=torch.float32
         ).to("neuron")
         bias = (
             torch.randn(out_channels, dtype=torch.float32).to("neuron")
@@ -185,8 +209,8 @@ class TestConv2dBackwardRegistration:
         dilation = config.get("dilation", 1)
 
         # Calculate output shape and create grad_output
-        h_out = ((input_shape[-2] + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
-        w_out = ((input_shape[-1] + 2 * padding - dilation * (kernel_size - 1) - 1) // stride) + 1
+        h_out = ((input_shape[-2] + 2 * padding - dilation * (kernel_h - 1) - 1) // stride) + 1
+        w_out = ((input_shape[-1] + 2 * padding - dilation * (kernel_w - 1) - 1) // stride) + 1
         grad_output = torch.randn(
             input_shape[0], out_channels, h_out, w_out, dtype=torch.float32
         ).to("neuron")
@@ -235,23 +259,24 @@ class TestConv2dBackwardRegistration:
             torch.manual_seed(0)
             input = torch.randn(input_shape, dtype=dtype, requires_grad=True)
             kernel_size = config["kernel_size"]
+            # Handle tuple or int kernel_size
+            if isinstance(kernel_size, int):
+                kernel_h, kernel_w = kernel_size, kernel_size
+            else:
+                kernel_h, kernel_w = kernel_size
             in_channels = config["in_channels"]
             out_channels = config["out_channels"]
             groups = config.get("groups", 1)
             weight = torch.randn(
-                out_channels, in_channels // groups, kernel_size, kernel_size, dtype=dtype
+                out_channels, in_channels // groups, kernel_h, kernel_w, dtype=dtype
             )
             bias = torch.randn(out_channels, dtype=dtype) if config.get("bias", True) else None
             padding = config.get("padding", 0)
             stride = config.get("stride", 1)
             dilation = config.get("dilation", 1)
 
-            h_out = (
-                (input_shape[-2] + 2 * padding - dilation * (kernel_size - 1) - 1) // stride
-            ) + 1
-            w_out = (
-                (input_shape[-1] + 2 * padding - dilation * (kernel_size - 1) - 1) // stride
-            ) + 1
+            h_out = ((input_shape[-2] + 2 * padding - dilation * (kernel_h - 1) - 1) // stride) + 1
+            w_out = ((input_shape[-1] + 2 * padding - dilation * (kernel_w - 1) - 1) // stride) + 1
             grad_output = torch.randn(input_shape[0], out_channels, h_out, w_out, dtype=dtype)
 
             if device == "neuron":

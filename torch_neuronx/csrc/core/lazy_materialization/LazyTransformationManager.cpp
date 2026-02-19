@@ -44,8 +44,8 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
   // Get original operation's MLIR and pointer addresses
   const auto& original_hlo_bytes = compilable_kernel->GetHloBytes();
   std::string original_mlir_str(original_hlo_bytes.begin(), original_hlo_bytes.end());
-  const auto& original_input_ptrs = compilable_kernel->GetInputPtrs();
-  const auto& original_output_ptrs = compilable_kernel->GetOutputPtrs();
+  const auto& original_input_ptrs = compilable_kernel->GetSrcPtrs();
+  const auto& original_output_ptrs = compilable_kernel->GetDstPtrs();
 
   // Generate cache key for the merged result (for kernel naming)
   std::string merged_operation_cache_key =
@@ -135,9 +135,9 @@ void LazyTransformationManager::ProcessOperationInputs(
   std::vector<std::vector<TensorTransformation>> kernel_transforms =
       xla_compilable->GetInputTransformations();
 
-  // Get input pointers and contexts from operation context
-  const auto& input_ptrs = xla_compilable->GetInputPtrs();
-  const auto& input_contexts = operation_context->input_tensors_context;
+  // Get input pointers and contexts from kernel
+  const auto& input_ptrs = xla_compilable->GetSrcPtrs();
+  const auto& input_contexts = xla_compilable->GetInputContexts();
 
   // Compute prologue cache key using pointers and contexts
   std::string prologue_cache_key = OperationPrologue::ComputePrologueCacheKey(

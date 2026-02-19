@@ -239,6 +239,13 @@ def run_invalid_root_rank_test(rank, world_size, kwargs):
     tensor = torch.ones(10).to("neuron")
 
     invalid_root = world_size + 1  # Invalid root rank
+    dist.gather(tensor, dst=invalid_root)
+
+
+def run_gather_list_on_non_dst_rank_test(rank, world_size, kwargs):
+    """Test that PyTorch rejects gather_list on non-destination ranks."""
+    tensor = torch.ones(10).to("neuron")
+    invalid_root = world_size + 1
     gather_list = [torch.zeros_like(tensor) for _ in range(world_size)] if rank == 0 else None
     dist.gather(tensor, gather_list, dst=invalid_root)
 
@@ -294,7 +301,7 @@ class TestGather(BaseCollectiveOpTest):
         """Test gather with specific process groups."""
         self.distributed_tester.run_test(run_group_argument_test)
 
-    @assert_raises(RuntimeError, match=r".*Operation all_gather is not implemented for Neuron.*")
+    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
     def test_different_devices(self):
         """Test gather with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -334,6 +341,13 @@ class TestGather(BaseCollectiveOpTest):
     def test_invalid_root_rank(self):
         """Test gather with invalid root rank."""
         self.distributed_tester.run_test(run_invalid_root_rank_test)
+
+    @assert_raises(
+        RuntimeError, match=r".*gather_list.*must NOT be specified on non-destination ranks.*"
+    )
+    def test_gather_list_on_non_dst_rank(self):
+        """Test that PyTorch rejects gather_list provided on non-destination ranks."""
+        self.distributed_tester.run_test(run_gather_list_on_non_dst_rank_test)
 
     @assert_raises(RuntimeError, match=r".*.*")
     def test_with_uneven_sized_tensors(self):

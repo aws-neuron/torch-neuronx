@@ -3,10 +3,10 @@ name = "torch-neuronx"
 version = "0.1.0"
 description = "Neuron Backend for PyTorch"
 authors = [{name = "AWS Neuron Team"}]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch~=2.9.0",
-    "jax",
+    "torch~=2.10",
+    # TODO: Relax for 3.12+
     "numpy<2", # neuronx-cc requires numpy 1.x
     "grpcio-tools",
     "wheel",
@@ -39,6 +39,19 @@ dev = [
     "PyYAML"
 ]
 
+docs = [
+    "sphinx>=8.0",
+    "sphinx-book-theme",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -50,5 +63,4 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "E402"]
 "tests/*" = ["S101", "F401"]  # Allow assert and unused imports in tests (torch_neuronx needs to be imported for side effects)
-"tests/python_ops/jax_plumbing/*" = ["E402"]  # Allow delayed imports in jax tests
 "examples/**/*" = ["F401"]  # Allow unused imports in examples for side effects

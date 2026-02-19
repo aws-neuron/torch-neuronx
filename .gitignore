@@ -8,6 +8,7 @@ venv/
 *.egg
 dist/
 build/
+build
 neuron_artifacts/
 .pytest_cache/
 .coverage
@@ -15,6 +16,11 @@ htmlcov/
 .tox/
 .attach_pid*
 .eggs/
+
+# Documentation
+docs/build/
+build/docs/
+
 # Ruff
 .ruff_cache/
 .uv.lock
@@ -66,3 +72,5 @@ tests/pytorch_tests/test/
 # lock files
 MODULE.bazel.lock
 uv.lock
+.clangd
+build

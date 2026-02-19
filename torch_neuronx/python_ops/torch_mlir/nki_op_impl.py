@@ -122,8 +122,11 @@ class NKITorchMlirOpImpl(TorchMlirOpImpl):
             output_params=None,
             static_argnums=(),
             static_argnames=(
+                "kernel_idx",
                 "grid",
+                "backend_config",
                 "operand_output_aliases",
+                "arg_names",
                 "constant_args_key",
             ),
         )

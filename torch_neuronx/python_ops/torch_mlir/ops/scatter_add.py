@@ -5,6 +5,11 @@ import torch
 from ..op_impl import TorchMlirOpImpl
 
 
+def _scatter_add_fn(input, dim, index, src, *, out=None):
+    # out is excluded from tracing - handled by output_params in base class
+    return torch.scatter_add(input, dim, index, src)
+
+
 class ScatterAddMLIRImpl(TorchMlirOpImpl):
     """Register scatter_add, scatter_add_, and scatter_add.out"""
 
@@ -21,7 +26,7 @@ class ScatterAddMLIRImpl(TorchMlirOpImpl):
 
         super().__init__(
             aten_op_name=aten_op_name,
-            torch_fn=torch.scatter_add,
+            torch_fn=_scatter_add_fn,
             output_params=output_params,
             static_argnums=(1,),
         )

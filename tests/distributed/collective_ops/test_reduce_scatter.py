@@ -999,6 +999,25 @@ def run_input_output_dtype_mismatch_test(rank, world_size, kwargs):
     dist.reduce_scatter(output=output_tensor, input_list=input_list, op=dist.ReduceOp.SUM)
 
 
+def run_large_volume_premul_sum_reduce_scatter_test(rank, world_size, kwargs):
+    """Test PREMUL_SUM with large volume to trigger _reduce_scatter_base path."""
+    tensor_size = 268435456  # ~1GB to trigger bucketing
+    input_list = [torch.ones(tensor_size, dtype=torch.float32).to("neuron") * (rank + 1)]
+    output_tensor = torch.zeros(int(tensor_size / world_size), dtype=torch.float32).to("neuron")
+
+    premul_factor = 2.0
+    reduce_op = dist._make_nccl_premul_sum(premul_factor)
+    dist.reduce_scatter(output=output_tensor, input_list=input_list, op=reduce_op)
+
+    sum_of_ranks = sum(range(1, world_size + 1))
+    expected = (
+        torch.ones(int(tensor_size / world_size), dtype=torch.float32)
+        * sum_of_ranks
+        * premul_factor
+    )
+    assert torch.allclose(output_tensor.to("cpu"), expected)
+
+
 def run_bucketing_memory_test(rank, world_size, kwargs):
     """Test reduce_scatter with bucketing to ensure memory stays under 1GB."""
     core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "0")
@@ -1336,9 +1355,7 @@ class TestReduceScatter(BaseCollectiveOpTest):
     # DEVICE & MEMORY TESTS
     # ========================================================================
 
-    @assert_raises(
-        RuntimeError, match=r".*Operation reduce_scatter is not implemented for Neuron.*"
-    )
+    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
     def test_non_neuron_device(self):
         """Test with tensors not on neuron device."""
         self.distributed_tester.run_test(run_non_neuron_device_test)
@@ -1526,6 +1543,10 @@ class TestReduceScatter(BaseCollectiveOpTest):
     def test_bucketing_memory(self):
         """Test reduce_scatter with bucketing for memory efficiency."""
         self.distributed_tester.run_test(run_bucketing_memory_test)
+
+    def test_large_volume_premul_sum(self):
+        """Test PREMUL_SUM with large volume data."""
+        self.distributed_tester.run_test(run_large_volume_premul_sum_reduce_scatter_test)
 
 
 # ========================================================================

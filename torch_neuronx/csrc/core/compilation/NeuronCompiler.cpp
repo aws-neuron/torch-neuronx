@@ -1,7 +1,6 @@
 #include "NeuronCompiler.h"
 
 #include <fcntl.h>
-#include <ftw.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,6 +13,9 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "torch_neuronx/csrc/core/compilation/CompilerDebugUtils.h"
+#include "torch_neuronx/csrc/core/utils/TempDirectory.h"
+
 namespace at::neuron {
 
 namespace {
@@ -23,10 +25,8 @@ constexpr const char* kHloFilename = "module.hlo.pb";
 constexpr const char* kMlirFilename = "module.mlir";
 constexpr const char* kNeffFilename = "module.neff";
 
-// Compiler executable and module constants.
-constexpr const char* kPythonExecutable = "python";
-constexpr const char* kModuleFlag = "-m";
-constexpr const char* kNeuronxCCWrapperModule = "torch_neuronx.kernels.neuronx_cc_wrapper";
+// Compiler executable constant.
+constexpr const char* kNeuronxCCExecutable = "neuronx-cc";
 
 // Command line arguments for neuronx-cc.
 constexpr const char* kCompileCommand = "compile";
@@ -205,63 +205,18 @@ class ProcessExecutor {
   }
 };
 
-// RAII wrapper for temporary directory management.
-// Automatically creates a temporary directory on construction and removes it on destruction.
-class TempDirectory {
- public:
-  TempDirectory() {
-    char temp_template[] = "/tmp/neuron_compile_XXXXXX";
-    char* temp_dir = mkdtemp(temp_template);
-    if (!temp_dir) {
-      throw std::runtime_error("Failed to create temporary directory: " +
-                               std::string(strerror(errno)));
-    }
-    path_ = temp_dir;
-  }
-
-  ~TempDirectory() {
-    if (!path_.empty()) {
-      // Use POSIX nftw instead of std::filesystem to avoid PyTorch 2.9 bug
-      nftw(
-          path_.c_str(),
-          [](const char* fpath, const struct stat*, int, struct FTW*) { return remove(fpath); }, 64,
-          FTW_DEPTH | FTW_PHYS);
-    }
-  }
-
-  // Non-copyable, movable
-  TempDirectory(const TempDirectory&) = delete;
-  TempDirectory& operator=(const TempDirectory&) = delete;
-
-  TempDirectory(TempDirectory&& other) noexcept : path_(std::move(other.path_)) {
-    other.path_.clear();
-  }
-
-  TempDirectory& operator=(TempDirectory&& other) noexcept {
-    if (this != &other) {
-      // Clean up current directory
-      if (!path_.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(path_, ec);
-      }
-      // Move from other
-      path_ = std::move(other.path_);
-      other.path_.clear();
-    }
-    return *this;
-  }
-
-  const std::string& path() const { return path_; }
-
- private:
-  std::string path_;
-};
-
 std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>& hlo_bytes,
                                                       const CompilationConfig& config,
-                                                      const std::string& ir_type) {
-  // Create temporary directory using RAII
-  TempDirectory temp_compilation_dir;
+                                                      const std::string& ir_type,
+                                                      const std::string& op_name,
+                                                      const std::string& cache_key,
+                                                      const std::string& kernel_class_name) {
+  // Dump IR details if requested via environment variable
+  debug::DumpIRDetails(hlo_bytes, config, op_name, cache_key,
+                       kernel_class_name.empty() ? "UnknownKernel" : kernel_class_name);
+
+  // Create temporary directory using RAII wrapper
+  TempDirectory temp_compilation_dir("neuron_compile_");
 
   // Determine file format based on ir_type parameter
   // "StableHLO" uses MLIR format, "XLA" (default) uses HLO protobuf
@@ -277,22 +232,13 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
   hlo_output_stream.write(reinterpret_cast<const char*>(hlo_bytes.data()), hlo_bytes.size());
   hlo_output_stream.close();
 
-  // Build neuronx-cc wrapper command arguments using config
-  // execvp will search PATH automatically, so just use python executable
-  std::vector<std::string> compiler_args = {kPythonExecutable,
-                                            kModuleFlag,
-                                            kNeuronxCCWrapperModule,
-                                            kCompileCommand,
-                                            hlo_input_file,
-                                            kFrameworkFlag,
-                                            config.framework,
-                                            kTargetFlag,
-                                            config.platform_target,
-                                            kLogicalNeuronCoresFlag,
-                                            config.logical_neuron_cores,
-                                            kWorkingDirFlag,
-                                            temp_compilation_dir.path(),
-                                            config.optimization_level};
+  // Build neuronx-cc command arguments using config
+  // execvp will search PATH automatically
+  std::vector<std::string> compiler_args = {
+      kNeuronxCCExecutable,     kCompileCommand,         hlo_input_file,
+      kFrameworkFlag,           config.framework,        kTargetFlag,
+      config.platform_target,   kLogicalNeuronCoresFlag, config.logical_neuron_cores,
+      config.optimization_level};
 
   // Parse and add additional compiler arguments
   std::istringstream additional_args_stream(config.additional_args);
@@ -305,8 +251,8 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
   compiler_args.push_back(kOutputFlag);
   compiler_args.push_back(neff_output_file);
 
-  // Execute neuronx-cc wrapper in the temporary directory
-  ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCWrapperModule) + " compilation",
+  // Execute neuronx-cc in the temporary directory
+  ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCExecutable) + " compilation",
                            temp_compilation_dir.path());
 
   // Read compiled NEFF file

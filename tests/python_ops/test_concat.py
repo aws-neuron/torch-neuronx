@@ -110,21 +110,9 @@ class TestConcat:
         # Clear any previous tracking
         torch_neuronx.clear_op_tracking()
 
-        # Operation should fall back to CPU (no warning expected since it's now debug level)
-        with track_neuron_ops():
-            result = torch.concat((input1.to(device), input2.to(device), input3), -1)
-
-            # xla op does not have aten::cat variant registered
-            if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1":
-                # Verify that cat was offloaded to CPU
-                assert "aten::cat" in torch_neuronx.get_fallback_ops()
-            else:
-                # Verify that cat.out was offloaded to CPU
-                assert "aten::cat.out" in torch_neuronx.get_fallback_ops()
-
-        # Verify the result is correct (same as CPU implementation)
-        out_cpu = torch.concat((input1, input2, input3), -1)
-        torch.testing.assert_close(result.cpu(), out_cpu)
+        # Should raise RuntimeError for non-scalar cross-device operation
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            torch.concat((input1.to(device), input2.to(device), input3), -1)
 
     def test_concat_with_multiple_mixed_empty_tensors(self):
         """Test concat with multiple empty and non-empty tensors mixed together

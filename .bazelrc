@@ -5,7 +5,8 @@ common --enable_workspace
 # Use GitHub-hosted registry to work around SSL certificate issues with bcr.bazel.build
 common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/
 
-common --repo_env=HERMETIC_PYTHON_VERSION=3.10
+# Python version - set via --@rules_python//python/config_settings:python_version=X.Y
+# Supported: 3.10, 3.11, 3.12, 3.13 (setup.py and tools/run-cpp-test pass this automatically)
 
 # Make Bazel print out all options from rc files
 build --announce_rc
@@ -41,14 +42,9 @@ build:posix --cxxopt=-std=c++17
 build:posix --host_cxxopt=-std=c++17
 build:linux --config=posix
 
-# Environment variables
-
-# Local python version.
-build --action_env=PYTHON_VERSION="3.10"
-
 ## Pytorch variables.
 # Pytorch version, when local is not available.
-build --action_env=PYTORCH_VERSION="2.9.0"
+build --action_env=PYTORCH_VERSION="2.10.0"
 
 # Default to use local Pytorch installation.
 # Set to "1" to download from source.

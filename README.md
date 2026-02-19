@@ -10,6 +10,7 @@ torch-neuronx is currently in development with the following limitations:
 
 1. JAX installation is currently required as a dependency.
 2. Compilation and execution latency may be significant.
+3. The neuron backend only supports `mode="default"` for torch.compile. Other modes like "reduce-overhead", "max-autotune", or "max-autotune-no-cudagraphs" are not supported.
 
 ## Installation
 
@@ -37,9 +38,6 @@ chmod +x ./tools/*
 ```python
 import torch
 
-# Register 'neuron' device
-import torch_neuronx
-
 # Use neuron device
 x_neuron = torch.randn(10, 5, device='neuron')
 linear = torch.nn.Linear(5, 3).to('neuron')
@@ -50,12 +48,20 @@ output = linear(x_neuron)
 
 torch-neuronx includes a Dynamo backend for `torch.compile`:
 
+**Note:** The neuron backend only supports `mode="default"`. Other compilation modes are not supported.
+
 ```python
 import torch
 
-# Compile
+# Supported: default mode (explicit)
 model = YourModel()
+compiled_model = torch.compile(model, backend="neuron", mode="default")
+
+# Supported: default mode (implicit)
 compiled_model = torch.compile(model, backend="neuron")
+
+# Not supported: other modes will show a warning
+# compiled_model = torch.compile(model, backend="neuron", mode="reduce-overhead")
 
 # Run inference
 output = compiled_model(input_tensor)
@@ -110,6 +116,17 @@ nki_add(x1, x2, y)
 cd examples/llama
 python llama.py
 ```
+
+## Documentation
+
+```bash
+./tools/build --docs
+# Output: build/docs/html/index.html
+```
+
+## Resources
+
+- [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/)
 
 ## Contributing
 

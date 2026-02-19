@@ -71,7 +71,8 @@ TEST_F(NeuronBindingsTest, ExecuteCompiledGraphCreatesValidKernel) {
   std::string cache_key = "precompiled_cache_key";
   bool has_collectives = false;
 
-  NeffDirectKernelExecution kernel(graph_name, cache_key, input_ptrs_, output_ptrs_,
+  NeffDirectKernelExecution kernel(graph_name, cache_key, create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0,
                                    has_collectives);
 
   EXPECT_TRUE(kernel.IsValid());
@@ -81,27 +82,33 @@ TEST_F(NeuronBindingsTest, ExecuteCompiledGraphCreatesValidKernel) {
 }
 
 TEST_F(NeuronBindingsTest, ExecuteCompiledGraphWithCollectives) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, true);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, true);
 
   EXPECT_TRUE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
 }
 
 TEST_F(NeuronBindingsTest, ExecuteCompiledGraphPreservesDeviceId) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, false);
+  int device_id = 2;
+
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, device_id, false);
 
   EXPECT_TRUE(kernel.IsValid());
 }
 
 TEST_F(NeuronBindingsTest, ExecuteCompiledGraphRequiresCacheLookup) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, false);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   // RequiresCompilation returns true to trigger cache lookup
   EXPECT_TRUE(kernel.RequiresCompilation());
 }
 
 TEST_F(NeuronBindingsTest, ExecuteCompiledGraphCompileToNeffThrows) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, false);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   // NEFF is pre-compiled, CompileToNeff should throw
   EXPECT_THROW(kernel.CompileToNeff(), std::logic_error);

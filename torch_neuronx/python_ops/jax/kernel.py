@@ -11,12 +11,11 @@ from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
+from torch_neuronx.python_ops.shared import CompilationConfig, ExecutionContext, TilingConfig
 from torch_neuronx.utils import cast_dtype_if_needed, is_sync_mode_enabled
 
 from ..processors import ArgumentProcessor
 from .compilation import JaxCompiler
-from .config import CompilationConfig, TilingConfig
-from .context import ExecutionContext
 from .handlers import OutputHandler
 
 logger = logging.getLogger(__name__)

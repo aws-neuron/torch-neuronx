@@ -9,8 +9,20 @@ import logging
 
 import torch
 import torch.distributed as dist
+from torch.fx.passes.infra.pass_base import PassBase, PassResult
 
 logger = logging.getLogger(__name__)
+
+# Maps collective op to the index of its "group" argument
+# e.g:
+#   all_reduce(tensor, reduce_op, group) -> 2
+#   reduce_scatter_tensor(tensor, reduce_op, scatter_dim, group) -> 3
+_COLLECTIVE_OPS_GROUP_INDEX = {
+    "_c10d_functional.all_reduce.default": 2,
+    "_c10d_functional.all_gather_into_tensor.default": 2,
+    "_c10d_functional.reduce_scatter_tensor.default": 3,
+    "_c10d_functional.all_to_all_single.default": 3,
+}
 
 
 def _get_process_group_ranks(group_name: str) -> list[int]:
@@ -49,52 +61,41 @@ def _get_process_group_ranks(group_name: str) -> list[int]:
         return list(range(world_size))
 
 
-def legalize_replica_groups(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+class CollectiveLegalization(PassBase):
     """
-    Rewrite collective operation group names mapped to global partial replica groups
-
-    Args:
-        gm: Input GraphModule containing collective operations
-
-    Returns:
-        Modified GraphModule with rewritten group names
+    Rewrite collective operation group names to explicit replica groups.
 
     Example:
-        >>> Transforms the following
+        Transforms the following:
+
         opcode         name         target                                args
         -------------  -----------  ------------------------------------  --------------------
         call_function  all_reduce   _c10d_functional.all_reduce.default   (arg0_1, 'sum', '0')
 
-        >>> Into
+        Into:
+
         opcode         name         target                                args
         -------------  -----------  ------------------------------------  ---------------------------
         call_function  all_reduce   _c10d_functional.all_reduce.default   (arg0_1, 'sum', '[[0, 1]]')
     """  # noqa: E501
 
-    # TODO: Support `broadcast`.`
-    # Maps collective op to the index of its "group" argument
-    # e.g:
-    #   all_reduce(tensor, reduce_op, group) -> 2
-    #   reduce_scatter_tensor(tensor, reduce_op, scatter_dim, group) -> 3
-    collective_ops_to_group_index = {
-        "_c10d_functional.all_reduce.default": 2,
-        "_c10d_functional.all_gather_into_tensor.default": 2,
-        "_c10d_functional.reduce_scatter_tensor.default": 3,
-        "_c10d_functional.all_to_all_single.default": 3,
-    }
+    # TODO: Support `broadcast`.
 
-    for node in gm.graph.nodes:
-        if node.op == "call_function" and str(node.target) in collective_ops_to_group_index:
-            # Replace the group name with flattened local replica_group
-            args = list(node.args)
-            group_index = collective_ops_to_group_index[str(node.target)]
-            group_arg = args[group_index]
-            logger.debug(
-                f"Found collective operation: {node.target} group ({group_arg}) -> "
-                + f"({_get_process_group_ranks(args[group_index])})"
-            )
-            args[group_index] = "[" + str(_get_process_group_ranks(group_arg)) + "]"
-            node.args = tuple(args)
+    def call(self, gm: torch.fx.GraphModule) -> PassResult:
+        modified = False
 
-    gm.recompile()
-    return gm
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and str(node.target) in _COLLECTIVE_OPS_GROUP_INDEX:
+                args = list(node.args)
+                group_index = _COLLECTIVE_OPS_GROUP_INDEX[str(node.target)]
+                group_arg = args[group_index]
+                ranks = _get_process_group_ranks(group_arg)
+                logger.debug(f"Collective {node.target}: group ({group_arg}) -> ({ranks})")
+                args[group_index] = "[" + str(ranks) + "]"
+                node.args = tuple(args)
+                modified = True
+
+        if modified:
+            gm.recompile()
+
+        return PassResult(gm, modified=modified)

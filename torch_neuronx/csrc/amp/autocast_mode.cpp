@@ -27,6 +27,7 @@ TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
 #define _KERNEL_NEURON_FP32(...) KERNEL_PRIVATEUSEONE(__VA_ARGS__, fp32)
 
   AT_FORALL_FP32(_KERNEL_NEURON_FP32)
+  KERNEL_PRIVATEUSEONE(cross_entropy_loss, fp32)
 
   // fp32_set_opt_dtype
 #define _KERNEL_NEURON_FP32_SET_OPT_DTYPE(...) KERNEL_PRIVATEUSEONE(__VA_ARGS__, fp32_set_opt_dtype)

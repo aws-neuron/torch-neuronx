@@ -238,7 +238,7 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test all_gather with specific process groups."""
         self.distributed_tester.run_test(run_group_argument_test)
 
-    @assert_raises(RuntimeError, match=r".*Operation all_gather is not implemented for Neuron.*")
+    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
     def test_different_devices(self):
         """Test all_gather with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -402,3 +402,32 @@ class TestAllGatherWorldSize4(BaseCollectiveOpTest):
     def test_bucketing_memory_flat_2d_tensor_test(self):
         """Test all_gather_into_tensor with bucketing for memory efficiency with flat 2d tensor"""
         self.distributed_tester.run_test(run_bucketing_memory_flat_2d_tensor_test)
+
+    def test_delayed_wait_after_completion(self):
+        """Regression test: wait() after watchdog may have processed completion.
+
+        Previously, the watchdog's detachStashedTensorShelf() could race with
+        synchronize()'s unstashTensors(), causing SIGSEGV in pthread_mutex_lock.
+        """
+        self.distributed_tester.run_test(run_delayed_wait_after_completion_test)
+
+
+def run_delayed_wait_after_completion_test(rank, world_size, kwargs):
+    """Wait on async work after giving watchdog time to process it."""
+    import time
+
+    for _ in range(20):
+        tensor = torch.ones(4, 4, device="neuron")
+        output_list = [torch.zeros(4, 4, device="neuron") for _ in range(world_size)]
+
+        work = dist.all_gather(output_list, tensor, async_op=True)
+
+        # Sleep to let watchdog detect completion and call handleCompletion
+        time.sleep(0.1)
+
+        # wait() must not crash even if watchdog already detached the shelf
+        work.wait()
+
+        # Verify results
+        for gathered in output_list:
+            assert torch.allclose(gathered.cpu(), torch.ones(4, 4))

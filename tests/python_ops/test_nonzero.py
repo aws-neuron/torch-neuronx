@@ -40,6 +40,18 @@ class TestNonzero:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::nonzero")
 
+    @pytest.mark.parametrize("shape", [(0,), (0, 3), (2, 0), (0, 0)])
+    def test_nonzero_empty_tensor(self, device, shape):
+        """Test nonzero with empty tensor (numel == 0)."""
+        x = torch.empty(shape, device=device)
+        neuron_result = torch.nonzero(x)
+        cpu_result = torch.nonzero(x.cpu())
+
+        assert neuron_result.device.type == "neuron"
+        assert neuron_result.shape == cpu_result.shape
+        assert neuron_result.shape == (0, len(shape))
+        torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+
     def test_nonzero_all_ones(self, device):
         """Test nonzero with all ones tensor."""
         with track_neuron_ops():

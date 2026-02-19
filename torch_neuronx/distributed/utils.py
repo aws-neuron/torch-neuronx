@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 
 from torch_neuronx.python_ops.base import _create_and_raise_detailed_error
+from torch_neuronx.utils import flatten_tensors as _flatten_tensors
 
 # Bucket size limit for collective operations (in MB)
 _COLLECTIVE_BUCKETSIZE_BYTES: int = (
@@ -56,17 +57,21 @@ def create_global_replica_group(world_size, current_group_ranks):
     return global_replica_groups
 
 
-def parse_and_update_inputs(inputs, reduce_op):
+def parse_and_update_inputs(inputs, options):
     """
     Preprocess inputs for PREMUL_SUM reduction operations by applying the
     premultiplication factor and converting to a regular SUM operation.
 
     For non-PREMUL_SUM operations, inputs are returned unchanged with their
     corresponding operation type.
+
+    Args:
+            inputs: Input tensors to process
+            options: Options object with reduceOp attribute
     """
-    reduce_type = get_reduce_type(reduce_op)
+    reduce_type = get_reduce_type(options.reduceOp)
     if reduce_type == "PREMUL_SUM":
-        _, premul_factor = reduce_op.__getstate__()
+        _, premul_factor = options.reduceOp.__getstate__()
         if isinstance(inputs, list):
             if isinstance(inputs[0], list):
                 scaled_inputs = [
@@ -76,7 +81,7 @@ def parse_and_update_inputs(inputs, reduce_op):
                 scaled_inputs = [tensor * premul_factor for tensor in inputs]
         else:
             scaled_inputs = inputs * premul_factor
-
+        options.reduceOp = dist.ReduceOp.SUM
         return scaled_inputs, "SUM"
 
     return inputs, reduce_type
@@ -181,13 +186,7 @@ def _should_use_split_allgather(tensor, world_size, bucket_size_bytes):
 
 def _validate_no_zero_dim0(tensors):
     """Validate tensors don't have zero size in dimension 0."""
-    # Flatten nested lists/tuples to get all tensors
-    flat_tensors = []
-    for item in tensors:
-        if isinstance(item, torch.Tensor):
-            flat_tensors.append(item)
-        elif isinstance(item, list | tuple):
-            flat_tensors.extend(item)
+    flat_tensors = _flatten_tensors(tensors)
 
     empty_tensors = [
         (i, tensor.shape) for i, tensor in enumerate(flat_tensors) if tensor.size(0) == 0

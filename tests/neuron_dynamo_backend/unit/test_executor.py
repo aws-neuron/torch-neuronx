@@ -10,7 +10,12 @@ import torch
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
 from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
+from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
+    FunctionIO,
+    NativeDropoutOp,
+    RandomInputInfo,
+    TensorSpec,
+)
 
 
 class TestExecutor:
@@ -557,3 +562,387 @@ class TestExecutor:
                 assert result[i] is not None
             else:
                 assert result[i] is None
+
+    @pytest.mark.parametrize(
+        "num_inputs,num_outputs,input_device,retain_device,expect_cpu_transfer",
+        [
+            (1, 1, "cpu", True, True),
+            (1, 1, "cpu", False, False),
+            (2, 2, "cpu", True, True),
+            (2, 1, "cpu", True, True),
+            (1, 2, "cpu", True, True),
+            (2, 1, "neuron", True, False),
+            (2, 2, "neuron", True, False),
+        ],
+    )
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_retain_device_behavior(
+        self,
+        mock_current_device,
+        mock_execute,
+        num_inputs,
+        num_outputs,
+        input_device,
+        retain_device,
+        expect_cpu_transfer,
+    ):
+        """Test retain_device behavior with various input/output configurations"""
+        mock_current_device.return_value = 0
+
+        input_specs = [TensorSpec(dtype=torch.float32, shape=[2, 3]) for _ in range(num_inputs)]
+        output_specs = [TensorSpec(dtype=torch.float32, shape=[2, 3]) for _ in range(num_outputs)]
+        io_specs = FunctionIO(inputs=input_specs, outputs=output_specs)
+        cast_spec = [TensorSpec(dtype=torch.float32, shape=[2, 3]) for _ in range(num_outputs)]
+
+        executor = Executor(
+            "test_graph", "test_cache_key", io_specs, cast_spec, retain_device=retain_device
+        )
+
+        # Create input tensors
+        input_tensors = []
+        for _ in range(num_inputs):
+            input_tensor = MagicMock(spec=torch.Tensor)
+            input_tensor.device.type = input_device
+            input_tensor.dtype = torch.float32
+            if input_device == "cpu":
+                mock_neuron_tensor = MagicMock(spec=torch.Tensor)
+                input_tensor.to.return_value = mock_neuron_tensor
+            input_tensors.append(input_tensor)
+
+        with patch("torch.empty") as mock_empty:
+            # Create output tensors
+            mock_outputs = []
+            for _ in range(num_outputs):
+                mock_output = MagicMock()
+                mock_output.dtype = torch.float32
+                mock_cpu_output = MagicMock()
+                mock_output.to.return_value = mock_cpu_output
+                mock_outputs.append(mock_output)
+
+            mock_empty.side_effect = mock_outputs
+
+            result = executor(*input_tensors)
+
+            # Verify CPU transfer behavior
+            for mock_output in mock_outputs:
+                if expect_cpu_transfer:
+                    mock_output.to.assert_called_once_with("cpu")
+
+            assert isinstance(result, tuple)
+            assert len(result) == num_outputs
+
+    @pytest.mark.parametrize(
+        "retain_device,should_raise",
+        [
+            (True, True),
+            (False, False),
+        ],
+    )
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_retain_device_mixed_devices(
+        self, mock_current_device, mock_execute, retain_device, should_raise
+    ):
+        """Test retain_device behavior with mixed CPU and neuron inputs"""
+        mock_current_device.return_value = 0
+
+        input_spec1 = TensorSpec(dtype=torch.float32, shape=[2, 3])
+        input_spec2 = TensorSpec(dtype=torch.float32, shape=[3, 4])
+        output_spec = TensorSpec(dtype=torch.float32, shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec1, input_spec2], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype=torch.float32, shape=[2, 4])]
+
+        executor = Executor(
+            "test_graph", "test_cache_key", io_specs, cast_spec, retain_device=retain_device
+        )
+
+        input_tensor1 = MagicMock(spec=torch.Tensor)
+        input_tensor1.device.type = "cpu"
+        input_tensor1.dtype = torch.float32
+        mock_neuron_tensor1 = MagicMock(spec=torch.Tensor)
+        input_tensor1.to.return_value = mock_neuron_tensor1
+
+        input_tensor2 = MagicMock(spec=torch.Tensor)
+        input_tensor2.device.type = "neuron"
+        input_tensor2.dtype = torch.float32
+
+        if should_raise:
+            with pytest.raises(
+                NEFFExecutionError,
+                match="cannot mix input devices with TORCH_NEURONX_RETAIN_DEVICE_MODE=1",
+            ):
+                executor(input_tensor1, input_tensor2)
+        else:
+            with patch("torch.empty") as mock_empty:
+                mock_output = MagicMock()
+                mock_output.dtype = torch.float32
+                mock_empty.return_value = mock_output
+
+                result = executor(input_tensor1, input_tensor2)
+                assert isinstance(result, tuple)
+
+    @pytest.mark.parametrize(
+        "ops_config,expected_total_inputs",
+        [
+            ([], 1),  # no random inputs
+            ([(0, (2, 3), 0.5, True)], 2),  # single random input
+            ([(0, (2, 3), 0.7, True), (1, (4, 5), 0.5, True)], 3),  # multiple random inputs
+        ],
+        ids=["no_random", "single_random", "multiple_random"],
+    )
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    @patch.object(NativeDropoutOp, "sample")
+    def test_random_input_generation(
+        self, mock_sample, mock_current_device, mock_execute, ops_config, expected_total_inputs
+    ):
+        """Test random input generation with various configurations."""
+        mock_current_device.return_value = 0
+
+        def sample_side_effect(device):
+            mock_tensor = MagicMock(spec=torch.Tensor)
+            mock_tensor.device.type = "neuron"
+            mock_tensor.dtype = torch.bool
+            return mock_tensor
+
+        mock_sample.side_effect = sample_side_effect
+        input_tensor = MagicMock(spec=torch.Tensor)
+        input_tensor.device.type = "cpu"
+        input_tensor.dtype = torch.float32
+        mock_neuron_tensor = MagicMock(spec=torch.Tensor)
+        input_tensor.to.return_value = mock_neuron_tensor
+
+        ops = [
+            NativeDropoutOp(
+                input_position=pos,
+                shape=shape,
+                dtype=torch.float32,
+                probability=prob,
+                train=train,
+            )
+            for pos, shape, prob, train in ops_config
+        ]
+        random_input_info = (
+            RandomInputInfo(
+                ops=ops,
+                original_input_count=1,
+                new_input_count=1 + len(ops),
+            )
+            if ops
+            else None
+        )
+        input_spec = [TensorSpec(dtype=torch.float32, shape=(2, 3))]
+        input_spec.extend([TensorSpec(dtype=torch.bool, shape=op.shape) for op in ops])
+        output_spec = [TensorSpec(dtype=torch.float32, shape=(2, 3))]
+        io_specs = FunctionIO(
+            inputs=tuple(input_spec),
+            outputs=tuple(output_spec),
+            random_input_info=random_input_info,
+        )
+        cast_spec = [TensorSpec(dtype=torch.float32, shape=(2, 3))]
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        with patch("torch.empty") as mock_empty:
+            mock_output = MagicMock()
+            mock_output.dtype = torch.float32
+            mock_empty.return_value = mock_output
+            executor(input_tensor)
+
+            # Validate execute_compiled_graph/sample called correctly
+            mock_execute.assert_called_once()
+            args, _ = mock_execute.call_args
+            neuron_inputs = args[2]
+            assert len(neuron_inputs) == expected_total_inputs
+            assert mock_sample.call_count == len(ops_config)
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_single_cpu_input(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that CPU input raises error when TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY=1"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        input_spec = TensorSpec(dtype="float32", shape=[2, 3])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        cpu_tensor = MagicMock(spec=torch.Tensor)
+        cpu_tensor.device.type = "cpu"
+
+        with pytest.raises(RuntimeError, match=r"Input tensor at index 0 is on cpu device"):
+            executor(cpu_tensor)
+
+        mock_execute.assert_not_called()
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_multiple_cpu_inputs(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that multiple CPU inputs lists all indices in error"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        input_spec1 = TensorSpec(dtype="float32", shape=[2, 3])
+        input_spec2 = TensorSpec(dtype="float32", shape=[2, 3])
+        input_spec3 = TensorSpec(dtype="float32", shape=[2, 3])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec1, input_spec2, input_spec3], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        cpu_tensor1 = MagicMock(spec=torch.Tensor)
+        cpu_tensor1.device.type = "cpu"
+        cpu_tensor2 = MagicMock(spec=torch.Tensor)
+        cpu_tensor2.device.type = "cpu"
+        cpu_tensor3 = MagicMock(spec=torch.Tensor)
+        cpu_tensor3.device.type = "cpu"
+
+        with pytest.raises(RuntimeError, match=r"Input tensor at index 0 is on cpu device"):
+            executor(cpu_tensor1, cpu_tensor2, cpu_tensor3)
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_mixed_inputs(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that mixed CPU/neuron inputs only lists CPU indices"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        input_spec1 = TensorSpec(dtype="float32", shape=[2, 3])
+        input_spec2 = TensorSpec(dtype="float32", shape=[2, 3])
+        input_spec3 = TensorSpec(dtype="float32", shape=[2, 3])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec1, input_spec2, input_spec3], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        neuron_tensor = MagicMock(spec=torch.Tensor)
+        neuron_tensor.device.type = "neuron"
+        cpu_tensor1 = MagicMock(spec=torch.Tensor)
+        cpu_tensor1.device.type = "cpu"
+        cpu_tensor2 = MagicMock(spec=torch.Tensor)
+        cpu_tensor2.device.type = "cpu"
+
+        with pytest.raises(RuntimeError, match=r"Input tensor at index 1 is on cpu device"):
+            executor(neuron_tensor, cpu_tensor1, cpu_tensor2)
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_neuron_inputs_work(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that neuron inputs work normally when autocopy is disabled"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        input_spec = TensorSpec(dtype="float32", shape=[2, 3])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        neuron_tensor = MagicMock(spec=torch.Tensor)
+        neuron_tensor.device.type = "neuron"
+        neuron_tensor.dtype = torch.float32
+
+        with patch("torch.empty") as mock_empty:
+            mock_output = MagicMock()
+            mock_output.dtype = torch.float32
+            mock_empty.return_value = mock_output
+
+            executor(neuron_tensor)
+            mock_execute.assert_called_once()
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_python_scalars_work(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that Python scalars work when autocopy is disabled"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        input_spec = TensorSpec(dtype="float32", shape=[])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        with patch("torch.empty") as mock_empty, patch("torch.tensor") as mock_tensor:
+            mock_output = MagicMock()
+            mock_output.dtype = torch.float32
+            mock_empty.return_value = mock_output
+
+            mock_scalar_tensor = MagicMock(spec=torch.Tensor)
+            mock_scalar_tensor.dtype = torch.float32
+            mock_scalar_tensor.dim.return_value = 0
+            mock_tensor.return_value = mock_scalar_tensor
+
+            executor(3.14)  # Python scalar
+            mock_execute.assert_called_once()
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_enabled_cpu_inputs_work(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that CPU inputs are auto-copied when env var is not set"""
+        monkeypatch.delenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", raising=False)
+        mock_current_device.return_value = 0
+
+        input_spec = TensorSpec(dtype="float32", shape=[2, 3])
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[input_spec], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        cpu_tensor = MagicMock(spec=torch.Tensor)
+        cpu_tensor.device.type = "cpu"
+        mock_neuron_tensor = MagicMock(spec=torch.Tensor)
+        mock_neuron_tensor.dtype = torch.float32
+        cpu_tensor.to.return_value = mock_neuron_tensor
+
+        with patch("torch.empty") as mock_empty:
+            mock_output = MagicMock()
+            mock_output.dtype = torch.float32
+            mock_empty.return_value = mock_output
+
+            executor(cpu_tensor)
+            cpu_tensor.to.assert_called_once_with("neuron:0")
+            mock_execute.assert_called_once()
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_cpu_autocopy_disabled_empty_inputs_work(
+        self, mock_current_device, mock_execute, monkeypatch
+    ):
+        """Test that empty inputs work when autocopy is disabled (no false positives)"""
+        monkeypatch.setenv("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", "1")
+        mock_current_device.return_value = 0
+
+        output_spec = TensorSpec(dtype="float32", shape=[2, 4])
+        io_specs = FunctionIO(inputs=[], outputs=[output_spec])
+        cast_spec = [TensorSpec(dtype="float32", shape=[2, 4])]
+
+        executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
+
+        with patch("torch.empty") as mock_empty:
+            mock_output = MagicMock()
+            mock_output.dtype = torch.float32
+            mock_empty.return_value = mock_output
+
+            executor()
+            mock_execute.assert_called_once()

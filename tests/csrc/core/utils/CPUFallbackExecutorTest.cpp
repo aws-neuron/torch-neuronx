@@ -104,12 +104,7 @@ TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackDisabled) {
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-  std::vector<TensorContext> input_contexts, output_contexts;
-  for (const auto& t : inputs) input_contexts.push_back(TensorContext::FromTensor(t));
-  for (const auto& t : outputs) output_contexts.push_back(TensorContext::FromTensor(t));
-
-  OperationContext mock_op(std::move(mock_kernel), input_contexts, output_contexts,
-                           "test_stack_trace");
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
 
   // Execute CPU fallback - should fail because disabled
@@ -135,12 +130,7 @@ TEST_F(CPUFallbackExecutorTest, ExecuteCpuFallbackWithMockOperation) {
   EXPECT_CALL(*mock_kernel, GetKernelType())
       .WillRepeatedly(::testing::Return(KernelTypeEnum::kHLO));
 
-  std::vector<TensorContext> input_contexts, output_contexts;
-  for (const auto& t : inputs) input_contexts.push_back(TensorContext::FromTensor(t));
-  for (const auto& t : outputs) output_contexts.push_back(TensorContext::FromTensor(t));
-
-  OperationContext mock_op(std::move(mock_kernel), input_contexts, output_contexts,
-                           "test_stack_trace");
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
 
   // Execute CPU fallback - will fail due to mock operation

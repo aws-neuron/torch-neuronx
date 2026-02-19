@@ -127,7 +127,18 @@ def test_group_name(process_group):
 
 
 def test_barrier(process_group):
-    with patch("torch.distributed.get_world_size", return_value=2):
+    mock_stream = MagicMock()
+    mock_stream.wait_stream = MagicMock()
+    mock_work = MagicMock(spec=torch._C._distributed_c10d.Work)
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch_neuronx.current_device", return_value=0),
+        patch("torch_neuronx.current_stream", return_value=mock_stream),
+        patch("torch_neuronx.stream"),
+        patch("torch_neuronx._C._nrt_barrier"),
+        patch.object(process_group, "_get_neuron_stream", return_value=mock_stream),
+        patch("torch_neuronx.distributed.backend._ret_work", return_value=mock_work),
+    ):
         process_group.barrier(None)
 
 
@@ -138,9 +149,18 @@ def test_barrier_error(process_group):
 
 
 def test_allreduce(process_group):
+    mock_work = MagicMock(spec=torch._C._distributed_c10d.Work)
+
+    def mock_ret_work(pg, tensors, op_type, opts, collective_fn=None, device=None):
+        # Execute the collective_fn to verify all_reduce_op is called
+        if collective_fn is not None:
+            collective_fn()
+        return mock_work
+
     with (
         patch.object(torch_neuronx.distributed.backend, "all_reduce_op") as mock_all_reduce_op,
         patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
+        patch.object(torch_neuronx.distributed.backend, "_ret_work", side_effect=mock_ret_work),
     ):
         tensors = [torch.tensor([1.0, 2.0])]
         options = MagicMock()
@@ -149,7 +169,7 @@ def test_allreduce(process_group):
         result = process_group.allreduce(tensors, options)
 
         mock_all_reduce_op.assert_called_once()
-        assert isinstance(result, torch._C._distributed_c10d.Work)
+        assert result == mock_work
 
 
 @patch("torch_neuronx.is_neuron_runtime_initialized", return_value=False)
