@@ -2,38 +2,72 @@
 
 import torch
 
+from torch_neuronx.python_ops.nki_kernels.adamw import _has_nki_adam_kernels
+
 from ..operation_registry import register_aten
 
 
-@register_aten(
-    ["aten::_fused_adamw_", "aten::_fused_adamw_.tensor_lr"],
-    uses_preprocessing=True,
-)
-def torch_fused_adamw(
-    params,
-    grads,
-    exp_avgs,
-    exp_avg_sqs,
-    max_exp_avg_sqs,
-    state_steps,
-    lr=0.001,
-    beta1=0.9,
-    beta2=0.999,
-    weight_decay=0.01,
-    eps=1e-8,
-    amsgrad=False,
-    maximize=False,
-    grad_scale=None,
-    found_inf=None,
-    **kwargs,
-):
-    if isinstance(lr, torch.Tensor):
-        lr = lr.item()
-
-    use_amsgrad = amsgrad
-    use_maximize = maximize
-
+def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
     def compute_fn(
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        max_exp_avg_sqs,
+        state_steps,
+        lr,
+        beta1,
+        beta2,
+        weight_decay,
+        eps,
+    ):
+        from torch_neuronx.python_ops.nki_kernels.adamw import adam_nki, adamw_nki
+
+        wd_val = (1.0 - lr * weight_decay) if decoupled_wd else weight_decay
+        # retain step-dependent params as tensors to avoid recompilation
+        step = state_steps[0]
+        bc1 = 1.0 - torch.pow(beta1, step)
+        bc2_sqrt = torch.sqrt(1.0 - torch.pow(beta2, step))
+        step_size = lr / bc1
+        inv_bc2_sqrt = 1.0 / bc2_sqrt
+
+        results_p, results_ea, results_eas, results_meas = [], [], [], []
+
+        for i in range(len(params)):
+            grad = -grads[i] if maximize else grads[i]
+            meas = max_exp_avg_sqs[i] if amsgrad else params[i]
+
+            results = (adamw_nki if decoupled_wd else adam_nki)(
+                params[i],
+                grad,
+                exp_avgs[i],
+                exp_avg_sqs[i],
+                meas,
+                step_size.expand(128, 1),
+                inv_bc2_sqrt.expand(128, 1),
+                wd_val * torch.ones((128, 1), dtype=torch.float32, device=params[i].device),
+                beta1,
+                beta2,
+                eps,
+                amsgrad,
+            )
+
+            if amsgrad:
+                p_new, ea_new, eas_new, meas_new = results
+                results_meas.append(meas_new)
+            else:
+                p_new, ea_new, eas_new = results
+
+            results_p.append(p_new)
+            results_ea.append(ea_new)
+            results_eas.append(eas_new)
+
+        if amsgrad:
+            return tuple(results_p + results_ea + results_eas + results_meas)
+        return tuple(results_p + results_ea + results_eas)
+
+    # TODO remove MLIR fallback once fused_adam NKI kernel is available
+    def compute_fn_mlir(
         params,
         grads,
         exp_avgs,
@@ -53,8 +87,13 @@ def torch_fused_adamw(
 
         for i in range(len(params)):
             grad = grads[i]
-            if use_maximize:
+            if maximize:
                 grad = -grad
+
+            # For Adam (L2 regularization), add weight decay to gradient
+            # For AdamW (decoupled), weight decay is applied to params directly
+            if not decoupled_wd:
+                grad = grad + weight_decay * params[i]
 
             step = state_steps[i]
 
@@ -66,7 +105,7 @@ def torch_fused_adamw(
 
             exp_avg_sq_new = exp_avg_sqs[i] * beta2 + grad * grad * (1.0 - beta2)
 
-            if use_amsgrad:
+            if amsgrad:
                 max_exp_avg_sq_new = torch.maximum(max_exp_avg_sqs[i], exp_avg_sq_new)
                 denom = (torch.sqrt(max_exp_avg_sq_new) / bias_correction2_sqrt) + eps
                 updated_max_exp_avg_sqs.append(max_exp_avg_sq_new)
@@ -74,13 +113,16 @@ def torch_fused_adamw(
                 denom = (torch.sqrt(exp_avg_sq_new) / bias_correction2_sqrt) + eps
 
             step_size = lr / bias_correction1
-            param_new = params[i] * (1.0 - lr * weight_decay) - step_size * exp_avg_new / denom
+            if decoupled_wd:
+                param_new = params[i] * (1.0 - lr * weight_decay) - step_size * exp_avg_new / denom
+            else:
+                param_new = params[i] - step_size * exp_avg_new / denom
 
             updated_params.append(param_new)
             updated_exp_avgs.append(exp_avg_new)
             updated_exp_avg_sqs.append(exp_avg_sq_new)
 
-        if use_amsgrad:
+        if amsgrad:
             return tuple(
                 updated_params + updated_exp_avgs + updated_exp_avg_sqs + updated_max_exp_avg_sqs
             )
@@ -88,30 +130,81 @@ def torch_fused_adamw(
         # Note that we can't return None here since the fx graph requires an output node
         return tuple(updated_params + updated_exp_avgs + updated_exp_avg_sqs)
 
-    # in-place variant returns None
-    def postprocess_fn(results):
-        return None
-
-    if use_amsgrad:
-        out_tensors = tuple(params + exp_avgs + exp_avg_sqs + max_exp_avg_sqs)
+    if _has_nki_adam_kernels:
+        return compute_fn
     else:
-        out_tensors = tuple(params + exp_avgs + exp_avg_sqs)
+        return compute_fn_mlir
 
-    return (
-        compute_fn,
-        (
-            params,
-            grads,
-            exp_avgs,
-            exp_avg_sqs,
-            max_exp_avg_sqs,
-            state_steps,
-            lr,
-            beta1,
-            beta2,
-            weight_decay,
-            eps,
-        ),
-        {"out": out_tensors},  # write directly to original tensors
-        postprocess_fn,
-    )
+
+def _register_fused_adam(op_names, decoupled_wd):
+    static_args = (7, 8, 9, 10) if _has_nki_adam_kernels else ()
+
+    @register_aten(op_names, uses_preprocessing=True, static_argnums=static_args)
+    def fused_adam_impl(
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        max_exp_avg_sqs,
+        state_steps,
+        lr=0.001,
+        beta1=0.9,
+        beta2=0.999,
+        weight_decay=0.01 if decoupled_wd else 0.0,
+        eps=1e-8,
+        amsgrad=False,
+        maximize=False,
+        grad_scale=None,
+        found_inf=None,
+        **kwargs,
+    ):
+        if isinstance(lr, torch.Tensor):
+            lr = lr.item()
+
+        compute_fn = _make_adam_compute_fn(amsgrad, maximize, decoupled_wd)
+
+        # Filter out zero-numel params
+        non_empty_idx = [i for i, p in enumerate(params) if p.numel() > 0]
+        ne_params = [params[i] for i in non_empty_idx]
+        ne_grads = [grads[i] for i in non_empty_idx]
+        ne_exp_avgs = [exp_avgs[i] for i in non_empty_idx]
+        ne_exp_avg_sqs = [exp_avg_sqs[i] for i in non_empty_idx]
+        ne_max_exp_avg_sqs = [max_exp_avg_sqs[i] for i in non_empty_idx] if amsgrad else []
+        ne_state_steps = [state_steps[i] for i in non_empty_idx]
+
+        if not ne_params:
+            return compute_fn, (), {}, lambda results: None
+
+        if amsgrad:
+            out_tensors = tuple(ne_params + ne_exp_avgs + ne_exp_avg_sqs + ne_max_exp_avg_sqs)
+        else:
+            out_tensors = tuple(ne_params + ne_exp_avgs + ne_exp_avg_sqs)
+
+        return (
+            compute_fn,
+            (
+                ne_params,
+                ne_grads,
+                ne_exp_avgs,
+                ne_exp_avg_sqs,
+                ne_max_exp_avg_sqs,
+                ne_state_steps,
+                lr,
+                beta1,
+                beta2,
+                weight_decay,
+                eps,
+            ),
+            {"out": out_tensors},
+            lambda results: None,
+        )
+
+    return fused_adam_impl
+
+
+torch_fused_adamw = _register_fused_adam(
+    ["aten::_fused_adamw_", "aten::_fused_adamw_.tensor_lr"], decoupled_wd=True
+)
+torch_fused_adam = _register_fused_adam(
+    ["aten::_fused_adam_", "aten::_fused_adam_.tensor_lr"], decoupled_wd=False
+)

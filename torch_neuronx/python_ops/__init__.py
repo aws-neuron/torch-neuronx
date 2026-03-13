@@ -81,6 +81,14 @@ def _register_common_ops():
         # when called through DTensor dispatch
         aten_lib.impl("rms_norm", rms_norm_neuron, "AutogradPrivateUse1")
 
+        from .torch_mlir.ops.loss import cross_entropy_autograd_privateuse1
+
+        aten_lib.impl(
+            "cross_entropy_loss",
+            cross_entropy_autograd_privateuse1,
+            "AutogradPrivateUse1",
+        )
+
 
 def register_mlir_ops():
     """Register MLIR-based operations with PyTorch dispatcher."""

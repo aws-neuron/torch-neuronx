@@ -35,12 +35,13 @@ class TestAddRegistration:
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("add")
 
-    @assert_raises(RuntimeError, match="Cannot (add|process) non-contiguous tensor.*")
-    def test_add_inplace_non_contiguous_output(self, monkeypatch):
+    def test_add_inplace_non_contiguous_output(self):
         """Test in-place add operations on tensor slices"""
-        monkeypatch.setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "1")
         m1 = torch.ones(10, 10, device="neuron")
         m1[:, 3].add_(2)
+        expected = torch.ones(10, 10)
+        expected[:, 3].add_(2)
+        torch.testing.assert_close(m1.cpu(), expected)
 
     def test_add_operator_syntax(self):
         """Test that a + b syntax works with neuron tensors."""

@@ -8,9 +8,10 @@ import logging
 import threading
 from typing import Final
 
+from torch_mlir.compiler_utils import run_pipeline_with_repro_report
+
 import torch_neuronx
 from torch_neuronx.neuron_dynamo_backend.cache_artifact import ArtifactType
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import compute_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -64,29 +65,40 @@ def _add_compiled_cache_key(artifact_type: ArtifactType, key: str) -> None:
 
 class CompileGraph:
     """
-    Takes StableHLO MLIR, compiles it to NEFF, and returns cache key.
+    Takes MLIR, compiles it to NEFF, and returns cache key.
+    Supports both the default compilation path and the tensorizer path.
     """
 
     def __init__(
-        self, stablehlo_mlir, model_name: str, segment_id: str, has_collectives: bool = False
+        self,
+        mlir,
+        model_name: str,
+        segment_id: str,
+        graph_name: str,
+        has_collectives: bool = False,
+        use_tensorizer: bool = False,
     ):
         """Initialize compilation context.
 
         Args:
-            stablehlo_mlir (Module): StableHLO MLIR module to compile.
+            mlir (Module): StableHLO MLIR module to compile.
             model_name (str): Model name for logging.
             segment_id (str): Segment ID for statistics tracking.
             has_collectives (bool): Whether graph contains collective operations.
+            use_tensorizer (bool): Whether to use the tensorizer compilation path.
+            graph_name (str): Deterministic graph name for cache key.
         """
-        self.stablehlo_mlir = stablehlo_mlir
+        self.mlir = mlir
         self.model_name = model_name
         self.segment_id = segment_id
         self.has_collectives = has_collectives
+        self.use_tensorizer = use_tensorizer
+        self.graph_name = graph_name
 
     def compile(self) -> str:
-        """Compile StableHLO to NEFF.
+        """Compile MLIR to NEFF.
 
-        Serializes the StableHLO module to bytecode and invokes the
+        Serializes the MLIR module to bytecode and invokes the
         C++ compilation backend.
 
         Returns:
@@ -95,21 +107,31 @@ class CompileGraph:
         logger.debug(f"CompileGraph.compile() called: model={self.model_name}")
 
         # Strip non-deterministic attributes before serializing for C++ backend.
-        # This ensures cache keys (in-memory and persistent) are consistent across ranks.
+        # This ensures persistent cache keys are consistent across ranks.
         # Note: Artifacts are already saved with debug_dump_path intact by this point.
-        attrs = self.stablehlo_mlir.operation.attributes
+        attrs = self.mlir.operation.attributes
         for attr_name in _NON_DETERMINISTIC_ATTRS:
             if attr_name in attrs:
                 del attrs[attr_name]
 
-        base_cache_key = compute_cache_key(self.stablehlo_mlir)
+        if self.use_tensorizer:
+            run_pipeline_with_repro_report(
+                self.mlir,
+                "builtin.module(stablehlo-legalize-to-linalg)",
+                "Lowering StableHLO IR -> Linalg IR",
+            )
 
         bytecode_buffer = io.BytesIO()
-        self.stablehlo_mlir.operation.write_bytecode(bytecode_buffer)
-        stablehlo_bytes = bytecode_buffer.getvalue()
+        self.mlir.operation.write_bytecode(bytecode_buffer)
+        mlir_bytes = bytecode_buffer.getvalue()
 
+        # Use graph_name as base cache key — deterministic across ranks for SPMD.
+        # Built from model_name + AOT compile ID.
         exec_handle = torch_neuronx._C.compile_graph(
-            base_cache_key, stablehlo_bytes, self.has_collectives
+            self.graph_name,
+            mlir_bytes,
+            self.has_collectives,
+            use_tensorizer=self.use_tensorizer,
         )
 
         # Track for MegaCache integration

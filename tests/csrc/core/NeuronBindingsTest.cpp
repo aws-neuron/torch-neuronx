@@ -5,6 +5,8 @@
 
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
+#include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
@@ -49,10 +51,8 @@ TEST_F(NeuronBindingsTest, CompileGraphReturnsCacheKey) {
   CompileOnlyKernelExecution kernel(base_cache_key, stablehlo_bytes, false);
   std::string cache_key = kernel.GetCacheKey();
 
-  // Cache key should contain the base key
-  EXPECT_TRUE(cache_key.find(base_cache_key) == 0);
-  // Cache key should have compiler extension appended
-  EXPECT_GT(cache_key.length(), base_cache_key.length());
+  // Cache key (in-memory) is the base key
+  EXPECT_EQ(cache_key, base_cache_key);
 }
 
 TEST_F(NeuronBindingsTest, CompileGraphWithCollectives) {

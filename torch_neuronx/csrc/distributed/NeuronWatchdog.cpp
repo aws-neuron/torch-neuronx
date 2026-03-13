@@ -80,7 +80,6 @@ void NeuronWatchdog::cleanupCompletedShelves() {
   std::vector<std::unique_ptr<TensorShelf>> localShelves;
   {
     std::unique_lock<std::mutex> lock(shelves_mutex_);
-    shelves_cv_.wait_for(lock, std::chrono::milliseconds(CLEANUP_WAIT_MILLIS));
     localShelves = std::move(shelvesToUnstash_);
     shelvesToUnstash_.clear();
   }

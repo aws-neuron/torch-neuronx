@@ -32,7 +32,7 @@ class DeviceCastMLIRImpl:
         kernel(src_prepared, out=dst_prepared, out_dtype=dst_prepared.dtype)
 
 
-def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor, non_blocking: bool) -> None:
+def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor) -> None:
     """Cast `src` into `dst` on Neuron device without CPU bounce for <=32-bit dtypes.
 
     - If dtypes match, performs a direct device-to-device copy.
@@ -49,7 +49,7 @@ def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor, non_block
 
     # Fast path: same dtype -> D2D copy
     if src.dtype == dst.dtype:
-        _C._nrt_copy_neuron_to_neuron_tensor(src, dst, non_blocking=non_blocking)
+        _C._nrt_copy_neuron_to_neuron_tensor(src, dst)
         return
 
     # Ensure contiguous inputs/outputs for kernel simplicity without redispatch

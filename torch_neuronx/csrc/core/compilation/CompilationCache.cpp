@@ -1,12 +1,20 @@
 #include "CompilationCache.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
-#include "torch_neuronx/csrc/core/cache/CacheUtils.h"
+#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
+#include "torch_neuronx/csrc/core/compilation/CompilerDebugUtils.h"
+#include "torch_neuronx/csrc/core/compilation/LocalCompilationBackend.h"
+#include "torch_neuronx/csrc/core/compilation/NeuronCompiler.h"
+#include "torch_neuronx/csrc/core/compilation/service/ServiceCompilationBackend.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 
 namespace at::neuron {
 
@@ -69,6 +77,45 @@ CompilationCache::CompilationCache() {
       persistent_cache_ = nullptr;
     }
   }
+
+  // Initialize compilation backend.
+  // NEURON_COMPILE_SERVICE=0 disables the service (uses local compilation).
+  // Default: service enabled.
+  const char* service_env = std::getenv("NEURON_COMPILE_SERVICE");
+  bool service_enabled = !(service_env && std::string(service_env) == "0");
+
+  if (service_enabled) {
+    std::string socket_name = "neuron_compile_service_" + std::to_string(getuid());
+    // When distributed is initialized, all ranks share MASTER_PORT so they
+    // connect to the same compilation service socket.
+    // When not distributed, use PID to give each process its own socket
+    // (uid is in the base name to separate users).
+    if (c10_neuron::is_distributed_initialized()) {
+      const char* master_port = std::getenv("MASTER_PORT");
+      if (master_port && master_port[0] != '\0') {
+        socket_name += "_";
+        socket_name += master_port;
+      } else {
+        socket_name += "_" + std::to_string(getpid());
+      }
+    } else {
+      socket_name += "_" + std::to_string(getpid());
+    }
+    std::string socket_path = "/tmp/" + socket_name + ".sock";
+    try {
+      backend_ = std::make_unique<ServiceCompilationBackend>(socket_path);
+    } catch (const std::exception& e) {
+      TORCH_NEURONX_WARN("Failed to connect to compilation service:", e.what(),
+                         "— falling back to local backend");
+      backend_ = std::make_unique<LocalCompilationBackend>();
+    }
+  } else {
+    backend_ = std::make_unique<LocalCompilationBackend>();
+  }
+  TORCH_NEURONX_DEBUG("CompilationCache backend:", backend_->GetName());
+
+  // Thread pool for parallel compilation via GetOrCompileNeffAsync.
+  compilation_pool_ = std::make_unique<CompilationThreadPool>();
 }
 
 std::vector<CompilationCache::CacheEntryInfo> CompilationCache::GetCacheEntries() const {
@@ -139,7 +186,8 @@ void CompilationCache::Clear() {
 }
 
 bool CompilationCache::CheckInMemoryCacheAndPending(
-    const std::string& cache_key, const CompilableKernelExecution& kernel_execution) {
+    const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution) {
+  const std::string& cache_key = key.GetKey();
   // Check for completed NEFF in in-memory cache.
   auto cache_it = cache_.find(cache_key);
   if (cache_it != cache_.end()) {
@@ -148,7 +196,7 @@ bool CompilationCache::CheckInMemoryCacheAndPending(
 
     // Fast-fail if this entry records a previous compilation failure.
     if (cached_entry->IsFailed()) {
-      ThrowCompilationError(cache_key, cached_entry->GetFailureMessage());
+      ThrowCompilationError(key, cached_entry->GetFailureMessage());
     }
 
     // Record in-memory cache hit and increment access statistics.
@@ -158,7 +206,7 @@ bool CompilationCache::CheckInMemoryCacheAndPending(
     // Create managed pointer and set on kernel execution.
     auto neff_ptr = CreateNeffBytesPtr(cached_entry->neff_bytes, cache_key);
     kernel_execution.SetCachedNeff(std::move(neff_ptr));
-    TORCH_NEURONX_DEBUG("In-memory cache hit", "key=", cache_key);
+    TORCH_NEURONX_DEBUG("In-memory cache hit: ", key.ToString());
     return true;
   }
 
@@ -174,64 +222,68 @@ bool CompilationCache::CheckInMemoryCacheAndPending(
 }
 
 bool CompilationCache::CheckCacheAndCoordinateWork(
-    const std::string& cache_key, const CompilableKernelExecution& kernel_execution,
-    uint32_t stream_id, std::string* persistent_cache_key) {
+    const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution,
+    uint32_t stream_id) {
+  const std::string& cache_key = key.GetKey();
   // First check in-memory cache and pending compilations with lock held.
   {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-    if (CheckInMemoryCacheAndPending(cache_key, kernel_execution)) {
+    if (CheckInMemoryCacheAndPending(key, kernel_execution)) {
       return true;
     }
     // Record in-memory cache miss.
     TORCH_NEURONX_COUNTER("CompilationCache.InMemoryMisses", 1);
-    TORCH_NEURONX_DEBUG("In memory cache miss", "key=", cache_key);
+    TORCH_NEURONX_DEBUG("In memory cache miss:", key.ToString());
+
+    // No persistent cache — register pending now while lock is held.
+    if (!persistent_cache_) {
+      auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
+      pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
+      return false;
+    }
   }  // Lock released before I/O persistent cache check.
 
-  // Check persistent cache (NFS/disk)
-  if (persistent_cache_) {
-    // Use pre-computed persistent cache key for Get operation.
-    auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
-    if (neff_bytes) {
-      TORCH_NEURONX_DEBUG("Persistent cache hit", "key=", cache_key,
-                          "persistent_key=", *persistent_cache_key, "size=", neff_bytes->size());
+  // Check persistent cache (NFS/disk) using the persistent key from CompilationCacheKey.
+  const std::string* persistent_cache_key = key.GetPersistentKey();
+  TORCH_CHECK(persistent_cache_key != nullptr,
+              "No HLO bytes available to compute persistent key. "
+              "Ensure HLO bytes are passed to CompilationCacheKey().");
+  auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
+  if (neff_bytes) {
+    TORCH_NEURONX_DEBUG("Persistent cache hit:", key.ToString());
 
-      // Record persistent cache hit.
-      TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
+    // Record persistent cache hit.
+    TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
 
-      // Create cache entry and store in memory cache.
-      auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), *persistent_cache_key,
-                                                      std::chrono::milliseconds(0));
-
-      {
-        std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-        cache_[cache_key] = cache_entry;
-
-        // Create managed pointer and set on kernel execution.
-        auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key);
-        kernel_execution.SetCachedNeff(std::move(neff_ptr));
-      }
-      // Check if eviction is needed after adding new entry.
-      CheckAndEvictIfNeeded();
-      return true;
-    }
-    // Persistent cache miss - record and check again if another thread added to memory cache.
+    // Create cache entry and store in memory cache.
+    auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), *persistent_cache_key,
+                                                    std::chrono::milliseconds(0));
 
     {
       std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-      TORCH_NEURONX_COUNTER("CompilationCache.PersistentMisses", 1);
-      TORCH_NEURONX_DEBUG("Persistent cache miss", "key=", cache_key,
-                          "persistent_key=", *persistent_cache_key);
-      // Double-check: another thread may have populated cache or registered compilation
-      // while we were checking persistent.
-      if (CheckInMemoryCacheAndPending(cache_key, kernel_execution)) {
-        return true;
-      }
+      cache_[cache_key] = cache_entry;
+
+      // Create managed pointer and set on kernel execution.
+      auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key);
+      kernel_execution.SetCachedNeff(std::move(neff_ptr));
     }
+    // Check if eviction is needed after adding new entry.
+    CheckAndEvictIfNeeded();
+    return true;
   }
 
-  // Full cache miss - register pending compilation and proceed to compile.
+  // Persistent cache miss — double-check and register pending.
   {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    TORCH_NEURONX_COUNTER("CompilationCache.PersistentMisses", 1);
+    TORCH_NEURONX_DEBUG("Persistent cache miss:", key.ToString());
+    // Double-check: another thread may have populated cache or registered compilation
+    // while we were checking persistent.
+    if (CheckInMemoryCacheAndPending(key, kernel_execution)) {
+      return true;
+    }
+
+    // Register pending compilation while still holding lock to prevent race.
     auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
     pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
     return false;
@@ -240,31 +292,90 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
 
 void CompilationCache::GetOrCompileNeff(const CompilableKernelExecution& kernel_execution,
                                         uint32_t stream_id) {
-  const std::string& cache_key = kernel_execution.GetCacheKey();
-
-  // Compute persistent cache key upfront if persistent caching is enabled.
-  // This key is reused for both Get and Put operations.
-  std::string* persistent_cache_key_ptr = nullptr;
-  std::string persistent_cache_key;
-  if (persistent_cache_) {
-    persistent_cache_key =
-        cache_utils::MakePersistentCacheKey(cache_key, kernel_execution.GetHloBytes());
-    persistent_cache_key_ptr = &persistent_cache_key;
-  }
+  const auto& key = kernel_execution.GetCompilationCacheKey();
 
   // Check caches (memory + persistent) and coordinate work scheduling.
-  if (CheckCacheAndCoordinateWork(cache_key, kernel_execution, stream_id,
-                                  persistent_cache_key_ptr)) {
+  if (CheckCacheAndCoordinateWork(key, kernel_execution, stream_id)) {
     if (kernel_execution.HasCachedNeff()) {
       return;  // Cache hit - NEFF already set.
     }
     // Another thread is compiling - wait for completion.
-    WaitForPendingCompilation(cache_key, kernel_execution, stream_id);
+    WaitForPendingCompilation(key, kernel_execution, stream_id);
     return;
   }
 
   // Cache miss (both memory and persistent) - this thread should compile.
-  Compile(cache_key, kernel_execution, stream_id, persistent_cache_key_ptr);
+  Compile(key, kernel_execution, stream_id);
+}
+
+void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& kernel_execution,
+                                             uint32_t stream_id,
+                                             std::function<void(bool success)> callback) {
+  const auto& key = kernel_execution.GetCompilationCacheKey();
+  const std::string& cache_key = key.GetKey();
+
+  // Check caches (memory + persistent) and coordinate work scheduling.
+  if (CheckCacheAndCoordinateWork(key, kernel_execution, stream_id)) {
+    if (kernel_execution.HasCachedNeff()) {
+      // Cache hit — invoke callback synchronously.
+      callback(true);
+      return;
+    }
+    // Another thread is compiling — get the future before it's cleaned up.
+    std::shared_future<std::shared_ptr<CacheEntry>> compilation_future;
+    {
+      std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+      auto pending_it = pending_compilations_.find(cache_key);
+      if (pending_it != pending_compilations_.end()) {
+        compilation_future = pending_it->second.future;
+      }
+    }
+
+    if (!compilation_future.valid()) {
+      std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+      auto it = cache_.find(cache_key);
+      if (it != cache_.end() && it->second) {
+        auto neff_ptr = CreateNeffBytesPtr(it->second->neff_bytes, cache_key);
+        kernel_execution.SetCachedNeff(std::move(neff_ptr));
+        callback(true);
+        return;
+      }
+      callback(false);
+      return;
+    }
+
+    // Submit wait to thread pool (don't block compilation worker).
+    std::string cache_key_copy = cache_key;
+    compilation_pool_->Submit([this, cache_key_copy, &kernel_execution,
+                               compilation_future = std::move(compilation_future),
+                               callback = std::move(callback)]() {
+      try {
+        auto cache_entry = compilation_future.get();
+        auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key_copy);
+        kernel_execution.SetCachedNeff(std::move(neff_ptr));
+        callback(true);
+      } catch (...) {
+        callback(false);
+      }
+    });
+    return;
+  }
+
+  // Cache miss — submit compilation to thread pool.
+  CompilationCacheKey key_copy = key;
+  compilation_pool_->Submit(
+      [this, key_copy, &kernel_execution, stream_id, callback = std::move(callback)]() {
+        try {
+          Compile(key_copy, kernel_execution, stream_id);
+          callback(true);
+        } catch (...) {
+          callback(false);
+        }
+      });
+}
+
+std::string CompilationCache::GetBackendName() const {
+  return backend_ ? backend_->GetName() : "none";
 }
 
 size_t CompilationCache::GetMemoryUsageBytes() const {
@@ -433,11 +544,12 @@ void CompilationCache::MarkEntryInactive(const std::string& cache_key) {
                       "total_active=", active_cache_keys_.size());
 }
 
-void CompilationCache::WaitForPendingCompilation(const std::string& cache_key,
+void CompilationCache::WaitForPendingCompilation(const CompilationCacheKey& key,
                                                  const CompilableKernelExecution& kernel_execution,
                                                  uint32_t stream_id) {
+  const std::string& cache_key = key.GetKey();
   TORCH_NEURONX_DEBUG("Waiting for another thread's compilation", "stream_id=", stream_id,
-                      "cache_key=", cache_key);
+                      "CompilationCacheKey=", key.ToString());
 
   // Retrieve the shared future for the pending compilation.
   std::shared_future<std::shared_ptr<CacheEntry>> compilation_future;
@@ -446,33 +558,34 @@ void CompilationCache::WaitForPendingCompilation(const std::string& cache_key,
     auto pending_it = pending_compilations_.find(cache_key);
     if (pending_it != pending_compilations_.end()) {
       compilation_future = pending_it->second.future;
-      TORCH_NEURONX_DEBUG("Found pending compilation to wait for", "cache_key=", cache_key);
+      TORCH_NEURONX_DEBUG("Found pending compilation to wait for", key.ToString());
     } else {
-      TORCH_NEURONX_DEBUG("No pending compilation found", "cache_key=", cache_key);
+      TORCH_NEURONX_DEBUG("No pending compilation found", key.ToString());
     }
   }
 
   if (!compilation_future.valid()) {
-    ThrowCompilationError(cache_key, "No pending compilation found");
+    ThrowCompilationError(key, "No pending compilation found");
   }
 
   try {
     TORCH_NEURONX_DEBUG("Waiting for compilation to complete", "stream_id=", stream_id,
-                        "cache_key=", cache_key);
+                        "CompilationCacheKey=", key.ToString());
     auto cache_entry = compilation_future.get();
     auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key);
     kernel_execution.SetCachedNeff(std::move(neff_ptr));
 
     TORCH_NEURONX_DEBUG("Compilation wait completed successfully", "stream_id=", stream_id,
-                        "cache_key=", cache_key);
+                        "CompilationCacheKey=", key.ToString());
   } catch (const std::exception& e) {
-    ThrowCompilationError(cache_key, "Pending compilation failed: " + std::string(e.what()));
+    ThrowCompilationError(key, "Pending compilation failed: " + std::string(e.what()));
   }
 }
 
-void CompilationCache::Compile(const std::string& cache_key,
+void CompilationCache::Compile(const CompilationCacheKey& key,
                                const CompilableKernelExecution& kernel_execution,
-                               uint32_t stream_id, std::string* persistent_cache_key) {
+                               uint32_t stream_id) {
+  const std::string& cache_key = key.GetKey();
   // Retrieve the compilation promise for this cache key.
   std::shared_ptr<std::promise<std::shared_ptr<CacheEntry>>> compilation_promise;
   {
@@ -484,51 +597,46 @@ void CompilationCache::Compile(const std::string& cache_key,
   }
 
   if (!compilation_promise) {
-    ThrowCompilationError(cache_key, "No pending compilation promise found");
+    ThrowCompilationError(key, "No pending compilation promise found");
   }
 
   try {
-    TORCH_NEURONX_DEBUG("Compiling IR to NEFF", "stream_id=", stream_id, "cache_key=", cache_key);
+    TORCH_NEURONX_DEBUG("Compiling IR to NEFF", "stream_id=", stream_id,
+                        "CompilationCacheKey=", key.ToString());
 
-    auto compilation_result = CompileAndCache(kernel_execution, cache_key, persistent_cache_key);
+    auto compilation_result = CompileAndCache(kernel_execution, key);
 
     // Notify all waiting threads that compilation is complete.
     compilation_promise->set_value(compilation_result);
-    CleanupPendingCompilation(cache_key);
+    CleanupPendingCompilation(key);
 
     // Set cached NEFF for the current execution context.
     auto neff_ptr = CreateNeffBytesPtr(compilation_result->neff_bytes, cache_key);
     kernel_execution.SetCachedNeff(std::move(neff_ptr));
 
-    TORCH_NEURONX_DEBUG("IR compilation complete", "cache_key=", cache_key);
+    TORCH_NEURONX_DEBUG("IR compilation complete:", key.ToString());
 
   } catch (const std::exception& e) {
-    HandleCompilationFailure(cache_key, compilation_promise, e.what());
+    HandleCompilationFailure(key, compilation_promise, e.what());
     throw;
   }
 }
 
 std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
-    const CompilableKernelExecution& kernel_execution, const std::string& cache_key,
-    std::string* persistent_cache_key) {
-  // Use the persistent cache key for the file lock to avoid collisions.
-  // If persistent_cache_key is null (persistent caching disabled), compute it locally.
-  std::string compilation_cache_key;
-  if (persistent_cache_key == nullptr) {
-    const auto& hlo_bytes = kernel_execution.GetHloBytes();
-    compilation_cache_key = cache_utils::MakePersistentCacheKey(cache_key, hlo_bytes);
-    persistent_cache_key = &compilation_cache_key;
-  }
+    const CompilableKernelExecution& kernel_execution, const CompilationCacheKey& key) {
+  const std::string& cache_key = key.GetKey();
+  // Get persistent key for file lock and cache storage.
+  const std::string* persistent_cache_key = key.GetPersistentKey();
 
   std::filesystem::path lock_path = GetLockPath(*persistent_cache_key);
 
-  TORCH_NEURONX_DEBUG("Acquiring compilation lock", "key=", cache_key,
+  TORCH_NEURONX_DEBUG("Acquiring compilation lock:", "CompilationCacheKey=", key.ToString(),
                       "lock_path=", lock_path.string());
 
   // Acquire file lock to coordinate compilation across processes.
   FileLockGuard lock_guard(lock_path);
 
-  TORCH_NEURONX_DEBUG("Compilation lock acquired", "key=", cache_key);
+  TORCH_NEURONX_DEBUG("Compilation lock acquired:", key.ToString());
 
   // Double-check persistent cache after acquiring lock.
   // Another process may have completed compilation while waiting for lock.
@@ -536,8 +644,7 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
     auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
     // Persistent cache hit - entry populated while waiting for compilation lock.
     if (neff_bytes) {
-      TORCH_NEURONX_DEBUG("Persistent cache hit after lock acquisition", "key=", cache_key,
-                          "persistent_key=", *persistent_cache_key, "size=", neff_bytes->size());
+      TORCH_NEURONX_DEBUG("Persistent cache hit after lock acquisition:", key.ToString());
 
       // Record persistent cache hit.
       TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
@@ -561,8 +668,25 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
 
   auto start_time = std::chrono::steady_clock::now();
 
-  // Perform the actual IR to NEFF compilation.
-  auto neff_bytes = kernel_execution.CompileToNeff();
+  // Dump IR details if requested (before compilation)
+  std::string ir_type = (!kernel_execution.HasCollectives() && NeuronCompiler::IsStableHLOEnabled())
+                            ? "StableHLO"
+                            : "XLA";
+  if (debug::IsDumpEnabled()) {
+    CompilationConfig config{.framework = "XLA",
+                             .platform_target = utils::GetPlatformTarget(),
+                             .logical_neuron_cores = utils::GetLogicalNeuronCores(),
+                             .optimization_level = kernel_execution.GetOptimizationLevel(),
+                             .additional_args = kernel_execution.GetAdditionalArgs()};
+    debug::DumpIRDetails(kernel_execution.GetHloBytes(), config, ir_type, cache_key,
+                         "CompilableKernelExecution");
+  }
+
+  // Compile via backend: local (in-process neuronx-cc) or service (remote RPC).
+  auto neff_bytes = backend_->Compile(
+      kernel_execution.GetHloBytes(), *persistent_cache_key, ir_type,
+      kernel_execution.GetOptimizationLevel(), kernel_execution.GetAdditionalArgs(),
+      [&kernel_execution]() -> std::vector<uint8_t> { return kernel_execution.CompileToNeff(); });
 
   auto end_time = std::chrono::steady_clock::now();
   auto compilation_time =
@@ -587,9 +711,7 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   // Use persistent_cache_key.
   if (persistent_cache_) {
     if (persistent_cache_->Put(*persistent_cache_key, cache_entry->neff_bytes)) {
-      TORCH_NEURONX_DEBUG("Stored to persistent cache", "key=", cache_key,
-                          "persistent_key=", *persistent_cache_key,
-                          "size=", cache_entry->neff_bytes.size());
+      TORCH_NEURONX_DEBUG("Stored to persistent cache", key.ToString());
     }
   }
 
@@ -600,12 +722,14 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
 }
 
 void CompilationCache::HandleCompilationFailure(
-    const std::string& cache_key,
+    const CompilationCacheKey& key,
     std::shared_ptr<std::promise<std::shared_ptr<CacheEntry>>> promise,
     const std::string& error_message) {
+  const std::string& cache_key = key.GetKey();
   std::string full_error_msg =
       "Compilation failed for cache key '" + cache_key + "': " + error_message;
-  TORCH_NEURONX_DEBUG("Compilation error", "cache_key=", cache_key, "error=", error_message);
+  TORCH_NEURONX_DEBUG("Compilation error", "CompilationCacheKey=", key.ToString(),
+                      "error=", error_message);
 
   // Cache the failed entry so subsequent lookups fail fast.
   {
@@ -619,12 +743,12 @@ void CompilationCache::HandleCompilationFailure(
     promise->set_exception(std::make_exception_ptr(std::runtime_error(full_error_msg)));
   }
 
-  CleanupPendingCompilation(cache_key);
+  CleanupPendingCompilation(key);
 }
 
-void CompilationCache::CleanupPendingCompilation(const std::string& cache_key) {
+void CompilationCache::CleanupPendingCompilation(const CompilationCacheKey& key) {
   std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-  pending_compilations_.erase(cache_key);
+  pending_compilations_.erase(key.GetKey());
 }
 
 std::filesystem::path CompilationCache::GetLockPath(const std::string& key) const {
@@ -633,10 +757,12 @@ std::filesystem::path CompilationCache::GetLockPath(const std::string& key) cons
   return local_cache_dir_ / "locks" / (key + ".lock");
 }
 
-[[noreturn]] void CompilationCache::ThrowCompilationError(const std::string& cache_key,
+[[noreturn]] void CompilationCache::ThrowCompilationError(const CompilationCacheKey& key,
                                                           const std::string& message) {
-  TORCH_NEURONX_ERROR("Compilation error", "cache_key=", cache_key, "error=", message);
-  throw std::runtime_error("Compilation failed for cache key '" + cache_key + "': " + message);
+  TORCH_NEURONX_ERROR("Compilation error", "CompilationCacheKey=", key.ToString(),
+                      "error=", message);
+  throw std::runtime_error("Compilation failed for CompilationCacheKey '" + key.ToString() +
+                           "': " + message);
 }
 
 }  // namespace at::neuron

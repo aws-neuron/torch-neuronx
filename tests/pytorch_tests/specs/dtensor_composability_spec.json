@@ -20,7 +20,7 @@
       "file": "distributed/_composable/test_composability/test_2d_composability.py",
       "xfail": [
         {
-          "reason": "ValueError: Invalid device specification: neuron:2",
+          "reason": "_pickle.UnpicklingError: Weights only load failed.",
           "tests": [
             "test_2d_load_state_dict_is_even_sharded_model_True",
             "test_2d_load_state_dict_is_even_sharded_model_False"

@@ -12,8 +12,6 @@
           "reason": "Multiple failures - CUDA driver missing, tensor comparison mismatches, device assignment errors, unsupported operations",
           "tests": [
             "test_train_parity_with_activation_checkpointing",
-            "test_train_mixed_requires_grad_across_groups",
-            "test_train_mixed_requires_grad_per_group",
             "test_3d_mlp_with_nd_mesh",
             "test_gradient_accumulation",
             "test_param_registration_after_backward",
@@ -22,6 +20,9 @@
           ]
         }
       ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_frozen.py"
     },
     {
       "file": "distributed/_composable/fsdp/test_fully_shard_state.py",
@@ -102,7 +103,7 @@
       "file": "distributed/_composable/fsdp/test_fully_shard_init.py",
       "skip_tests": [
         {
-          "reason": "Runnning tests separately in test_fully_shard_meta_device_init.py",
+          "reason": "Running tests separately in test_fully_shard_meta_device_init.py",
           "tests": [
             "test_1d_process_group_init",
             "test_2d_process_group_init"
@@ -162,7 +163,7 @@
       "file": "distributed/_composable/fsdp/test_fully_shard_comm.py",
       "skip_tests": [
         {
-          "reason": "NCCL log comparision does not apply to Neuron",
+          "reason": "NCCL log comparison does not apply to Neuron",
           "tests": [
             "test_fully_shard_force_sum_both_reductions",
             "test_fully_shard_force_sum_reduce_scatter",
@@ -183,8 +184,7 @@
             "test_fully_shard_communication_count",
             "test_all_gather_fp32",
             "test_manual_reshard_with_reshard_after_forward_false",
-            "test_set_reshard_after_forward",
-            "test_fully_shard_alloc_from_pg"
+            "test_set_reshard_after_forward"
           ]
         },
         {
@@ -211,16 +211,6 @@
       "sanity_methods": [
         "test_nontensor_activations",
         "test_unused_forward_module"
-      ],
-      "xfail": [
-        {
-          "reason": "Autograd and parameter management failures",
-          "tests": [
-            "test_manual_reshard_with_reshard_after_forward_false",
-            "test_set_reshard_after_forward",
-            "test_unshard_without_lazy_init"
-          ]
-        }
       ]
     }
   ]

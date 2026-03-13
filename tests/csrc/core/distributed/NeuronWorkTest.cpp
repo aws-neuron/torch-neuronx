@@ -415,12 +415,6 @@ TEST_F(NeuronWorkTest, HandleExceptionNoopWithoutException) {
   EXPECT_NO_THROW(work->handleException());
 }
 
-// Test markFutureCompleteIfNeeded with no future
-TEST_F(NeuronWorkTest, MarkFutureCompleteIfNeededNoopWithoutFuture) {
-  auto work = createWork();
-  EXPECT_NO_THROW(work->markFutureCompleteIfNeeded());
-}
-
 // Test concurrent detach and unstash is safe (regression test for shelf race condition)
 // Previously, synchronize() calling unstashTensors() could race with watchdog's
 // detachStashedTensorShelf(), causing use-after-free on the shelf's mutex (SIGSEGV).

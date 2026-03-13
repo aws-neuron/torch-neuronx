@@ -92,9 +92,12 @@ class ContiguousBroadcastImpl(OperationImplementation):
         if self_tensor.is_complex():
             return False
 
-        # Only handle contiguous or preserve formats
-        if memory_format is not None and (
-            memory_format != torch.contiguous_format and memory_format != torch.preserve_format
+        # Only handle contiguous-targeted formats
+        if memory_format is not None and memory_format not in (
+            torch.contiguous_format,
+            torch.preserve_format,
+            torch.channels_last,
+            torch.channels_last_3d,
         ):
             return False
 

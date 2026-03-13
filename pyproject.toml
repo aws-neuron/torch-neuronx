@@ -52,6 +52,11 @@ name = "pytorch"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cpu"
+explicit = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

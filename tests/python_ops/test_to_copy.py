@@ -210,10 +210,11 @@ def test_to_copy_neuron_to_neuron_dtype_combinations(src_dtype, dst_dtype):
 
     # Verify MLIR rejects bool, float64, and int32
     impl = ToCopyMLIRImpl()
-    if src_dtype in [torch.bool, torch.float64, torch.int32] or dst_dtype in [
+    if src_dtype in [torch.bool, torch.float64, torch.int32, torch.int64] or dst_dtype in [
         torch.bool,
         torch.float64,
         torch.int32,
+        torch.int64,
     ]:
         assert not impl.can_handle(src, dtype=dst_dtype, device="neuron")
 

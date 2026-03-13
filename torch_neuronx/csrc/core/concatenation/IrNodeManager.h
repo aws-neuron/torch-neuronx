@@ -490,6 +490,11 @@ class IrNodeManager {
   /// Controlled by TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE environment variable
   /// Default: enabled. Set TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE=0 to disable
   bool skip_intermediate_enabled_ = true;
+
+  /// Feature flag for input-output overlap checking
+  /// Controlled by TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR environment variable
+  /// Default: enabled. Set TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR=0 to disable
+  bool check_overlap_enabled_ = true;
 };
 
 }  // namespace torch_neuronx

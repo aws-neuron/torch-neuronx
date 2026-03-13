@@ -93,9 +93,8 @@ class BaseOutputHandler:
             dst_dev = out.device.type
 
             # Neuron -> Neuron: use device-side policy (handles ≤32-bit cast and 64-bit bounce)
-            # In case of D2D without CPU bounces, copies are not blocking.
             if src_dev == "neuron" and dst_dev == "neuron":
-                write_neuron_to_neuron(out, result, non_blocking=True)
+                write_neuron_to_neuron(out, result)
                 return
 
             # CPU -> Neuron: perform CPU-side cast to match out.dtype, then raw copy

@@ -110,8 +110,11 @@ class ContiguousSliceImpl(OperationImplementation):
         if self_tensor.is_complex():
             return False
 
-        if memory_format is not None and (
-            memory_format != torch.contiguous_format and memory_format != torch.preserve_format
+        if memory_format is not None and memory_format not in (
+            torch.contiguous_format,
+            torch.preserve_format,
+            torch.channels_last,
+            torch.channels_last_3d,
         ):
             return False
 

@@ -15,6 +15,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/concatenation/FunctionPruneUtils.h"
 #include "torch_neuronx/csrc/core/concatenation/OpConcatUtils.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 
 namespace torch_neuronx {
 
@@ -30,6 +31,14 @@ IrNodeManager::IrNodeManager() : context(std::make_unique<mlir::MLIRContext>()) 
   if (skip_intermediate_env && std::string(skip_intermediate_env) == "0") {
     skip_intermediate_enabled_ = false;
     TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE=0 (disabled)");
+  }
+
+  // Load overlap check flag from environment variable
+  // Default: enabled. Set TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR=0 to disable
+  const char* overlap_env = std::getenv("TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR");
+  if (overlap_env && std::string(overlap_env) == "0") {
+    check_overlap_enabled_ = false;
+    TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR=0 (disabled)");
   }
 }
 
@@ -85,6 +94,7 @@ std::unique_ptr<StableHloNode> IrNodeManager::CreateConcatNode(StableHloNode* no
 
   if (auto concat_op_it = ir_resource_cache_.find(cache_key);
       concat_op_it != ir_resource_cache_.end()) {
+    TORCH_NEURONX_COUNTER("Concatenation.CacheHits", 1);
     TORCH_NEURONX_DEBUG("Found cached concatenation result - returning existing node",
                         "cache_key:", cache_key, "cached_node_op:", concat_op_it->second->op_name);
     auto ir_resource = concat_op_it->second.get();
@@ -152,6 +162,7 @@ std::unique_ptr<StableHloNode> IrNodeManager::CreateConcatNode(StableHloNode* no
     return result_node;
   }
 
+  TORCH_NEURONX_COUNTER("Concatenation.CacheMisses", 1);
   TORCH_NEURONX_DEBUG("cache miss", "cache_key:", cache_key);
 
   std::unique_ptr<StableHloNode> concat_node;
@@ -188,13 +199,76 @@ std::unique_ptr<StableHloNode> IrNodeManager::CreateConcatNode(StableHloNode* no
   }
 }
 
+/**
+ * @brief Generate cache key for concatenated IR nodes with aliasing information
+ *
+ * Creates a unique cache key by combining node cache keys and aliasing patterns.
+ * Different aliasing patterns produce different cache keys to ensure correct
+ * cached module reuse.
+ *
+ * @param node1 First IR node (executes before node2)
+ * @param node2 Second IR node (executes after node1)
+ * @return Cache key format: "<node1_key>|<node2_key>|alias:<aliases>,"
+ *         where aliases are: "1i<idx>->1o<idx>," (node1 self-aliasing),
+ *                           "2i<idx>->2o<idx>," (node2 self-aliasing),
+ *                           "1i<idx>->2o<idx>," (cross-node aliasing)
+ *
+ * Example: "key1|key2|alias:1i0->1o0,2i1->2o1,1i0->2o1,"
+ */
 std::string IrNodeManager::GenerateConcatenationCacheKey(const IrNode* node1, const IrNode* node2) {
   if (!node1 || !node2) {
     TORCH_NEURONX_ERROR("generate_concatenation_cache_key called with null nodes");
     throw std::invalid_argument("Both nodes must be non-null to generate cache key");
   }
+
+  // Base key: concatenate individual node cache keys
   std::string cache_key = node1->cache_key + "|" + node2->cache_key;
-  TORCH_NEURONX_DEBUG("Generated cache key:", cache_key);
+
+  // Append aliasing information to distinguish different memory sharing patterns
+  std::string alias_suffix = "|alias:";
+
+  // Node1 self-aliasing: detect when node1's input and output share same address
+  // Format: "1i<input_idx>->1o<output_idx>,"
+  for (size_t out_idx = 0; out_idx < node1->outputs.size(); ++out_idx) {
+    void* out_addr = node1->outputs[out_idx];
+    if (!out_addr) continue;
+    for (size_t in_idx = 0; in_idx < node1->inputs.size(); ++in_idx) {
+      if (node1->inputs[in_idx] == out_addr) {
+        alias_suffix += "1i" + std::to_string(in_idx) + "->1o" + std::to_string(out_idx) + ",";
+      }
+    }
+  }
+
+  // Node2 self-aliasing: detect when node2's input and output share same address
+  // Format: "2i<input_idx>->2o<output_idx>,"
+  for (size_t out_idx = 0; out_idx < node2->outputs.size(); ++out_idx) {
+    void* out_addr = node2->outputs[out_idx];
+    if (!out_addr) continue;
+    for (size_t in_idx = 0; in_idx < node2->inputs.size(); ++in_idx) {
+      if (node2->inputs[in_idx] == out_addr) {
+        alias_suffix += "2i" + std::to_string(in_idx) + "->2o" + std::to_string(out_idx) + ",";
+      }
+    }
+  }
+
+  // Cross-node aliasing: detect when node1's input shares address with node2's output
+  // Format: "1i<input_idx>->2o<output_idx>,"
+  // Note: Only check node1 input -> node2 output since if node1 output has the same address
+  // with node2 input, it's either node2 depends on node1, in which case the node2 input won't
+  // appear as top-level module input, or node1's output is deallocated, which will be removed from
+  // top-level module output by skip intermediate handling.
+  for (size_t out_idx = 0; out_idx < node2->outputs.size(); ++out_idx) {
+    void* out_addr = node2->outputs[out_idx];
+    if (!out_addr) continue;
+    for (size_t in_idx = 0; in_idx < node1->inputs.size(); ++in_idx) {
+      if (node1->inputs[in_idx] == out_addr) {
+        alias_suffix += "1i" + std::to_string(in_idx) + "->2o" + std::to_string(out_idx) + ",";
+      }
+    }
+  }
+
+  cache_key += alias_suffix;
+  TORCH_NEURONX_DEBUG("Generated cache key with aliasing:", cache_key);
   return cache_key;
 }
 
@@ -271,6 +345,7 @@ std::unique_ptr<IrNode> IrNodeManager::CreateNodeFromOperationContext(
                       "has_collectives:", xla_kernel->HasCollectives());
 
   if (auto node = ir_resource_cache_.find(cache_key); node != ir_resource_cache_.end()) {
+    TORCH_NEURONX_COUNTER("Concatenation.CacheHits", 1);
     TORCH_NEURONX_DEBUG("Found existing IrNode in cache - returning cached instance",
                         "cache_key:", cache_key, "cached_op:", node->second->op_name);
     auto ir_resource = node->second.get();
@@ -578,6 +653,129 @@ bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address
   return true;
 }
 
+/**
+ * @brief Validate that aliasing attributes match actual input-output address relationships
+ *
+ * Checks if the concatenated StableHLO module has correct aliasing attributes when
+ * inputs and outputs share the same address.
+ *
+ * TODO: Move to the util class for debugging purpose
+ */
+static void validateAliasingAttributes(IrNode* node) {
+  static bool debug_enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_DEBUG_CONCATENATION");
+    return env && std::string(env) == "1";
+  }();
+  if (!debug_enabled) return;
+
+  if (!node) return;
+
+  auto* stablehlo_node = dynamic_cast<StableHloNode*>(node);
+  if (!stablehlo_node || !stablehlo_node->module) return;
+
+  // Find input-output address matches
+  std::vector<std::pair<size_t, size_t>> expected_aliases;  // (input_idx, output_idx)
+  for (size_t out_idx = 0; out_idx < node->outputs.size(); ++out_idx) {
+    void* out_addr = node->outputs[out_idx];
+    if (!out_addr) continue;
+
+    for (size_t in_idx = 0; in_idx < node->inputs.size(); ++in_idx) {
+      void* in_addr = node->inputs[in_idx];
+      if (in_addr == out_addr) {
+        expected_aliases.emplace_back(in_idx, out_idx);
+      }
+    }
+  }
+
+  if (expected_aliases.empty()) {
+    return;  // No aliasing expected, validation passes
+  }
+
+  // Parse aliasing attributes from module
+  auto& module = *(stablehlo_node->module);
+  if (!module) return;
+
+  auto aliasAttr = (*module)->getAttr("mhlo.input_output_alias");
+
+  if (!aliasAttr) {
+    TORCH_NEURONX_ERROR(
+        "ALIASING VALIDATION FAILED: Expected aliasing but no mhlo.input_output_alias attribute "
+        "found");
+    TORCH_NEURONX_ERROR("  Expected ", expected_aliases.size(), " alias relationships:");
+    for (const auto& [in_idx, out_idx] : expected_aliases) {
+      TORCH_NEURONX_ERROR("    input[", in_idx, "] -> output[", out_idx,
+                          "] addr=", node->inputs[in_idx]);
+    }
+    TORCH_NEURONX_ERROR("  StableHLO module:");
+    std::string module_str;
+    llvm::raw_string_ostream stream(module_str);
+    module->print(stream);
+    TORCH_NEURONX_ERROR(stream.str());
+    return;
+  }
+
+  // Parse actual aliasing pairs from attribute
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  if (!arrayAttr) {
+    TORCH_NEURONX_ERROR("ALIASING VALIDATION FAILED: mhlo.input_output_alias is not an ArrayAttr");
+    return;
+  }
+
+  std::set<std::pair<size_t, size_t>> actual_aliases;
+  for (auto attr : arrayAttr) {
+    auto dictAttr = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+    if (!dictAttr) continue;
+
+    // Get "alias" inner dict and "output_index" array
+    auto aliasInnerAttr = dictAttr.get("alias");
+    auto outputIndexAttr = dictAttr.get("output_index");
+
+    if (!aliasInnerAttr || !outputIndexAttr) continue;
+
+    auto aliasInnerDict = mlir::dyn_cast<mlir::DictionaryAttr>(aliasInnerAttr);
+    auto outputIndexArray = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(outputIndexAttr);
+
+    if (!aliasInnerDict || !outputIndexArray) continue;
+
+    // Get parameter_index from inner dict
+    auto paramNumberAttr = aliasInnerDict.get("parameter_number");
+    if (!paramNumberAttr) continue;
+
+    auto paramNumberInt = mlir::dyn_cast<mlir::IntegerAttr>(paramNumberAttr);
+    if (!paramNumberInt) continue;
+
+    size_t input_idx = paramNumberInt.getInt();
+    size_t output_idx = outputIndexArray[0];
+
+    actual_aliases.insert({input_idx, output_idx});
+  }
+
+  // Compare expected vs actual
+  std::set<std::pair<size_t, size_t>> expected_set(expected_aliases.begin(),
+                                                   expected_aliases.end());
+
+  if (actual_aliases != expected_set) {
+    TORCH_NEURONX_ERROR("ALIASING VALIDATION FAILED: Aliasing pairs mismatch");
+    TORCH_NEURONX_ERROR("  Expected ", expected_set.size(), " aliases:");
+    for (const auto& [in_idx, out_idx] : expected_set) {
+      TORCH_NEURONX_ERROR("    input[", in_idx, "] -> output[", out_idx,
+                          "] addr=", node->inputs[in_idx]);
+    }
+    TORCH_NEURONX_ERROR("  Actual ", actual_aliases.size(), " aliases:");
+    for (const auto& [in_idx, out_idx] : actual_aliases) {
+      TORCH_NEURONX_ERROR("    input[", in_idx, "] -> output[", out_idx, "]");
+    }
+    TORCH_NEURONX_ERROR("  StableHLO module:");
+    std::string module_str;
+    llvm::raw_string_ostream stream(module_str);
+    module->print(stream);
+    TORCH_NEURONX_ERROR(stream.str());
+    return;
+  }
+
+  TORCH_NEURONX_DEBUG("Aliasing validation PASSED: ", expected_aliases.size(), " aliases match");
+}
+
 void IrNodeManager::ProcessIrNode(IrNode* node, ConcatState& state) {
   if (node->ir_type == IrNodeType::ALLOC_HINT) {
     // ALLOC: Remove address from pruned set (it's been reallocated)
@@ -656,15 +854,47 @@ IrConcatResult IrNodeManager::ConcatAll(const std::list<IrNode*>& input_ir_list)
 
   // Build result
   if (state.merged_owned) {
-    // We have a concatenated result
-    res.compilable_irs.push_back(state.merged);
-    for (auto* orig : state.original_hlo_nodes) {
-      res.concated_ir_to_original_irs[state.merged].push_back(orig);
+    // Check for input-output overlap (controlled by member variable)
+    bool has_overlap = false;
+    if (check_overlap_enabled_) {
+      std::unordered_set<void*> input_addrs;
+      std::unordered_set<void*> output_addrs;
+
+      for (void* addr : state.merged->inputs) {
+        if (addr) input_addrs.insert(addr);
+      }
+
+      for (void* addr : state.merged->outputs) {
+        if (addr) output_addrs.insert(addr);
+      }
+
+      for (void* addr : output_addrs) {
+        if (input_addrs.count(addr)) {
+          TORCH_NEURONX_DEBUG("Concatenated IR has input-output address overlap, addr=", addr);
+          has_overlap = true;
+        }
+      }
     }
-    res.concat_ir_list.push_back(std::move(state.merged_owned));
-    TORCH_NEURONX_DEBUG("ConcatAll completed with concatenation",
-                        "compilable_irs:", res.compilable_irs.size(),
-                        "original_hlo_count:", state.original_hlo_nodes.size());
+
+    if (has_overlap) {
+      TORCH_NEURONX_DEBUG("Discarding concatenated IR due to input-output overlap. op names: ",
+                          state.merged->op_name);
+      res.compilable_irs.insert(res.compilable_irs.end(), state.original_hlo_nodes.begin(),
+                                state.original_hlo_nodes.end());
+    } else {
+      // We have a concatenated result
+      res.compilable_irs.push_back(state.merged);
+      for (auto* orig : state.original_hlo_nodes) {
+        res.concated_ir_to_original_irs[state.merged].push_back(orig);
+      }
+      res.concat_ir_list.push_back(std::move(state.merged_owned));
+      TORCH_NEURONX_DEBUG("ConcatAll completed with concatenation",
+                          "compilable_irs:", res.compilable_irs.size(),
+                          "original_hlo_count:", state.original_hlo_nodes.size());
+
+      validateAliasingAttributes(state.merged);
+    }
+
   } else if (state.merged) {
     // Single HLO node, no concatenation occurred
     res.compilable_irs.push_back(state.merged);

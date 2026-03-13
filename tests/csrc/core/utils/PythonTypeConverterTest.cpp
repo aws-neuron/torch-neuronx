@@ -2,6 +2,7 @@
 #include <pybind11/embed.h>
 #include <torch/torch.h>
 
+#include "nrt/nrt.h"
 #include "torch_neuronx/csrc/core/utils/PythonTypeConverter.h"
 
 namespace py = pybind11;
@@ -25,7 +26,7 @@ class PythonTypeConverterTest : public ::testing::Test {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_None) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   auto result =
       at::neuron::utils::ConvertToInputMetadata(py::none(), tensor_metadata, tensor_data_ptrs);
@@ -38,7 +39,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_None) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Bool) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   auto result =
       at::neuron::utils::ConvertToInputMetadata(py::bool_(true), tensor_metadata, tensor_data_ptrs);
@@ -51,7 +52,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Bool) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Int) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   auto result =
       at::neuron::utils::ConvertToInputMetadata(py::int_(42), tensor_metadata, tensor_data_ptrs);
@@ -63,7 +64,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Int) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Double) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   auto result = at::neuron::utils::ConvertToInputMetadata(py::float_(3.14), tensor_metadata,
                                                           tensor_data_ptrs);
@@ -75,7 +76,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Double) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_String) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   auto result = at::neuron::utils::ConvertToInputMetadata(py::str("hello"), tensor_metadata,
                                                           tensor_data_ptrs);
@@ -87,7 +88,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_String) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_IntList) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   py::list int_list;
   int_list.append(py::int_(1));
@@ -108,7 +109,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_IntList) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_BoolList) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   py::list bool_list;
   bool_list.append(py::bool_(true));
@@ -123,7 +124,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_BoolList) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_DoubleList) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   py::list double_list;
   double_list.append(py::float_(1.5));
@@ -138,7 +139,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_DoubleList) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_MixedTuple) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   py::list mixed_list;
   mixed_list.append(py::int_(1));
@@ -154,7 +155,7 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_MixedTuple) {
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_EmptyList) {
   std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<void*> tensor_data_ptrs;
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   py::list empty_list;
 

@@ -22,6 +22,9 @@ struct CompilationConfig {
 
   // Additional compiler arguments
   std::string additional_args;
+
+  // Create config from environment (platform, cores, opt level, flags).
+  static CompilationConfig FromEnvironment();
 };
 
 // NeuronCompiler provides functionality to compile modules to NEFF format

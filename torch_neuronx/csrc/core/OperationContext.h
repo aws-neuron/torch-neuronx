@@ -19,6 +19,7 @@
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackContext.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/TensorContext.h"
 
 namespace at::neuron {
@@ -199,50 +200,61 @@ class StreamImpl;
 // that evolves through the execution pipeline stages.
 struct OperationContext {
   // Core execution data (immutable after creation)
-  std::unique_ptr<at::neuron::NeuronKernelExecution> kernel_execution;
+  std::unique_ptr<at::neuron::NeuronKernelExecution> kernel_execution = nullptr;
 
   // CPU fallback metadata (bundles static args and list arg reconstruction data)
-  CPUFallbackContext cpu_fallback_context;
+  CPUFallbackContext cpu_fallback_context = {};
 
   // Pipeline state (populated during execution)
-  std::string python_stack_trace;  // Python stack trace for debugging
+  std::string python_stack_trace = "";
 
   // Stream context - pointer to the stream this operation belongs to
-  StreamImpl* stream;
+  StreamImpl* stream = nullptr;
 
   // Logical (user-facing) Stream ID
   c10::StreamId stream_id{0};
 
   // Priority from PyTorch stream (decoded from stream_id at submission)
-  int stream_priority{0};
+  int stream_priority = 0;
 
   // Completion handling
-  std::promise<OperationContextResult> promise;
-  std::shared_future<OperationContextResult> result_future;
+  std::promise<OperationContextResult> promise = {};
+  std::shared_future<OperationContextResult> result_future = {};
 
   // Execution readiness state (set after compilation completes or for direct ops)
   std::atomic<bool> execution_ready_{false};
 
   // nrt-async execution state
-  nrt::AsyncSchedulingState nrt_async_state_;
+  nrt::AsyncSchedulingState nrt_async_state_ = {};
+
+  // Per-operation async completion status, written on completion.
+  // Default NRT_FAILURE ensures unset status is treated as error (fail-closed).
+  NRT_STATUS nrt_status_{NRT_FAILURE};
+
+  bool HasNRTError() const { return nrt_status_ != NRT_SUCCESS; }
+
+  torch_neuronx::ExecutionRuntimeException GetNRTError() const {
+    return torch_neuronx::ExecutionRuntimeException(
+        "Async execution failed with NRT status: " + std::to_string(nrt_status_), nrt_status_);
+  }
 
   // Concatenation support - state for operations in a concatenation group
   // For individual cascading ops: shared_ptr keeps the state (and concatenated op) alive
   // For concatenated op itself: raw pointer (non-owning) to avoid circular reference
   //   since ConcatenationState owns the concatenated op via unique_ptr
-  std::shared_ptr<ConcatenationState> concatenation_state_;  // For cascading ops
-  ConcatenationState* concatenation_state_raw_ = nullptr;    // For concatenated op (non-owning)
+  std::shared_ptr<ConcatenationState> concatenation_state_ = nullptr;
+  ConcatenationState* concatenation_state_raw_ = nullptr;
 
   // Timing information for performance analysis
-  std::chrono::steady_clock::time_point
-      submit_start;  // Top of SubmitOperationContext (PyTorch thread)
-  std::chrono::steady_clock::time_point submit_time;
-  std::chrono::steady_clock::time_point compile_start;
-  std::chrono::steady_clock::time_point compile_end;
-  std::chrono::steady_clock::time_point execute_start;
-  std::chrono::steady_clock::time_point execute_end;
-  std::chrono::steady_clock::time_point concat_start;
-  std::chrono::steady_clock::time_point concat_end;
+  std::chrono::steady_clock::time_point submit_start =
+      {};  // Top of SubmitOperationContext (PyTorch thread)
+  std::chrono::steady_clock::time_point submit_time = {};
+  std::chrono::steady_clock::time_point compile_start = {};
+  std::chrono::steady_clock::time_point compile_end = {};
+  std::chrono::steady_clock::time_point execute_start = {};
+  std::chrono::steady_clock::time_point execute_end = {};
+  std::chrono::steady_clock::time_point concat_start = {};
+  std::chrono::steady_clock::time_point concat_end = {};
 
   // PyTorch tracing identifiers for linking with torch profiler and neuron-tools.
   // Upon SubmitOperationContext, pytorch_sequence_nr and pytorch_thread_id are populated with the
@@ -260,6 +272,8 @@ struct OperationContext {
 
   // OS thread ID (gettid) of the Neuron stream execution worker that scheduled this operation
   int32_t neuron_stream_os_tid{-1};  // -1 = not yet assigned; valid tids are positive (gettid())
+  // Unique event ID for framework-to-NRT event linking
+  uint64_t event_id = 0;
 
   explicit OperationContext(std::unique_ptr<at::neuron::NeuronKernelExecution> kernel_exec,
                             const std::string& python_stack_trace = "",
@@ -363,8 +377,9 @@ struct OperationContext {
 
   // Check if this operation is ready to execute (for event wait primitives)
   bool IsSchedulable() const {
+    // Events must be both execution ready (pipeline processed) AND event ready (dependencies met)
     if (GetKernelType() == KernelTypeEnum::kEvent) {
-      return GetKernel<KernelTypeEnum::kEvent>().IsReady();
+      return IsExecutionReady() && GetKernel<KernelTypeEnum::kEvent>().IsReady();
     }
 
     // If this operation has a concatenated operation, check if the concatenated operation is ready
@@ -393,12 +408,6 @@ struct OperationContext {
     auto* compilable = dynamic_cast<CompilableKernelExecution*>(kernel_execution.get());
     TORCH_CHECK(compilable, "Kernel execution is not a compilable kernel");
     return *compilable;
-  }
-
-  void Execute() {
-    StartExecution();
-    kernel_execution->Execute();
-    CompleteExecution();
   }
 
   // ============== Concatenation State Helpers ==============

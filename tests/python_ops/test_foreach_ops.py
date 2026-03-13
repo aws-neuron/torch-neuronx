@@ -16,7 +16,7 @@ def set_seed():
     torch.manual_seed(42)
 
 
-@pytest.mark.parametrize("op_name", ["add", "mul"])
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
 @pytest.mark.parametrize("num_tensors", [1, 3, 5])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_foreach_scalar(op_name, num_tensors, dtype):
@@ -25,7 +25,9 @@ def test_foreach_scalar(op_name, num_tensors, dtype):
     op = getattr(torch, f"_foreach_{op_name}")
     op_ = getattr(torch, f"_foreach_{op_name}_")
 
-    tensors_cpu = [torch.randn(10, dtype=dtype) for _ in range(num_tensors)]
+    tensors_cpu = [torch.randn(10, dtype=dtype) for _ in range(num_tensors)] + [
+        torch.randn(256, dtype=dtype)
+    ]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
 
     result_cpu = op(tensors_cpu, 2.5)
@@ -48,7 +50,7 @@ def test_foreach_scalar(op_name, num_tensors, dtype):
         torch.testing.assert_close(t_neuron.cpu(), t_cpu)
 
 
-@pytest.mark.parametrize("op_name", ["mul", "add"])
+@pytest.mark.parametrize("op_name", ["mul", "add", "sub", "div"])
 @pytest.mark.parametrize(
     "tensor_dtype,other_dtype",
     [
@@ -63,12 +65,12 @@ def test_foreach_list(op_name, tensor_dtype, other_dtype):
     op = getattr(torch, f"_foreach_{op_name}")
     op_ = getattr(torch, f"_foreach_{op_name}_")
 
-    tensors_cpu = [torch.randn(10, dtype=tensor_dtype) for _ in range(2)]
-    other_cpu = [torch.randn(10, dtype=other_dtype) for _ in range(2)]
+    tensors_cpu = [torch.randn(10, dtype=tensor_dtype), torch.randn(256, dtype=tensor_dtype)]
+    other_cpu = [torch.randn(10, dtype=other_dtype), torch.randn(256, dtype=other_dtype)]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
     other_neuron = [t.clone().to("neuron") for t in other_cpu]
-    # add supports alpha, mul does not
-    kwargs = {"alpha": 0.5} if op_name == "add" else {}
+    # add/sub supports alpha, mul/div does not
+    kwargs = {"alpha": 0.5} if op_name in ("add", "sub") else {}
     result_cpu = op(tensors_cpu, other_cpu, **kwargs)
     with track_neuron_ops():
         result_neuron = op(tensors_neuron, other_neuron, **kwargs)
@@ -91,7 +93,7 @@ def test_foreach_list(op_name, tensor_dtype, other_dtype):
         torch.testing.assert_close(t_neuron.cpu(), t_cpu, rtol=1e-3, atol=1e-4)
 
 
-@pytest.mark.parametrize("op_name", ["add", "mul"])
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
 @pytest.mark.parametrize("num_tensors", [1, 3])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_foreach_scalarlist(op_name, num_tensors, dtype):
@@ -100,8 +102,10 @@ def test_foreach_scalarlist(op_name, num_tensors, dtype):
     op = getattr(torch, f"_foreach_{op_name}")
     op_ = getattr(torch, f"_foreach_{op_name}_")
 
-    tensors_cpu = [torch.randn(10, dtype=dtype) for _ in range(num_tensors)]
-    scalars = [1.5 + i * 0.5 for i in range(num_tensors)]
+    tensors_cpu = [torch.randn(10, dtype=dtype) for _ in range(num_tensors)] + [
+        torch.randn(256, dtype=dtype)
+    ]
+    scalars = [1.5 + i * 0.5 for i in range(num_tensors + 1)]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
 
     result_cpu = op(tensors_cpu, scalars)
@@ -123,7 +127,7 @@ def test_foreach_scalarlist(op_name, num_tensors, dtype):
         torch.testing.assert_close(t_neuron.cpu(), t_cpu)
 
 
-@pytest.mark.parametrize("op_name", ["add", "mul"])
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
 @pytest.mark.parametrize(
     "tensor_dtype,scalar_dtype",
     [
@@ -138,7 +142,7 @@ def test_foreach_tensor(op_name, tensor_dtype, scalar_dtype):
     op = getattr(torch, f"_foreach_{op_name}")
     op_ = getattr(torch, f"_foreach_{op_name}_")
 
-    tensors_cpu = [torch.randn(10, 8, dtype=tensor_dtype) for _ in range(2)]
+    tensors_cpu = [torch.randn(10, 8, dtype=tensor_dtype), torch.randn(256, dtype=tensor_dtype)]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
 
     res_cpu = op(tensors_cpu, torch.tensor(0.5, dtype=scalar_dtype))
@@ -183,11 +187,12 @@ def test_foreach_add_list_mismatched_length():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_foreach_norm(ord, dtype):
     """Test foreach norm operation"""
-
+    torch.manual_seed(42)
     tensors_cpu = [
         torch.randn(10, dtype=dtype),
         torch.randn(5, 3, dtype=dtype),
-        torch.randn(2, 4, 2, dtype=dtype),
+        torch.randn(256, dtype=dtype),
+        torch.randn(16, 16, dtype=dtype),
     ]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
 
@@ -197,13 +202,10 @@ def test_foreach_norm(ord, dtype):
         assert_op_runs_on_neuron("_foreach_norm")
 
     for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
-        torch.testing.assert_close(r_neuron.cpu(), r_cpu)
+        rtol, atol = (1e-2, 1e-2) if dtype == torch.float16 else (1e-4, 1e-4)
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=rtol, atol=atol)
 
 
-@pytest.mark.skipif(
-    not torch_neuronx.utils.use_mlir_aten_ops(),
-    reason="dtype conversion only supported in MLIR backend",
-)
 @pytest.mark.parametrize("ord", [1, 2, float("inf")])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_foreach_norm_dtype_conversion(ord, dtype):
@@ -212,7 +214,8 @@ def test_foreach_norm_dtype_conversion(ord, dtype):
     tensors_cpu = [
         torch.randn(10, dtype=dtype),
         torch.randn(5, 3, dtype=dtype),
-        torch.randn(2, 4, 2, dtype=dtype),
+        torch.randn(256, dtype=dtype),
+        torch.randn(16, 16, dtype=dtype),
     ]
     tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
 
@@ -264,7 +267,7 @@ def test_nonzero_dim_tensor():
     ), f"Error messages differ: neuron='{neuron_error}', cpu='{cpu_error}'"
 
 
-@pytest.mark.parametrize("op_name", ["add", "mul"])
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
 def test_foreach_binary_empty(op_name):
     """Test foreach binary operations with empty tensors"""
     op_ = getattr(torch, f"_foreach_{op_name}_")
@@ -297,7 +300,7 @@ def test_foreach_norm_empty():
         assert r_neuron.cpu().item() == 0.0
 
 
-@pytest.mark.parametrize("op_name", ["add", "mul"])
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
 def test_foreach_mixed_empty_nonempty(op_name):
     """Test foreach with mix of empty and non-empty tensors"""
     op = getattr(torch, f"_foreach_{op_name}")
@@ -456,3 +459,116 @@ def test_foreach_returns_new_objects():
     for i, (inp, res) in enumerate(zip(mixed_neuron, results, strict=False)):
         assert inp is not res, f"Result[{i}] should be a new object, not the same as input"
         print(f"Input[{i}] id: {id(inp)}, Result[{i}] id: {id(res)}, Same: {inp is res}")
+
+
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
+def test_foreach_non_divisible_by_p_size(op_name):
+    """Test foreach operations with tensor sizes not divisible by P_SIZE (128)."""
+    op = getattr(torch, f"_foreach_{op_name}")
+
+    # Sizes that require padding: 200 elements needs padding to 256 (128*2)
+    tensors_cpu = [torch.randn(200), torch.randn(50, 5), torch.randn(10, 10, 3)]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = op(tensors_cpu, 2.5)
+    with track_neuron_ops():
+        result_neuron = op(tensors_neuron, 2.5)
+        assert_op_runs_on_neuron(f"_foreach_{op_name}")
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu)
+
+
+@pytest.mark.parametrize("ord", [1, 2, float("inf")])
+def test_foreach_norm_non_divisible_by_p_size(ord):
+    """Test foreach norm with tensor sizes not divisible by P_SIZE (128)."""
+    # Sizes that require padding: 200 elements needs padding to 256 (128*2)
+    tensors_cpu = [torch.randn(200), torch.randn(50, 5), torch.randn(10, 10, 3)]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = torch._foreach_norm(tensors_cpu, ord)
+    with track_neuron_ops():
+        result_neuron = torch._foreach_norm(tensors_neuron, ord)
+        assert_op_runs_on_neuron("_foreach_norm")
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        # Relaxed tolerance due to different reduction order in NKI vs CPU
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("ord", [1, 2, float("inf")])
+def test_foreach_norm_non_contiguous(ord):
+    """Test foreach norm with non-contiguous tensors (e.g., from transpose)."""
+    torch.manual_seed(42)
+    tensors_cpu = [
+        torch.randn(16, 16).t(),  # transposed, non-contiguous, NKI path
+        torch.randn(256, 2)[:, 0],  # sliced, non-contiguous, NKI path
+        torch.randn(8, 20).t(),  # transposed, non-contiguous, NKI path
+    ]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = torch._foreach_norm(tensors_cpu, ord)
+    with track_neuron_ops():
+        result_neuron = torch._foreach_norm(tensors_neuron, ord)
+        assert_op_runs_on_neuron("_foreach_norm")
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
+def test_foreach_scalar_boundary_sizes(op_name):
+    """Test foreach scalar ops at P_SIZE boundary (127, 128, 129, 255, 256)."""
+    torch.manual_seed(42)
+    op = getattr(torch, f"_foreach_{op_name}")
+    tensors_cpu = [torch.randn(n) for n in [127, 128, 129, 255, 256]]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = op(tensors_cpu, 3.0)
+    with track_neuron_ops():
+        result_neuron = op(tensors_neuron, 3.0)
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("ord", [1, 2, float("inf")])
+def test_foreach_norm_boundary_sizes(ord):
+    """Test foreach norm at P_SIZE boundary (127, 128, 129, 255, 256)."""
+    torch.manual_seed(42)
+    tensors_cpu = [torch.randn(n) for n in [127, 128, 129, 255, 256]]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = torch._foreach_norm(tensors_cpu, ord)
+    with track_neuron_ops():
+        result_neuron = torch._foreach_norm(tensors_neuron, ord)
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
+def test_foreach_scalar_tensor_input(op_name):
+    """Test foreach ops with 0-dim scalar tensor input (numel=1, ndim=0)."""
+    op = getattr(torch, f"_foreach_{op_name}")
+    tensors_cpu = [torch.tensor(3.0), torch.randn(256)]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = op(tensors_cpu, 2.0)
+    result_neuron = op(tensors_neuron, 2.0)
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu)
+
+
+@pytest.mark.parametrize("ord", [1, 2, float("inf")])
+def test_foreach_norm_scalar_tensor_input(ord):
+    """Test foreach norm with 0-dim scalar tensor input (numel=1, ndim=0)."""
+    tensors_cpu = [torch.tensor(3.0), torch.randn(256)]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    result_cpu = torch._foreach_norm(tensors_cpu, ord)
+    result_neuron = torch._foreach_norm(tensors_neuron, ord)
+
+    for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-4, atol=1e-4)

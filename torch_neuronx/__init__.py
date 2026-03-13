@@ -57,9 +57,8 @@ os.environ.setdefault("TORCH_NEURONX_RETAIN_DEVICE_MODE", DEFAULT_RETAIN_DEVICE_
 # Set default for legacy neff
 os.environ.setdefault("NEURON_RT_ALLOW_LEGACY_NEFF", "1")
 
-# Set defaults for async nrt execution
+# Set default for async nrt execution
 os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
-os.environ.setdefault("TORCH_NEURONX_ENABLE_ASYNC_NRT", "1")
 
 # Set default for host-cc
 os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
@@ -98,6 +97,9 @@ from . import distributed, neuron, profiling, python_ops
 
 # Import memory apis
 from .memory import (
+    _dump_snapshot,
+    _record_memory_history,
+    _snapshot,
     max_memory_allocated,
     max_memory_reserved,
     memory_allocated,
@@ -274,12 +276,142 @@ def get_executed_ops() -> list:
 
 def clear_op_tracking() -> None:
     """
-    Clear both fallback and executed operation tracking.
+    Clear fallback, executed, and concatenated operation tracking.
 
     This resets the internal tracking of which operations have been
-    executed on Neuron vs CPU, useful for testing.
+    executed on Neuron vs CPU, and concatenated op mappings, useful for testing.
     """
     _C._clear_op_tracking()
+
+
+def get_concatenated_ops() -> dict:
+    """
+    Get mapping of concatenated op names to their original constituent op names.
+
+    When TORCH_NEURONX_ENABLE_CONCATENATION=1, operations may be merged into
+    concatenated groups. This function returns which original ops were merged
+    into each concatenated group.
+
+    Returns:
+        Dictionary mapping concatenated op name (str) to list of original op names (list[str]).
+        Empty dict if no concatenation has occurred.
+    """
+    return _C._get_concatenated_ops()
+
+
+def get_concatenated_op_execution_counts() -> dict:
+    """
+    Get per-op execution counts for concatenated operations.
+
+    Each concatenated op's first execution requires compilation (uncached).
+    Subsequent executions of the same concatenated group are cache hits.
+    A count of 1 means the op was compiled but never re-executed from cache.
+    A count > 1 means (count - 1) cache hits occurred.
+
+    Returns:
+        Dictionary mapping concatenated op name (str) to execution count (int).
+        Empty dict if no concatenation has occurred.
+    """
+    return _C._get_concatenated_op_execution_counts()
+
+
+def get_concatenation_profiles() -> dict:
+    """
+    Get per-concatenation-type profiling data.
+
+    Returns detailed merge time and group size data for each unique
+    concatenation type (identified by the pipe-separated op name).
+
+    Returns:
+        Dictionary mapping concat op name to profile dict with:
+        - merge_times_ns: list[float] — merge time per invocation in nanoseconds
+        - group_sizes: list[int] — number of ops per group per invocation
+        - invocation_count: int — total number of times this concat type was created
+        - avg_merge_time_ms: float — average merge time in milliseconds
+        - avg_group_size: float — average group size
+        Empty dict if no profiling data.
+    """
+    raw = _C._get_concatenation_profiles()
+    result = {}
+    for op_name, profile in raw.items():
+        merge_times = profile["merge_times_ns"]
+        group_sizes = profile["group_sizes"]
+        count = profile["invocation_count"]
+        avg_merge_ms = (sum(merge_times) / len(merge_times) / 1e6) if merge_times else 0.0
+        avg_group = (sum(group_sizes) / len(group_sizes)) if group_sizes else 0.0
+        result[op_name] = {
+            "merge_times_ns": merge_times,
+            "group_sizes": group_sizes,
+            "invocation_count": count,
+            "avg_merge_time_ms": avg_merge_ms,
+            "avg_group_size": avg_group,
+        }
+    return result
+
+
+def get_concatenation_status() -> dict:
+    """
+    Diagnose whether op concatenation is actually working.
+
+    When TORCH_NEURONX_ENABLE_CONCATENATION=1, ops should be merged into
+    concatenated groups whose names contain "|" (e.g.,
+    "aten::add.Tensor|aten::linear_backward|...").
+
+    This function checks both the executed ops (for "|" marker) and the
+    ConcatenatedOpTracker (for explicit group recordings) to determine
+    if concatenation is actually producing merged ops at runtime.
+
+    Returns:
+        Dictionary with diagnostic fields:
+        - enabled: bool — whether the env var is set to "1"
+        - concatenated_ops_in_executed: list[str] — executed op names containing "|"
+        - individual_ops_in_executed: list[str] — executed op names without "|"
+        - concatenated_groups_tracked: int — number of groups in ConcatenatedOpTracker
+        - is_active: bool — True if concatenation produced at least one merged op
+        - diagnosis: str — human-readable explanation of the status
+    """
+    import re
+
+    enabled = os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1"
+
+    executed_ops = get_executed_ops()
+    concat_pattern = re.compile(r".*\|.*")
+    concatenated_ops_in_executed = [op for op in executed_ops if concat_pattern.match(op)]
+    individual_ops_in_executed = [op for op in executed_ops if not concat_pattern.match(op)]
+
+    concatenated_groups = get_concatenated_ops()
+    num_groups_tracked = len(concatenated_groups)
+
+    is_active = len(concatenated_ops_in_executed) > 0 or num_groups_tracked > 0
+
+    # Build diagnosis
+    if not enabled:
+        diagnosis = (
+            "Concatenation is DISABLED (TORCH_NEURONX_ENABLE_CONCATENATION != 1). "
+            "Set TORCH_NEURONX_ENABLE_CONCATENATION=1 to enable."
+        )
+    elif is_active:
+        diagnosis = (
+            f"Concatenation is ACTIVE. "
+            f"Found {len(concatenated_ops_in_executed)} concatenated op(s) in executed ops "
+            f"and {num_groups_tracked} group(s) in ConcatenatedOpTracker."
+        )
+    else:
+        diagnosis = (
+            "Concatenation is ENABLED but NOT ACTIVE — no merged ops detected in executed ops "
+            "(no '|' separator found) and ConcatenatedOpTracker has 0 groups. "
+            "This may indicate dispatch overhead is preventing concatenation from triggering, "
+            "or the workload does not have fusible op sequences."
+        )
+
+    return {
+        "enabled": enabled,
+        "concatenated_ops_in_executed": concatenated_ops_in_executed,
+        "individual_ops_in_executed": individual_ops_in_executed,
+        "concatenated_groups_tracked": num_groups_tracked,
+        "is_active": is_active,
+        "diagnosis": diagnosis,
+    }
 
 
 def _get_device_index(device, optional=False, allow_cpu=False):

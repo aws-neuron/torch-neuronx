@@ -103,32 +103,14 @@
         {
           "reason": "RecursionError in DTensor compile tests - setUp recursion issue (26 tests)",
           "tests": [
-            "test_dtensor_dont_recompile_on_same_placement_devicemesh",
             "test_dtensor_dynamic",
             "test_dtensor_dynamic_cat",
             "test_dtensor_dynamic_loss_parallel_log_softmax",
             "test_dtensor_dynamic_slice",
-            "test_dtensor_dynamo_device_mesh_attrs",
-            "test_dynamo_dtensor",
-            "test_dynamo_dtensor_from_local",
-            "test_dynamo_dtensor_from_local_dynamic_shapes",
             "test_dynamo_dtensor_from_local_redistribute",
             "test_dynamo_dtensor_from_local_redistribute_async",
-            "test_dynamo_dtensor_recompile",
-            "test_dynamo_to_local_kwargs",
-            "test_dynamo_to_local_kwargs_forward_hook",
-            "test_fakify_dtensor",
             "test_graph_input_is_async",
-            "test_placement_compile",
-            "test_device_mesh_compile",
-            "test_dtensor_basic",
-            "test_dtensor_basic_export",
-            "test_dtensor_constructor_w_dynamo_disable",
-            "test_dtensor_constructor_w_graph_break",
-            "test_dtensor_attribute_access_on_intermediate",
-            "test_dtensor_noncontiguous_output",
-            "test_dtensor_partial_placement_redistribute_unbalanced_correct_strides",
-            "test_unwrap_async_collective_tensor_tangent"
+            "test_dtensor_partial_placement_redistribute_unbalanced_correct_strides"
           ]
         },
         {
@@ -159,6 +141,12 @@
           ]
         },
         {
+          "reason": "AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_dtensor_op_db_logit_neuron_float32"
+          ]
+        },
+        {
           "reason": "Device barrier failures - Failed to execute the device barrier 2 (6 tests)",
           "tests": [
             "test_dtensor_view_op_uneven",
@@ -171,7 +159,6 @@
         {
           "reason": "FSDP/TP compile tests - AssertionError in compiled autograd (4 tests)",
           "tests": [
-            "test_2d_fsdp_tp_ac_compile_use_ca_False",
             "test_2d_fsdp_tp_ac_compile_use_ca_True",
             "test_2d_fsdp_tp_compile_use_ca_False",
             "test_2d_fsdp_tp_compile_use_ca_True"
@@ -189,7 +176,6 @@
         {
           "reason": "No backend type associated with device type neuron (3 tests)",
           "tests": [
-            "test_conv_backward_none_grad_inp",
             "test_depthwise_convolution",
             "test_bernoulli"
           ]
@@ -198,8 +184,7 @@
           "reason": "TP compile fullgraph backward failures (3 tests)",
           "tests": [
             "test_tp_compile_fullgraph_is_seq_parallel_False_use_ca_True",
-            "test_tp_compile_fullgraph_is_seq_parallel_True_use_ca_True",
-            "test_sharded_embedding_rowwise"
+            "test_tp_compile_fullgraph_is_seq_parallel_True_use_ca_True"
           ]
         },
         {
@@ -225,16 +210,8 @@
           ]
         },
         {
-          "reason": "Missing get_rng_state attribute in torch_neuronx.neuron (2 tests)",
-          "tests": [
-            "test_pipeline_parallel_manual_seed",
-            "test_rng_tracker_init"
-          ]
-        },
-        {
           "reason": "Dynamo redistribute backward - TorchRuntimeError with fake tensors (2 tests)",
           "tests": [
-            "test_compile_dtensor_redistribute_backward_use_ca_False",
             "test_compile_dtensor_redistribute_backward_use_ca_True"
           ]
         },
@@ -259,8 +236,6 @@
           "tests": [
             "test_deterministic_rand_1d",
             "test_deterministic_uniform_2d",
-            "test_manual_seed",
-            "test_manual_seed_submesh",
             "test_meta_tensor_init"
           ]
         },
@@ -274,16 +249,13 @@
         {
           "reason": "Layer norm backward failures (2 tests)",
           "tests": [
-            "test_layer_norm_bwd",
             "test_layer_norm_bwd_req_grad"
           ]
         },
         {
           "reason": "Copy operation failures - non-contiguous or size mismatch (3 tests)",
           "tests": [
-            "test_linalg_eigh",
-            "test_shard0_svd",
-            "test_copy_"
+            "test_shard0_svd"
           ]
         },
         {
@@ -318,18 +290,6 @@
           ]
         },
         {
-          "reason": "DTensor dtype conversion - sharding propagation failed (1 test)",
-          "tests": [
-            "test_dtensor_dtype_conversion"
-          ]
-        },
-        {
-          "reason": "Contiguous backward - element does not require grad (1 test)",
-          "tests": [
-            "test_contiguous"
-          ]
-        },
-        {
           "reason": "Model init - AssertionError not raised (1 test)",
           "tests": [
             "test_model_init"
@@ -351,47 +311,14 @@
           "reason": "[TODO FIX post Beta] RuntimeError: Process exited with error code 10",
           "tests": [
             "test_storage_offset_slice",
-            "test_fill_inplace_partial_sum",
-            "test_index",
-            "test_index_put_scalar",
             "test_attention_shard_without_cp",
-            "test_scatter",
-            "test_slice",
-            "test_stack_cache",
-            "test_where_type_promotion",
-            "test_zeros_like_partial_sum",
-            "test_fsdp2_tp_2d_dtensor_local_shards_and_offsets",
-            "test_1d_mesh_strided_sharding",
-            "test_2d_mesh_strided_sharding",
-            "test_detach",
-            "test_meta_init_partial",
-            "test_ones_like_partial_sum",
-            "test_stack",
-            "test_zero_inplace",
-            "test_init_ops",
             "test_dtensor_add_op_dispatch_overhead",
-            "test_adagrad_optimizer",
             "test_storage_offset_shard_dim1_slice_dim0",
-            "test_empty_like",
-            "test_equal",
-            "test_fill_inplace",
-            "test_full_like",
-            "test_inplace_op",
             "test_flex_cp_custom_op",
-            "test_new_empty_strided",
-            "test_new_full",
-            "test_ones_like",
-            "test_op_out_variant",
             "test_allgather_base",
             "test_allgather_base_async_op",
-            "test_unbind",
-            "test_zeros_like",
             "test_conv2d_no_bias_compile",
-            "test_fsdp1_tp_2d_dtensor_local_shards_and_offsets",
-            "test_2d_mesh_2d_tensor_strided_sharding",
             "test_2d_mesh_uneven_strided_shard",
-            "test_adadelta_optimizer",
-            "test_gather",
             "test_storage_offset_shard_dim0_slice_dim1"
           ]
         },
@@ -412,9 +339,19 @@
           ]
         },
         {
-          "reason": "[TODO FIX post Beta] ValueError: RANK env variable expected",
+          "reason": "[TODO FIX post Beta] CPU fallback disabled: all_to_all failed",
           "tests": [
-            "test_embedding_error_msg"
+            "test_force_min_cost_redistribution_plan",
+            "test_ordered_distribute_all_combination",
+            "test_ordered_redistribute",
+            "test_ordered_redistribute_with_partial",
+            "test_redistribute_to_partial"
+          ]
+        },
+        {
+          "reason": "[TODO FIX post Beta] AssertionError: Scalars are not equal",
+          "tests": [
+            "test_shard_order_same_data_as_strided_shard"
           ]
         },
         {
@@ -424,9 +361,13 @@
             "test_distribute_module_casting",
             "test_distribute_module_input_fn_output_fn",
             "test_distribute_module_input_fn_output_fn_warning",
-            "test_distribute_module_meta",
-            "test_distribute_tensor_errors",
-            "test_checkpoint_apis_check_partial_placement"
+            "test_distribute_module_meta"
+          ]
+        },
+        {
+          "reason": "Fails with RANK environment variable missing error",
+          "tests": [
+            "test_embedding_error_msg"
           ]
         }
       ]
@@ -476,7 +417,6 @@
             "test_state_dict_new_group",
             "test_sharded_tensor_metadata",
             "test_sharded_tensor_device",
-            "test_init_from_local_shards_and_global_metadata",
             "test_custom_op_override",
             "test_sharded_tensor_to_cpu",
             "test_state_dict_no_sharded_tensors",
@@ -509,12 +449,6 @@
             "test_sharded_tensor_reshard",
             "test_sharded_embedding_colwise",
             "test_sharded_embedding_bag_colwise"
-          ]
-        },
-        {
-          "reason": "AllGather execution failure on Neuron",
-          "tests": [
-            "test_sharded_embedding_rowwise"
           ]
         },
         {
@@ -567,6 +501,12 @@
           "reason": "[TODO FIX post Beta] RuntimeError: In operator() at tensorpipe/common/ibv.h:172: Operation not supported",
           "tests": [
             "test_invalid_pg_rpc_ranks"
+          ]
+        },
+        {
+          "reason": "RPC framework not initialized and not yet supported",
+          "tests": [
+            "test_init_from_local_shards_and_global_metadata"
           ]
         }
       ]

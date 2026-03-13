@@ -59,7 +59,7 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         # - float64: Not natively supported on device, handled by NRT-based implementation
         # - bool: Requires special handling, handled by NRT-based implementation
         # - int32: Requires special handling, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.bool, torch.int32)
+        unsupported_dtypes = (torch.float64, torch.bool, torch.int32, torch.int64)
         return (
             src.device.type == "neuron"
             and target_device.type == "neuron"
@@ -77,7 +77,6 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         src = args[0]
         dtype = kwargs.get("dtype")
         device = kwargs.get("device")
-        non_blocking = kwargs.get("non_blocking", False)
 
         target_dtype = dtype if dtype is not None else src.dtype
         target_device = device if device is not None else src.device
@@ -103,12 +102,4 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
             mlir_kwargs["out_dtype"] = target_dtype
         mlir_kwargs["out"] = out
 
-        result = super().execute(src_prepared, **mlir_kwargs)
-
-        if not non_blocking:
-            import torch_neuronx
-
-            stream = torch_neuronx.current_stream(target_device)
-            stream.synchronize()
-
-        return result
+        return super().execute(src_prepared, **mlir_kwargs)

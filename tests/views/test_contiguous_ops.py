@@ -198,15 +198,13 @@ class TestContiguousOps:
         # This is primarily for 4D tensors (NCHW format)
         x = make_test_tensor((2, 3, 4, 5), device="neuron")
 
-        try:
-            # Try to make it channels_last contiguous
-            y = x.contiguous(memory_format=torch.channels_last)
-            # If supported, verify it's contiguous in some format
-            assert y.is_contiguous() or y.is_contiguous(
-                memory_format=torch.channels_last
-            ), "Should be contiguous in some format"
-        except (RuntimeError, NotImplementedError):
-            pytest.skip("channels_last memory format not supported")
+        y = x.contiguous(memory_format=torch.channels_last)
+        assert y.is_contiguous(
+            memory_format=torch.channels_last
+        ), "Should be contiguous in channels_last format"
+        torch.testing.assert_close(
+            y.to("cpu"), x.to("cpu").contiguous(memory_format=torch.channels_last)
+        )
 
     def test_contiguous_force_copy(self):
         """Test that contiguous can be forced to make a copy"""
@@ -224,10 +222,8 @@ class TestContiguousOps:
         y[0, 0] = -999
         assert x[0, 0].item() != -999, "Modifying clone should not affect original"
 
-    @assert_raises(
-        RuntimeError, match="Neuron tensors only support contiguous or preserve memory format"
-    )
-    def test_contiguous_rejects_unsupported_memory_format(self):
-        """Reject unsupported memory formats with canonical message"""
+    def test_contiguous_channels_last_is_supported(self):
+        """channels_last memory format is supported on Neuron"""
         x = make_test_tensor((2, 3, 4, 5), device="neuron")
-        x.contiguous(memory_format=torch.channels_last)
+        y = x.contiguous(memory_format=torch.channels_last)
+        assert y.is_contiguous(memory_format=torch.channels_last)

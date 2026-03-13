@@ -25,13 +25,12 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   dst.copy_(src, non_blocking);
 }
 
-void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blocking) {
+void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   if (g_copy_utils_mocks_initialized) {
-    testing::MockCopyUtils::GetInstance()->copy_neuron_to_neuron(src, dst, non_blocking);
+    testing::MockCopyUtils::GetInstance()->copy_neuron_to_neuron(src, dst);
     return;
   }
-  // Default: just copy the data
-  dst.copy_(src, non_blocking);
+  dst.copy_(src);
 }
 
 nrt_tensor_t* get_nrt_tensor(const at::Tensor& tensor, bool non_blocking) {
@@ -66,9 +65,9 @@ MockCopyUtilsSession::MockCopyUtilsSession() {
         .WillByDefault(::testing::Invoke([](const at::Tensor& src, at::Tensor& dst,
                                             bool non_blocking) { dst.copy_(src, non_blocking); }));
 
-    ON_CALL(*mock, copy_neuron_to_neuron(::testing::_, ::testing::_, ::testing::_))
-        .WillByDefault(::testing::Invoke([](const at::Tensor& src, at::Tensor& dst,
-                                            bool non_blocking) { dst.copy_(src, non_blocking); }));
+    ON_CALL(*mock, copy_neuron_to_neuron(::testing::_, ::testing::_))
+        .WillByDefault(
+            ::testing::Invoke([](const at::Tensor& src, at::Tensor& dst) { dst.copy_(src); }));
 
     ON_CALL(*mock, get_nrt_tensor(::testing::_, ::testing::_))
         .WillByDefault(::testing::Return(nullptr));

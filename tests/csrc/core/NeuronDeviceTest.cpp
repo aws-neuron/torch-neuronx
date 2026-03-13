@@ -247,6 +247,20 @@ TEST_F(NeuronDeviceTest, LocalWorldSizeComprehensiveTest) {
   EXPECT_THROW(c10_neuron::set_device(5), std::invalid_argument);  // Above range
 }
 
+TEST_F(NeuronDeviceTest, IsDistributedInitialized) {
+  // After reset, distributed should not be initialized
+  c10_neuron::reset_distributed_state();
+  EXPECT_FALSE(c10_neuron::is_distributed_initialized());
+
+  // After setting world_size, it should be initialized
+  c10_neuron::set_world_size(2);
+  EXPECT_TRUE(c10_neuron::is_distributed_initialized());
+
+  // After reset again, should be false
+  c10_neuron::reset_distributed_state();
+  EXPECT_FALSE(c10_neuron::is_distributed_initialized());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

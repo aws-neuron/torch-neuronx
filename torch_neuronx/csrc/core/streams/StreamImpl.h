@@ -26,7 +26,7 @@ namespace at::neuron {
 // Tracking info for the last scheduled operation on a stream
 // Used for cross-XU synchronization
 struct LastScheduledInfo {
-  KernelTypeEnum kernel_type{KernelTypeEnum::kHLO};
+  nrta_xu_t xu{NRTA_XU_COMPUTE};
   nrt::SequenceId sequence_id{0};
   bool valid{false};
 };
@@ -44,6 +44,44 @@ class NeuronEvent;
 class ModelHandleCache;
 class OperationExecutionEngine;
 
+// Per-XU completion tracking, sized to each XU's actual queue count.
+struct XUCompletionState {
+  std::array<nrt::SequenceId, nrt::kTensorOpQueues> tensor_op{};
+  std::array<nrt::SequenceId, nrt::kComputeQueues> compute{};
+  std::array<nrt::SequenceId, nrt::kCollectivesQueues> collectives{};
+
+  nrt::SequenceId Get(nrta_xu_t xu, int queue) const {
+    switch (xu) {
+      case NRTA_XU_TENSOR_OP:
+        return tensor_op[queue];
+      case NRTA_XU_COMPUTE:
+        return compute[queue];
+      case NRTA_XU_COLLECTIVES:
+        return collectives[queue];
+      case NRTA_XU_TYPE_NUM:
+        break;
+    }
+    TORCH_CHECK(false, "Unknown XU type: ", static_cast<int>(xu));
+  }
+
+  void Set(nrta_xu_t xu, int queue, nrt::SequenceId seq) {
+    switch (xu) {
+      case NRTA_XU_TENSOR_OP:
+        tensor_op[queue] = seq;
+        return;
+      case NRTA_XU_COMPUTE:
+        compute[queue] = seq;
+        return;
+      case NRTA_XU_COLLECTIVES:
+        collectives[queue] = seq;
+        return;
+      case NRTA_XU_TYPE_NUM:
+        break;
+    }
+    TORCH_CHECK(false, "Unknown XU type: ", static_cast<int>(xu));
+  }
+};
+
 // StreamImpl provides the core implementation for Neuron stream execution.
 // This class implements a multi-threaded pipeline for async operation execution:
 // - Build IR thread: Handles JAX lowering and NEFF compilation
@@ -52,10 +90,10 @@ class OperationExecutionEngine;
 struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   friend class OperationExecutionEngine;
 
-  // Stream identification
+  // Global device index
   c10::DeviceIndex device_index;
+  // Physical stream ID
   c10::StreamId stream_id;
-
   // Operation tracking
   std::list<std::shared_ptr<OperationContext>> active_operations_;
   std::mutex active_operations_mutex_;
@@ -66,14 +104,11 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Per-stream error handling
   std::unique_ptr<ErrorHandler> error_handler_;
 
-  // Per-stream error tracker for async execution mode (RAII-managed)
-  nrt::ErrorTrackerPtr async_error_tracker_;
-
   // Tracking for last scheduled operation (for cross-XU synchronization)
   LastScheduledInfo last_scheduled_info_;
 
   // Per-stream completion tracking state for async NRT operations
-  nrt::CompletionState completion_state_;
+  XUCompletionState xu_completed_seqs_;
 
   // Cleanup timeout configuration
   std::chrono::milliseconds operation_timeout_;
@@ -108,9 +143,6 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Check if stream has pending async operations (scheduled or pending signal)
   bool HasPendingAsyncOperations() const;
 
-  // Get error tracker for async operations (creates if needed)
-  nrt::ErrorTrackerHandle* GetAsyncErrorTracker();
-
   // Get/set last scheduled info for cross-XU synchronization
   LastScheduledInfo& GetLastScheduledInfo() { return last_scheduled_info_; }
   const LastScheduledInfo& GetLastScheduledInfo() const { return last_scheduled_info_; }
@@ -132,6 +164,9 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   OperationContext* FindOperationBySeq(nrt::SequenceId sequence_id);
 
  private:
+  // Prepare operation on the calling thread if RequiresPrepare() is true.
+  void PrepareOperation(OperationContext* op);
+
   // Operation management
   void RemoveActiveOperation(const OperationContext* operation);
 

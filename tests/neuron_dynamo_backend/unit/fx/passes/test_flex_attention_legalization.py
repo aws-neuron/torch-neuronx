@@ -1600,3 +1600,149 @@ class TestScoreModInlining:
         torch.testing.assert_close(h.squeeze(), torch.arange(H, dtype=torch.int32))
         torch.testing.assert_close(q.squeeze(), torch.arange(L, dtype=torch.int32))
         torch.testing.assert_close(kv.squeeze(), torch.arange(S, dtype=torch.int32))
+
+
+class TestTypePromotionInScoreMod:
+    """Tests for type promotion in score_mod operations."""
+
+    @pytest.mark.parametrize(
+        "dtype1,dtype2,op,expected_dtype",
+        [
+            (torch.float32, torch.int32, torch.ops.aten.add.Tensor, torch.float32),
+            (torch.float16, torch.float32, torch.ops.aten.mul.Tensor, torch.float32),
+            (torch.int32, torch.float32, torch.ops.aten.sub.Tensor, torch.float32),
+            (torch.float32, torch.float32, torch.ops.aten.ge.Tensor, torch.bool),
+            (torch.float16, torch.float16, torch.ops.aten.le.Tensor, torch.bool),
+            (torch.int32, torch.int32, torch.ops.aten.eq.Tensor, torch.bool),
+        ],
+    )
+    def test_binary_op_type_promotion(self, dtype1, dtype2, op, expected_dtype):
+        """Test that binary ops correctly handle type promotion via meta tensors."""
+        B, H, L, S = 1, 1, 4, 4
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
+        flex_pass = FlexAttentionLegalization()
+
+        graph = fx.Graph()
+        arg1 = graph.placeholder("arg1")
+        arg1.meta = {"val": torch.empty(B, H, L, S, dtype=dtype1)}
+
+        arg2 = graph.placeholder("arg2")
+        arg2.meta = {"val": torch.empty(1, 1, L, 1, dtype=dtype2)}
+
+        op_node = graph.call_function(op, args=(arg1, arg2))
+        flex_pass._fix_score_mod_metadata(op_node, op_node, arg1, shapes)
+
+        assert op_node.meta["val"].dtype == expected_dtype
+        assert list(op_node.meta["val"].shape) == [B, H, L, S]
+
+
+class TestScoreModBroadcasting:
+    """Integration tests for score_mod with complex broadcasting scenarios."""
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_score_mod_with_mixed_dtype_operations(self, B, H, L, S, E):
+        """Test score_mod with operations that require type promotion."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # Score mod that uses integer indices in arithmetic (requires type promotion)
+        def score_mod_with_indices(score, b, h, q_idx, kv_idx):
+            # q_idx and kv_idx are int32, score is float32
+            # This tests type promotion: float32 + int32 -> float32
+            return score + (q_idx - kv_idx) * 0.01
+
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value, score_mod=score_mod_with_indices)
+
+        # Capture and legalize
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class MixedDtypeFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, score_mod=score_mod_with_indices)
+
+        model = MixedDtypeFlexAttnModule()
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization
+        legalized_gm = legalize_flex_attention_pass(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = legalized_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_score_mod_with_complex_broadcasting(self, B, H, L, S, E):
+        """Test score_mod with complex broadcasting from index operations."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        def score_mod_with_broadcasting(score, b, h, q_idx, kv_idx):
+            # Creates broadcasting: q_idx [1,1,L,1] and kv_idx [1,1,1,S] broadcast together
+            # Then broadcast with score [B,H,L,S]
+            relative_pos = q_idx - kv_idx  # broadcasts to [1,1,L,S]
+            return score + relative_pos * 0.01  # broadcasts to [B,H,L,S]
+
+        with torch.no_grad():
+            reference_output = flex_attention(
+                query, key, value, score_mod=score_mod_with_broadcasting
+            )
+
+        # Capture and legalize
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class BroadcastFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, score_mod=score_mod_with_broadcasting)
+
+        model = BroadcastFlexAttnModule()
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization
+        legalized_gm = legalize_flex_attention_pass(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = legalized_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)

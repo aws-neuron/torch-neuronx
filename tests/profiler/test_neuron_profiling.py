@@ -430,9 +430,18 @@ class TestNeuronProfilerIntegration:
         # Verify SESSION mode produces exactly one .ntff file per instance
         for subdir in subdirs:
             instance_dir = os.path.join(test_output_dir, subdir)
-            files = os.listdir(instance_dir)
-            print(f"Instance directory {subdir} contents: {files}")
+            top_level = os.listdir(instance_dir)
+            print(f"Instance directory {subdir} contents: {top_level}")
 
+            # NRT places files inside a numeric timestamp subdirectory
+            numeric_subdirs = [
+                d for d in top_level if os.path.isdir(os.path.join(instance_dir, d)) and d.isdigit()
+            ]
+            assert (
+                len(numeric_subdirs) >= 1
+            ), f"Expected at least one numeric subdirectory inside {subdir}, found: {top_level}"
+
+            files = os.listdir(os.path.join(instance_dir, numeric_subdirs[0]))
             ntff_files = [f for f in files if f.endswith(".ntff")]
             assert len(ntff_files) == 1, (
                 f"SESSION mode should produce exactly 1 .ntff file per instance, "
@@ -540,6 +549,52 @@ class TestFrameworkMapping:
 
         # Should have multiple mappings for multiple ops
         assert len(mappings["data"]) >= 1, "Should have mappings for executed ops"
+
+    def test_framework_mapping_external_id_present_and_unique(self, tmp_path):
+        """Test that external_id is present in all framework mapping entries and all are unique."""
+        import glob as glob_module
+        import json
+
+        test_output_dir = str(tmp_path)
+        profiler = NeuronProfiler(
+            pytorch_activities=[ProfilerActivity.CPU],
+            neuron_output_dir=test_output_dir,
+        )
+
+        with profiler:
+            x = torch.randn(64, 64, device="neuron")
+            y = torch.mm(x, x)
+            z = torch.relu(y)
+            w = torch.add(z, z)
+            torch.mul(w, w)
+
+        mapping_files = glob_module.glob(str(tmp_path / "framework_mapping_*.json"))
+        assert len(mapping_files) == 1
+
+        with open(mapping_files[0]) as f:
+            mappings = json.load(f)
+
+        assert len(mappings["data"]) > 0, "Should have at least one mapping entry"
+
+        # Collect all external_ids across all entries
+        all_event_ids = []
+        for entry in mappings["data"]:
+            for fw_id in entry["framework_op_exec_ids"]:
+                assert "event_id" in fw_id, f"event_id missing from framework_op_exec_id: {fw_id}"
+                eid = fw_id["event_id"]
+                assert isinstance(eid, int), f"event_id should be int, got {type(eid)}"
+                assert eid != 0, f"event_id should be non-zero, got 0 for entry: {fw_id}"
+                all_event_ids.append(eid)
+
+        assert len(all_event_ids) > 0, "Should have collected at least one event_id"
+
+        # All event_ids must be unique
+        unique_ids = set(all_event_ids)
+        assert len(unique_ids) == len(all_event_ids), (
+            f"event_ids are not unique: {len(all_event_ids)} total, "
+            f"{len(unique_ids)} unique. Duplicates: "
+            f"{[eid for eid in all_event_ids if all_event_ids.count(eid) > 1]}"
+        )
 
 
 @pytest.mark.skipif(

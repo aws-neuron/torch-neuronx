@@ -130,8 +130,7 @@ class ToCopyNeuronImpl(OperationImplementation):
                 f"non_blocking={non_blocking}"
             )
             try:
-                # In case of D2D without CPU bounces, copies are not blocking.
-                write_neuron_to_neuron(result, self_tensor, non_blocking=True)
+                write_neuron_to_neuron(result, self_tensor)
             except Exception as e:
                 return ExecutionResult(success=False, error_msg=str(e))
             return ExecutionResult(success=True, output=result)

@@ -14,6 +14,7 @@
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
 #include "torch_neuronx/csrc/core/compilation/CacheEntry.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
@@ -58,23 +59,20 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   return false;
 }
 
-// Convert device KernelTypeEnum to array index (0-4) for completion tracking.
-// Only valid for device kernel types
-inline size_t GetDeviceKernelTypeIndex(KernelTypeEnum kernel_type) {
+// Convert device KernelTypeEnum to XU index for completion/inflight tracking.
+inline size_t GetXUIndex(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
-      return 0;
+      return NRTA_XU_COMPUTE;
     case KernelTypeEnum::kCollective:
-      return 1;
+      return NRTA_XU_COLLECTIVES;
     case KernelTypeEnum::kCopy:
-      return 2;
     case KernelTypeEnum::kWrite:
-      return 3;
     case KernelTypeEnum::kRead:
-      return 4;
+      return NRTA_XU_TENSOR_OP;
     default:
       TORCH_CHECK(false,
-                  "Invalid device kernel type for indexing: ", static_cast<int>(kernel_type));
+                  "Invalid device kernel type for XU indexing: ", static_cast<int>(kernel_type));
   }
 }
 
@@ -99,9 +97,6 @@ class NeuronKernelExecution {
   std::string GetOpName() const { return op_name_; }
   int GetDeviceId() const { return device_id_; }
 
-  // Execute kernel synchronously. Default calls ExecuteOrSchedule with nullptr (sync mode).
-  virtual void Execute() const { ExecuteOrSchedule(nullptr, nullptr, 0); }
-
   virtual bool RequiresCompilation() const = 0;
   virtual KernelTypeEnum GetKernelType() const = 0;
 
@@ -112,10 +107,10 @@ class NeuronKernelExecution {
   // collectives).
   virtual void Prepare() const {}
 
-  // Executes or schedules kernel. When err_tracker is nullptr, executes synchronously.
-  // When err_tracker is provided, schedules asynchronously and returns sequence_id.
-  virtual void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                                 c10::StreamId stream_id) const = 0;
+  // Schedules kernel for async execution.
+  // Returns true if work was submitted to NRT, false otherwise.
+  virtual bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                        c10::StreamId stream_id) const = 0;
 
   // Check if this operation requires Prepare() to be called before Dispatch()
   virtual bool RequiresPrepare() const { return false; }
@@ -270,8 +265,10 @@ class CompilableKernelExecution {
   // Cache management methods
   const std::vector<uint8_t>& GetCachedNeff() const { return *cached_neff_ptr_; }
   void SetCachedNeff(NeffBytesPtr neff_ptr) const { cached_neff_ptr_ = std::move(neff_ptr); }
-  const std::string& GetCacheKey() const { return cache_key_; }
-  void UpdateCacheKey(const std::string& new_cache_key) { cache_key_ = new_cache_key; }
+  const std::string& GetCacheKey() const { return cache_key_.GetKey(); }
+  const CompilationCacheKey& GetCompilationCacheKey() const { return cache_key_; }
+  void SetCompilationCacheKey(CompilationCacheKey key) { cache_key_ = std::move(key); }
+  void UpdateCacheKey(const std::string& new_key) { cache_key_.SetKey(new_key); }
   bool HasCachedNeff() const { return cached_neff_ptr_ != nullptr; }
   bool HasCollectives() const { return has_collectives_; }
   const std::string& GetAdditionalArgs() const { return additional_args_; }
@@ -293,24 +290,24 @@ class CompilableKernelExecution {
  protected:
   virtual bool ValidateImpl() const;
 
-  // Helper to build cache key that is aware of different compilation arguments.
-  static std::string GenerateCacheKey(const std::string& base_key,
-                                      const std::string& additional_args,
-                                      const std::string& optimization_level);
-
-  CompilableKernelExecution(const std::string& cache_key, const std::string& additional_args,
+  // Construct with a pre-computed CompilationCacheKey.
+  CompilableKernelExecution(CompilationCacheKey key, const std::string& additional_args,
                             const std::string& optimization_level, bool has_collectives)
-      : cache_key_(cache_key),
+      : cache_key_(std::move(key)),
+        additional_args_(additional_args),
+        optimization_level_(optimization_level),
+        has_collectives_(has_collectives) {}
+
+  // Construct from a key string
+  CompilableKernelExecution(const std::string& cache_key_str, const std::string& additional_args,
+                            const std::string& optimization_level, bool has_collectives)
+      : cache_key_(CompilationCacheKey(cache_key_str, additional_args, optimization_level)),
         additional_args_(additional_args),
         optimization_level_(optimization_level),
         has_collectives_(has_collectives) {}
 
  private:
-  // Creates a compiler-specific extension hash from compilation parameters.
-  static std::string CreateCompilerExtensionHash(const std::string& additional_args,
-                                                 const std::string& optimization_level);
-
-  std::string cache_key_;
+  CompilationCacheKey cache_key_;
   std::string additional_args_;
   std::string optimization_level_;
   mutable NeffBytesPtr cached_neff_ptr_;
@@ -339,11 +336,15 @@ class XLACompilableKernelExecution
   // Override to return HLO bytes for persistent cache key generation
   const std::vector<uint8_t>& GetHloBytes() const override { return hlo_bytes_; }
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
 
   // Update methods for in-place kernel modification, used in fast path pre-processing step.
-  void UpdateHloBytes(const std::vector<uint8_t>& new_hlo_bytes) { hlo_bytes_ = new_hlo_bytes; }
+  void UpdateHloBytes(const std::vector<uint8_t>& new_hlo_bytes) {
+    hlo_bytes_ = new_hlo_bytes;
+    // Invalidate cached persistent key if already computed.
+    GetCompilationCacheKey().InvalidateCachedStrings();
+  }
 
   const std::vector<TensorContext>& GetInputContexts() const { return GetSrcTensorContexts(); }
   const std::vector<TensorContext>& GetOutputContexts() const { return GetDstTensorContexts(); }
@@ -359,22 +360,21 @@ class XLACompilableKernelExecution
   std::vector<uint8_t> hlo_bytes_;
 };
 
-// torch.compile compilation kernels (StableHLO)
+// torch.compile compilation kernels.
 class CompileOnlyKernelExecution : public CompilableKernelExecution, public NeuronKernelExecution {
  public:
   CompileOnlyKernelExecution(const std::string& base_cache_key,
-                             const std::vector<uint8_t>& stablehlo_bytes, bool has_collectives);
+                             const std::vector<uint8_t>& mlir_bytes, bool has_collectives,
+                             bool use_tensorizer = false);
 
   std::vector<uint8_t> CompileToNeff() const override;
 
-  // Override to return StableHLO bytes for persistent cache key generation
-  const std::vector<uint8_t>& GetHloBytes() const override { return stablehlo_bytes_; }
+  const std::vector<uint8_t>& GetHloBytes() const override { return mlir_bytes_; }
 
-  // No-op. Currently in place due to OpExecutionEngine semantics.
-  // TODO: Dispatch reliably to Compile worker.
-  void Execute() const override {}
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override {}
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override {
+    return false;
+  }
 
   bool RequiresCompilation() const override { return true; }
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kHLO; }
@@ -389,7 +389,8 @@ class CompileOnlyKernelExecution : public CompilableKernelExecution, public Neur
   bool ValidateImpl() const override;
 
  private:
-  std::vector<uint8_t> stablehlo_bytes_;
+  std::vector<uint8_t> mlir_bytes_;
+  bool use_tensorizer_;
 };
 
 // NEFF execution kernel (torch.compile executor)
@@ -409,8 +410,8 @@ class NeffDirectKernelExecution
 
   std::vector<uint8_t> CompileToNeff() const override;
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
 
   // Forces a cache-lookup.
   // TODO: Expose CompileCache to Binding / Execution engine.
@@ -448,11 +449,12 @@ class CollectiveDirectKernelExecution
   c10d::ReduceOp GetReduceOp() const { return reduce_op_; }
   const std::vector<std::vector<int>>& GetReplicaGroups() const { return replica_groups_; }
   c10::ScalarType GetDtype() const { return dtype_; }
+  int GetMyRank() const { return my_rank_; }
+  const nrt::NRTCollectiveComm& GetComm() const { return comm_; }
 
-  void Execute() const override;
   void Prepare() const override;
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kCollective; }
   bool RequiresPrepare() const override { return true; }
 
@@ -492,9 +494,10 @@ class HintDirectKernelExecution : public NeuronKernelExecution {
   HintDirectKernelExecution(const std::string& op_name, void* ptr, size_t size_bytes, int device_id,
                             HintType hint_type);
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override {
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override {
     // No-op for hints - nothing to execute or schedule
+    return false;
   }
   bool RequiresCompilation() const override { return false; }
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kHint; }
@@ -520,8 +523,8 @@ class CopyDirectKernelExecution
                             TensorDataRef dst_ref, size_t src_offset_bytes, size_t dst_offset_bytes,
                             size_t size_bytes, int device_id);
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
 
  protected:
   bool ValidateImpl() const override;
@@ -550,8 +553,8 @@ class WriteDirectKernelExecution
                              TensorDataRef dst_ref, size_t dst_offset_bytes, c10::ScalarType dtype,
                              int device_id);
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
 
   // Allocate bounce buffer for non-blocking writes.
   void* AllocateBounceBuffer(size_t size_bytes);
@@ -572,8 +575,8 @@ class ReadDirectKernelExecution
   ReadDirectKernelExecution(const std::string& op_name, TensorDataRef src_ref, void* dst_ptr,
                             size_t src_offset_bytes, size_t src_size_bytes, int device_id);
 
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
 
  protected:
   bool ValidateImpl() const override;
@@ -593,16 +596,16 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   EventDirectKernelExecution(const std::string& op_name, const NeuronEvent& event,
                              EventAction action, int device_id);
 
-  // Events are host-side operations - ExecuteOrSchedule handles sync execution
-  void ExecuteOrSchedule(nrt::ErrorTrackerHandle* err_tracker, nrt::SequenceId* sequence_id,
-                         c10::StreamId stream_id) const override;
+  // Events are host-side operations - Schedule handles async execution
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
   bool RequiresCompilation() const override { return false; }
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kEvent; }
 
   // Event-specific methods
   EventAction GetEventAction() const { return action_; }
   const NeuronEvent& GetEvent() const { return event_; }
-  bool IsReady() const;
+  virtual bool IsReady() const;
 
  protected:
   bool ValidateImpl() const override;

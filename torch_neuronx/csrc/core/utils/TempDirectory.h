@@ -4,11 +4,13 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace at::neuron {
 
@@ -56,6 +58,12 @@ class TempDirectory {
 
   // Returns the path as a std::filesystem::path
   std::filesystem::path fs_path() const { return std::filesystem::path(path_); }
+
+  // Writes bytes to a file within this temp directory.
+  void WriteFile(const std::string& filename, const std::vector<uint8_t>& bytes) const;
+
+  // Reads a file within this temp directory as bytes.
+  std::vector<uint8_t> ReadFile(const std::string& filename) const;
 
  private:
   void Cleanup() {

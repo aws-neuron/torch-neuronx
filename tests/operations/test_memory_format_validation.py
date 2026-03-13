@@ -1,23 +1,34 @@
-import os
-
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
 
 
-@pytest.mark.skipif(
-    os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") != "1",
-    reason="Error message for Neuron execution only",
-)
-@assert_raises(
-    RuntimeError, match="Neuron tensors only support contiguous or preserve memory format"
-)
-def test_contiguous_rejects_channels_last_on_neuron():
+def test_contiguous_channels_last_on_neuron():
+    """channels_last contiguous should produce a tensor with NHWC strides."""
     x = torch.randn(2, 3, 4, 5, device="neuron:0")
-    # Use both Python API and dispatcher op form are equivalent here
-    x.contiguous(memory_format=torch.channels_last)
+    y = x.contiguous(memory_format=torch.channels_last)
+    assert y.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(
+        y.to("cpu"), x.to("cpu").contiguous(memory_format=torch.channels_last)
+    )
+
+
+def test_contiguous_channels_last_3d_on_neuron():
+    """channels_last_3d contiguous should produce a tensor with NDHWC strides."""
+    x = torch.randn(2, 3, 4, 5, 6, device="neuron:0")
+    y = x.contiguous(memory_format=torch.channels_last_3d)
+    assert y.is_contiguous(memory_format=torch.channels_last_3d)
+    torch.testing.assert_close(
+        y.to("cpu"), x.to("cpu").contiguous(memory_format=torch.channels_last_3d)
+    )
+
+
+def test_contiguous_channels_last_already_channels_last():
+    """If tensor is already channels_last, return as-is (no copy)."""
+    x = torch.empty(2, 3, 4, 5, device="neuron:0", memory_format=torch.channels_last)
+    y = x.contiguous(memory_format=torch.channels_last)
+    assert y.data_ptr() == x.data_ptr()
 
 
 def test_contiguous_accepts_preserve_format_on_neuron():

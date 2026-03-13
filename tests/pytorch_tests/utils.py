@@ -23,6 +23,57 @@ logger = logging.getLogger(__name__)
 pytorch_tests_dir = Path("tests/pytorch_tests")
 
 
+def _apply_opinfo_patches():
+    """Patch OpInfo to filter complex dtypes for Neuron."""
+    import torch
+    from torch.testing._internal.common_device_type import DeviceTypeTestBase
+    from torch.testing._internal.opinfo.core import OpInfo
+
+    # Skip if already patched
+    if getattr(OpInfo.supported_dtypes, "_neuron_patched", False):
+        return
+
+    complex_dtypes = frozenset({torch.complex32, torch.complex64, torch.complex128})
+
+    orig_supported_dtypes = OpInfo.supported_dtypes
+    orig_supported_backward_dtypes = OpInfo.supported_backward_dtypes
+
+    def patched_supported_dtypes(self, device_type):
+        result = orig_supported_dtypes(self, device_type)
+        if device_type in ("privateuse1", "neuron"):
+            return result - complex_dtypes
+        return result
+
+    def patched_supported_backward_dtypes(self, device_type):
+        result = orig_supported_backward_dtypes(self, device_type)
+        if device_type in ("privateuse1", "neuron"):
+            return result - complex_dtypes
+        return result
+
+    patched_supported_dtypes._neuron_patched = True
+    OpInfo.supported_dtypes = patched_supported_dtypes
+    OpInfo.supported_backward_dtypes = patched_supported_backward_dtypes
+
+    orig_get_dtypes = DeviceTypeTestBase._get_dtypes
+
+    @classmethod
+    def patched_get_dtypes(cls, test):
+        result = orig_get_dtypes.__func__(cls, test)
+        if result is None or cls.device_type not in ("privateuse1", "neuron"):
+            return result
+        filtered = tuple(
+            d
+            for d in result
+            if not (
+                d in complex_dtypes
+                or (isinstance(d, tuple) and any(x in complex_dtypes for x in d))
+            )
+        )
+        return filtered or None
+
+    DeviceTypeTestBase._get_dtypes = patched_get_dtypes
+
+
 @dataclass
 class PytorchTestConfig:
     """Configuration for a single test file/class combination."""
@@ -120,6 +171,13 @@ def _create_test_config(
 
     normalized_skip_tests = _normalize_skip_tests_format(config.get("skip_tests", []))
 
+    # Handle skip_class - mark all tests in class as skipped
+    if config.get("skip_class"):
+        skip_reason = config.get("skip_reason", "Class skipped")
+        logger.info(f"Skipping entire class {class_name}: {skip_reason}")
+        class_skip_tests = [{method: {"reason": skip_reason}} for method in test_methods]
+        normalized_skip_tests.extend(class_skip_tests)
+
     if normalized_skip_tests:
         skip_test_names = set()
         default_skip_reason = "No reason provided, should provide valid reason to skip test"
@@ -132,7 +190,8 @@ def _create_test_config(
 
         # Remove skipped tests from the methods list unless collect_skipped_tests is True
         # When True, tests remain in list and pytest.mark.skip is applied in test wrapper
-        if not collect_skipped_tests:
+        # For skip_class, always keep tests to show them as skipped
+        if not collect_skipped_tests and not config.get("skip_class"):
             test_methods = [method for method in test_methods if method not in skip_test_names]
             logger.info(
                 f"After applying skip_tests filter, {len(test_methods)} test methods remain"
@@ -269,7 +328,6 @@ def _process_single_test_configuration(
     sanity_pt_distributed_tests: bool = False,
     collect_skipped_tests: bool = False,
 ) -> list[PytorchTestConfig]:
-    # Skip if distributed flag doesn't match
     test_file_name = config["file"]
     test_class_name = config.get("class")
     specified_methods = config.get("methods")

@@ -264,8 +264,7 @@ class CopyNeuronImpl(OperationImplementation):
         try:
             from .cast_policy import write_neuron_to_neuron
 
-            # In case of D2D without CPU bounces, copies are not blocking.
-            write_neuron_to_neuron(dst, src, non_blocking=True)
+            write_neuron_to_neuron(dst, src)
             return ExecutionResult(success=True, output=dst)
         except Exception as e:
             return ExecutionResult(success=False, error_msg=str(e))

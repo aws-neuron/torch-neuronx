@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
@@ -55,15 +56,10 @@ class OperationExecutionEngine {
   // Execution queue depth management
   int64_t GetExecutionQueueDepth() const { return execution_queue_depth_.load(); }
   int64_t GetQueueLowThreshold() const { return queue_low_threshold_; }
+  void DecrementExecutionQueueDepth(OperationContext* operation);
 
   // Check if concatenation is enabled via environment variable
   bool IsConcatenationEnabled() const;
-
-  // Check if async NRT mode is enabled
-  bool IsNRTAsyncModeEnabled() const { return nrt_async_mode_enabled_; }
-
-  // Set async NRT mode (for testing purposes)
-  void SetAsyncModeEnabled(bool enabled) { nrt_async_mode_enabled_ = enabled; }
 
   // Handle concatenation failure - called by StreamImpl during error handling
   void HandleConcatenationFailure(OperationContext* operation);
@@ -93,8 +89,6 @@ class OperationExecutionEngine {
   // Shutdown coordination
   std::atomic<bool> shutdown_requested_{false};
 
-  bool nrt_async_mode_enabled_{false};
-
   // Shared resources (accessed through resource manager)
   CompilationCache* compilation_cache_{nullptr};
   ModelHandleCache* model_handle_cache_{nullptr};
@@ -105,7 +99,6 @@ class OperationExecutionEngine {
   // Worker thread implementations
   void ConcatenationWorker();
   void CompilationWorker();
-  void ExecutionWorker();
   void AsyncExecutionWorker();
 
   // Async execution helpers
@@ -117,20 +110,14 @@ class OperationExecutionEngine {
   // Process a single async execution task (schedule without waiting)
   void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
 
-  // Async scheduling helpers
-  bool ScheduleDeviceOperation(OperationContext* op, StreamImpl* stream,
-                               KernelTypeEnum kernel_type);
-  bool ScheduleHostOperation(OperationContext* op, StreamImpl* stream);
-  void ProcessAsyncErrors(StreamImpl* stream, c10::DeviceIndex device_idx);
+  // Async scheduling helper
+  bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
 
   // Preprocessing helpers prologue attached with operations if needed
   void ProcessPreprocessingTask(OperationContext* operation);
 
-  // Execute operation, handling concatenation logic internally
-  void ExecuteOperation(OperationContext* operation);
-
-  // Handle execution when operation has a concatenated operation
-  void ExecuteConcatenatedOperation(OperationContext* operation);
+  // Shared completion logic for both sync and async compilation paths.
+  void HandleCompilationComplete(OperationContext* operation);
 
   // Handle execution failure for concatenated operations
   // Returns true if this was a concatenated op failure that requires retry
@@ -140,13 +127,17 @@ class OperationExecutionEngine {
  protected:
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
-  virtual void ProcessExecutionTask(OperationContext* operation) noexcept;
-  void ProcessCompletions(StreamImpl* stream, const nrt::CompletionState& completion_state);
-  void DecrementExecutionQueueDepth();
+  void ProcessCompletions(StreamImpl* stream);
   std::atomic<int64_t> execution_queue_depth_{0};
 
   // Track pending async operations count to avoid expensive iteration
   std::atomic<int> pending_async_ops_count_{0};
+
+  // Per-device per-XU count of inflight operations.
+  int xu_inflight_counts_[kMaxDevices][NRTA_XU_TYPE_NUM]{};
+
+  // Configurable max inflight per XU
+  size_t max_inflight_per_xu_{kDefaultMaxInflightPerXU};
 };
 
 }  // namespace at::neuron

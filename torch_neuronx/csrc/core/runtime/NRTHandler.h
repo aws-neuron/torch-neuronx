@@ -60,7 +60,7 @@ class NRTHandler {
    * @param inputs Input tensor pointers
    * @param outputs Output tensor pointers
    * @param config Execution configuration
-   * @param err_tracker Error tracker pointer for nrt-async mode (nullptr for nrt-sync)
+   * @param nrt_status NRT status
    * @param sequence_id Output sequence number for nrt-async mode (nullptr for nrt-sync)
    * @param stream_id Stream ID for queue selection in nrt-async mode
    */
@@ -68,7 +68,7 @@ class NRTHandler {
                                      const std::vector<nrt_tensor_t*>& inputs,
                                      const std::vector<nrt_tensor_t*>& outputs,
                                      const ExecutionConfig& config,
-                                     nrt::ErrorTrackerHandle* err_tracker = nullptr,
+                                     NRT_STATUS* nrt_status = nullptr,
                                      nrt::SequenceId* sequence_id = nullptr,
                                      c10::StreamId stream_id = 0);
 

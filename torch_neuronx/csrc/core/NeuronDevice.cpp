@@ -281,4 +281,6 @@ void reset_distributed_state() {
   rank_vnc_count = -1;
 }
 
+bool is_distributed_initialized() { return world_size != -1; }
+
 }  // namespace c10_neuron

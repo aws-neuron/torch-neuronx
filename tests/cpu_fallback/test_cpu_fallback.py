@@ -310,3 +310,30 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             assert torch.allclose(result.to("cpu"), torch.full((2, 3), 5.0))
             assert_op_falls_back_on_cpu("aten::fill_.Scalar")
+
+    def test_nonzero_offset_src(self):
+        """Test CPU fallback with non-zero storage offset src tensor."""
+        base = torch.randn(4, 6, device="neuron")
+        x = base[1:3, :]
+        index = torch.tensor([0, 2], dtype=torch.int64, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.index_select(x, 1, index)
+            assert result.shape == (2, 2)
+            assert result.device.type == "neuron"
+            expected = base[1:3, :].to("cpu").index_select(1, index.to("cpu"))
+            assert torch.allclose(result.to("cpu"), expected)
+            assert_op_falls_back_on_cpu("aten::index_select")
+
+    def test_nonzero_offset_dst(self):
+        """Test CPU fallback with non-zero storage offset dst tensor."""
+        base = torch.randn(4, 6, device="neuron")
+        expected_base = base.to("cpu").clone()
+        view = base[2:4, :]
+
+        with track_neuron_ops():
+            view.fill_(42.0)
+            expected_base[2:4, :].fill_(42.0)
+            assert base.device.type == "neuron"
+            assert torch.allclose(base.to("cpu"), expected_base)
+            assert_op_falls_back_on_cpu("aten::fill_.Scalar")

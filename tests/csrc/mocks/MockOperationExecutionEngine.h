@@ -17,17 +17,10 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
                                ModelHandleCache* model_handle_cache)
       : OperationExecutionEngine(compilation_cache, model_handle_cache) {}
 
+  using OperationExecutionEngine::DecrementExecutionQueueDepth;
   using OperationExecutionEngine::execution_queue_depth_;
   using OperationExecutionEngine::pending_async_ops_count_;
   using OperationExecutionEngine::ProcessCompletions;
-
- protected:
-  void ProcessExecutionTask(OperationContext* operation) noexcept override {
-    auto* stream = operation->stream;
-    operation->StartExecution();
-    operation->execute_end = std::chrono::steady_clock::now();
-    stream->CompleteOperation(operation);
-  }
 };
 
 // Wrapper for backward compatibility

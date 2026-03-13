@@ -1,6 +1,12 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load(":test_utils.bzl", "torch_neuronx_cc_test")
 
+# Test suite that includes all cc_test targets in this package.
+# New tests added here are automatically included - no need to update //:cpp_unit_tests
+test_suite(
+    name = "all_tests",
+    visibility = ["//visibility:public"],
+)
 
 # Test mocks library - shared mock sources for all tests
 cc_library(
@@ -30,6 +36,12 @@ cc_library(
 torch_neuronx_cc_test(
     name = "NeuronDeviceTest",
     srcs = ["core/NeuronDeviceTest.cpp"],
+    deps = ["//:device"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronGuardImplTest",
+    srcs = ["core/NeuronGuardImplTest.cpp"],
     deps = ["//:device"],
 )
 
@@ -64,8 +76,20 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "TensorizerCompilerTest",
+    srcs = ["core/compilation/experimental/TensorizerCompilerTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronCompilerTest",
     srcs = ["core/compilation/NeuronCompilerTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
+    name = "CompilerDebugUtilsTest",
+    srcs = ["core/compilation/CompilerDebugUtilsTest.cpp"],
     deps = ["//:compilation"],
 )
 
@@ -82,6 +106,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "CompilationCacheKeyTest",
+    srcs = ["core/cache/CompilationCacheKeyTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
     name = "ModelHandleCacheTest",
     srcs = ["core/runtime/ModelHandleCacheTest.cpp"],
     deps = ["//:runtime"],
@@ -91,6 +121,13 @@ torch_neuronx_cc_test(
     name = "NeuronCachingAllocatorTest",
     srcs = ["core/allocator/NeuronCachingAllocatorTest.cpp"],
     deps = ["//:runtime", "//:distributed"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronHostAllocatorTest",
+    srcs = ["core/allocator/NeuronHostAllocatorTest.cpp"],
+    deps = ["//:runtime"],
+    tags = ["manual"],  # TODO: Fix - RecordEventReturnsTrueForKnownPtr needs stream pool init
 )
 
 torch_neuronx_cc_test(
@@ -174,6 +211,12 @@ torch_neuronx_cc_test(
 torch_neuronx_cc_test(
     name = "TransposeOpBuilderTest",
     srcs = ["core/opbuilder/module_builder/TransposeOpBuilderTest.cpp"],
+    deps = ["//:opbuilder"],
+)
+
+torch_neuronx_cc_test(
+    name = "BroadcastOpBuilderTest",
+    srcs = ["core/opbuilder/module_builder/BroadcastOpBuilderTest.cpp"],
     deps = ["//:opbuilder"],
 )
 
@@ -445,10 +488,46 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
-    name = "FunctionPruneUtilsTest",
+name = "FunctionPruneUtilsTest",
     srcs = ["core/concatenation/FunctionPruneUtilsTest.cpp"],
     deps = [
         "//:concatenation",
         "//:opbuilder",
     ],
+)
+
+torch_neuronx_cc_test(
+    name = "ServiceProtocolTest",
+    srcs = ["core/compilation/service/ServiceProtocolTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronCompilationServiceTest",
+    srcs = ["core/compilation/service/NeuronCompilationServiceTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
+    name = "LocalCompilationBackendTest",
+    srcs = ["core/compilation/LocalCompilationBackendTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
+    name = "CompilationThreadPoolTest",
+    srcs = ["core/compilation/CompilationThreadPoolTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronOpTrackingTest",
+    srcs = ["core/concatenation/NeuronOpTrackingTest.cpp"],
+    deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronMemorySnapshotTest",
+    srcs = ["core/metrics/NeuronMemorySnapshotTest.cpp"],
+    deps = ["//:runtime"],
 )

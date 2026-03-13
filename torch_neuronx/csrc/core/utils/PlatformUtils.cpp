@@ -91,13 +91,5 @@ std::string GetLogicalNeuronCores() {
   return GetPlatformConfig().logical_cores;
 }
 
-bool IsSyncModeEnabled() {
-  static bool is_sync_mode_enabled = []() {
-    const char* sync_mode = std::getenv("NEURON_LAUNCH_BLOCKING");
-    return sync_mode != nullptr && strcmp(sync_mode, "1") == 0;
-  }();
-  return is_sync_mode_enabled;
-}
-
 }  // namespace utils
 }  // namespace at::neuron

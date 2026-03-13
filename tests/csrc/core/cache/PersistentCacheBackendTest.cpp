@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "torch_neuronx/csrc/core/cache/CacheUtils.h"
+#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
 #include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/utils/TempDirectory.h"
 
@@ -41,9 +42,15 @@ class PersistentCacheBackendTest : public ::testing::Test {
 
   std::filesystem::path test_dir() const { return temp_dir_->fs_path(); }
 
-  // Helper to create a valid XXH3_128 cache key (32 hex chars)
+  // Helper to create a valid XXH3_128 cache key (32 hex chars).
+  // Uses CompilationCacheKey to mirror the persistent key path.
   std::string MakeCacheKey(const std::string& base_key, const std::vector<uint8_t>& ir_bytes = {}) {
-    return cache_utils::MakePersistentCacheKey(base_key, ir_bytes);
+    // Use base_key as HLO bytes when no explicit ir_bytes provided
+    std::vector<uint8_t> hlo =
+        ir_bytes.empty() ? std::vector<uint8_t>(base_key.begin(), base_key.end()) : ir_bytes;
+    auto key = CompilationCacheKey(base_key, "", "", &hlo);
+    const std::string* pk = key.GetPersistentKey();
+    return pk ? *pk : std::string();
   }
 
   std::unique_ptr<TempDirectory> temp_dir_;
@@ -154,8 +161,8 @@ TEST_F(PersistentCacheBackendTest, DifferentIRBytesDifferentKeys) {
   std::vector<uint8_t> ir1 = {0x01, 0x02, 0x03};  // Version 1 IR
   std::vector<uint8_t> ir2 = {0x04, 0x05, 0x06};  // Version 2 IR
 
-  std::string key1 = cache_utils::MakePersistentCacheKey(base_key, ir1);
-  std::string key2 = cache_utils::MakePersistentCacheKey(base_key, ir2);
+  std::string key1 = MakeCacheKey(base_key, ir1);
+  std::string key2 = MakeCacheKey(base_key, ir2);
 
   std::vector<uint8_t> data1 = {0xAA};
   std::vector<uint8_t> data2 = {0xBB};
@@ -178,8 +185,8 @@ TEST_F(PersistentCacheBackendTest, ConsistentKeyGeneration) {
   std::string base_key = "consistent_test";
   std::vector<uint8_t> ir = {0xDE, 0xAD, 0xBE, 0xEF};
 
-  std::string key1 = cache_utils::MakePersistentCacheKey(base_key, ir);
-  std::string key2 = cache_utils::MakePersistentCacheKey(base_key, ir);
+  std::string key1 = MakeCacheKey(base_key, ir);
+  std::string key2 = MakeCacheKey(base_key, ir);
 
   EXPECT_EQ(key1, key2);
 

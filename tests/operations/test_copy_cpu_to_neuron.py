@@ -103,6 +103,51 @@ class TestAsyncCopySafety:
 
         assert torch.allclose(dst.cpu(), expected, rtol=1e-5)
 
+    def test_nonblocking_h2d_pinned_source(self):
+        size = 1_000_000
+        src = torch.empty(size).pin_memory(device="neuron")
+        src.copy_(torch.randn(size))
+        dst = torch.empty(size, device="neuron")
+        expected = src.clone()
+
+        dst.copy_(src, non_blocking=True)
+
+        torch.neuron.synchronize()
+        assert torch.allclose(dst.cpu(), expected, rtol=1e-5)
+
+    def test_nonblocking_h2d_pinned_source_deletion(self):
+        size = 1_000_000
+        dst = torch.empty(size, device="neuron")
+
+        def create_and_copy():
+            src = torch.empty(size).pin_memory(device="neuron")
+            src.copy_(torch.randn(size))
+            expected = src.clone()
+            dst.copy_(src, non_blocking=True)
+            return expected
+
+        expected = create_and_copy()
+        torch.neuron.synchronize()
+        assert torch.allclose(dst.cpu(), expected, rtol=1e-5)
+
+    def test_nonblocking_h2d_pinned_multiple_concurrent(self):
+        n_copies = 10
+        size = 100_000
+
+        srcs = [torch.empty(size).pin_memory(device="neuron") for _ in range(n_copies)]
+        for src in srcs:
+            src.copy_(torch.randn(size))
+        dsts = [torch.empty(size, device="neuron") for _ in range(n_copies)]
+        expecteds = [src.clone() for src in srcs]
+
+        for src, dst in zip(srcs, dsts, strict=False):
+            dst.copy_(src, non_blocking=True)
+
+        torch.neuron.synchronize()
+
+        for i, (dst, expected) in enumerate(zip(dsts, expecteds, strict=False)):
+            assert torch.allclose(dst.cpu(), expected, rtol=1e-5), f"Copy {i} corrupted"
+
     def test_empty_tensor_copy(self):
         src = torch.empty(0, device="cpu")
         dst = torch.empty(0, device="neuron")

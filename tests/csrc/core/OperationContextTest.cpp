@@ -491,6 +491,55 @@ TEST_F(OperationContextTest, RequiresPrepareDefaultsFalse) {
   EXPECT_FALSE(context.RequiresPrepare());
 }
 
+// ============================================================================
+// Event Kernel IsSchedulable Tests
+// Events require BOTH MarkExecutionReady AND event.IsReady() for IsSchedulable
+// ============================================================================
+
+TEST_F(OperationContextTest, EventKernelIsSchedulableRequiresBothExecutionReadyAndEventReady) {
+  using ::testing::Return;
+
+  auto kernel = std::make_unique<MockEventDirectKernelExecution>(
+      "test_event_wait", EventDirectKernelExecution::EventAction::kWait, 0);
+
+  // Initially: event is not ready, execution is not ready
+  EXPECT_CALL(*kernel, IsReady()).WillRepeatedly(Return(false));
+
+  OperationContext context(std::move(kernel));
+
+  // Case 1: Neither execution ready nor event ready → NOT schedulable
+  EXPECT_FALSE(context.IsExecutionReady());
+  EXPECT_FALSE(context.IsSchedulable());
+
+  // Case 2: Execution ready but event not ready → NOT schedulable
+  context.MarkExecutionReady();
+  EXPECT_TRUE(context.IsExecutionReady());
+  EXPECT_FALSE(context.IsSchedulable());
+}
+
+TEST_F(OperationContextTest, EventKernelIsSchedulableWhenBothConditionsMet) {
+  using ::testing::Return;
+
+  auto kernel = std::make_unique<MockEventDirectKernelExecution>(
+      "test_event_wait", EventDirectKernelExecution::EventAction::kWait, 0);
+
+  // Event IS ready
+  EXPECT_CALL(*kernel, IsReady()).WillRepeatedly(Return(true));
+
+  OperationContext context(std::move(kernel));
+
+  // Even though the event is ready, without MarkExecutionReady() it should NOT be schedulable
+  // This ensures all kernel types go through the execution pipeline before being scheduled
+  // Case 1: Event ready but execution not ready → NOT schedulable
+  EXPECT_FALSE(context.IsExecutionReady());
+  EXPECT_FALSE(context.IsSchedulable());
+
+  // Case 2: Both execution ready AND event ready → IS schedulable
+  context.MarkExecutionReady();
+  EXPECT_TRUE(context.IsExecutionReady());
+  EXPECT_TRUE(context.IsSchedulable());
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

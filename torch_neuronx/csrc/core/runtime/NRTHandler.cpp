@@ -35,12 +35,10 @@ namespace at::neuron {
 void NRTHandler::DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>& model,
                                         const std::vector<nrt_tensor_t*>& src_data_ptrs,
                                         const std::vector<nrt_tensor_t*>& dst_data_ptrs,
-                                        const ExecutionConfig& config,
-                                        nrt::ErrorTrackerHandle* err_tracker,
+                                        const ExecutionConfig& config, NRT_STATUS* nrt_status,
                                         nrt::SequenceId* sequence_id, c10::StreamId stream_id) {
-  bool is_async = (err_tracker != nullptr);
   TORCH_NEURONX_DEBUG("NRTHandler dispatching model execution", "device_id=", config.device_id,
-                      "num_cores=", config.num_cores, "async=", is_async);
+                      "num_cores=", config.num_cores);
   // Prepare tensor sets for NRT execution
   auto input_set = nrt::CreateTensorSet();
   auto output_set = nrt::CreateTensorSet();
@@ -48,11 +46,10 @@ void NRTHandler::DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>&
   PrepareInputTensorSet(src_data_ptrs, input_set);
   PrepareOutputTensorSet(dst_data_ptrs, output_set);
 
-  // Queue parameter is not used yet; always use queue 0
-  constexpr int kDefaultQueue = 0;
-  NRT_CHECK_STATUS(nrt::DispatchExecution(model.get(), input_set.get(), output_set.get(),
-                                          kDefaultQueue, err_tracker, sequence_id),
-                   is_async ? "NRT model async scheduling failed" : "NRT model execution failed");
+  int queue = nrt::GetHardwareQueue(NRTA_XU_COMPUTE, stream_id);
+  NRT_CHECK_STATUS(nrt::DispatchExecution(model.get(), input_set.get(), output_set.get(), queue,
+                                          nrt_status, sequence_id),
+                   "NRT model scheduling failed");
 }
 
 void NRTHandler::PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,

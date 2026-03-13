@@ -48,8 +48,10 @@ def _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir):
             capture_output=True,
         )
 
-        # Configure sparse checkout for test directory only
-        subprocess.run(["git", "sparse-checkout", "set", "test"], cwd=temp_path, check=True)
+        # Configure sparse checkout for test and tools/stats directories
+        subprocess.run(
+            ["git", "sparse-checkout", "set", "test", "tools/stats"], cwd=temp_path, check=True
+        )
 
         # Move test directory to final location
         source_test_dir = temp_path / "test"
@@ -61,6 +63,15 @@ def _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir):
         except FileExistsError:
             # Another worker already renamed the temp directory, skip this
             print(f"Directory {test_dir} already exists, skipping.")
+
+        # Move tools directory to final location
+        source_tools_dir = temp_path / "tools"
+        tools_dir = pytorch_tests_dir / "tools"
+        if source_tools_dir.exists():
+            try:
+                source_tools_dir.rename(tools_dir)
+            except FileExistsError:
+                print(f"Directory {tools_dir} already exists, skipping.")
 
 
 def clone_pytorch_tests(torch_version=None):

@@ -38,16 +38,19 @@ def is_64bit(dtype: torch.dtype | None) -> bool:
 def validate_neuron_memory_format(memory_format: torch.memory_format | None, op_name: str) -> None:
     """Validate memory format constraints for Neuron tensors.
 
-    Only contiguous or preserve formats are supported for now.
+    Supported formats: contiguous, preserve, channels_last, channels_last_3d.
     Raise a clear error otherwise.
     """
     if memory_format is None:
         return
-    if memory_format in (torch.contiguous_format, torch.preserve_format):
+    if memory_format in (
+        torch.contiguous_format,
+        torch.preserve_format,
+        torch.channels_last,
+        torch.channels_last_3d,
+    ):
         return
-    raise RuntimeError(
-        f"{op_name}: Neuron tensors only support contiguous or preserve memory format"
-    )
+    raise RuntimeError(f"{op_name}: Neuron tensors do not support {memory_format} memory format")
 
 
 def ensure_contiguous_on_device(t: torch.Tensor) -> torch.Tensor:
@@ -102,7 +105,9 @@ def copy_neuron_to_cpu(
 
     if not neuron_src.is_contiguous():
         neuron_src = ensure_contiguous_on_device(neuron_src)
-    cpu_tmp = io_tensor.empty(neuron_src.shape, dtype=neuron_src.dtype, device="cpu")
+    cpu_tmp = io_tensor.empty(
+        neuron_src.shape, dtype=neuron_src.dtype, device="cpu", pin_memory=non_blocking
+    )
     _C._nrt_copy_neuron_to_cpu_tensor(neuron_src, cpu_tmp, non_blocking=non_blocking)
     if target_dtype is not None and target_dtype != cpu_tmp.dtype:
         cpu_tmp = cpu_tmp.to(target_dtype)
@@ -129,14 +134,12 @@ def prepare_src_for_neuron_to_neuron_copy(src: torch.Tensor, dst: torch.Tensor) 
     )
 
 
-def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = True) -> None:
+def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor) -> None:
     """In-place copy/cast from Neuron tensor `src` to Neuron tensor `dst`.
 
     - If dtypes match: direct NRT device copy.
     - If 64-bit is involved (src or dst): CPU bounce for cast (Neuron lacks 64-bit).
     - Else: device-side cast kernel for <=32-bit dtypes.
-
-    NOTE: By default, this is non-blocking, unless there is a CPU bounce.
     """
     import torch_neuronx._C as _C  # local import
 
@@ -167,7 +170,7 @@ def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor, non_blocking: b
     if dst.dtype == src.dtype:
         # Enforce contiguity/layout policy even for same-dtype copies
         src_prepared = prepare_src_for_neuron_to_neuron_copy(src, dst)
-        _C._nrt_copy_neuron_to_neuron_tensor(src_prepared, dst, non_blocking=non_blocking)
+        _C._nrt_copy_neuron_to_neuron_tensor(src_prepared, dst)
         return
 
     if is_64bit(dst.dtype) or is_64bit(src.dtype):
@@ -181,7 +184,7 @@ def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor, non_blocking: b
     # Local import to avoid cycles and heavy deps
     from torch_neuronx.python_ops.device_cast import device_cast_neuron_to_neuron
 
-    device_cast_neuron_to_neuron(src_prepared, dst, non_blocking=non_blocking)
+    device_cast_neuron_to_neuron(src_prepared, dst)
 
 
 def _get_permutation_from_strides(shape: tuple, strides: tuple) -> list | None:
@@ -233,7 +236,7 @@ def _write_to_noncontiguous_neuron(dst: torch.Tensor, src: torch.Tensor) -> None
 
     if dst.is_contiguous():
         # Fast path
-        _C._nrt_copy_neuron_to_neuron_tensor(src, dst, non_blocking=True)
+        _C._nrt_copy_neuron_to_neuron_tensor(src, dst)
         return
 
     # Try XLA-based approach for transpose patterns
@@ -249,7 +252,7 @@ def _write_to_noncontiguous_neuron(dst: torch.Tensor, src: torch.Tensor) -> None
             dst_flat = dst.as_strided((dst_storage_size,), (1,), 0)
             src_flat = src_permuted.view(-1)
 
-            _C._nrt_copy_neuron_to_neuron_tensor(src_flat, dst_flat, non_blocking=True)
+            _C._nrt_copy_neuron_to_neuron_tensor(src_flat, dst_flat)
             return
     except RuntimeError:
         pass  # Fall through to CPU fallback

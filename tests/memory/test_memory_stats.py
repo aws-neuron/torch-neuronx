@@ -85,10 +85,14 @@ class TestMemoryStats:
     def test_max_memory_allocated_tracks_peak(self):
         """Test that max_memory_allocated() tracks peak allocation."""
         # Allocate a tensor
+        initial = torch_neuronx.memory_allocated()
+
         x = torch.randn(1024, device="neuron")
         torch_neuronx.synchronize()
 
         peak_with_tensor = torch_neuronx.max_memory_allocated()
+        allocated_with_tensor = torch_neuronx.memory_allocated()
+        assert allocated_with_tensor > initial
 
         # Delete tensor
         del x
@@ -99,8 +103,8 @@ class TestMemoryStats:
 
         # Peak should remain at the high water mark
         assert peak_after_del >= peak_with_tensor
-        # Current should be less than peak after deletion
-        assert current_after_del <= peak_after_del
+        # Current must drop after deletion (memory was actually freed)
+        assert current_after_del < allocated_with_tensor
 
     def test_reset_peak_memory_stats_resets_peaks(self):
         """Test that reset_peak_memory_stats() resets peak to current."""
@@ -223,3 +227,30 @@ class TestMemoryStats:
 
         # Clean up
         del tensors
+
+    def test_sequential_ops_free_intermediate_tensors(self):
+        """Test that intermediate tensors from sequential ops are freed."""
+        baseline = torch_neuronx.memory_allocated()
+
+        # Run two ops that reuse the same cached kernel (aten::add)
+        a = torch.randn(1024, device="neuron")
+        b = a + a
+        del a
+        torch_neuronx.synchronize()
+
+        # Only b should be alive
+        mem_one = torch_neuronx.memory_allocated()
+
+        c = b + b
+        del b
+        torch_neuronx.synchronize()
+
+        # Only c should be alive — b's memory must be freed
+        mem_two = torch_neuronx.memory_allocated()
+        assert mem_two <= mem_one
+
+        del c
+        torch_neuronx.synchronize()
+
+        mem_final = torch_neuronx.memory_allocated()
+        assert mem_final <= baseline

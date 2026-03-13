@@ -142,7 +142,7 @@ class ContiguousTransposeImpl(OperationImplementation):
         This implementation can handle:
         1. Tensors that are already on the Neuron device
         2. Non-contiguous tensors that are permutations of contiguous tensors
-        3. Standard contiguous memory format (not channels_last, etc.)
+        3. Contiguous, preserve, channels_last, and channels_last_3d memory formats
         """
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
@@ -151,13 +151,18 @@ class ContiguousTransposeImpl(OperationImplementation):
             return False
 
         # Only handle contiguous or preserve formats (validation happens at entry)
-        if memory_format is not None and (
-            memory_format != torch.contiguous_format and memory_format != torch.preserve_format
+        if memory_format is not None and memory_format not in (
+            torch.contiguous_format,
+            torch.preserve_format,
+            torch.channels_last,
+            torch.channels_last_3d,
         ):
             return False
 
-        # If already contiguous, we don't need to handle it
-        if self_tensor.is_contiguous(memory_format=torch.contiguous_format):
+        # If already contiguous in the requested format, nothing to do
+        if self_tensor.is_contiguous(
+            memory_format=memory_format if memory_format is not None else torch.contiguous_format
+        ):
             return False
 
         # Check if this is a transpose/permutation case

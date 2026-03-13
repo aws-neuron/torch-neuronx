@@ -259,3 +259,28 @@ class TestIndexPut:
             )
             values = torch.tensor([1.0, 2.0], device=device)
             self._track_and_compare(x, indices, values)
+
+    def test_index_put_empty_indices(self, device):
+        """Test index_put with empty indices."""
+        with track_neuron_ops():
+            x = torch.zeros(3, 4, device=device)
+            indices = (torch.tensor([], dtype=torch.int64, device=device),)
+            values = torch.ones(0, 4, device=device)
+            self._track_and_compare(x, indices, values)
+
+    def test_index_put_all_empty_indices(self, device):
+        """Test index_put with all empty indices preserves original tensor."""
+        x = torch.ones(3, 4, device=device)
+        empty = torch.tensor([], dtype=torch.int64, device=device)
+        self._track_and_compare(x, (empty, empty), torch.ones(0, device=device))
+
+    def test_index_put_single_empty_accumulate(self, device):
+        """Test index_put with single empty index and accumulate=True preserves original tensor."""
+        x = torch.ones(3, 4, device=device)
+        empty = torch.tensor([], dtype=torch.int64, device=device)
+        self._track_and_compare(x, (empty,), torch.ones(0, 4, device=device), accumulate=True)
+
+    def test_index_put_all_false_boolean_mask(self, device):
+        """Test index_put with all-False boolean mask preserves original tensor."""
+        x = torch.ones(3, 4, device=device)
+        self._track_and_compare(x, ([False, False, False],), torch.ones(0, 4, device=device))

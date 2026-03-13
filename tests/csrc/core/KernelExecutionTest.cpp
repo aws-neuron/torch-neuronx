@@ -180,6 +180,61 @@ TEST_F(KernelExecutionTest, CollectiveKernelReduceOps) {
   }
 }
 
+TEST_F(KernelExecutionTest, CollectiveKernelUsesGlobalRankForLookup) {
+  // Simulate multi-node: global rank 1, but local device_id 0
+  c10_neuron::reset_distributed_state();
+  c10_neuron::set_world_size(2);
+  c10_neuron::set_rank(1);
+
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
+  CollectiveDirectKernelExecution kernel(
+      "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, /*device_id=*/0);
+
+  // Should find rank 1 at index 1 in the replica group, not index 0
+  EXPECT_EQ(kernel.GetMyRank(), 1);
+  const auto& comm = kernel.GetComm();
+  EXPECT_EQ(comm.ctx_device_id, 1u);  // global rank, not local device_id
+  EXPECT_EQ(comm.rank, 1u);
+}
+
+TEST_F(KernelExecutionTest, CollectiveKernelMultiNodeRank0) {
+  // Simulate multi-node: global rank 0, local device_id 0
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
+  CollectiveDirectKernelExecution kernel(
+      "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, /*device_id=*/0);
+
+  EXPECT_EQ(kernel.GetMyRank(), 0);
+  const auto& comm = kernel.GetComm();
+  EXPECT_EQ(comm.ctx_device_id, 0u);
+  EXPECT_EQ(comm.rank, 0u);
+  EXPECT_EQ(comm.rank_n, 2u);
+  EXPECT_EQ(comm.ctx_device_count, 2u);
+}
+
+TEST_F(KernelExecutionTest, CollectiveKernelMultiGroupLookup) {
+  // Multiple replica groups — device should be found in the correct one
+  c10_neuron::reset_distributed_state();
+  c10_neuron::set_world_size(4);
+  c10_neuron::set_rank(3);
+
+  std::vector<std::vector<int>> replica_groups = {{0, 1}, {2, 3}};
+  CollectiveDirectKernelExecution kernel(
+      "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, /*device_id=*/0);
+
+  // Global rank 3 is at index 1 in group {2, 3}
+  EXPECT_EQ(kernel.GetMyRank(), 1);
+  const auto& comm = kernel.GetComm();
+  EXPECT_EQ(comm.ctx_device_id, 3u);
+  EXPECT_EQ(comm.rank, 1u);
+  EXPECT_EQ(comm.rank_n, 2u);
+}
+
 TEST_F(KernelExecutionTest, PolymorphicBehavior) {
   // Create different kernel types and verify polymorphic behavior through base pointer
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
@@ -205,23 +260,15 @@ TEST_F(KernelExecutionTest, PolymorphicBehavior) {
   }
 }
 
-TEST_F(KernelExecutionTest, CacheKeyIncludesCompilerExtension) {
+TEST_F(KernelExecutionTest, CacheKeyIsBaseKey) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
                                       create_fake_tensor_refs(output_ptrs_), {}, {}, "base_key",
                                       hlo_bytes, false, 0);
 
-  // Cache key should start with base key
-  std::string cache_key = kernel.GetCacheKey();
-  EXPECT_TRUE(cache_key.find("base_key") == 0);
-
-  // Cache key should be longer than base key (includes extension)
-  EXPECT_GT(cache_key.length(), std::string("base_key").length());
-
-  // Cache key should contain platform-specific information
-  // Format: base_key_<platform>_<cores>_<opt_level>_<args>
-  EXPECT_TRUE(cache_key.find("_") != std::string::npos);
+  // In-memory cache key is just the base key (compiler config is only in persistent key)
+  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
@@ -258,37 +305,30 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   EXPECT_TRUE(kernel.GetAdditionalArgs().find("--custom-flag=value") != std::string::npos);
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
 
-  // Cache key should reflect the custom settings
-  std::string cache_key = kernel.GetCacheKey();
-  EXPECT_TRUE(cache_key.find("O2") != std::string::npos);
+  // Cache key is just the base key (compiler config is in persistent key only)
+  EXPECT_EQ(kernel.GetCacheKey(), "key");
 
   // Clean up
   unsetenv("NEURON_CC_FLAGS");
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
 
-TEST_F(KernelExecutionTest, CacheKeyUniquenessWithDifferentArgs) {
+TEST_F(KernelExecutionTest, SameBaseKeyDifferentArgsEqualInMemoryKey) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
-  // Create two kernels with same base key but different environment settings
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O1", 1);
   XLACompilableKernelExecution kernel1("op", create_fake_tensor_refs(input_ptrs_),
                                        create_fake_tensor_refs(output_ptrs_), {}, {}, "same_base",
                                        hlo_bytes, false, 0);
-  std::string key1 = kernel1.GetCacheKey();
 
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
   XLACompilableKernelExecution kernel2("op", create_fake_tensor_refs(input_ptrs_),
                                        create_fake_tensor_refs(output_ptrs_), {}, {}, "same_base",
                                        hlo_bytes, false, 0);
-  std::string key2 = kernel2.GetCacheKey();
 
-  // Keys should be different due to different optimization levels
-  EXPECT_NE(key1, key2);
-
-  // Both should start with the same base
-  EXPECT_TRUE(key1.find("same_base") == 0);
-  EXPECT_TRUE(key2.find("same_base") == 0);
+  // In-memory keys are equal (both just "same_base")
+  EXPECT_EQ(kernel1.GetCacheKey(), kernel2.GetCacheKey());
+  EXPECT_EQ(kernel1.GetCacheKey(), "same_base");
 
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
@@ -403,7 +443,7 @@ TEST_F(KernelExecutionTest, EventSignalKernelExecuteCompletesEvent) {
   EXPECT_FALSE(event.get_impl()->is_completed.load());
 
   // Execute the signal kernel
-  kernel.Execute();
+  kernel.Schedule(nullptr, nullptr, 0);
 
   // Event should now be completed
   EXPECT_TRUE(event.get_impl()->is_completed.load());
@@ -420,7 +460,7 @@ TEST_F(KernelExecutionTest, EventWaitKernelExecuteWhenReady) {
   EXPECT_TRUE(kernel.IsReady());
 
   // Execute should not throw when event is ready
-  EXPECT_NO_THROW(kernel.Execute());
+  EXPECT_NO_THROW(kernel.Schedule(nullptr, nullptr, 0));
 }
 
 TEST_F(KernelExecutionTest, EventKernelGetEventReturnsCorrectEvent) {
@@ -442,7 +482,7 @@ TEST_F(KernelExecutionTest, EventKernelSharedEventState) {
                                     EventDirectKernelExecution::EventAction::kSignal, 0);
 
   // Execute the kernel (signals the event)
-  kernel.Execute();
+  kernel.Schedule(nullptr, nullptr, 0);
 
   // Both the original event and the copy should see the completion
   EXPECT_TRUE(original_event.query());
@@ -494,11 +534,8 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelCacheKey) {
   std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
   CompileOnlyKernelExecution kernel("base_key", stablehlo_bytes, false);
 
-  std::string cache_key = kernel.GetCacheKey();
-  // Cache key should start with base key
-  EXPECT_TRUE(cache_key.find("base_key") == 0);
-  // Cache key should include compiler extension
-  EXPECT_GT(cache_key.length(), std::string("base_key").length());
+  // In-memory cache key is just the base key
+  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
@@ -532,14 +569,6 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelCompilation) {
 
   // CompileToNeff should throw since we don't have real compiler
   EXPECT_THROW(kernel.CompileToNeff(), std::exception);
-}
-
-TEST_F(KernelExecutionTest, CompileOnlyKernelExecuteIsNoOp) {
-  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
-  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, false);
-
-  // Execute should be a no-op and not throw
-  EXPECT_NO_THROW(kernel.Execute());
 }
 
 // NeffDirectKernelExecution tests
@@ -659,7 +688,7 @@ TEST_F(KernelExecutionTest, EventKernelDoesNotRequirePrepare) {
   EXPECT_FALSE(kernel.RequiresPrepare());
 }
 
-// IsDeviceKernelType and GetDeviceKernelTypeIndex tests
+// IsDeviceKernelType and GetXUIndex tests
 
 TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
   // Device kernel types should return true
@@ -676,19 +705,19 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
   EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kHint));
 }
 
-TEST_F(KernelExecutionTest, GetDeviceKernelTypeIndexMapping) {
-  // Verify the index mapping for device kernel types
-  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kHLO), 0);
-  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kCollective), 1);
-  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kCopy), 2);
-  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kWrite), 3);
-  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kRead), 4);
+TEST_F(KernelExecutionTest, GetXUIndexMapping) {
+  // All tensor ops map to NRTA_XU_TENSOR_OP
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kHLO), NRTA_XU_COMPUTE);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCollective), NRTA_XU_COLLECTIVES);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCopy), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kWrite), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kRead), NRTA_XU_TENSOR_OP);
 }
 
-TEST_F(KernelExecutionTest, GetDeviceKernelTypeIndexThrowsForNonDevice) {
+TEST_F(KernelExecutionTest, GetXUIndexThrowsForNonDevice) {
   // Non-device kernel types should throw
-  EXPECT_THROW(GetDeviceKernelTypeIndex(KernelTypeEnum::kEvent), c10::Error);
-  EXPECT_THROW(GetDeviceKernelTypeIndex(KernelTypeEnum::kHint), c10::Error);
+  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), c10::Error);
+  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kHint), c10::Error);
 }
 
 TEST_F(KernelExecutionTest, BaseKernelPrepareDoesNotThrow) {
@@ -794,6 +823,36 @@ TEST_F(KernelExecutionTest, NRTReduceOpEnumValues) {
   EXPECT_EQ(static_cast<int>(NRTReduceOp::kAdd), NRT_OP_ADD);
   EXPECT_EQ(static_cast<int>(NRTReduceOp::kMax), NRT_OP_MAX);
   EXPECT_EQ(static_cast<int>(NRTReduceOp::kMin), NRT_OP_MIN);
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
+  std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
+  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, true);
+
+  EXPECT_TRUE(kernel.IsValid());
+  EXPECT_TRUE(kernel.RequiresCompilation());
+  EXPECT_FALSE(kernel.HasCollectives());
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
+  std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
+  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, true);
+
+  // CompileToNeff should throw since we don't have real compiler
+  try {
+    kernel.CompileToNeff();
+    FAIL() << "Expected exception";
+  } catch (const std::exception& e) {
+    EXPECT_TRUE(std::string(e.what()).find("Linalg") != std::string::npos)
+        << "Error message should mention Linalg, got: " << e.what();
+  }
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerWithEmptyBytes) {
+  std::vector<uint8_t> empty_bytes;
+  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, true);
+
+  EXPECT_FALSE(kernel.IsValid());
 }
 
 int main(int argc, char** argv) {

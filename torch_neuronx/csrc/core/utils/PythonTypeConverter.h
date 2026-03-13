@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackContext.h"
 
 namespace py = pybind11;
@@ -21,9 +22,10 @@ namespace at::neuron::utils {
  */
 inline void ExtractTensorInfo(const at::Tensor& tensor,
                               std::vector<at::neuron::TensorContext>& tensor_metadata,
-                              std::vector<void*>& tensor_data_ptrs) {
+                              std::vector<nrt_tensor_t*>& tensor_data_ptrs) {
   tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
-  tensor_data_ptrs.push_back(tensor.data_ptr());
+  tensor_data_ptrs.push_back(
+      c10_neuron::NeuronCachingAllocator::findTensor(const_cast<void*>(tensor.storage().data())));
 }
 
 /**
@@ -36,12 +38,13 @@ inline void ExtractTensorInfo(const at::Tensor& tensor,
  *
  * @param obj The Python object to convert
  * @param tensor_metadata Output vector for tensor metadata (populated for tensor types)
- * @param tensor_data_ptrs Output vector for tensor data pointers (populated for tensor types)
+ * @param tensor_data_ptrs Output vector for resolved NRT tensor pointers (populated for tensor
+ * types)
  * @return InputMetadata describing the input
  */
 inline InputMetadata ConvertToInputMetadata(py::object obj,
                                             std::vector<at::neuron::TensorContext>& tensor_metadata,
-                                            std::vector<void*>& tensor_data_ptrs) {
+                                            std::vector<nrt_tensor_t*>& tensor_data_ptrs) {
   // Handle None type
   if (obj.is_none()) {
     return ScalarValue(c10::IValue());

@@ -263,3 +263,10 @@ def save_mlir_bytecode(mlir: mlir_ir.Module, output_path: Path) -> Path:
     with open(output_path, "wb") as f:
         mlir.operation.write_bytecode(f)
     return output_path
+
+
+def save_mlir_text(mlir: mlir_ir.Module, output_path: Path) -> Path:
+    """Save MLIR as human-readable text."""
+    with open(output_path, "w") as f:
+        f.write(str(mlir))
+    return output_path

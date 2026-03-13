@@ -43,6 +43,20 @@ std::optional<TransformationCreationResult> CreateSliceTransformation(const at::
 }  // anonymous namespace
 
 // ============================================================================
+// BROADCAST Registration
+// ============================================================================
+
+namespace {
+
+// Broadcast creator wrapper - detects broadcast pattern from tensor
+std::optional<TransformationCreationResult> CreateBroadcastTransformation(
+    const at::Tensor& input, const std::string& op_name, size_t input_index) {
+  return Creators::TryCreateBroadcast(input, op_name, input_index);
+}
+
+}  // anonymous namespace
+
+// ============================================================================
 // Registration Function
 // ============================================================================
 
@@ -81,6 +95,18 @@ void RegisterTransformations() {
 
     registry.Register(TransformationType::SLICE, std::move(slice_desc));
     TORCH_NEURONX_DEBUG("RegisterTransformations: Registered SLICE");
+  }
+
+  // Register BROADCAST
+  {
+    TransformationDescriptor broadcast_desc;
+    broadcast_desc.creator = CreateBroadcastTransformation;
+    broadcast_desc.handler = std::make_unique<Handlers::BroadcastHandler>();
+    broadcast_desc.priority = 85;  // Lower than slice
+    broadcast_desc.name = "BROADCAST";
+
+    registry.Register(TransformationType::BROADCAST, std::move(broadcast_desc));
+    TORCH_NEURONX_DEBUG("RegisterTransformations: Registered BROADCAST");
   }
 
   TORCH_NEURONX_DEBUG("RegisterTransformations: Complete",

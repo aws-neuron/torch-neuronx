@@ -178,6 +178,27 @@ class TestStreamSynchronization:
 
         assert len(results) == 3
 
+    def test_sanity_multi_stream_consecutive_operations(self):
+        """Sanity test with several consecutive operations across multiple streams."""
+        stream1 = torch.neuron.Stream()
+        stream2 = torch.neuron.Stream()
+
+        size = 4096
+        n_ops = 20
+        results = []
+
+        for _ in range(n_ops):
+            with torch.neuron.stream(stream1):
+                a = torch.randn(size, size, device="neuron")
+                results.append(torch.matmul(a, a))
+
+            with torch.neuron.stream(stream2):
+                b = torch.randn(size, size, device="neuron")
+                results.append(torch.matmul(b, b))
+
+        stream1.synchronize()
+        stream2.synchronize()
+
     def test_query_during_operations(self):
         """Test querying stream status during operations."""
         stream = torch.neuron.Stream()
