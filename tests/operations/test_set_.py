@@ -96,7 +96,7 @@ class TestSetOperations:
         reason="Test gets stuck when lowering aten ops with torch-mlir",
     )
     @pytest.mark.xfail(
-        condition=os.environ.get("TORCH_NEURONX_SYNC_MODE") == "0",
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "0",
         reason=("Fails in async mode due to compilation error related to contiguous op; needs RCA"),
     )
     def test_set_source_tensor_with_view(self):

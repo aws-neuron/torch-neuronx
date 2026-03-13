@@ -12,7 +12,7 @@ from tests.utils.neuron_test_utils import assert_raises
 
 
 @pytest.mark.skipif(
-    os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+    os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
     reason="Error Handler is used only during async mode",
 )
 class TestErrorHandler:

@@ -155,7 +155,7 @@ def finalize_registrations(aten_lib=None, verbose: bool = False):
         output_params = ops_list[0].get("output_params")
 
         # Import the unified JaxOpImpl class
-        from torch_neuronx.python_ops.jax_base import JaxOpImpl
+        from torch_neuronx.python_ops.legacy.jax_base import JaxOpImpl
 
         # Use unified JaxOpImpl for all operation types
         base_class = JaxOpImpl

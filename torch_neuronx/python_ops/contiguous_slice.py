@@ -2,9 +2,7 @@
 
 import torch
 
-from torch_neuronx.python_ops.jax.kernel import JaxKernel
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
-from torch_neuronx.utils import use_mlir_aten_ops
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -164,13 +162,14 @@ class ContiguousSliceImpl(OperationImplementation):
         end_offset = start_offset + shape[slice_axis]
         kernel = self._get_kernel()
 
-        if use_mlir_aten_ops():
-            output = kernel(base_view, slice_axis, start_offset, end_offset)
-        else:
-            from .jax.context import ExecutionContext
+        from .shared.context import ExecutionContext
 
-            exec_ctx = ExecutionContext(original_inputs=(self_tensor,))
-            output = kernel(base_view, slice_axis, start_offset, end_offset, context=exec_ctx)
+        exec_ctx = ExecutionContext(
+            original_inputs=(base_view, slice_axis, start_offset, end_offset),
+            original_kwargs={},
+        )
+
+        output = kernel(base_view, slice_axis, start_offset, end_offset, context=exec_ctx)
 
         return output
 
@@ -208,42 +207,12 @@ class ContiguousSliceImpl(OperationImplementation):
 
 
 @neuron_op("aten::contiguous", priority=90)
-class ContiguousSliceJAXImpl(ContiguousSliceImpl):  # lower priority than ContiguousBroadcastImpl
-    """JAX implementation for slice-based contiguous operation."""
-
-    _kernel: JaxKernel | None = None
-
-    def can_handle(self, self_tensor, memory_format=None) -> bool:
-        if use_mlir_aten_ops():
-            return False
-        return super().can_handle(self_tensor, memory_format)
-
-    def __init__(self):
-        super().__init__()
-        if ContiguousSliceJAXImpl._kernel is None:
-
-            def slice_fn(x, axis, start_idx, end_idx):
-                slices = [slice(None)] * x.ndim
-                slices[axis] = slice(start_idx, end_idx)
-                return x[tuple(slices)]
-
-            ContiguousSliceJAXImpl._kernel = JaxKernel(
-                slice_fn, op_name="aten::contiguous", static_argnums=(1, 2, 3)
-            )
-
-    def _get_kernel(self):
-        return ContiguousSliceJAXImpl._kernel
-
-
-@neuron_op("aten::contiguous", priority=90)
 class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than ContiguousBroadcastImpl
     """MLIR implementation for slice-based contiguous operation."""
 
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        if not use_mlir_aten_ops():
-            return False
         return super().can_handle(self_tensor, memory_format)
 
     def __init__(self):

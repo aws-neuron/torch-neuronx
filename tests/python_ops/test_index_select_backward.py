@@ -233,3 +233,39 @@ class TestIndexSelectBackward:
         torch.ops.aten.index_select_backward(
             grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
         )
+
+    @assert_raises(
+        IndexError,
+        match=r"index -3 is out of bounds for dimension 0 with size 2",
+    )
+    def test_index_select_backward_negative_index_oob(self):
+        """Test index_select_backward with negative index out of bounds"""
+        input_shape = (2, 4)
+        dim = 0
+        indices = torch.tensor([-3], dtype=torch.long)
+
+        grad_output_shape = list(input_shape)
+        grad_output_shape[dim] = 1
+        grad_output = torch.randn(grad_output_shape, dtype=torch.float32)
+
+        torch.ops.aten.index_select_backward(
+            grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
+        )
+
+    @assert_raises(
+        IndexError,
+        match=r"index 5 is out of bounds for dimension 1 with size 4",
+    )
+    def test_index_select_backward_positive_index_oob(self):
+        """Test index_select_backward with positive index out of bounds"""
+        input_shape = (2, 4)
+        dim = 1
+        indices = torch.tensor([1, 5], dtype=torch.long)
+
+        grad_output_shape = list(input_shape)
+        grad_output_shape[dim] = 2
+        grad_output = torch.randn(grad_output_shape, dtype=torch.float32)
+
+        torch.ops.aten.index_select_backward(
+            grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
+        )

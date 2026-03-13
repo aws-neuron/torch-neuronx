@@ -1,5 +1,4 @@
 from .base import Operation
-from .xla_ops.native_multi_head_attn_suffix_xla import NativeMultiHeadAttnSuffixXLAImpl
 
 
 class NativeMultiHeadAttnSuffixOp(Operation):
@@ -7,7 +6,11 @@ class NativeMultiHeadAttnSuffixOp(Operation):
 
     def _setup_implementations(self):
         """Setup available implementations"""
-        self._implementations.append(NativeMultiHeadAttnSuffixXLAImpl(self.op_name))
+        from .torch_mlir.ops.native_multi_head_attn_suffix import (
+            NativeMultiHeadAttnSuffixMLIRImpl,
+        )
+
+        self._implementations.append(NativeMultiHeadAttnSuffixMLIRImpl(self.op_name))
 
     @property
     def op_name(self) -> str:

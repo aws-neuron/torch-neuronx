@@ -234,3 +234,11 @@ class TestDiv:
         result_neuron = a_neuron / b_neuron
 
         torch.testing.assert_close(result_neuron.cpu(), expected)
+
+    def test_div_scalar_zero_divisor(self):
+        """Test div with scalar zero divisor"""
+        with track_neuron_ops():
+            a = torch.tensor([10.0, 20.0], device="neuron")
+            result = torch.div(a, 0, rounding_mode="floor")
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::div")

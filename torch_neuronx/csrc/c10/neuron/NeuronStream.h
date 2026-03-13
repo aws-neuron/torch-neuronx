@@ -5,6 +5,7 @@
 #include <c10/util/Exception.h>
 
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <utility>
 
@@ -148,5 +149,25 @@ void synchronize(c10::DeviceIndex device_index = -1);
 /// @param operation_context The operation to execute
 void SubmitOperationContext(const NeuronStream& stream,
                             std::unique_ptr<OperationContext> operation_context);
+
+/// Stream pool configuration
+constexpr int kStreamPoolSize = 1;
+constexpr int kMaxDevices = 128;
+
+/// Initialize all stream pools (called by NeuronResourceManager)
+void InitializeStreamPools();
+
+/// Cleanup stream pools (called by NeuronResourceManager destructor)
+void CleanupStreamPools();
+
+/// Direct stream accessors for performance-critical paths
+StreamImpl* GetDefaultStreamImpl(c10::DeviceIndex device_index);
+StreamImpl* GetPoolStreamImpl(c10::DeviceIndex device_index, int pool_index);
+
+/// Iterate through all streams on a device with a callback
+/// @param device_index The device to iterate streams on
+/// @param callback Function to call for each stream. Return true to stop iteration.
+void ForEachStreamImpl(c10::DeviceIndex device_index,
+                       const std::function<bool(StreamImpl*)>& callback);
 
 }  // namespace at::neuron

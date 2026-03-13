@@ -28,7 +28,7 @@ tools/run-test pytorch_tests/test_aten.py
 python tests/pytorch_tests/test_aten.py \
     --test-file-name test_tensor_creation_ops.py \
     --test-class-name TestLikeTensorCreation \
-    --class-name-suffix NEURON \
+    --class-name-suffix-options PRIVATEUSE1,NEURON \
     --test-method-name test_ones_like_neuron,test_zeros_like_neuron \
     --debug
 ```
@@ -46,7 +46,7 @@ export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && pytest -n 8 tests/pytorch_tests
 python tests/pytorch_tests/distributed/test_c10d_common.py \
     --test-file-name distributed/test_c10d_object_collectives.py \
     --test-class-name TestObjectCollectives \
-    --class-name-suffix NEURON \
+    --class-name-suffix-options NEURON \
     --test-method-name test_send_recv_object_list \
     --debug
 ```
@@ -55,7 +55,7 @@ python tests/pytorch_tests/distributed/test_c10d_common.py \
 
 - `--test-file-name`: Override spec file, specify PyTorch test file path
 - `--test-class-name`: Specify test class to run
-- `--class-name-suffix`: Suffix to append to class name (e.g., `PRIVATEUSE1`, `NEURON`)
+- `--class-name-suffix-options`: Comma-separated suffixes to try appending to class name (e.g., `PRIVATEUSE1,NEURON`)
 - `--test-method-name`: Comma-separated list of test methods to run
 - `--torch-version`: PyTorch version to clone (if tests not already cloned)
 - `--debug`: Enable debug logging
@@ -91,7 +91,7 @@ Spec files in `specs/` define which tests to run. Example (`c10d_common_spec.jso
 - `folder`: Directory path to run all `test_*.py` files recursively
 - `exclude_subfolders`: List of subdirectory names to exclude from folder scan
 - `class`: (Optional) Specific test class. If omitted, auto-discovers all classes
-- `class_name_suffix`: (Optional) Suffix to append to class name (e.g., `PRIVATEUSE1`, `NEURON`)
+- `class_name_suffix_options`: (Optional) List of suffixes to try appending to class name (e.g., `["PRIVATEUSE1", "NEURON"]`)
 - `methods`: (Optional) List of specific methods. If omitted/null, runs all methods
 - `xfail`: List of expected failures with reasons
 - `skip_tests`: List of tests to skip entirely (similar format to xfail)

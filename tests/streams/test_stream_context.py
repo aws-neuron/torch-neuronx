@@ -6,11 +6,13 @@ import pytest
 import torch
 
 import torch_neuronx
+from tests.utils.neuron_test_utils import requires_nrt_streams
 
 
 class TestStreamContext:
     """Test stream context manager functionality."""
 
+    @requires_nrt_streams
     def test_stream_context_manager(self):
         """Test stream context manager switches current stream."""
         default_stream = torch_neuronx.current_stream()

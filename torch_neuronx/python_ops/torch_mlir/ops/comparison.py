@@ -33,15 +33,22 @@ def torch_lt(x, y, out=None):
 
 @register_aten(["aten::le", "aten::le.Tensor_out", "aten::le.Scalar_out"])
 def torch_le(x, y, out=None):
-    return torch.le(x, y, out=out) if out is not None else torch.le(x, y)
+    return torch.le(x, y)
 
 
 @register_aten(
     ["aten::clamp", "aten::clamp.out", "aten::clamp.Tensor", "aten::clamp.Tensor_out"],
 )
-def torch_clamp(x, min=None, max=None):
+def torch_clamp(x, min=None, max=None, out=None):
     if min is None and max is None:
         raise RuntimeError("torch.clamp: At least one of 'min' or 'max' must not be None")
+
+    # Ensure tensor min/max have same dtype as input
+    if min is not None and isinstance(min, torch.Tensor):
+        min = min.to(x.dtype)
+    if max is not None and isinstance(max, torch.Tensor):
+        max = max.to(x.dtype)
+
     return torch.clamp(x, min=min, max=max)
 
 
@@ -53,7 +60,10 @@ def torch_clamp(x, min=None, max=None):
         "aten::clamp_max.Tensor_out",
     ],
 )
-def torch_clamp_max(x, max):
+def torch_clamp_max(x, max, out=None):
+    # Ensure tensor max has same dtype as input
+    if isinstance(max, torch.Tensor):
+        max = max.to(x.dtype)
     return torch.clamp_max(x, max)
 
 
@@ -65,7 +75,10 @@ def torch_clamp_max(x, max):
         "aten::clamp_min.Tensor_out",
     ],
 )
-def torch_clamp_min(x, min):
+def torch_clamp_min(x, min, out=None):
+    # Ensure tensor min has same dtype as input
+    if isinstance(min, torch.Tensor):
+        min = min.to(x.dtype)
     return torch.clamp_min(x, min)
 
 
@@ -76,11 +89,18 @@ def torch_isnan(x):
 
 @register_aten(["aten::isinf"])
 def torch_isinf(x):
-    return torch.isinf(x)
+    """Integer dtype cannot be inf and should always return False.
+
+    Bypassing the operation here to avoid running stablehlo.abs with unsupported dtypes.
+    """
+    if x.dtype.is_floating_point or x.dtype.is_complex:
+        return torch.isinf(x)
+    else:
+        return torch.zeros_like(x, dtype=torch.bool)
 
 
 @register_aten(["aten::isneginf", "aten::isneginf.out"])
-def torch_isneginf(x):
+def torch_isneginf(x, out=None):
     return torch.isneginf(x)
 
 

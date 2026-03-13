@@ -12,6 +12,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -31,7 +32,8 @@ class TestOneHot:
             assert_op_runs_on_neuron("aten::one_hot")
 
     @pytest.mark.xfail(
-        reason="Can't support meta tensor evaluation requiring accessing meta tensor content"
+        reason="Can't support meta tensor evaluation requiring accessing meta tensor content",
+        condition=not use_mlir_aten_ops(),
     )
     def test_one_hot_inferred_classes(self):
         """Test one_hot with automatically inferred num_classes (-1)."""
@@ -113,3 +115,10 @@ class TestOneHot:
             assert result.size() == expected.size()
             assert torch.all(result.cpu() == expected)
             assert_op_runs_on_neuron("aten::one_hot")
+
+    def test_one_hot_torch_compile(self):
+        """Test one_hot with torch.compile."""
+        compiled_one_hot = torch.compile(functional.one_hot, backend="neuron", fullgraph=True)
+        x = torch.randint(0, 3, (2, 1), dtype=torch.int64, device="neuron")
+        result = compiled_one_hot(x, num_classes=3)
+        assert result.size() == torch.Size([2, 1, 3])

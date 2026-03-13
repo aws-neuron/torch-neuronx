@@ -17,7 +17,6 @@ class TestBasicExecution:
     def test_simple_dma_copy(self):
         """Test a simple DMA copy kernel."""
 
-        @wrap_nki
         @nki.jit
         def dma_copy(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -31,7 +30,7 @@ class TestBasicExecution:
         y = torch.empty(128, device="neuron")
 
         # Execute kernel
-        dma_copy(x, y)
+        wrap_nki(dma_copy)(x, y)
 
         # Verify output matches input
         assert torch.allclose(x, y)
@@ -39,7 +38,6 @@ class TestBasicExecution:
     def test_tensor_scale(self):
         """Test scaling a tensor by a constant."""
 
-        @wrap_nki
         @nki.jit
         def tensor_scale(x, y: nt.mutable_tensor, scale):
             import neuronxcc.nki.language as nl
@@ -53,7 +51,7 @@ class TestBasicExecution:
         y = torch.empty(128, device="neuron")
         scale = 2.5
 
-        tensor_scale(x, y, scale)
+        wrap_nki(tensor_scale)(x, y, scale)
 
         expected = x * scale
         assert torch.allclose(y, expected)
@@ -61,7 +59,6 @@ class TestBasicExecution:
     def test_element_wise_add(self):
         """Test element-wise addition of two tensors."""
 
-        @wrap_nki
         @nki.jit
         def tensor_add(x1, x2, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -76,7 +73,7 @@ class TestBasicExecution:
         x2 = torch.randn(128, device="neuron")
         y = torch.empty(128, device="neuron")
 
-        tensor_add(x1, x2, y)
+        wrap_nki(tensor_add)(x1, x2, y)
 
         expected = x1 + x2
         assert torch.allclose(y, expected)
@@ -84,7 +81,6 @@ class TestBasicExecution:
     def test_different_shapes(self):
         """Test kernels with different tensor shapes."""
 
-        @wrap_nki
         @nki.jit
         def copy_2d(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -99,13 +95,12 @@ class TestBasicExecution:
         for shape in shapes:
             x = torch.randn(*shape, device="neuron")
             y = torch.empty(*shape, device="neuron")
-            copy_2d(x, y)
+            wrap_nki(copy_2d)(x, y)
             assert torch.allclose(x, y)
 
     def test_different_dtypes(self):
         """Test kernels with different data types."""
 
-        @wrap_nki
         @nki.jit
         def copy_kernel(x, y: nt.mutable_tensor):
             import neuronxcc.nki.language as nl
@@ -124,5 +119,5 @@ class TestBasicExecution:
                 x = torch.randn(64, device="neuron", dtype=dtype)
             y = torch.empty(64, device="neuron", dtype=dtype)
 
-            copy_kernel(x, y)
+            wrap_nki(copy_kernel)(x, y)
             assert torch.equal(x, y)

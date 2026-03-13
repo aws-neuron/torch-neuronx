@@ -18,11 +18,15 @@ from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
+from torch_neuronx.python_ops.shared import (
+    CompilationConfig,
+    ExecutionContext,
+    IndexOps,
+    ReductionOps,
+)
 from torch_neuronx.utils import is_sync_mode_enabled
 
-from ..jax.config import CompilationConfig
-from ..jax.context import ExecutionContext
-from ..jax.handlers import OutputHandler
+from ..handlers.output import BaseOutputHandler
 from ..processors import ArgumentProcessor
 from .compilation import TorchMlirCompiler
 
@@ -58,7 +62,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         self.cache = CompilationCache()
         self.hlo_cache = {}
         self.arg_processor = ArgumentProcessor(static_argnames)
-        self.output_handler = OutputHandler()
+        self.output_handler = BaseOutputHandler()
 
         assert isinstance(self.static_argnums, tuple)
         assert isinstance(self.static_argnames, tuple)
@@ -78,10 +82,9 @@ class TorchMlirKernel(BaseNeuronKernel):
         """
         # Get base cache key from parent class
         filtered_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in CompilationConfig.PYTORCH_SPECIFIC_PARAMS
-            and key not in self.static_argnames
+            k: v
+            for k, v in self._get_compilation_kwargs(kwargs).items()
+            if k not in self.static_argnames
         }
         normalized_static_argnums = self._normalize_static_argnums(len(inputs))
         base_key = self.get_cache_key(
@@ -97,31 +100,28 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _get_compilation_kwargs(self, kwargs):
         """Process kwargs for lowering."""
-        # Exclude unsupported kwargs
         compilation_kwargs = {}
 
-        # Extract dtype from 'out' tensor for ops that need it
-        if (
-            "dtype" in self.static_argnames
-            and "dtype" not in kwargs
-            and "out" in kwargs
-            and kwargs["out"] is not None
-        ):
-            out_tensor = kwargs["out"]
-            if isinstance(out_tensor, torch.Tensor):
-                compilation_kwargs["dtype"] = out_tensor.dtype
-
         for key, value in kwargs.items():
-            if key not in CompilationConfig.PYTORCH_SPECIFIC_PARAMS:
-                compilation_kwargs[key] = value
+            if key not in CompilationConfig.PYTORCH_SPECIFIC_PARAMS or (
+                key == "out" and isinstance(value, torch.Tensor)
+            ):
+                # Convert tensor kwargs to meta device for tracing
+                if isinstance(value, torch.Tensor):
+                    compilation_kwargs[key] = torch.empty_like(value, device="meta")
+                else:
+                    compilation_kwargs[key] = value
 
         return compilation_kwargs
 
-    def _generate_fake_inputs(self, inputs: tuple) -> tuple[list, dict]:
+    def _generate_fake_inputs(
+        self, inputs: tuple, compilation_kwargs: dict | None = None
+    ) -> tuple[list, dict]:
         """Generate fake inputs and mapping for flattened indices.
 
         Args:
             inputs: Input tensors
+            compilation_kwargs: Compilation kwargs (optional)
 
         Returns:
             Tuple of (fake_inputs, fake_to_flattened_idx)
@@ -149,12 +149,19 @@ class TorchMlirKernel(BaseNeuronKernel):
             fake_inp = create_fake_recursive(inp, idx)
             fake_inputs.append(fake_inp)
 
+        # Track tensor kwargs in fake_to_flattened_idx
+        if compilation_kwargs:
+            for key, value in compilation_kwargs.items():
+                if isinstance(value, torch.Tensor) and key not in self.static_argnames:
+                    fake_to_flattened_idx[id(value)] = flattened_idx
+                    flattened_idx += 1
+
         return fake_inputs, fake_to_flattened_idx
 
     def infer_outputs_from_meta(self, inputs: tuple, kwargs: dict):
         """Infer outputs by running torch_fn with meta tensors."""
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
-        fake_inputs, _ = self._generate_fake_inputs(inputs)
+        fake_inputs, _ = self._generate_fake_inputs(inputs, compilation_kwargs)
         return self.torch_fn(*fake_inputs, **compilation_kwargs)
 
     def _generate_fx_graph(self, fake_inputs: tuple, compilation_kwargs: dict):
@@ -194,7 +201,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _generate_hlo(
         self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
-    ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple]:
+    ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple, dict]:
         """Generate HLO from PyTorch function.
 
         Args:
@@ -204,24 +211,24 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         Returns:
             Tuple of (HLO bytes, io_spec, cast_spec, kept_input_indices, kept_output_indices,
-                        downcasted_outputs, original_outputs)
+                        downcasted_outputs, original_outputs, passthrough_mappings)
         """
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
         # Create fake tensors and track flattened indices
-        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs)
+        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs, compilation_kwargs)
 
         # Get the same decomposition table used by neuron_backend
         decomposition_table = get_decomposition_table(decompose_all=False)
-
-        flat_args, in_spec = pytree.tree_flatten((fake_inputs, compilation_kwargs))
-        decomposed_gm = self._generate_fx_graph(fake_inputs, compilation_kwargs)
 
         # Generate original_outputs by running meta eval
         original_outputs = self.infer_outputs_from_meta(
             context.original_inputs if context else inputs,
             context.original_kwargs if context else kwargs,
         )
+
+        flat_args, in_spec = pytree.tree_flatten((fake_inputs, compilation_kwargs))
+        decomposed_gm = self._generate_fx_graph(fake_inputs, compilation_kwargs)
 
         # Capture original output nodes before any optimization
         original_output_node = list(decomposed_gm.graph.find_nodes(op="output"))[-1]
@@ -230,11 +237,19 @@ class TorchMlirKernel(BaseNeuronKernel):
         if not isinstance(original_output_args, tuple):
             original_output_args = (original_output_args,)
 
+        # Detect pass-through mappings from captured graph
+        passthrough_mappings = self._detect_passthrough_mappings(
+            decomposed_gm, original_output_args
+        )
+
         assert (
             len(original_outputs) == len(original_output_args)
-            if isinstance(original_outputs, tuple)
+            if isinstance(original_outputs, tuple | list)
             else len(original_output_args) == 1
-        ), f"Meta eval expects {len(original_outputs)} outputs while FX Graph expects {len(original_output_args)} outputs"  # noqa E501
+        ), (
+            f"Meta eval expects {len(original_outputs)} outputs "
+            f"while FX Graph expects {len(original_output_args)} outputs"
+        )
 
         captured_gm = decomposed_gm
         kept_input_indices = []
@@ -242,13 +257,49 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         def capture_backend(gm, example_inputs):
             nonlocal captured_gm, kept_input_indices, kept_output_indices
+
+            # Get output node
+            output_node = list(gm.graph.find_nodes(op="output"))[-1]
+            output_args = output_node.args[0]
+            if not isinstance(output_args, tuple):
+                output_args = (output_args,)
+
+            # Remove empty tensor pass-throughs from output
+            placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+            new_output_args = []
+            for out_arg in output_args:
+                if out_arg in placeholders:
+                    p_idx = placeholders.index(out_arg)
+                    if p_idx < len(example_inputs):
+                        inp = example_inputs[p_idx]
+                        if isinstance(inp, torch.Tensor) and inp.numel() == 0:
+                            continue  # Skip empty tensor pass-through
+                new_output_args.append(out_arg)
+
+            if new_output_args:
+                output_node.args = (tuple(new_output_args),)
+
+            # Remove unused placeholders (empty pass-throughs now have no users)
+            used_placeholder_indices = []
+            for i, p in enumerate(placeholders):
+                if len(p.users) > 0:
+                    used_placeholder_indices.append(i)
+                else:
+                    gm.graph.erase_node(p)
+
+            gm.recompile()
+
+            # Filter inputs to only used ones
+            filtered_inputs = tuple(
+                example_inputs[i] for i in used_placeholder_indices if i < len(example_inputs)
+            )
+
             captured_gm = gm
 
-            # Create input mapping: example_inputs id -> flattened tensor index
             kept_input_indices = []
-            for example_input in example_inputs:
-                if id(example_input) in fake_to_flattened_idx:
-                    kept_input_indices.append(fake_to_flattened_idx[id(example_input)])
+            for inp in filtered_inputs:
+                if isinstance(inp, torch.Tensor) and id(inp) in fake_to_flattened_idx:
+                    kept_input_indices.append(fake_to_flattened_idx[id(inp)])
 
             # Create output mapping by comparing node names instead of object identity
             optimized_output_node = list(gm.graph.find_nodes(op="output"))[-1]
@@ -258,6 +309,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 optimized_output_args = (optimized_output_args,)
 
             kept_output_indices = []
+
             for opt_out in optimized_output_args:
                 for i, orig_out in enumerate(original_output_args):
                     if (
@@ -278,7 +330,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 fw_compiler=fw_compiler,
                 decompositions=decomposition_table,
             )
-            return aot_backend(gm, example_inputs)
+            return aot_backend(gm, filtered_inputs)
 
         # Configure dynamo for graph capture only (not execution)
         with (
@@ -290,20 +342,23 @@ class TorchMlirKernel(BaseNeuronKernel):
                 cache_size_limit=float("inf"),
             ),
             torch.no_grad(),
-        ):  # Avoid grad_mode guards
-            # Create compiled function directly
-            compiled_fn = dynamo.optimize(
-                capture_backend,
-                nopython=True,  # Equivalent to fullgraph=True
-            )(decomposed_gm)
+        ):
+            output_node = list(decomposed_gm.graph.find_nodes(op="output"))[-1]
+            if not isinstance(output_node.args[0], tuple):
+                output_node.args = ((output_node.args[0],),)
+                decomposed_gm.recompile()
+                original_output_args = output_node.args[0]
 
-            # Trigger compilation by calling the function with fake tensors
-            compiled_fn(*flat_args)
-
+            # Call capture_backend directly - this runs aot_autograd with decompositions
+            capture_backend(decomposed_gm, flat_args)
             gm = captured_gm
 
         # Convert to StableHLO
         stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs)
+
+        # Remove torch.debug_dump_path to avoid non-deterministicmlir path cause recompilation
+        if "torch.debug_dump_path" in stablehlo_module.operation.attributes:
+            del stablehlo_module.operation.attributes["torch.debug_dump_path"]
 
         # Generate downcasted_outputs from io_spec instead of running gm again
         if len(io_spec.outputs) == 1:
@@ -324,14 +379,22 @@ class TorchMlirKernel(BaseNeuronKernel):
             kept_output_indices,
             downcasted_outputs,
             original_outputs,
+            passthrough_mappings,
         )
 
-    def _reconstruct_outputs(self, execution_tensors, original_outputs, kept_output_indices):
+    def _reconstruct_outputs(
+        self,
+        execution_tensors,
+        original_outputs,
+        kept_output_indices,
+        context=None,
+        passthrough_mappings=None,
+    ):
         """Reconstruct full output structure using kept_output_indices mapping."""
         if original_outputs is None:
             return None
 
-        if not isinstance(original_outputs, tuple):
+        if not isinstance(original_outputs, tuple | list):
             return execution_tensors
 
         # Map execution tensors back to original structure using kept_output_indices
@@ -343,12 +406,46 @@ class TorchMlirKernel(BaseNeuronKernel):
         for exec_idx, orig_idx in enumerate(kept_output_indices):
             result[orig_idx] = exec_tuple[exec_idx]
 
-        # Create empty tensor for unused output tensors
+        if context and context.has_original_inputs:
+            flattened_original_inputs = self._flatten_all_inputs(context.original_inputs)
+        # Handle optimized-away outputs using pass-through mappings
         for idx, tensor in enumerate(result):
             if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
-                result[idx] = torch.empty(tensor.shape, dtype=tensor.dtype, device="neuron")
+                # Check if this output is a pass-through from an input
+                if (
+                    passthrough_mappings
+                    and idx in passthrough_mappings
+                    and context
+                    and context.has_original_inputs()
+                ):
+                    input_idx = passthrough_mappings[idx]
+                    passthrough_tensor = flattened_original_inputs[input_idx]
+                    result[idx] = passthrough_tensor.to("neuron")
+                else:
+                    result[idx] = torch.empty(tensor.shape, dtype=tensor.dtype, device="neuron")
 
-        return tuple(result) if len(result) > 1 else result[0]
+        if isinstance(original_outputs, tuple | list):
+            return tuple(result)
+        else:
+            return result[0]
+
+    def _detect_passthrough_mappings(self, gm, original_output_args):
+        """Detect which inputs are passed through as outputs in the FX graph."""
+        passthrough_mappings = {}
+
+        # Get input nodes (placeholders)
+        input_nodes = [node for node in gm.graph.nodes if node.op == "placeholder"]
+
+        # For each original output, check if it's a direct input passthrough
+        for orig_idx, orig_out in enumerate(original_output_args):
+            if hasattr(orig_out, "name"):
+                # Check if this output name matches any input node name
+                for input_idx, input_node in enumerate(input_nodes):
+                    if input_node.name == orig_out.name:
+                        passthrough_mappings[orig_idx] = input_idx
+                        break
+
+        return passthrough_mappings
 
     def _create_output_tensors_from_original(self, original_outputs, device):
         """Create output tensors based on original_outputs structure."""
@@ -386,7 +483,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         if original_outputs is None or downcasted_outputs is None:
             return execution_tensors
 
-        if not isinstance(original_outputs, tuple):
+        if not isinstance(original_outputs, tuple | list):
             # Single output
             if (
                 hasattr(original_outputs, "dtype")
@@ -423,7 +520,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _handle_empty_tensors(self, original_outputs, processed_inputs, device):
         """Handle empty tensors using original_outputs for shape/dtype info."""
-        from torch_neuronx.python_ops.jax.config import IndexOps, ReductionOps
 
         if original_outputs is None:
             return None
@@ -441,7 +537,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _create_reduction_identity(self, original_outputs, device):
         """Create identity values for reductions."""
-        from torch_neuronx.python_ops.jax.config import ReductionOps
 
         # Get identity value for this reduction operation
         identity = ReductionOps.get_identity_value(self.op_name)
@@ -455,7 +550,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _create_filled_tensors(self, original_outputs, device, fill_value):
         """Create tensors filled with a specific value."""
-        if not isinstance(original_outputs, tuple):
+        if not isinstance(original_outputs, tuple | list):
             if original_outputs is None:
                 return None
             return torch.full(
@@ -477,7 +572,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _create_index_result(self, original_outputs, processed_inputs, device):
         """Create result for index operations."""
-        from torch_neuronx.python_ops.jax.config import IndexOps
 
         # Check if this is an index operation with empty index tensor
         index_argnum = IndexOps.get_index_argnum(self.op_name)
@@ -506,7 +600,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _create_zeros_like_original(self, original_outputs, device):
         """Create zero tensors matching original output structure."""
-        if not isinstance(original_outputs, tuple):
+        if not isinstance(original_outputs, tuple | list):
             if original_outputs is None:
                 return None
             return (
@@ -560,8 +654,9 @@ class TorchMlirKernel(BaseNeuronKernel):
         if downcasted_outputs is None:
             return provided_output, False
 
-        is_single_output = not isinstance(provided_output, tuple)
+        is_single_output = not isinstance(provided_output, tuple | list)
         provided_tuple = (provided_output,) if is_single_output else provided_output
+        provided_tuple = self._flatten_tensors(provided_tuple)
         downcast_tuple = (
             (downcasted_outputs,)
             if not isinstance(downcasted_outputs, tuple)
@@ -603,6 +698,18 @@ class TorchMlirKernel(BaseNeuronKernel):
         return all(_is_zero_shape(out) for out in original_outputs if out is not None)
 
     @staticmethod
+    def _flatten_all_inputs(inputs):
+        """Flatten all inputs including non-tensors for passthrough mapping."""
+        flattened = []
+        for inp in inputs:
+            if isinstance(inp, list | tuple):
+                flattened.extend(TorchMlirKernel._flatten_all_inputs(inp))
+            else:
+                # Include tensor and non-tensor inputs
+                flattened.append(inp)
+        return flattened
+
+    @staticmethod
     def _flatten_tensors(inputs):
         """Flatten nested tensor structures for execution."""
         flattened = []
@@ -625,10 +732,11 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         Returns:
             Tuple of (hlo_bytes, kept_input_indices, kept_output_indices, downcasted_outputs,
-                     original_outputs, cache_key)
+                     original_outputs, passthrough_mappings, cache_key)
         """
         cache_key = self._generate_unified_cache_key(
-            context.original_inputs if context and context.has_original_inputs() else inputs, kwargs
+            context.original_inputs if context and context.has_original_inputs() else inputs,
+            context.original_kwargs if context and context.has_original_kwargs() else kwargs,
         )
 
         if cache_key in self.hlo_cache:
@@ -639,6 +747,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 kept_output_indices,
                 downcasted_outputs,
                 original_outputs,
+                passthrough_mappings,
             ) = self.hlo_cache[cache_key]
         else:
             # Generate HLO
@@ -650,6 +759,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 kept_output_indices,
                 downcasted_outputs,
                 original_outputs,
+                passthrough_mappings,
             ) = self._generate_hlo(inputs, kwargs, context)
             self.hlo_cache[cache_key] = (
                 hlo_bytes,
@@ -658,6 +768,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 kept_output_indices,
                 downcasted_outputs,
                 original_outputs,
+                passthrough_mappings,
             )
 
         return (
@@ -667,6 +778,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             kept_output_indices,
             downcasted_outputs,
             original_outputs,
+            passthrough_mappings,
             cache_key,
         )
 
@@ -696,18 +808,24 @@ class TorchMlirKernel(BaseNeuronKernel):
     @torch._dynamo.disable
     def __call__(self, *args, context: ExecutionContext | None = None, **kwargs):
         """Execute the kernel."""
+        # Short-circuit if no args/kwargs provided (all tensors filtered out).
+        # This handles foreach ops where all input tensors were empty.
+        if not args and not kwargs:
+            return None
+
         self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
 
         # Preprocess inputs
         processed_inputs = self.arg_processor.preprocess_inputs(args, scalar_to_tensor=True)
-        device = self.arg_processor.extract_device(processed_inputs, kwargs)
+        processed_kwargs = self.arg_processor.preprocess_kwargs(kwargs)
+        device = self.arg_processor.extract_device(processed_inputs, processed_kwargs)
 
         # Check for empty tensors first to avoid lowering
         if self._should_handle_empty(processed_inputs):
             # Generate outputs without HLO compilation for empty tensor handling
             original_outputs = self.infer_outputs_from_meta(
                 context.original_inputs if context else processed_inputs,
-                context.original_kwargs if context else kwargs,
+                context.original_kwargs if context else processed_kwargs,
             )
 
             _C._log_executed_op(self.op_name)
@@ -727,6 +845,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                         if out is not None and res is not None:
                             out.copy_(res)
                     return provided_output
+
             return result
 
         # Get or compile HLO and metadata
@@ -737,12 +856,14 @@ class TorchMlirKernel(BaseNeuronKernel):
             kept_output_indices,
             downcasted_outputs,
             original_outputs,
+            passthrough_mappings,
             cache_key,
-        ) = self._get_or_compile_hlo(processed_inputs, kwargs, context)
+        ) = self._get_or_compile_hlo(processed_inputs, processed_kwargs, context)
 
         # Early return if no valid outputs
         if original_outputs is None or (
-            isinstance(original_outputs, tuple) and all(out is None for out in original_outputs)
+            isinstance(original_outputs, tuple | list)
+            and all(out is None for out in original_outputs)
         ):
             _C._log_executed_op(self.op_name)
             return original_outputs
@@ -761,8 +882,8 @@ class TorchMlirKernel(BaseNeuronKernel):
             execution_tensors, needs_copy = self._prepare_execution_tensors(
                 provided_output, downcasted_outputs
             )
-        elif self.op_name.endswith("_"):
-            # For inplace operations, use the first input tensor as output
+        elif self.op_name.endswith("_") and len(io_spec.outputs) == 1:
+            # For single-output inplace ops, use the first input tensor as output
             execution_tensors = processed_inputs[0]
         else:
             # Create output tensors from downcasted_outputs (for execution)
@@ -778,6 +899,10 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         # Flatten processed inputs for execution
         flattened_processed_inputs = self._flatten_tensors(processed_inputs)
+        # Also include tensor kwargs in flattened inputs
+        for _key, value in processed_kwargs.items():
+            if isinstance(value, torch.Tensor):
+                flattened_processed_inputs.append(value)
         # Create filtered inputs using kept_input_indices on flattened inputs
         filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
 
@@ -824,7 +949,9 @@ class TorchMlirKernel(BaseNeuronKernel):
             return provided_output
 
         # Reconstruct full output structure with None values
-        return self._reconstruct_outputs(upcast_tensors, original_outputs, kept_output_indices)
+        return self._reconstruct_outputs(
+            upcast_tensors, original_outputs, kept_output_indices, context, passthrough_mappings
+        )
 
     def _execute_async(
         self,

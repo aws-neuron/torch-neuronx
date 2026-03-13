@@ -8,8 +8,11 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockNRT.h"
+#include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "tests/csrc/utils/TestUtils.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
@@ -19,11 +22,19 @@ using namespace at::neuron;
 using namespace at::neuron::testing;
 using namespace std::chrono_literals;
 using ::testing::_;
+using ::testing::DoAll;
 using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class OperationExecutionEngineTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Initialize mock NRT session first
+    mock_nrt_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
+
+    // Initialize stream pools before creating any engines
+    InitializeStreamPools();
+
     compilation_cache_ = std::make_unique<CompilationCache>();
     model_handle_cache_ = std::make_unique<ModelHandleCache>();
 
@@ -39,8 +50,12 @@ class OperationExecutionEngineTest : public ::testing::Test {
     if (engine_) {
       engine_->Shutdown();
     }
+
+    // Cleanup stream pools
+    CleanupStreamPools();
   }
 
+  std::unique_ptr<torch_neuronx::testing::MockNRTSession> mock_nrt_session_;
   std::unique_ptr<CompilationCache> compilation_cache_;
   std::unique_ptr<ModelHandleCache> model_handle_cache_;
   std::unique_ptr<OperationExecutionEngine> engine_;
@@ -54,28 +69,6 @@ TEST_F(OperationExecutionEngineTest, ConstructionWithNullCaches) {
   EXPECT_NE(engine_with_nulls, nullptr);
 
   engine_with_nulls->Shutdown();
-}
-
-// Test that TaskPriority enum has expected values
-TEST_F(OperationExecutionEngineTest, TaskPriorityEnumOrdering) {
-  // Verify the enum values are in the expected order
-  EXPECT_EQ(static_cast<int>(TaskPriority::HIGH), 0);
-  EXPECT_EQ(static_cast<int>(TaskPriority::DEFAULT), 1);
-  EXPECT_EQ(static_cast<int>(TaskPriority::LOW), 2);
-}
-
-// Test BucketizePriority helper function
-TEST_F(OperationExecutionEngineTest, BucketizePriorityFunction) {
-  // Test the bucketing logic
-  EXPECT_EQ(BucketizePriority(-1), TaskPriority::HIGH);
-  EXPECT_EQ(BucketizePriority(-100), TaskPriority::HIGH);
-  EXPECT_EQ(BucketizePriority(0), TaskPriority::DEFAULT);
-  EXPECT_EQ(BucketizePriority(1), TaskPriority::LOW);
-  EXPECT_EQ(BucketizePriority(100), TaskPriority::LOW);
-
-  // Test edge cases
-  EXPECT_EQ(BucketizePriority(INT_MIN), TaskPriority::HIGH);
-  EXPECT_EQ(BucketizePriority(INT_MAX), TaskPriority::LOW);
 }
 
 TEST_F(OperationExecutionEngineTest, MultipleShutdownCallsAreSafe) {
@@ -119,16 +112,617 @@ TEST_F(OperationExecutionEngineTest, ConcurrentNotifyExecutionReady) {
   EXPECT_NO_THROW(engine_->Shutdown());
 }
 
-TEST_F(OperationExecutionEngineTest, BucketizePriorityBoundaryValues) {
-  // Test values around zero boundary
-  EXPECT_EQ(BucketizePriority(-1), TaskPriority::HIGH);
-  EXPECT_EQ(BucketizePriority(0), TaskPriority::DEFAULT);
-  EXPECT_EQ(BucketizePriority(1), TaskPriority::LOW);
+TEST_F(OperationExecutionEngineTest, QueueLowThresholdEnvironmentVariable) {
+  // Test with default values (no environment variables set)
+  {
+    // Clear any existing environment variables
+    unsetenv("TORCH_NEURONX_CONCATENATION_QUEUE_LOW_THRESHOLD");
 
-  // Verify the enum values are distinct
-  EXPECT_NE(TaskPriority::HIGH, TaskPriority::DEFAULT);
-  EXPECT_NE(TaskPriority::DEFAULT, TaskPriority::LOW);
-  EXPECT_NE(TaskPriority::HIGH, TaskPriority::LOW);
+    auto engine_default = std::make_unique<OperationExecutionEngine>(compilation_cache_.get(),
+                                                                     model_handle_cache_.get());
+
+    // Default queue low threshold should be applied
+    EXPECT_EQ(engine_default->GetQueueLowThreshold(), DEFAULT_QUEUE_LOW_THRESHOLD);
+
+    engine_default->Shutdown();
+  }
+
+  // Test with custom environment variable value
+  {
+    setenv("TORCH_NEURONX_CONCATENATION_QUEUE_LOW_THRESHOLD", "25", 1);
+
+    auto engine_custom = std::make_unique<OperationExecutionEngine>(compilation_cache_.get(),
+                                                                    model_handle_cache_.get());
+
+    EXPECT_EQ(engine_custom->GetQueueLowThreshold(), 25);
+
+    engine_custom->Shutdown();
+  }
+
+  // Test with invalid environment variable value (should use default)
+  {
+    setenv("TORCH_NEURONX_CONCATENATION_QUEUE_LOW_THRESHOLD", "invalid", 1);
+
+    auto engine_invalid = std::make_unique<OperationExecutionEngine>(compilation_cache_.get(),
+                                                                     model_handle_cache_.get());
+
+    EXPECT_EQ(engine_invalid->GetQueueLowThreshold(), DEFAULT_QUEUE_LOW_THRESHOLD);
+
+    engine_invalid->Shutdown();
+  }
+
+  // Test with negative value (should use default)
+  {
+    setenv("TORCH_NEURONX_CONCATENATION_QUEUE_LOW_THRESHOLD", "-10", 1);
+
+    auto engine_negative = std::make_unique<OperationExecutionEngine>(compilation_cache_.get(),
+                                                                      model_handle_cache_.get());
+
+    EXPECT_EQ(engine_negative->GetQueueLowThreshold(), DEFAULT_QUEUE_LOW_THRESHOLD);
+
+    engine_negative->Shutdown();
+  }
+
+  // Clean up environment variables
+  unsetenv("TORCH_NEURONX_CONCATENATION_QUEUE_LOW_THRESHOLD");
+}
+
+// Test that ProcessCompletions decrements execution_queue_depth_ for completed async ops
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsDecrementsQueueDepth) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  // Create a stream
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create a mock operation with async state set as "scheduled"
+  auto mock_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*mock_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  ON_CALL(*mock_kernel, Execute()).WillByDefault(Return());
+
+  auto op = std::make_shared<OperationContext>(std::move(mock_kernel));
+  op->stream = stream.get();
+  op->nrt_async_state_.is_scheduled = true;
+  op->nrt_async_state_.sequence_id = 1;
+
+  // Add op to stream's active operations
+  stream->active_operations_.push_back(op);
+
+  // Simulate queue depth was incremented when op was submitted
+  engine.execution_queue_depth_.store(1);
+  EXPECT_EQ(engine.GetExecutionQueueDepth(), 1);
+
+  // Create completion state showing op's sequence is completed
+  nrt::CompletionState completion_state{};
+  completion_state.last_completed_seq[0] = 1;  // kHLO index is 0
+
+  // Mock nrta_is_completed to return true for the operation's sequence ID
+  EXPECT_CALL(*torch_neuronx::testing::MockNRT::GetInstance(), nrta_is_completed(1, _))
+      .WillOnce(DoAll(SetArgPointee<1>(true), Return(NRT_SUCCESS)));
+
+  engine.ProcessCompletions(stream.get(), completion_state);
+
+  EXPECT_EQ(engine.GetExecutionQueueDepth(), 0);
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that ProcessCompletions correctly handles multiple cascading ops linked to one concat op
+// When the concat op completes, all cascading ops complete but pending_async_ops_count
+// should only decrement once (for the concat op), not for each cascading op
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsConcatenatedOpsCountOnce) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  // Create a stream
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create the concatenated operation (the fused op that actually runs on device)
+  auto concat_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*concat_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+  concat_op->stream = stream.get();
+  concat_op->nrt_async_state_.is_scheduled = true;
+  concat_op->nrt_async_state_.sequence_id = 1;
+
+  // Keep a raw pointer before moving into ConcatenationState
+  OperationContext* concat_op_ptr = concat_op.get();
+
+  // Create 3 cascading operations first (we need their raw pointers for ConcatenationState)
+  std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+  std::vector<OperationContext*> cascading_ops_raw;
+  for (int i = 0; i < 3; ++i) {
+    auto cascading_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*cascading_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+    auto cascading_op = std::make_shared<OperationContext>(std::move(cascading_kernel));
+    cascading_op->stream = stream.get();
+    // Note: cascading ops are NOT scheduled individually - they share the concat op's scheduling
+    cascading_op->nrt_async_state_.is_scheduled = false;
+    cascading_ops_raw.push_back(cascading_op.get());
+    cascading_ops.push_back(cascading_op);
+  }
+
+  // Create a concatenation state with proper constructor
+  // (concat op ownership transferred, cascading ops, failure callback)
+  auto concat_state = std::make_shared<ConcatenationState>(
+      std::move(concat_op), cascading_ops_raw,
+      [](OperationContext*) { /* no-op failure callback for test */ });
+
+  // Link cascading ops to the concatenation state
+  for (auto& op : cascading_ops) {
+    op->concatenation_state_ = concat_state;
+  }
+
+  // Set the raw pointer on the concatenated op (now owned by concat_state)
+  concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+  // Add cascading ops to stream's active operations (in order they would execute)
+  for (auto& op : cascading_ops) {
+    stream->active_operations_.push_back(op);
+  }
+
+  // Set initial counts:
+  // - pending_async_ops_count = 1 (only one async op scheduled: the concat op)
+  // - execution_queue_depth = 3 (3 cascading ops submitted to engine)
+  engine.pending_async_ops_count_.store(1);
+  engine.execution_queue_depth_.store(3);
+
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+  EXPECT_EQ(engine.GetExecutionQueueDepth(), 3);
+
+  // Create completion state showing the concat op's sequence is completed
+  nrt::CompletionState completion_state{};
+  completion_state.last_completed_seq[0] = 1;  // kHLO index is 0
+
+  // Mock nrta_is_completed to return true for the concat op's sequence ID
+  // Called 3 times - once for each cascading op checking if its concat op is complete
+  EXPECT_CALL(*torch_neuronx::testing::MockNRT::GetInstance(), nrta_is_completed(1, _))
+      .Times(3)
+      .WillRepeatedly(DoAll(SetArgPointee<1>(true), Return(NRT_SUCCESS)));
+
+  // Process completions - all 3 cascading ops should complete
+  engine.ProcessCompletions(stream.get(), completion_state);
+
+  // Key assertion: pending_async_ops_count should decrement only ONCE (from 1 to 0)
+  // because only one device operation (the concat op) actually ran
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
+
+  // execution_queue_depth should decrement for each cascading op (3 times)
+  EXPECT_EQ(engine.GetExecutionQueueDepth(), 0);
+
+  // The concat op's promise should be set to success (marking it as completed)
+  auto future_status = concat_op_ptr->result_future.wait_for(std::chrono::seconds(0));
+  EXPECT_EQ(future_status, std::future_status::ready);
+  auto result = concat_op_ptr->result_future.get();
+  EXPECT_EQ(result.status, OperationContextResult::Status::kCompleted);
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that ProcessCompilationTask handles concatenated operation compilation failure
+// When the concatenated operation fails compilation (e.g., compiler error inside
+// ProcessCompilationTask), the error should be caught and HandleErrorWithCleanup should be called
+// on the concatenated operation
+TEST_F(OperationExecutionEngineTest, ProcessCompilationTaskConcatenatedOpFailure) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  // Create a stream
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create 2 cascading operations that will be "merged" into a concatenated operation
+  std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+  std::vector<OperationContext*> cascading_ops_raw;
+
+  for (int i = 0; i < 2; ++i) {
+    auto cascading_kernel = std::make_unique<at::neuron::testing::MockXLACompilableKernelExecution>(
+        "cascading_op_" + std::to_string(i));
+    // Cascading ops compile successfully
+    ON_CALL(*cascading_kernel, CompileToNeff())
+        .WillByDefault(::testing::Return(std::vector<uint8_t>{0x01, 0x02, 0x03}));
+
+    auto cascading_op = std::make_shared<OperationContext>(std::move(cascading_kernel));
+    cascading_op->stream = stream.get();
+    cascading_ops_raw.push_back(cascading_op.get());
+    cascading_ops.push_back(cascading_op);
+  }
+
+  // Create the concatenated operation that will FAIL compilation
+  auto concat_kernel =
+      std::make_unique<at::neuron::testing::MockXLACompilableKernelExecution>("concatenated_op");
+  // Make the concatenated operation's compilation throw an exception
+  ON_CALL(*concat_kernel, CompileToNeff())
+      .WillByDefault(
+          ::testing::Throw(std::runtime_error("Simulated concatenated op compilation failure")));
+
+  auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+  concat_op->stream = stream.get();
+
+  // Keep a raw pointer before moving into ConcatenationState
+  OperationContext* concat_op_ptr = concat_op.get();
+
+  // Track if the failure callback was invoked
+  bool failure_callback_invoked = false;
+  OperationContext* failed_op_in_callback = nullptr;
+
+  // Create a concatenation state with failure callback
+  auto concat_state = std::make_shared<ConcatenationState>(
+      std::move(concat_op), cascading_ops_raw,
+      [&failure_callback_invoked, &failed_op_in_callback](OperationContext* failed_op) {
+        failure_callback_invoked = true;
+        failed_op_in_callback = failed_op;
+      });
+
+  // Link cascading ops to the concatenation state
+  for (auto& op : cascading_ops) {
+    op->concatenation_state_ = concat_state;
+  }
+
+  // Set the raw pointer on the concatenated op (now owned by concat_state)
+  concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+  // Simulate: First cascading op compiles successfully
+  // IncrementAndCheckCompiledCascadingOpsCount returns false (not all cascading ops compiled yet)
+  EXPECT_FALSE(concat_state->IncrementAndCheckCompiledCascadingOpsCount());
+  EXPECT_EQ(concat_state->GetCompiledCascadingOpsCount(), 1);
+
+  // Simulate: Second cascading op compiles successfully
+  // IncrementAndCheckCompiledCascadingOpsCount returns true (all cascading ops compiled)
+  // This would trigger ProcessCompilationTask on the concatenated operation
+  EXPECT_TRUE(concat_state->IncrementAndCheckCompiledCascadingOpsCount());
+  EXPECT_EQ(concat_state->GetCompiledCascadingOpsCount(), 2);
+
+  // At this point, ProcessCompilationTask would be called on concat_op_ptr
+  // and it should fail compilation, triggering HandleErrorWithCleanup
+
+  // Verify the concatenation state was set up correctly
+  EXPECT_EQ(concat_state->GetCascadingOperationsCount(), 2);
+  EXPECT_EQ(concat_state->GetConcatenatedOperation(), concat_op_ptr);
+  EXPECT_TRUE(cascading_ops[0]->HasConcatenatedOperation());
+  EXPECT_TRUE(cascading_ops[1]->HasConcatenatedOperation());
+  EXPECT_FALSE(cascading_ops[0]->IsConcatenatedOperation());
+  EXPECT_FALSE(cascading_ops[1]->IsConcatenatedOperation());
+  EXPECT_TRUE(concat_op_ptr->IsConcatenatedOperation());
+
+  // Verify we can invoke the failure callback (simulating error recovery path)
+  concat_state->InvokeFailureCallback(concat_op_ptr);
+  EXPECT_TRUE(failure_callback_invoked);
+  EXPECT_EQ(failed_op_in_callback, concat_op_ptr);
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that verifies the error handling path when concatenated operation compilation
+// throws an exception - the cascading operations should have their concatenation state
+// cleared so they can proceed with individual execution
+TEST_F(OperationExecutionEngineTest, ConcatenatedOpCompilationFailureFallsBackToIndividualOps) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create cascading operations
+  std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+  std::vector<OperationContext*> cascading_ops_raw;
+
+  for (int i = 0; i < 3; ++i) {
+    auto cascading_kernel = std::make_unique<at::neuron::testing::MockXLACompilableKernelExecution>(
+        "cascading_op_" + std::to_string(i));
+    auto cascading_op = std::make_shared<OperationContext>(std::move(cascading_kernel));
+    cascading_op->stream = stream.get();
+    cascading_ops_raw.push_back(cascading_op.get());
+    cascading_ops.push_back(cascading_op);
+  }
+
+  // Create concatenated operation
+  auto concat_kernel =
+      std::make_unique<at::neuron::testing::MockXLACompilableKernelExecution>("concatenated_op");
+  auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+  concat_op->stream = stream.get();
+  OperationContext* concat_op_ptr = concat_op.get();
+
+  // Track failure callback invocation
+  std::atomic<int> failure_callback_count{0};
+
+  // Create a failure callback that clears the concatenation state from cascading ops
+  // This mimics what ConcatenationCore::ProcessNewConcatenatedOperation does
+  auto concat_state =
+      std::make_shared<ConcatenationState>(std::move(concat_op), cascading_ops_raw,
+                                           [&failure_callback_count](OperationContext* failed_op) {
+                                             failure_callback_count.fetch_add(1);
+
+                                             // Clear concatenation state for all cascading
+                                             // operations so they can fall back to individual
+                                             // execution (This is what the real failure callback in
+                                             // ConcatenationCore does)
+                                             if (failed_op) {
+                                               auto* state = failed_op->GetConcatenationState();
+                                               if (state) {
+                                                 for (auto* op : state->GetCascadingOperations()) {
+                                                   op->concatenation_state_ = nullptr;
+                                                 }
+                                               }
+                                             }
+                                           });
+
+  // Link cascading ops
+  for (auto& op : cascading_ops) {
+    op->concatenation_state_ = concat_state;
+  }
+  concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+  // Verify initial state - cascading ops are linked to concatenation state
+  EXPECT_EQ(concat_state->GetCompiledCascadingOpsCount(), 0);
+  EXPECT_EQ(failure_callback_count.load(), 0);
+  for (auto& op : cascading_ops) {
+    EXPECT_TRUE(op->HasConcatenatedOperation())
+        << "Cascading op should have concatenated operation before failure";
+  }
+
+  // Simulate compilation of cascading ops
+  for (size_t i = 0; i < cascading_ops.size() - 1; ++i) {
+    bool is_last = concat_state->IncrementAndCheckCompiledCascadingOpsCount();
+    EXPECT_FALSE(is_last) << "Should not be last at iteration " << i;
+  }
+
+  // Last cascading op compilation - triggers concatenated op compilation
+  bool is_last = concat_state->IncrementAndCheckCompiledCascadingOpsCount();
+  EXPECT_TRUE(is_last);
+  EXPECT_EQ(concat_state->GetCompiledCascadingOpsCount(), 3);
+
+  // Simulate the error path: concat op compilation failed, invoke failure callback
+  // This clears the concatenation state from all cascading operations
+  concat_state->InvokeFailureCallback(concat_op_ptr);
+  EXPECT_EQ(failure_callback_count.load(), 1);
+
+  // After failure callback, cascading ops should NOT have concatenation state anymore
+  // They should be able to proceed with individual execution
+  for (auto& op : cascading_ops) {
+    EXPECT_FALSE(op->HasConcatenatedOperation())
+        << "Cascading op should NOT have concatenated operation after failure callback";
+    EXPECT_EQ(op->concatenation_state_, nullptr)
+        << "Cascading op's concatenation_state_ should be nullptr after failure";
+    // The operation itself is still valid and can be executed individually
+    EXPECT_NE(op->GetOpName().find("cascading_op_"), std::string::npos);
+  }
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that FindOperationBySeq can find a concatenated operation via its cascading ops
+// This is critical for async error handling where NRT reports errors using concat op's sequence ID
+TEST_F(OperationExecutionEngineTest, FindOperationBySeqFindsConcatOpViaCascadingOps) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create the concatenated operation with a specific sequence ID
+  auto concat_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*concat_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+  concat_op->stream = stream.get();
+  concat_op->nrt_async_state_.is_scheduled = true;
+  concat_op->nrt_async_state_.sequence_id = 42;  // The sequence ID NRT would report
+
+  OperationContext* concat_op_ptr = concat_op.get();
+
+  // Create cascading operations (NOT scheduled individually)
+  std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+  std::vector<OperationContext*> cascading_ops_raw;
+
+  for (int i = 0; i < 2; ++i) {
+    auto cascading_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*cascading_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+    auto cascading_op = std::make_shared<OperationContext>(std::move(cascading_kernel));
+    cascading_op->stream = stream.get();
+    cascading_op->nrt_async_state_.is_scheduled = false;  // NOT scheduled
+    cascading_ops_raw.push_back(cascading_op.get());
+    cascading_ops.push_back(cascading_op);
+  }
+
+  // Create concatenation state
+  auto concat_state = std::make_shared<ConcatenationState>(std::move(concat_op), cascading_ops_raw,
+                                                           [](OperationContext*) {});
+
+  // Link cascading ops to the concatenation state
+  for (auto& op : cascading_ops) {
+    op->concatenation_state_ = concat_state;
+  }
+  concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+  // Add ONLY cascading ops to active_operations_ (concat op is owned by concat_state)
+  for (auto& op : cascading_ops) {
+    stream->active_operations_.push_back(op);
+  }
+
+  // Test: FindOperationBySeq should find the concat op via its cascading ops
+  OperationContext* found_op = stream->FindOperationBySeq(42);
+
+  EXPECT_NE(found_op, nullptr) << "Should find concat op via cascading ops";
+  EXPECT_EQ(found_op, concat_op_ptr) << "Found op should be the concat op";
+  EXPECT_TRUE(found_op->IsConcatenatedOperation())
+      << "Found op should be identified as concatenated op";
+
+  // Test: FindOperationBySeq should return nullptr for non-existent sequence ID
+  OperationContext* not_found = stream->FindOperationBySeq(999);
+  EXPECT_EQ(not_found, nullptr) << "Should not find op with non-existent sequence ID";
+
+  // Clean up: clear active_operations_ before stream destructor calls Synchronize()
+  // (StreamImpl::~StreamImpl calls Synchronize which waits for active_operations_ to be empty)
+  stream->active_operations_.clear();
+  cascading_ops.clear();
+  concat_state.reset();
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that ProcessAsyncErrors properly handles concatenated operation async failure
+// and fails all cascading operations individually
+TEST_F(OperationExecutionEngineTest, ProcessAsyncErrorsConcatenatedOpFailsAllCascadingOps) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  // Initialize NRT mocks to avoid actual NRT calls during test setup
+  auto mock_session = std::make_unique<torch_neuronx::testing::MockNRTSession>();
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create the concatenated operation
+  auto concat_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*concat_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+  concat_op->stream = stream.get();
+  concat_op->nrt_async_state_.is_scheduled = true;
+  concat_op->nrt_async_state_.sequence_id = 100;
+
+  OperationContext* concat_op_ptr = concat_op.get();
+
+  // Create 3 cascading operations
+  std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+  std::vector<OperationContext*> cascading_ops_raw;
+
+  for (int i = 0; i < 3; ++i) {
+    auto cascading_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*cascading_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+    auto cascading_op = std::make_shared<OperationContext>(std::move(cascading_kernel));
+    cascading_op->stream = stream.get();
+    cascading_op->nrt_async_state_.is_scheduled = false;
+    cascading_ops_raw.push_back(cascading_op.get());
+    cascading_ops.push_back(cascading_op);
+  }
+
+  // Create concatenation state
+  auto concat_state = std::make_shared<ConcatenationState>(std::move(concat_op), cascading_ops_raw,
+                                                           [](OperationContext*) {});
+
+  // Link cascading ops
+  for (auto& op : cascading_ops) {
+    op->concatenation_state_ = concat_state;
+  }
+  concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+  // Add cascading ops to active_operations_
+  for (auto& op : cascading_ops) {
+    stream->active_operations_.push_back(op);
+  }
+
+  // Set initial counters:
+  // - pending_async_ops_count = 1 (one concat op scheduled)
+  // - execution_queue_depth = 3 (three cascading ops in queue)
+  // - inflight_count[0] = 1 (one HLO op inflight)
+  engine.pending_async_ops_count_.store(1);
+  engine.execution_queue_depth_.store(3);
+  stream->completion_state_.inflight_count[0] = 1;
+
+  // Verify initial state
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+  EXPECT_EQ(engine.GetExecutionQueueDepth(), 3);
+  EXPECT_EQ(stream->active_operations_.size(), 3);
+
+  // Verify the concatenation state is properly set up for error handling
+  EXPECT_EQ(concat_state->GetCascadingOperationsCount(), 3);
+  EXPECT_EQ(concat_state->GetConcatenatedOperation(), concat_op_ptr);
+  EXPECT_TRUE(concat_op_ptr->IsConcatenatedOperation());
+
+  // Verify GetCascadingOperations returns all cascading ops
+  auto retrieved_cascading_ops = concat_state->GetCascadingOperations();
+  EXPECT_EQ(retrieved_cascading_ops.size(), 3);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(retrieved_cascading_ops[i], cascading_ops_raw[i]);
+  }
+
+  // Clean up: clear active_operations_ before stream destructor calls Synchronize()
+  stream->active_operations_.clear();
+  cascading_ops.clear();
+  concat_state.reset();
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that execution_queue_depth is decremented exactly once per cascading op
+// regardless of whether the concatenated operation succeeds or fails
+TEST_F(OperationExecutionEngineTest, ExecutionQueueDepthDecrementedOncePerOp) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  // Test 1: Success path - each cascading op decrements queue depth once
+  {
+    auto stream = std::make_shared<StreamImpl>(0, 1);
+
+    auto concat_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*concat_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+    auto concat_op = std::make_unique<OperationContext>(std::move(concat_kernel));
+    concat_op->stream = stream.get();
+    concat_op->nrt_async_state_.is_scheduled = true;
+    concat_op->nrt_async_state_.sequence_id = 1;
+    OperationContext* concat_op_ptr = concat_op.get();
+
+    std::vector<std::shared_ptr<OperationContext>> cascading_ops;
+    std::vector<OperationContext*> cascading_ops_raw;
+    for (int i = 0; i < 5; ++i) {
+      auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+      ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+      auto op = std::make_shared<OperationContext>(std::move(kernel));
+      op->stream = stream.get();
+      cascading_ops_raw.push_back(op.get());
+      cascading_ops.push_back(op);
+    }
+
+    auto concat_state = std::make_shared<ConcatenationState>(
+        std::move(concat_op), cascading_ops_raw, [](OperationContext*) {});
+    for (auto& op : cascading_ops) {
+      op->concatenation_state_ = concat_state;
+      stream->active_operations_.push_back(op);
+    }
+    concat_op_ptr->concatenation_state_raw_ = concat_state.get();
+
+    // Set initial queue depth to 5 (one per cascading op)
+    engine.pending_async_ops_count_.store(1);
+    engine.execution_queue_depth_.store(5);
+
+    // Mock nrta_is_completed to return true for the concat op's sequence ID
+    // Called 5 times - once for each cascading op checking if its concat op is complete
+    EXPECT_CALL(*torch_neuronx::testing::MockNRT::GetInstance(), nrta_is_completed(1, _))
+        .Times(5)
+        .WillRepeatedly(DoAll(SetArgPointee<1>(true), Return(NRT_SUCCESS)));
+
+    // Process completions (success)
+    nrt::CompletionState completion_state{};
+    completion_state.last_completed_seq[0] = 1;
+    engine.ProcessCompletions(stream.get(), completion_state);
+
+    // Verify: queue depth should be 0 after all 5 ops complete
+    EXPECT_EQ(engine.GetExecutionQueueDepth(), 0)
+        << "Queue depth should be 0 after 5 cascading ops complete successfully";
+    EXPECT_EQ(engine.pending_async_ops_count_.load(), 0)
+        << "pending_async_ops_count should be 0 after concat op completes";
+  }
+
+  engine.Shutdown();
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
 }
 
 int main(int argc, char** argv) {

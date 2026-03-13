@@ -71,57 +71,18 @@ TEST_F(OperationContextTest, ConstructionWithKernelExecution) {
 
   EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
 
-  OperationContext context(std::move(kernel), {}, {}, stack_trace);
+  OperationContext context(std::move(kernel), stack_trace);
 
   EXPECT_NE(context.kernel_execution, nullptr);
   EXPECT_EQ(context.python_stack_trace, stack_trace);
   EXPECT_TRUE(context.IsValid());
-  EXPECT_TRUE(context.input_tensors_context.empty());
-  EXPECT_TRUE(context.output_tensors_context.empty());
 }
 
 TEST_F(OperationContextTest, ConstructionWithNullKernel) {
-  OperationContext context(nullptr, {}, {}, "test_trace");
+  OperationContext context(nullptr, "test_trace");
 
   // Cannot call IsValid() on null kernel_execution - would crash
   EXPECT_EQ(context.kernel_execution, nullptr);
-}
-
-TEST_F(OperationContextTest, ConstructionWithTensorContext) {
-  auto input_tensor = torch::ones({2, 3}, torch::dtype(torch::kFloat32));
-  auto output_tensor = torch::zeros({4, 5}, torch::dtype(torch::kInt32));
-
-  std::vector<TensorContext> input_contexts = {TensorContext::FromTensor(input_tensor)};
-  std::vector<TensorContext> output_contexts = {TensorContext::FromTensor(output_tensor)};
-
-  auto kernel = std::make_unique<MockNeuronKernelExecution>();
-  EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
-
-  OperationContext context(std::move(kernel), input_contexts, output_contexts, "test_trace");
-
-  EXPECT_EQ(context.input_tensors_context.size(), 1);
-  EXPECT_EQ(context.output_tensors_context.size(), 1);
-
-  // Verify input context - all fields
-  const auto& input_ctx = context.input_tensors_context[0];
-  EXPECT_EQ(input_ctx.get_numel(), static_cast<size_t>(input_tensor.numel()));
-  EXPECT_EQ(input_ctx.get_size_bytes(), static_cast<size_t>(input_tensor.nbytes()));
-  EXPECT_EQ(input_ctx.get_element_size(), static_cast<size_t>(input_tensor.element_size()));
-  EXPECT_EQ(input_ctx.get_shape(), input_tensor.sizes().vec());
-  EXPECT_EQ(input_ctx.get_storage_offset(), static_cast<size_t>(input_tensor.storage_offset()));
-  EXPECT_EQ(input_ctx.get_dtype(), input_tensor.scalar_type());
-  EXPECT_EQ(input_ctx.get_options().dtype(), input_tensor.options().dtype());
-  EXPECT_EQ(input_ctx.get_options().layout(), input_tensor.options().layout());
-
-  // Verify output context - all fields
-  const auto& output_ctx = context.output_tensors_context[0];
-  EXPECT_EQ(output_ctx.get_numel(), static_cast<size_t>(output_tensor.numel()));
-  EXPECT_EQ(output_ctx.get_size_bytes(), static_cast<size_t>(output_tensor.nbytes()));
-  EXPECT_EQ(output_ctx.get_element_size(), static_cast<size_t>(output_tensor.element_size()));
-  EXPECT_EQ(output_ctx.get_shape(), output_tensor.sizes().vec());
-  EXPECT_EQ(output_ctx.get_storage_offset(), static_cast<size_t>(output_tensor.storage_offset()));
-  EXPECT_EQ(output_ctx.get_dtype(), output_tensor.scalar_type());
-  EXPECT_EQ(output_ctx.get_options().dtype(), output_tensor.options().dtype());
 }
 
 TEST_F(OperationContextTest, TimingLogic) {
@@ -207,7 +168,7 @@ TEST_F(OperationContextTest, CompilableKernelIntegration) {
   EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
 
   std::vector<TensorContext> input_contexts, output_contexts;
-  OperationContext context(std::move(kernel), input_contexts, output_contexts, "test_stack");
+  OperationContext context(std::move(kernel), "test_stack");
 
   EXPECT_TRUE(context.IsValid());
   EXPECT_EQ(context.GetOpName(), "compilable_op");
@@ -220,7 +181,7 @@ TEST_F(OperationContextTest, KernelTypeChecking) {
   EXPECT_CALL(*kernel, RequiresCompilation()).WillRepeatedly(Return(false));
 
   std::vector<TensorContext> input_contexts, output_contexts;
-  OperationContext context(std::move(kernel), input_contexts, output_contexts, "test_stack");
+  OperationContext context(std::move(kernel), "test_stack");
 
   EXPECT_FALSE(context.RequiresCompilation());
 
@@ -235,9 +196,7 @@ TEST_F(OperationContextTest, CompilationRequirementChecking) {
   EXPECT_CALL(*compilable, RequiresCompilation()).WillRepeatedly(Return(true));
   EXPECT_CALL(*compilable, ValidateImpl()).WillRepeatedly(Return(true));
 
-  std::vector<TensorContext> input_contexts, output_contexts;
-  OperationContext compilable_context(std::move(compilable), input_contexts, output_contexts,
-                                      "test_stack");
+  OperationContext compilable_context(std::move(compilable), "test_stack");
 
   EXPECT_TRUE(compilable_context.RequiresCompilation());
 
@@ -245,7 +204,7 @@ TEST_F(OperationContextTest, CompilationRequirementChecking) {
 
   EXPECT_CALL(*direct, RequiresCompilation()).WillRepeatedly(Return(false));
 
-  OperationContext direct_context(std::move(direct), input_contexts, output_contexts, "test_stack");
+  OperationContext direct_context(std::move(direct), "test_stack");
 
   EXPECT_FALSE(direct_context.RequiresCompilation());
 }
@@ -254,8 +213,8 @@ TEST_F(OperationContextTest, BasicPromiseFunctionality) {
   auto kernel = std::make_unique<MockNeuronKernelExecution>();
   OperationContext context(std::move(kernel));
 
-  // Get future from promise
-  auto future = context.promise.get_future();
+  // Get future from result_future (already created in constructor)
+  auto future = context.result_future;
 
   // Promise should be valid
   EXPECT_TRUE(future.valid());
@@ -274,7 +233,7 @@ TEST_F(OperationContextTest, PromiseWithError) {
   auto kernel = std::make_unique<MockNeuronKernelExecution>();
   OperationContext context(std::move(kernel));
 
-  auto future = context.promise.get_future();
+  auto future = context.result_future;
 
   // Set error result
   context.promise.set_value(OperationContextResult::CreateError("Test error"));
@@ -326,7 +285,7 @@ TEST_F(OperationContextTest, StreamPointerInitiallyNull) {
 TEST_F(OperationContextTest, CPUFallbackContextAccessor) {
   auto kernel = std::make_unique<MockNeuronKernelExecution>();
   CPUFallbackContext fallback_ctx;
-  OperationContext context(std::move(kernel), {}, {}, "", std::move(fallback_ctx));
+  OperationContext context(std::move(kernel), "", std::move(fallback_ctx));
 
   // Should be able to access the fallback context
   const auto& ctx = context.GetCPUFallbackContext();
@@ -359,10 +318,7 @@ TEST_F(OperationContextTest, MultipleTensorContexts) {
   auto kernel = std::make_unique<MockNeuronKernelExecution>();
   EXPECT_CALL(*kernel, ValidateImpl()).WillRepeatedly(Return(true));
 
-  OperationContext context(std::move(kernel), input_contexts, output_contexts, "test");
-
-  EXPECT_EQ(context.input_tensors_context.size(), 2);
-  EXPECT_EQ(context.output_tensors_context.size(), 1);
+  OperationContext context(std::move(kernel), "test");
 }
 
 TEST_F(OperationContextTest, IsSchedulableForNonEventKernel) {
@@ -378,6 +334,161 @@ TEST_F(OperationContextTest, IsSchedulableForNonEventKernel) {
 
   // Now should be schedulable
   EXPECT_TRUE(context.IsSchedulable());
+}
+
+// ============================================================================
+// Async Execution State Tests
+// ============================================================================
+
+TEST_F(OperationContextTest, AsyncStateInitiallyNotScheduled) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  OperationContext context(std::move(kernel));
+
+  EXPECT_FALSE(context.nrt_async_state_.is_scheduled);
+  EXPECT_EQ(context.nrt_async_state_.sequence_id, 0);
+}
+
+TEST_F(OperationContextTest, MarkScheduledSetsState) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  OperationContext context(std::move(kernel));
+
+  nrt::SequenceId test_seq = 12345;
+
+  context.MarkScheduled(test_seq);
+
+  EXPECT_TRUE(context.nrt_async_state_.is_scheduled);
+  EXPECT_EQ(context.nrt_async_state_.sequence_id, test_seq);
+}
+
+TEST_F(OperationContextTest, MarkScheduledMultipleTimes) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  OperationContext context(std::move(kernel));
+
+  context.MarkScheduled(100);
+  EXPECT_TRUE(context.nrt_async_state_.is_scheduled);
+  EXPECT_EQ(context.nrt_async_state_.sequence_id, 100);
+
+  context.MarkScheduled(200);
+  EXPECT_TRUE(context.nrt_async_state_.is_scheduled);
+  EXPECT_EQ(context.nrt_async_state_.sequence_id, 200);
+}
+
+TEST_F(OperationContextTest, PendingSignalInitiallyFalse) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  OperationContext context(std::move(kernel));
+
+  EXPECT_FALSE(context.nrt_async_state_.is_pending_signal);
+}
+
+TEST_F(OperationContextTest, MarkPendingSignalSetsState) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  OperationContext context(std::move(kernel));
+
+  context.nrt_async_state_.is_pending_signal = true;
+
+  EXPECT_TRUE(context.nrt_async_state_.is_pending_signal);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeHLO) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kHLO));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_TRUE(IsDeviceKernelType(kt));
+  EXPECT_EQ(kt, KernelTypeEnum::kHLO);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeCollective) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kCollective));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_TRUE(IsDeviceKernelType(kt));
+  EXPECT_EQ(kt, KernelTypeEnum::kCollective);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeCopy) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kCopy));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_TRUE(IsDeviceKernelType(kt));
+  EXPECT_EQ(kt, KernelTypeEnum::kCopy);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeWrite) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kWrite));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_TRUE(IsDeviceKernelType(kt));
+  EXPECT_EQ(kt, KernelTypeEnum::kWrite);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeRead) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kRead));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_TRUE(IsDeviceKernelType(kt));
+  EXPECT_EQ(kt, KernelTypeEnum::kRead);
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeEventReturnsFalse) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kEvent));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_FALSE(IsDeviceKernelType(kt));
+}
+
+TEST_F(OperationContextTest, IsDeviceKernelTypeHintReturnsFalse) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kHint));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_FALSE(IsDeviceKernelType(kt));
+}
+
+TEST_F(OperationContextTest, IsDeviceOperationForDeviceKernels) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kHLO));
+
+  OperationContext context(std::move(kernel));
+
+  EXPECT_TRUE(IsDeviceKernelType(context.GetKernelType()));
+}
+
+TEST_F(OperationContextTest, IsDeviceOperationForHostKernels) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kEvent));
+
+  OperationContext context(std::move(kernel));
+
+  EXPECT_FALSE(IsDeviceKernelType(context.GetKernelType()));
+}
+
+TEST_F(OperationContextTest, RequiresPrepareDefaultsFalse) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, RequiresPrepare()).WillRepeatedly(Return(false));
+
+  OperationContext context(std::move(kernel));
+
+  EXPECT_FALSE(context.RequiresPrepare());
 }
 
 int main(int argc, char** argv) {

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
@@ -31,62 +32,86 @@ namespace at::neuron {
     }                                                                    \
   } while (0)
 
-void NRTHandler::PrepareAndExecuteModel(nrt::Model* model,
+void NRTHandler::DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>& model,
                                         const std::vector<nrt_tensor_t*>& src_data_ptrs,
                                         const std::vector<nrt_tensor_t*>& dst_data_ptrs,
-                                        const ExecutionConfig& config) {
-  TORCH_NEURONX_DEBUG("NRTHandler executing model", "device_id=", config.device_id,
-                      "num_cores=", config.num_cores);
+                                        const ExecutionConfig& config,
+                                        nrt::ErrorTrackerHandle* err_tracker,
+                                        nrt::SequenceId* sequence_id, c10::StreamId stream_id) {
+  bool is_async = (err_tracker != nullptr);
+  TORCH_NEURONX_DEBUG("NRTHandler dispatching model execution", "device_id=", config.device_id,
+                      "num_cores=", config.num_cores, "async=", is_async);
   // Prepare tensor sets for NRT execution
-  nrt::TensorSet input_set;
-  nrt::TensorSet output_set;
+  auto input_set = nrt::CreateTensorSet();
+  auto output_set = nrt::CreateTensorSet();
 
   PrepareInputTensorSet(src_data_ptrs, input_set);
   PrepareOutputTensorSet(dst_data_ptrs, output_set);
 
-  NRT_CHECK_STATUS(model->Execute(input_set.get(), output_set.get()), "NRT model execution failed");
+  // Queue parameter is not used yet; always use queue 0
+  constexpr int kDefaultQueue = 0;
+  NRT_CHECK_STATUS(nrt::DispatchExecution(model.get(), input_set.get(), output_set.get(),
+                                          kDefaultQueue, err_tracker, sequence_id),
+                   is_async ? "NRT model async scheduling failed" : "NRT model execution failed");
 }
 
 void NRTHandler::PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
-                                       nrt::TensorSet& input_set) {
+                                       nrt::TensorSetPtr& input_set) {
   TORCH_NEURONX_DEBUG("NRTHandler preparing input tensor set");
   for (size_t i = 0; i < inputs.size(); ++i) {
     TORCH_NEURONX_DEBUG("Processing input tensor", "index=", i);
     nrt_tensor_t* data_ptr = inputs[i];
     std::string name = "input" + std::to_string(i);
-    NRT_CHECK_STATUS(input_set.AddTensor(name, data_ptr),
+    NRT_CHECK_STATUS(nrt::AddTensorToSet(input_set, name, data_ptr),
                      "Failed to add input tensor to tensor set");
     TORCH_NEURONX_DEBUG("Added input tensor to tensor set", "name=", name);
   }
 }
 
 void NRTHandler::PrepareOutputTensorSet(const std::vector<nrt_tensor_t*>& outputs,
-                                        nrt::TensorSet& output_set) {
+                                        nrt::TensorSetPtr& output_set) {
   TORCH_NEURONX_DEBUG("NRTHandler preparing output tensor set");
   for (size_t i = 0; i < outputs.size(); ++i) {
     TORCH_NEURONX_DEBUG("Processing output tensor", "index=", i);
     nrt_tensor_t* data_ptr = outputs[i];
     std::string name = "output" + std::to_string(i);
-    NRT_CHECK_STATUS(output_set.AddTensor(name, data_ptr),
+    NRT_CHECK_STATUS(nrt::AddTensorToSet(output_set, name, data_ptr),
                      "Failed to add output tensor to tensor set");
     TORCH_NEURONX_DEBUG("Added output tensor to tensor set", "name=", name);
   }
 }
 
-nrt::Model* NRTHandler::GetOrLoadModel(const CompilableKernelExecution& compilable_kernel,
-                                       const ExecutionConfig& config) {
+std::shared_ptr<nrt::ModelHandle> NRTHandler::GetOrLoadModel(
+    const CompilableKernelExecution& compilable_kernel, const ExecutionConfig& config) {
   TORCH_NEURONX_DEBUG("NRTHandler getting model from cache", "device_id=", config.device_id,
                       "num_cores=", config.num_cores);
 
-  auto& model_handle_cache = NeuronResourceManager::Instance().GetModelHandleCache();
+  auto& cache = NeuronResourceManager::Instance().GetModelHandleCache();
+  const auto& neff_bytes = compilable_kernel.GetCachedNeff();
+  std::string cache_key = cache.GenerateCacheKey(neff_bytes, config.device_id);
 
-  auto cached_model =
-      model_handle_cache.GetOrLoadModel(compilable_kernel, config.device_id, config.num_cores);
+  // Try cache first
+  auto model = cache.GetModel(cache_key);
+  if (model) return model;
 
-  if (!cached_model || !cached_model->IsValid()) {
-    throw std::runtime_error("Failed to get valid model from cache");
+  // Cache miss — resolve device params and load
+  int vnc_id = c10_neuron::get_vnc_id(config.device_id);
+  bool has_collectives = compilable_kernel.HasCollectives();
+  nrt::ModelPtr model_ptr;
+
+  if (has_collectives) {
+    int rank = c10_neuron::get_rank();
+    int world_size = c10_neuron::get_world_size();
+    NRT_CHECK_STATUS(nrt::LoadModelCollectives(model_ptr, neff_bytes, vnc_id, config.num_cores,
+                                               rank, world_size),
+                     "Failed to load model with collectives");
+  } else {
+    NRT_CHECK_STATUS(nrt::LoadModel(model_ptr, neff_bytes, vnc_id, config.num_cores),
+                     "Failed to load model");
   }
-  return cached_model.get();
+
+  // Store in cache
+  return cache.StoreModel(cache_key, std::move(model_ptr), config.device_id, has_collectives);
 }
 
 }  // namespace at::neuron

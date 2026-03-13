@@ -11,11 +11,13 @@ class AllGatherXlaOp(XLABuilderOpImpl):
     def __init__(self):
         """Initialize AllGatherXLAOp with XLA kernel configuration.
 
-        Sets up the XLA kernel with static arguments for replica groups.
+        Sets up the XLA kernel with static arguments for replica groups and slice_output.
         Enables collective operations for distributed computing.
         """
         super().__init__(
-            op_name="all_gather", static_argnames=["replica_groups"], has_collectives=True
+            op_name="all_gather",
+            static_argnames=["replica_groups", "slice_output"],
+            has_collectives=True,
         )
 
     def hlo_fn(self, input_tensors, **kwargs):

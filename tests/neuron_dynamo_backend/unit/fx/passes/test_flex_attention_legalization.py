@@ -7,18 +7,70 @@ These tests verify the PassBase-based FlexAttentionLegalization class
 produces correct numerical results and properly integrates with PassManager.
 """
 
+import logging
 import operator
 
 import pytest
 import torch
 import torch.fx as fx
 import torch.nn.functional as F
+from functorch.compile import aot_module, make_boxed_func
 from torch.fx.passes.pass_manager import PassManager
 
+from tests.neuron_dynamo_backend.unit.utils.test_utils import create_capture_compiler
 from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
     AttentionShapes,
     FlexAttentionLegalization,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Fixtures
+# ============================================================================
+
+
+@pytest.fixture
+def create_graph():
+    """Factory fixture for creating FX graphs with placeholders and metadata.
+
+    Usage:
+        graph, nodes = create_graph({
+            "query": ((B, H, L, E), torch.float32),
+            "key": ((B, H, S, E), torch.float32),
+        })
+        # Access nodes: nodes["query"], nodes["key"]
+    """
+
+    def _create(placeholders: dict):
+        """
+        Args:
+            placeholders: {"name": (shape, dtype), ...}
+                         dtype is optional, defaults to torch.float32
+        Returns:
+            (graph, {name: node})
+        """
+        graph = fx.Graph()
+        nodes = {}
+        for name, spec in placeholders.items():
+            # Handle both (shape, dtype) and just shape
+            if isinstance(spec, tuple) and len(spec) == 2 and isinstance(spec[1], torch.dtype):
+                shape, dtype = spec
+            else:
+                shape, dtype = spec, torch.float32
+
+            node = graph.placeholder(name)
+            node.meta = {"val": torch.empty(*shape, dtype=dtype)}
+            nodes[name] = node
+        return graph, nodes
+
+    return _create
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 
 def legalize_flex_attention_pass(gm: fx.GraphModule) -> fx.GraphModule:
@@ -219,22 +271,29 @@ class TestReduceGQAGradients:
 class TestComputeAttentionScores:
     """Tests for attention score computation via FlexAttentionLegalization."""
 
-    def test_attention_scores_numerical_accuracy(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 4, 16, 32, 64),
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_attention_scores_numerical_accuracy(self, create_graph, B, H, L, S, E):
         """Test that attention scores computation produces correct results."""
-        B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
-        graph = fx.Graph()
-        query_node = graph.placeholder("query")
-        query_node.meta = {"val": torch.empty(B, H, L, E)}
-        key_node = graph.placeholder("key")
-        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        graph, nodes = create_graph(
+            {
+                "query": (B, H, L, E),
+                "key": (B, H, S, E),
+            }
+        )
 
         scores = flex_pass._compute_attention_scores(
-            graph, query_node, key_node, scale, shapes, torch.float32
+            graph, nodes["query"], nodes["key"], scale, shapes, torch.float32
         )
         graph.output(scores)
         gm = fx.GraphModule(torch.nn.Module(), graph)
@@ -248,22 +307,29 @@ class TestComputeAttentionScores:
 
         torch.testing.assert_close(result, expected)
 
-    def test_scale_is_applied_correctly(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 4, 8),
+            (2, 4, 8, 8, 16),
+        ],
+    )
+    def test_scale_is_applied_correctly(self, create_graph, B, H, L, S, E):
         """Test that the scale factor is correctly applied."""
-        B, H, L, S, E = 1, 2, 4, 4, 8
-        scale = 0.5  # Use a distinctive scale
+        scale = 1.0 / (E**0.5)
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
-        graph = fx.Graph()
-        query_node = graph.placeholder("query")
-        query_node.meta = {"val": torch.empty(B, H, L, E)}
-        key_node = graph.placeholder("key")
-        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        graph, nodes = create_graph(
+            {
+                "query": (B, H, L, E),
+                "key": (B, H, S, E),
+            }
+        )
 
         scores = flex_pass._compute_attention_scores(
-            graph, query_node, key_node, scale, shapes, torch.float32
+            graph, nodes["query"], nodes["key"], scale, shapes, torch.float32
         )
         graph.output(scores)
         gm = fx.GraphModule(torch.nn.Module(), graph)
@@ -279,18 +345,28 @@ class TestComputeAttentionScores:
 class TestComputeSoftmax:
     """Tests for softmax computation via FlexAttentionLegalization."""
 
-    def test_softmax_matches_pytorch(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S",
+        [
+            (2, 4, 16, 32),
+            (1, 2, 8, 8),
+        ],
+    )
+    def test_softmax_matches_pytorch(self, create_graph, B, H, L, S):
         """Test that softmax computation matches PyTorch's F.softmax."""
-        B, H, L, S = 2, 4, 16, 32
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
         flex_pass = FlexAttentionLegalization()
 
-        graph = fx.Graph()
-        scores_node = graph.placeholder("scores")
-        scores_node.meta = {"val": torch.empty(B, H, L, S)}
+        graph, nodes = create_graph(
+            {
+                "scores": (B, H, L, S),
+            }
+        )
 
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
+        attn_weights, _, _ = flex_pass._compute_softmax(
+            graph, nodes["scores"], shapes, torch.float32
+        )
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -506,15 +582,340 @@ class TestLegalizeFlexAttentionPass:
         assert result.graph_module is not None
 
 
+class TestCombinedScoreMaskMod:
+    """Tests for combined score_mod and mask_mod functionality."""
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 8, 8, 16),  # small
+            (2, 4, 16, 32, 64),  # medium
+            (1, 1, 4, 4, 8),  # minimal
+        ],
+    )
+    def test_combined_score_mask_mod_numerical_accuracy(self, B, H, L, S, E):
+        """Test that combined score_mod + mask_mod produces correct results."""
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        # Create test inputs
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # Define separate score_mod and mask_mod
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + 0.1
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        # Create block_mask with mask_mod
+        block_mask = create_block_mask(mask_mod, B, H, L, S, device="cpu")
+
+        # Test reference: flex_attention with both score_mod and block_mask
+        with torch.no_grad():
+            reference_output = flex_attention(
+                query, key, value, score_mod=score_mod, block_mask=block_mask
+            )
+
+        # Capture graph using aot_module
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class CombinedFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+
+        model = CombinedFlexAttnModule()
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0, "Graph not captured"
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization pass (unit test for the pass)
+        legalized_gm = legalize_flex_attention_pass(captured_gm)
+
+        # Verify flex_attention was legalized
+        flex_nodes = [
+            n
+            for n in legalized_gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.higher_order.flex_attention
+        ]
+        assert len(flex_nodes) == 0, "flex_attention nodes should be legalized"
+
+        # Test legalized output
+        with torch.no_grad():
+            legalized_output = legalized_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_mask_only_flex_attention(self, B, H, L, S, E):
+        """Test flex_attention with only mask_mod (no score_mod)."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # Define only mask_mod (causal mask)
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        # Create block_mask (force CPU device)
+        block_mask = create_block_mask(mask_mod, B, H, L, S, device="cpu")
+
+        # Reference
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value, block_mask=block_mask)
+
+        # Test legalization
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class MaskOnlyFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, block_mask=block_mask)
+
+        model = MaskOnlyFlexAttnModule()
+
+        # Use FakeTensorMode with allow_non_fake_inputs to handle block_mask tensors
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "mask_mod_func,test_name",
+        [
+            pytest.param(
+                lambda b, h, q_idx, kv_idx: q_idx >= kv_idx, "causal_mask", id="causal_mask"
+            ),
+            pytest.param(
+                lambda b, h, q_idx, kv_idx: torch.abs(q_idx - kv_idx) <= 2,
+                "band_mask",
+                id="band_mask",
+            ),
+            pytest.param(
+                lambda b, h, q_idx, kv_idx: (q_idx // 2) == (kv_idx // 2),
+                "block_diagonal",
+                id="block_diagonal",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_complex_mask_mod_patterns(self, B, H, L, S, E, mask_mod_func, test_name):
+        """Test various mask_mod patterns to ensure robustness."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        block_mask = create_block_mask(mask_mod_func, B, H, L, S, device="cpu")
+
+        # Reference
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value, block_mask=block_mask)
+
+        # Test legalization
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class TestFlexAttnModule(torch.nn.Module):
+            def __init__(self, mask):
+                super().__init__()
+                self.mask = mask
+
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, block_mask=self.mask)
+
+        model = TestFlexAttnModule(block_mask)
+
+        # Use FakeTensorMode with allow_non_fake_inputs to handle block_mask tensors
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.xfail(
+        reason="External buffer support in mask_mod/score_mod currently not implemented"
+    )
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 2, 8, 8, 16),
+        ],
+    )
+    def test_mask_mod_with_external_buffer(self, B, H, L, S, E):
+        """Test mask_mod that uses an external buffer (e.g., prefix_length tensor)."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # External buffer: prefix length per batch
+        prefix_length = torch.tensor([4, 6], dtype=torch.int32)  # Different prefix for each batch
+
+        def prefix_mask(b, h, q_idx, kv_idx):
+            return kv_idx <= prefix_length[b]
+
+        # This may not work yet - marked as xfail
+        block_mask = create_block_mask(prefix_mask, B, H, L, S, device="cpu")
+
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value, block_mask=block_mask)
+
+        # Test legalization
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class PrefixMaskFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, block_mask=block_mask)
+
+        model = PrefixMaskFlexAttnModule()
+
+        # Use FakeTensorMode with allow_non_fake_inputs to handle block_mask tensors
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        # Apply legalization
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S",
+        [
+            (1, 1, 4, 4),
+            (2, 2, 8, 8),
+        ],
+    )
+    def test_mask_mod_as_score_mod_conversion(self, B, H, L, S):
+        """Test the mask_mod to score_mod conversion pattern."""
+
+        # Create index tensors
+        b_idx = torch.arange(B).view(B, 1, 1, 1)
+        h_idx = torch.arange(H).view(1, H, 1, 1)
+        q_idx = torch.arange(L).view(1, 1, L, 1)
+        kv_idx = torch.arange(S).view(1, 1, 1, S)
+
+        # Sample scores
+        scores = torch.randn(B, H, L, S)
+
+        # Define a simple mask_mod (causal)
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        # Convert mask_mod to score_mod
+        def mask_mod_as_score_mod(score, b, h, q_idx, kv_idx):
+            mask = mask_mod(b, h, q_idx, kv_idx)
+            return torch.where(mask, score, float("-inf"))
+
+        # Apply the conversion
+        result = mask_mod_as_score_mod(scores, b_idx, h_idx, q_idx, kv_idx)
+
+        # Verify masking worked correctly
+        mask = mask_mod(b_idx, h_idx, q_idx, kv_idx)
+        expected = torch.where(mask, scores, float("-inf"))
+
+        torch.testing.assert_close(result, expected)
+
+        # Verify causal pattern
+        for i in range(L):
+            for j in range(S):
+                if i >= j:  # Should be unmasked
+                    assert not torch.isinf(result[0, 0, i, j])
+                else:  # Should be masked
+                    assert result[0, 0, i, j] == float("-inf")
+
+
 class TestFlexAttentionLegalizationE2E:
     """End-to-end tests for FlexAttentionLegalization with real flex_attention graphs."""
 
-    def test_flex_attention_legalization_numerical_accuracy(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            pytest.param(1, 4, 16, 16, 32, id="small"),
+            pytest.param(2, 8, 32, 32, 64, id="medium"),
+            pytest.param(1, 2, 8, 8, 16, id="minimal"),
+        ],
+    )
+    def test_flex_attention_legalization_numerical_accuracy(self, B, H, L, S, E):
         """Test that legalized flex_attention produces same output as original."""
-        from functorch.compile import aot_module, make_boxed_func
         from torch.nn.attention.flex_attention import flex_attention
-
-        B, H, L, S, E = 1, 4, 16, 16, 32
 
         query = torch.randn(B, H, L, E)
         key = torch.randn(B, H, S, E)
@@ -523,12 +924,8 @@ class TestFlexAttentionLegalizationE2E:
         with torch.no_grad():
             reference_output = flex_attention(query, key, value)
 
-        captured_gm = None
-
-        def capture_compiler(gm: torch.fx.GraphModule, example_inputs):
-            nonlocal captured_gm
-            captured_gm = gm
-            return make_boxed_func(gm.forward)
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
 
         class FlexAttnModule(torch.nn.Module):
             def forward(self, q, k, v):
@@ -544,7 +941,8 @@ class TestFlexAttentionLegalizationE2E:
         with torch.no_grad():
             _ = aot_model(query, key, value)
 
-        assert captured_gm is not None
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
 
         # Test using the class-based pass with PassManager
         flex_pass = FlexAttentionLegalization()
@@ -562,63 +960,6 @@ class TestFlexAttentionLegalizationE2E:
         with torch.no_grad():
             legalized_output = captured_gm(query, key, value)
 
-        # Unpack if tuple
-        if isinstance(legalized_output, tuple):
-            legalized_output = legalized_output[0]
-
-        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
-
-    def test_flex_attention_legalization_via_convenience_function(self):
-        """Test legalization using the convenience function."""
-        from functorch.compile import aot_module, make_boxed_func
-        from torch.nn.attention.flex_attention import flex_attention
-
-        B, H, L, S, E = 1, 2, 8, 8, 16
-
-        query = torch.randn(B, H, L, E)
-        key = torch.randn(B, H, S, E)
-        value = torch.randn(B, H, S, E)
-
-        with torch.no_grad():
-            reference_output = flex_attention(query, key, value)
-
-        captured_gm = None
-
-        def capture_compiler(gm: torch.fx.GraphModule, example_inputs):
-            nonlocal captured_gm
-            captured_gm = gm
-            return make_boxed_func(gm.forward)
-
-        class FlexAttnModule(torch.nn.Module):
-            def forward(self, q, k, v):
-                return flex_attention(q, k, v)
-
-        model = FlexAttnModule()
-
-        aot_model = aot_module(
-            model,
-            fw_compiler=capture_compiler,
-        )
-
-        with torch.no_grad():
-            _ = aot_model(query, key, value)
-
-        assert captured_gm is not None
-
-        # Test using the convenience function
-        legalized_gm = legalize_flex_attention_pass(captured_gm)
-
-        flex_nodes = [
-            n
-            for n in legalized_gm.graph.nodes
-            if n.op == "call_function" and n.target == torch.ops.higher_order.flex_attention
-        ]
-
-        assert len(flex_nodes) == 0
-
-        with torch.no_grad():
-            legalized_output = legalized_gm(query, key, value)
-
         if isinstance(legalized_output, tuple):
             legalized_output = legalized_output[0]
 
@@ -629,9 +970,15 @@ class TestDtypeSizeCombinations:
     """Tests for various dtype and size combinations across attention functions."""
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_gqa_expansion_dtypes(self, dtype):
+    @pytest.mark.parametrize(
+        "b,h_q,h_kv,s,e",
+        [
+            (2, 8, 2, 16, 32),
+            (1, 6, 2, 8, 16),
+        ],
+    )
+    def test_gqa_expansion_dtypes(self, dtype, b, h_q, h_kv, s, e):
         """Test GQA expansion preserves dtype correctly."""
-        b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
         shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
 
         flex_pass = FlexAttentionLegalization()
@@ -655,9 +1002,15 @@ class TestDtypeSizeCombinations:
         assert key_expanded.shape == (b, h_q, s, e)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_attention_scores_dtypes(self, dtype):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 4, 16, 32, 64),
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_attention_scores_dtypes(self, dtype, B, H, L, S, E):
         """Test attention scores computation with different dtypes."""
-        B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
@@ -684,9 +1037,15 @@ class TestDtypeSizeCombinations:
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_softmax_dtypes(self, dtype):
+    @pytest.mark.parametrize(
+        "B,H,L,S",
+        [
+            (2, 4, 16, 32),
+            (1, 2, 8, 8),
+        ],
+    )
+    def test_softmax_dtypes(self, dtype, B, H, L, S):
         """Test softmax computation with different dtypes."""
-        B, H, L, S = 2, 4, 16, 32
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
         flex_pass = FlexAttentionLegalization()
@@ -750,9 +1109,15 @@ class TestDtypeSizeCombinations:
 class TestComputeAttentionBackward:
     """Tests for attention backward computation via FlexAttentionLegalization."""
 
-    def test_backward_gradient_shapes(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 4, 16, 32, 64),
+            (1, 2, 8, 8, 16),
+        ],
+    )
+    def test_backward_gradient_shapes(self, B, H, L, S, E):
         """Test that backward pass produces correct gradient shapes."""
-        B, H, L, S, E = 2, 4, 16, 32, 64
         scale = 1.0 / (E**0.5)
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
@@ -796,9 +1161,15 @@ class TestComputeAttentionBackward:
         assert grad_key.shape == (B, H, S, E)
         assert grad_value.shape == (B, H, S, E)
 
-    def test_backward_grad_value_numerical(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 8, 16),
+            (2, 4, 8, 16, 32),
+        ],
+    )
+    def test_backward_grad_value_numerical(self, B, H, L, S, E):
         """Test grad_value computation: grad_value = attn_weights^T @ grad_out."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
@@ -842,9 +1213,15 @@ class TestComputeAttentionBackward:
         expected_grad_value = torch.matmul(attn_weights.transpose(-2, -1), grad_out)
         torch.testing.assert_close(grad_value, expected_grad_value)
 
-    def test_backward_with_autograd_reference(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 8, 16),
+            (2, 4, 8, 16, 32),
+        ],
+    )
+    def test_backward_with_autograd_reference(self, B, H, L, S, E):
         """Test backward pass against PyTorch autograd reference."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0 / (E**0.5)
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
@@ -910,9 +1287,15 @@ class TestComputeAttentionBackward:
         torch.testing.assert_close(grad_value, expected_grad_v, rtol=1e-4, atol=1e-5)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_backward_dtypes(self, dtype):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 8, 16),
+            (2, 4, 8, 16, 32),
+        ],
+    )
+    def test_backward_dtypes(self, dtype, B, H, L, S, E):
         """Test backward pass preserves dtype."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
         scale = 1.0
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
@@ -956,13 +1339,127 @@ class TestComputeAttentionBackward:
         assert grad_key.dtype == dtype
         assert grad_value.dtype == dtype
 
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 4, 8),
+            (2, 4, 8, 8, 16),
+        ],
+    )
+    def test_backward_with_mask_mod(self, B, H, L, S, E):
+        """Test that legalization handles mask_mod in both forward and backward passes."""
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        # Define causal mask
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        # Create block_mask on CPU
+        block_mask = create_block_mask(mask_mod, B, H, L, S, device="cpu")
+
+        # Capture graphs using torch.compile pattern (as suggested in review)
+        captured_fw_gm = []
+        captured_bw_gm = []
+
+        def fw_compiler(gm: torch.fx.GraphModule, example_inputs):
+            captured_fw_gm.clear()
+            captured_fw_gm.append(gm)
+            # Apply legalization in the compiler
+            flex_pass = FlexAttentionLegalization()
+            pm = PassManager(passes=[flex_pass])
+            result = pm(gm)
+            return result.graph_module
+
+        def bw_compiler(gm: torch.fx.GraphModule, example_inputs):
+            captured_bw_gm.clear()
+            captured_bw_gm.append(gm)
+            # Apply legalization in the compiler
+            flex_pass = FlexAttentionLegalization()
+            pm = PassManager(passes=[flex_pass])
+            result = pm(gm)
+            return result.graph_module
+
+        class FlexAttnWithMaskModule(torch.nn.Module):
+            def __init__(self, mask):
+                super().__init__()
+                self.block_mask = mask
+
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, block_mask=self.block_mask)
+
+        model = FlexAttnWithMaskModule(block_mask)
+
+        # Use torch.compile with backend that applies our pass
+        import torch._dynamo as dynamo
+        from torch._dynamo.backends.common import aot_autograd
+
+        def custom_backend(gm, example_inputs):
+            # This is called for both forward and backward
+            return aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+            )(gm, example_inputs)
+
+        compiled_model = torch.compile(model, backend=custom_backend)
+
+        # Create inputs with gradients
+        query = torch.randn(B, H, L, E, requires_grad=True)
+        key = torch.randn(B, H, S, E, requires_grad=True)
+        value = torch.randn(B, H, S, E, requires_grad=True)
+
+        # Run forward pass
+        output = compiled_model(query, key, value)
+
+        # Run backward pass to trigger backward graph compilation
+        loss = output.sum()
+        loss.backward()
+
+        # Verify forward graph was captured and legalized
+        assert len(captured_fw_gm) > 0, "Forward graph not captured"
+
+        # Check if forward had flex_attention nodes (before legalization)
+        fw_had_flex = any(
+            n.op == "call_function" and n.target == torch.ops.higher_order.flex_attention
+            for n in captured_fw_gm[0].graph.nodes
+        )
+
+        if fw_had_flex:
+            logger.debug("Forward graph had flex_attention nodes (legalized in compiler)")
+        else:
+            logger.debug("Forward graph captured (may have been pre-legalized)")
+
+        # Verify backward graph was captured
+        assert len(captured_bw_gm) > 0, "Backward graph not captured"
+
+        bw_had_flex = any(
+            n.op == "call_function"
+            and (
+                n.target == torch.ops.higher_order.flex_attention_backward
+                or (hasattr(n.target, "__name__") and "flex_attention" in n.target.__name__)
+            )
+            for n in captured_bw_gm[0].graph.nodes
+        )
+
+        if bw_had_flex:
+            logger.debug("Backward graph had flex_attention nodes (legalized in compiler)")
+        else:
+            logger.debug("Backward graph captured (may have been pre-legalized)")
+
+        logger.debug("Backward pass with mask_mod successfully legalized")
+
 
 class TestScoreModInlining:
     """Tests for score_mod inlining functionality."""
 
-    def test_inline_score_mod_creates_nodes(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 8, 16),
+            (2, 4, 8, 16, 32),
+        ],
+    )
+    def test_inline_score_mod_creates_nodes(self, B, H, L, S, E):
         """Test that _inline_score_mod creates expected nodes in graph."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
@@ -1004,9 +1501,15 @@ class TestScoreModInlining:
         ]
         assert len(add_nodes) > 0
 
-    def test_inline_score_mod_with_arithmetic(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (1, 2, 4, 8, 16),
+            (2, 4, 8, 16, 32),
+        ],
+    )
+    def test_inline_score_mod_with_arithmetic(self, B, H, L, S, E):
         """Test score_mod inlining with arithmetic operations using indices."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
@@ -1046,9 +1549,15 @@ class TestScoreModInlining:
         ]
         assert len(mul_nodes) > 0
 
-    def test_create_index_tensors_shapes(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 4, 8, 16, 32),
+            (1, 2, 4, 8, 16),
+        ],
+    )
+    def test_create_index_tensors_shapes(self, B, H, L, S, E):
         """Test that _create_index_tensors creates correctly shaped tensors."""
-        B, H, L, S, E = 2, 4, 8, 16, 32
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
@@ -1066,9 +1575,15 @@ class TestScoreModInlining:
         assert q.shape == (1, 1, L, 1)
         assert kv.shape == (1, 1, 1, S)
 
-    def test_create_index_tensors_values(self):
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (3, 2, 4, 5, 8),
+            (2, 4, 8, 10, 16),
+        ],
+    )
+    def test_create_index_tensors_values(self, B, H, L, S, E):
         """Test that _create_index_tensors creates correct index values."""
-        B, H, L, S, E = 3, 2, 4, 5, 8
         shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()

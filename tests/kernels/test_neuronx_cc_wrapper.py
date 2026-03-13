@@ -1,6 +1,7 @@
 """Comprehensive tests for NeuronxCCWrapper command-line interface."""
 
 import tempfile
+import uuid
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -290,10 +291,14 @@ class TestNeuronxCCWrapper:
 
     def test_caching_behavior(self, temp_dirs, sample_hlo, sample_neff, monkeypatch):
         """Test that caching behavior works through the wrapper"""
+
+        # Use unique HLO content to ensure unique cache key
+        unique_hlo = sample_hlo + uuid.uuid4().hex.encode()
+
         input_file = temp_dirs["temp"] / "test.hlo.pb"
         output = temp_dirs["temp"] / "test.neff"
 
-        atomic_write_bytes(input_file, sample_hlo)
+        atomic_write_bytes(input_file, unique_hlo)
 
         # Mock the compilation method
         def write_neff_side_effect(*args, **kwargs):
@@ -344,7 +349,7 @@ class TestNeuronxCCWrapper:
 
         # Verify the parameters of the single call
         call_args = mock_compile.call_args
-        assert call_args[0][0] == sample_hlo  # First arg is hlo_protobuf
+        assert call_args[0][0] == unique_hlo  # First arg is hlo_protobuf
 
     def test_neuron_cc_flags_with_existing_args(self, sample_hlo, temp_dirs, monkeypatch):
         """Test that NEURON_CC_FLAGS is prepended to existing extra arguments."""

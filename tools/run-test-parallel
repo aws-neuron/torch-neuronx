@@ -7,7 +7,7 @@ set -e
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback")
+readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback" "tests/vertical")
 readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
@@ -22,6 +22,7 @@ declare -g exit_code=0
 # Flags
 declare -g CUSTOM_N=false
 declare -g SKIP_DISTRIBUTED=false
+declare -g SKIP_VERTICAL=true
 declare -g ENABLE_COVERAGE=false
 declare -g ENABLE_JSON_REPORT=false
 declare -g HAS_EXPLICIT_TEST_PATH=false
@@ -33,7 +34,6 @@ declare -g SANITY_PT_DISTRIBUTED_TESTS=""
 init_environment() {
     cd "$PROJECT_ROOT"
     export NEURON_LAUNCH_BLOCKING="${NEURON_LAUNCH_BLOCKING:-0}"
-    export TORCH_NEURONX_SYNC_MODE="${TORCH_NEURONX_SYNC_MODE:-0}"
 
     if command -v uv >/dev/null 2>&1; then
         RUNNER=(uv run python)
@@ -107,6 +107,7 @@ parse_arguments() {
         case "$arg" in
             "-n") CUSTOM_N=true ;;
             "--skip-distributed") SKIP_DISTRIBUTED=true ;;
+            "--include-vertical") SKIP_VERTICAL=false ;;
             "--coverage") ENABLE_COVERAGE=true ;;
             "--json-report") ENABLE_JSON_REPORT=true ;;
             "--skip_pt_test_distributed") SKIP_PT_TEST_DISTRIBUTED=true ;;
@@ -277,6 +278,12 @@ run_additional_tests() {
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
     run_and_record "cpu_fallback_tests" "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=0 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/cpu_fallback/test_cpu_fallback.py"
 
+    if [[ "$SKIP_VERTICAL" == "false" ]]; then
+        local pytest_opts
+        pytest_opts=$(build_pytest_options "vertical-report" "$NUM_WORKERS")
+        run_and_record "vertical_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/vertical"
+    fi
+
     local pytest_opts
     pytest_opts=$(build_pytest_options "streams-report" "$NUM_WORKERS")
     run_and_record "streams_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/streams"
@@ -293,7 +300,7 @@ run_additional_tests() {
 
         # Fallback if detection fails
         if [[ -z "$torch_version" ]]; then
-            torch_version="2.9.1"
+            torch_version="2.10.0"
             echo "Warning: Could not detect torch version, using fallback: $torch_version"
         else
             echo "Detected torch version: $torch_version"
@@ -309,9 +316,7 @@ run_additional_tests() {
             "test_ddp.py"
         )
 
-        if [[ "$TORCH_NEURONX_SYNC_MODE" == "1" ]]; then
-            test_files+=("test_fsdp.py" "fsdp_v2/")
-        fi
+        test_files+=("test_fsdp.py" "fsdp_v2/")
 
         # Run each test configuration
         for test_file in "${test_files[@]}"; do
@@ -352,6 +357,9 @@ display_results() {
             echo "Distributed Tests: $REPORTS_DIR/distributed-report.html"
         fi
         echo "Multi-Device Tests: $REPORTS_DIR/multi-device-report.html"
+        if [[ "$SKIP_VERTICAL" == "false" ]]; then
+            echo "Vertical Tests: $REPORTS_DIR/vertical-report.html"
+        fi
     fi
 
     echo "========================================="

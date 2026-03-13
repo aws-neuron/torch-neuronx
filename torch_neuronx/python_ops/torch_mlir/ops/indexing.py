@@ -2,6 +2,8 @@
 
 import torch
 
+from torch_neuronx.utils import skip_op_preconditions
+
 from ..operation_registry import register_aten
 
 
@@ -29,16 +31,19 @@ def index_checking(tensor, indices):
             raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
 
         # Bounds checking on PyTorch tensors
-        size = tensor.shape[dim]
-        if torch.any(idx >= size) or torch.any(idx < -size):
-            raise IndexError(
-                f"index {torch.max(idx).item()} is out of bounds "
-                f"for dimension {dim} with size {size}"
-            )
+        if not skip_op_preconditions():
+            size = tensor.shape[dim]
+            if torch.any(idx >= size) or torch.any(idx < -size):
+                raise IndexError(
+                    f"index {torch.max(idx).item()} is out of bounds "
+                    f"for dimension {dim} with size {size}"
+                )
 
 
-@register_aten(["aten::index_select", "aten::index_select.out"], static_argnums=(1,))
-def torch_index_select(x, dim, index):
+@register_aten(
+    ["aten::index_select", "aten::index_select.out"], static_argnums=(1,), uses_preprocessing=True
+)
+def torch_index_select(x, dim, index, out=None):
     if index.dtype not in [torch.int32, torch.int64]:
         # Actually pytorch raise RuntimeError, but RuntimeError will cause
         # neuron op fallback to CPU. So raise TypeError instead
@@ -49,38 +54,131 @@ def torch_index_select(x, dim, index):
     elif index.dim() != 1:
         raise IndexError("index_select(): Index is supposed to be a vector")
 
-    return torch.index_select(x, dim, index)
+    # Bounds checking
+    if not skip_op_preconditions():
+        dim_size = x.size(dim)
+        if torch.any(index >= dim_size) or torch.any(index < -dim_size):
+            raise IndexError("index out of range in self")
 
-
-@register_aten(["aten::index_copy", "aten::index_copy_"], static_argnums=(1,))
-def torch_index_copy(x, dim, indexes, source):
-    return torch.index_copy(x, dim, indexes, source)
-
-
-@register_aten(["aten::index_add", "aten::index_add.out"], static_argnums=(1,))
-def torch_index_add(x, dim, index, source, alpha=1):
-    return torch.index_add(x, dim, index, source, alpha=alpha)
-
-
-@register_aten(["aten::gather", "aten::gather.out"])
-def torch_gather(x, dim, index):
-    return torch.gather(x, dim, index)
-
-
-@register_aten(["aten::scatter", "aten::scatter.value_out"])
-def torch_scatter_value(x, dim, index, value):
-    return torch.scatter(x, dim, index, value)
+    return torch.index_select, (x, dim, index), {}
 
 
 @register_aten(
-    ["aten::scatter.src", "aten::scatter.src_out", "aten::scatter.reduce"],
+    ["aten::index_copy", "aten::index_copy_", "aten::index_copy.out"], static_argnums=(1,)
+)
+def torch_index_copy(x, dim, indexes, source, out=None):
+    if indexes.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError("index_copy_(): Expected a long tensor for index, but got Float")
+
+    # Validate source shape matches expected slice shape
+    actual_dim = dim if dim >= 0 else x.dim() + dim
+    expected_shape = list(x.shape)
+    expected_shape[actual_dim] = indexes.numel()
+    if list(source.shape) != expected_shape:
+        raise ValueError(
+            f"Incompatible shapes for broadcasting: {tuple(source.shape)}"
+            f" and requested shape {tuple(expected_shape)}"
+        )
+    return torch.index_copy(x, dim, indexes, source)
+
+
+@register_aten(
+    ["aten::index_add", "aten::index_add_", "aten::index_add.out"],
+    static_argnums=(1,),
+    static_argnames=("alpha",),
+)
+def torch_index_add(x, dim, index, source, alpha=1, out=None):
+    return torch.index_add(x, dim, index, source, alpha=alpha)
+
+
+@register_aten(["aten::gather", "aten::gather.out"], static_argnums=(1,))
+def torch_gather(x, dim, index, out=None):
+    return torch.gather(x, dim, index)
+
+
+@register_aten(
+    ["aten::scatter", "aten::scatter.value_out"],
+    static_argnums=(1,),
+    uses_preprocessing=True,
+)
+def torch_scatter_value(x, dim, index, value, out=None):
+    # Convert scalar to tensor with matching dtype
+    if not isinstance(value, torch.Tensor):
+        value = torch.tensor(value, dtype=x.dtype, device=x.device)
+
+    def torch_scatter_value_fn(x, dim, index, value, out=None):
+        if value.dim() == 0:
+            # without expanding, we hit dimension mismatch issues
+            value = value.expand_as(index)
+        if x.is_floating_point() and not value.is_floating_point():
+            value = value.to(x.dtype)
+        return torch.scatter(x, dim, index, value)
+
+    # index OOB check
+    if not skip_op_preconditions():
+        size = x.shape[dim]
+        if torch.any(index >= size) or torch.any(index < -size):
+            raise RuntimeError(
+                f"index {torch.max(index.abs()).item()} is out of "
+                f"bounds for dimension {dim} with size {size}"
+            )
+
+    return torch_scatter_value_fn, (x, dim, index, value), {"out": out}
+
+
+@register_aten(
+    [
+        "aten::scatter.src",
+        "aten::scatter.src_out",
+        "aten::scatter.reduce",
+        "aten::scatter.value_reduce_out",
+        "aten::scatter.reduce_out",
+    ],
     static_argnums=(1,),
     static_argnames=("reduce",),
+    uses_preprocessing=True,
 )
-def torch_scatter_src(input, dim, index, src, reduce=None):
-    if reduce is None:
-        return torch.scatter(input, dim, index, src)
-    return torch.scatter(input, dim, index, src, reduce=reduce)
+def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
+    def torch_scatter_src_fn(x, dim, index, src, out=None, reduce=None):
+        if isinstance(src, torch.Tensor) and src.dim() == 0:
+            # without expanding, we hit dimension mismatch issues
+            src = src.expand_as(index)
+        if reduce is None:
+            return torch.scatter(x, dim, index, src)
+
+        # Fallback/workaround for unsupported reduce operations
+        if reduce == "add":
+            # scatter_add requires tensor src, convert scalar if needed
+            if not isinstance(src, torch.Tensor):
+                src = torch.full_like(index, src, dtype=x.dtype)
+            return torch.scatter_add(x, dim, index, src)
+        elif reduce == "multiply":
+            # Use scatter with multiplication: input * (1 + (src-1) at indices)
+            ones = torch.ones_like(x)
+            multiplier = torch.scatter(ones, dim, index, src)
+            return x * multiplier
+        else:
+            raise RuntimeError(f"reduce argument must be either add or multiply. Got {reduce}")
+
+    # index OOB check
+    if not skip_op_preconditions():
+        size = x.shape[dim]
+        if torch.any(index >= size) or torch.any(index < -size):
+            raise RuntimeError(
+                f"index {torch.max(index.abs()).item()} is out of "
+                f"bounds for dimension {dim} with size {size}"
+            )
+
+    # handle out and reduce kwargs
+    out_kwargs = {}
+    if out is not None:
+        out_kwargs["out"] = out
+    if reduce is not None:
+        if reduce not in ("add", "multiply"):
+            raise RuntimeError(f"reduce argument must be either add or multiply. Got {reduce}")
+        out_kwargs["reduce"] = reduce
+
+    return torch_scatter_src_fn, (x, dim, index, src), out_kwargs
 
 
 @register_aten(
@@ -91,7 +189,7 @@ def torch_scatter_src(input, dim, index, src, reduce=None):
 def torch_masked_select(x, mask, out=None):
     size = mask.sum().item()
 
-    # Correct size after broadcast outside kernel functioin to ensure it is traced correctly
+    # Correct size after broadcast outside kernel function to ensure it is traced correctly
     broadcast_shape = torch.broadcast_shapes(x.shape, mask.shape)
     size = int(size * broadcast_shape.numel() / mask.shape.numel())
 
@@ -114,24 +212,26 @@ def torch_masked_select(x, mask, out=None):
 
 
 @register_aten(["aten::masked_fill", "aten::masked_fill_.Scalar"])
-def torch_masked_fill(x, mask, value):
+def torch_masked_fill(x, mask, value, out=None):
     return torch.masked_fill(x, mask, value)
+
+
+# NOTE: where.ScalarOther, where.ScalarSelf, and where.Scalar are NOT registered
+# because they are CompositeImplicitAutograd ops that decompose to where.self:
+# - ScalarOther: converts scalar to tensor, calls where.self
+# - ScalarSelf: converts scalar to tensor, calls where.self
+# - Scalar: converts both scalars to tensors, calls where.self
+# Registering them would break the autograd chain.
+# Reference: https://github.com/pytorch/pytorch/blob/8e65dfa6f2c451dc3c71d76d68796d1271c72772/aten/src/ATen/native/TensorCompare.cpp#L642
 
 
 @register_aten(
     [
-        "aten::where",
         "aten::where.self",
         "aten::where.self_out",
-        "aten::where.ScalarSelf",
-        "aten::where.ScalarOther",
-        "aten::where.Scalar",
     ],
-    use_torch_compile=True,
 )
 def torch_where(condition, x=None, y=None, out=None):
-    if x is None:
-        return torch.where(condition)
     return torch.where(condition, x, y)
 
 
@@ -140,11 +240,14 @@ def torch_where(condition, x=None, y=None, out=None):
     static_argnames=("size", "fill_value", "dtype"),
 )
 def torch_nonzero_static(tensor, size=None, fill_value=-1, out=None, with_count=False, dtype=None):
-    if dtype is not None and dtype != torch.int64:
+    if (dtype is not None and dtype != torch.int64) or (
+        out is not None and out.dtype != torch.int64
+    ):
         raise RuntimeError(
             "nonzero_static: Expected out tensor to have scalar type Long "
             "but got scalar typeFloat"
         )
+
     return torch.nonzero_static(tensor, size=size, fill_value=fill_value)
 
 
@@ -214,6 +317,18 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
             values = values.to(x.dtype)
             return torch.where(indices, values, x)
 
+        # Normalize negative indices and ensure proper tensor format
+        normalized_indices = []
+        for i, idx in enumerate(indices):
+            if idx is not None and isinstance(idx, torch.Tensor):
+                dim_size = x.shape[i]
+                idx = torch.where(idx < 0, idx + dim_size, idx)
+                # Ensure scalar indices are properly shaped for MLIR
+                if idx.dim() == 0:
+                    idx = idx.unsqueeze(0)  # Convert scalar to [1] shape
+            normalized_indices.append(idx)
+        indices = tuple(normalized_indices)
+
         return torch.ops.aten.index_put(x, indices, values, accumulate=accumulate)
 
     if can_dispatch:
@@ -241,13 +356,33 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
     )
 
 
-@register_aten(["aten::index_select_backward"], static_argnums=(1, 2))
+@register_aten(["aten::index_select_backward"], static_argnums=(1, 2), uses_preprocessing=True)
 def torch_index_select_backward(grad, input_sizes, dim, index):
     if index.dtype not in [torch.int32, torch.int64]:
         raise TypeError(
             f"index_select_backward(): Expected dtype int32/int64 for index but got: {index.dtype}"
         )
 
-    if index.dim() == 0:
-        index = index.reshape(1)
-    return torch.ops.aten.index_select_backward(grad, input_sizes, dim, index)
+    if not skip_op_preconditions():
+        dim_size = input_sizes[dim]
+        if torch.any(index < 0) or torch.any(index >= dim_size):
+            oob_idx = index.min().item() if torch.any(index < 0) else index.max().item()
+            raise IndexError(
+                f"index {oob_idx} is out of bounds for dimension {dim} with size {dim_size}"
+            )
+
+    def index_select_backward_fn(grad, input_sizes, dim, index):
+        arange = torch.arange(input_sizes[dim], dtype=index.dtype, device=index.device).unsqueeze(1)
+        one_hot = (index == arange).to(grad.dtype)
+        return (one_hot @ grad.movedim(dim, -2)).movedim(-2, dim)
+
+    return index_select_backward_fn, (grad, input_sizes, dim, index), {}
+
+
+@register_aten(["aten::slice_backward"], static_argnums=(1, 2, 3, 4, 5))
+def torch_slice_backward(grad_output, input_sizes, dim, start, end, step):
+    grad_input = torch.zeros(input_sizes, dtype=grad_output.dtype, device=grad_output.device)
+    indices = [slice(None)] * len(input_sizes)
+    indices[dim] = slice(start, end, step)
+    grad_input[tuple(indices)] = grad_output
+    return grad_input

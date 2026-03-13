@@ -6,8 +6,8 @@ import jax
 import torch
 
 from torch_neuronx.python_ops.handlers import BaseOutputHandler
+from torch_neuronx.python_ops.shared import MetadataOps
 
-from ..config import MetadataOps
 from ..type_converter import JaxTypeConverter
 
 logger = logging.getLogger(__name__)

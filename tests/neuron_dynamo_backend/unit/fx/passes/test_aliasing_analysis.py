@@ -313,3 +313,211 @@ class TestAliasDetection:
         alias2 = aliasing_info.aliases[1]
         assert_alias_exists(alias1, param_num=1, param_idx=[], output_idx=0)
         assert_alias_exists(alias2, param_num=3, param_idx=[], output_idx=1)
+
+
+class TestCustomOpAliasing:
+    """Unit tests for custom op with mutable arguments detection."""
+
+    def test_is_custom_op_with_mutations_detection(self):
+        """Test that _is_custom_op_with_mutations correctly identifies custom ops."""
+        import torch.fx as fx
+
+        # Create a custom op with mutable args
+        @torch.library.custom_op("test::mutating_op", mutates_args={"y"})
+        def mutating_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return x + y
+
+        @mutating_op.register_fake
+        def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        y = graph.placeholder("y")
+        op_node = graph.call_function(torch.ops.test.mutating_op.default, args=(x, y))
+        graph.output(op_node)
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_analysis = AliasingAnalysis()
+
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and "mutating_op" in str(node.target):
+                assert aliasing_analysis._is_custom_op_with_mutations(
+                    node
+                ), "Should detect custom op with mutations"
+
+    def test_custom_op_aliasing(self, run_aliasing_analysis):
+        """Test custom op with mutable argument produces correct aliasing."""
+        import torch.fx as fx
+
+        # Create a custom op with mutable args
+        @torch.library.custom_op("test::kv_update", mutates_args={"k_cache", "v_cache"})
+        def kv_update(
+            x: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+        ) -> torch.Tensor:
+            return x
+
+        @kv_update.register_fake
+        def _(x: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        k_cache = graph.placeholder("k_cache")
+        v_cache = graph.placeholder("v_cache")
+        op_node = graph.call_function(torch.ops.test.kv_update.default, args=(x, k_cache, v_cache))
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should detect k_cache (input[1]) and v_cache (input[2]) as mutated
+        assert_alias_count(aliasing_info.aliases, 2)
+        alias1 = aliasing_info.aliases[0]
+        alias2 = aliasing_info.aliases[1]
+        assert_alias_exists(alias1, param_num=1, param_idx=[], output_idx=0)
+        assert_alias_exists(alias2, param_num=2, param_idx=[], output_idx=1)
+
+    def test_custom_op_with_view_chain(self, run_aliasing_analysis):
+        """Test custom op where mutated input comes through a view chain."""
+        import torch.fx as fx
+
+        # Create a custom op with mutable args
+        @torch.library.custom_op("test::cache_update", mutates_args={"cache"})
+        def cache_update(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return x
+
+        @cache_update.register_fake
+        def _(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        cache_orig = graph.placeholder("cache_orig")
+        x = graph.placeholder("x")
+
+        # View of the original cache
+        cache_view = graph.call_method("view", args=(cache_orig, -1))
+
+        # Custom op takes the VIEW as input, should trace back to original
+        op_node = graph.call_function(torch.ops.test.cache_update.default, args=(x, cache_view))
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should trace back through view to detect cache_orig (input[0]) as mutated
+        assert_alias_count(aliasing_info.aliases, 1)
+        alias = aliasing_info.aliases[0]
+        assert_alias_exists(alias, param_num=0, param_idx=[], output_idx=0)
+
+    def test_custom_op_no_mutations(self, run_aliasing_analysis):
+        """Test custom op without mutable arguments produces no aliasing."""
+        import torch.fx as fx
+
+        # Create a custom op WITHOUT mutable args
+        @torch.library.custom_op("test::pure_op", mutates_args={})
+        def pure_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return x + y
+
+        @pure_op.register_fake
+        def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        y = graph.placeholder("y")
+        op_node = graph.call_function(torch.ops.test.pure_op.default, args=(x, y))
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should have no aliases since no args are mutated
+        assert_alias_count(aliasing_info.aliases, 0)
+
+    def test_custom_op_kwargs_mutation(self, run_aliasing_analysis):
+        """Test custom op with mutable argument passed via kwargs."""
+        import torch.fx as fx
+
+        @torch.library.custom_op("test::kwargs_update", mutates_args={"cache"})
+        def kwargs_update(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return x
+
+        @kwargs_update.register_fake
+        def _(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        cache = graph.placeholder("cache")
+        op_node = graph.call_function(
+            torch.ops.test.kwargs_update.default, args=(x,), kwargs={"cache": cache}
+        )
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should detect cache (input[1]) as mutated via kwargs
+        assert_alias_count(aliasing_info.aliases, 1)
+        alias = aliasing_info.aliases[0]
+        assert_alias_exists(alias, param_num=1, param_idx=[], output_idx=0)
+
+    def test_custom_op_mixed_positional_and_kwargs_mutation(self, run_aliasing_analysis):
+        """Test custom op with mutations in both positional args and kwargs."""
+        import torch.fx as fx
+
+        @torch.library.custom_op("test::mixed_update", mutates_args={"a", "c"})
+        def mixed_update(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+            return b
+
+        @mixed_update.register_fake
+        def _(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(b)
+
+        graph = fx.Graph()
+        t_a = graph.placeholder("a")
+        t_b = graph.placeholder("b")
+        t_c = graph.placeholder("c")
+        # a is positional, c is kwarg
+        op_node = graph.call_function(
+            torch.ops.test.mixed_update.default, args=(t_a, t_b), kwargs={"c": t_c}
+        )
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should detect both a (input[0]) and c (input[2]) as mutated
+        assert_alias_count(aliasing_info.aliases, 2)
+
+    def test_custom_op_missing_kwarg(self, run_aliasing_analysis):
+        """Test custom op when a mutable kwarg is not provided (uses default or is optional)."""
+        import torch.fx as fx
+
+        @torch.library.custom_op("test::optional_cache", mutates_args={"cache"})
+        def optional_cache(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return x
+
+        @optional_cache.register_fake
+        def _(x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        # Only pass x, omit cache entirely - simulates missing kwarg scenario
+        op_node = graph.call_function(torch.ops.test.optional_cache.default, args=(x,), kwargs={})
+        graph.output((op_node,))
+
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Should handle gracefully - no crash, no alias detected for missing arg
+        assert_alias_count(aliasing_info.aliases, 0)

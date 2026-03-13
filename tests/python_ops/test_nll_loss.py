@@ -50,3 +50,10 @@ class TestNLLLoss:
         torch.testing.assert_close(result.cpu(), expected)
         if backward:
             torch.testing.assert_close(input_tensor_device.grad.cpu(), input_tensor.grad)
+
+    def test_nll_loss_1d_input_1d_target_invalid_size(self):
+        """Test that 1D input with 1D target of size != 1 raises ValueError."""
+        input_tensor = torch.randn(10, device="neuron")
+        target = torch.randint(0, 10, (3,), dtype=torch.int64, device="neuron")
+        with pytest.raises(ValueError, match="For 1D input, 1D target must have size 1"):
+            F.nll_loss(input_tensor, target)

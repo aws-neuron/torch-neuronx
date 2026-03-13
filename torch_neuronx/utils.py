@@ -12,6 +12,60 @@ import torch
 from neuronxcc.starfish.support import dtype as _ndt
 from packaging.version import Version
 
+# ==================== Tensor Utilities ====================
+
+
+def flatten_tensors(obj) -> list[torch.Tensor]:
+    """
+    Recursively flatten nested tensor structures into a flat list.
+
+    Handles: Tensor, List[Tensor], List[List[Tensor]], etc.
+
+    Args:
+        obj: Single tensor, list, tuple, or nested structure of tensors
+
+    Returns:
+        Flat list of all tensors found in the structure
+    """
+    result = []
+    if isinstance(obj, torch.Tensor):
+        result.append(obj)
+    elif isinstance(obj, list | tuple):
+        for item in obj:
+            result.extend(flatten_tensors(item))
+    return result
+
+
+def _get_first_tensor_device(obj) -> torch.device | None:
+    """Get device from first tensor encountered (early return, no full flatten)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.device
+    elif isinstance(obj, list | tuple):
+        for item in obj:
+            dev = _get_first_tensor_device(item)
+            if dev is not None:
+                return dev
+    return None
+
+
+def get_device_from_tensors(tensors) -> torch.device:
+    """
+    Extract device from tensor inputs.
+
+    Gets device from first tensor encountered (early return, avoids flattening all).
+    Falls back to current_device() when no tensors (e.g., barrier()).
+
+    Args:
+        tensors: Single tensor, list, or nested structure of tensors
+
+    Returns:
+        torch.device for the tensors, or current device if no tensors
+    """
+    import torch_neuronx
+
+    dev = _get_first_tensor_device(tensors)
+    return dev if dev is not None else torch.device("neuron", torch_neuronx.current_device())
+
 
 @contextmanager
 def suppress_specific_warnings(patterns):
@@ -44,13 +98,54 @@ def use_mlir_aten_ops():
     return os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
 
 
+def is_stablehlo_enabled() -> bool:
+    """Check if StableHLO lowering is enabled via environment variable.
+
+    Returns:
+        True by default. False if TORCH_NEURONX_ENABLE_STABLEHLO is set to "0" or "false".
+    """
+    return os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") not in ("0", "false")
+
+
 def is_sync_mode_enabled():
     """Check if legacy launch blocking is enabled via environment variable.
 
     Returns:
-        bool: True if TORCH_NEURONX_SYNC_MODE is set to "1"
+        bool: True if NEURON_LAUNCH_BLOCKING is set to "1"
     """
-    return os.environ.get("TORCH_NEURONX_SYNC_MODE", "0") == "1"
+    return os.environ.get("NEURON_LAUNCH_BLOCKING", "0") == "1"
+
+
+def is_host_cc_enabled():
+    """Check if host-side collective communication is enabled.
+
+    Host-cc enables collective operations on non-default streams using NRT host collectives API.
+    Requires both async NRT and host-cc to be enabled.
+
+    Returns:
+        bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1" and TORCH_NEURONX_ENABLE_ASYNC_NRT is "1"
+    """
+    async_nrt_enabled = os.environ.get("TORCH_NEURONX_ENABLE_ASYNC_NRT", "1") == "1"
+    host_cc_enabled = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "1"
+    return async_nrt_enabled and host_cc_enabled
+
+
+def get_gmm_align() -> int:
+    """Get the alignment constraint for grouped matmul offsets.
+
+    Returns:
+        int: Alignment value from TORCH_NEURONX_ATEN_GMM_ALIGN, default 128
+    """
+    return int(os.environ.get("TORCH_NEURONX_ATEN_GMM_ALIGN", "128"))
+
+
+def skip_op_preconditions() -> bool:
+    """Check if op precondition validation should be skipped.
+
+    Returns:
+        bool: True if TORCH_NEURONX_SKIP_OP_PRECONDITIONS is set to "1"
+    """
+    return os.environ.get("TORCH_NEURONX_SKIP_OP_PRECONDITIONS", "0") == "1"
 
 
 def get_logical_neuron_cores():
@@ -399,6 +494,72 @@ def map_torch_dtype_to_external(_dtype):
     return torch.empty(1, dtype=_dtype, device="cpu").numpy().dtype
 
 
+def convert_for_neuron(tensor: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+    """Convert tensor to Neuron-compatible dtype if needed.
+
+    Args:
+        tensor: Input tensor
+        non_blocking: Whether to use non-blocking transfers
+
+    Returns:
+        Tensor with compatible dtype (int64->int32, float64->float32)
+    """
+    # Only handle dtype compatibility here (int64/float64 -> int32/float32)
+    if tensor.dtype == torch.int64:
+        target_dtype = torch.int32
+    elif tensor.dtype == torch.float64:
+        target_dtype = torch.float32
+    else:
+        # <=32-bit: already compatible
+        return tensor
+
+    # CPU tensors: safe to use .to(...) without involving Neuron redispatch
+    if tensor.device.type == "cpu":
+        return tensor.to(target_dtype)
+
+    # Neuron tensors: avoid Tensor.to(...) to prevent redispatch into aten::_to_copy.
+    # 64-bit conversions may bounce through CPU explicitly via cast_policy helpers.
+    if tensor.device.type == "neuron":
+        from torch_neuronx.python_ops import cast_policy  # local import to avoid cycles
+
+        cpu_tmp = cast_policy.copy_neuron_to_cpu(
+            tensor, target_dtype=target_dtype, non_blocking=non_blocking
+        )
+        return cast_policy.copy_cpu_to_neuron(
+            cpu_tmp, tensor.device, target_dtype, non_blocking=non_blocking
+        )
+
+    # Other devices: fallback to .to(...)
+    return tensor.to(target_dtype)
+
+
 # ==================== Version Info ====================
 
 TORCH_VERSION = Version(torch.__version__)
+
+
+# ==================== Op Registration Discovery ====================
+
+
+def get_neuron_registered_ops(
+    as_sorted: bool = False, keep_variant: bool = False
+) -> set[str] | list[str]:
+    """Get op names registered for Neuron device (PrivateUse1).
+
+    Args:
+        as_sorted: If True, return sorted list; otherwise return set.
+        keep_variant: If True, keep variant suffix (e.g., "add.Tensor"),
+            otherwise return base name only.
+
+    Returns:
+        Set or sorted list of op names (e.g., {"add", "mul"} or ["add.Tensor", "mul"])
+    """
+    registrations = torch._C._dispatch_get_registrations_for_dispatch_key("PrivateUse1")
+
+    op_names = set()
+    for reg in registrations:
+        if "::" in reg:
+            _, op = reg.split("::", 1)
+            op_names.add(op if keep_variant else op.split(".")[0])
+
+    return sorted(op_names) if as_sorted else op_names

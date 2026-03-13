@@ -75,8 +75,11 @@ def clone_pytorch_tests(torch_version=None):
     if torch_version is None:
         torch_version = get_torch_version()
 
-    # Convert version to tag format
-    if not torch_version.startswith("v"):
+    # fetch pre-release branch
+    if "2.10" in torch_version:
+        torch_version = "release/2.10"
+    # Convert released version to tag format
+    elif not torch_version.startswith("v"):
         torch_version = f"v{torch_version}"
 
     script_path = Path(__file__).resolve()

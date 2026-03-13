@@ -119,7 +119,6 @@ def test_foreach_scalarlist(op_name, num_tensors, dtype):
     with track_neuron_ops():
         op_(tensors_neuron_copy, scalars)
         assert_op_runs_on_neuron(f"_foreach_{op_name}_")
-
     for t_cpu, t_neuron in zip(tensors_cpu_copy, tensors_neuron_copy, strict=False):
         torch.testing.assert_close(t_neuron.cpu(), t_cpu)
 
@@ -199,6 +198,34 @@ def test_foreach_norm(ord, dtype):
 
     for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
         torch.testing.assert_close(r_neuron.cpu(), r_cpu)
+
+
+@pytest.mark.skipif(
+    not torch_neuronx.utils.use_mlir_aten_ops(),
+    reason="dtype conversion only supported in MLIR backend",
+)
+@pytest.mark.parametrize("ord", [1, 2, float("inf")])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_foreach_norm_dtype_conversion(ord, dtype):
+    """Test foreach norm operation with dtype conversion"""
+
+    tensors_cpu = [
+        torch.randn(10, dtype=dtype),
+        torch.randn(5, 3, dtype=dtype),
+        torch.randn(2, 4, 2, dtype=dtype),
+    ]
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    # Test with dtype conversion
+    output_dtype = torch.float32 if dtype == torch.float16 else torch.float64
+    result_cpu_converted = torch._foreach_norm(tensors_cpu, ord, dtype=output_dtype)
+    with track_neuron_ops():
+        result_neuron_converted = torch._foreach_norm(tensors_neuron, ord, dtype=output_dtype)
+        assert_op_runs_on_neuron("_foreach_norm")
+
+    for r_cpu, r_neuron in zip(result_cpu_converted, result_neuron_converted, strict=False):
+        assert r_neuron.dtype == output_dtype
+        torch.testing.assert_close(r_neuron.cpu(), r_cpu, rtol=1e-5, atol=1e-5)
 
 
 def test_nonzero_dim_tensor():
@@ -368,3 +395,64 @@ def test_foreach_mixed_empty_nonempty(op_name):
         assert t_cpu.shape == t_neuron.shape
         if t_cpu.numel() > 0:
             torch.testing.assert_close(t_neuron.cpu(), t_cpu)
+
+
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
+def test_foreach_inplace_all_empty_after_nonempty(op_name):
+    """Test inplace foreach with all-empty tensors after a non-empty call.
+
+    The kernel is created on the first (non-empty) call and reused on subsequent
+    calls. The empty case must not crash due to a stale cached torch_fn.
+    """
+    op_ = getattr(torch, f"_foreach_{op_name}_")
+
+    # First call with non-empty tensors (creates the kernel)
+    nonempty = [torch.randn(4, device="neuron") for _ in range(3)]
+    nonempty_cpu = [t.clone().cpu() for t in nonempty]
+    op_(nonempty, 2.0)
+    op_(nonempty_cpu, 2.0)
+    for t_cpu, t_neuron in zip(nonempty_cpu, nonempty, strict=False):
+        torch.testing.assert_close(t_neuron.cpu(), t_cpu)
+
+    # Second call with all-empty tensors (reuses the kernel) — must not raise
+    empty = [torch.empty(0, device="neuron") for _ in range(3)]
+    op_(empty, 2.0)
+    for t in empty:
+        assert t.numel() == 0
+
+
+@pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
+def test_foreach_inplace_nonempty_after_empty(op_name):
+    """Test inplace foreach with non-empty tensors after an all-empty call.
+
+    The empty case must not poison the cached kernel with a no-op torch_fn.
+    A subsequent non-empty call must still compute correctly.
+    """
+    op_ = getattr(torch, f"_foreach_{op_name}_")
+
+    # First call with all-empty tensors
+    empty = [torch.empty(0, device="neuron") for _ in range(3)]
+    op_(empty, 2.0)
+
+    # Second call with non-empty tensors — must compute correctly
+    nonempty = [torch.randn(4, device="neuron") for _ in range(3)]
+    nonempty_cpu = [t.clone().cpu() for t in nonempty]
+    op_(nonempty, 2.0)
+    op_(nonempty_cpu, 2.0)
+    for t_cpu, t_neuron in zip(nonempty_cpu, nonempty, strict=False):
+        torch.testing.assert_close(t_neuron.cpu(), t_cpu)
+
+
+def test_foreach_returns_new_objects():
+    """Test that foreach operations return new objects, not input objects"""
+    # Mixed empty and non-empty tensors
+    mixed = [torch.randn(5), torch.empty(0), torch.randn(3)]
+    mixed_neuron = [t.clone().to("neuron") for t in mixed]
+
+    # Test out-of-place operation
+    results = torch._foreach_add(mixed_neuron, 1.0)
+
+    # Check that results are different objects from inputs
+    for i, (inp, res) in enumerate(zip(mixed_neuron, results, strict=False)):
+        assert inp is not res, f"Result[{i}] should be a new object, not the same as input"
+        print(f"Input[{i}] id: {id(inp)}, Result[{i}] id: {id(res)}, Same: {inp is res}")

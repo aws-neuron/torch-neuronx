@@ -4,6 +4,8 @@
 
 #include <vector>
 
+#include "torch_neuronx/csrc/core/KernelExecution.h"
+
 namespace at::neuron::testing {
 
 // Helper function to create test tensors for unit tests.
@@ -50,6 +52,16 @@ inline std::vector<void*> get_tensor_data_ptrs(const std::vector<torch::Tensor>&
     ptrs.push_back(tensor.data_ptr());
   }
   return ptrs;
+}
+
+// Helper to create fake TensorDataRef for tests (no registry needed)
+inline std::vector<at::neuron::TensorDataRef> create_fake_tensor_refs(
+    const std::vector<void*>& ptrs) {
+  std::vector<at::neuron::TensorDataRef> refs;
+  for (auto ptr : ptrs) {
+    refs.emplace_back(nullptr, ptr);  // null tensor_ptr for tests
+  }
+  return refs;
 }
 
 }  // namespace at::neuron::testing

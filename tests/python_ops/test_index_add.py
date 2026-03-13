@@ -5,6 +5,7 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -57,7 +58,9 @@ class TestIndexAddRegistration:
             input_neuron.index_add_(dim, indices_neuron, source_neuron)
 
             torch.testing.assert_close(input_neuron.cpu(), input_cpu)
-            assert_op_runs_on_neuron("aten::index_add.out")
+            assert_op_runs_on_neuron(
+                "aten::index_add_" if use_mlir_aten_ops() else "aten::index_add.out"
+            )
 
     def test_index_add_with_alpha(self):
         """Test index_add with alpha parameter"""

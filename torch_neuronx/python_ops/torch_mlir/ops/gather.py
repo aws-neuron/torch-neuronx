@@ -5,7 +5,7 @@ import torch
 from ..op_impl import TorchMlirOpImpl
 
 
-def _gather_mlir(input, dim, index, sparse_grad=False):
+def _gather_mlir(input, dim, index, sparse_grad=False, out=None):
     if index.numel() == 0:
         return torch.empty(index.shape, dtype=input.dtype, device=input.device)
     return torch.ops.aten.gather(input, dim, index, sparse_grad=sparse_grad)

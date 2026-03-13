@@ -102,6 +102,104 @@ def pytest_addoption(parser):
         help="Run tests in async mode",
     )
 
+    parser.addoption(
+        "--instance_type",
+        action="store",
+        default="trn2.48xlarge",
+        help="Instance type for remote workload tests",
+    )
+
+    # Block performance test options
+    parser.addoption(
+        "--block",
+        action="store",
+        default="qwen3_torchtitan",
+        help="Block module name",
+    )
+    parser.addoption(
+        "--preset",
+        action="store",
+        default="qwen3-8b-tp",
+        help="Block preset config",
+    )
+    parser.addoption(
+        "--tp_size",
+        action="store",
+        type=int,
+        default=1,
+        help="Tensor parallel size",
+    )
+    parser.addoption(
+        "--nproc",
+        action="store",
+        type=int,
+        default=1,
+        help="Number of processes",
+    )
+    parser.addoption(
+        "--warmup_runs",
+        action="store",
+        type=int,
+        default=2,
+        help="Number of warmup runs",
+    )
+    parser.addoption(
+        "--benchmark_runs",
+        action="store",
+        type=int,
+        default=3,
+        help="Number of benchmark runs",
+    )
+    parser.addoption(
+        "--singlecore",
+        action="store_true",
+        default=False,
+        help="Run singlecore block perf (no distributed)",
+    )
+
+    # Collective performance test options
+    parser.addoption(
+        "--collective_op",
+        action="store",
+        default="all",
+        help="Collective op (all_reduce, all_gather_into_tensor, reduce_scatter_tensor, all)",
+    )
+    parser.addoption(
+        "--collective_sizes",
+        action="store",
+        default="2M",
+        help="Comma-separated tensor sizes for collective benchmark",
+    )
+    parser.addoption(
+        "--collective_dtype",
+        action="store",
+        default="float32",
+        help="Data type for collective benchmark (float32, float16, bfloat16)",
+    )
+
+    parser.addoption(
+        "--remote_workload_timeout",
+        action="store",
+        default=None,
+        help="Timeout in seconds for remote workload execution",
+    )
+
+    # Performance regression gate options
+    parser.addoption(
+        "--min_mfu",
+        action="store",
+        type=float,
+        default=None,
+        help="Minimum MFU percentage threshold for perf regression gate",
+    )
+    parser.addoption(
+        "--max_peak_memory_gb",
+        action="store",
+        type=float,
+        default=None,
+        help="Maximum peak memory in GB for perf regression gate",
+    )
+
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_neuron_initialized(request):

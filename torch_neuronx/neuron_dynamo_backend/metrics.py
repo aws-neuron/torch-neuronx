@@ -117,7 +117,14 @@ def _get_enabled_tables() -> set:
 
 
 def _get_last_phase_time_us(phase: str) -> int:
-    """Get the last recorded time for a phase in microseconds."""
+    """Get the last recorded time for a compilation phase in microseconds.
+
+    Args:
+        phase (str): Name of the compilation phase (e.g., 'torch_neuronx_fx_passes').
+
+    Returns:
+        int: Time in microseconds, or 0 if no timing recorded.
+    """
     times = compilation_time_metrics.get(phase, [])
     if times:
         return int(times[-1] * 1_000_000)
@@ -125,7 +132,17 @@ def _get_last_phase_time_us(phase: str) -> int:
 
 
 def _get_compilation_time_ms(cache_key: str) -> int:
-    """Get actual compilation time from C++ cache for a given cache key."""
+    """Get the actual compilation time from the C++ cache.
+
+    Queries the compilation cache entries to find the compilation time
+    for a specific graph identified by its cache key.
+
+    Args:
+        cache_key (str): Unique identifier for the compiled graph.
+
+    Returns:
+        int: Compilation time in milliseconds, or 0 if not found.
+    """
     entries = torch_neuronx._C._get_compilation_cache_entries()
     return next(
         (e["compilation_time_ms"] for e in entries if e["cache_key"] == cache_key),
@@ -185,7 +202,14 @@ def record_compilation(metrics: NeuronCompilationMetrics) -> None:
 
 
 def _populate_compile_timing(metrics: NeuronCompilationMetrics) -> None:
-    """Populate torch_neuronx_compile timing from C++ cache (call after sync)."""
+    """Populate the torch_neuronx_compile timing field from the C++ cache.
+
+    Must be called after synchronization to ensure compilation has completed.
+    Converts milliseconds from cache to microseconds for the metrics object.
+
+    Args:
+        metrics (NeuronCompilationMetrics): Metrics object to update in place.
+    """
     compilation_time_ms = _get_compilation_time_ms(metrics.graph_id)
     metrics.torch_neuronx_compile_us = compilation_time_ms * 1000
 

@@ -19,6 +19,7 @@ _TORCH_NEURONX_TEST_DEPS = [
     "@torch//:libtorch",
     "@torch//:libtorch_cpu",
     "@torch//:libtorch_python",
+    "@torch//:libshm",
     "@googletest//:gtest_main",
     "@rules_python//python/cc:current_py_cc_headers",
     "@rules_python//python/cc:current_py_cc_libs",

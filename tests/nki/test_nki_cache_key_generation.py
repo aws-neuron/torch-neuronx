@@ -97,8 +97,11 @@ class TestNKICacheKey:
     def test_static_argnames_configuration(self):
         """Test that the static_argnames are correctly configured."""
         expected_static_argnames = (
+            "kernel_idx",
             "grid",
+            "backend_config",
             "operand_output_aliases",
+            "arg_names",
             "constant_args_key",
         )
 

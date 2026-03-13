@@ -17,8 +17,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import ProfilerActivity
 from utils import printf
+
+from torch_neuronx.profiling import NeuronProfiler
 
 
 def find_project_root(start_path):
@@ -175,6 +177,7 @@ def warmup_block(
     enable_autocast=False,
     autocast_dtype=None,
     device_name="cpu",
+    optimizer=None,
 ):
     """
     Perform warmup runs to handle compilation/initialization.
@@ -186,11 +189,17 @@ def warmup_block(
         is_causal: Whether to use causal masking
         forward_only: Whether to run only forward or forward+loss+backward
         block_module: Block module containing run_block function
+        optimizer: Optional optimizer for optimizer.step() benchmarking
 
     Returns:
         List of warmup timings in milliseconds
     """
-    mode_str = "FORWARD" if forward_only else "FORWARD + LOSS + BACKWARD"
+    if forward_only:
+        mode_str = "FORWARD"
+    else:
+        mode_str = "FORWARD + LOSS + BACKWARD"
+        if optimizer is not None:
+            mode_str += " + OPTIMIZER"
     printf("\n" + "=" * 40)
     printf(f"WARMUP PHASE ({mode_str})")
     printf("=" * 40)
@@ -206,6 +215,7 @@ def warmup_block(
             enable_autocast=enable_autocast,
             autocast_dtype=autocast_dtype,
             device_name=device_name,
+            optimizer=optimizer,
         )
         warmup_timings.append(total_ms)
         printf(f"  Warmup run {i + 1}: {total_ms:.2f} ms")
@@ -218,18 +228,17 @@ def run_block_step(
     input_tensor,
     is_causal=True,
     forward_only=True,
-    with_profile=False,
     block_module=None,
     enable_autocast=False,
     autocast_dtype=None,
     device_name="cpu",
     trace_json=None,
+    optimizer=None,
 ):
     """
     Run a single block step, measuring forward and optionally backward times.
 
     When forward_only is True, use torch.no_grad() and measure only forward.
-    When with_profile is True, wrap in a profiler context and return the profile.
 
     Returns (total_ms, prof)
     """
@@ -253,19 +262,13 @@ def run_block_step(
                     outputs = run_block(block, input_tensor, block_module, is_causal=is_causal)
                     loss = compute_loss(outputs)
                     loss.backward()
+                    # Apply optimizer step if provided
+                    if optimizer is not None:
+                        optimizer.step()
                 torch.neuron.synchronize()
                 return (time.perf_counter() - start_time) * 1000
 
-            if with_profile:
-                with profile(
-                    activities=[ProfilerActivity.CPU],
-                    record_shapes=True,
-                    with_stack=True,
-                    profile_memory=False,
-                ) as prof:
-                    total_ms = execute_block()
-            else:
-                total_ms = execute_block()
+            total_ms = execute_block()
     return total_ms, prof
 
 
@@ -279,9 +282,15 @@ def benchmark_passes(
     enable_autocast=False,
     autocast_dtype=None,
     device_name="cpu",
+    optimizer=None,
 ):
     """Benchmark pass timings."""
-    mode_str = "FORWARD" if forward_only else "FORWARD + LOSS + BACKWARD"
+    if forward_only:
+        mode_str = "FORWARD"
+    else:
+        mode_str = "FORWARD + LOSS + BACKWARD"
+        if optimizer is not None:
+            mode_str += " + OPTIMIZER"
     printf("\n" + "=" * 40)
     printf(f"BENCHMARK PHASE ({mode_str})")
     printf("=" * 40)
@@ -297,6 +306,7 @@ def benchmark_passes(
             enable_autocast=enable_autocast,
             autocast_dtype=autocast_dtype,
             device_name=device_name,
+            optimizer=optimizer,
         )
         timings.append(total_ms)
         printf(f"  Run {i + 1}: {total_ms:.2f} ms")
@@ -322,35 +332,80 @@ def profile_block_step(
     autocast_dtype=None,
     device_name="cpu",
     trace_json=None,
+    trace_steps=3,
+    optimizer=None,
+    neuron_profile=False,
+    with_stack=False,
 ):
     """Profile either forward-only or fwd+loss+bwd as one region."""
-    title = "PROFILER ANALYSIS (FORWARD)" if forward_only else "PROFILER ANALYSIS (FWD+LOSS+BWD)"
+    if forward_only:
+        title = "PROFILER ANALYSIS (FORWARD)"
+    else:
+        title = "PROFILER ANALYSIS (FWD+LOSS+BWD"
+        if optimizer is not None:
+            title += "+OPT"
+        title += ")"
     printf("\n" + "=" * 40)
     printf(title)
     printf("=" * 40)
 
-    _, prof = run_block_step(
-        block,
-        input_tensor,
-        is_causal=is_causal,
-        forward_only=forward_only,
-        with_profile=True,
-        block_module=block_module,
-        enable_autocast=enable_autocast,
-        autocast_dtype=autocast_dtype,
-        device_name=device_name,
-        trace_json=trace_json,
-    )
+    for i in range(trace_steps):
+        if neuron_profile:
+            profiler_ctx = NeuronProfiler(
+                pytorch_activities=[ProfilerActivity.CPU],
+                record_shapes=True,
+                neuron_output_dir="./output",
+                with_stack=with_stack,  # Pass-through to torch.profiler.profile
+            )
+        else:
+            from torch.profiler import profile
 
-    printf("\nDetailed Time Breakdown (sorted by self CPU time):")
-    printf(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
-    if trace_json:
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0:
-            prof.export_chrome_trace(trace_json)
-            printf(f"\\nTrace exported to: {trace_json}")
-        if dist.is_initialized():
-            dist.barrier()
+            profiler_ctx = profile(
+                activities=[ProfilerActivity.CPU],
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=False,
+            )
+        with profiler_ctx as prof:
+            total_ms, _ = run_block_step(
+                block,
+                input_tensor,
+                is_causal=is_causal,
+                forward_only=forward_only,
+                block_module=block_module,
+                enable_autocast=enable_autocast,
+                autocast_dtype=autocast_dtype,
+                device_name=device_name,
+                trace_json=trace_json,
+                optimizer=optimizer,
+            )
+        prefix = "\n" if i == 0 else ""
+        printf(f"{prefix}Run {i} total ms for run_block_step: {total_ms}.")
+
+    if neuron_profile:
+        if prof._pytorch_profiler:
+            printf("\nDetailed Time Breakdown (sorted by self CPU time):")
+            printf(
+                prof._pytorch_profiler.key_averages().table(
+                    sort_by="self_cpu_time_total", row_limit=20
+                )
+            )
+        if trace_json:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                printf(f"\nTrace exported to: {prof.pytorch_trace_file}")
+            if dist.is_initialized():
+                dist.barrier()
+    else:
+        printf("\nDetailed Time Breakdown (sorted by self CPU time):")
+        printf(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
+        if trace_json:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                prof.export_chrome_trace(trace_json)
+                printf(f"\nTrace exported to: {trace_json}")
+            if dist.is_initialized():
+                dist.barrier()
     return prof
 
 
@@ -394,6 +449,27 @@ def calculate_mfu_trn2(tflops):
         "total_devices": num_devices,
         "lnc": lnc,
     }
+
+
+def collect_memory_stats(device_name):
+    """Collect and print memory stats for neuron devices."""
+    if device_name != "neuron":
+        return None
+    import torch_neuronx
+
+    stats = torch_neuronx.memory_stats()
+    memory_stats = {
+        "allocated_bytes_current": stats["allocated_bytes"]["current"],
+        "allocated_bytes_peak": stats["allocated_bytes"]["peak"],
+        "num_alloc_retries": stats["num_alloc_retries"],
+        "num_ooms": stats["num_ooms"],
+    }
+    printf("\nMemory Stats:")
+    printf(f"  Current allocated: {memory_stats['allocated_bytes_current'] / 1e9:.2f} GB")
+    printf(f"  Peak allocated: {memory_stats['allocated_bytes_peak'] / 1e9:.2f} GB")
+    printf(f"  Alloc retries (OOM): {memory_stats['num_alloc_retries']}")
+    printf(f"  OOMs: {memory_stats['num_ooms']}")
+    return memory_stats
 
 
 def print_performance_metrics(timings, total_flops, device_name, forward_only=True):
@@ -471,6 +547,10 @@ def benchmark_block(
     tp_size=1,
     autocast_dtype=None,
     trace_json=None,
+    trace_steps=3,
+    with_optimizer=False,
+    neuron_profile=False,
+    with_stack=False,
 ):
     """
     Generic benchmark function for transformer blocks.
@@ -508,7 +588,14 @@ def benchmark_block(
         printf(f"  Autocast: enabled with dtype {autocast_dtype}")
     else:
         printf("  Autocast: disabled")
-    printf(f"  Mode: {'Forward only' if forward_only else 'Forward + Loss + Backward'}")
+    # Build mode string
+    if forward_only:
+        mode_str = "Forward only"
+    else:
+        mode_str = "Forward + Loss + Backward"
+        if with_optimizer:
+            mode_str += " + Optimizer"
+    printf(f"  Mode: {mode_str}")
     printf(f"  Warmup runs: {warmup_runs}")
     printf(f"  Benchmark runs: {benchmark_runs}")
 
@@ -578,6 +665,14 @@ def benchmark_block(
             input_tensor = DTensor.from_local(input_tensor, tp_mesh, [Replicate()])
         else:
             input_tensor = DTensor.from_local(input_tensor, tp_mesh, [Shard(1)])
+
+    # Create optimizer if requested
+    optimizer = None
+    if with_optimizer and not forward_only:
+        optimizer = torch.optim.AdamW(block.parameters(), lr=1e-4)
+        num_params = sum(p.numel() for p in block.parameters())
+        printf(f"\nCreated AdamW optimizer (lr=1e-4) for {num_params} parameters")
+
     # Warmup + Benchmark + Profile
     warmup_timings = warmup_block(
         block,
@@ -589,6 +684,7 @@ def benchmark_block(
         enable_autocast,
         autocast_dtype,
         device_name,
+        optimizer,
     )
     benchmark_timings = benchmark_passes(
         block,
@@ -600,20 +696,26 @@ def benchmark_block(
         enable_autocast,
         autocast_dtype,
         device_name,
+        optimizer,
     )
 
     # Profile
-    profile_block_step(
-        block,
-        input_tensor,
-        is_causal,
-        forward_only,
-        block_module,
-        enable_autocast,
-        autocast_dtype,
-        device_name,
-        trace_json=trace_json,
-    )
+    if trace_json:
+        profile_block_step(
+            block,
+            input_tensor,
+            is_causal,
+            forward_only,
+            block_module,
+            enable_autocast,
+            autocast_dtype,
+            device_name,
+            trace_json=trace_json,
+            trace_steps=trace_steps,
+            optimizer=optimizer,
+            neuron_profile=neuron_profile,
+            with_stack=with_stack,
+        )
 
     # Calculate FLOPs
     # Forward pass FLOPs from the module (for a single block)
@@ -624,8 +726,16 @@ def benchmark_block(
     # Total for forward+loss+backward = forward + 2*forward = 3*forward
     total_flops = forward_flops if forward_only else forward_flops * 3
 
+    # For FSDP: all ranks compute the same FLOPs, scale by dp_size
+    if dist.is_initialized():
+        dp_size = dist.get_world_size() // tp_size
+        total_flops = total_flops * dp_size  ## Total system FLOPS
+
     # Print metrics
     metrics = print_performance_metrics(benchmark_timings, total_flops, device_name, forward_only)
+
+    # Collect memory stats
+    memory_stats = collect_memory_stats(device_name)
 
     printf("\n" + "=" * 80)
 
@@ -635,6 +745,7 @@ def benchmark_block(
         "warmup_timings": warmup_timings,
         "benchmark_timings": benchmark_timings,
         "metrics": metrics,
+        "memory_stats": memory_stats,
     }
 
 
@@ -645,7 +756,15 @@ def main():
         "--block",
         type=str,
         default="llama",
-        choices=["llama", "gpt_oss", "qwen3", "qwen3_torchtitan", "rms_norm", "rope"],
+        choices=[
+            "llama",
+            "gpt_oss",
+            "gpt_oss_transformer",
+            "qwen3",
+            "qwen3_torchtitan",
+            "rms_norm",
+            "rope",
+        ],
     )
     args_temp, _ = parser_temp.parse_known_args()
 
@@ -663,7 +782,15 @@ def main():
         "--block",
         type=str,
         default="llama",
-        choices=["llama", "qwen3", "qwen3_torchtitan", "rms_norm", "gpt_oss", "rope"],
+        choices=[
+            "llama",
+            "qwen3",
+            "qwen3_torchtitan",
+            "rms_norm",
+            "gpt_oss",
+            "gpt_oss_transformer",
+            "rope",
+        ],
         help="Block type to benchmark (default: llama)",
     )
 
@@ -738,11 +865,50 @@ def main():
         default=1,
         help="Tensor parallel degree (default: 1)",
     )
+
     parser.add_argument(
         "--trace_json",
         type=str,
         help="Export Chrome trace JSON to specified file",
     )
+
+    parser.add_argument(
+        "--trace_steps",
+        type=int,
+        default=3,
+        help="How many warmup steps for the profiler before it captures.",
+    )
+
+    parser.add_argument(
+        "--with-optimizer",
+        action="store_true",
+        help="Include optimizer.step() in backward pass (creates AdamW optimizer)",
+    )
+
+    parser.add_argument(
+        "--neuron-profile",
+        action="store_true",
+        help="Enable Neuron/NRT profiling (default: PyTorch profiler only)",
+    )
+    parser.add_argument(
+        "--min-mfu",
+        type=float,
+        default=None,
+        help="Minimum MFU %% threshold - fails if below (perf regression gate)",
+    )
+    parser.add_argument(
+        "--max-peak-memory-gb",
+        type=float,
+        default=None,
+        help="Max peak memory in GB - fails if exceeded (memory regression gate)",
+    )
+
+    parser.add_argument(
+        "--with-stack",
+        action="store_true",
+        help="Capture Python stack traces with line numbers (default: False)",
+    )
+
     # Parse all arguments
     args = parser.parse_args()
     setup_distributed(args.device)
@@ -783,6 +949,10 @@ def main():
         tp_size=args.tp_size,
         autocast_dtype=autocast_dtype,
         trace_json=args.trace_json,
+        trace_steps=args.trace_steps,
+        with_optimizer=args.with_optimizer,
+        neuron_profile=args.neuron_profile,
+        with_stack=args.with_stack,
     )
 
     # Save results if requested
@@ -798,6 +968,7 @@ def main():
                 "warmup_timings": results["warmup_timings"],
                 "benchmark_timings": results["benchmark_timings"],
                 "metrics": results["metrics"],
+                "memory_stats": results.get("memory_stats"),
             },
         }
 
@@ -805,6 +976,26 @@ def main():
             json.dump(output_data, f, indent=2, default=str)
 
         printf(f"\nResults saved to {args.output_file}")
+
+    # Perf regression check (only on rank 0)
+    if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
+        if args.min_mfu is not None:
+            mfu_metrics = results["metrics"].get("mfu_metrics")
+            if mfu_metrics:
+                actual_mfu = mfu_metrics["mfu_percent"]
+                printf(f"\nPerf gate: MFU {actual_mfu:.2f}% >= {args.min_mfu}%")
+                assert (
+                    actual_mfu >= args.min_mfu
+                ), f"MFU regression: {actual_mfu:.2f}% < {args.min_mfu}% minimum"
+
+        if args.max_peak_memory_gb is not None:
+            mem_stats = results.get("memory_stats")
+            if mem_stats:
+                peak_gb = mem_stats["allocated_bytes_peak"] / 1e9
+                printf(f"\nMemory gate: Peak {peak_gb:.2f} GB <= {args.max_peak_memory_gb} GB")
+                assert (
+                    peak_gb <= args.max_peak_memory_gb
+                ), f"Memory regression: {peak_gb:.2f} GB > {args.max_peak_memory_gb} GB max"
 
     printf("\nBenchmark completed successfully!")
 

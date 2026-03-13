@@ -88,17 +88,6 @@ class TestNeuronModule(unittest.TestCase):
         self.assertEqual(props.total_memory, 0)
         mock_get_props.assert_called_once_with(0)  # Should parse "neuron:0" to device_id=0
 
-    def test_reset_peak_memory_stats(self):
-        """Test reset_peak_memory_stats function"""
-        # Should not raise exception
-        neuron.reset_peak_memory_stats()
-        neuron.reset_peak_memory_stats(0)
-
-    def test_memory_stats(self):
-        """Test memory_stats function"""
-        self.assertEqual(neuron.memory_stats(), {})
-        self.assertEqual(neuron.memory_stats(0), {})
-
     def test_empty_cache(self):
         """Test empty_cache function"""
         # Should not raise exception

@@ -103,7 +103,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeIndependentMod
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates merge should succeed for independent modules";
@@ -155,7 +155,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeModulesWithCom
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates merge should succeed for common inputs";
@@ -198,7 +198,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeModulesWithDep
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates merge should succeed for dependencies";
@@ -244,7 +244,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeMixedModules) 
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates merge should succeed for mixed scenario";
@@ -273,7 +273,8 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
 
   // Create conservative merged module
   std::string conservative_result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   // Create MLIR context and load dialects
   mlir::MLIRContext context;
@@ -297,7 +298,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_FALSE(conservative_result.empty()) << "Conservative merge should succeed";
   ASSERT_TRUE(skip_intermediates_merged) << "SkipIntermediates merge should succeed";
@@ -313,16 +314,21 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
   ASSERT_TRUE(conservative_main) << "Conservative module should have main function";
   ASSERT_TRUE(skip_intermediates_main) << "SkipIntermediates module should have main function";
 
-  // Compare input counts (should be same)
+  // CRITICAL: Compare input counts (should be EXACTLY the same - skip NEVER adds inputs)
   EXPECT_EQ(conservative_main.getNumArguments(), skip_intermediates_main.getNumArguments())
       << "Both versions should have same number of inputs";
+  EXPECT_LE(skip_intermediates_main.getNumArguments(), conservative_main.getNumArguments())
+      << "CONSTRAINT: Skip intermediate should NEVER add extra inputs vs non-skip";
   EXPECT_EQ(conservative_main.getNumArguments(), 3) << "Both should have 3 inputs";
+  EXPECT_EQ(skip_intermediates_main.getNumArguments(), 3) << "Skip version should have 3 inputs";
 
-  // Compare output counts (should be different)
+  // Compare output counts (should be different - skip reduces outputs)
   EXPECT_EQ(conservative_main.getNumResults(), 2)
       << "Conservative version should have 2 outputs (c, e)";
   EXPECT_EQ(skip_intermediates_main.getNumResults(), 1)
       << "SkipIntermediates version should have 1 output (e only)";
+  EXPECT_LT(skip_intermediates_main.getNumResults(), conservative_main.getNumResults())
+      << "Skip intermediate should have fewer outputs than conservative";
 
   // Verify both contain the same operations
   std::string skip_intermediates_result =
@@ -342,7 +348,8 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
 
   // Create conservative merged module
   std::string conservative_result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   // Create MLIR context and load dialects
   mlir::MLIRContext context;
@@ -366,7 +373,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_FALSE(conservative_result.empty()) << "Conservative merge should succeed";
   ASSERT_TRUE(skip_intermediates_merged) << "SkipIntermediates merge should succeed";
@@ -395,7 +402,141 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, CompareSkipIntermediatesVsConservati
 }
 
 // ============================================================================
-// Section 3: Complex Dependency Chain Tests
+// Section 3: Critical Constraint Test - Skip NEVER Adds Inputs
+// ============================================================================
+
+// NEW TEST: Explicitly verify that skip intermediate NEVER adds extra inputs compared to
+// conservative
+TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediateNeverAddsExtraInputs) {
+  // Test all dependency scenarios to ensure input counts are always <= conservative version
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+
+  // Test Scenario 1: Direct Dependencies
+  {
+    auto mod1_inputs = createMockAddresses({100, 101});
+    auto mod1_outputs = createMockAddresses({200});
+    auto mod2_inputs = createMockAddresses({200, 102});
+    auto mod2_outputs = createMockAddresses({300});
+
+    std::string conservative = torch_neuronx::mergeStableHLOModules(
+        mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+        /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_two_input, &context);
+    auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_two_input, &context);
+    auto analysis =
+        torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+    torch_neuronx::MergeMapping mapping;
+    auto skip = torch_neuronx::mergeModulesSkipIntermediates(
+        *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+        &mapping, /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto cons_mod = mlir::parseSourceString<mlir::ModuleOp>(conservative, &context);
+    auto cons_main = cons_mod->lookupSymbol<mlir::func::FuncOp>("main");
+    auto skip_main = skip->lookupSymbol<mlir::func::FuncOp>("main");
+
+    EXPECT_LE(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "DIRECT_DEPS: Skip should NEVER add extra inputs";
+    EXPECT_EQ(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "DIRECT_DEPS: Skip should have SAME input count as conservative";
+  }
+
+  // Test Scenario 2: Mixed (Common + Dependencies)
+  {
+    auto mod1_inputs = createMockAddresses({100, 101});
+    auto mod1_outputs = createMockAddresses({200});
+    auto mod2_inputs = createMockAddresses({100, 200});
+    auto mod2_outputs = createMockAddresses({300});
+
+    std::string conservative = torch_neuronx::mergeStableHLOModules(
+        mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+        /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_two_input, &context);
+    auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_two_input, &context);
+    auto analysis =
+        torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+    torch_neuronx::MergeMapping mapping;
+    auto skip = torch_neuronx::mergeModulesSkipIntermediates(
+        *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+        &mapping, /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto cons_mod = mlir::parseSourceString<mlir::ModuleOp>(conservative, &context);
+    auto cons_main = cons_mod->lookupSymbol<mlir::func::FuncOp>("main");
+    auto skip_main = skip->lookupSymbol<mlir::func::FuncOp>("main");
+
+    EXPECT_LE(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "MIXED: Skip should NEVER add extra inputs";
+    EXPECT_EQ(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "MIXED: Skip should have SAME input count as conservative";
+  }
+
+  // Test Scenario 3: Common Inputs Only
+  {
+    auto mod1_inputs = createMockAddresses({100, 101});
+    auto mod1_outputs = createMockAddresses({200});
+    auto mod2_inputs = createMockAddresses({100, 102});
+    auto mod2_outputs = createMockAddresses({300});
+
+    std::string conservative = torch_neuronx::mergeStableHLOModules(
+        mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+        /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_two_input, &context);
+    auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_two_input, &context);
+    auto analysis =
+        torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+    torch_neuronx::MergeMapping mapping;
+    auto skip = torch_neuronx::mergeModulesSkipIntermediates(
+        *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+        &mapping, /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto cons_mod = mlir::parseSourceString<mlir::ModuleOp>(conservative, &context);
+    auto cons_main = cons_mod->lookupSymbol<mlir::func::FuncOp>("main");
+    auto skip_main = skip->lookupSymbol<mlir::func::FuncOp>("main");
+
+    EXPECT_LE(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "COMMON_INPUTS: Skip should NEVER add extra inputs";
+    EXPECT_EQ(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "COMMON_INPUTS: Skip should have SAME input count as conservative";
+  }
+
+  // Test Scenario 4: Independent Modules
+  {
+    auto mod1_inputs = createMockAddresses({100});
+    auto mod1_outputs = createMockAddresses({200});
+    auto mod2_inputs = createMockAddresses({300});
+    auto mod2_outputs = createMockAddresses({400});
+
+    std::string conservative = torch_neuronx::mergeStableHLOModules(
+        mlir1_independent, mlir2_independent, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+        /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+    auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+    auto analysis =
+        torch_neuronx::analyzeDependencies(mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+    torch_neuronx::MergeMapping mapping;
+    auto skip = torch_neuronx::mergeModulesSkipIntermediates(
+        *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+        &mapping, /*verify_output=*/true, /*run_optimization=*/false);
+
+    auto cons_mod = mlir::parseSourceString<mlir::ModuleOp>(conservative, &context);
+    auto cons_main = cons_mod->lookupSymbol<mlir::func::FuncOp>("main");
+    auto skip_main = skip->lookupSymbol<mlir::func::FuncOp>("main");
+
+    EXPECT_LE(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "INDEPENDENT: Skip should NEVER add extra inputs";
+    EXPECT_EQ(skip_main.getNumArguments(), cons_main.getNumArguments())
+        << "INDEPENDENT: Skip should have SAME input count as conservative";
+  }
+}
+
+// ============================================================================
+// Section 4: Complex Dependency Chain Tests
 // ============================================================================
 
 // Test multiple output dependencies - some intermediate, some final
@@ -448,7 +589,7 @@ module @jit_module2 {
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged) << "SkipIntermediates merge should succeed";
 
@@ -528,7 +669,7 @@ module @jit_moduleC {
   torch_neuronx::MergeMapping mappingAB;
   auto mergedAB = torch_neuronx::mergeModulesSkipIntermediates(
       *modA, *modB, &contextAB, modA_inputs, modA_outputs, modB_inputs, modB_outputs, analysisAB,
-      &mappingAB);
+      &mappingAB, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(mergedAB) << "Merge A+B should succeed";
 
@@ -569,7 +710,8 @@ module @jit_moduleC {
   torch_neuronx::MergeMapping mappingFinal;
   auto finalMerged = torch_neuronx::mergeModulesSkipIntermediates(
       *mergedAB_module, *modC, &contextFinal, mergedAB_inputs, mergedAB_outputs, modC_inputs,
-      modC_outputs, analysisFinal, &mappingFinal);
+      modC_outputs, analysisFinal, &mappingFinal, /*verify_output=*/true,
+      /*run_optimization=*/false);
 
   ASSERT_TRUE(finalMerged) << "Final merge should succeed";
 
@@ -648,7 +790,7 @@ module @jit__aten_mm attributes {jax.uses_shape_polymorphism = false, mhlo.num_p
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates transpose+matmul merge should succeed";
@@ -746,7 +888,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeModule2ToModul
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged)
       << "SkipIntermediates merge should succeed for module2->module1 dependency";
@@ -861,7 +1003,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMismatchedTensorAdd
         torch_neuronx::MergeMapping mapping;
         auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
             *mod1, *mod2, &context, too_few_inputs, normal_outputs, normal_inputs, normal_outputs2,
-            analysis, &mapping);
+            analysis, &mapping, /*verify_output=*/true, /*run_optimization=*/false);
       },
       std::runtime_error);
 }
@@ -899,7 +1041,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeMappingInforma
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged) << "SkipIntermediates merge should succeed";
 
@@ -945,7 +1087,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesMergeMappingMixed) 
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged) << "SkipIntermediates merge should succeed";
 
@@ -979,7 +1121,8 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesProducesFewerOutput
 
   // Create conservative merged module
   std::string conservative_result = torch_neuronx::mergeStableHLOModules(
-      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs);
+      mlir1_two_input, mlir2_two_input, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs,
+      /*verify_output=*/true, /*run_optimization=*/false);
 
   // Create MLIR context and load dialects
   mlir::MLIRContext context;
@@ -1003,7 +1146,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesProducesFewerOutput
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged);
   ASSERT_FALSE(conservative_result.empty());
@@ -1052,7 +1195,7 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, SkipIntermediatesContainsAllOperatio
   torch_neuronx::MergeMapping mapping;
   auto skip_intermediates_merged = torch_neuronx::mergeModulesSkipIntermediates(
       *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
-      &mapping);
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
 
   ASSERT_TRUE(skip_intermediates_merged);
 
@@ -1099,9 +1242,9 @@ TEST_F(StableHloUtilsSkipIntermediatesTest,
   EXPECT_TRUE(analysis.module1First) << "Module1 should execute first";
 
   torch_neuronx::MergeMapping mapping;
-  auto merged = torch_neuronx::mergeModulesSkipIntermediates(*mod1, *mod2, &context, mod1_inputs,
-                                                             mod1_outputs, mod2_inputs,
-                                                             mod2_outputs, analysis, &mapping);
+  auto merged = torch_neuronx::mergeModulesSkipIntermediates(
+      *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
   ASSERT_TRUE(merged);
 
   // Verify mapping: inputs (a, b, d), outputs (e) - 'c' excluded as intermediate
@@ -1143,9 +1286,9 @@ TEST_F(StableHloUtilsSkipIntermediatesTest,
   EXPECT_FALSE(analysis.module1First) << "Module2 should execute first";
 
   torch_neuronx::MergeMapping mapping;
-  auto merged = torch_neuronx::mergeModulesSkipIntermediates(*mod1, *mod2, &context, mod1_inputs,
-                                                             mod1_outputs, mod2_inputs,
-                                                             mod2_outputs, analysis, &mapping);
+  auto merged = torch_neuronx::mergeModulesSkipIntermediates(
+      *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
   ASSERT_TRUE(merged);
 
   // Verify mapping: inputs (a, c), outputs (d) - 'b' excluded as intermediate
@@ -1184,9 +1327,9 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, MappingTestSkipIntermediatesCommonIn
   EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::COMMON_INPUTS);
 
   torch_neuronx::MergeMapping mapping;
-  auto merged = torch_neuronx::mergeModulesSkipIntermediates(*mod1, *mod2, &context, mod1_inputs,
-                                                             mod1_outputs, mod2_inputs,
-                                                             mod2_outputs, analysis, &mapping);
+  auto merged = torch_neuronx::mergeModulesSkipIntermediates(
+      *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
   ASSERT_TRUE(merged);
 
   // Verify mapping: inputs (a, b, d), outputs (c, e) - no intermediates to skip
@@ -1229,9 +1372,9 @@ TEST_F(StableHloUtilsSkipIntermediatesTest, MappingTestSkipIntermediatesMixedSce
   EXPECT_EQ(analysis.scenario, torch_neuronx::DependencyAnalysis::MIXED);
 
   torch_neuronx::MergeMapping mapping;
-  auto merged = torch_neuronx::mergeModulesSkipIntermediates(*mod1, *mod2, &context, mod1_inputs,
-                                                             mod1_outputs, mod2_inputs,
-                                                             mod2_outputs, analysis, &mapping);
+  auto merged = torch_neuronx::mergeModulesSkipIntermediates(
+      *mod1, *mod2, &context, mod1_inputs, mod1_outputs, mod2_inputs, mod2_outputs, analysis,
+      &mapping, /*verify_output=*/true, /*run_optimization=*/false);
   ASSERT_TRUE(merged);
 
   // Verify mapping: inputs (a, b), outputs (e) - 'c' excluded as intermediate

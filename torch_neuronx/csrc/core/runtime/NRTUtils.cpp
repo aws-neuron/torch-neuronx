@@ -6,113 +6,112 @@
 #include <stdexcept>
 #include <utility>
 
-#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 namespace at::neuron::nrt {
 
-// TensorSet implementation
-TensorSet::TensorSet() : tensor_set_(nullptr) {
-  NRT_STATUS status = nrt_allocate_tensor_set(&tensor_set_);
-  if (status != NRT_SUCCESS || !tensor_set_) {
+void ErrorTrackerDeleter::operator()(ErrorTrackerHandle* raw) const {
+  if (raw) nrta_error_tracker_destroy(raw);
+}
+
+void TensorSetDeleter::operator()(TensorSetHandle* raw) const {
+  if (raw) nrt_destroy_tensor_set(&raw);
+}
+
+ErrorTrackerPtr CreateErrorTracker(uint32_t lnc_idx) {
+  nrta_error_tracker_t* tracker = nullptr;
+  NRT_STATUS status = nrta_error_tracker_create(lnc_idx, &tracker);
+  if (status != NRT_SUCCESS) {
+    throw std::runtime_error("Failed to create NRT error tracker for LNC " +
+                             std::to_string(lnc_idx) + ". Status: " + std::to_string(status));
+  }
+  return ErrorTrackerPtr{tracker};
+}
+
+TensorSetPtr CreateTensorSet() {
+  nrt_tensor_set_t* set = nullptr;
+  NRT_STATUS status = nrt_allocate_tensor_set(&set);
+  if (status != NRT_SUCCESS || !set) {
     throw std::runtime_error("Failed to allocate NRT tensor set. Status: " +
                              std::to_string(status));
   }
+  return TensorSetPtr{set};
 }
 
-TensorSet::~TensorSet() noexcept {
-  if (tensor_set_) {
-    nrt_destroy_tensor_set(&tensor_set_);
+std::vector<AsyncError> GetAndClearErrors(const ErrorTrackerPtr& tracker) {
+  std::vector<AsyncError> errors;
+  if (!tracker) {
+    return errors;
   }
-}
 
-TensorSet::TensorSet(TensorSet&& other) noexcept
-    : tensor_set_(std::exchange(other.tensor_set_, nullptr)) {}
-
-TensorSet& TensorSet::operator=(TensorSet&& other) noexcept {
-  if (this != &other) {
-    reset();
-    tensor_set_ = std::exchange(other.tensor_set_, nullptr);
+  const nrta_error_t* error_list = nullptr;
+  size_t error_count = 0;
+  NRT_STATUS status = nrta_error_tracker_get_list(tracker.get(), &error_list, &error_count);
+  if (status != NRT_SUCCESS) {
+    TORCH_NEURONX_ERROR("Failed to retrieve errors from error tracker. Status: ", status);
+    return errors;
   }
-  return *this;
-}
 
-NRT_STATUS TensorSet::AddTensor(std::string_view name, nrt_tensor_t* data_ptr) {
-  return nrt_add_tensor_to_tensor_set(tensor_set_, name.data(), data_ptr);
-}
-
-void TensorSet::validate() const {
-  if (!IsValid()) {
-    throw std::runtime_error("TensorSet is not properly initialized");
+  if (error_count > 0 && error_list) {
+    errors.reserve(error_count);
+    for (size_t i = 0; i < error_count; ++i) {
+      errors.push_back({error_list[i].seq_id, error_list[i].error_code});
+    }
   }
+  return errors;
 }
 
-void TensorSet::reset() noexcept {
-  if (tensor_set_) {
-    nrt_destroy_tensor_set(&tensor_set_);
-    tensor_set_ = nullptr;
+NRT_STATUS AddTensorToSet(const TensorSetPtr& set, const std::string& name,
+                          nrt_tensor_t* data_ptr) {
+  return nrt_add_tensor_to_tensor_set(set.get(), name.c_str(), data_ptr);
+}
+
+void ModelDeleter::operator()(ModelHandle* raw) const {
+  if (raw) nrt_unload(raw);
+}
+
+NRT_STATUS LoadModel(ModelPtr& model, const std::vector<uint8_t>& neff_bytes, int vnc_id,
+                     int num_cores) {
+  nrt_model_t* raw = nullptr;
+  NRT_STATUS status = nrt_load(neff_bytes.data(), neff_bytes.size(), vnc_id, num_cores, &raw);
+  if (status == NRT_SUCCESS) {
+    model.reset(raw);
   }
+  return status;
 }
 
-// Model implementation
-Model::Model() noexcept : model_(nullptr) {}
-
-Model::~Model() noexcept {
-  if (model_) {
-    nrt_unload(model_);
+NRT_STATUS LoadModelCollectives(ModelPtr& model, const std::vector<uint8_t>& neff_bytes, int vnc_id,
+                                int num_cores, int rank, int world_size) {
+  nrt_model_t* raw = nullptr;
+  NRT_STATUS status = nrt_load_collectives(neff_bytes.data(), neff_bytes.size(), vnc_id, num_cores,
+                                           rank, world_size, &raw);
+  if (status == NRT_SUCCESS) {
+    model.reset(raw);
   }
+  return status;
 }
 
-Model::Model(Model&& other) noexcept : model_(std::exchange(other.model_, nullptr)) {}
-
-Model& Model::operator=(Model&& other) noexcept {
-  if (this != &other) {
-    reset();
-    model_ = std::exchange(other.model_, nullptr);
+NRT_STATUS DispatchExecution(ModelHandle* model, TensorSetHandle* input_set,
+                             TensorSetHandle* output_set, int queue,
+                             ErrorTrackerHandle* err_tracker, SequenceId* req_sequence) {
+  if (!model) {
+    throw std::runtime_error("Model is not properly loaded");
   }
-  return *this;
-}
-
-NRT_STATUS Model::Load(const std::vector<uint8_t>& neff_bytes, int device_id, int num_cores) {
-  // Unload existing model if any
-  reset();
-
-  int vnc_id = c10_neuron::get_vnc_id(device_id);
-  return nrt_load(neff_bytes.data(), neff_bytes.size(), vnc_id, num_cores, &model_);
-}
-
-NRT_STATUS Model::LoadCollectives(const std::vector<uint8_t>& neff_bytes, int device_id,
-                                  int num_cores) {
-  // Unload existing model if any
-  reset();
-
-  int rank = c10_neuron::get_rank();
-  int world_size = c10_neuron::get_world_size();
-  int vnc_id = c10_neuron::get_vnc_id(device_id);
-
-  return nrt_load_collectives(neff_bytes.data(), neff_bytes.size(), vnc_id, num_cores, rank,
-                              world_size, &model_);
-}
-
-NRT_STATUS Model::Execute(nrt_tensor_set_t* input_set, nrt_tensor_set_t* output_set) {
-  validate();
   if (!input_set || !output_set) {
     throw std::invalid_argument("Tensor sets cannot be null");
   }
-  return nrt_execute(model_, input_set, output_set);
-}
 
-void Model::validate() const {
-  if (!IsValid()) {
-    throw std::runtime_error("Model is not properly loaded");
-  }
-}
+  bool async_mode_enabled =
+      NeuronResourceManager::Instance().GetOperationExecutionEngine().IsNRTAsyncModeEnabled();
 
-void Model::reset() noexcept {
-  if (model_) {
-    nrt_unload(model_);
-    model_ = nullptr;
+  if (async_mode_enabled) {
+    TORCH_CHECK(err_tracker != nullptr && req_sequence != nullptr,
+                "Async mode requires both err_tracker and req_sequence");
+    return nrta_execute_schedule(model, input_set, output_set, queue, err_tracker, req_sequence);
   }
+  return nrt_execute(model, input_set, output_set);
 }
 
 }  // namespace at::neuron::nrt

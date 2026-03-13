@@ -56,7 +56,7 @@ class IndexMLIRImpl(OperationImplementation):
         """Handle empty output tensor case"""
         try:
             if out is None:
-                _, _, _, _, _, outputs, _ = self.kernel._get_or_compile_hlo(
+                _, _, _, _, _, outputs, _, _ = self.kernel._get_or_compile_hlo(
                     (tensor, indices), {"out": out}
                 )
                 result = torch.empty(outputs.shape, dtype=tensor.dtype, device=tensor.device)

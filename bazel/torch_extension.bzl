@@ -4,7 +4,7 @@ See https://bazel.build/rules/lib/repo/local.
 
 load("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-load("//bazel:python_config.bzl", "format_python_wheel_tag")
+load("//bazel:python_config.bzl", "format_python_wheel_tag", "get_torch_sha256", "DEFAULT_PYTHON_VERSION")
 
 
 def _torch_extension_impl(module_ctx):
@@ -21,13 +21,15 @@ def _torch_extension_impl(module_ctx):
         )
     else:
         torch_version = module_ctx.getenv("PYTORCH_VERSION")
-        python_version = module_ctx.getenv("PYTHON_VERSION")
+        python_version = module_ctx.getenv("PYTHON_VERSION") or DEFAULT_PYTHON_VERSION
         python_wheel_tag = format_python_wheel_tag(python_version)
+        sha256 = get_torch_sha256(python_version)
+
         # Download and extract PyTorch wheel
         http_archive(
             name = "torch",
-            urls = ["https://download.pytorch.org/whl/cpu-cxx11-abi/torch-{}%2Bcpu.cxx11.abi-{}-linux_x86_64.whl".format(torch_version, python_wheel_tag)],
-            sha256 = "e8ab5a935b33526df0ccae43f4ec1bf6656c5be9c1238af412e0e87dc8345f04",
+            urls = ["https://download.pytorch.org/whl/cpu/torch-{}%2Bcpu-{}-manylinux_2_28_x86_64.whl".format(torch_version, python_wheel_tag)],
+            sha256 = sha256,
             build_file = Label("//bazel:torch.BUILD"),
             strip_prefix = "torch",
             type = "zip",

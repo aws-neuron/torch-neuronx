@@ -29,11 +29,11 @@ class ScatterAddNKIImpl(OperationImplementation):
 
     def _execute_kernel(self, input, dim, index, src):
         """Execute the NKI kernel"""
-        from torch_neuronx.kernels.type_converter import TypeConverter
+        from torch_neuronx.utils import convert_for_neuron
 
         from .nki_kernels.scatter_add import scatter_add_kernel
 
-        index = TypeConverter.convert_for_neuron(index)
+        index = convert_for_neuron(index)
         index_1d = index[:, 0]
         result = scatter_add_kernel(input, dim, index_1d, src)
         return result
@@ -55,10 +55,7 @@ class ScatterAddOp(Operation):
 
     def _setup_implementations(self):
         self._implementations.append(ScatterAddNKIImpl())
-        from .xla_ops.scatter_add_xla import ScatterAddXLAImpl
-
         self._implementations.append(ScatterAddMLIRImpl())
-        self._implementations.append(ScatterAddXLAImpl())
 
     @property
     def op_name(self) -> str:
@@ -70,10 +67,7 @@ class ScatterAddInplaceOp(Operation):
 
     def _setup_implementations(self):
         self._implementations.append(ScatterAddNKIImpl())
-        from .xla_ops.scatter_add_xla import ScatterAddInplaceXLAImpl
-
         self._implementations.append(ScatterAddInplaceMLIRImpl())
-        self._implementations.append(ScatterAddInplaceXLAImpl())
 
     @property
     def op_name(self) -> str:
@@ -84,10 +78,7 @@ class ScatterAddOutOp(Operation):
     """Scatter add operation with out parameter (scatter_add.out)"""
 
     def _setup_implementations(self):
-        from .xla_ops.scatter_add_xla import ScatterAddOutXLAImpl
-
         self._implementations.append(ScatterAddOutMLIRImpl())
-        self._implementations.append(ScatterAddOutXLAImpl())
 
     @property
     def op_name(self) -> str:

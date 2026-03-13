@@ -11,7 +11,6 @@ from torch_neuronx import nki_op, wrap_nki
 my_namespace = "TestNKIDevicePrint"
 
 
-@wrap_nki
 @nki.jit
 def nki_tensor_add_print(a_input, b_input):
     """NKI kernel to compute element-wise addition"""
@@ -32,7 +31,7 @@ def nki_tensor_add_print(a_input, b_input):
 @nki_op(f"{my_namespace}::add_print", mutates_args={})
 def nki_add_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """NKI add operation wrapper"""
-    return nki_tensor_add_print(a, b)
+    return wrap_nki(nki_tensor_add_print)(a, b)
 
 
 def nki_func(a, b):

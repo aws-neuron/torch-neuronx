@@ -1,10 +1,16 @@
 """NKI kernel wrapper for scatter_add operation"""
 
-import neuronxcc.nki.language as nl
 import torch
-from neuronxcc.nki._pre_prod_kernels.experimental.misc.scatter_add import scatter_add
 
 from torch_neuronx.nki_hop import nki_op, wrap_nki
+from torch_neuronx.utils import get_logical_neuron_cores
+
+try:
+    from neuronxcc.nki._pre_prod_kernels.experimental.misc.klir_scatter_add import scatter_add
+except ImportError:
+    raise ImportError(
+        "scatter_add requires neuronxcc >= 2.23. Please upgrade your compiler."
+    ) from None
 
 wrapped_scatter_add_nki = wrap_nki(scatter_add)
 
@@ -25,10 +31,8 @@ def scatter_add_kernel(
     Returns:
         input: Modified input tensor
     """
-    from torch_neuronx.utils import get_logical_neuron_cores
 
     logical_neuron_cores = int(get_logical_neuron_cores())
-
-    result = wrapped_scatter_add_nki[(nl.nc(logical_neuron_cores),)](input, dim, index, src)
-
+    grid = (logical_neuron_cores,)
+    result = wrapped_scatter_add_nki[grid](input, dim, index, src)
     return result

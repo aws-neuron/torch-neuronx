@@ -6,6 +6,13 @@
         "PRIVATEUSE1"
       ],
       "file": "test_nn.py",
+      "skip_tests": [
+        {
+          "test_ReplicationPad2d_large_neuron": {
+            "reason": "Long compilation - causes test suite timeout"
+          }
+        }
+      ],
       "xfail": [
         {
           "reason": "XFail all failing tests",

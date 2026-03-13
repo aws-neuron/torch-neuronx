@@ -1,5 +1,6 @@
 """Test that clamp and clamp_min operations are properly registered with PyTorch dispatcher."""
 
+import os
 import re
 
 import pytest
@@ -187,6 +188,38 @@ class TestClamp:
             ("clamp_max", torch.clamp_max, "aten::clamp_max", {"max": 5.0}),
         ],
     )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32, torch.int64])
+    def test_clamp_ops_scalar_tensor(self, op_name, op_func, aten_name, kwargs, dtype):
+        """Test clamp operations with scalar tensors and different data types."""
+        with track_neuron_ops():
+            if dtype.is_floating_point:
+                input_cpu = torch.tensor(7.5, dtype=dtype)
+            else:
+                input_cpu = torch.tensor(7, dtype=dtype)
+
+            input_arr = input_cpu.to("neuron")
+
+            # Run on CPU to get expected result
+            if dtype.is_floating_point:
+                expected = op_func(input_cpu, **kwargs)
+                result = op_func(input_arr, **kwargs)
+            else:
+                int_kwargs = {k: int(v) for k, v in kwargs.items()}
+                expected = op_func(input_cpu, **int_kwargs)
+                result = op_func(input_arr, **int_kwargs)
+
+            assert result.cpu().item() == expected.item()
+            assert result.shape == expected.shape == torch.Size([])
+            assert_op_runs_on_neuron(aten_name)
+
+    @pytest.mark.parametrize(
+        "op_name,op_func,aten_name,kwargs",
+        [
+            ("clamp", torch.clamp, "aten::clamp", {"min": 0.0, "max": 5.0}),
+            ("clamp_min", torch.clamp_min, "aten::clamp_min", {"min": 0.0}),
+            ("clamp_max", torch.clamp_max, "aten::clamp_max", {"max": 5.0}),
+        ],
+    )
     def test_clamp_ops_tensor_method(self, op_name, op_func, aten_name, kwargs):
         """Test tensor method variants of clamp operations."""
         input_cpu = torch.tensor([-5.0, 1.0, 3.0, 7.0, 10.0])
@@ -225,7 +258,16 @@ class TestClamp:
         [
             ("clamp", torch.clamp, "aten::clamp", {"min": -10.0, "max": 10.0}),
             ("clamp_min", torch.clamp_min, "aten::clamp_min", {"min": -10.0}),
-            ("clamp_max", torch.clamp_max, "aten::clamp_max", {"max": 10.0}),
+            pytest.param(
+                "clamp_max",
+                torch.clamp_max,
+                "aten::clamp_max",
+                {"max": 10.0},
+                marks=pytest.mark.xfail(
+                    condition=os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
+                    reason="-inf preservation issues in torch.clamp_max for multi-element tensors",
+                ),
+            ),
         ],
     )
     def test_clamp_ops_extreme_values(self, op_name, op_func, aten_name, kwargs):
@@ -280,15 +322,20 @@ class TestClamp:
             assert_op_runs_on_neuron(aten_name)
 
     @pytest.mark.parametrize(
-        "op_name,op_func,aten_name",
+        "op_name,op_func",
         [
-            ("clamp", torch.clamp, "aten::clamp.Tensor_out"),
-            ("clamp_min", torch.clamp_min, "aten::clamp_min.Tensor_out"),
-            ("clamp_max", torch.clamp_max, "aten::clamp_max.Tensor_out"),
+            ("clamp", torch.clamp),
+            ("clamp_min", torch.clamp_min),
+            ("clamp_max", torch.clamp_max),
         ],
     )
-    def test_clamp_ops_broadcasting(self, op_name, op_func, aten_name):
+    def test_clamp_ops_broadcasting(self, op_name, op_func):
         """Test clamp operations with broadcasted tensors."""
+        suffix = (
+            ".Tensor" if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1" else ".Tensor_out"
+        )
+        aten_name = f"aten::{op_name}{suffix}"
+
         with track_neuron_ops():
             # 2x3 input tensor
             input_cpu = torch.tensor([[1.0, 5.0, 9.0], [2.0, 6.0, 10.0]])

@@ -23,11 +23,15 @@ class NeuronDeviceTest : public ::testing::Test {
     mock_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
     mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
 
+    c10_neuron::reset_distributed_state();
+
     // Clear any previous mock expectations
     ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
   }
 
   void TearDown() override {
+    c10_neuron::reset_distributed_state();
+
     // Clear mock expectations
     ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
 
@@ -69,16 +73,23 @@ TEST_F(NeuronDeviceTest, SetDeviceInvalidRange) {
 }
 
 TEST_F(NeuronDeviceTest, VncCount) {
-  // Test vnc_count function with different return values
+  // Test vnc_count function - value is cached after first call
   EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
       .WillOnce(DoAll(SetArgPointee<0>(4), Return(NRT_SUCCESS)));
   EXPECT_EQ(c10_neuron::vnc_count(), 4);
+  // Subsequent calls return cached value
+  EXPECT_EQ(c10_neuron::vnc_count(), 4);
+}
 
+TEST_F(NeuronDeviceTest, VncCountZero) {
+  // Test vnc_count with zero devices
   EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
       .WillOnce(DoAll(SetArgPointee<0>(0), Return(NRT_SUCCESS)));
   EXPECT_EQ(c10_neuron::vnc_count(), 0);
+}
 
-  // Test failure case
+TEST_F(NeuronDeviceTest, VncCountFailure) {
+  // Test vnc_count failure case - returns 0 on NRT failure
   EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_)).WillOnce(Return(NRT_FAILURE));
   EXPECT_EQ(c10_neuron::vnc_count(), 0);
 }
@@ -159,6 +170,9 @@ TEST_F(NeuronDeviceTest, BoundaryConditions) {
 
 // Test thread safety. Must run before LocalWorldSizeComprehensiveTest
 TEST_F(NeuronDeviceTest, ThreadLocalCurrentDevice) {
+  // Reset global_default_device so new threads will fallback to device 0
+  c10_neuron::reset_distributed_state();
+
   // Mock vnc_count to return enough devices
   EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
       .WillRepeatedly(DoAll(SetArgPointee<0>(4), Return(NRT_SUCCESS)));

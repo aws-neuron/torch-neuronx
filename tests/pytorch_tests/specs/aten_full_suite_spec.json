@@ -30,7 +30,14 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_nn.py"
+      "file": "test_nn.py",
+      "skip_tests": [
+        {
+          "test_ReplicationPad2d_large_neuron": {
+            "reason": "Long compilation - causes test suite timeout"
+          }
+        }
+      ]
     },
     {
       "class": "TestRandomTensorCreation",

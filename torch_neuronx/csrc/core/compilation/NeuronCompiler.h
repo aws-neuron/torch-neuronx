@@ -35,15 +35,19 @@ class NeuronCompiler {
   //   hlo_bytes: The HLO module serialized as protobuf bytes or MLIR bytes
   //   config: Compilation configuration with framework, platform, and optimization settings
   //   ir_type: Type of IR being compiled ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+  //   op_name: Optional operation name for IR dumping
+  //   cache_key: Optional cache key for IR dumping
+  //   kernel_class_name: Optional kernel class name for IR dumping
   //
   // Returns:
   //   The compiled NEFF file as a byte vector
   //
   // Throws:
   //   std::runtime_error if compilation fails or neuronx-cc is not found
-  static std::vector<uint8_t> CompileHloToNeff(const std::vector<uint8_t>& hlo_bytes,
-                                               const CompilationConfig& config,
-                                               const std::string& ir_type = "XLA");
+  static std::vector<uint8_t> CompileHloToNeff(
+      const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
+      const std::string& ir_type = "XLA", const std::string& op_name = "",
+      const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");
 
   // Checks if StableHLO lowering is enabled via the TORCH_NEURONX_ENABLE_STABLEHLO environment
   // variable.

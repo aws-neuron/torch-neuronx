@@ -25,7 +25,6 @@ def _should_use_sync_execution(impl, *args):
         not hasattr(impl, "kernel")
         or impl.kernel is None
         or BaseEmptyTensorHandler().check_for_empty(*args)
-        or os.environ.get("TORCH_NEURONX_SYNC_MODE", "0") == "1"
         or os.environ.get("NEURON_LAUNCH_BLOCKING", "0") == "1"
     )
 
@@ -53,25 +52,45 @@ class OperationImplementation(ABC):
         Default implementation requires all tensors to be in device, assuming single implementation
         for the operation. Override this method when multiple implementations
         exist and need to filter based on input arguments.
-        """
-        for arg in args:
-            if (
-                isinstance(arg, torch.Tensor) and arg.ndim != 0 and arg.device.type != "neuron"
-            ) or (
-                isinstance(arg, list | tuple)
-                and any(
-                    value.device.type != "neuron"
-                    for value in arg
-                    if isinstance(value, torch.Tensor) and value.ndim != 0
-                )
-            ):
-                return False
 
-        return not any(
-            kwarg.device.type != "neuron"
-            for kwarg in kwargs
-            if isinstance(kwarg, torch.Tensor) and kwarg.ndim != 0
-        )
+        Returns False for complex dtypes (not supported yet by neuron backend).
+
+        Raises:
+            RuntimeError: If non-scalar tensors are on wrong device
+        """
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                # Complex dtype not supported yet
+                if arg.dtype.is_complex:
+                    return False
+                if arg.ndim != 0 and arg.device.type != "neuron":
+                    raise RuntimeError(
+                        f"Non-scalar tensor arg{i} is on {arg.device.type} device, expected neuron"
+                    )
+            elif isinstance(arg, list | tuple):
+                for j, value in enumerate(arg):
+                    if isinstance(value, torch.Tensor):
+                        # Complex dtype not supported yet
+                        if value.dtype.is_complex:
+                            return False
+                        if value.ndim != 0 and value.device.type != "neuron":
+                            raise RuntimeError(
+                                f"Non-scalar tensor arg{i}[{j}] is on {value.device.type} "
+                                "device, expected neuron"
+                            )
+
+        for key, kwarg in kwargs.items():
+            if isinstance(kwarg, torch.Tensor):
+                # Complex dtype not supported yet
+                if kwarg.dtype.is_complex:
+                    return False
+                if kwarg.ndim != 0 and kwarg.device.type != "neuron":
+                    raise RuntimeError(
+                        f"Non-scalar tensor kwarg '{key}' is on {kwarg.device.type}"
+                        "device, expected neuron"
+                    )
+
+        return True
 
     @torch._dynamo.disable
     def execute(self, *args, **kwargs) -> ExecutionResult:
@@ -721,14 +740,14 @@ class Operation(ABC):
                     import torch_neuronx
 
                     # Log the op for all impl other than JAX/XLA/c10d kernels
-                    # or NEURON_LAUNCH_BLOCKING=1 or TORCH_NEURONX_SYNC_MODE=1
+                    # or NEURON_LAUNCH_BLOCKING=1
                     # TODO - remove this condition once all ops are onboarded to async pipeline
                     if _should_use_sync_execution(impl, *args):
                         torch_neuronx._C._log_executed_op(self.op_name)
                     return result.output
                 # Log failure and continue to next implementation - debug print once only
                 debug_msg = (
-                    f"Neuron implementation {impl.__class__.__name__}failed: {result.error_msg}"
+                    f"Neuron implementation {impl.__class__.__name__} failed: {result.error_msg}"
                 )
                 if debug_msg not in _debug_messages_printed:
                     logging.debug(debug_msg)
@@ -747,7 +766,9 @@ class Operation(ABC):
                 if first_failure_message is None:
                     first_failure_message = f"{impl.__class__.__name__}: {can_handle_error_msg}"
 
-        torch.neuron.synchronize()
+        # Synchronize since we had and error and might have to wrap up things.
+        stream = torch.neuron.current_stream()
+        stream.synchronize()
 
         # Build debug message before CPU fallback
         base_debug_msg = (
@@ -758,7 +779,10 @@ class Operation(ABC):
         )
 
         if debug_msg not in _debug_messages_printed:
-            logging.debug(debug_msg)
+            if not fallback_only_for_unimplemented:
+                logging.debug(debug_msg)
+            else:
+                logging.error(debug_msg)
             _debug_messages_printed.add(debug_msg)
 
         # No implementation could handle the operation
@@ -769,6 +793,17 @@ class Operation(ABC):
                 f"Operation {self.op_name} failed to execute on Neuron "
                 f"(last implementation: {last_failed_impl}). "
                 f"Details: {first_failure_message if first_failure_message else 'Unknown error'}"
+            )
+            _create_and_raise_detailed_error(
+                RuntimeError, self.op_name, base_msg, args, kwargs, None
+            )
+        elif fallback_only_for_unimplemented:
+            base_msg = (
+                "CPU fallback disabled because "
+                "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. "
+                f"Operation {self.op_name} failed to be handled by any Neuron implementation "
+                f"(last implementation: {last_failed_impl}). "
+                f"Details: {can_handle_error_msg if can_handle_error_msg else 'Unknown error'}"
             )
             _create_and_raise_detailed_error(
                 RuntimeError, self.op_name, base_msg, args, kwargs, None

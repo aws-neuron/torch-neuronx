@@ -41,6 +41,8 @@
 #ifndef TORCH_NEURON_CSRC_CORE_METRICS_NEURON_METRICS_H_
 #define TORCH_NEURON_CSRC_CORE_METRICS_NEURON_METRICS_H_
 
+#include <c10/util/Exception.h>
+
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -311,6 +313,222 @@ void SetMetricsEnabled(bool enabled);
           ? new ::at::neuron::metrics::NeuronMetric(name, ::at::neuron::metrics::MetricFnTime) \
           : nullptr;                                                                           \
   ::at::neuron::metrics::TimedSection __timed_section(__timed_metric)
+
+// =============================================================================
+// Memory Statistics Classes
+// These classes provide memory tracking for Neuron devices.
+// =============================================================================
+
+/**
+ * MemoryStatistics tracks a memory metric with current, peak, and historical totals.
+ * All operations are thread-safe using atomic operations.
+ */
+struct MemoryStatistics {
+  /**
+   * Increase the stat by the given amount.
+   * Updates current, peak (if new max), and allocated (historical total).
+   */
+  void increase(size_t amount) {
+    int64_t new_current =
+        current.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed) +
+        static_cast<int64_t>(amount);
+    allocated.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed);
+
+    // Update peak using compare-exchange loop
+    int64_t prev_peak = peak.load(std::memory_order_relaxed);
+    while (new_current > prev_peak &&
+           !peak.compare_exchange_weak(prev_peak, new_current, std::memory_order_relaxed)) {
+      // prev_peak is updated by compare_exchange_weak on failure
+    }
+  }
+
+  /**
+   * Decrease the stat by the given amount.
+   * Updates current and freed (historical total).
+   */
+  void decrease(size_t amount) {
+    int64_t new_current =
+        current.fetch_sub(static_cast<int64_t>(amount), std::memory_order_relaxed) -
+        static_cast<int64_t>(amount);
+    freed.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed);
+    // Debug assertion - note: may have false positives under high contention but useful for
+    // catching bugs
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+        new_current >= 0, "Negative tracked stat in memory allocator (likely logic error).");
+  }
+
+  /**
+   * Reset peak to current value.
+   * Used when user wants to track peak from this point forward.
+   */
+  void reset_peak() {
+    peak.store(current.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
+
+  /**
+   * Reset accumulated historical counters (allocated and freed).
+   */
+  void reset_accumulated() {
+    allocated.store(0, std::memory_order_relaxed);
+    freed.store(0, std::memory_order_relaxed);
+  }
+
+  /**
+   * Reset all values to zero.
+   */
+  void reset_all() {
+    current.store(0, std::memory_order_relaxed);
+    peak.store(0, std::memory_order_relaxed);
+    allocated.store(0, std::memory_order_relaxed);
+    freed.store(0, std::memory_order_relaxed);
+  }
+
+  std::atomic<int64_t> current{0};    // Current value
+  std::atomic<int64_t> peak{0};       // Peak value since last reset
+  std::atomic<int64_t> allocated{0};  // Historical total increase
+  std::atomic<int64_t> freed{0};      // Historical total decrease
+};
+
+/**
+ * Simple POD struct for returning memory stat values to callers.
+ * Used by GetMemoryStats() to return a copy of current values.
+ */
+struct MemoryStatInfo {
+  int64_t current = 0;    // Current value
+  int64_t peak = 0;       // Peak value since last reset
+  int64_t allocated = 0;  // Historical total increase
+  int64_t freed = 0;      // Historical total decrease
+};
+
+/**
+ * Per-device memory statistics.
+ * Simplified for Neuron - no pool type distinction (small/large).
+ * All operations are thread-safe using atomic operations.
+ *
+ * Memory stat semantics (matching CUDA API):
+ * - allocated_bytes: Total memory obtained from NRT (via nrt_tensor_alloc)
+ * - reserved_bytes: Memory held in cache for reuse (currently always 0, no caching)
+ * - active_bytes: Memory in active use by tensors (currently equals allocated_bytes)
+ */
+struct DeviceMemoryStats {
+  // Byte-level statistics with current and peak tracking
+  MemoryStatistics allocated_bytes;  // Total memory obtained from NRT
+  MemoryStatistics reserved_bytes;   // Memory held in cache (currently unused)
+  MemoryStatistics active_bytes;     // Memory in active use by tensors
+
+  // Simple counters for events
+  std::atomic<int64_t> num_alloc_retries{0};    // OOM retries after cache flush
+  std::atomic<int64_t> num_ooms{0};             // Final OOM failures
+  std::atomic<int64_t> num_tensor_frees{0};     // neuron_deleter calls
+  std::atomic<int64_t> allocation_requests{0};  // Total allocation requests
+
+  void reset_peak() {
+    allocated_bytes.reset_peak();
+    reserved_bytes.reset_peak();
+    active_bytes.reset_peak();
+  }
+
+  void reset_counters() {
+    num_alloc_retries.store(0, std::memory_order_relaxed);
+    num_ooms.store(0, std::memory_order_relaxed);
+    num_tensor_frees.store(0, std::memory_order_relaxed);
+    allocation_requests.store(0, std::memory_order_relaxed);
+  }
+
+  void reset_accumulated() {
+    allocated_bytes.reset_accumulated();
+    reserved_bytes.reset_accumulated();
+    active_bytes.reset_accumulated();
+  }
+
+  /**
+   * Reset all values to zero.
+   */
+  void reset_all() {
+    allocated_bytes.reset_all();
+    reserved_bytes.reset_all();
+    active_bytes.reset_all();
+    reset_counters();
+  }
+};
+
+/**
+ * POD struct for returning all device memory stats to callers.
+ * Used by GetMemoryStats() to return a copy of current values.
+ */
+struct DeviceMemoryStatsInfo {
+  MemoryStatInfo allocated_bytes;
+  MemoryStatInfo reserved_bytes;
+  MemoryStatInfo active_bytes;
+  int64_t num_alloc_retries = 0;
+  int64_t num_ooms = 0;
+  int64_t num_tensor_frees = 0;
+  int64_t allocation_requests = 0;
+};
+
+// =============================================================================
+// Memory Statistics Helper Functions
+// These functions provide a clean API for recording memory allocation events.
+// They should be used by allocator code to update stats consistently.
+// =============================================================================
+
+/**
+ * Record stats for a new allocation from NRT.
+ * Updates allocated_bytes and active_bytes.
+ */
+void RecordNewAllocation(int device_id, size_t size_bytes);
+
+/**
+ * Record stats for a deallocation (memory freed back to NRT).
+ * Increments num_tensor_frees and decreases active_bytes and allocated_bytes.
+ */
+void RecordDeallocation(int device_id, size_t size_bytes);
+
+/**
+ * Global registry for per-device memory statistics.
+ * Provides thread-safe access to DeviceMemoryStats for each device.
+ *
+ * This is the PUBLIC API for memory statistics - all queries and resets
+ * should go through this registry rather than accessing allocator internals.
+ */
+class DeviceMemoryStatsRegistry {
+ public:
+  static DeviceMemoryStatsRegistry& Instance();
+
+  // === Internal API (for allocator to update stats) ===
+
+  /**
+   * Get mutable stats reference for a specific device (initializes if needed).
+   * Note: Returns reference - caller must hold allocator mutex when modifying.
+   */
+  DeviceMemoryStats& GetDeviceStats(int device_index);
+
+  // === Public API (for querying stats) ===
+
+  /**
+   * Get a copy of all stats for a device (thread-safe read).
+   * Returns zero-initialized struct if device not yet initialized.
+   */
+  DeviceMemoryStatsInfo GetMemoryStats(int device_index);
+
+  /**
+   * Reset peak stats for a device.
+   * Sets peak values to current values.
+   */
+  void ResetPeakStats(int device_index);
+
+  /**
+   * Reset accumulated counters for a device.
+   * Resets num_alloc_retries and num_ooms to zero.
+   */
+  void ResetAccumulatedStats(int device_index);
+
+ private:
+  DeviceMemoryStatsRegistry() = default;
+
+  std::mutex mutex_;  // Protects device_stats_ vector access
+  std::vector<std::unique_ptr<DeviceMemoryStats>> device_stats_;
+};
 
 }  // namespace at::neuron::metrics
 

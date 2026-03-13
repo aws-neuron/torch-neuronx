@@ -3,13 +3,17 @@ Neuron backend implementation for torch.compile
 """
 
 import logging
+import os
 from collections.abc import Callable
 
 import torch
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 
+# Import process group variable tracking (needed for registration side effect)
+from torch_neuronx.neuron_dynamo_backend import process_group_variable
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_current_timestamp,
@@ -19,7 +23,7 @@ from torch_neuronx.neuron_dynamo_backend.config import (
     managed_artifacts_directory,
     reset_timestamp,
 )
-from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
+from torch_neuronx.neuron_dynamo_backend.decompositions import get_compile_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
     convert_fx_to_stablehlo,
@@ -36,8 +40,12 @@ from torch_neuronx.neuron_dynamo_backend.metrics import (
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.io_utils import save_fx_graph_txt
+from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import RandomInputInfo
 
 logger = logging.getLogger(__name__)
+
+# Ensure process group registration happens
+_ = process_group_variable
 
 
 def _compile_fx_to_stablehlo(
@@ -47,28 +55,36 @@ def _compile_fx_to_stablehlo(
     segment_id: str,
     preserve_artifacts: bool,
     aliasing_info: AliasingInfo = None,
+    random_input_info: RandomInputInfo = None,
 ):
-    """
-    FX Graph to StableHLO conversion helper function.
+    """Convert an FX GraphModule to StableHLO MLIR.
 
     Args:
-        gm: FX GraphModule with Aten operations
-        example_inputs: Example input tensors
-        model_name: Model name for logging
-        segment_id: Segment ID for stats
-        preserve_artifacts: Save artifacts
+        gm (torch.fx.GraphModule): FX GraphModule with ATen operations.
+        example_inputs: Example input tensors.
+        model_name (str): Model name for logging and artifact naming.
+        segment_id (str): Segment ID for statistics tracking.
+        preserve_artifacts (bool): Whether to save intermediate artifacts.
+        aliasing_info (AliasingInfo): Input-output aliasing information.
+        random_input_info: Optional metadata about random inputs added to the graph
 
     Returns:
-        tuple: (stablehlo_mlir, stablehlo_time, artifacts_stablehlo)
-            - stablehlo_mlir: Compiled StableHLO MLIR module
-            - artifacts_stablehlo: Path to saved StableHLO artifacts
+        tuple: (stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec)
+            - stablehlo_mlir: Compiled StableHLO MLIR module.
+            - artifacts_stablehlo (Path): Path to saved StableHLO artifacts.
+            - io_spec (FunctionIO): Input/output specifications.
+            - cast_spec (list[TensorSpec]): Output dtype specifications.
     """
-    logger.debug("--- Starting FX Graph -> StableHLO conversion ---")
+    logger.debug("Starting FX Graph to StableHLO conversion")
 
     stablehlo_mlir, io_spec, cast_spec = convert_fx_to_stablehlo(
-        gm, example_inputs, aliasing_info, preserve_artifacts=preserve_artifacts
+        gm,
+        example_inputs,
+        aliasing_info,
+        preserve_artifacts=preserve_artifacts,
+        random_input_info=random_input_info,
     )
-    logger.debug("FX Graph -> StableHLO completed")
+    logger.debug("FX Graph to StableHLO conversion completed")
 
     # Save stablehlo to artifacts dir
     artifacts_stablehlo = get_stablehlo_path(model_name)
@@ -79,16 +95,15 @@ def _compile_fx_to_stablehlo(
 
 
 def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
-    """
-    Detect if FX graph contains collective operations.
+    """Detect if an FX graph contains collective operations.
 
     Scans the FX graph for torch._c10d_functional collective operations.
 
     Args:
-        gm: FX GraphModule to analyze
+        gm (torch.fx.GraphModule): FX GraphModule to analyze.
 
     Returns:
-        True if graph contains any collective operations, False otherwise
+        bool: True if graph contains any collective operations.
     """
     collective_ops = {"all_reduce", "all_gather", "reduce_scatter", "all_to_all"}
 
@@ -104,36 +119,36 @@ def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     return False
 
 
-# TODO (NF-19): move all FX->NEFF compilation into a single function
 def neuron_backend_fx_compiler(
     gm: torch.fx.GraphModule, example_inputs, pre_processing_analysis_info=None, options=None
 ):
-    """
-    Neuron compiler function that receives core Aten ops from AOTAutograd
+    """Compile an FX GraphModule to NEFF for Neuron execution.
 
-    This implements the complete compilation pipeline:
+    Implements the compilation pipeline:
     1. FX Graph -> StableHLO conversion
-    2. StableHLO validation
-    3. StableHLO -> NEFF compilation
-    4. NEFF execution wrapper creation
+    2. StableHLO -> NEFF compilation
+    3. NEFF execution wrapper creation
 
     Args:
-        gm: FX GraphModule with Aten operations (from AOTAutograd)
-        example_inputs: Example input tensors
-        options: Compilation options from torch.compile
+        gm (torch.fx.GraphModule): FX GraphModule with ATen operations from AOTAutograd.
+        example_inputs: Example input tensors for shape inference.
+        pre_processing_analysis_info (dict | None): Analysis results from preprocessing.
+        options (dict | None): Compilation options from torch.compile.
 
     Returns:
-        Boxed function for execution
+        Callable: Boxed function for execution.
 
     Raises:
-        RuntimeError: If compilation fails at any stage
+        RuntimeError: If compilation fails at any stage.
     """
 
     logger.debug("Applying FX graph transformations...")
-    post_aot_processing_result = post_aot_processing(gm)
+    with dynamo_timed("torch_neuronx_fx_passes"):
+        post_aot_processing_result = post_aot_processing(gm)
     gm = post_aot_processing_result.graph_module
     mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
     none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
+    random_input_info = post_aot_processing_result.analysis.get("random_input_info", None)
     aliasing_info = (
         None
         if pre_processing_analysis_info is None
@@ -153,6 +168,9 @@ def neuron_backend_fx_compiler(
 
     # Get model name from global variable
     model_name = get_model_name() if options is None else options.get("model_name", "model_default")
+
+    # Set retain device mode
+    retain_device = os.environ.get("TORCH_NEURONX_RETAIN_DEVICE_MODE", "0") == "1"
 
     # Construct human-readable graph name from model_name and AOT compile ID
     # get_aot_graph_name() returns: model__{aot_id}_{graph_type}_{nth}
@@ -176,7 +194,13 @@ def neuron_backend_fx_compiler(
             save_fx_graph_txt(gm, graph_path)
 
             stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
-                gm, example_inputs, model_name, segment_id, preserve_artifacts, aliasing_info
+                gm,
+                example_inputs,
+                model_name,
+                segment_id,
+                preserve_artifacts,
+                aliasing_info,
+                random_input_info,
             )
             compile_graph = CompileGraph(stablehlo_mlir, model_name, segment_id, has_collectives)
             final_cache_key = compile_graph.compile()
@@ -199,6 +223,7 @@ def neuron_backend_fx_compiler(
                 io_spec,
                 cast_spec,
                 has_collectives,
+                retain_device=retain_device,
                 mutation_info=mutation_info,
                 none_output_info=none_output_info,
             )
@@ -231,10 +256,11 @@ def make_fw_compiler(
     """Create a forward compiler wrapper with custom aliasing information.
 
     Args:
-        analysis_info: FX graph pre-processing info
+        analysis_info (dict): FX graph pre-processing info from aliasing analysis.
+        options (dict | None): Compilation options from torch.compile.
 
     Returns:
-        Callable: Wrapper function that invokes neuron_compiler with aliasing info
+        Callable: Wrapper function that invokes neuron_compiler with aliasing info.
     """
 
     def wrapper(gm, example_inputs):
@@ -243,25 +269,29 @@ def make_fw_compiler(
     return wrapper
 
 
-def create_neuron_backend(decompose_all: bool = False):
-    """
-    Create a new neuron backend with specified decomposition settings
-
-    Args:
-        decompose_all: If True, decompose all operations. If False (default),
-            only decompose ops in DECOMP_NAMES.
+def create_neuron_backend():
+    """Create a neuron backend for torch.compile.
 
     Returns:
-        Neuron backend for torch.compile
+        Callable: Neuron backend function for torch.compile.
 
     Example:
-        compiled_model = torch.compile(model, backend="neuron")
+        >>> compiled_model = torch.compile(model, backend="neuron")
     """
 
     # TODO (NF-24): add explicit bw_compiler
-    decomposition_table = get_decomposition_table()
+    decomposition_table = get_compile_decomposition_table()
 
-    def neuron_backend_wrapper(gm, example_inputs, *, options=None):
+    def neuron_backend_wrapper(gm, example_inputs, *, options=None, mode="default"):
+        # There are 4 torch.compile mode: “default”, “reduce-overhead”,
+        #   “max-autotune” or “max-autotune-no-cudagraphs”
+        # Currently, we only support mode "default".
+        if mode != "default":
+            logging.warning(
+                f"Neuron backend does not support mode='{mode}', falling back to default mode."
+            )
+            mode = "default"
+
         # Force dynamic=False for neuron backend
         if options is None:
             options = {}
@@ -281,4 +311,4 @@ def create_neuron_backend(decompose_all: bool = False):
 neuron_backend = create_neuron_backend()
 
 
-logger.debug("Neuron backend module loaded successfully")
+logger.debug("Neuron backend module successfully loaded")

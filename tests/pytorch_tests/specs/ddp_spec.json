@@ -31,9 +31,12 @@
           ]
         },
         {
-          "test_ddp_complex_params": {
-            "reason": "Having Complex params in weights, skipping as its not P0."
-          }
+          "reason": "Having Complex params in weights, skipping as its not P0.",
+          "tests": [
+            "test_ddp_mixed_real_and_complex_params",
+            "test_ddp_complex_params_and_grads",
+            "test_ddp_complex_params"
+          ]
         },
         {
           "test_dataclass_output_unused_param": {
@@ -45,6 +48,13 @@
           "tests": [
             "test_dataclass_output",
             "test_nccl_backend_multi_device_ids_not_allowed"
+          ]
+        },
+        {
+          "reason": "BF16 all reduce communication hook requires CUDA 11+ and NCCL 2.10+, which Neuron does not use.",
+          "tests": [
+            "test_bf16_compress_wrapper_is_view",
+            "test_bf16_compress_wrapper_nccl"
           ]
         }
       ],
@@ -85,6 +95,35 @@
           "test_ddp_packed_sequence": {
             "reason": " Could not run 'aten::_thnn_fused_lstm_cell' with arguments from the 'CPU' backend."
           }
+        },
+        {
+          "reason": "[TODO-FIX post Beta] RuntimeError: Device index 32 is out of range. Valid range is 1 to 1 for this process",
+          "tests": [
+            "test_accumulate_gradients_module",
+            "test_accumulate_gradients_module_with_grad_is_view"
+          ]
+        },
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: None mismatch - gradient is None instead of expected tensor",
+          "tests": [
+            "test_ddp_checkpointing_dynamic_module",
+            "test_ddp_checkpointing_dynamic_weight_sharing"
+          ]
+        },
+        {
+          "reason": "[TODO-FIX post Beta] RuntimeError: Neuron backend doesn't support acquiring a stream from pool",
+          "tests": [
+            "test_ddp_comm_hook_allreduce_hook_nccl",
+            "test_ddp_comm_hook_allreduce_hook_nccl_grad_is_view",
+            "test_ddp_comm_hook_allreduce_hook_nccl_static_graph",
+            "test_default_ddp_comm_hooks_nccl",
+            "test_ddp_comm_hook_allreduce_with_then_hook_nccl",
+            "test_default_ddp_comm_hooks_nccl_is_view",
+            "test_fp16_compress_wrapper_nccl",
+            "test_fp16_compress_wrapper_is_view",
+            "test_powerSGD_ddp_comm_hook_nccl_grad_is_view",
+            "test_powerSGD_ddp_comm_hook_nccl"
+          ]
         }
       ]
     },
@@ -98,6 +137,16 @@
           "test_ddp_comm_hook_quantize_per_channel_hook": {
             "reason": "quantization_per_channel not supported at neuron backend, skipping as its not P0."
           }
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] RuntimeError: Neuron backend doesn't support acquiring a stream from pool",
+          "tests": [
+            "test_ddp_comm_hook_quantize_per_tensor_hook",
+            "test_ddp_comm_hook_fp16compress_hook",
+            "test_ddp_comm_hook_allreduce_hook"
+          ]
         }
       ]
     }

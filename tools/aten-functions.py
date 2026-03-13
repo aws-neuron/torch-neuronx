@@ -318,34 +318,17 @@ CATEGORY_PATTERNS = {
 
 def get_implemented_ops():
     """Dynamically get the set of operations implemented in torch-neuronx"""
-    implemented = set()
-
     try:
-        import torch
-        import torch._C
-
         import torch_neuronx  # noqa: F401
+        from torch_neuronx.utils import get_neuron_registered_ops
 
-        # Get all registrations for PrivateUse1 (Neuron backend)
-        registrations = torch._C._dispatch_get_registrations_for_dispatch_key("PrivateUse1")
-
-        # Extract unique base operation names
-        for reg in registrations:
-            if "::" in reg:
-                namespace, op = reg.split("::", 1)
-                # Extract base operation name (before the dot)
-                base_op = op.split(".")[0]
-                implemented.add(base_op)
-
+        return get_neuron_registered_ops()
     except ImportError:
-        # If torch/torch_neuronx not available, return empty set
         print("Warning: Could not import torch_neuronx to get implemented ops", file=sys.stderr)
-        pass
+        return set()
     except Exception as e:
         print(f"Warning: Error getting implemented ops: {e}", file=sys.stderr)
-        pass
-
-    return implemented
+        return set()
 
 
 def extract_function_name(func_signature):

@@ -13,6 +13,7 @@ from tests.utils.neuron_test_utils import (
     track_neuron_ops,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.utils import use_mlir_aten_ops
 
 # Test cases for both scatter and gather operations
 SHAPE_TEST_CASES = [
@@ -176,6 +177,30 @@ class TestScatterGatherRegistration:
 
         _test_invalid_index()
 
+    def test_scatter_dtype_mismatch(self):
+        """Test scatter with integer value on float tensor."""
+        input_tensor = torch.zeros(1, 2, dtype=torch.float32, device="neuron")
+        index_tensor = torch.tensor([[0]], device="neuron")
+        result = input_tensor.scatter_(1, index_tensor, 1)
+        torch.testing.assert_close(result.cpu(), torch.tensor([[1.0, 0.0]]))
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_scatter_scalar_dtype_conversion(self, dtype):
+        """Test scatter with scalar value"""
+        input_tensor = torch.zeros(3, 5, dtype=dtype, device="neuron")
+        index = torch.tensor([[0, 1, 2, 0, 0]], dtype=torch.long, device="neuron")
+        scalar_value = 1.0
+
+        with track_neuron_ops():
+            result = torch.scatter(input_tensor, 0, index, scalar_value)
+            assert_op_runs_on_neuron("scatter.value")
+
+        input_cpu = torch.zeros(3, 5, dtype=dtype)
+        index_cpu = torch.tensor([[0, 1, 2, 0, 0]], dtype=torch.long)
+        expected = torch.scatter(input_cpu, 0, index_cpu, scalar_value)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
     def test_gather_out_variant(self):
         """Test torch.gather with out parameter."""
         # Create input tensor with some values on neuron
@@ -302,7 +327,16 @@ class TestGatherPriorityImpl:
             torch.gather(input_neuron, 0, index_neuron)
             assert_op_runs_on_neuron("aten::gather")
 
-        assert mock_compiler.call_count == initial_count + 1, "Compiler was not called as expected"
+        # index_neuron is not contiguous
+        # .contiguous and .gather trigger kernel
+        if use_mlir_aten_ops():
+            assert (
+                mock_compiler.call_count == initial_count + 2
+            ), "Compiler was not called as expected"
+        else:
+            assert (
+                mock_compiler.call_count == initial_count + 1
+            ), "Compiler was not called as expected"
 
     @patch("torch_neuronx.python_ops.gather.GatherNKIImpl.can_handle", return_value=False)
     def test_gather_xla_fallback(self, mocked_handle):

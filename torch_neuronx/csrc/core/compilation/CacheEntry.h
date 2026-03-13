@@ -22,6 +22,9 @@ struct CacheEntry {
   // Compiled NEFF binary data.
   std::vector<uint8_t> neff_bytes;
 
+  // Key for persistent cache (disk). XXH3_128 hash of cache_key + hlo_bytes.
+  std::string persistent_cache_key;
+
   // Timestamp when this entry was created.
   std::chrono::steady_clock::time_point created_time;
 
@@ -37,17 +40,39 @@ struct CacheEntry {
   CacheEntry() = default;
 
   /**
-   * @brief Constructs a cache entry with NEFF bytes and compilation time.
+   * @brief Constructs a cache entry with NEFF bytes, persistent key, and compilation time.
    * @param bytes Compiled NEFF binary data.
+   * @param persistent_key Key for persistent cache storage.
    * @param compilation_time_ms Time spent compiling (defaults to 0).
    */
-  CacheEntry(std::vector<uint8_t> bytes,
+  CacheEntry(std::vector<uint8_t> bytes, std::string persistent_key,
              std::chrono::milliseconds compilation_time_ms = std::chrono::milliseconds{0})
-      : neff_bytes(std::move(bytes)), compilation_time(compilation_time_ms) {
+      : neff_bytes(std::move(bytes)),
+        persistent_cache_key(std::move(persistent_key)),
+        compilation_time(compilation_time_ms) {
     const auto now = std::chrono::steady_clock::now();
     created_time = now;
     last_used_time = now;
   }
+
+  /**
+   * @brief Creates a failed cache entry that records a compilation failure.
+   * @param cache_key The cache key for this entry.
+   * @param error_msg The original compilation error message.
+   */
+  static std::shared_ptr<CacheEntry> Failed(std::string cache_key, std::string error_msg) {
+    auto entry = std::make_shared<CacheEntry>();
+    entry->persistent_cache_key = std::move(cache_key);
+    entry->is_failed_ = true;
+    entry->failure_message_ = std::move(error_msg);
+    const auto now = std::chrono::steady_clock::now();
+    entry->created_time = now;
+    entry->last_used_time = now;
+    return entry;
+  }
+
+  bool IsFailed() const { return is_failed_; }
+  const std::string& GetFailureMessage() const { return failure_message_; }
 
   // Disable copy and move operations since objects are managed via shared_ptr.
   CacheEntry(const CacheEntry&) = delete;
@@ -65,6 +90,13 @@ struct CacheEntry {
     last_used_time = std::chrono::steady_clock::now();
     access_count.fetch_add(1, std::memory_order_relaxed);
   }
+
+ private:
+  // Whether this entry represents a failed compilation attempt.
+  bool is_failed_ = false;
+
+  // Original error message from the failed compilation.
+  std::string failure_message_;
 };
 
 /**

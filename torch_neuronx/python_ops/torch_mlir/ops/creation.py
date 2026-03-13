@@ -8,20 +8,21 @@ from ..operation_registry import register_aten
 @register_aten(
     ["aten::arange", "aten::arange.start_out"], static_argnums=(0, 1, 2), static_argnames=("dtype",)
 )
-def torch_arange(start, end=None, step=1, dtype=None, **kwargs):
+def torch_arange(start, end=None, step=1, dtype=None, out=None, **kwargs):
     if end is None:
         return torch.arange(start, dtype=dtype, **kwargs)
     return torch.arange(start, end, step, dtype=dtype, **kwargs)
 
 
-# TODO there was a backward issue running this with gpt-oss
-@register_aten(["aten::zeros", "aten::zeros.out"], static_argnums=(0, 1))
-def torch_zeros(size, dtype=None, layout=None, device=None, pin_memory=False, **kwargs):
+@register_aten(
+    ["aten::zeros", "aten::zeros.out"], static_argnums=(0,), static_argnames=("dtype", "device")
+)
+def torch_zeros(size, dtype=None, layout=None, device=None, pin_memory=False, out=None, **kwargs):
     return torch.zeros(size, dtype=dtype, device=device)
 
 
 @register_aten(["aten::ones", "aten::ones.out"], static_argnums=(0,), static_argnames=("dtype",))
-def torch_ones(size, dtype=None, **kwargs):
+def torch_ones(size, dtype=None, out=None, **kwargs):
     return torch.ones(size, dtype=dtype, **kwargs)
 
 
@@ -30,8 +31,13 @@ def torch_ones_like(x, dtype=None, **kwargs):
     return torch.ones_like(x, dtype=dtype, **kwargs)
 
 
-@register_aten(["aten::eye", "aten::eye.m_out"], static_argnums=(0, 1))
-def torch_eye(n, m=None, dtype=None, **kwargs):
+@register_aten(["aten::eye", "aten::eye.out"], static_argnums=(0, 1))
+def torch_eye(n, dtype=None, out=None, **kwargs):
+    return torch.eye(n, dtype=dtype, **kwargs)
+
+
+@register_aten(["aten::eye.m", "aten::eye.m_out"], static_argnums=(0, 1))
+def torch_eye_m(n, m=None, dtype=None, out=None, **kwargs):
     return torch.eye(n, m, dtype=dtype, **kwargs)
 
 
@@ -54,12 +60,13 @@ def torch_full(size, value, out=None, dtype=None):
     """
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value, dtype=dtype)
+
     return torch.broadcast_to(value, size).to(dtype)
 
 
 @register_aten(["aten::zero_"])
-def torch_zero(x):
-    return torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+def torch_zero(x, out=None):
+    return torch.zeros_like(x)
 
 
 @register_aten(["aten::scalar_tensor"], static_argnames=("dtype",))

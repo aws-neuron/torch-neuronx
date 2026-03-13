@@ -8,13 +8,14 @@
 #include <stdexcept>
 #include <vector>
 
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+
 namespace at::neuron {
 
 // Forward declarations
 class CompilationCache;
 class ModelHandleCache;
 class OperationExecutionEngine;
-class StreamManager;
 
 // Enhanced semaphore implementation for resource management with priority support.
 //
@@ -143,13 +144,13 @@ class NeuronResourceManager {
   // Returns: Reference to the execution engine
   OperationExecutionEngine& GetOperationExecutionEngine();
 
-  // Get the stream manager for stream lifecycle management
-  // Returns: Reference to the stream manager
-  StreamManager& GetStreamManager();
-
   // Get the shared resource semaphore for general resource management
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
+
+  // Get the tensor pool for a specific device
+  // Returns: Reference to the device's tensor pool
+  c10_neuron::NrtTensorPool& GetTensorPool(int device);
 
  private:
   // Private constructor for singleton pattern
@@ -165,13 +166,11 @@ class NeuronResourceManager {
   // Helper function to get max resource slots from environment
   static int GetMaxResourceSlots();
 
-  // Thread synchronization
   mutable std::mutex mutex_;
 
-  // Shared resources
+  std::vector<std::unique_ptr<c10_neuron::NrtTensorPool>> tensor_pools_;
   std::unique_ptr<CompilationCache> compilation_cache_;
   std::unique_ptr<ModelHandleCache> model_handle_cache_;
-  std::unique_ptr<StreamManager> stream_manager_;
   std::unique_ptr<OperationExecutionEngine> operation_execution_engine_;
   std::unique_ptr<ResourceSemaphore> resource_semaphore_;
 };

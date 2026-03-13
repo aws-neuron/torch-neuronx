@@ -111,15 +111,13 @@ class TestSubRegistration:
         torch.testing.assert_close(a.cpu(), expected)
 
     def test_sub_mixed_devices(self):
-        """Test that mixing CPU and neuron tensors promotes cpu tensor to device."""
+        """Test that mixing CPU and neuron tensors raises error."""
         # One tensor on neuron, one on CPU
         a = torch.ones(16, 16, dtype=torch.float32).to("neuron") * 3
         b = torch.ones(16, 16, dtype=torch.float32)  # CPU
 
-        c = a - b
-        assert c.device.type == "neuron"
-        expected = torch.ones(16, 16, dtype=torch.float32) * 2
-        torch.testing.assert_close(c.cpu(), expected)
+        with pytest.raises(RuntimeError, match="is on cpu device, expected neuron"):
+            _ = a - b
 
     def test_sub_small_tensor(self):
         """Test that small tensors work with XLA implementation."""

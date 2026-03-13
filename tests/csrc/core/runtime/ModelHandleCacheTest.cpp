@@ -6,51 +6,29 @@
 
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/utils/TestUtils.h"
-#include "torch_neuronx/csrc/core/KernelExecution.h"
-#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
 using namespace torch_neuronx::testing;
 using ::testing::_;
-using ::testing::DoAll;
-using ::testing::Return;
-using ::testing::SetArgPointee;
 
 class ModelHandleCacheTest : public ::testing::Test {
  protected:
   void SetUp() override {
     mock_session_ = std::make_unique<MockNRTSession>();
     cache_ = std::make_unique<ModelHandleCache>();
-    c10_neuron::reset_distributed_state();
 
-    // Create test tensors
-    input_tensor_ = create_test_tensor({2, 3});
-    output_tensor_ = create_test_tensor({2, 3});
-    inputs_ = {input_tensor_};
-    outputs_ = {output_tensor_};
-    input_ptrs_ = get_tensor_data_ptrs(inputs_);
-    output_ptrs_ = get_tensor_data_ptrs(outputs_);
-
-    // Create test NEFF bytes
     neff_bytes_ = {0x4E, 0x45, 0x46, 0x46, 0x01, 0x02, 0x03, 0x04};
   }
 
   void TearDown() override {
     cache_.reset();
     mock_session_.reset();
-    c10_neuron::reset_distributed_state();
   }
 
   std::unique_ptr<MockNRTSession> mock_session_;
   std::unique_ptr<ModelHandleCache> cache_;
-  torch::Tensor input_tensor_;
-  torch::Tensor output_tensor_;
-  std::vector<torch::Tensor> inputs_;
-  std::vector<torch::Tensor> outputs_;
-  std::vector<void*> input_ptrs_;
-  std::vector<void*> output_ptrs_;
   std::vector<uint8_t> neff_bytes_;
 };
 
@@ -59,263 +37,127 @@ TEST_F(ModelHandleCacheTest, InitialState) {
   EXPECT_EQ(keys.size(), 0);
 }
 
-TEST_F(ModelHandleCacheTest, GetOrLoadModelFirstTime) {
-  nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
+TEST_F(ModelHandleCacheTest, GetModelMiss) {
+  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  auto model = cache_->GetModel(key);
+  EXPECT_EQ(model, nullptr);
+}
 
-  // Create a compilable kernel with cached NEFF
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  // Set cached NEFF
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes_.size(), 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model), Return(NRT_SUCCESS)));
-
+TEST_F(ModelHandleCacheTest, StoreAndGetModel) {
+  nrt::ModelHandle* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
 
-  auto model = cache_->GetOrLoadModel(kernel, 0, 1);
+  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::shared_ptr<nrt::ModelHandle> model(fake_model, nrt::ModelDeleter{});
 
-  EXPECT_TRUE(model);
-  EXPECT_TRUE(model->IsValid());
-  EXPECT_EQ(model->get(), fake_model);
+  auto stored = cache_->StoreModel(key, model, 0, false);
+  EXPECT_EQ(stored.get(), fake_model);
+
+  auto retrieved = cache_->GetModel(key);
+  EXPECT_EQ(retrieved.get(), fake_model);
 
   auto keys = cache_->GetAllCacheKeys();
   EXPECT_EQ(keys.size(), 1);
 }
 
-TEST_F(ModelHandleCacheTest, GetOrLoadModelCacheHit) {
-  nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  // First load
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes_.size(), 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model), Return(NRT_SUCCESS)));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
-
-  auto model1 = cache_->GetOrLoadModel(kernel, 0, 1);
-  EXPECT_TRUE(model1);
-
-  // Second load - should hit cache (no additional nrt_load call)
-  auto model2 = cache_->GetOrLoadModel(kernel, 0, 1);
-  EXPECT_TRUE(model2);
-  EXPECT_EQ(model1, model2);  // Should be the same shared_ptr
-
-  auto keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(keys.size(), 1);
-}
-
-TEST_F(ModelHandleCacheTest, GetOrLoadModelDifferentDevices) {
-  nrt_model_t* fake_model1 = reinterpret_cast<nrt_model_t*>(0xABCD);
-  nrt_model_t* fake_model2 = reinterpret_cast<nrt_model_t*>(0xDCBA);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  // Load on device 0
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes_.size(), 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model1), Return(NRT_SUCCESS)));
-
-  // Load on device 1
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes_.size(), 1, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model2), Return(NRT_SUCCESS)));
-
+TEST_F(ModelHandleCacheTest, StoreModelRaceReturnsExisting) {
+  nrt::ModelHandle* fake_model1 = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
+  nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  auto model1 = cache_->GetOrLoadModel(kernel, 0, 1);
-  auto model2 = cache_->GetOrLoadModel(kernel, 1, 1);
+  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::shared_ptr<nrt::ModelHandle> model1(fake_model1, nrt::ModelDeleter{});
+  std::shared_ptr<nrt::ModelHandle> model2(fake_model2, nrt::ModelDeleter{});
 
-  EXPECT_TRUE(model1);
-  EXPECT_TRUE(model2);
-  EXPECT_NE(model1, model2);  // Different devices = different models
+  auto stored1 = cache_->StoreModel(key, model1, 0, false);
+  EXPECT_EQ(stored1.get(), fake_model1);
+
+  // Second store with same key returns the first one
+  auto stored2 = cache_->StoreModel(key, model2, 0, false);
+  EXPECT_EQ(stored2.get(), fake_model1);
+
+  auto keys = cache_->GetAllCacheKeys();
+  EXPECT_EQ(keys.size(), 1);
+}
+
+TEST_F(ModelHandleCacheTest, DifferentDevicesAreDifferentKeys) {
+  nrt::ModelHandle* fake_model1 = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
+  nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
+
+  std::string key0 = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key1 = cache_->GenerateCacheKey(neff_bytes_, 1);
+  EXPECT_NE(key0, key1);
+
+  cache_->StoreModel(key0, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,
+                     false);
+  cache_->StoreModel(key1, std::shared_ptr<nrt::ModelHandle>(fake_model2, nrt::ModelDeleter{}), 1,
+                     false);
+
+  EXPECT_EQ(cache_->GetModel(key0).get(), fake_model1);
+  EXPECT_EQ(cache_->GetModel(key1).get(), fake_model2);
 
   auto keys = cache_->GetAllCacheKeys();
   EXPECT_EQ(keys.size(), 2);
 }
 
-TEST_F(ModelHandleCacheTest, GetOrLoadModelWithCollectives) {
-  nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
-
-  c10_neuron::set_rank(0);
-  c10_neuron::set_world_size(2);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      true, 0);  // has_collectives = true, device_id = 0
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load_collectives(_, neff_bytes_.size(), 0, 1, 0, 2, _))
-      .WillOnce(DoAll(SetArgPointee<6>(fake_model), Return(NRT_SUCCESS)));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
-
-  auto model = cache_->GetOrLoadModel(kernel, 0, 1);
-
-  EXPECT_TRUE(model);
-  EXPECT_TRUE(model->IsValid());
-}
-
-TEST_F(ModelHandleCacheTest, GetOrLoadModelLoadFailure) {
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _)).WillOnce(Return(NRT_FAILURE));
-  auto model = cache_->GetOrLoadModel(kernel, 0, 1);
-  EXPECT_FALSE(model->IsValid());
-}
-
 TEST_F(ModelHandleCacheTest, ClearCache) {
-  nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model), Return(NRT_SUCCESS)));
-
+  nrt::ModelHandle* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
 
-  auto model = cache_->GetOrLoadModel(kernel, 0, 1);
-  EXPECT_TRUE(model);
+  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  cache_->StoreModel(key, std::shared_ptr<nrt::ModelHandle>(fake_model, nrt::ModelDeleter{}), 0,
+                     false);
 
-  // Verify cache has entries by checking we can retrieve cached models
-  auto entries_before = cache_->GetCacheEntries();
-  EXPECT_FALSE(entries_before.empty());
+  EXPECT_FALSE(cache_->GetCacheEntries().empty());
 
   cache_->Clear();
 
-  // Verify cache is empty after clear
-  auto entries_after = cache_->GetCacheEntries();
-  EXPECT_TRUE(entries_after.empty());
+  EXPECT_TRUE(cache_->GetCacheEntries().empty());
 }
 
 TEST_F(ModelHandleCacheTest, GetCacheEntries) {
-  nrt_model_t* fake_model1 = reinterpret_cast<nrt_model_t*>(0xABCD);
-  nrt_model_t* fake_model2 = reinterpret_cast<nrt_model_t*>(0xDCBA);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model1), Return(NRT_SUCCESS)));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, 1, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model2), Return(NRT_SUCCESS)));
-
+  nrt::ModelHandle* fake_model1 = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
+  nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  cache_->GetOrLoadModel(kernel, 0, 1);
-  cache_->GetOrLoadModel(kernel, 1, 1);
+  std::string key0 = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key1 = cache_->GenerateCacheKey(neff_bytes_, 1);
+
+  cache_->StoreModel(key0, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,
+                     false);
+  cache_->StoreModel(key1, std::shared_ptr<nrt::ModelHandle>(fake_model2, nrt::ModelDeleter{}), 1,
+                     true);
 
   auto entries = cache_->GetCacheEntries();
   EXPECT_EQ(entries.size(), 2);
 
-  // Verify entry information
   for (const auto& entry : entries) {
     EXPECT_FALSE(entry.cache_key.empty());
-    EXPECT_FALSE(entry.has_collectives);
     EXPECT_TRUE(entry.device_index == 0 || entry.device_index == 1);
   }
 }
 
-TEST_F(ModelHandleCacheTest, GetAllCacheKeys) {
-  nrt_model_t* fake_model = reinterpret_cast<nrt_model_t*>(0xABCD);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("test_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
-
-  auto neff_data = new std::vector<uint8_t>(neff_bytes_);
-  NeffBytesPtr neff_ptr(neff_data, CacheEntryGuard{});
-  kernel.SetCachedNeff(std::move(neff_ptr));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model), Return(NRT_SUCCESS)));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
-
-  cache_->GetOrLoadModel(kernel, 0, 1);
-
-  auto keys = cache_->GetAllCacheKeys();
-  EXPECT_EQ(keys.size(), 1);
-  EXPECT_FALSE(keys.begin()->empty());
-}
-
 TEST_F(ModelHandleCacheTest, MultipleNeffBytes) {
-  nrt_model_t* fake_model1 = reinterpret_cast<nrt_model_t*>(0xABCD);
-  nrt_model_t* fake_model2 = reinterpret_cast<nrt_model_t*>(0xDCBA);
-
-  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-
-  // Create two kernels with different NEFF bytes (different sizes to distinguish in mock)
-  XLACompilableKernelExecution kernel1("test_op1", input_ptrs_, output_ptrs_, "cache_key1",
-                                       hlo_bytes, false, 0);
-  XLACompilableKernelExecution kernel2("test_op2", input_ptrs_, output_ptrs_, "cache_key2",
-                                       hlo_bytes, false, 0);
-
-  std::vector<uint8_t> neff_bytes1 = {0x4E, 0x45, 0x46, 0x46, 0x01};
-  std::vector<uint8_t> neff_bytes2 = {0x4E, 0x45, 0x46, 0x46, 0x02, 0x03};  // Different size
-
-  auto neff_data1 = new std::vector<uint8_t>(neff_bytes1);
-  NeffBytesPtr neff_ptr1(neff_data1, CacheEntryGuard{});
-  kernel1.SetCachedNeff(std::move(neff_ptr1));
-
-  auto neff_data2 = new std::vector<uint8_t>(neff_bytes2);
-  NeffBytesPtr neff_ptr2(neff_data2, CacheEntryGuard{});
-  kernel2.SetCachedNeff(std::move(neff_ptr2));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes1.size(), 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model1), Return(NRT_SUCCESS)));
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes2.size(), 0, 1, _))
-      .WillOnce(DoAll(SetArgPointee<4>(fake_model2), Return(NRT_SUCCESS)));
-
+  nrt::ModelHandle* fake_model1 = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
+  nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  auto model1 = cache_->GetOrLoadModel(kernel1, 0, 1);
-  auto model2 = cache_->GetOrLoadModel(kernel2, 0, 1);
+  std::vector<uint8_t> neff_bytes1 = {0x4E, 0x45, 0x46, 0x46, 0x01};
+  std::vector<uint8_t> neff_bytes2 = {0x4E, 0x45, 0x46, 0x46, 0x02, 0x03};
 
-  EXPECT_TRUE(model1);
-  EXPECT_TRUE(model2);
-  EXPECT_NE(model1, model2);  // Different NEFF = different models
+  std::string key1 = cache_->GenerateCacheKey(neff_bytes1, 0);
+  std::string key2 = cache_->GenerateCacheKey(neff_bytes2, 0);
+  EXPECT_NE(key1, key2);
 
-  // Verify we have multiple cache entries by checking GetCacheEntries
-  auto entries = cache_->GetCacheEntries();
-  EXPECT_EQ(entries.size(), 2);
+  cache_->StoreModel(key1, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,
+                     false);
+  cache_->StoreModel(key2, std::shared_ptr<nrt::ModelHandle>(fake_model2, nrt::ModelDeleter{}), 0,
+                     false);
+
+  EXPECT_EQ(cache_->GetModel(key1).get(), fake_model1);
+  EXPECT_EQ(cache_->GetModel(key2).get(), fake_model2);
+  EXPECT_EQ(cache_->GetCacheEntries().size(), 2);
 }
 
 int main(int argc, char** argv) {

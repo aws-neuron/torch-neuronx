@@ -18,13 +18,12 @@ from torch_neuronx.neuron_dynamo_backend.config import (
     get_transformed_fx_path,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
-from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
-    legalize_replica_groups,
-)
+from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
+    RandomInputInfo,
     TensorSpec,
     parse_module_io,
     shapes_match,
@@ -35,7 +34,14 @@ IR_DEBUG_PRINT = logger.getEffectiveLevel() <= logging.DEBUG
 
 
 def _is_tuple_return(module: Module) -> bool:
-    """Check if the module's entry function returns a tuple type."""
+    """Check if the module's entry function returns a tuple type.
+
+    Args:
+        module (Module): MLIR module to check.
+
+    Returns:
+        bool: True if the main function returns a tuple or multiple results.
+    """
     with module.context:
         for op in module.body.operations:
             if op.operation.name == "func.func":
@@ -55,13 +61,15 @@ def _is_tuple_return(module: Module) -> bool:
 def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
     """Set aliasing attributes on the MLIR module for input-output tensor aliasing.
 
-    This function attaches mhlo.input_output_alias attributes to the module operation,
+    Attaches mhlo.input_output_alias attributes to the module operation,
     informing the compiler which output tensors should alias input tensors.
 
     Args:
-        module: MLIR Module to modify
-        aliasing_info: Dictionary containing aliasing information with 'aliases' key
-                      Each alias specifies parameter_number, parameter_index, and output_index
+        module (Module): MLIR Module to modify.
+        aliasing_info (AliasingInfo): Aliasing relationships to apply.
+
+    Raises:
+        IndexError: If parameter_number or output_index is out of bounds.
     """
     if aliasing_info is None:
         return
@@ -142,34 +150,30 @@ def convert_fx_to_stablehlo(
     example_inputs,
     aliasing_info: AliasingInfo = None,
     preserve_artifacts: bool = False,
+    random_input_info: RandomInputInfo | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
     """
     Convert FX GraphModule to StableHLO using torch-mlir with collective support
 
+    Pipeline:
     1. Apply FX graph-level collective transformations
-    2. Import FX to RAW Torch dialect (no backend pipeline to avoid ReduceOpVariants)
+    2. Import FX to RAW Torch dialect
     3. Apply custom Neuron transformations/lowerings
-    4. Lower to torch backend IR
-    5. Lower to stablehlo IR
+    4. Lower to Torch backend IR
+    5. Lower to StableHLO IR
 
     Args:
         gm: FX GraphModule with Aten operations (from AOTAutograd)
         example_inputs: Example input tensors
         preserve_artifacts: Save artifacts
+        random_input_info: Optional metadata about random inputs added to the graph
 
     Returns:
-        str: StableHLO MLIR string
-        io_spec: Input/output specifications for Executor.
-        cast_spec: Output specifications for dtype preservation.
-
-    Raises:
-        Exception: If StableHLO conversion fails
+        tuple: (stablehlo_module, io_spec, cast_spec)
+            - stablehlo_module (Module): StableHLO MLIR module.
+            - io_spec (FunctionIO): Input/output specifications for Executor.
+            - cast_spec (list[TensorSpec]): Output specifications for dtype preservation.
     """
-    # FX graph-level passes
-    with dynamo_timed("torch_neuronx_fx_passes"):
-        logger.debug("FX transformation (replica_groups legalization)")
-        gm = legalize_replica_groups(gm)
-
     # Save transformed fx graph for debugging
     if preserve_artifacts:
         transformed_fx_path = get_transformed_fx_path()
@@ -183,7 +187,7 @@ def convert_fx_to_stablehlo(
         raw_module = fx.stateless_fx_import(
             gm,
             output_type=OutputType.RAW,  # RAW = no backend pipeline
-            hooks=CustomFxImporterHooks(),  # Custom literal handling
+            fx_importer=NeuronFxImporter(hooks=CustomFxImporterHooks()),
             verbose=IR_DEBUG_PRINT,
             enable_ir_printing=IR_DEBUG_PRINT,
         )
@@ -232,7 +236,13 @@ def convert_fx_to_stablehlo(
         raw_module = dtype_conversion_pass(raw_module)
 
     # Spec for executor.
-    io_spec = parse_module_io(raw_module)
+    io_spec = parse_module_io(raw_module, random_input_info=random_input_info)
+    # Module should have at least one output
+    if len(io_spec.outputs) == 0:
+        raise ValueError(
+            "No outputs found in the module, expected at least one output, "
+            "modify your code to have at least one output."
+        )
     logger.debug("FX Graph -> StableHLO conversion successful")
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
@@ -240,15 +250,14 @@ def convert_fx_to_stablehlo(
 
 
 def save_mlir_bytecode(mlir: mlir_ir.Module, output_path: Path) -> Path:
-    """
-    Save MLIR bytecode to file
+    """Save MLIR bytecode to file.
 
     Args:
-        stablemlirhlo_mlir: MLIR Module
-        output_path: Path to save the file
+        mlir (mlir_ir.Module): MLIR module to save.
+        output_path (Path): Path to save the file.
 
     Returns:
-        Path: Path to the saved file
+        Path: Path to the saved file.
     """
     logger.debug(f"Saving MLIR to {output_path}")
     with open(output_path, "wb") as f:

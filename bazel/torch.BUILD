@@ -40,6 +40,21 @@ cc_import(
 )
 
 cc_import(
+    name = "libshm",
+    shared_library = "lib/libshm.so",
+)
+
+cc_import(
     name = "libc10",
     shared_library = "lib/libc10.so",
+)
+
+# Kineto headers (for profiler integration with PyTorch's kineto backend)
+cc_library(
+    name = "kineto_headers",
+    hdrs = glob([
+        "include/kineto/**/*.h",
+    ]),
+    strip_include_prefix = "include/kineto",
+    visibility = ["//visibility:public"],
 )

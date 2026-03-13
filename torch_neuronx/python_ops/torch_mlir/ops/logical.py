@@ -119,15 +119,15 @@ def torch_bitwise_left_shift(x, y, out=None):
         "aten::bitwise_right_shift.Scalar_Tensor_out",
     ],
 )
-def torch_bitwise_right_shift(x, y):
+def torch_bitwise_right_shift(x, y, out=None):
     return run_bitwise_shift_op("bitwise_right_shift", x, y)
 
 
 @register_aten(["aten::signbit", "aten::signbit.out"])
-def torch_signbit(x):
+def torch_signbit(x, out=None):
     return torch.signbit(x)
 
 
 @register_aten(["aten::sgn", "aten::sgn.out"])
-def torch_sgn(x):
+def torch_sgn(x, out=None):
     return torch.sgn(x)

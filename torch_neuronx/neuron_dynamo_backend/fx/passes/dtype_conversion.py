@@ -21,8 +21,16 @@ class DTypeConstantConverter:
     """
 
     def _need_op_conversion(self, op):
-        """
-        Check if any operation (non-constant) needs f64->f32 conversion
+        """Check if an operation needs f64 to f32 conversion.
+
+        Examines the operation's result types to determine if any
+        contain f64 element types that need conversion.
+
+        Args:
+            op: MLIR operation to check.
+
+        Returns:
+            bool: True if any result has f64 element type.
         """
         # Check if any result needs conversion
         for result in op.results:
@@ -34,8 +42,17 @@ class DTypeConstantConverter:
         return False
 
     def _get_new_type(self, op, result_type):
-        """
-        Get converted dtype
+        """Get the converted type for f64 to f32 conversion.
+
+        Args:
+            op: MLIR operation (used for location).
+            result_type: Original MLIR type with f64 element type.
+
+        Returns:
+            Type: New MLIR type with f32 element type.
+
+        Raises:
+            TypeError: If element type is not f64.
         """
         elem_type = str(result_type.element_type)
         if elem_type == "f64":
@@ -50,8 +67,19 @@ class DTypeConstantConverter:
         return new_type
 
     def _convert_constant_op(self, op):
-        """
-        Convert a single constant operation from f64->f32
+        """Convert a constant operation from f64 to f32.
+
+        Creates a new DenseElementsAttr with f32 dtype from the original
+        f64 constant value.
+
+        Args:
+            op: StableHLO constant operation with f64 type.
+
+        Returns:
+            DenseElementsAttr: New attribute with f32 values.
+
+        Raises:
+            TypeError: If the constant is not f64 type.
         """
         # Get the value attribute
         value_attr = op.attributes["value"]
@@ -71,8 +99,18 @@ class DTypeConstantConverter:
         return new_value_attr
 
     def convert_dense_attr(self, old_attr, new_type, target_dtype):
-        """
-        Convert DenseElementsAttr to target dtype
+        """Convert a DenseElementsAttr to a target numpy dtype.
+
+        Extracts values from the attribute, converts to target dtype,
+        and creates a new attribute with the converted values.
+
+        Args:
+            old_attr: Original DenseElementsAttr.
+            new_type: Target MLIR type for the new attribute.
+            target_dtype: Target numpy dtype (e.g., np.float32).
+
+        Returns:
+            DenseElementsAttr: New attribute with converted values.
         """
         # Extract numpy array from DenseElementsAttr
         np_array = np.array(old_attr)
@@ -87,16 +125,27 @@ class DTypeConstantConverter:
         return new_attr
 
     def _convert_op_types(self, op):
-        """
-        Convert operation result types from f64->f32
+        """Convert operation result types from f64 to f32 in place.
+
+        Modifies the operation's result types directly without
+        creating new operations.
+
+        Args:
+            op: MLIR operation to modify.
         """
         for result in op.results:
             new_type = self._get_new_type(op, result.type)
             result.set_type(new_type)
 
     def _replace_constant(self, old_op, new_value):
-        """
-        Replace old constant with new f32 constant
+        """Replace an f64 constant operation with an f32 constant.
+
+        Creates a new constant operation with the converted value,
+        replaces all uses of the old operation, and erases the old operation.
+
+        Args:
+            old_op: Original constant operation to replace.
+            new_value: New DenseElementsAttr with f32 values.
         """
         # Create new constant operation before the old one
         with InsertionPoint(old_op):
@@ -165,7 +214,14 @@ class DTypeConstantConverter:
         return module
 
     def _needs_func_conversion(self, func_op):
-        """Check if function signature has f64 types"""
+        """Check if a function signature contains f64 types.
+
+        Args:
+            func_op: MLIR function operation.
+
+        Returns:
+            bool: True if function type string contains 'f64'.
+        """
         func_type = func_op.attributes["function_type"]
         type_str = str(func_type)
 
@@ -173,7 +229,14 @@ class DTypeConstantConverter:
         return bool(re.search(r"(f64)", type_str))
 
     def _convert_func_signature(self, func_op):
-        """Convert f64 to f32 in function signature"""
+        """Convert f64 to f32 in a function's signature.
+
+        Updates the function_type attribute and block argument types
+        to use f32 instead of f64.
+
+        Args:
+            func_op: MLIR function operation to modify.
+        """
         old_func_type = func_op.attributes["function_type"]
         type_str = str(old_func_type)
 
@@ -186,7 +249,14 @@ class DTypeConstantConverter:
         self._convert_block_args(func_op)
 
     def _convert_block_args(self, func_op):
-        """Convert f64 block arguments to f32/i32"""
+        """Convert f64 block arguments to f32.
+
+        Iterates through all blocks in the function and converts
+        any f64-typed arguments to f32.
+
+        Args:
+            func_op: MLIR function operation containing blocks.
+        """
         for region in func_op.regions:
             for block in region:
                 for i, arg in enumerate(block.arguments):

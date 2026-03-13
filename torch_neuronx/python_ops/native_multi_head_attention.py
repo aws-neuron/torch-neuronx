@@ -97,7 +97,7 @@ def native_multi_head_attention_neuron(
             warnings.simplefilter("once")
             warnings.warn(
                 f"Sequence length {seq_len} is not a multiple of 512. "
-                "Falling back to XLA implementation instead of flash "
+                "Falling back to XLA/MLIR implementation instead of flash "
                 "attention for better compatibility.",
                 UserWarning,
                 stacklevel=2,

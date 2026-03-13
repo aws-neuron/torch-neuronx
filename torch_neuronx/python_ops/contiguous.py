@@ -1,18 +1,9 @@
 import torch
 
 import torch_neuronx._C as _C
-from torch_neuronx.python_ops.contiguous_broadcast import (
-    ContiguousBroadcastJAXImpl,
-    ContiguousBroadcastMLIRImpl,
-)
-from torch_neuronx.python_ops.contiguous_slice import (
-    ContiguousSliceJAXImpl,
-    ContiguousSliceMLIRImpl,
-)
-from torch_neuronx.python_ops.contiguous_transpose import (
-    ContiguousTransposeJAXImpl,
-    ContiguousTransposeMLIRImpl,
-)
+from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastMLIRImpl
+from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceMLIRImpl
+from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
 
 from .auto_registration import neuron_op
 from .base import ExecutionResult, OperationImplementation
@@ -108,11 +99,8 @@ class ContiguousNKIImpl(OperationImplementation):
 def contiguous_internal(self_tensor, memory_format=None):
     """Internal contiguous implementation that can be called from C++ without dispatcher"""
     implementations = [
-        ContiguousTransposeJAXImpl(),
         ContiguousTransposeMLIRImpl(),
-        ContiguousBroadcastJAXImpl(),
         ContiguousBroadcastMLIRImpl(),
-        ContiguousSliceJAXImpl(),
         ContiguousSliceMLIRImpl(),
         ContiguousNKIImpl(),
     ]

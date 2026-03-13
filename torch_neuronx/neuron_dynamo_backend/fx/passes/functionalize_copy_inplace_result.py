@@ -49,10 +49,7 @@ class FunctionalizeCopyInplacePass(PassBase):
     """
     Pass that detects and records input-output mutation relationships.
 
-    Handles three mutation patterns:
-    1. copy_ pattern: Removes copy_ ops, prepends mutation value to outputs
-    2. clone→scatter pattern: Output is a mutated copy of an input
-    3. Direct scatter on input: Output traces through scatter back to input
+    Handles copy_ pattern: Removes copy_ ops, prepends mutation value to outputs
 
     Records mutation info mapping outputs to their source inputs,
     enabling compiler buffer optimizations (e.g., buffer reuse).
@@ -75,15 +72,8 @@ class FunctionalizeCopyInplacePass(PassBase):
         if output_node is None:
             return PassResult(gm, modified=False)
 
-        outputs = self._normalize_outputs(output_node)
-
-        # Strategy 1: Handle explicit copy_ operations (graph modification)
+        # Handle explicit copy_ operations (graph modification)
         modified = self._handle_copy_inplace(graph, placeholders, output_node)
-
-        # Strategy 2: Detect mutation lineage in existing outputs
-        # (handles clone→scatter and direct scatter patterns without graph changes)
-        if not modified:
-            self._detect_mutation_lineage(graph, placeholders, outputs)
 
         if modified:
             graph.lint()
@@ -92,11 +82,25 @@ class FunctionalizeCopyInplacePass(PassBase):
         return PassResult(gm, modified=modified)
 
     def _get_output_node(self, graph: torch.fx.Graph) -> Node | None:
-        """Find the output node in the graph."""
+        """Find the output node in the graph.
+
+        Args:
+            graph (torch.fx.Graph): FX graph to search.
+
+        Returns:
+            Node | None: The output node, or None if not found.
+        """
         return next((node for node in graph.nodes if node.op == "output"), None)
 
     def _normalize_outputs(self, output_node: Node) -> list[Node]:
-        """Convert output node args to a list of output nodes."""
+        """Convert output node arguments to a normalized list.
+
+        Args:
+            output_node (Node): The graph's output node.
+
+        Returns:
+            list[Node]: List of output nodes.
+        """
         outputs = output_node.args[0]
         if outputs is None:
             return []
@@ -105,7 +109,14 @@ class FunctionalizeCopyInplacePass(PassBase):
         return list(outputs)
 
     def _is_copy_inplace(self, node: Node) -> bool:
-        """Check if node is a copy_ (in-place copy) operation."""
+        """Check if a node is a copy_ (in-place copy) operation.
+
+        Args:
+            node (Node): FX node to check.
+
+        Returns:
+            bool: True if node is aten.copy_ or similar in-place copy.
+        """
         if node.op != "call_function":
             return False
         target = node.target
@@ -206,19 +217,18 @@ class FunctionalizeCopyInplacePass(PassBase):
         return len(self.mutation_info) > 0
 
     def _trace_to_input(self, node: Node, placeholders: list[Node]) -> tuple[int, bool] | None:
-        """
-        Trace a node backward to find its source input placeholder.
+        """Trace a node backward to find its source input placeholder.
 
-        Follows the first argument of traceable operations (views, clones,
-        mutations) until reaching a placeholder or an untraceable node.
+        Follows traceable operations (views, clones, mutations) until
+        reaching a placeholder or an untraceable node.
 
         Args:
-            node: Starting node to trace from.
-            placeholders: List of input placeholder nodes.
+            node (Node): Starting node to trace from.
+            placeholders (list[Node]): List of input placeholder nodes.
 
         Returns:
-            Tuple of (placeholder_index, went_through_mutation_op) if trace
-            reaches a placeholder, None otherwise.
+            tuple[int, bool] | None: Tuple of (placeholder_index, went_through_mutation)
+                if trace reaches a placeholder, None otherwise.
         """
         visited: set[Node] = set()
         current = node

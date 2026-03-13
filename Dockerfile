@@ -92,7 +92,7 @@ ENV BAZELISK_BASE_URL=https://github.com/bazelbuild/bazel/releases/download
 RUN python -m pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com
 
 # Install compiler (will use PyPI for dependencies and Neuron repo for neuronx-cc)
-RUN python -m pip install neuronx-cc==2.20.*
+RUN python -m pip install neuronx-cc==2.23.*
 
 # Install additional dependencies for PyTorch CPU build and C++ tests
 RUN apt-get update -y && \
@@ -160,7 +160,6 @@ RUN chmod +x ./tools/*
 # Build torch-neuronx with Bazel and install
 RUN ./tools/build
 RUN USE_BAZEL=1 python -m pip install --no-build-isolation -e .
-
 # Create and set working directory
 RUN mkdir -p /workspace
 WORKDIR /workspace

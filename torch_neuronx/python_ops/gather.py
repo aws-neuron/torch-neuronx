@@ -29,18 +29,18 @@ class GatherNKIImpl(OperationImplementation):
     def _execute_impl(self, input, dim, index, sparse_grad=False) -> ExecutionResult:
         """Execute NKI gather"""
         try:
-            from torch_neuronx.kernels.type_converter import TypeConverter
             from torch_neuronx.python_ops.cast_policy import (
                 copy_cpu_to_neuron,
                 copy_neuron_to_cpu,
                 is_64bit,
             )
+            from torch_neuronx.utils import convert_for_neuron
 
             from .nki_kernels.gather import gather_kernel
 
             original_input_dtype = input.dtype
 
-            index = TypeConverter.convert_for_neuron(index)
+            index = convert_for_neuron(index)
             index_1d = index[:, 0]
             result = gather_kernel(input, dim, index_1d)
             # Cast back to 64-bit if needed
@@ -62,10 +62,7 @@ class GatherOp(Operation):
 
     def _setup_implementations(self):
         self._implementations.append(GatherNKIImpl())
-        from .xla_ops.gather_xla import GatherXLAImpl
-
         self._implementations.append(GatherMLIRImpl())
-        self._implementations.append(GatherXLAImpl())
 
     @property
     def op_name(self) -> str:
@@ -76,10 +73,7 @@ class GatherOutOp(Operation):
     """Gather operation with out parameter (gather.out)"""
 
     def _setup_implementations(self):
-        from .xla_ops.gather_xla import GatherOutXLAImpl
-
         self._implementations.append(GatherOutMLIRImpl())
-        self._implementations.append(GatherOutXLAImpl())
 
     @property
     def op_name(self) -> str:

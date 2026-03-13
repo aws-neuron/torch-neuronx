@@ -41,9 +41,7 @@ class ErrorHandlerTest : public ::testing::Test {
     EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
     EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-    auto mock_op =
-        std::make_unique<OperationContext>(std::move(mock_kernel), std::vector<TensorContext>{},
-                                           std::vector<TensorContext>{}, "test_stack_trace");
+    auto mock_op = std::make_unique<OperationContext>(std::move(mock_kernel), "test_stack_trace");
     mock_op->submit_time = std::chrono::steady_clock::now();
     mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
     return mock_op;
@@ -190,7 +188,7 @@ TEST_F(ErrorHandlerTest, CreateErrorContextWithMockOperation) {
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(true));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-  OperationContext op(std::move(mock_kernel), {}, {}, "test_stack_trace");
+  OperationContext op(std::move(mock_kernel), "test_stack_trace");
   op.submit_time = std::chrono::steady_clock::now();
   op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
@@ -228,7 +226,7 @@ TEST_F(ErrorHandlerTest, HandleExecutionErrorWithStatusCode) {
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-  OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
   mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
@@ -263,7 +261,7 @@ TEST_F(ErrorHandlerTest, HandleExecutionErrorWithDifferentStatusCodes) {
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-  OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
   mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
@@ -370,7 +368,7 @@ TEST_F(ErrorHandlerTest, HandleOperationError) {
   EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
   EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
-  OperationContext mock_op(std::move(mock_kernel), {}, {}, "test_stack_trace");
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
   mock_op.submit_time = std::chrono::steady_clock::now();
   mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
 
@@ -738,6 +736,51 @@ TEST_F(ErrorHandlerTest, RecordFirstExceptionAfterClearing) {
   } catch (const std::runtime_error& e) {
     EXPECT_STREQ(e.what(), "Second exception");
   }
+}
+
+// ExecutionRuntimeException tests
+
+TEST_F(ErrorHandlerTest, ExecutionRuntimeExceptionMessageOnly) {
+  torch_neuronx::ExecutionRuntimeException e("Test error message");
+
+  EXPECT_STREQ(e.what(), "Test error message");
+  EXPECT_FALSE(e.HasNRTStatus());
+  EXPECT_FALSE(e.HasSeqId());
+}
+
+TEST_F(ErrorHandlerTest, ExecutionRuntimeExceptionWithNRTStatus) {
+  torch_neuronx::ExecutionRuntimeException e("Test error", static_cast<NRT_STATUS>(5));
+
+  EXPECT_STREQ(e.what(), "Test error");
+  EXPECT_TRUE(e.HasNRTStatus());
+  EXPECT_FALSE(e.HasSeqId());
+  EXPECT_EQ(e.GetNRTStatus(), 5);
+}
+
+TEST_F(ErrorHandlerTest, ExecutionRuntimeExceptionWithSeqId) {
+  // Constructor for async execution errors (seq_id, NRT_STATUS)
+  torch_neuronx::ExecutionRuntimeException e(12345, static_cast<NRT_STATUS>(6));
+
+  EXPECT_STREQ(e.what(), "Async execution error");
+  EXPECT_TRUE(e.HasNRTStatus());
+  EXPECT_TRUE(e.HasSeqId());
+  EXPECT_EQ(e.GetSeqId(), 12345);
+  EXPECT_EQ(e.GetNRTStatus(), 6);
+}
+
+TEST_F(ErrorHandlerTest, HandleOperationErrorWithSeqId) {
+  // Test that HandleOperationError correctly handles exceptions with seq_id
+  auto mock_op = create_mock_operation();
+
+  // Create async execution error with seq_id
+  torch_neuronx::ExecutionRuntimeException async_error(42, static_cast<NRT_STATUS>(1005));
+
+  auto result = error_handler_->HandleOperationError(mock_op.get(), async_error);
+
+  EXPECT_FALSE(result.IsSuccess());
+  // Error message should contain seq_id info
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("seq_id=42"));
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("Neuron core busy"));
 }
 
 int main(int argc, char** argv) {

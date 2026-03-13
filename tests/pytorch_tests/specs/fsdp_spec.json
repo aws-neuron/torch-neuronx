@@ -9,14 +9,6 @@
         "test_transformer_offload_false_none_neuron",
         "test_delayed_optim_step_offload_false_no_shard_neuron",
         "test_mixture_of_experts_offload_true_shard_grad_op_neuron"
-      ],
-      "xfail": [
-        {
-          "reason": "Expects to use Tensor views but using parameter views",
-          "tests": [
-            "test_unshard_params_as_tensors_neuron"
-          ]
-        }
       ]
     },
     {
@@ -49,12 +41,6 @@
           "tests": [
             "test_ddp_parity_neuron"
           ]
-        },
-        {
-          "reason": "AssertionError: UserWarning not triggered",
-          "tests": [
-            "test_no_gradients_neuron"
-          ]
         }
       ]
     },
@@ -63,21 +49,6 @@
       "sanity_methods": [
         "test_communication_hook_with_fsdp",
         "test_default_communication_hook"
-      ],
-      "xfail": [
-        {
-          "reason": "AssertionError: Num all gathers mismatch",
-          "tests": [
-            "test_communication_nested_model_True_use_no_sync_True_sharding_strategy1_neuron",
-            "test_communication_nested_model_True_use_no_sync_True_sharding_strategy0_neuron",
-            "test_communication_nested_model_True_use_no_sync_False_sharding_strategy1_neuron",
-            "test_communication_nested_model_True_use_no_sync_False_sharding_strategy0_neuron",
-            "test_communication_nested_model_False_use_no_sync_True_sharding_strategy0_neuron",
-            "test_communication_nested_model_False_use_no_sync_True_sharding_strategy1_neuron",
-            "test_communication_nested_model_False_use_no_sync_False_sharding_strategy1_neuron",
-            "test_communication_nested_model_False_use_no_sync_False_sharding_strategy0_neuron"
-          ]
-        }
       ]
     },
     {
@@ -86,14 +57,6 @@
         "test_default_communication_hook_behavior_sharding_strategy0",
         "test_default_communication_hook_initialization_has_wrapping_False_sharding_strategy0",
         "test_fp16_hook_has_wrapping_False_sharding_strategy0"
-      ],
-      "xfail": [
-        {
-          "reason": "AssertionError: AssertionError not raised",
-          "tests": [
-            "test_registering_hook_hybrid_strategy"
-          ]
-        }
       ]
     },
     {
@@ -102,14 +65,6 @@
         "test_flat_param_shard_metadata_aligned_full_precision",
         "test_flatten_nothing",
         "test_numel_without_shared_params"
-      ],
-      "xfail": [
-        {
-          "reason": "AssertionError: The values for attribute 'dtype' do not match: torch.float16 != torch.float32",
-          "tests": [
-            "test_pnorm_after_step_with_shared_params"
-          ]
-        }
       ]
     },
     {
@@ -120,20 +75,7 @@
       ]
     },
     {
-      "file": "distributed/fsdp/test_fsdp_grad_acc.py",
-      "xfail": [
-        {
-          "reason": "Operation index failed to execute on Neuron",
-          "tests": [
-            "test_grad_acc_cpu_offload_use_orig_params_True",
-            "test_grad_acc_cpu_offload_use_orig_params_False",
-            "test_grad_acc_configs0_use_orig_params_False",
-            "test_grad_acc_configs0_use_orig_params_True",
-            "test_grad_acc_configs1_use_orig_params_False",
-            "test_grad_acc_configs1_use_orig_params_True"
-          ]
-        }
-      ]
+      "file": "distributed/fsdp/test_fsdp_grad_acc.py"
     },
     {
       "file": "distributed/fsdp/test_fsdp_sharded_grad_scaler.py",
@@ -141,21 +83,6 @@
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_none_none",
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_none_none",
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_mixed_precision_use_orig_params"
-      ],
-      "xfail": [
-        {
-          "reason": "SegFault - c10::make_storage_imp",
-          "tests": [
-            "test_sharded_grad_scaler_found_inf"
-          ]
-        },
-        {
-          "reason": "AssertionError: FSDP assumes module.0.weight is in the state_dict but the state_dict only has odict_keys",
-          "tests": [
-            "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_none_use_orig_params",
-            "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_none_use_orig_params"
-          ]
-        }
       ]
     },
     {
@@ -163,15 +90,6 @@
       "sanity_methods": [
         "test_fsdp_save_load_state_dict",
         "test_fsdp_checkpoint_integration"
-      ],
-      "xfail": [
-        {
-          "reason": "Can't pickle local object 'NeuronPatcher.patch_device_class.<locals>.PatchDevice'",
-          "tests": [
-            "test_distributed_checkpoint_state_dict_type0_neuron",
-            "test_distributed_checkpoint_state_dict_type1_neuron"
-          ]
-        }
       ]
     },
     {
@@ -180,7 +98,8 @@
         "test_full_precision_in_eval_buffers",
         "test_eval_root_cast_inputs",
         "test_mixed_precision_e2e_full_shard_mp_fp16_offload_false_fp32_none",
-        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_false_fp64_none"
+        "test_mixed_precision_e2e_full_shard_mp_no_mp_offload_false_fp64_none",
+        "test_mixed_precision_e2e_full_shard_mp_only_reduce_offload_true_fp32_enable_sharded_grad_scaler"
       ],
       "skip_tests": [
         {
@@ -217,33 +136,9 @@
       ],
       "xfail": [
         {
-          "reason": "RuntimeError: Cannot writeback when the gradient shape changes, Expects torch.Size([128]) but got torch.Size([16, 8])",
-          "tests": [
-            "test_compatible_with_trec"
-          ]
-        },
-        {
           "reason": "SegFault c10 storage",
           "tests": [
-            "test_no_grad",
-            "test_interface_arguments",
-            "test_optim_state_without_param_groups",
-            "test_state_dict_with_none_tensor_state",
-            "test_with_no_shard"
-          ]
-        },
-        {
-          "reason": "RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx",
-          "tests": [
-            "test_flatten_sharded_optim_state_dict_transformer",
-            "test_scatter_full_optim_state_dict_transformer",
-            "test_shard_full_optim_state_dict_transformer"
-          ]
-        },
-        {
-          "reason": "AssertionError: RuntimeError not raised",
-          "tests": [
-            "test_full_optim_state_dict_nested_invalid"
+            "test_interface_arguments"
           ]
         }
       ]

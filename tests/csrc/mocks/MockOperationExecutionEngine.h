@@ -17,17 +17,15 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
                                ModelHandleCache* model_handle_cache)
       : OperationExecutionEngine(compilation_cache, model_handle_cache) {}
 
+  using OperationExecutionEngine::execution_queue_depth_;
+  using OperationExecutionEngine::pending_async_ops_count_;
+  using OperationExecutionEngine::ProcessCompletions;
+
  protected:
-  // Override ProcessExecutionTask to skip device checks and NRT execution
-  // Just immediately complete the operation successfully
   void ProcessExecutionTask(OperationContext* operation) noexcept override {
     auto* stream = operation->stream;
-
-    // Set execution timing
     operation->StartExecution();
     operation->execute_end = std::chrono::steady_clock::now();
-
-    // Complete the operation on the stream
     stream->CompleteOperation(operation);
   }
 };

@@ -20,7 +20,7 @@ class XLABuilderOpImpl(CompilableOpImpl):
     CompilableOpImpl interface.
     This class provides functionality to execute XLA operations with
     automatic dtype casting, empty tensor handling, and output parameter management.
-    Note: empty tensor handling is not implemeted yet, and would be added
+    Note: empty tensor handling is not implemented yet, and would be added
     in subsequent revisions
 
     Args:

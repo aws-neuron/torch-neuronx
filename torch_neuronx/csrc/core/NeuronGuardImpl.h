@@ -66,8 +66,13 @@ struct NeuronGuardImpl final : public c10::impl::DeviceGuardImplInterface {
   }
 
   c10::Stream getStreamFromGlobalPool(c10::Device d, bool isHighPriority = false) const override {
-    (void)isHighPriority;  // Suppress unused variable warning
-    TORCH_CHECK(false, "Neuron backend doesn't support acquiring a stream from pool.");
+    TORCH_INTERNAL_ASSERT(d.type() == c10::DeviceType::PrivateUse1);
+
+    // Neuron doesn't have a stream pool like CUDA, so we create a new stream.
+
+    // This is called by Future::invokeCallback when .then() is used on a device-aware Future.
+    int priority = isHighPriority ? -1 : 0;
+    return at::neuron::NeuronStream::createStream(d.index(), priority).unwrap();
   }
 
   bool queryStream(const c10::Stream& stream) const override {

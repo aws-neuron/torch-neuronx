@@ -52,6 +52,12 @@ void markExecutedLogged(const std::string& op_name) {
   ExecutedOpTracker::getInstance().mark_as_tracked(op_name);
 }
 
+void logOperationExecuted(const std::string& op_name) {
+  if (shouldLogExecuted(op_name)) {
+    markExecutedLogged(op_name);
+  }
+}
+
 std::unordered_set<std::string> getFallbackOps() {
   return FallbackOpTracker::getInstance().get_tracked_ops();
 }

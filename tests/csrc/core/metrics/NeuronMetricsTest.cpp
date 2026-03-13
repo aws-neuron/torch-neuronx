@@ -19,6 +19,11 @@ class NeuronMetricsTest : public ::testing::Test {
     // Clear all metrics and counters before each test
     NeuronMetricsArena::Get()->ClearCounters();
     NeuronMetricsArena::Get()->ClearMetrics();
+
+    // Reset device memory stats for device 0 (used in tests)
+    auto& registry = DeviceMemoryStatsRegistry::Instance();
+    auto& stats = registry.GetDeviceStats(0);
+    stats.reset_all();  // Reset to default state
   }
 
   void TearDown() override {
@@ -430,6 +435,227 @@ TEST_F(NeuronMetricsTest, NegativeMetricValues) {
   metric.AddSample(-5.0);
 
   EXPECT_DOUBLE_EQ(metric.Accumulator(), 15.0);
+}
+
+// ============================================================================
+// MemoryStatistics Tests
+// ============================================================================
+
+TEST_F(NeuronMetricsTest, MemoryStatIncreaseUpdatesCurrent) {
+  MemoryStatistics stat;
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 0);
+
+  stat.increase(100);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 100);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+
+  stat.increase(50);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 150);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 150);
+}
+
+TEST_F(NeuronMetricsTest, MemoryStatDecreaseUpdatesCurrent) {
+  MemoryStatistics stat;
+  stat.increase(100);
+
+  stat.decrease(30);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 70);
+  // Peak should remain unchanged
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+}
+
+TEST_F(NeuronMetricsTest, MemoryStatPeakTracking) {
+  MemoryStatistics stat;
+
+  // Increase to 100
+  stat.increase(100);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+
+  // Decrease to 50 - peak should stay at 100
+  stat.decrease(50);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 50);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+
+  // Increase to 80 - peak should stay at 100
+  stat.increase(30);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 80);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+
+  // Increase to 120 - peak should update to 120
+  stat.increase(40);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 120);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 120);
+}
+
+TEST_F(NeuronMetricsTest, MemoryStatResetPeak) {
+  MemoryStatistics stat;
+  stat.increase(100);
+  stat.decrease(60);
+
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 40);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 100);
+
+  stat.reset_peak();
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 40);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 40);
+
+  // After reset, new peak should track from current
+  stat.increase(30);
+  EXPECT_EQ(stat.current.load(std::memory_order_relaxed), 70);
+  EXPECT_EQ(stat.peak.load(std::memory_order_relaxed), 70);
+}
+
+// ============================================================================
+// DeviceMemoryStatsRegistry Tests
+// ============================================================================
+
+TEST_F(NeuronMetricsTest, RegistryGetDeviceStatsLazyInit) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+
+  // Getting stats for a device should initialize it
+  auto& stats = registry.GetDeviceStats(0);
+
+  // Initial values should be zero
+  EXPECT_EQ(stats.allocated_bytes.current.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.reserved_bytes.current.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.active_bytes.current.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_tensor_frees.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.allocation_requests.load(std::memory_order_relaxed), 0);
+}
+
+TEST_F(NeuronMetricsTest, RegistryGetMemoryStatsReturnsCorrectValues) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+
+  // Modify stats directly
+  auto& stats = registry.GetDeviceStats(0);
+  stats.allocated_bytes.increase(1000);
+  stats.active_bytes.increase(1000);
+  stats.num_alloc_retries.store(2, std::memory_order_relaxed);
+  stats.num_ooms.store(1, std::memory_order_relaxed);
+  stats.num_tensor_frees.store(5, std::memory_order_relaxed);
+  stats.allocation_requests.store(10, std::memory_order_relaxed);
+
+  // Get a copy via GetMemoryStats
+  auto info = registry.GetMemoryStats(0);
+
+  EXPECT_EQ(info.allocated_bytes.current, 1000);
+  EXPECT_EQ(info.allocated_bytes.peak, 1000);
+  EXPECT_EQ(info.reserved_bytes.current, 0);  // No caching, always 0
+  EXPECT_EQ(info.active_bytes.current, 1000);
+  EXPECT_EQ(info.num_alloc_retries, 2);
+  EXPECT_EQ(info.num_ooms, 1);
+  EXPECT_EQ(info.num_tensor_frees, 5);
+  EXPECT_EQ(info.allocation_requests, 10);
+}
+
+TEST_F(NeuronMetricsTest, RegistryResetPeakStats) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+  auto& stats = registry.GetDeviceStats(0);
+
+  // Set up some values with peaks
+  stats.allocated_bytes.increase(1000);
+  stats.allocated_bytes.decrease(400);
+  stats.active_bytes.increase(1000);
+  stats.active_bytes.decrease(400);
+
+  EXPECT_EQ(stats.allocated_bytes.current.load(std::memory_order_relaxed), 600);
+  EXPECT_EQ(stats.allocated_bytes.peak.load(std::memory_order_relaxed), 1000);
+  EXPECT_EQ(stats.active_bytes.current.load(std::memory_order_relaxed), 600);
+  EXPECT_EQ(stats.active_bytes.peak.load(std::memory_order_relaxed), 1000);
+
+  // Reset peaks
+  registry.ResetPeakStats(0);
+
+  EXPECT_EQ(stats.allocated_bytes.current.load(std::memory_order_relaxed), 600);
+  EXPECT_EQ(stats.allocated_bytes.peak.load(std::memory_order_relaxed), 600);
+  EXPECT_EQ(stats.active_bytes.current.load(std::memory_order_relaxed), 600);
+  EXPECT_EQ(stats.active_bytes.peak.load(std::memory_order_relaxed), 600);
+}
+
+TEST_F(NeuronMetricsTest, RegistryResetAccumulatedStats) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+  auto& stats = registry.GetDeviceStats(0);
+
+  stats.num_alloc_retries.store(5, std::memory_order_relaxed);
+  stats.num_ooms.store(3, std::memory_order_relaxed);
+  stats.num_tensor_frees.store(10, std::memory_order_relaxed);
+  stats.allocation_requests.store(50, std::memory_order_relaxed);
+
+  registry.ResetAccumulatedStats(0);
+
+  EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_tensor_frees.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.allocation_requests.load(std::memory_order_relaxed), 0);
+}
+
+TEST_F(NeuronMetricsTest, RegistryMultipleDevices) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+
+  // Get stats for multiple devices
+  auto& stats0 = registry.GetDeviceStats(0);
+  auto& stats1 = registry.GetDeviceStats(1);
+
+  stats0.allocated_bytes.increase(100);
+  stats1.allocated_bytes.increase(200);
+
+  auto info0 = registry.GetMemoryStats(0);
+  auto info1 = registry.GetMemoryStats(1);
+
+  EXPECT_EQ(info0.allocated_bytes.current, 100);
+  EXPECT_EQ(info1.allocated_bytes.current, 200);
+}
+
+TEST_F(NeuronMetricsTest, RegistryUninitializedDeviceReturnsZeros) {
+  auto& registry = DeviceMemoryStatsRegistry::Instance();
+
+  // Get stats for a device that hasn't been initialized
+  // (using a high device index that likely hasn't been used)
+  auto info = registry.GetMemoryStats(99);
+
+  EXPECT_EQ(info.allocated_bytes.current, 0);
+  EXPECT_EQ(info.allocated_bytes.peak, 0);
+  EXPECT_EQ(info.reserved_bytes.current, 0);
+  EXPECT_EQ(info.active_bytes.current, 0);
+  EXPECT_EQ(info.num_alloc_retries, 0);
+  EXPECT_EQ(info.num_ooms, 0);
+}
+
+TEST_F(NeuronMetricsTest, DeviceMemoryStatsResetPeak) {
+  DeviceMemoryStats stats;
+
+  stats.allocated_bytes.increase(1000);
+  stats.active_bytes.increase(1000);
+
+  stats.allocated_bytes.decrease(200);
+  stats.active_bytes.decrease(200);
+
+  EXPECT_EQ(stats.allocated_bytes.peak.load(std::memory_order_relaxed), 1000);
+  EXPECT_EQ(stats.active_bytes.peak.load(std::memory_order_relaxed), 1000);
+
+  stats.reset_peak();
+
+  EXPECT_EQ(stats.allocated_bytes.peak.load(std::memory_order_relaxed), 800);
+  EXPECT_EQ(stats.active_bytes.peak.load(std::memory_order_relaxed), 800);
+}
+
+TEST_F(NeuronMetricsTest, DeviceMemoryStatsResetCounters) {
+  DeviceMemoryStats stats;
+
+  stats.num_alloc_retries.store(10, std::memory_order_relaxed);
+  stats.num_ooms.store(5, std::memory_order_relaxed);
+  stats.num_tensor_frees.store(20, std::memory_order_relaxed);
+  stats.allocation_requests.store(100, std::memory_order_relaxed);
+
+  stats.reset_counters();
+
+  EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.num_tensor_frees.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(stats.allocation_requests.load(std::memory_order_relaxed), 0);
 }
 
 int main(int argc, char** argv) {

@@ -93,103 +93,74 @@ std::string ErrorHandler::HandleExecutionError(OperationContext* op,
 
 std::string ErrorHandler::ClassifyNrtError(
     const torch_neuronx::ExecutionRuntimeException& e) const {
-  std::string readable_error = "";
-  int nrt_status = e.GetNRTStatus();
+  if (e.HasNRTStatus()) {
+    return std::string(e.what()) + ", " + ClassifyNrtError(e.GetNRTStatus());
+  }
+  return std::string(e.what());
+}
 
+std::string ErrorHandler::ClassifyNrtError(NRT_STATUS nrt_status) const {
   switch (nrt_status) {
     case 0:  // NRT_SUCCESS
-      readable_error = "Success (unexpected in error context)";
-      break;
+      return "Success (unexpected in error context)";
     case 1:  // NRT_FAILURE
-      readable_error = "Non-specific failure";
-      break;
+      return "Non-specific failure";
     case 2:  // NRT_INVALID
-      readable_error = "Invalid NEFF, instruction, or input";
-      break;
+      return "Invalid NEFF, instruction, or input";
     case 3:  // NRT_INVALID_HANDLE
-      readable_error = "Invalid handle";
-      break;
+      return "Invalid handle";
     case 4:  // NRT_RESOURCE
-      readable_error = "Failed to allocate resource";
-      break;
+      return "Failed to allocate resource";
     case 5:  // NRT_TIMEOUT
-      readable_error = "Operation timed out";
-      break;
+      return "Operation timed out";
     case 6:  // NRT_HW_ERROR
-      readable_error = "Hardware failure";
-      break;
+      return "Hardware failure";
     case 7:  // NRT_QUEUE_FULL
-      readable_error = "Execution input queue full";
-      break;
+      return "Execution input queue full";
     case 9:  // NRT_LOAD_NOT_ENOUGH_NC
-      readable_error = "Not enough NCs for loading NEFF";
-      break;
+      return "Not enough NCs for loading NEFF";
     case 10:  // NRT_UNSUPPORTED_NEFF_VERSION
-      readable_error = "Unsupported NEFF version";
-      break;
+      return "Unsupported NEFF version";
     case 11:  // NRT_FAIL_HOST_MEM_ALLOC
-      readable_error = "Failed to allocate host memory";
-      break;
+      return "Failed to allocate host memory";
     case 13:  // NRT_UNINITIALIZED
-      readable_error = "NRT not initialized";
-      break;
+      return "NRT not initialized";
     case 14:  // NRT_CLOSED
-      readable_error = "NRT already closed";
-      break;
+      return "NRT already closed";
     case 15:  // NRT_QUEUE_EMPTY
-      readable_error = "Accessed an empty Queue";
-      break;
+      return "Accessed an empty Queue";
     case 1002:  // NRT_EXEC_BAD_INPUT
-      readable_error = "Invalid input to exec()";
-      break;
+      return "Invalid input to exec()";
     case 1003:  // NRT_EXEC_COMPLETED_WITH_NUM_ERR
-      readable_error = "Execution completed with numerical errors (NaN)";
-      break;
+      return "Execution completed with numerical errors (NaN)";
     case 1004:  // NRT_EXEC_COMPLETED_WITH_ERR
-      readable_error = "Execution completed with errors";
-      break;
+      return "Execution completed with errors";
     case 1005:  // NRT_EXEC_NC_BUSY
-      readable_error = "Neuron core busy/locked by another model/process";
-      break;
+      return "Neuron core busy/locked by another model/process";
     case 1006:  // NRT_EXEC_OOB
-      readable_error = "one or more indirect memcopies and/or embedding updates are out of bound";
-      break;
+      return "one or more indirect memcopies and/or embedding updates are out of bound";
     case 1100:  // NRT_COLL_PENDING
-      readable_error = "Collective operation pending";
-      break;
+      return "Collective operation pending";
     case 1200:  // NRT_EXEC_HW_ERR_COLLECTIVES
-      readable_error =
-          "Stuck in collectives op (missing notification(s)). Possibly caused by a hardware error "
-          "on another worker";
-      break;
+      return "Stuck in collectives op (missing notification(s)). Possibly caused by a hardware "
+             "error on another worker";
     case 1201:  // NRT_EXEC_HW_ERR_HBM_UE
-      readable_error =
-          "An HBM encountered an unrepairable uncorrectable error and produced incorrect results";
-      break;
+      return "An HBM encountered an unrepairable uncorrectable error and produced incorrect "
+             "results";
     case 1202:  // NRT_EXEC_HW_ERR_NC_UE
-      readable_error =
-          "An on-chip memory of Neuron Core encountered a parity error and produced incorrect "
-          "results.";
-      break;
+      return "An on-chip memory of Neuron Core encountered a parity error and produced incorrect "
+             "results.";
     case 1203:  // NRT_EXEC_HW_ERR_DMA_ABORT
-      readable_error = "A DMA engine encountered an unrecoverable error";
-      break;
+      return "A DMA engine encountered an unrecoverable error";
     case 1204:  // NRT_EXEC_SW_NQ_OVERFLOW
-      readable_error = "Software notification queue overflow";
-      break;
+      return "Software notification queue overflow";
     case 1205:  // NRT_EXEC_HW_ERR_REPAIRABLE_HBM_UE
-      readable_error = "HBM repairable uncorrectable error";
-      break;
+      return "HBM repairable uncorrectable error";
     case 1206:
-      readable_error = "EFA network proxy failure";
-      break;
+      return "EFA network proxy failure";
     default:
-      // Handle unknown status codes including 1206 (NRT_NETWORK_PROXY_FAILURE) and -999
-      readable_error = "Unknown status (status: " + std::to_string(nrt_status) + ")";
-      break;
+      return "Unknown status (status: " + std::to_string(nrt_status) + ")";
   }
-
-  return std::string(e.what()) + ", " + readable_error;
 }
 
 ErrorContext ErrorHandler::CreateErrorContext(OperationContext* op,
@@ -357,19 +328,24 @@ OperationContextResult ErrorHandler::HandleOperationError(
   uint32_t stream_id = op->stream->stream_id;
   TORCH_NEURONX_DEBUG("Handling execution error", "stream_id=", stream_id, "op=", op->GetOpName());
 
-  auto recovery_status = error_recovery_->AttemptRecovery(op, e);
-  if (recovery_status.IsSuccess()) {
-    return recovery_status;
-  }
-
   // Create error context with inferred stage
   ErrorContext context = CreateErrorContext(op, ErrorContext::Stage::EXECUTION);
 
   // TODO: Use ExecutionRuntimeException properties to parse NRT statuses.
   std::string error_details;
   try {
-    auto readable_error = e.HasNRTStatus() ? ClassifyNrtError(e) : std::string(e.what());
-    error_details = HandleExecutionError(op, readable_error, context);
+    std::string error_msg;
+    if (e.HasSeqId()) {
+      // nrt-async execution error - include seq_id in message
+      error_msg = "Async execution error: seq_id=" + std::to_string(e.GetSeqId());
+      if (e.HasNRTStatus()) {
+        error_msg += ", " + ClassifyNrtError(e.GetNRTStatus());
+      }
+    } else {
+      // nrt-sync execution error
+      error_msg = e.HasNRTStatus() ? ClassifyNrtError(e) : std::string(e.what());
+    }
+    error_details = HandleExecutionError(op, error_msg, context);
     context.error_details = error_details;
     RecordErrorForMonitoring(op, context);
   } catch (const std::exception& handler_error) {

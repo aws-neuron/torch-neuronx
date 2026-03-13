@@ -5,6 +5,8 @@
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
@@ -12,6 +14,10 @@ using namespace at::neuron::testing;
 class KernelExecutionTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Set up world size for collective kernel tests
+    c10_neuron::set_world_size(2);
+    c10_neuron::set_rank(0);
+
     // Create test tensors
     input_tensor_ = create_test_tensor({2, 3});
     output_tensor_ = create_test_tensor({2, 3});
@@ -19,6 +25,11 @@ class KernelExecutionTest : public ::testing::Test {
     outputs_ = {output_tensor_};
     input_ptrs_ = get_tensor_data_ptrs(inputs_);
     output_ptrs_ = get_tensor_data_ptrs(outputs_);
+  }
+
+  void TearDown() override {
+    // Reset distributed state so next test can set it again
+    c10_neuron::reset_distributed_state();
   }
 
   torch::Tensor input_tensor_;
@@ -31,8 +42,9 @@ class KernelExecutionTest : public ::testing::Test {
 
 TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("compilable_op", input_ptrs_, output_ptrs_, "cache_key_123",
-                                      hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel("compilable_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {},
+                                      "cache_key_123", hlo_bytes, false, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "compilable_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -44,7 +56,8 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
 
 TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("collective_op", input_ptrs_, output_ptrs_, "cache_key",
+  XLACompilableKernelExecution kernel("collective_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "cache_key",
                                       hlo_bytes, true, 0);
 
   EXPECT_TRUE(kernel.HasCollectives());
@@ -53,7 +66,8 @@ TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
 
 TEST_F(KernelExecutionTest, CompilableKernelCompilation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("compilable_op", input_ptrs_, output_ptrs_, "cache_key",
+  XLACompilableKernelExecution kernel("compilable_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "cache_key",
                                       hlo_bytes, false, 0);
 
   // Test compilation - will throw since we don't have real compiler
@@ -64,12 +78,15 @@ TEST_F(KernelExecutionTest, CompilableKernelValidation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
   // Test with empty cache key (should be invalid)
-  XLACompilableKernelExecution kernel1("op", input_ptrs_, output_ptrs_, "", hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel1("op", create_fake_tensor_refs(input_ptrs_),
+                                       create_fake_tensor_refs(output_ptrs_), {}, {}, "", hlo_bytes,
+                                       false, 0);
   EXPECT_FALSE(kernel1.IsValid());
 
   // Test with empty op name (should be invalid)
-  XLACompilableKernelExecution kernel2("", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes, false,
-                                       0);
+  XLACompilableKernelExecution kernel2("", create_fake_tensor_refs(input_ptrs_),
+                                       create_fake_tensor_refs(output_ptrs_), {}, {}, "cache_key",
+                                       hlo_bytes, false, 0);
   EXPECT_FALSE(kernel2.IsValid());
 }
 
@@ -78,8 +95,9 @@ TEST_F(KernelExecutionTest, CompilableKernelValidation) {
 TEST_F(KernelExecutionTest, XLAKernelConstruction) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};  // "HLO"
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "xla_cache_key",
-                                      hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {},
+                                      "xla_cache_key", hlo_bytes, false, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "xla_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -92,8 +110,9 @@ TEST_F(KernelExecutionTest, XLAKernelConstruction) {
 TEST_F(KernelExecutionTest, XLAKernelWithEmptyHLO) {
   std::vector<uint8_t> empty_hlo;
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "cache_key", empty_hlo,
-                                      false, 0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "cache_key",
+                                      empty_hlo, false, 0);
 
   EXPECT_FALSE(kernel.IsValid());  // Should be invalid with empty HLO
 }
@@ -101,17 +120,20 @@ TEST_F(KernelExecutionTest, XLAKernelWithEmptyHLO) {
 TEST_F(KernelExecutionTest, XLAKernelCompilation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F, 0x01, 0x02};
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "cache_key", hlo_bytes,
-                                      false, 0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "cache_key",
+                                      hlo_bytes, false, 0);
 
   // TODO(rpsilva): Integrate or mock the compiler.
   EXPECT_THROW(kernel.CompileToNeff(), std::exception);
 }
 
 TEST_F(KernelExecutionTest, CollectiveKernelConstruction) {
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
   CollectiveDirectKernelExecution kernel(
-      "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
-      output_ptrs_, c10d::ReduceOp::SUM, 0);
+      "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, 0);
 
   EXPECT_EQ(kernel.GetOpName(), "allreduce_op");
   EXPECT_FALSE(kernel.RequiresCompilation());
@@ -119,22 +141,24 @@ TEST_F(KernelExecutionTest, CollectiveKernelConstruction) {
   EXPECT_EQ(kernel.GetCollectiveType(),
             CollectiveDirectKernelExecution::CollectiveType::kAllReduce);
   EXPECT_EQ(kernel.GetReduceOp(), c10d::ReduceOp::SUM);
+  EXPECT_EQ(kernel.GetDtype(), c10::ScalarType::Float);
+  EXPECT_EQ(kernel.GetReplicaGroups(), replica_groups);
   EXPECT_TRUE(kernel.IsValid());
 }
 
 TEST_F(KernelExecutionTest, CollectiveKernelAllTypes) {
-  // Test all collective types
+  // Test supported collective types (kAllToAll, kBroadcast, kReduce not yet implemented)
   std::vector<CollectiveDirectKernelExecution::CollectiveType> types = {
       CollectiveDirectKernelExecution::CollectiveType::kAllGather,
       CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
-      CollectiveDirectKernelExecution::CollectiveType::kReduceScatter,
-      CollectiveDirectKernelExecution::CollectiveType::kAllToAll,
-      CollectiveDirectKernelExecution::CollectiveType::kBroadcast,
-      CollectiveDirectKernelExecution::CollectiveType::kReduce};
+      CollectiveDirectKernelExecution::CollectiveType::kReduceScatter};
 
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
   for (auto type : types) {
-    CollectiveDirectKernelExecution kernel("collective", type, input_ptrs_, output_ptrs_,
-                                           c10d::ReduceOp::SUM, 0);
+    CollectiveDirectKernelExecution kernel("collective", type, create_fake_tensor_refs(input_ptrs_),
+                                           create_fake_tensor_refs(output_ptrs_), {}, {},
+                                           c10::ScalarType::Float, c10d::ReduceOp::SUM,
+                                           replica_groups, 0);
     EXPECT_EQ(kernel.GetCollectiveType(), type);
     EXPECT_TRUE(kernel.IsValid());
   }
@@ -142,14 +166,15 @@ TEST_F(KernelExecutionTest, CollectiveKernelAllTypes) {
 
 TEST_F(KernelExecutionTest, CollectiveKernelReduceOps) {
   // Test different reduce operations
-  std::vector<c10d::ReduceOp> reduce_ops = {
-      c10d::ReduceOp::SUM,  c10d::ReduceOp::PRODUCT, c10d::ReduceOp::MIN,  c10d::ReduceOp::MAX,
-      c10d::ReduceOp::BAND, c10d::ReduceOp::BOR,     c10d::ReduceOp::BXOR, c10d::ReduceOp::AVG};
+  std::vector<c10d::ReduceOp> reduce_ops = {c10d::ReduceOp::SUM, c10d::ReduceOp::MIN,
+                                            c10d::ReduceOp::MAX};
 
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
   for (auto reduce_op : reduce_ops) {
     CollectiveDirectKernelExecution kernel(
-        "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
-        output_ptrs_, reduce_op, 0);
+        "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+        create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+        c10::ScalarType::Float, reduce_op, replica_groups, 0);
     EXPECT_EQ(kernel.GetReduceOp(), reduce_op);
     EXPECT_TRUE(kernel.IsValid());
   }
@@ -158,13 +183,17 @@ TEST_F(KernelExecutionTest, CollectiveKernelReduceOps) {
 TEST_F(KernelExecutionTest, PolymorphicBehavior) {
   // Create different kernel types and verify polymorphic behavior through base pointer
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
 
   std::vector<std::unique_ptr<NeuronKernelExecution>> kernels;
-  kernels.push_back(std::make_unique<XLACompilableKernelExecution>("xla", input_ptrs_, output_ptrs_,
-                                                                   "key", hlo_bytes, false, 0));
+  kernels.push_back(std::make_unique<XLACompilableKernelExecution>(
+      "xla", create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_),
+      std::vector<TensorContext>{}, std::vector<TensorContext>{}, "key", hlo_bytes, false, 0));
   kernels.push_back(std::make_unique<CollectiveDirectKernelExecution>(
-      "collective", CollectiveDirectKernelExecution::CollectiveType::kAllReduce, input_ptrs_,
-      output_ptrs_, c10d::ReduceOp::SUM, 0));
+      "collective", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_),
+      std::vector<TensorContext>{}, std::vector<TensorContext>{}, c10::ScalarType::Float,
+      c10d::ReduceOp::SUM, replica_groups, 0));
 
   // Verify polymorphic behavior
   EXPECT_TRUE(kernels[0]->RequiresCompilation());   // XLA kernel
@@ -179,8 +208,9 @@ TEST_F(KernelExecutionTest, PolymorphicBehavior) {
 TEST_F(KernelExecutionTest, CacheKeyIncludesCompilerExtension) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "base_key", hlo_bytes,
-                                      false, 0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "base_key",
+                                      hlo_bytes, false, 0);
 
   // Cache key should start with base key
   std::string cache_key = kernel.GetCacheKey();
@@ -197,8 +227,9 @@ TEST_F(KernelExecutionTest, CacheKeyIncludesCompilerExtension) {
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false,
-                                      0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
 
   // Test that we can access compilation configuration
   EXPECT_FALSE(kernel.GetAdditionalArgs().empty());
@@ -219,8 +250,9 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   setenv("NEURON_CC_FLAGS", "--custom-flag=value", 1);
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
 
-  XLACompilableKernelExecution kernel("xla_op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false,
-                                      0);
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
 
   // Check that environment variables are reflected
   EXPECT_TRUE(kernel.GetAdditionalArgs().find("--custom-flag=value") != std::string::npos);
@@ -240,13 +272,15 @@ TEST_F(KernelExecutionTest, CacheKeyUniquenessWithDifferentArgs) {
 
   // Create two kernels with same base key but different environment settings
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O1", 1);
-  XLACompilableKernelExecution kernel1("op", input_ptrs_, output_ptrs_, "same_base", hlo_bytes,
-                                       false, 0);
+  XLACompilableKernelExecution kernel1("op", create_fake_tensor_refs(input_ptrs_),
+                                       create_fake_tensor_refs(output_ptrs_), {}, {}, "same_base",
+                                       hlo_bytes, false, 0);
   std::string key1 = kernel1.GetCacheKey();
 
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
-  XLACompilableKernelExecution kernel2("op", input_ptrs_, output_ptrs_, "same_base", hlo_bytes,
-                                       false, 0);
+  XLACompilableKernelExecution kernel2("op", create_fake_tensor_refs(input_ptrs_),
+                                       create_fake_tensor_refs(output_ptrs_), {}, {}, "same_base",
+                                       hlo_bytes, false, 0);
   std::string key2 = kernel2.GetCacheKey();
 
   // Keys should be different due to different optimization levels
@@ -261,7 +295,9 @@ TEST_F(KernelExecutionTest, CacheKeyUniquenessWithDifferentArgs) {
 
 TEST_F(KernelExecutionTest, CachedNeffManagement) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
-  XLACompilableKernelExecution kernel("op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
 
   // Initially no cached NEFF
   EXPECT_FALSE(kernel.HasCachedNeff());
@@ -286,7 +322,9 @@ TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
   setenv("NEURON_COMPILER_OPT_LEVEL", "-O2", 1);
   setenv("NEURON_CC_FLAGS", "--test-flag", 1);
 
-  XLACompilableKernelExecution kernel("op", input_ptrs_, output_ptrs_, "key", hlo_bytes, false, 0);
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
 
   // Verify that compilation config would include these settings
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
@@ -507,7 +545,8 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelExecuteIsNoOp) {
 // NeffDirectKernelExecution tests
 
 TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
-  NeffDirectKernelExecution kernel("graph_name", "cache_key", input_ptrs_, output_ptrs_, 0, false);
+  NeffDirectKernelExecution kernel("graph_name", "cache_key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   EXPECT_EQ(kernel.GetOpName(), "graph_name");
   EXPECT_EQ(kernel.GetCacheKey(), "cache_key");
@@ -516,71 +555,62 @@ TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
 }
 
 TEST_F(KernelExecutionTest, NeffDirectKernelWithCollectives) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, true);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, true);
 
   EXPECT_TRUE(kernel.HasCollectives());
 }
 
 TEST_F(KernelExecutionTest, NeffDirectKernelValidation) {
   // Valid kernel with inputs and outputs
-  NeffDirectKernelExecution valid_kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+  NeffDirectKernelExecution valid_kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                         create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
   EXPECT_TRUE(valid_kernel.IsValid());
 }
 
 TEST_F(KernelExecutionTest, NeffDirectKernelCompileToNeffThrows) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   // CompileToNeff should throw logic_error since NEFF is pre-compiled
   EXPECT_THROW(kernel.CompileToNeff(), std::logic_error);
 }
 
 TEST_F(KernelExecutionTest, NeffDirectKernelRequiresCompilation) {
-  NeffDirectKernelExecution kernel("graph", "key", input_ptrs_, output_ptrs_, 0, false);
+  NeffDirectKernelExecution kernel("graph", "key", create_fake_tensor_refs(input_ptrs_),
+                                   create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   // RequiresCompilation returns true to force cache lookup
   EXPECT_TRUE(kernel.RequiresCompilation());
 }
 
-TEST_F(KernelExecutionTest, WriteKernelScalarBoolConstruction) {
-  c10::Scalar scalar_value(true);
+TEST_F(KernelExecutionTest, WriteKernelBoolConstruction) {
+  bool src_value = true;
   void* dst_ptr = output_ptrs_[0];
 
-  WriteDirectKernelExecution kernel("write_scalar_bool", scalar_value, dst_ptr, 0,
-                                    c10::ScalarType::Bool, 0);
+  WriteDirectKernelExecution kernel("write_bool", &src_value, TensorDataRef{dst_ptr}, 0,
+                                    sizeof(bool), 0);
 
-  EXPECT_EQ(kernel.GetOpName(), "write_scalar_bool");
+  EXPECT_EQ(kernel.GetOpName(), "write_bool");
   EXPECT_TRUE(kernel.IsValid());
 }
 
-TEST_F(KernelExecutionTest, WriteKernelScalarAllIntTypes) {
+TEST_F(KernelExecutionTest, WriteKernelAllIntTypes) {
   void* dst_ptr = output_ptrs_[0];
-  std::vector<c10::ScalarType> int_types = {
-      c10::ScalarType::Byte,   // uint8
-      c10::ScalarType::Char,   // int8
-      c10::ScalarType::Short,  // int16
-      c10::ScalarType::Int,    // int32
-      c10::ScalarType::Long    // int64
-  };
+  int64_t src_value = 123;
 
-  for (auto dtype : int_types) {
-    c10::Scalar scalar_value(123);
-    WriteDirectKernelExecution kernel("write_int", scalar_value, dst_ptr, 0, dtype, 0);
-    EXPECT_TRUE(kernel.IsValid()) << "Failed for dtype: " << static_cast<int>(dtype);
-  }
+  WriteDirectKernelExecution kernel("write_int", &src_value, TensorDataRef{dst_ptr}, 0,
+                                    sizeof(int64_t), 0);
+  EXPECT_TRUE(kernel.IsValid());
 }
 
-TEST_F(KernelExecutionTest, WriteKernelScalarAllFloatTypes) {
+TEST_F(KernelExecutionTest, WriteKernelAllFloatTypes) {
   void* dst_ptr = output_ptrs_[0];
-  std::vector<c10::ScalarType> float_types = {c10::ScalarType::Half,    // float16
-                                              c10::ScalarType::Float,   // float32
-                                              c10::ScalarType::Double,  // float64
-                                              c10::ScalarType::BFloat16};
+  double src_value = 1.5;
 
-  for (auto dtype : float_types) {
-    c10::Scalar scalar_value(1.5);
-    WriteDirectKernelExecution kernel("write_float", scalar_value, dst_ptr, 0, dtype, 0);
-    EXPECT_TRUE(kernel.IsValid()) << "Failed for dtype: " << static_cast<int>(dtype);
-  }
+  WriteDirectKernelExecution kernel("write_float", &src_value, TensorDataRef{dst_ptr}, 0,
+                                    sizeof(double), 0);
+  EXPECT_TRUE(kernel.IsValid());
 }
 
 TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
@@ -588,12 +618,182 @@ TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
   void* dst_ptr = output_ptrs_[0];
   size_t size_bytes = 24;  // 2*3 floats * 4 bytes
 
-  WriteDirectKernelExecution kernel("write_buffer", src_ptr, dst_ptr, 0, size_bytes, 0);
+  WriteDirectKernelExecution kernel("write_buffer", src_ptr, TensorDataRef{dst_ptr}, 0, size_bytes,
+                                    0);
 
   EXPECT_EQ(kernel.GetOpName(), "write_buffer");
   EXPECT_FALSE(kernel.RequiresCompilation());
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kWrite);
   EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, CollectiveKernelRequiresPrepare) {
+  std::vector<std::vector<int>> replica_groups = {{0, 1}};
+  CollectiveDirectKernelExecution kernel(
+      "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, 0);
+
+  // Collectives require preparation before scheduling
+  EXPECT_TRUE(kernel.RequiresPrepare());
+}
+
+TEST_F(KernelExecutionTest, NonCollectiveKernelsDoNotRequirePrepare) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+
+  XLACompilableKernelExecution xla_kernel("xla", create_fake_tensor_refs(input_ptrs_),
+                                          create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                          hlo_bytes, false, 0);
+  EXPECT_FALSE(xla_kernel.RequiresPrepare());
+
+  NeffDirectKernelExecution neff_kernel("neff", "key", create_fake_tensor_refs(input_ptrs_),
+                                        create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
+  EXPECT_FALSE(neff_kernel.RequiresPrepare());
+}
+
+TEST_F(KernelExecutionTest, EventKernelDoesNotRequirePrepare) {
+  NeuronEvent event;
+  EventDirectKernelExecution kernel("event_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+
+  EXPECT_FALSE(kernel.RequiresPrepare());
+}
+
+// IsDeviceKernelType and GetDeviceKernelTypeIndex tests
+
+TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
+  // Device kernel types should return true
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kHLO));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCollective));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCopy));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kWrite));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kRead));
+}
+
+TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
+  // Host-side kernel types should return false
+  EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kEvent));
+  EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kHint));
+}
+
+TEST_F(KernelExecutionTest, GetDeviceKernelTypeIndexMapping) {
+  // Verify the index mapping for device kernel types
+  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kHLO), 0);
+  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kCollective), 1);
+  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kCopy), 2);
+  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kWrite), 3);
+  EXPECT_EQ(GetDeviceKernelTypeIndex(KernelTypeEnum::kRead), 4);
+}
+
+TEST_F(KernelExecutionTest, GetDeviceKernelTypeIndexThrowsForNonDevice) {
+  // Non-device kernel types should throw
+  EXPECT_THROW(GetDeviceKernelTypeIndex(KernelTypeEnum::kEvent), c10::Error);
+  EXPECT_THROW(GetDeviceKernelTypeIndex(KernelTypeEnum::kHint), c10::Error);
+}
+
+TEST_F(KernelExecutionTest, BaseKernelPrepareDoesNotThrow) {
+  // Base NeuronKernelExecution::Prepare() should complete without throwing
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("xla_op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  // Non-collective kernels should not throw from Prepare()
+  EXPECT_NO_THROW(kernel.Prepare());
+}
+
+TEST_F(KernelExecutionTest, CollectiveKernelNewAccessors) {
+  std::vector<std::vector<int>> replica_groups = {{0, 1, 2}, {3, 4, 5}};
+  CollectiveDirectKernelExecution kernel(
+      "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+      create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
+      c10::ScalarType::BFloat16, c10d::ReduceOp::MAX, replica_groups, 0);
+
+  // Test new accessors added for host-cc
+  EXPECT_EQ(kernel.GetDtype(), c10::ScalarType::BFloat16);
+  EXPECT_EQ(kernel.GetReplicaGroups().size(), 2);
+  EXPECT_EQ(kernel.GetReplicaGroups()[0].size(), 3);
+  EXPECT_EQ(kernel.GetReplicaGroups()[1][2], 5);
+}
+
+TEST_F(KernelExecutionTest, CollectiveKernelValidationRequiresReplicaGroups) {
+  // Empty replica_groups should throw in constructor
+  std::vector<std::vector<int>> empty_replica_groups = {};
+  EXPECT_THROW(CollectiveDirectKernelExecution(
+                   "allreduce", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
+                   create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {},
+                   {}, c10::ScalarType::Float, c10d::ReduceOp::SUM, empty_replica_groups, 0),
+               c10::Error);
+}
+
+// NRT type mapping tests
+
+TEST_F(KernelExecutionTest, MapScalarTypeToNRTFloat) {
+  using namespace at::neuron::nrt;
+
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Float), NRTDType::kFloat32);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Half), NRTDType::kFloat16);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::BFloat16), NRTDType::kBFloat16);
+}
+
+TEST_F(KernelExecutionTest, MapScalarTypeToNRTInt) {
+  using namespace at::neuron::nrt;
+
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Int), NRTDType::kInt32);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Long), NRTDType::kInt64);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Short), NRTDType::kInt16);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Char), NRTDType::kInt8);
+}
+
+TEST_F(KernelExecutionTest, MapScalarTypeToNRTUnsigned) {
+  using namespace at::neuron::nrt;
+
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::Byte), NRTDType::kUInt8);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::UInt16), NRTDType::kUInt16);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::UInt32), NRTDType::kUInt32);
+  EXPECT_EQ(MapScalarTypeToNRT(c10::ScalarType::UInt64), NRTDType::kUInt64);
+}
+
+TEST_F(KernelExecutionTest, MapScalarTypeToNRTUnsupportedThrows) {
+  using namespace at::neuron::nrt;
+
+  // Complex types are not supported
+  EXPECT_THROW(MapScalarTypeToNRT(c10::ScalarType::ComplexFloat), c10::Error);
+  EXPECT_THROW(MapScalarTypeToNRT(c10::ScalarType::ComplexDouble), c10::Error);
+}
+
+TEST_F(KernelExecutionTest, MapReduceOpToNRT) {
+  using namespace at::neuron::nrt;
+
+  EXPECT_EQ(MapReduceOpToNRT(c10d::ReduceOp::SUM), NRTReduceOp::kAdd);
+  EXPECT_EQ(MapReduceOpToNRT(c10d::ReduceOp::MAX), NRTReduceOp::kMax);
+  EXPECT_EQ(MapReduceOpToNRT(c10d::ReduceOp::MIN), NRTReduceOp::kMin);
+}
+
+TEST_F(KernelExecutionTest, MapReduceOpToNRTUnsupportedThrows) {
+  using namespace at::neuron::nrt;
+
+  // PRODUCT, BAND, BOR, BXOR are not supported
+  EXPECT_THROW(MapReduceOpToNRT(c10d::ReduceOp::PRODUCT), c10::Error);
+  EXPECT_THROW(MapReduceOpToNRT(c10d::ReduceOp::BAND), c10::Error);
+}
+
+TEST_F(KernelExecutionTest, NRTCollectiveOpEnumValues) {
+  using namespace at::neuron::nrt;
+
+  // Verify enum values match NRT constants
+  EXPECT_EQ(static_cast<int>(NRTCollectiveOp::kAllGather), NRT_CC_ALLGATHER);
+  EXPECT_EQ(static_cast<int>(NRTCollectiveOp::kReduceScatter), NRT_CC_REDUCESCATTER);
+  EXPECT_EQ(static_cast<int>(NRTCollectiveOp::kAllReduce), NRT_CC_ALLREDUCE);
+}
+
+TEST_F(KernelExecutionTest, NRTReduceOpEnumValues) {
+  using namespace at::neuron::nrt;
+
+  // Verify enum values match NRT constants
+  EXPECT_EQ(static_cast<int>(NRTReduceOp::kAdd), NRT_OP_ADD);
+  EXPECT_EQ(static_cast<int>(NRTReduceOp::kMax), NRT_OP_MAX);
+  EXPECT_EQ(static_cast<int>(NRTReduceOp::kMin), NRT_OP_MIN);
 }
 
 int main(int argc, char** argv) {

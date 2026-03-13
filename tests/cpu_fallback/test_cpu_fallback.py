@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 import torch
@@ -9,79 +10,10 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
-
-
-@pytest.fixture
-def fail_jax_kernel_call(monkeypatch):
-    """Force JaxKernel call to fail so Operation falls back to CPU.
-
-    This simulates a JAX/compilation/execution failure without invoking the runtime.
-    """
-    from torch_neuronx.python_ops.jax.kernel import JaxKernel
-
-    def _fail(self, *inputs, **kwargs):
-        raise RuntimeError("Simulated JAX kernel failure")
-
-    monkeypatch.setattr(JaxKernel, "__call__", _fail)
-
-
-class TestCpuFallbackLoweringError:
-    def test_factory_op_no_tensor_args_falls_back_cleanly(self, fail_jax_kernel_call):
-        """
-        When a factory op (no tensor inputs) fails in JAX path, ensure CPU fallback:
-        - rewrites device kw to CPU (to avoid recursion)
-        - returns a tensor on neuron (copied back)
-        - records as a fallback op
-        """
-        size = (2, 3)
-        device = "neuron:0"
-
-        with track_neuron_ops():
-            x = torch.ones(size, device=device)
-            # Should come back on neuron device after CPU fallback
-            assert x.device.type == "neuron"
-            assert tuple(x.shape) == size
-            assert_op_falls_back_on_cpu("aten::ones")
-
-    def test_factory_out_param_resize_and_copy_on_fallback(self, fail_jax_kernel_call):
-        """
-        With an out tensor provided on neuron device and wrong shape:
-        - CPU fallback computes on CPU, then resizes+copies into out
-        - Returns the same out tensor
-        - Records as a fallback op
-        """
-        device = "neuron:0"
-        out = torch.empty((1,), dtype=torch.float32, device=device)
-
-        with track_neuron_ops():
-            # For .out overload, do not pass device kwarg
-            y = torch.ones((2, 4), out=out)
-            # Same object and resized
-            assert y is out
-            assert tuple(out.shape) == (2, 4)
-            # Values are correct
-            assert torch.all(out.to("cpu") == 1)
-            assert_op_falls_back_on_cpu("aten::ones.out")
+from torch_neuronx.utils import use_mlir_aten_ops
 
 
 class TestCpuFallback:
-    @assert_raises(
-        RuntimeError,
-        match="CPU fallback failed. Cannot copy result to output tensor which is not contiguous",
-    )
-    def test_copy_neuron_to_neuron_non_contiguous(self):
-        tile_t = 128
-        tile_h = 128
-        nopad_t = 128
-        nopad_h = 64
-
-        x = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
-        y = torch.zeros(tile_t, tile_h, dtype=torch.bfloat16, device="neuron")
-        z = x[:nopad_t, :nopad_h]
-
-        # Should raise error for copying to non-contiguous destination
-        y[:nopad_t, :nopad_h] = z
-
     def test_fallback_handler_unregistered_op(self):
         """Test that unregistered operations fall back to CPU"""
         # Create a tensor on CPU first, then move to neuron
@@ -107,6 +39,9 @@ class TestCpuFallback:
     @assert_raises(
         RuntimeError,
         match="torch.histogram: input tensor and hist tensor should have the same dtype, "
+        "but got input torch.float32 and hist torch.int32"
+        if use_mlir_aten_ops()
+        else "torch.histogram: input tensor and hist tensor should have the same dtype, "
         "but got input float and hist int",
     )
     def test_histc_out_inconsistent_dtype_neuron(self):
@@ -146,6 +81,26 @@ class TestCpuFallback:
         # CPU error message does not seem to be descriptive neither
         input_neuron.index_copy(0, indices_neuron, source_neuron)
 
+    @assert_raises(
+        RuntimeError if use_mlir_aten_ops() else TypeError,
+        match=re.escape("index_copy_(): Expected a long tensor for index, but got Float")
+        if use_mlir_aten_ops()
+        else "Indexer must have integer or boolean type, "
+        "got indexer with type float32 at position 0",
+    )
+    def test_index_copy_with_index_dtype_float(self):
+        """Test index select with float type index"""
+
+        device = "neuron"
+        input = torch.zeros(5, 3)
+        input_neuron = input.to(device)
+        source = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        source_neuron = source.to(device)
+        indices = torch.tensor([0, 4, 2], dtype=torch.float)
+        indices_neuron = indices.to(device)
+
+        input_neuron.index_copy(0, indices_neuron, source_neuron)
+
     @assert_raises(IndexError, match="index out of range in self")
     def test_index_select_with_input_empty(self):
         """Test index select with input empty"""
@@ -156,6 +111,8 @@ class TestCpuFallback:
 
         torch.index_select(input.to(device), dim=0, index=indices.to(device))
 
+    # TODO move to test_index_select.py after fully migrate to MLIR
+    @pytest.mark.skipif(use_mlir_aten_ops(), reason="Can get the same result as CPU in MLIR path")
     @assert_raises(
         AssertionError,
         match=r".*aten::index_select ran on Neuron instead of falling back to CPU",
@@ -189,6 +146,25 @@ class TestCpuFallback:
         row_idx = torch.tensor([1, 2], dtype=dtype, device="neuron")  # 15 is out of bounds
         x[row_idx, :]
 
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_complex_dtype_fallback(self, dtype):
+        """Test that complex dtypes fall back to CPU"""
+        x = torch.randn(3, 4, dtype=dtype)
+        x_neuron = x.to("neuron")
+
+        with track_neuron_ops():
+            # Any operation on complex dtype should fall back to CPU
+            result = torch.add(x_neuron, x_neuron)
+            assert result.device.type == "neuron"
+            assert result.dtype == dtype
+
+            # Verify it fell back to CPU
+            assert_op_falls_back_on_cpu("aten::add.Tensor")
+
+        # Result should match CPU computation
+        expected = torch.add(x, x)
+        assert torch.allclose(result.cpu(), expected)
+
     @pytest.mark.parametrize(
         "shape1,shape2,shape3,expected_error",
         [
@@ -219,7 +195,7 @@ class TestCpuFallback:
 
 
 @pytest.mark.skipif(
-    os.environ.get("TORCH_NEURONX_SYNC_MODE") == "1",
+    os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
     reason="Async CPU fallback is only relevant with aysnc execution mode",
 )
 class TestCpuFallbackAsync:
@@ -247,7 +223,10 @@ class TestCpuFallbackAsync:
             assert result.device.type == "neuron"
             expected = x.to("cpu") * 2.5
             assert torch.allclose(result.to("cpu"), expected)
-            assert_op_falls_back_on_cpu("mul")
+            if use_mlir_aten_ops():
+                assert_op_falls_back_on_cpu("aten::mul.Tensor")
+            else:
+                assert_op_falls_back_on_cpu("mul")
 
     def test_static_arg_single_int(self):
         """Test CPU fallback with single int static arg: index_select(x, dim, index)."""
@@ -268,7 +247,10 @@ class TestCpuFallbackAsync:
             result = torch.nn.functional.pad(x, (1, 1), mode="constant", value=2.0)
             assert result.shape == (2, 5)
             assert result.device.type == "neuron"
-            assert_op_falls_back_on_cpu("aten::pad")
+            if use_mlir_aten_ops():
+                assert_op_falls_back_on_cpu("aten::constant_pad_nd")
+            else:
+                assert_op_falls_back_on_cpu("aten::pad")
 
     def test_static_arg_bool(self):
         """Test CPU fallback with bool as static args: triu with diagonal."""
