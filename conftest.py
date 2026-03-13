@@ -156,6 +156,14 @@ def pytest_addoption(parser):
         default=False,
         help="Run singlecore block perf (no distributed)",
     )
+    parser.addoption(
+        "--n_layers",
+        action="store",
+        type=int,
+        default=4,
+        help="Number of transformer layers for block perf benchmarks "
+        "(default: 4, mixtral_moe uses 2)",
+    )
 
     # Collective performance test options
     parser.addoption(
@@ -183,21 +191,35 @@ def pytest_addoption(parser):
         default=None,
         help="Timeout in seconds for remote workload execution",
     )
+    parser.addoption(
+        "--torch_version",
+        action="store",
+        default="stable",
+        choices=["stable", "nightly"],
+        help="PyTorch version: 'stable' or 'nightly'",
+    )
 
     # Performance regression gate options
     parser.addoption(
-        "--min_mfu",
+        "--mfu_threshold",
         action="store",
         type=float,
         default=None,
         help="Minimum MFU percentage threshold for perf regression gate",
     )
     parser.addoption(
-        "--max_peak_memory_gb",
+        "--peak_memory_gb",
         action="store",
         type=float,
         default=None,
         help="Maximum peak memory in GB for perf regression gate",
+    )
+    parser.addoption(
+        "--mfu_regression_tolerance",
+        action="store",
+        type=float,
+        default=0.10,
+        help="MFU regression tolerance (default: 0.10 = 10%)",
     )
 
 

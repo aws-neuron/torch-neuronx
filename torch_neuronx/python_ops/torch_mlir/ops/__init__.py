@@ -16,6 +16,7 @@ from .misc import *  # noqa: F403
 from .normalization import *  # noqa: F403
 from .optimizer import *  # noqa: F403
 from .reduction import *  # noqa: F403
+from .split_with_sizes_copy import *  # noqa: F403
 from .tensor_ops import *  # noqa: F403
 from .to_copy import *  # noqa: F403
 from .unary import *  # noqa: F403

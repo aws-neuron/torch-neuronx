@@ -1,7 +1,7 @@
 # Guidelines for running upstream PyTorch tests
 
 Framework for executing PyTorch upstream tests against torch_neuronx. The framework:
-1. Clones PyTorch test directory from GitHub
+1. Clones PyTorch test directory from GitHub (or optionally from a fork with device-agnostic changes)
 2. Auto-imports test modules and classes from the JSON spec
 3. Dynamically wraps PyTorch test classes for Neuron device compatibility (appends suffix like `PRIVATEUSE1` or `NEURON`)
 4. Executes each test method as a separate pytest
@@ -13,7 +13,28 @@ Test configurations are defined in JSON spec files (`specs/`).
 Clone PyTorch tests before running any tests:
 
 ```sh
-python tests/pytorch_tests/clone_tests.py --torch-version v2.8.0
+python tests/pytorch_tests/clone_tests.py --torch-version v2.10.0
+```
+
+### Device-Agnostic Tests (FSDP, etc.)
+
+For tests requiring device-agnostic changes (e.g., FSDP distributed tests), use the dedicated clone script:
+
+```sh
+# Clone from remote fork with device-agnostic changes
+python tests/pytorch_tests/clone_device_agnostic_tests.py
+
+# Clone from local pytorch fork
+python tests/pytorch_tests/clone_device_agnostic_tests.py --source-repo ../pytorch
+```
+
+This script:
+1. Clones from a PyTorch fork with PrivateUse1 backend support
+2. Patches test files to apply overlay and register Neuron backend in spawned processes
+
+Run PyTorch tests directly using the test file:
+```sh
+pytest tests/pytorch_tests/test/distributed/_composable/fsdp/test_fully_shard_training.py -sv
 ```
 
 ## Running Tests

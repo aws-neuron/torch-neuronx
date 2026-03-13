@@ -23,9 +23,11 @@ declare -A BLOCKS=(
     ["qwen3"]="qwen3-8b-1lyr"
     ["rms_norm"]="custom"
     ["rope"]="rope-gqa-32-8-torchtitan"
+    ["mixtral_moe"]="mixtral-8x7b"
 )
 
 ENABLE_PROFILE=""
+ENABLE_METRICS=""
 FILTER_BLOCKS=()
 
 while [[ $# -gt 0 ]]; do
@@ -34,18 +36,24 @@ while [[ $# -gt 0 ]]; do
             ENABLE_PROFILE="1"
             shift
             ;;
+        --metrics)
+            ENABLE_METRICS="1"
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--profile] [block1 block2 ...]"
+            echo "Usage: $0 [--profile] [--metrics] [block1 block2 ...]"
             echo ""
             echo "Compares ops-concat performance across transformer blocks."
             echo "By default, sweeps all blocks: ${!BLOCKS[*]}"
             echo ""
             echo "Options:"
             echo "  --profile    Enable torch profiler Chrome trace export"
+            echo "  --metrics    Enable NeuronMetrics collection and print concatenation metrics"
             echo ""
             echo "Examples:"
             echo "  $0                    # Run all blocks"
             echo "  $0 llama qwen3        # Run only llama and qwen3"
+            echo "  $0 --metrics llama    # Run llama with metrics report"
             echo "  $0 --profile llama    # Run llama with profiler traces"
             echo ""
             echo "For custom configs, use run_benchmarks.py directly."
@@ -89,22 +97,26 @@ for block in "${RUN_BLOCKS[@]}"; do
     # Build base command
     BASE_CMD="python run_benchmarks.py --block $block --preset $preset"
 
+    # Build metrics flag if enabled
+    METRICS_FLAG=""
+    [[ -n "$ENABLE_METRICS" ]] && METRICS_FLAG="--metrics"
+
     # Without ops-concat
     NO_CONCAT_LOG="${block}_${safe_preset}_no_concat.log"
-    RUN_CMD="$BASE_CMD"
+    RUN_CMD="$BASE_CMD $METRICS_FLAG"
     [[ -n "$ENABLE_PROFILE" ]] && RUN_CMD="$RUN_CMD --trace_json ${block}_${safe_preset}_no_concat_trace.json"
 
     echo "Without ops-concat -> $NO_CONCAT_LOG"
-    TORCH_NEURONX_ENABLE_CONCATENATION=0 $RUN_CMD 2>&1 | tee "$NO_CONCAT_LOG"
+    TORCH_NEURONX_ENABLE_CONCATENATION=0 TORCH_NEURONX_METRICS_ENABLED=${ENABLE_METRICS:-0} $RUN_CMD 2>&1 | tee "$NO_CONCAT_LOG"
 
     # With ops-concat
     WITH_CONCAT_LOG="${block}_${safe_preset}_with_concat.log"
-    RUN_CMD="$BASE_CMD"
+    RUN_CMD="$BASE_CMD $METRICS_FLAG"
     [[ -n "$ENABLE_PROFILE" ]] && RUN_CMD="$RUN_CMD --trace_json ${block}_${safe_preset}_with_concat_trace.json"
 
     echo ""
     echo "With ops-concat -> $WITH_CONCAT_LOG"
-    TORCH_NEURONX_ENABLE_CONCATENATION=1 $RUN_CMD 2>&1 | tee "$WITH_CONCAT_LOG"
+    TORCH_NEURONX_ENABLE_CONCATENATION=1 TORCH_NEURONX_METRICS_ENABLED=${ENABLE_METRICS:-0} $RUN_CMD 2>&1 | tee "$WITH_CONCAT_LOG"
 done
 
 echo ""

@@ -34,11 +34,11 @@ class TestAmaxAmin:
             assert_op_runs_on_neuron(f"aten::{op_name}")
 
     @pytest.mark.parametrize("op_name,op_func", [("amax", torch.amax), ("amin", torch.amin)])
-    @pytest.mark.parametrize("dim", [0, 1, -1])
-    def test_op_with_dim(self, device, op_name, op_func, dim):
+    @pytest.mark.parametrize("shape,dim", [((3, 4), 0), ((3, 4), 1), ((3, 4), -1), ((), 0)])
+    def test_op_with_dim(self, device, op_name, op_func, shape, dim):
         """Test operation with specific dimensions."""
         with track_neuron_ops():
-            x = torch.randn(3, 4, device=device)
+            x = torch.randn(shape, device=device)
             neuron_result = op_func(x, dim=dim)
             cpu_result = op_func(x.cpu(), dim=dim)
 
@@ -152,3 +152,23 @@ class TestAmaxAmin:
             assert out.device.type == "neuron"
             torch.testing.assert_close(out.cpu(), cpu_result)
             assert_op_runs_on_neuron(f"aten::{op_name}")
+
+    @pytest.mark.parametrize("op_name,op_func", [("amax", torch.amax), ("amin", torch.amin)])
+    @assert_raises(IndexError, match="Dimension out of range")
+    def test_op_scalar_invalid_dim(self, device, op_name, op_func):
+        """Test operation on scalar tensor with invalid dimension."""
+        with track_neuron_ops():
+            x = torch.tensor(3.0, device=device)
+            op_func(x, dim=[1], keepdim=True)
+
+    @pytest.mark.parametrize("op_name,op_func", [("amax", torch.amax), ("amin", torch.amin)])
+    @pytest.mark.parametrize("keepdim", [False, True])
+    def test_op_scalar_keepdim(self, device, op_name, op_func, keepdim):
+        """Test operation on scalar tensor respects keepdim."""
+        with track_neuron_ops():
+            x = torch.tensor(3.0, device=device)
+            neuron_result = op_func(x, dim=0, keepdim=keepdim)
+            cpu_result = op_func(x.cpu(), dim=0, keepdim=keepdim)
+
+            assert neuron_result.shape == cpu_result.shape
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)

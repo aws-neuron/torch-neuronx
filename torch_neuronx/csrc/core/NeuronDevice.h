@@ -55,6 +55,9 @@ int get_rank();
 // Mainly used for testing
 void reset_distributed_state();
 
+// Check if distributed state has been initialized (non-throwing).
+bool is_distributed_initialized();
+
 }  // namespace c10_neuron
 
 namespace torch_neuronx {

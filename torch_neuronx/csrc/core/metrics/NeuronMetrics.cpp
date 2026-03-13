@@ -46,6 +46,15 @@
 #include <iomanip>
 #include <sstream>
 
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
+
+extern "C" {
+#include <nrt/nrt.h>
+}
+
+namespace NeuronMemorySnapshot = c10_neuron::NeuronMemorySnapshot;
+
 namespace at::neuron::metrics {
 
 // =============================================================================
@@ -443,17 +452,71 @@ std::string CreateMetricReport(const std::vector<std::string>& counter_names,
 // Memory Statistics Helper Functions implementation
 // =============================================================================
 
-void RecordNewAllocation(int device_id, size_t size_bytes) {
+void RecordNewAllocation(int device_id, size_t size_bytes, void* tensor_data_ptr,
+                         c10::StreamId stream_id,
+                         const std::shared_ptr<NeuronMemorySnapshot::StackContext>& context) {
   auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
   stats.allocated_bytes.increase(size_bytes);
   stats.active_bytes.increase(size_bytes);
+
+  if (NeuronMemorySnapshot::IsRecordingEnabled()) {
+    NeuronMemorySnapshot::RecordTrace(NeuronMemorySnapshot::TraceAction::ALLOC, device_id,
+                                      reinterpret_cast<size_t>(tensor_data_ptr), size_bytes,
+                                      stream_id, context);
+  }
 }
 
-void RecordDeallocation(int device_id, size_t size_bytes) {
+void RecordDeallocation(int device_id, size_t size_bytes, void* tensor_data_ptr,
+                        c10::StreamId stream_id,
+                        const std::shared_ptr<NeuronMemorySnapshot::StackContext>& context) {
   auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
   stats.num_tensor_frees.fetch_add(1, std::memory_order_relaxed);
   stats.active_bytes.decrease(size_bytes);
   stats.allocated_bytes.decrease(size_bytes);
+  if (NeuronMemorySnapshot::IsRecordingEnabled()) {
+    NeuronMemorySnapshot::RecordTrace(NeuronMemorySnapshot::TraceAction::FREE_REQUESTED, device_id,
+                                      reinterpret_cast<size_t>(tensor_data_ptr), size_bytes,
+                                      stream_id, context);
+  }
+}
+
+void RecordDeallocationCompleted(
+    int device_id, size_t size_bytes, void* tensor_data_ptr, c10::StreamId stream_id,
+    const std::shared_ptr<NeuronMemorySnapshot::StackContext>& context) {
+  if (NeuronMemorySnapshot::IsRecordingEnabled()) {
+    NeuronMemorySnapshot::RecordTrace(NeuronMemorySnapshot::TraceAction::FREE_COMPLETED, device_id,
+                                      reinterpret_cast<size_t>(tensor_data_ptr), size_bytes,
+                                      stream_id, context);
+  }
+}
+
+void RecordOOMRetry(int device_id) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_alloc_retries.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream_id,
+                      const std::shared_ptr<NeuronMemorySnapshot::StackContext>& context) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_ooms.fetch_add(1, std::memory_order_relaxed);
+
+  if (NeuronMemorySnapshot::IsRecordingEnabled()) {
+    size_t device_free = 0;
+    // Try to get free memory from VNC stats
+    nrt_vnc_memory_stats_t memory_stats;
+    size_t stats_size_out;
+    NRT_STATUS mem_status =
+        nrt_get_vnc_memory_stats(static_cast<uint32_t>(c10_neuron::get_vnc_id(device_id)),
+                                 &memory_stats, sizeof(memory_stats), &stats_size_out);
+    if (mem_status == NRT_SUCCESS) {
+      device_free = memory_stats.bytes_limit - memory_stats.bytes_used;
+    }
+
+    NeuronMemorySnapshot::RecordTrace(
+        NeuronMemorySnapshot::TraceAction::OOM, device_id,
+        requested_size,  // For OOM, addr field stores the requested size
+        requested_size, stream_id, context, device_free);
+  }
 }
 
 // =============================================================================
@@ -482,46 +545,62 @@ DeviceMemoryStats& DeviceMemoryStatsRegistry::GetDeviceStats(int device_index) {
 }
 
 DeviceMemoryStatsInfo DeviceMemoryStatsRegistry::GetMemoryStats(int device_index) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  DeviceMemoryStats* stats_ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  // Return zeros if device not initialized
-  if (device_index >= static_cast<int>(device_stats_.size()) || !device_stats_[device_index]) {
-    return DeviceMemoryStatsInfo{};
-  }
+    // Return zeros if device not initialized
+    if (device_index >= static_cast<int>(device_stats_.size()) || !device_stats_[device_index]) {
+      return DeviceMemoryStatsInfo{};
+    }
 
-  const auto& stats = *device_stats_[device_index];
+    stats_ptr = device_stats_[device_index].get();
+  }  // Release lock before reading atomics
 
-  return DeviceMemoryStatsInfo{{stats.allocated_bytes.current.load(std::memory_order_relaxed),
-                                stats.allocated_bytes.peak.load(std::memory_order_relaxed),
-                                stats.allocated_bytes.allocated.load(std::memory_order_relaxed),
-                                stats.allocated_bytes.freed.load(std::memory_order_relaxed)},
-                               {stats.reserved_bytes.current.load(std::memory_order_relaxed),
-                                stats.reserved_bytes.peak.load(std::memory_order_relaxed),
-                                stats.reserved_bytes.allocated.load(std::memory_order_relaxed),
-                                stats.reserved_bytes.freed.load(std::memory_order_relaxed)},
-                               {stats.active_bytes.current.load(std::memory_order_relaxed),
-                                stats.active_bytes.peak.load(std::memory_order_relaxed),
-                                stats.active_bytes.allocated.load(std::memory_order_relaxed),
-                                stats.active_bytes.freed.load(std::memory_order_relaxed)},
-                               stats.num_alloc_retries.load(std::memory_order_relaxed),
-                               stats.num_ooms.load(std::memory_order_relaxed),
-                               stats.num_tensor_frees.load(std::memory_order_relaxed),
-                               stats.allocation_requests.load(std::memory_order_relaxed)};
+  return DeviceMemoryStatsInfo{
+      {stats_ptr->allocated_bytes.current.load(std::memory_order_relaxed),
+       stats_ptr->allocated_bytes.peak.load(std::memory_order_relaxed),
+       stats_ptr->allocated_bytes.allocated.load(std::memory_order_relaxed),
+       stats_ptr->allocated_bytes.freed.load(std::memory_order_relaxed)},
+      {stats_ptr->reserved_bytes.current.load(std::memory_order_relaxed),
+       stats_ptr->reserved_bytes.peak.load(std::memory_order_relaxed),
+       stats_ptr->reserved_bytes.allocated.load(std::memory_order_relaxed),
+       stats_ptr->reserved_bytes.freed.load(std::memory_order_relaxed)},
+      {stats_ptr->active_bytes.current.load(std::memory_order_relaxed),
+       stats_ptr->active_bytes.peak.load(std::memory_order_relaxed),
+       stats_ptr->active_bytes.allocated.load(std::memory_order_relaxed),
+       stats_ptr->active_bytes.freed.load(std::memory_order_relaxed)},
+      stats_ptr->num_alloc_retries.load(std::memory_order_relaxed),
+      stats_ptr->num_ooms.load(std::memory_order_relaxed),
+      stats_ptr->num_tensor_frees.load(std::memory_order_relaxed),
+      stats_ptr->allocation_requests.load(std::memory_order_relaxed)};
 }
 
 void DeviceMemoryStatsRegistry::ResetPeakStats(int device_index) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (device_index < static_cast<int>(device_stats_.size()) && device_stats_[device_index]) {
-    device_stats_[device_index]->reset_peak();
-  }
+  DeviceMemoryStats* stats_ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (device_index >= static_cast<int>(device_stats_.size()) || !device_stats_[device_index]) {
+      return;
+    }
+    stats_ptr = device_stats_[device_index].get();
+  }  // Release lock before modifying atomics
+
+  stats_ptr->reset_peak();
 }
 
 void DeviceMemoryStatsRegistry::ResetAccumulatedStats(int device_index) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (device_index < static_cast<int>(device_stats_.size()) && device_stats_[device_index]) {
-    device_stats_[device_index]->reset_counters();
-    device_stats_[device_index]->reset_accumulated();
-  }
+  DeviceMemoryStats* stats_ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (device_index >= static_cast<int>(device_stats_.size()) || !device_stats_[device_index]) {
+      return;
+    }
+    stats_ptr = device_stats_[device_index].get();
+  }  // Release lock before modifying atomics
+
+  stats_ptr->reset_counters();
+  stats_ptr->reset_accumulated();
 }
 
 }  // namespace at::neuron::metrics

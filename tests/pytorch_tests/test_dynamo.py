@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 PYTORCH_TEST_CONFIGS = setup_pytorch_tests(spec_file="dynamo_spec.json", collect_skipped_tests=True)
 
 
+def get_class_key(config):
+    file_name = config.test_module.__file__.split("/")[-1].split(".")[0]
+    return f"{file_name}__{config.test_class_name}"
+
+
 def get_method_name(config, test):
     config_name = config.test_module.__file__.split("/")[-1]
     config_name = config_name.split(".")[0]
@@ -36,11 +41,12 @@ class TestPytorchDynamoWrapper:
         cls.pytorch_test_classes = {}
         for config in PYTORCH_TEST_CONFIGS:
             test_class = getattr(config.test_module, config.test_class_name)
-            cls.pytorch_test_classes[config.test_class_name] = test_class
+            cls.pytorch_test_classes[get_class_key(config)] = test_class
 
-    def _run_pytorch_test(self, class_name, method_name):
+    def _run_pytorch_test(self, class_key, method_name):
+        class_name = class_key.split("__")[-1]
         with get_context_for_class(class_name):
-            test_instance = self.pytorch_test_classes[class_name]()
+            test_instance = self.pytorch_test_classes[class_key]()
             if hasattr(test_instance, "setUp"):
                 test_instance.setUp()
             try:
@@ -66,11 +72,11 @@ for config in PYTORCH_TEST_CONFIGS:
     for method_name in config.test_methods:
 
         def create_test_method(config, method_name):
-            test_class_name = config.test_class_name
+            class_key = get_class_key(config)
             test_attribute_name = get_method_name(config, method_name)
 
             def test_method(self):
-                self._run_pytorch_test(test_class_name, method_name)
+                self._run_pytorch_test(class_key, method_name)
 
             test_method.__name__ = f"{test_attribute_name}"
             test_method.__doc__ = f"PyTorch Dynamo {method_name} test"

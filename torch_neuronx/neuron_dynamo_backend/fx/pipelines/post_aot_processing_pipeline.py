@@ -14,6 +14,9 @@ from torch.fx.passes.infra.pass_manager import PassManager
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     CollectiveLegalization,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.dtensor_redistribute_optimization import (
+    DTensorRedistributeOptimization,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
     FlexAttentionLegalization,
 )
@@ -48,6 +51,7 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
     random_op_pass = RandomOpLegalization()
     remove_none_outputs = RemoveNoneOutputs()
     collective_legalization = CollectiveLegalization()
+    dtensor_redistribute = DTensorRedistributeOptimization()
 
     pm = PassManager(
         passes=[
@@ -55,6 +59,7 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
             functionalize_pass,
             random_op_pass,
             remove_none_outputs,
+            dtensor_redistribute,  # Before collective legalization
             collective_legalization,
         ],
         run_checks_after_each_pass=True,

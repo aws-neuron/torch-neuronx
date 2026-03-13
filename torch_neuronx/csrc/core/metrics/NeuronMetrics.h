@@ -41,6 +41,7 @@
 #ifndef TORCH_NEURON_CSRC_CORE_METRICS_NEURON_METRICS_H_
 #define TORCH_NEURON_CSRC_CORE_METRICS_NEURON_METRICS_H_
 
+#include <c10/core/Stream.h>
 #include <c10/util/Exception.h>
 
 #include <atomic>
@@ -51,6 +52,13 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+// Forward declaration for NeuronMemorySnapshot types
+namespace c10_neuron {
+namespace NeuronMemorySnapshot {
+struct StackContext;
+}  // namespace NeuronMemorySnapshot
+}  // namespace c10_neuron
 
 namespace at::neuron::metrics {
 
@@ -470,19 +478,47 @@ struct DeviceMemoryStatsInfo {
 // Memory Statistics Helper Functions
 // These functions provide a clean API for recording memory allocation events.
 // They should be used by allocator code to update stats consistently.
+// When snapshot parameters are provided, memory traces are also recorded.
 // =============================================================================
 
 /**
  * Record stats for a new allocation from NRT.
  * Updates allocated_bytes and active_bytes.
+ * If snapshot params provided, also records SEGMENT_ALLOC trace.
  */
-void RecordNewAllocation(int device_id, size_t size_bytes);
+void RecordNewAllocation(
+    int device_id, size_t size_bytes, void* tensor_data_ptr = nullptr, c10::StreamId stream_id = 0,
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr);
 
 /**
  * Record stats for a deallocation (memory freed back to NRT).
  * Increments num_tensor_frees and decreases active_bytes and allocated_bytes.
  */
-void RecordDeallocation(int device_id, size_t size_bytes);
+void RecordDeallocation(
+    int device_id, size_t size_bytes, void* tensor_data_ptr = nullptr, c10::StreamId stream_id = 0,
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr);
+
+/**
+ * Record deallocation completed trace (called after cache operation completes).
+ * Only records FREE_COMPLETED trace if snapshot recording is enabled.
+ */
+void RecordDeallocationCompleted(
+    int device_id, size_t size_bytes, void* tensor_data_ptr, c10::StreamId stream_id,
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context);
+
+/**
+ * Record an OOM retry attempt (cache cleared, retrying allocation).
+ * Increments num_alloc_retries.
+ */
+void RecordOOMRetry(int device_id);
+
+/**
+ * Record an OOM failure (allocation failed even after retry).
+ * Increments num_ooms and records OOM trace if snapshot recording is enabled.
+ */
+void RecordOOMFailure(
+    int device_id, size_t requested_size, c10::StreamId stream_id,
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context);
 
 /**
  * Global registry for per-device memory statistics.

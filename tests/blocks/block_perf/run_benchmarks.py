@@ -83,7 +83,8 @@ class StackedBlocks(nn.Module):
     def forward(self, x, *args, **kwargs):
         """Forward pass through all stacked layers."""
         for layer in self.layers:
-            x = layer(x, *args, **kwargs)
+            result = layer(x, *args, **kwargs)
+            x = result[0] if isinstance(result, tuple) else result
         return x
 
 
@@ -764,6 +765,7 @@ def main():
             "qwen3_torchtitan",
             "rms_norm",
             "rope",
+            "mixtral_moe",
         ],
     )
     args_temp, _ = parser_temp.parse_known_args()
@@ -790,6 +792,7 @@ def main():
             "gpt_oss",
             "gpt_oss_transformer",
             "rope",
+            "mixtral_moe",
         ],
         help="Block type to benchmark (default: llama)",
     )
@@ -891,13 +894,13 @@ def main():
         help="Enable Neuron/NRT profiling (default: PyTorch profiler only)",
     )
     parser.add_argument(
-        "--min-mfu",
+        "--mfu-threshold",
         type=float,
         default=None,
         help="Minimum MFU %% threshold - fails if below (perf regression gate)",
     )
     parser.add_argument(
-        "--max-peak-memory-gb",
+        "--peak-memory-gb",
         type=float,
         default=None,
         help="Max peak memory in GB - fails if exceeded (memory regression gate)",
@@ -909,9 +912,27 @@ def main():
         help="Capture Python stack traces with line numbers (default: False)",
     )
 
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Enable NeuronMetrics collection and print full metrics/op-tracking report",
+    )
+
     # Parse all arguments
     args = parser.parse_args()
     setup_distributed(args.device)
+
+    # Enable metrics collection if requested
+    if args.metrics:
+        import torch_neuronx.metrics as met
+
+        met.set_enabled(True)
+        met.clear_all()
+        import torch_neuronx
+
+        torch_neuronx.clear_op_tracking()
+        # Enable detailed per-type concatenation profiling via centralized metrics toggle
+        met.set_concatenation_profiling_enabled(True)
 
     # Re-import the module (already imported above but we do it again for clarity)
     block_module = importlib.import_module(f"block_perf.{args.block}")
@@ -979,23 +1000,97 @@ def main():
 
     # Perf regression check (only on rank 0)
     if (dist.is_initialized() and dist.get_rank() == 0) or not dist.is_initialized():
-        if args.min_mfu is not None:
+        if args.mfu_threshold is not None:
             mfu_metrics = results["metrics"].get("mfu_metrics")
             if mfu_metrics:
                 actual_mfu = mfu_metrics["mfu_percent"]
-                printf(f"\nPerf gate: MFU {actual_mfu:.2f}% >= {args.min_mfu}%")
+                printf(f"\nPerf gate: MFU {actual_mfu:.2f}% >= {args.mfu_threshold}%")
                 assert (
-                    actual_mfu >= args.min_mfu
-                ), f"MFU regression: {actual_mfu:.2f}% < {args.min_mfu}% minimum"
+                    actual_mfu >= args.mfu_threshold
+                ), f"FAILED: MFU regression: {actual_mfu:.2f}% < {args.mfu_threshold}% minimum"
+                printf("PASSED")
 
-        if args.max_peak_memory_gb is not None:
+        if args.peak_memory_gb is not None:
             mem_stats = results.get("memory_stats")
             if mem_stats:
                 peak_gb = mem_stats["allocated_bytes_peak"] / 1e9
-                printf(f"\nMemory gate: Peak {peak_gb:.2f} GB <= {args.max_peak_memory_gb} GB")
+                printf(f"\nMemory gate: Peak {peak_gb:.2f} GB <= {args.peak_memory_gb} GB")
                 assert (
-                    peak_gb <= args.max_peak_memory_gb
-                ), f"Memory regression: {peak_gb:.2f} GB > {args.max_peak_memory_gb} GB max"
+                    peak_gb <= args.peak_memory_gb
+                ), f"FAILED: Memory regression: {peak_gb:.2f} GB > {args.peak_memory_gb} GB max"
+                printf("PASSED")
+
+    # Print metrics report if enabled
+    if args.metrics:
+        import torch_neuronx
+        import torch_neuronx.metrics as met
+
+        printf("\n" + "=" * 40)
+        printf("NEURON METRICS REPORT")
+        printf("=" * 40)
+
+        # Concatenation status diagnostic
+        concat_status = torch_neuronx.get_concatenation_status()
+        printf("\nConcatenation Status:")
+        printf(f"  Enabled: {concat_status['enabled']}")
+        printf(f"  Active: {concat_status['is_active']}")
+        printf(
+            f"  Concatenated ops in executed: {len(concat_status['concatenated_ops_in_executed'])}"
+        )
+        printf(f"  Individual ops in executed: {len(concat_status['individual_ops_in_executed'])}")
+        printf(f"  Groups tracked: {concat_status['concatenated_groups_tracked']}")
+        printf(f"  Diagnosis: {concat_status['diagnosis']}")
+
+        # All collected metrics (compilation + concatenation + future)
+        all_metrics = met.get_metrics_dict()
+        if all_metrics:
+            printf("\nCollected Metrics:")
+            for name, value in sorted(all_metrics.items()):
+                if isinstance(value, dict):
+                    printf(f"  {name}: {value.get('formatted', value)}")
+                else:
+                    printf(f"  {name}: {value}")
+        else:
+            printf("\nNo metrics collected (enable with TORCH_NEURONX_METRICS_ENABLED=1)")
+
+        # Op tracking
+        executed_ops = torch_neuronx.get_executed_ops()
+        printf(f"\nExecuted ops ({len(executed_ops)} unique):")
+        for op in sorted(executed_ops):
+            marker = " [CONCATENATED]" if "|" in op else ""
+            printf(f"  {op}{marker}")
+
+        concatenated_ops = torch_neuronx.get_concatenated_ops()
+        if concatenated_ops:
+            execution_counts = torch_neuronx.get_concatenated_op_execution_counts()
+            printf(f"\nConcatenated op groups ({len(concatenated_ops)}):")
+            for concat_name, original_ops in concatenated_ops.items():
+                count = execution_counts.get(concat_name, 0)
+                cache_hits = max(0, count - 1)
+                printf(f"  {concat_name}  (executions={count}, cache_hits={cache_hits})")
+                for orig in original_ops:
+                    printf(f"    <- {orig}")
+
+        # Per-type concatenation profiles
+        profiles = torch_neuronx.get_concatenation_profiles()
+        if profiles:
+            printf(f"\nPer-type concatenation profiles ({len(profiles)} types):")
+            for op_name, profile in sorted(profiles.items()):
+                printf(f"  {op_name}:")
+                printf(f"    Invocations: {profile['invocation_count']}")
+                printf(f"    Avg merge time: {profile['avg_merge_time_ms']:.3f} ms")
+                printf(f"    Avg group size: {profile['avg_group_size']:.1f} ops")
+                if len(profile["merge_times_ns"]) <= 10:
+                    times_ms = [t / 1e6 for t in profile["merge_times_ns"]]
+                    printf(f"    Merge times (ms): {[f'{t:.3f}' for t in times_ms]}")
+
+        # Full report
+        full_report = met.report()
+        if full_report:
+            printf("\nFull Metrics Report:")
+            printf(full_report)
+
+        printf("=" * 40)
 
     printf("\nBenchmark completed successfully!")
 

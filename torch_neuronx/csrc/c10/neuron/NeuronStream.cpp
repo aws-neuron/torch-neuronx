@@ -16,6 +16,7 @@
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
+#include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
@@ -59,13 +60,10 @@ std::array<StreamImpl*, kMaxDevices> default_streams{};
 std::array<std::atomic<uint32_t>, kMaxDevices> stream_counters{};
 std::atomic<uint32_t> round_robin_counter{0};
 
-// Check if host-cc is enabled via environment variables.
+// Check if host-cc is enabled via environment variable.
 bool IsHostCCEnabled() {
   const char* host_cc = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-  const char* async_nrt = std::getenv("TORCH_NEURONX_ENABLE_ASYNC_NRT");
-  bool host_cc_on = host_cc && std::string(host_cc) == "1";
-  bool async_nrt_on = async_nrt && std::string(async_nrt) == "1";
-  return host_cc_on && async_nrt_on;
+  return host_cc && std::string(host_cc) == "1";
 }
 
 void EnableHostCC(int stream_pool_size) {
@@ -296,13 +294,14 @@ void SubmitOperationContext(const NeuronStream& stream,
 
   operation->pytorch_thread_id = at::RecordFunction::currentThreadId();
   operation->kineto_correlation_id = at::neuron::CorrelationTracker::current();
+  operation->event_id = ProfilerMappingCollector::GenerateEventId();
 
   TORCH_NEURONX_TRACE_FUNCTION_WITH_ARGS("op_name=", operation->GetOpName());
-  TORCH_NEURONX_DEBUG("Submit operation context", "stream_id=", stream.id(),
-                      "op=", operation->GetOpName(),
-                      "device=", static_cast<int>(stream.device_index()),
-                      "pytorch_seq_nr=", operation->pytorch_sequence_nr,
-                      "pytorch_tid=", operation->pytorch_thread_id);
+  TORCH_NEURONX_DEBUG(
+      "Submit operation context", "stream_id=", stream.id(), "op=", operation->GetOpName(),
+      "device=", static_cast<int>(stream.device_index()),
+      "pytorch_seq_nr=", operation->pytorch_sequence_nr,
+      "pytorch_tid=", operation->pytorch_thread_id, "event_id=", operation->event_id);
 
   // Capture priority from stream_id before routing to HW queue
   operation->stream_priority = GetPriorityFromStreamId(stream.id());

@@ -6,6 +6,7 @@ repos:
         args: [--fix]
         exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/
       - id: ruff-format
+        exclude: ^tests/pytorch_tests/clone_tests\.py$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.0
     hooks:

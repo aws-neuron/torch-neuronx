@@ -273,16 +273,13 @@ def get_cache_size(kernel):
 def requires_nrt_streams(test_func):
     """Decorator to enable multi-stream mode for tests that require unique streams.
 
-    Sets TORCH_NEURONX_ENABLE_HOST_CC=1 and TORCH_NEURONX_ENABLE_ASYNC_NRT=1
-    for the duration of the test.
+    Sets TORCH_NEURONX_ENABLE_HOST_CC=1 for the duration of the test.
     """
 
     @wraps(test_func)
     def wrapper(*args, **kwargs):
         old_host_cc = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
-        old_async_nrt = os.environ.get("TORCH_NEURONX_ENABLE_ASYNC_NRT")
         os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
-        os.environ["TORCH_NEURONX_ENABLE_ASYNC_NRT"] = "1"
         try:
             return test_func(*args, **kwargs)
         finally:
@@ -290,10 +287,6 @@ def requires_nrt_streams(test_func):
                 del os.environ["TORCH_NEURONX_ENABLE_HOST_CC"]
             else:
                 os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_host_cc
-            if old_async_nrt is None:
-                del os.environ["TORCH_NEURONX_ENABLE_ASYNC_NRT"]
-            else:
-                os.environ["TORCH_NEURONX_ENABLE_ASYNC_NRT"] = old_async_nrt
 
     return wrapper
 

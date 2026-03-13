@@ -3,6 +3,7 @@ Trivial 1 core sanity tests for torch.compile functionality on neuron backend.
 """
 
 import os
+from typing import ClassVar
 
 import pytest
 import torch
@@ -14,6 +15,13 @@ assert torch.neuron.device_count() > 0, "No neuron devices were discovered."
 
 class TestTorchCompileBackend:
     """Test trivial torch.compile tests with neuron backend."""
+
+    COMPILE_OPTIONS: ClassVar[dict] = {}  # Subclasses can override
+
+    def _compile(self, fn, **kwargs):
+        """Compile with backend options. Subclasses override COMPILE_OPTIONS."""
+        options = {**self.COMPILE_OPTIONS, **kwargs}
+        return torch.compile(fn, backend="neuron", options=options if options else None)
 
     def test_backend_available(self):
         """Test `neuron` backend is available under dynamo."""
@@ -32,7 +40,7 @@ class TestTorchCompileBackend:
 
         with torch.inference_mode():
             model = SimpleModel().to("neuron")
-            compiled_model = torch.compile(model, backend="neuron")
+            compiled_model = self._compile(model)
 
             # Create CPU model with same parameters
             cpu_model = SimpleModel()
@@ -85,7 +93,7 @@ class TestTorchCompileBackend:
         with torch.inference_mode():
             x = torch.randn(batch_size, in_features).to("neuron")
             eager_output = model(x)
-            compiled_model = torch.compile(model, backend="neuron")
+            compiled_model = self._compile(model)
             compiled_output = compiled_model(x)
 
         torch.testing.assert_close(compiled_output, eager_output, rtol=1e-4, atol=1e-4)
@@ -93,10 +101,10 @@ class TestTorchCompileBackend:
     def test_cpu_tensor_handling(self):
         """Test CPU tensors are handled on neuron backend during execution."""
 
-        @torch.compile(backend="neuron")
         def fn(x):
             return x * 2
 
+        fn = self._compile(fn)
         x_cpu = torch.randn(10, device="cpu")
         y = fn(x_cpu)
 
@@ -137,10 +145,10 @@ class TestTorchCompileBackend:
     def test_multiple_outputs(self):
         """Test function with multiple outputs"""
 
-        @torch.compile(backend="neuron")
         def fn(x):
             return x + 1, x * 2
 
+        fn = self._compile(fn)
         x = torch.randn(5, device="neuron")
         y1, y2 = fn(x)
 
@@ -152,10 +160,10 @@ class TestTorchCompileBackend:
     def test_where_with_scalar(self):
         """Test torch.where with scalar broadcast"""
 
-        @torch.compile(backend="neuron")
         def fn(x, y, z):
             return torch.where(x, y, z)
 
+        fn = self._compile(fn)
         x = torch.tensor([True, False], device="neuron")
         y = torch.tensor([0.0, 0.0], device="neuron")
         z = torch.tensor(1.0, device="neuron")
@@ -169,10 +177,10 @@ class TestTorchCompileBackend:
     def test_add_default_dtype(self):
         """Test torch.add with default 64-bit dtypes"""
 
-        @torch.compile(backend="neuron")
         def fn(x, y):
             return torch.add(x, y)
 
+        fn = self._compile(fn)
         x = torch.tensor([3, 4], dtype=torch.int64, device="neuron")
         y = torch.tensor([3, 4], dtype=torch.int64, device="neuron")
 
@@ -186,10 +194,10 @@ class TestTorchCompileBackend:
     def test_add_float64(self):
         """Test torch.add with float 64-bit dtypes"""
 
-        @torch.compile(backend="neuron")
         def fn(x, y):
             return torch.add(x, y)
 
+        fn = self._compile(fn)
         x = torch.tensor([3, 4], dtype=torch.float64, device="neuron")
         y = torch.tensor([3, 4], dtype=torch.float64, device="neuron")
 
@@ -207,12 +215,12 @@ class TestTorchCompileBackend:
     def test_print_with_cpu_conversion(self, capsys):
         """Test that printing tensors with .cpu() works inside compiled functions."""
 
-        @torch.compile(backend="neuron")
         def fn(x, y):
             tmp = torch.add(x, y)
             print(f"Output from print: {tmp.cpu()}")
             return tmp * 2
 
+        fn = self._compile(fn)
         x = torch.tensor([3.0, 4.0], dtype=torch.float32, device="neuron")
         y = torch.tensor([1.0, 2.0], dtype=torch.float32, device="neuron")
 
@@ -235,7 +243,6 @@ class TestTorchCompileBackend:
     def test_print_cpu_tensor_operations(self, capsys):
         """Test various operations on CPU tensors inside compiled functions."""
 
-        @torch.compile(backend="neuron")
         def fn(x):
             # Convert to CPU
             cpu_x = x.cpu()
@@ -254,6 +261,7 @@ class TestTorchCompileBackend:
 
             return x * 2
 
+        fn = self._compile(fn)
         x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="neuron")
         result = fn(x)
 
@@ -270,7 +278,6 @@ class TestTorchCompileBackend:
     def test_print_multiple_cpu_conversions(self, capsys):
         """Test multiple .cpu() calls in compiled function."""
 
-        @torch.compile(backend="neuron")
         def fn(x, y):
             tmp1 = x + y
             print(f"First: {tmp1.cpu()}")
@@ -280,6 +287,7 @@ class TestTorchCompileBackend:
 
             return tmp2
 
+        fn = self._compile(fn)
         x = torch.tensor([1.0, 2.0], dtype=torch.float32, device="neuron")
         y = torch.tensor([3.0, 4.0], dtype=torch.float32, device="neuron")
 
@@ -297,7 +305,6 @@ class TestTorchCompileBackend:
     def test_print_cpu_tensor_indexing(self, capsys):
         """Test indexing CPU tensors inside compiled functions."""
 
-        @torch.compile(backend="neuron")
         def fn(x):
             cpu_x = x.cpu()
 
@@ -311,6 +318,7 @@ class TestTorchCompileBackend:
 
             return x + 1
 
+        fn = self._compile(fn)
         x = torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32, device="neuron")
         result = fn(x)
 
@@ -326,7 +334,6 @@ class TestTorchCompileBackend:
     def test_print_cpu_tensor_with_item(self, capsys):
         """Test .item() on CPU tensors inside compiled functions."""
 
-        @torch.compile(backend="neuron")
         def fn(x):
             cpu_x = x.cpu()
 
@@ -336,6 +343,7 @@ class TestTorchCompileBackend:
 
             return x * 2
 
+        fn = self._compile(fn)
         x = torch.tensor([5.0], dtype=torch.float32, device="neuron")
         result = fn(x)
 

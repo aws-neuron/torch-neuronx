@@ -50,7 +50,7 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
         # - bool: Requires special handling, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.bool)
+        unsupported_dtypes = (torch.float64, torch.bool, torch.int64)
         return (
             dest.device.type == "neuron"
             and src.device.type == "neuron"
@@ -94,6 +94,4 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         # kwargs may already contain 'out' from dispatch, but we rewrite for safety
         mlir_kwargs["out"] = dest
 
-        result = super().execute(src_prepared, **mlir_kwargs)
-
-        return result
+        return super().execute(src_prepared, **mlir_kwargs)

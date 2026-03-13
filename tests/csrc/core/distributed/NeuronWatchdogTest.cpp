@@ -273,21 +273,6 @@ TEST_F(NeuronWatchdogTest, CleanupCompletedShelvesOnEmptyWatchdog) {
   EXPECT_NO_THROW(watchdog.cleanupCompletedShelves());
 }
 
-// Test the timing behavior - cleanup waits for CLEANUP_WAIT_MILLIS
-TEST_F(NeuronWatchdogTest, CleanupWaitsForConfiguredTimeout) {
-  NeuronWatchdog watchdog;
-
-  auto start = std::chrono::steady_clock::now();
-  watchdog.cleanupCompletedShelves();
-  auto end = std::chrono::steady_clock::now();
-
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-  // Should wait at least CLEANUP_WAIT_MILLIS (1ms)
-  // Allow some slack for system variance
-  EXPECT_GE(duration.count(), NeuronWatchdog::CLEANUP_WAIT_MILLIS);
-  EXPECT_LT(duration.count(), NeuronWatchdog::CLEANUP_WAIT_MILLIS + 10);
-}
-
 // =============================================================================
 // Thread Safety Tests
 // =============================================================================

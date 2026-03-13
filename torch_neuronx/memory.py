@@ -5,6 +5,7 @@ Provides memory statistics and management functions
 for monitoring device memory usage on Neuron hardware.
 """
 
+import sys
 from typing import Any
 
 import torch
@@ -13,16 +14,9 @@ import torch
 def _get_device_index(device: int | torch.device | None = None) -> int:
     """Get device index, defaulting to current device."""
     # Import here to avoid circular imports
-    from torch_neuronx import _C
+    import torch_neuronx
 
-    if device is None:
-        return _C._neuron_getCurrentDevice()
-    if isinstance(device, int):
-        return device
-    # Handle torch.device objects
-    if hasattr(device, "index") and device.index is not None:
-        return device.index
-    return _C._neuron_getCurrentDevice()
+    return torch_neuronx._get_device_index(device, optional=False)
 
 
 def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
@@ -195,3 +189,171 @@ def memory_summary(device: int | torch.device | None = None, abbreviated: bool =
 
     lines.append("=" * 75)
     return "\n".join(lines)
+
+
+# =============================================================================
+# Memory Snapshot API
+# =============================================================================
+
+
+def _record_memory_history(
+    enabled: bool | str | None = "all",
+    *,
+    context: str | None = "all",
+    stacks: str = "all",
+    max_entries: int = sys.maxsize,
+    device: int | torch.device | None = None,
+) -> None:
+    """
+    Enable or disable recording of memory allocation/deallocation history.
+
+    When enabled, the allocator will record a trace of memory events that can
+    be retrieved with _snapshot(). This is useful for debugging memory issues.
+
+    Args:
+        enabled: Controls recording. Can be:
+            - True or "all": Enable recording
+            - False, None, or "none": Disable recording
+        context: When to capture stack traces. One of:
+            - "all": Capture for all events (alloc and free)
+            - "alloc": Capture only for allocation events
+            - "state": Capture for current state only
+            - "never" or None: Don't capture stack traces
+        stacks: Stack trace mode. One of:
+            - "all": Include C++ frames (not yet implemented)
+            - "python": Python frames only (default behavior)
+        max_entries: Maximum number of trace entries to keep in the ring buffer.
+            Older entries are overwritten when the buffer is full.
+        device: Device to configure (currently applies globally).
+
+    Example:
+        >>> import torch_neuronx
+        >>> torch_neuronx.memory._record_memory_history(True, context="all")
+        >>> # ... perform allocations ...
+        >>> snapshot = torch_neuronx.memory._snapshot()
+        >>> torch_neuronx.memory._record_memory_history(None)  # Disable
+    """
+    _record_memory_history_impl(
+        enabled=enabled,
+        context=context,
+        stacks=stacks,
+        max_entries=max_entries,
+    )
+
+
+def _record_memory_history_impl(
+    enabled: bool | str | None = "all",
+    context: str | None = "all",
+    stacks: str = "all",
+    max_entries: int = sys.maxsize,
+) -> None:
+    """
+    Internal implementation of _record_memory_history.
+    """
+    from torch_neuronx import _C
+
+    # Convert enabled to appropriate format
+    if enabled is None or enabled is False or enabled == "none":
+        _C._neuron_record_memory_history(
+            enabled=False,
+            context=None,
+            stacks=None,
+            max_entries=max_entries,
+            clear_history=False,
+        )
+        return
+
+    # Validate context parameter
+    valid_contexts = {"all", "alloc", "state", "never", None}
+    if context not in valid_contexts:
+        raise ValueError(f"Invalid context '{context}'. Must be one of: {valid_contexts}")
+
+    # Validate stacks parameter
+    valid_stacks = {"all", "python"}
+    if stacks not in valid_stacks:
+        raise ValueError(f"Invalid stacks '{stacks}'. Must be one of: {valid_stacks}")
+
+    # Map context to C++ enum string
+    context_str = context if context else "never"
+
+    _C._neuron_record_memory_history(
+        enabled=True,
+        context=context_str,
+        stacks=stacks,
+        max_entries=max_entries,
+        clear_history=True,
+    )
+
+
+def _snapshot(device: int | torch.device | None = None) -> dict[str, Any]:
+    """
+    Capture a snapshot of the current memory state.
+
+    Returns a dictionary containing:
+    - segments: List of memory segments with their blocks
+    - device_traces: Per-device list of trace entries (if recording enabled)
+
+    Each segment contains:
+    - device: Device index
+    - address: Memory address
+    - total_size: Total segment size in bytes
+    - allocated_size: Allocated portion size
+    - active_size: Active (in-use) portion size
+    - stream: Stream ID where segment was allocated
+    - blocks: List of blocks within the segment
+
+    Each block contains:
+    - size: Block size in bytes
+    - requested_size: Originally requested size
+    - address: Block address
+    - state: "active_allocated" or "inactive"
+    - frames: Stack trace frames (if context recording enabled)
+
+    Each trace entry contains:
+    - action: Event type (alloc, free_requested, free_completed, etc.)
+    - device: Device index
+    - addr: Memory address
+    - size: Allocation size
+    - stream: Stream ID
+    - time_us: Timestamp in microseconds
+    - frames: Stack trace frames (if context recording enabled)
+
+    Args:
+        device: Device to snapshot (currently returns all devices).
+
+    Returns:
+        Dictionary with segments and device_traces.
+
+    Example:
+        >>> import torch_neuronx
+        >>> torch_neuronx.memory._record_memory_history(True)
+        >>> x = torch.zeros(1000, device='neuron')
+        >>> snapshot = torch_neuronx.memory._snapshot()
+        >>> print(f"Segments: {len(snapshot['segments'])}")
+    """
+    from torch_neuronx import _C
+
+    return _C._neuron_memory_snapshot()
+
+
+def _dump_snapshot(filename: str = "memory_snapshot.pickle") -> None:
+    """
+    Dump a memory snapshot to a pickle file.
+
+    The snapshot can be loaded and analyzed later, or visualized using
+    PyTorch's memory visualization tools.
+
+    Args:
+        filename: Output filename. Defaults to "memory_snapshot.pickle".
+
+    Example:
+        >>> import torch_neuronx
+        >>> torch_neuronx.memory._record_memory_history(True)
+        >>> # ... perform allocations ...
+        >>> torch_neuronx.memory._dump_snapshot("debug_snapshot.pickle")
+    """
+    import pickle
+
+    snapshot = _snapshot()
+    with open(filename, "wb") as f:
+        pickle.dump(snapshot, f)

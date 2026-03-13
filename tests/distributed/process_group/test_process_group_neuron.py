@@ -10,11 +10,13 @@ Run with: torchrun --nproc_per_node=2 -m pytest \
 """
 
 import os
+import weakref
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.distributed_c10d import AllgatherOptions
 
 import torch_neuronx
 
@@ -606,6 +608,53 @@ class TestEdgeCases:
             expected_val = sum(range(size))
             expected = torch.ones(4, 4, device="neuron", dtype=dtype) * expected_val
             assert torch.allclose(tensor, expected)
+
+
+class TestFutureTensorLifecycle:
+    """Tests for Future tensor storage behavior based on async_op flag.
+
+    When async_op=False, the Future is completed with an empty tensor list
+    to allow early memory reclamation. When async_op=True, the Future stores
+    actual tensors so future.value() returns results.
+    """
+
+    def test_sync_allgather_future_has_empty_value(self, dist_setup):
+        """Sync collective Future should have empty tensor list."""
+
+        rank = dist.get_rank()
+        size = dist.get_world_size()
+
+        input_tensor = torch.full((4,), float(rank), device="neuron")
+        output_tensor = torch.empty(size * 4, device="neuron")
+
+        pg = dist.distributed_c10d._get_default_group()
+        opts = AllgatherOptions()
+        opts.asyncOp = False
+        work = pg._allgather_base(output_tensor, input_tensor, opts)
+
+        fut = work.get_future()
+        val = fut.value()
+        assert isinstance(val, list)
+        assert len(val) == 0
+
+    def test_sync_op_tensor_freed_after_del(self, dist_setup):
+        """Tensor from sync collective should be freeable after Python del."""
+
+        rank = dist.get_rank()
+        size = dist.get_world_size()
+
+        input_tensor = torch.full((4, 4), float(rank), device="neuron")
+        output_tensor = torch.empty(size * 4, 4, device="neuron")
+
+        dist.all_gather_into_tensor(output_tensor, input_tensor)
+        torch_neuronx.synchronize()
+
+        # Create weakref and delete the tensor
+        ref = weakref.ref(output_tensor)
+        del output_tensor, input_tensor
+
+        # The tensor should be freed immediately — no hidden refs holding it
+        assert ref() is None, "Output tensor should be freed after del"
 
 
 if __name__ == "__main__":

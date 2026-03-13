@@ -146,19 +146,18 @@ def _ret_work(
     if collective_fn is None:
         work_stream = torch_neuronx.current_stream(device)
         work = _create_work(pg, tensors, op_type, device, work_stream)
-        work.record_end_event()
+        work.record_end_event(async_op=getattr(opts, "asyncOp", False))
         work.register_with_tensors()
         return work
 
     async_op = getattr(opts, "asyncOp", False)
 
-    # Choose stream based on asyncOp
-    if async_op:
-        neuron_stream = pg._get_neuron_stream(device)
-        neuron_stream.wait_stream(torch_neuronx.current_stream())
-        work_stream = neuron_stream
-    else:
-        work_stream = torch_neuronx.current_stream(device)
+    # Neuron always runs collectives on the caller's current stream.
+    # Unlike NCCL, which uses asyncOp to select a dedicated stream for overlap,
+    # Neuron delegates stream management to the framework (e.g., FSDP creates
+    # its own streams). Overlap is achieved through explicit stream context,
+    # not the async flag.
+    work_stream = torch_neuronx.current_stream(device)
 
     # 1. Create work
     # 2. Stash tensors (BEFORE collective execution)
@@ -173,27 +172,17 @@ def _ret_work(
     work = _create_work(pg, tensors, op_type, device, work_stream)
 
     # Step 2: Stash tensors BEFORE executing collective
-    # For Neuron, we ALWAYS stash inputs and outputs regardless of async_op.
-    # Unlike CUDA where sync ops are truly synchronous, Neuron's NRT may queue
-    # operations even for "sync" ops.
     if async_op:
         if inputs is not None:
             work.stash(_flatten_tensors(inputs))
         if tensors is not None:
             work.stash(_flatten_tensors(tensors))
 
-    # Step 3: Execute collective on the chosen stream
-    if async_op:
-        with torch_neuronx.stream(neuron_stream):
-            collective_fn()
-    else:
-        try:
-            collective_fn()
-        except Exception:
-            raise
+    # Step 3: Execute collective on the current stream
+    collective_fn()
 
     # Step 4: Record end event and register with tensors
-    work.record_end_event()
+    work.record_end_event(async_op=async_op)
     work.register_with_tensors()
 
     # Enqueue ALL work for watchdog monitoring
@@ -426,7 +415,6 @@ class ProcessGroupNeuron(ProcessGroup):
         self._pg_uid = str(id(self))
 
         self._enable_timing = False
-        self._neuron_streams = {}
         # TODO: look for way to set via environment variable
         # Also look in kernel.py to add for all collectives
         # Use default_pg_timeout for non-NCCL backends per PyTorch convention
@@ -444,14 +432,6 @@ class ProcessGroupNeuron(ProcessGroup):
 
         self._watchdog = NeuronWatchdog()
         self._watchdog.start()
-
-    def _get_neuron_stream(self, device):
-        """Get or create dedicated neuron stream for async collectives."""
-        key = str(device.index)
-        if key not in self._neuron_streams:
-            # Create high-priority stream for collectives
-            self._neuron_streams[key] = torch_neuronx.Stream(device)
-        return self._neuron_streams[key]
 
     def _get_next_seq_num(self) -> int:
         "Get the next sequence number for work tracking."
@@ -661,13 +641,24 @@ class ProcessGroupNeuron(ProcessGroup):
                     slice_output=True,
                 )
 
+        # Pre-allocate stacked output for fut.wait()[0][rank] indexing (DDP comm hooks need this)
+        output_list = list(output_tensors_list[0])
+        stacked = torch.empty(
+            [len(output_list), *list(output_list[0].shape)],
+            dtype=output_list[0].dtype,
+            device=output_list[0].device,
+        )
+
+        # Wrap collective_fn to copy results into stacked tensor after gather completes
+        original_fn = collective_fn
+
+        def collective_fn():
+            original_fn()
+            for i, t in enumerate(output_list):
+                stacked[i].copy_(t)
+
         return _ret_work(
-            self,
-            list(output_tensors_list[0]),
-            "allgather",
-            opts,
-            collective_fn=collective_fn,
-            inputs=input_tensors,
+            self, [stacked], "allgather", opts, collective_fn=collective_fn, inputs=input_tensors
         )
 
     def allgather_coalesced(
@@ -1345,8 +1336,7 @@ class ProcessGroupNeuron(ProcessGroup):
         input_shape = input_tensor_list[0].shape
 
         def collective_fn():
-            # Move temp allocation inside collective_fn so it happens on the correct stream
-            # when async_op=True (collective runs on neuron_stream, not default stream)
+            # Move temp allocation inside collective_fn so it happens on the current stream
             concat_shape = (group_size * input_shape[0], *input_shape[1:])
             temp_result = torch.empty(
                 concat_shape, dtype=input_tensor_list[0].dtype, device=input_tensor_list[0].device

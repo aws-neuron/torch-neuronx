@@ -4,15 +4,15 @@
 #include <cstdlib>
 #include <list>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/concatenation/ConcatenationCore.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 
 namespace at::neuron {
@@ -20,13 +20,11 @@ namespace at::neuron {
 // Pimpl implementation class to hide implementation details from header
 class ConcatenationEngine::BufferingImpl {
  public:
-  // Per-stream buffering system - using std::list for O(1) front removal
-  std::unordered_map<StreamImpl*, std::unique_ptr<std::list<OperationContext*>>> operation_buffers_;
+  // Single global buffer - using std::list for O(1) front removal
+  std::list<OperationContext*> operation_buffer_;
 
-  // Track output addresses per stream for conflict detection
-  std::unordered_map<StreamImpl*, std::unordered_set<void*>> output_ptrs_;
-
-  mutable std::mutex buffered_operations_mutex_;
+  // Track output addresses for conflict detection
+  std::unordered_set<void*> output_ptrs_;
 };
 
 // Constructor
@@ -95,19 +93,17 @@ bool ConcatenationEngine::IsNonFusibleBoundaryOperation(const OperationContext* 
   }
 
   // Check if buffer size limit would be exceeded - treat as boundary if so
-  if (buffer_size_limit > 0 && stream) {
-    auto buffer_it = buffering_impl_->operation_buffers_.find(stream);
-    if (buffer_it != buffering_impl_->operation_buffers_.end() && buffer_it->second) {
-      size_t current_buffer_size = buffer_it->second->size();
-      if (current_buffer_size >= static_cast<size_t>(buffer_size_limit)) {
-        c10::StreamId stream_id = stream->GetStreamId();
+  if (buffer_size_limit > 0) {
+    size_t current_buffer_size = buffering_impl_->operation_buffer_.size();
+    if (current_buffer_size >= static_cast<size_t>(buffer_size_limit)) {
+      c10::StreamId stream_id = stream ? stream->GetStreamId() : -1;
 
-        TORCH_NEURONX_INFO(
-            "[CONCATENATION_ENGINE] Buffer size limit exceeded - treating as boundary",
-            "stream_id=", stream_id, "current_buffer_size=", current_buffer_size,
-            "buffer_size_limit=", buffer_size_limit);
-        return true;
-      }
+      TORCH_NEURONX_INFO("[CONCATENATION_ENGINE] Buffer size limit exceeded - treating as boundary",
+                         "stream_id=", stream_id, "current_buffer_size=", current_buffer_size,
+                         "buffer_size_limit=", buffer_size_limit);
+      // Buffer size limit is configurable via TORCH_NEURONX_CONCATENATION_BUFFER_SIZE_LIMIT env var
+      TORCH_NEURONX_COUNTER("Concatenation.BufferLimitHits", 1);
+      return true;
     }
   }
 
@@ -117,34 +113,36 @@ bool ConcatenationEngine::IsNonFusibleBoundaryOperation(const OperationContext* 
 std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* stream) {
   std::list<OperationContext*> result;
 
-  auto buffer_it = buffering_impl_->operation_buffers_.find(stream);
-  if (buffer_it == buffering_impl_->operation_buffers_.end() || !buffer_it->second ||
-      buffer_it->second->empty()) {
+  auto& buffer = buffering_impl_->operation_buffer_;
+  if (buffer.empty()) {
     return result;
   }
 
-  auto& buffer = buffer_it->second;
+  TORCH_NEURONX_COUNTER("Concatenation.BoundaryFlushes", 1);
+  TORCH_NEURONX_METRIC("Concatenation.BufferSize", static_cast<double>(buffer.size()));
 
   // Attempt concatenation on buffered operations
   uint64_t cutoff_index = 0;
-  MaybeTryConcatenate(*buffer, stream, &cutoff_index);
+  MaybeTryConcatenate(buffer, stream, &cutoff_index);
 
   // Mark ALL buffered operations as completed (regardless of concatenation result)
-  for (auto* op : *buffer) {
+  for (auto* op : buffer) {
     op->CompleteConcatenation();
     result.push_back(op);
   }
 
   // Clear buffer
-  buffer->clear();
-  buffering_impl_->operation_buffers_.erase(buffer_it);
+  buffer.clear();
 
-  // Clear output address tracking for this stream
-  auto output_it = buffering_impl_->output_ptrs_.find(stream);
-  if (output_it != buffering_impl_->output_ptrs_.end()) {
-    output_it->second.clear();
-    buffering_impl_->output_ptrs_.erase(output_it);
-  }
+  // Clear output address tracking
+  buffering_impl_->output_ptrs_.clear();
+
+  // ASSERTION: After flush, buffer must be empty
+  TORCH_CHECK(buffering_impl_->operation_buffer_.empty(),
+              "[CONCATENATION_ENGINE] Buffer not empty after FlushStreamBuffer! "
+              "remaining_ops=",
+              buffering_impl_->operation_buffer_.size(),
+              " This indicates a bug in buffer management.");
 
   return result;
 }
@@ -205,16 +203,14 @@ std::list<OperationContext*> ConcatenationEngine::BufferAndTryConcatenation(
 std::list<OperationContext*> ConcatenationEngine::TryNormalConcatenation(StreamImpl* stream) {
   std::list<OperationContext*> operations_to_enqueue;
 
-  auto buffer_it = buffering_impl_->operation_buffers_.find(stream);
-  if (buffer_it == buffering_impl_->operation_buffers_.end() || !buffer_it->second ||
-      buffer_it->second->empty()) {
+  auto& buffer = buffering_impl_->operation_buffer_;
+  if (buffer.empty()) {
     return operations_to_enqueue;
   }
 
   // Fast path: If the last operation is not a matmul, skip concatenation processing
-  auto& op_contexts = *buffer_it->second;
-  if (!op_contexts.empty()) {
-    auto* last_op_context = op_contexts.back();
+  if (!buffer.empty()) {
+    auto* last_op_context = buffer.back();
     if (last_op_context &&
         !concatenation_core_->IsFusibleBoundaryOperation(last_op_context->GetOpName())) {
       return {};
@@ -236,6 +232,8 @@ std::list<OperationContext*> ConcatenationEngine::Flush(size_t num_to_flush) {
 
 std::list<OperationContext*> ConcatenationEngine::ProcessConcatenationTask(
     OperationContext* operation) {
+  auto concat_task_start = std::chrono::steady_clock::now();
+
   // ========================================================================
   // Validate operation and stream
   // ========================================================================
@@ -256,6 +254,7 @@ std::list<OperationContext*> ConcatenationEngine::ProcessConcatenationTask(
   // Handle stream change - flush previous stream
   bool is_stream_change = (last_processed_stream_ != nullptr && last_processed_stream_ != stream);
   if (is_stream_change) {
+    TORCH_NEURONX_COUNTER("Concatenation.StreamChangeFlushes", 1);
     auto flushed = FlushStreamBuffer(last_processed_stream_);
     result.splice(result.end(), flushed);
   }
@@ -309,6 +308,11 @@ std::list<OperationContext*> ConcatenationEngine::ProcessConcatenationTask(
   // Update stream tracker
   last_processed_stream_ = stream;
 
+  auto concat_task_end = std::chrono::steady_clock::now();
+  // Time-series metric: each sample is one invocation's duration (nanoseconds).
+  // The metrics system stores all samples and computes accumulator (total), count, etc.
+  TORCH_NEURONX_TIME_METRIC("Concatenation.ProcessingTime", concat_task_start, concat_task_end);
+
   return result;
 }
 
@@ -324,6 +328,11 @@ std::list<OperationContext*> ConcatenationEngine::MaybeTryConcatenate(
     return {};
   }
 
+  // Concatenation.Attempts counts how many times we attempted concatenation.
+  // Corresponding Concatenation.Successes and Concatenation.Failures are tracked
+  // in ConcatenationCore::ProcessBufferedOperationsImpl and ProcessConcatenationFailure.
+  TORCH_NEURONX_COUNTER("Concatenation.Attempts", 1);
+
   // Delegate to ConcatenationCore for the actual concatenation logic
   auto result = concatenation_core_->ProcessBufferedOperations(buffered_ops);
 
@@ -337,11 +346,7 @@ std::list<OperationContext*> ConcatenationEngine::MaybeTryConcatenate(
 }
 
 void ConcatenationEngine::AddOperationToBuffer(OperationContext* operation, StreamImpl* stream) {
-  // Note: This method assumes the caller already holds buffered_operations_mutex_
-  // TODO: pre-allocate buffers to avoid hash map resize corruption
-  auto [stream_buffer_it, inserted] = buffering_impl_->operation_buffers_.try_emplace(
-      stream, std::move(std::make_unique<std::list<OperationContext*>>()));
-  stream_buffer_it->second->push_back(operation);
+  buffering_impl_->operation_buffer_.push_back(operation);
 }
 
 void ConcatenationEngine::ClearCache() { concatenation_core_->ClearCache(); }
@@ -349,14 +354,7 @@ void ConcatenationEngine::ClearCache() { concatenation_core_->ClearCache(); }
 size_t ConcatenationEngine::GetCacheSize() const { return concatenation_core_->GetCacheSize(); }
 
 size_t ConcatenationEngine::GetBufferedOperationsCount() const {
-  std::lock_guard<std::mutex> lock(buffering_impl_->buffered_operations_mutex_);
-  size_t total_count = 0;
-  for (const auto& [stream, buffer] : buffering_impl_->operation_buffers_) {
-    if (buffer) {
-      total_count += buffer->size();
-    }
-  }
-  return total_count;
+  return buffering_impl_->operation_buffer_.size();
 }
 
 void ConcatenationEngine::ProcessConcatenationFailure(OperationContext* failed_concatenated_op) {
@@ -377,70 +375,28 @@ void ConcatenationEngine::ProcessConcatenationFailure(OperationContext* failed_c
   // Invoke the failure callback stored in the ConcatenationState
   // The callback handles cache invalidation and clearing cascading ops' state
   // Note: callback is guaranteed to be set (required by ConcatenationState constructor)
+  TORCH_NEURONX_COUNTER("Concatenation.Failures", 1);
   state->InvokeFailureCallback(failed_concatenated_op);
 }
 
 std::list<OperationContext*> ConcatenationEngine::FlushOperationsInGlobalOrder(
     size_t num_to_flush) {
-  std::lock_guard<std::mutex> lock(buffering_impl_->buffered_operations_mutex_);
-
   std::list<OperationContext*> operations_to_enqueue;
+  auto& buffer = buffering_impl_->operation_buffer_;
+  size_t to_flush = std::min(num_to_flush, buffer.size());
 
-  // If we have a last processed stream, prioritize flushing from it first
-  if (last_processed_stream_ != nullptr) {
-    auto buffer_it = buffering_impl_->operation_buffers_.find(last_processed_stream_);
-    if (buffer_it != buffering_impl_->operation_buffers_.end() && buffer_it->second &&
-        !buffer_it->second->empty()) {
-      auto& buffer = buffer_it->second;
-      size_t stream_ops_count = buffer->size();
-      size_t to_flush_from_stream = std::min(num_to_flush, stream_ops_count);
-
-      // Flush operations from last processed stream
-      for (size_t i = 0; i < to_flush_from_stream; ++i) {
-        OperationContext* op = buffer->front();
-        op->CompleteConcatenation();
-        operations_to_enqueue.push_back(op);
-        buffer->pop_front();
-      }
-
-      // Clean up empty buffer
-      if (buffer->empty()) {
-        buffering_impl_->operation_buffers_.erase(buffer_it);
-      }
-
-      num_to_flush -= to_flush_from_stream;
-    }
+  // Flush operations from the single global buffer
+  for (size_t i = 0; i < to_flush; ++i) {
+    OperationContext* op = buffer.front();
+    op->CompleteConcatenation();
+    operations_to_enqueue.push_back(op);
+    buffer.pop_front();
   }
 
-  // If we still need to flush more, flush from other streams
-  if (num_to_flush > 0) {
-    std::vector<StreamImpl*> streams_to_erase;
-    for (auto& [stream, buffer] : buffering_impl_->operation_buffers_) {
-      if (num_to_flush <= 0) break;
-
-      if (!buffer || buffer->empty()) continue;
-
-      while (!buffer->empty() && num_to_flush > 0) {
-        OperationContext* op = buffer->front();
-        op->CompleteConcatenation();
-        operations_to_enqueue.push_back(op);
-        buffer->pop_front();
-        num_to_flush--;
-      }
-
-      // Clean up empty buffer
-      if (buffer->empty()) {
-        streams_to_erase.push_back(stream);
-      }
-    }
-
-    for (auto* stream : streams_to_erase) {
-      buffering_impl_->operation_buffers_.erase(stream);
-    }
+  // Clear output address tracking after flush
+  if (buffer.empty()) {
+    buffering_impl_->output_ptrs_.clear();
   }
-
-  // Clear ALL output address tracking across all streams after a global flush
-  buffering_impl_->output_ptrs_.clear();
 
   return operations_to_enqueue;
 }
@@ -452,8 +408,8 @@ bool ConcatenationEngine::HasOutputConflict(const OperationContext* operation,
     return false;
   }
 
-  auto output_it = buffering_impl_->output_ptrs_.find(stream);
-  if (output_it == buffering_impl_->output_ptrs_.end()) {
+  const auto& tracked_outputs = buffering_impl_->output_ptrs_;
+  if (tracked_outputs.empty()) {
     return false;
   }
 
@@ -462,7 +418,7 @@ bool ConcatenationEngine::HasOutputConflict(const OperationContext* operation,
 
   // Check if any output pointer already exists in tracked outputs
   for (void* output_ptr : dst_ptrs) {
-    if (output_ptr && output_it->second.count(output_ptr) > 0) {
+    if (output_ptr && tracked_outputs.count(output_ptr) > 0) {
       return true;
     }
   }
@@ -483,7 +439,7 @@ void ConcatenationEngine::TrackOutputAddresses(const OperationContext* operation
   // Track all output pointers
   for (void* output_ptr : dst_ptrs) {
     if (output_ptr) {
-      buffering_impl_->output_ptrs_[stream].insert(output_ptr);
+      buffering_impl_->output_ptrs_.insert(output_ptr);
     }
   }
 }

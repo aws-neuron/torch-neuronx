@@ -258,14 +258,10 @@ class TestDebugDirectoryCreationAndPopulation:
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend.managed_artifacts_directory"
             ) as mock_managed_dir,
-            patch(
-                "torch_neuronx.neuron_dynamo_backend.compile.compute_cache_key"
-            ) as mock_compute_cache_key,
             patch("torch_neuronx._C.compile_graph") as mock_c_compile_graph,
         ):
             mock_managed_dir.return_value.__enter__.return_value = (self.temp_dir, True)
             mock_managed_dir.return_value.__exit__.return_value = None
-            mock_compute_cache_key.return_value = "test_cache_key_123"
             mock_c_compile_graph.return_value = "exec_handle_456"
             _ = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
 

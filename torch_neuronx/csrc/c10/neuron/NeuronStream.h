@@ -9,6 +9,8 @@
 #include <future>
 #include <utility>
 
+#include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
+
 // Forward declarations
 namespace c10_neuron {
 struct NeuronStorageImpl;
@@ -152,6 +154,9 @@ void SubmitOperationContext(const NeuronStream& stream,
 
 /// Stream pool configuration
 constexpr int kStreamPoolSize = 1;
+// Non-default streams must match the number of hardware queues for collectives.
+static_assert(kStreamPoolSize == nrt::kCollectivesQueues,
+              "Stream pool size must match COLLECTIVES HW queue count");
 constexpr int kMaxDevices = 128;
 
 /// Initialize all stream pools (called by NeuronResourceManager)
@@ -171,3 +176,12 @@ void ForEachStreamImpl(c10::DeviceIndex device_index,
                        const std::function<bool(StreamImpl*)>& callback);
 
 }  // namespace at::neuron
+
+namespace std {
+template <>
+struct hash<at::neuron::NeuronStream> {
+  size_t operator()(const at::neuron::NeuronStream& s) const noexcept {
+    return std::hash<c10::Stream>{}(s.unwrap());
+  }
+};
+}  // namespace std

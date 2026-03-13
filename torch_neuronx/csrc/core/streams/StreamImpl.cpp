@@ -54,6 +54,9 @@ namespace {
 
 namespace at::neuron {
 
+// Definition of ProfilerMappingCollector's static atomic unique event id
+std::atomic<uint64_t> ProfilerMappingCollector::next_event_id_{1};
+
 StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
     : device_index(device_idx),
       stream_id(id),
@@ -65,11 +68,6 @@ StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
 
   // Initialize per-stream ErrorHandler
   error_handler_ = std::make_unique<ErrorHandler>();
-
-  // Initialize completion state LNC index with validation
-  int vnc_id = c10_neuron::get_vnc_id(device_index);
-  TORCH_CHECK(vnc_id >= 0, "Invalid VNC ID (", vnc_id, ") for device index ", dev_idx);
-  completion_state_.lnc_idx = static_cast<uint32_t>(vnc_id);
 
   TORCH_NEURONX_DEBUG("StreamImpl fully initialized", "stream_id=", str_id,
                       "device_index=", dev_idx);
@@ -110,6 +108,10 @@ std::shared_future<OperationContextResult> StreamImpl::SubmitOperationContext(
     }
     TORCH_NEURONX_STREAM_DEBUG("Added operation to active tracking", "stream_id=", stream_id,
                                "op=", operation_name, "total_active=", active_operations_.size());
+
+    // Ensure the operation is prepared, in case if consists of a staging step.
+    PrepareOperation(op_ptr);
+
     // Always route through SubmitOperation to ensure consistent queue depth tracking
     // Non-compilable operations will be handled specially in the concatenation/execution pipeline
     auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
@@ -198,11 +200,11 @@ void RecordProfilerMapping(OperationContext* operation) {
   if (auto* concat_state = operation->GetConcatenationState()) {
     for (auto* cascading_op : concat_state->GetCascadingOperations()) {
       collector.Record(seq_id, cascading_op->pytorch_sequence_nr, cascading_op->pytorch_thread_id,
-                       cascading_op->stream_id, operation->os_tid);
+                       cascading_op->stream_id, operation->os_tid, cascading_op->event_id);
     }
   } else {
     collector.Record(seq_id, operation->pytorch_sequence_nr, operation->pytorch_thread_id,
-                     operation->stream_id, operation->os_tid);
+                     operation->stream_id, operation->os_tid, operation->event_id);
   }
 }
 }  // anonymous namespace
@@ -210,6 +212,10 @@ void RecordProfilerMapping(OperationContext* operation) {
 void StreamImpl::CompleteOperation(OperationContext* operation) {
   TORCH_NEURONX_DEBUG("Operation completion callback", "stream_id=", stream_id,
                       "operation=", operation->GetOpName());
+
+  // Decrement execution queue depth (skips concatenated ops internally)
+  auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+  engine.DecrementExecutionQueueDepth(operation);
 
   // Set execution end time
   operation->execute_end = std::chrono::steady_clock::now();
@@ -250,13 +256,23 @@ void StreamImpl::HandleErrorWithCleanup(OperationContext* operation, const Excep
   static_assert(torch_neuronx::is_neuron_runtime_exception_v<ExceptionType>,
                 "ExceptionType must be CompilationRuntimeException or ExecutionRuntimeException");
 
+  bool is_concatenated = operation->IsConcatenatedOperation();
   auto status = error_handler_->HandleOperationError(operation, e);
 
   if (status.IsSuccess()) {
-    TORCH_NEURONX_DEBUG("Recovery succeeded, completing operation normally",
-                        "stream_id=", stream_id, "op=", operation->GetOpName());
-    CompleteOperation(operation);
+    TORCH_NEURONX_DEBUG("Recovery succeeded", "stream_id=", stream_id,
+                        "op=", operation->GetOpName());
+
+    // For concatenated operations, recovery (CPU fallback) invokes the failure callback
+    // which frees the ConcatenationState that owns the concat_op. Calling CompleteOperation
+    // would be use-after-free.
+    if (!is_concatenated) {
+      CompleteOperation(operation);
+    }
   } else {
+    // Error path (no recovery) - decrement queue depth since CompleteOperation won't be called
+    auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+    engine.DecrementExecutionQueueDepth(operation);
     operation->promise.set_value(status);
     RemoveActiveOperation(operation);
   }
@@ -350,18 +366,6 @@ bool StreamImpl::HasPendingAsyncOperations() const {
   return false;
 }
 
-nrt::ErrorTrackerHandle* StreamImpl::GetAsyncErrorTracker() {
-  if (!async_error_tracker_) {
-    // Create error tracker for the LNC associated with this stream's device
-    int vnc_id = c10_neuron::get_vnc_id(device_index);
-    TORCH_CHECK(vnc_id >= 0, "Invalid VNC ID (", vnc_id, ") for device index ", device_index);
-    async_error_tracker_ = nrt::CreateErrorTracker(static_cast<uint32_t>(vnc_id));
-    TORCH_NEURONX_DEBUG("Created async error tracker for stream", "stream_id=", stream_id,
-                        "device_index=", device_index, "vnc_id=", vnc_id);
-  }
-  return async_error_tracker_.get();
-}
-
 OperationContext* StreamImpl::FindOperationBySeq(nrt::SequenceId sequence_id) {
   std::lock_guard<std::mutex> lock(active_operations_mutex_);
   for (auto& op_ptr : active_operations_) {
@@ -385,13 +389,15 @@ OperationContext* StreamImpl::FindOperationBySeq(nrt::SequenceId sequence_id) {
 }
 
 void StreamImpl::UpdateCompletionState() {
-  // Queue parameter is not used yet; always use queue 0
-  constexpr int kDefaultQueue = 0;
-  for (size_t i = 0; i < nrt::kDeviceKernelTypeCount; ++i) {
-    nrt::SequenceId sequence_id = 0;
-    if (nrt::GetLastCompletedRequest(completion_state_.lnc_idx, i, kDefaultQueue, &sequence_id) ==
-        NRT_SUCCESS) {
-      completion_state_.last_completed_seq[i] = sequence_id;
+  int vnc_id = c10_neuron::get_vnc_id(device_index);
+  for (size_t xu = 0; xu < NRTA_XU_TYPE_NUM; ++xu) {
+    auto xu_type = static_cast<nrta_xu_t>(xu);
+    int num_queues = nrt::GetNumQueuesForXU(xu_type);
+    for (int queue = 0; queue < num_queues; ++queue) {
+      nrt::SequenceId seq = 0;
+      if (nrt::GetLastCompletedRequest(vnc_id, xu_type, queue, &seq) == NRT_SUCCESS) {
+        xu_completed_seqs_.Set(xu_type, queue, seq);
+      }
     }
   }
 }
@@ -416,47 +422,46 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
     kernel_type = concat_op->GetKernelType();
   }
 
-  // Schedule the operation (either regular op or concat op for first cascading op)
-  size_t kt_idx = GetDeviceKernelTypeIndex(kernel_type);
-
-  // Cross-XU synchronization: ensure prior XU operation completes first
-  if (last_scheduled_info_.valid && last_scheduled_info_.kernel_type != kernel_type) {
+  // Cross-XU synchronization: ensure prior XU operation completes before switching XUs
+  auto current_xu = static_cast<nrta_xu_t>(GetXUIndex(kernel_type));
+  if (last_scheduled_info_.valid && last_scheduled_info_.xu != current_xu) {
     UpdateCompletionState();
-    size_t last_kt_idx = GetDeviceKernelTypeIndex(last_scheduled_info_.kernel_type);
-    nrt::SequenceId completed_seq = completion_state_.last_completed_seq[last_kt_idx];
+    int queue = nrt::GetHardwareQueue(last_scheduled_info_.xu, stream_id);
+    nrt::SequenceId completed_seq = xu_completed_seqs_.Get(last_scheduled_info_.xu, queue);
     if (NRTA_SEQ_GET_SEQ_NUM(last_scheduled_info_.sequence_id) >
         NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
       return ScheduleResult::kNotReady;
     }
   }
 
-  // Check queue depth limit
-  if (completion_state_.inflight_count[kt_idx] >= kDefaultMaxInflightPerXU) {
-    return ScheduleResult::kNotReady;
-  }
-
-  // For collective operations, call Prepare() before scheduling
-  if (kernel_type == KernelTypeEnum::kCollective) {
-    TORCH_NEURONX_DEBUG("Preparing collective operation", "stream_id=", stream_id,
-                        "op=", op->GetOpName());
-    op->kernel_execution->Prepare();
-  }
-
   op->execute_start = std::chrono::steady_clock::now();
   op->neuron_stream_os_tid = getOsTid();
   nrt::SequenceId sequence_id = 0;
-  op->kernel_execution->ExecuteOrSchedule(GetAsyncErrorTracker(), &sequence_id, stream_id);
+  bool scheduled = op->kernel_execution->Schedule(&op->nrt_status_, &sequence_id, stream_id);
 
-  op->MarkScheduled(sequence_id);
-  completion_state_.inflight_count[kt_idx]++;
+  if (scheduled) {
+    op->MarkScheduled(sequence_id);
+    last_scheduled_info_.xu = current_xu;
+    last_scheduled_info_.sequence_id = sequence_id;
+    last_scheduled_info_.valid = true;
+  } else {
+    // No NRT work — mark as immediately complete
+    op->nrt_status_ = NRT_SUCCESS;
+    op->MarkScheduled(sequence_id);
+  }
   AdvanceToNextOperation();
 
-  last_scheduled_info_.kernel_type = kernel_type;
-  last_scheduled_info_.sequence_id = sequence_id;
-  last_scheduled_info_.valid = true;
-
-  TORCH_NEURONX_DEBUG("Async operation scheduled", "stream_id=", stream_id, "op=", op->GetOpName(),
+  TORCH_NEURONX_DEBUG("Operation scheduled", "stream_id=", stream_id, "op=", op->GetOpName(),
                       "sequence_id=", sequence_id);
   return ScheduleResult::kScheduled;
 }
+
+void StreamImpl::PrepareOperation(OperationContext* op) {
+  if (!op->RequiresPrepare()) {
+    return;
+  }
+  op->kernel_execution->Prepare();
+  TORCH_NEURONX_DEBUG("Operation prepared", "stream_id=", stream_id, "op=", op->GetOpName());
+}
+
 }  // namespace at::neuron

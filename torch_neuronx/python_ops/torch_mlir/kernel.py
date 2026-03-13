@@ -584,16 +584,18 @@ class TorchMlirKernel(BaseNeuronKernel):
             and input_argnum < len(processed_inputs)
         ):
             input_tensor = processed_inputs[input_argnum]
-            index_tensor = processed_inputs[index_argnum]
+            index_arg = processed_inputs[index_argnum]
 
-            if (
-                isinstance(input_tensor, torch.Tensor)
-                and isinstance(index_tensor, torch.Tensor)
-                and input_tensor.numel() > 0
-                and index_tensor.numel() == 0
-            ):
-                # Return input tensor unchanged for empty index
-                return input_tensor
+            if isinstance(input_tensor, torch.Tensor) and input_tensor.numel() > 0:
+                # index_arg may be a single tensor or a tuple of tensors
+                if isinstance(index_arg, torch.Tensor) and index_arg.numel() == 0:
+                    return input_tensor
+                if isinstance(index_arg, tuple | list) and all(
+                    isinstance(idx, torch.Tensor) and idx.numel() == 0
+                    for idx in index_arg
+                    if idx is not None
+                ):
+                    return input_tensor
 
         # Default: create zeros
         return self._create_zeros_like_original(original_outputs, device)
@@ -630,29 +632,36 @@ class TorchMlirKernel(BaseNeuronKernel):
         """Check if any input tensors are empty."""
         return any(isinstance(arg, torch.Tensor) and arg.numel() == 0 for arg in args)
 
-    def _prepare_execution_tensors(self, provided_output, downcasted_outputs):
-        """Prepare execution tensors, only creating new ones if downcasting is needed."""
+    def _prepare_execution_tensors(self, provided_output, downcasted_outputs=None):
+        """Prepare execution tensors, only creating new ones if downcasting or non-contiguous."""
 
         def _prepare_single_tensor(provided, downcast):
             """Helper to prepare a single tensor."""
-            if provided is None or downcast is None:
+            if provided is None:
                 return provided, False
 
             # Resize provided tensor if shape mismatch
-            if provided.shape != downcast.shape:
+            if downcast is not None and provided.shape != downcast.shape:
                 provided.resize_(downcast.shape)
 
-            # If dtype mismatch, create new tensor for execution
-            if provided.dtype != downcast.dtype:
+            # If dtype mismatch, create new tensor with execution dtype
+            if downcast is not None and provided.dtype != downcast.dtype:
                 return io_tensor.empty(
                     downcast.shape, dtype=downcast.dtype, device=provided.device
                 ), True
 
-            # Can use provided tensor directly (after potential resize)
+            # If non-contiguous, create new contiguous tensor preserving original dtype
+            if not provided.is_contiguous():
+                return io_tensor.empty(
+                    provided.shape, dtype=provided.dtype, device=provided.device
+                ), True
+
+            # Can use provided tensor directly
             return provided, False
 
         if downcasted_outputs is None:
-            return provided_output, False
+            # No downcasting - just check contiguity
+            return _prepare_single_tensor(provided_output, None)
 
         is_single_output = not isinstance(provided_output, tuple | list)
         provided_tuple = (provided_output,) if is_single_output else provided_output
@@ -877,16 +886,16 @@ class TorchMlirKernel(BaseNeuronKernel):
         provided_output = self.output_handler.extract_output_params(kwargs, self.output_params)
 
         needs_copy = False
+
         if provided_output is not None:
-            # Check if we need to downcast for execution
             execution_tensors, needs_copy = self._prepare_execution_tensors(
                 provided_output, downcasted_outputs
             )
         elif self.op_name.endswith("_") and len(io_spec.outputs) == 1:
-            # For single-output inplace ops, use the first input tensor as output
-            execution_tensors = processed_inputs[0]
+            # For single-output inplace ops, use first input as output
+            provided_output = processed_inputs[0]
+            execution_tensors, needs_copy = self._prepare_execution_tensors(provided_output)
         else:
-            # Create output tensors from downcasted_outputs (for execution)
             execution_tensors = self._create_output_tensors_from_original(
                 downcasted_outputs, device
             )
@@ -906,6 +915,13 @@ class TorchMlirKernel(BaseNeuronKernel):
         # Create filtered inputs using kept_input_indices on flattened inputs
         filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
 
+        # Normalize execution_tensors to sequence for execution
+        exec_tensors = (
+            execution_tensors
+            if isinstance(execution_tensors, list | tuple)
+            else (execution_tensors,)
+        )
+
         # Execute based on sync/async mode
         if not is_sync_mode_enabled():
             cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
@@ -920,9 +936,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
             self._execute_async(
                 filtered_inputs,
-                execution_tensors
-                if isinstance(execution_tensors, list | tuple)
-                else (execution_tensors,),
+                exec_tensors,
                 hlo_bytes,
                 cache_key,
                 cpu_fallback_context,
@@ -931,9 +945,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key)
             self._execute_sync(
                 filtered_inputs,
-                execution_tensors
-                if isinstance(execution_tensors, list | tuple)
-                else (execution_tensors,),
+                exec_tensors,
                 neff_bytes,
                 device,
             )
@@ -943,9 +955,13 @@ class TorchMlirKernel(BaseNeuronKernel):
             execution_tensors, downcasted_outputs, original_outputs, kept_output_indices
         )
 
-        # Copy results to provided output tensors only if downcasting was needed
+        # Copy results back if needed (dtype mismatch or non-contiguous output)
         if provided_output is not None and needs_copy:
             self._copy_to_provided_output(upcast_tensors, provided_output)
+            return provided_output
+
+        # Return original tensor for inplace/out= ops (no copy needed)
+        if provided_output is not None:
             return provided_output
 
         # Reconstruct full output structure with None values

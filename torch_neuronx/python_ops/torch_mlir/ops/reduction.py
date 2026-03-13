@@ -5,12 +5,25 @@ import torch
 from ..operation_registry import register_aten
 
 
+def _validate_scalar_dim(dim):
+    """Validate dimension for scalar tensors."""
+    dim_list = dim if isinstance(dim, list | tuple) else [dim]
+    for d in dim_list:
+        if d < -1 or d > 0:
+            raise IndexError(
+                f"Dimension out of range (expected to be in range of [-1, 0], but got {d})"
+            )
+
+
 @register_aten(
     ["aten::sum", "aten::sum.dim_IntList", "aten::sum.IntList_out"],
     static_argnums=(1, 2),
     static_argnames=("dtype",),
 )
 def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
+    if self.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return self.clone().to(dtype) if dtype else self.clone()
     return torch.sum(self, dim, keepdim, dtype=dtype)
 
 
@@ -42,6 +55,9 @@ def torch_amax(x, dim=None, keepdim=False, out=None):
             f"Expected the dtype for input and out to match, but got "
             f"{x.dtype} for input's dtype and {out.dtype} for out's dtype."
         )
+    if x.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return x.clone()
     return torch.amax(x, dim, keepdim)
 
 
@@ -52,6 +68,9 @@ def torch_amin(self, dim=None, keepdim=False, out=None):
             f"Expected the dtype for input and out to match, but got "
             f"{self.dtype} for input's dtype and {out.dtype} for out's dtype."
         )
+    if self.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return self.clone()
     return torch.amin(self, dim, keepdim)
 
 

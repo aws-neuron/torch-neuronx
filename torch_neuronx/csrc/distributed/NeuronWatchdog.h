@@ -30,9 +30,6 @@ class NeuronWatchdog {
   // Sleep interval matches NCCL's kWatchdogThreadSleepMillis
   static constexpr int SLEEP_MILLIS = 100;
 
-  // Max wait time for shelves to populate during cleanup
-  static constexpr int CLEANUP_WAIT_MILLIS = 1;
-
   /**
    * Initialize watchdog.
    * The watchdog manages its own internal work list.

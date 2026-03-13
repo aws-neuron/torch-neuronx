@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/core/DeviceCapability.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/macros/Macros.h>
 
@@ -58,6 +59,23 @@ struct NeuronGuardImpl final : public c10::impl::DeviceGuardImplInterface {
 
   c10::DeviceIndex deviceCount() const noexcept override {
     return static_cast<c10::DeviceIndex>(c10_neuron::device_count());
+  }
+
+  c10::DeviceCapability getDeviceCapability(c10::Device /*unused*/) const override {
+    c10::DeviceCapability cap;
+    cap.capability_data.capability_bits = 0;
+    cap.capability_data.capability_bits =
+        (1ULL << c10::kIndex_Byte) |      // uint8
+        (1ULL << c10::kIndex_Char) |      // int8
+        (1ULL << c10::kIndex_Short) |     // int16
+        (1ULL << c10::kIndex_Int) |       // int32
+        (1ULL << c10::kIndex_Long) |      // int64 (autocast to int32)
+        (1ULL << c10::kIndex_Float) |     // float32
+        (1ULL << c10::kIndex_Double) |    // float64 (autocast to float32)
+        (1ULL << c10::kIndex_Half) |      // float16
+        (1ULL << c10::kIndex_BFloat16) |  // bfloat16
+        (1ULL << c10::kIndex_Bool);
+    return cap;
   }
 
   c10::Stream getDefaultStream(c10::Device d) const override {

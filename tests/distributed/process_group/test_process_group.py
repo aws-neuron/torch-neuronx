@@ -128,15 +128,12 @@ def test_group_name(process_group):
 
 def test_barrier(process_group):
     mock_stream = MagicMock()
-    mock_stream.wait_stream = MagicMock()
     mock_work = MagicMock(spec=torch._C._distributed_c10d.Work)
     with (
         patch("torch.distributed.get_world_size", return_value=2),
         patch("torch_neuronx.current_device", return_value=0),
         patch("torch_neuronx.current_stream", return_value=mock_stream),
-        patch("torch_neuronx.stream"),
         patch("torch_neuronx._C._nrt_barrier"),
-        patch.object(process_group, "_get_neuron_stream", return_value=mock_stream),
         patch("torch_neuronx.distributed.backend._ret_work", return_value=mock_work),
     ):
         process_group.barrier(None)
@@ -323,6 +320,46 @@ def reset_global_state():
             del os.environ[var]
         if original_env[var] is not None:
             os.environ[var] = original_env[var]
+
+
+def test_ret_work_uses_current_stream(process_group):
+    """_ret_work always uses the caller's current stream, regardless of asyncOp."""
+    from torch_neuronx.distributed.backend import _ret_work
+
+    caller_stream = MagicMock()
+    mock_work = MagicMock()
+    mock_work.stash = MagicMock()
+    mock_work.record_end_event = MagicMock()
+    mock_work.register_with_tensors = MagicMock()
+    collective_called = []
+
+    with (
+        patch("torch_neuronx.current_stream", return_value=caller_stream),
+        patch("torch_neuronx.current_device", return_value=0),
+        patch("torch_neuronx.distributed.backend._create_work", return_value=mock_work) as mock_cw,
+        patch("torch_neuronx.Stream") as mock_stream_ctor,
+        patch.object(process_group, "_enqueue_work"),
+    ):
+        for async_val in (False, True):
+            mock_cw.reset_mock()
+            mock_stream_ctor.reset_mock()
+            collective_called.clear()
+
+            opts = MagicMock()
+            opts.asyncOp = async_val
+
+            _ret_work(
+                process_group,
+                None,
+                "test",
+                opts,
+                collective_fn=lambda: collective_called.append(True),
+            )
+
+            # Always passes caller's current stream, never creates a new one
+            assert mock_cw.call_args[0][4] is caller_stream
+            mock_stream_ctor.assert_not_called()
+            assert collective_called == [True]
 
 
 def test_set_enable_nan_check(process_group):

@@ -2,7 +2,9 @@
 
 import functools
 import os
+import sys
 from contextlib import nullcontext
+from unittest import mock
 
 import torch._dynamo
 
@@ -10,6 +12,12 @@ import torch_neuronx
 from tests.pytorch_tests.distributed.neuron_patch import NeuronPatcher, pre_run_patches
 
 HAS_NEURON = True
+
+
+def patch_jiterator_utils():
+    """Mock CUDA-dependent test utilities that fail to import on Neuron."""
+    sys.modules["torch.testing._internal.common_methods_invocations"] = mock.MagicMock()
+    sys.modules["torch.testing._internal.jit_utils"] = mock.MagicMock()
 
 
 def patch_requires_cuda_and_triton_early():
@@ -197,6 +205,8 @@ def apply_dynamo_patches():
     patch_device_for_fx_namespace()
 
     patch_minifier_gen_test_code()
+
+    patch_jiterator_utils()
 
     # Ensure retain device is set
     os.environ["TORCH_NEURONX_RETAIN_DEVICE_MODE"] = "1"

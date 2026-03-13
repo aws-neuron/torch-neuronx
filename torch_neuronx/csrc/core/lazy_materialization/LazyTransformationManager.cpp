@@ -122,9 +122,20 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
 
 void LazyTransformationManager::ProcessOperationInputs(
     at::neuron::OperationContext* operation_context) {
+  // Validate operation_context is not null
+  TORCH_CHECK(operation_context != nullptr,
+              "[ProcessOperationInputs] Received null operation_context");
+
+  // Validate kernel_execution before dynamic_cast to catch use-after-free
+  auto* kernel_ptr = operation_context->kernel_execution.get();
+  TORCH_CHECK(kernel_ptr != nullptr,
+              "[ProcessOperationInputs] Operation has null kernel_execution. ",
+              "This indicates memory corruption or use-after-free. ",
+              "stream=", static_cast<void*>(operation_context->stream),
+              " pytorch_seq_nr=", operation_context->pytorch_sequence_nr);
+
   // Early exit: Only process if kernel is compilable and has input transformations
-  auto* xla_compilable = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(
-      operation_context->kernel_execution.get());
+  auto* xla_compilable = dynamic_cast<at::neuron::XLACompilableKernelExecution*>(kernel_ptr);
   if (!xla_compilable || !xla_compilable->HasInputTransformations()) {
     // No transformations needed, skip processing
     return;

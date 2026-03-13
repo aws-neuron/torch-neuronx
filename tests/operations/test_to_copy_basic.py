@@ -75,19 +75,14 @@ def test_to_copy_no_op_same_device():
     assert result_int.dtype == torch.int32
 
 
-@pytest.mark.skipif(
-    os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") != "1",
-    reason="Error message for Neuron execution only",
-)
-@assert_raises(
-    RuntimeError, match="Neuron tensors only support contiguous or preserve memory format"
-)
-def test_to_copy_memory_format_error():
-    """Test that unsupported memory formats are rejected with canonical message"""
+@pytest.mark.xfail(reason="_to_copy does not yet propagate memory_format to output layout")
+def test_to_copy_memory_format_channels_last():
+    """Test that channels_last memory format is preserved for to() operations"""
     tensor = torch.randn(4, 4, 4, 4)
 
-    # Should fail for non-supported formats
-    tensor.to("neuron:0", memory_format=torch.channels_last)
+    result = tensor.to("neuron:0", memory_format=torch.channels_last)
+    assert result.device.type == "neuron"
+    assert result.is_contiguous(memory_format=torch.channels_last)
 
 
 def test_to_copy_combined_dtype_and_device():

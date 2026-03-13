@@ -4,7 +4,6 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
 
 
 def test_copy_neuron_to_neuron_same_device():
@@ -21,21 +20,6 @@ def test_copy_neuron_to_neuron_same_device():
     src_cpu.copy_(src)
     dst_cpu.copy_(dst)
     torch.testing.assert_close(src_cpu, dst_cpu)
-
-
-@assert_raises(RuntimeError, match="same Neuron core")
-def test_copy_neuron_to_neuron_different_devices_fails():
-    """Test that cross-device copy fails"""
-    # Skip if only one device available
-    if torch_neuronx.device_count() < 2:
-        pytest.skip("Need at least 2 Neuron devices")
-
-    cpu_src = torch.randn(4, 4)
-    src = torch.empty(4, 4, device="neuron:0")
-    src.copy_(cpu_src)
-    dst = torch.empty(4, 4, device="neuron:1")
-
-    dst.copy_(src)
 
 
 def test_copy_self_is_noop():
@@ -133,6 +117,22 @@ def test_copy_neuron_to_neuron_dtype_conversion():
     dst2.copy_(src2)
 
     torch.testing.assert_close(dst2.cpu(), src2.cpu().to(torch.float32))
+
+
+def test_copy_neuron_to_neuron_int64():
+    """Test neuron int64 copy - MLIR impl should reject int64"""
+    from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
+
+    src = torch.randint(0, 100, (4, 4), dtype=torch.int64, device="neuron")
+    dst = torch.empty(4, 4, dtype=torch.int64, device="neuron")
+
+    impl = CopyMLIRImpl()
+    assert not impl.can_handle(dst, src)
+
+    dst.copy_(src)
+    torch_neuronx.synchronize()
+    assert dst.dtype == torch.int64
+    torch.testing.assert_close(src.cpu(), dst.cpu())
 
 
 def test_copy_neuron_to_neuron_fp64_to_fp32():

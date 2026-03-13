@@ -120,14 +120,11 @@ def is_host_cc_enabled():
     """Check if host-side collective communication is enabled.
 
     Host-cc enables collective operations on non-default streams using NRT host collectives API.
-    Requires both async NRT and host-cc to be enabled.
 
     Returns:
-        bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1" and TORCH_NEURONX_ENABLE_ASYNC_NRT is "1"
+        bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1"
     """
-    async_nrt_enabled = os.environ.get("TORCH_NEURONX_ENABLE_ASYNC_NRT", "1") == "1"
-    host_cc_enabled = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "1"
-    return async_nrt_enabled and host_cc_enabled
+    return os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "1"
 
 
 def get_gmm_align() -> int:

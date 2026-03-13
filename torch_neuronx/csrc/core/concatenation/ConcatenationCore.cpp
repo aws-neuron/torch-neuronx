@@ -9,7 +9,9 @@
 #include <unordered_set>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/concatenation/IrNodeManager.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 
 namespace torch_neuronx {
@@ -35,6 +37,7 @@ ConcatenationResult CreateFallbackResult(
 
   TORCH_NEURONX_INFO("[CONCATENATION CORE] Falling back to original operations",
                      "reason:", error_msg, "op_count:", op_contexts.size());
+  TORCH_NEURONX_COUNTER("Concatenation.Fallbacks", 1);
   return result;
 }
 
@@ -191,6 +194,24 @@ int ConcatenationCore::ProcessNewConcatenatedOperation(
     op_context_results.push_back(original_op);
   }
 
+  TORCH_NEURONX_COUNTER("Concatenation.GroupsCreated", 1);
+  TORCH_NEURONX_COUNTER("Concatenation.OpsConcatenated", processed_count);
+  // Each group merges N ops into 1 graph, reducing graph count by (N - 1)
+  TORCH_NEURONX_COUNTER("Concatenation.GraphsReduced", processed_count - 1);
+  TORCH_NEURONX_METRIC("Concatenation.GroupSize", static_cast<double>(processed_count));
+
+  // Track concatenated op with its original constituent op names for testing/diagnostics.
+  // This records the group→ops mapping in ConcatenatedOpTracker so that
+  // get_concatenated_ops() and get_concatenation_status() can report it.
+  {
+    std::vector<std::string> original_op_names;
+    original_op_names.reserve(concat_state->GetCascadingOperations().size());
+    for (auto* op : concat_state->GetCascadingOperations()) {
+      original_op_names.push_back(op->GetOpName());
+    }
+    torch_neuronx::logConcatenatedOpExecuted(concat_op_context->GetOpName(), original_op_names);
+  }
+
   return processed_count;
 }
 
@@ -259,6 +280,8 @@ ConcatenationResult ConcatenationCore::ProcessBufferedOperations(
  */
 ConcatenationResult ConcatenationCore::ProcessBufferedOperationsImpl(
     const std::list<at::neuron::OperationContext*>& op_contexts) {
+  auto merge_start = std::chrono::steady_clock::now();
+
   // Create mixed IR node list: HLO nodes + DeallocHintNodes in execution order
   std::list<IrNode*> mixed_ir_nodes;
   std::list<std::unique_ptr<IrNode>> ir_nodes_owned;
@@ -310,6 +333,29 @@ ConcatenationResult ConcatenationCore::ProcessBufferedOperationsImpl(
 
   // Build result - always return success per API contract
   bool concatenation_happened = ir_concat_result.concated_ir_to_original_irs.size() > 0;
+
+  auto merge_end = std::chrono::steady_clock::now();
+  TORCH_NEURONX_TIME_METRIC("Concatenation.MergeTime", merge_start, merge_end);
+
+  if (concatenation_happened) {
+    TORCH_NEURONX_COUNTER("Concatenation.Successes", 1);
+
+    // Record per-concatenation-type profiling data (only if profiling is enabled).
+    // Gated separately because it stores unbounded per-invocation vectors, unlike
+    // the fixed-size NeuronMetrics counters/circular buffers above.
+    if (torch_neuronx::ConcatenationProfiler::getInstance().is_enabled()) {
+      auto merge_duration_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(merge_end - merge_start).count();
+      for (auto* ir_node : ir_concat_result.compilable_irs) {
+        auto it = ir_concat_result.concated_ir_to_original_irs.find(ir_node);
+        if (it != ir_concat_result.concated_ir_to_original_irs.end()) {
+          int64_t group_size = static_cast<int64_t>(it->second.size());
+          torch_neuronx::logConcatenationProfile(
+              ir_node->op_name, static_cast<double>(merge_duration_ns), group_size);
+        }
+      }
+    }
+  }
 
   ConcatenationResult concat_res;
 
@@ -494,8 +540,9 @@ std::unique_ptr<ConcatenationCore> ConcatenationCoreFactory::CreateInstance(
 }
 
 void ConcatenationCore::InvalidateCacheEntry(const std::string& key) {
+  TORCH_NEURONX_COUNTER("Concatenation.CacheInvalidations", 1);
+  TORCH_NEURONX_INFO("[CONCATENATION CORE] Cache entry invalidated", "cache_key:", key);
   invalidated_cache_keys_.insert(key);
-  // ir_node_manager->evict(key);
 }
 
 bool ConcatenationCore::IsFusibleBoundaryOperation(const std::string& op_name) {

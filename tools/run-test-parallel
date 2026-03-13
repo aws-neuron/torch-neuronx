@@ -278,6 +278,13 @@ run_additional_tests() {
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
     run_and_record "cpu_fallback_tests" "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=0 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/cpu_fallback/test_cpu_fallback.py"
 
+    local pytest_opts
+    local saved_custom_n="$CUSTOM_N"
+    CUSTOM_N=true
+    pytest_opts=$(build_pytest_options "host-cc-multi-stream")
+    CUSTOM_N="$saved_custom_n"
+    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_HOST_CC=1 NEURON_RT_DISABLE_EXECUTION_BARRIER=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
+
     if [[ "$SKIP_VERTICAL" == "false" ]]; then
         local pytest_opts
         pytest_opts=$(build_pytest_options "vertical-report" "$NUM_WORKERS")

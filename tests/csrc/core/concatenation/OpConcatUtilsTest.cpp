@@ -2512,6 +2512,189 @@ module @jit_module2 {
       << "Should have dependency to input index 1";
 }
 
+// ============================================================================
+// Aliasing Tests
+// ============================================================================
+
+TEST_F(OpConcatUtilsTest, AliasingNoAliasing) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  EXPECT_FALSE(aliasAttr) << "No aliasing expected";
+}
+
+TEST_F(OpConcatUtilsTest, AliasingModule1SelfAliasing) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({100});  // Same address
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  ASSERT_TRUE(aliasAttr) << "Aliasing attribute should exist";
+
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  ASSERT_TRUE(arrayAttr);
+  EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 alias";
+}
+
+TEST_F(OpConcatUtilsTest, AliasingModule2SelfAliasing) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({300});  // Same address
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  ASSERT_TRUE(aliasAttr) << "Aliasing attribute should exist";
+
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  ASSERT_TRUE(arrayAttr);
+  EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 alias";
+}
+
+TEST_F(OpConcatUtilsTest, AliasingCrossNodeAliasing) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({200});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({100});  // Aliases with mod1 input
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  ASSERT_TRUE(aliasAttr) << "Aliasing attribute should exist";
+
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  ASSERT_TRUE(arrayAttr);
+  EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 cross-node alias";
+}
+
+TEST_F(OpConcatUtilsTest, AliasingMultipleAliases) {
+  auto mod1_inputs = createMockAddresses({100, 200});
+  auto mod1_outputs = createMockAddresses({100});      // First input aliases
+  auto mod2_inputs = createMockAddresses({200, 400});  // First input aliases with mod1 second input
+  auto mod2_outputs = createMockAddresses({200});      // Both alias
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_two_input, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_two_input, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  ASSERT_TRUE(aliasAttr) << "Aliasing attribute should exist";
+
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  ASSERT_TRUE(arrayAttr);
+  EXPECT_GE(arrayAttr.size(), 2) << "Should have at least 2 aliases";
+}
+
+TEST_F(OpConcatUtilsTest, AliasingAttributeStructure) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({100});
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  ASSERT_TRUE(aliasAttr);
+
+  auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
+  ASSERT_TRUE(arrayAttr);
+
+  for (auto attr : arrayAttr) {
+    auto dictAttr = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+    ASSERT_TRUE(dictAttr) << "Each alias should be a dictionary";
+
+    auto aliasInner = dictAttr.get("alias");
+    auto outputIndex = dictAttr.get("output_index");
+    ASSERT_TRUE(aliasInner) << "Should have 'alias' field";
+    ASSERT_TRUE(outputIndex) << "Should have 'output_index' field";
+
+    auto aliasDict = mlir::dyn_cast<mlir::DictionaryAttr>(aliasInner);
+    ASSERT_TRUE(aliasDict);
+
+    auto kind = aliasDict.get("kind");
+    auto paramNum = aliasDict.get("parameter_number");
+    ASSERT_TRUE(kind) << "Should have 'kind' field";
+    ASSERT_TRUE(paramNum) << "Should have 'parameter_number' field";
+
+    auto kindStr = mlir::dyn_cast<mlir::StringAttr>(kind);
+    ASSERT_TRUE(kindStr);
+    EXPECT_EQ(kindStr.getValue().str(), "must_alias");
+  }
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

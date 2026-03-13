@@ -734,7 +734,13 @@ class Operation(ABC):
                 # Store context directly on kernel for access
                 if hasattr(impl, "kernel") and impl.kernel is not None:
                     impl.kernel._cpu_fallback_context = cpu_fallback_context
-                result = impl.execute(*args, **kwargs)
+                try:
+                    result = impl.execute(*args, **kwargs)
+                finally:
+                    # Clear fallback context to avoid holding tensor references
+                    # in long-lived cached kernel objects
+                    if hasattr(impl, "kernel") and impl.kernel is not None:
+                        impl.kernel._cpu_fallback_context = None
                 if result.success:
                     # Log that this operation was executed on Neuron
                     import torch_neuronx

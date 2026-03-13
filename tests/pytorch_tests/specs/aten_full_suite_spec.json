@@ -133,7 +133,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_ops_jit.py"
+      "file": "test_ops_jit.py",
+      "skip_class": true,
+      "skip_reason": "Neuron doesn't register JIT-level backends"
     },
     {
       "class": "TestShapeOps",
@@ -181,7 +183,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_masked.py"
+      "file": "test_masked.py",
+      "skip_class": true,
+      "skip_reason": "Sparse/masked tensors not supported for Beta - requires sparse storage format support"
     },
     {
       "class": "TestSortAndSelect",
@@ -197,7 +201,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_nestedtensor.py"
+      "file": "test_nestedtensor.py",
+      "skip_class": true,
+      "skip_reason": "Nested tensors not supported for Beta"
     },
     {
       "class": "TestDeviceUtils",
@@ -213,7 +219,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_complex.py"
+      "file": "test_complex.py",
+      "skip_class": true,
+      "skip_reason": "Complex tensors not supported for Beta"
     },
     {
       "class": "TestContentStore",
@@ -317,7 +325,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_sparse.py"
+      "file": "test_sparse.py",
+      "skip_class": true,
+      "skip_reason": "Sparse COO/CSR tensors not supported for Beta - requires sparse storage format support"
     },
     {
       "class": "TestFFT",
@@ -325,7 +335,9 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_spectral_ops.py"
+      "file": "test_spectral_ops.py",
+      "skip_class": true,
+      "skip_reason": "FFT ops not supported for Beta - aten::_fft_r2c/c2r/c2c not registered on Neuron dispatch key, requires complex tensors"
     },
     {
       "class": "TestTesting",
@@ -398,6 +410,45 @@
         "NEURON"
       ],
       "file": "test_decomp.py"
+    },
+    {
+      "class": "TestBothSerialization",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_serialization.py"
+    },
+    {
+      "class": "TestOptimRenewed",
+      "class_name_suffix_options": [
+        "PRIVATEUSE1",
+        "NEURON"
+      ],
+      "file": "test_optim.py",
+      "skip_tests": [
+        {
+          "test_forloop_goes_right_direction_contiguous_True_with_lrsched_True_LBFGS_neuron_float32": {
+            "reason": "Long compilation - causes test suite timeout"
+          }
+        },
+        {
+          "test_forloop_goes_right_direction_contiguous_True_with_lrsched_False_LBFGS_neuron_float32": {
+            "reason": "Long compilation - causes test suite timeout"
+          }
+        },
+        {
+          "test_complex_LBFGS_neuron_complex64": {
+            "reason": "Long running test (~28 min) - numerical mismatch failure, not support complex64"
+          }
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "XFail all failing tests",
+          "test_list_filename": "failing_test_methods/TestOptimRenewed.json"
+        }
+      ]
     }
   ]
 }

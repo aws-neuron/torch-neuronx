@@ -132,6 +132,48 @@ std::string GenerateSlice(const std::vector<int64_t>& input_shape,
                           const std::vector<int64_t>& end_indices, mlir::Type element_type);
 
 // ============================================================================
+// BROADCAST - StableHLO broadcast operation generation
+// ============================================================================
+
+/**
+ * @brief Generate StableHLO MLIR for broadcast operation
+ *
+ * Creates a broadcast operation that expands tensor dimensions from size-1
+ * to larger sizes according to the specified broadcast dimensions.
+ *
+ * @param input_shape Shape of the input tensor
+ * @param output_shape Desired output shape after broadcast
+ * @param broadcast_dims Dimensions in output that correspond to input dimensions
+ * @param element_type Element type as string (e.g., "f32", "bf16")
+ * @return MLIR string for broadcast operation
+ *
+ * @throws std::invalid_argument if broadcast dimensions are invalid
+ *
+ * @example
+ * // Broadcast from [1,3] to [2,3,2] where input dims map to output dims [2,1]
+ * auto mlir = GenerateBroadcast({1,3}, {2,3,2}, {2,1}, "f32");
+ */
+std::string GenerateBroadcast(const std::vector<int64_t>& input_shape,
+                              const std::vector<int64_t>& output_shape,
+                              const std::vector<int64_t>& broadcast_dims,
+                              const std::string& element_type);
+
+/**
+ * @brief Generate StableHLO MLIR for broadcast operation (MLIR type)
+ *
+ * Same as above but accepts mlir::Type directly instead of string.
+ *
+ * @param input_shape Shape of the input tensor
+ * @param output_shape Desired output shape after broadcast
+ * @param broadcast_dims Dimensions in output that correspond to input dimensions
+ * @param element_type Element type as mlir::Type
+ * @return MLIR string for broadcast operation
+ */
+std::string GenerateBroadcast(const std::vector<int64_t>& input_shape,
+                              const std::vector<int64_t>& output_shape,
+                              const std::vector<int64_t>& broadcast_dims, mlir::Type element_type);
+
+// ============================================================================
 // EMPTY - StableHLO empty/identity operation generation
 // ============================================================================
 

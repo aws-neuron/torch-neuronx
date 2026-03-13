@@ -22,6 +22,7 @@ SAFE_COMPOSITE_OPS = {
     "isfinite",  # Non-differentiable boolean operation
     "one_hot",  # Typically used with integer tensors (no gradients)
     "rms_norm",  # Dispatched to _fused_rms_norm for perf
+    "cross_entropy_loss",  # Dispatched to memory efficient cross_entropy_loss impl
 }
 
 

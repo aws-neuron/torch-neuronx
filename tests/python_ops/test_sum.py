@@ -6,6 +6,7 @@ import torch
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
+    assert_raises,
     track_neuron_ops,
 )
 
@@ -31,11 +32,13 @@ class TestSum:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::sum")
 
-    @pytest.mark.parametrize("dim", [0, 1, -1])
-    def test_sum_with_dim(self, device, dim):
+    @pytest.mark.parametrize(
+        "shape,dim", [((4, 5, 6), 0), ((4, 5, 6), 1), ((4, 5, 6), -1), ((), 0)]
+    )
+    def test_sum_with_dim(self, device, shape, dim):
         """Test sum with specified dimension."""
         with track_neuron_ops():
-            x = torch.ones(4, 5, 6, device=device)
+            x = torch.ones(shape, device=device)
             neuron_result = torch.sum(x, dim=dim)
             cpu_result = torch.sum(x.cpu(), dim=dim)
 
@@ -143,3 +146,36 @@ class TestSum:
             assert neuron_result.device.type == "neuron"
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::sum.dim_IntList")
+
+    @pytest.mark.parametrize("dtype", [None, torch.float32])
+    def test_sum_scalar(self, device, dtype):
+        """Test sum on scalar tensor."""
+        with track_neuron_ops():
+            x = torch.tensor(3.0, dtype=torch.float16, device=device)
+            neuron_result = torch.sum(x, dtype=dtype)
+            cpu_result = torch.sum(x.cpu(), dtype=dtype)
+
+            assert neuron_result.device.type == "neuron"
+            if dtype:
+                assert neuron_result.dtype == dtype
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::sum")
+
+    @pytest.mark.parametrize("invalid_dim", [[1], 1])
+    @assert_raises(IndexError, match="Dimension out of range")
+    def test_sum_scalar_invalid_dim(self, device, invalid_dim):
+        """Test sum on scalar tensor with invalid dimension raises IndexError."""
+        with track_neuron_ops():
+            x = torch.tensor(3.0, device=device)
+            torch.sum(x, dim=invalid_dim)
+
+    @pytest.mark.parametrize("keepdim", [False, True])
+    def test_sum_scalar_keepdim(self, device, keepdim):
+        """Test sum on scalar tensor respects keepdim."""
+        with track_neuron_ops():
+            x = torch.tensor(3.0, device=device)
+            neuron_result = torch.sum(x, dim=0, keepdim=keepdim)
+            cpu_result = torch.sum(x.cpu(), dim=0, keepdim=keepdim)
+
+            assert neuron_result.shape == cpu_result.shape
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)

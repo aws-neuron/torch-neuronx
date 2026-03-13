@@ -2,6 +2,8 @@
 # This module is accessed as torch.neuron and provides device-specific functionality
 
 # Import memory module to enable torch.neuron.memory.* access
+import sys
+
 from torch_neuronx import memory  # noqa: F401
 
 
@@ -445,3 +447,96 @@ def is_bf16_supported() -> bool:
     torch.cuda is patched to torch.neuron so bf16 is supported
     """
     return True
+
+
+# =============================================================================
+# Memory Snapshot Functions
+# =============================================================================
+
+
+def _record_memory_history(
+    enabled="all",
+    *,
+    context="all",
+    stacks="all",
+    max_entries=sys.maxsize,
+    device=None,
+):
+    """Enable or disable recording of memory allocation/deallocation history.
+
+    When enabled, the allocator will record a trace of memory events that can
+    be retrieved with _snapshot(). This is useful for debugging memory issues.
+
+    Args:
+        enabled: Controls recording. Can be:
+            - True or "all": Enable recording
+            - False, None, or "none": Disable recording
+        context: When to capture stack traces. One of:
+            - "all": Capture for all events (alloc and free)
+            - "alloc": Capture only for allocation events
+            - "state": Capture for current state only
+            - "never" or None: Don't capture stack traces
+        stacks: Stack trace mode. One of:
+            - "all": Include C++ frames (not yet implemented)
+            - "python": Python frames only (default behavior)
+        max_entries: Maximum number of trace entries to keep in the ring buffer.
+        device: Device to configure (currently applies globally).
+
+    Example:
+        >>> torch.neuron._record_memory_history(True, context="all")
+        >>> # ... perform allocations ...
+        >>> snapshot = torch.neuron._snapshot()
+        >>> torch.neuron._record_memory_history(None)  # Disable
+    """
+    import torch_neuronx
+
+    torch_neuronx.memory._record_memory_history(
+        enabled=enabled,
+        context=context,
+        stacks=stacks,
+        max_entries=max_entries,
+        device=device,
+    )
+
+
+def _snapshot(device=None):
+    """Capture a snapshot of the current memory state.
+
+    Returns a dictionary containing:
+    - segments: List of memory segments with their blocks
+    - device_traces: Per-device list of trace entries (if recording enabled)
+
+    Args:
+        device: Device to snapshot (currently returns all devices).
+
+    Returns:
+        Dictionary with segments and device_traces.
+
+    Example:
+        >>> torch.neuron._record_memory_history(True)
+        >>> x = torch.zeros(1000, device='neuron')
+        >>> snapshot = torch.neuron._snapshot()
+        >>> print(f"Segments: {len(snapshot['segments'])}")
+    """
+    import torch_neuronx
+
+    return torch_neuronx.memory._snapshot(device)
+
+
+def _dump_snapshot(filename="memory_snapshot.pickle"):
+    """Dump a memory snapshot to a pickle file.
+
+    The snapshot can be loaded and analyzed later, or visualized using
+    PyTorch's memory visualization tools.
+
+    Args:
+        filename: Output filename. Defaults to "memory_snapshot.pickle".
+
+    Example:
+        >>> torch.neuron._record_memory_history(True)
+        >>> # ... perform allocations ...
+        >>> torch.neuron._dump_snapshot("debug_snapshot.pickle")
+    """
+    import torch_neuronx
+
+    torch_neuronx.memory._dump_snapshot(filename)

@@ -2,6 +2,11 @@
 
 import torch
 
+from torch_neuronx.python_ops.nki_kernels.foreach_norm import _has_nki_norm_kernels
+
+if _has_nki_norm_kernels:
+    from torch_neuronx.python_ops.nki_kernels.foreach_norm import foreach_norm_nki
+
 from ..operation_registry import register_aten
 
 
@@ -32,18 +37,20 @@ def _check_tensors_tensors(tensors1, tensors2):
     static_argnames=("dtype",),
 )
 def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
-    """Foreach norm operation."""
+    """Foreach norm operation using NKI kernel with MLIR fallback."""
+    # TODO remove once foreach_norm NKI kernel is available
+    if _has_nki_norm_kernels:
+        return foreach_norm_nki(tensors, ord=ord, dtype=dtype)
+
+    # MLIR fallback
     result = []
     for t in tensors:
         if t.numel() == 0:
-            # For empty tensors, norm is 0
             result.append(torch.zeros((), dtype=dtype or t.dtype, device=t.device))
+        elif dtype is not None:
+            result.append(torch.linalg.vector_norm(t.flatten(), ord=ord, dtype=dtype))
         else:
-            # Only pass dtype if it's not None
-            if dtype is not None:
-                result.append(torch.linalg.vector_norm(t.flatten(), ord=ord, dtype=dtype))
-            else:
-                result.append(torch.linalg.vector_norm(t.flatten(), ord=ord))
+            result.append(torch.linalg.vector_norm(t.flatten(), ord=ord))
     return tuple(result)
 
 

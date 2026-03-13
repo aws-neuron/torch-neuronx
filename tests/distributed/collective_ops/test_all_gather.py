@@ -95,6 +95,54 @@ def run_async_operations(rank, world_size, kwargs):
         assert torch.allclose(gathered_tensor.cpu(), expected)
 
 
+def run_future_index_by_rank_test(rank, world_size, kwargs):
+    """Test accessing future results via future.value()[0][rank] pattern.
+
+    This pattern is used by DDP comm hooks (e.g., allreduce_hook) where:
+    1. An async all_gather is performed
+    2. The user gets the future via work.get_future()
+    3. After waiting, they access the result as future.value()[0][rank]
+
+    This tests the fix for the torch.empty output stacking which ensures
+    that future.value()[0][rank] returns the correct tensor for each rank.
+    """
+    tensor = torch.full((10,), float(rank), dtype=torch.float32)
+    tensor_neuron = tensor.to("neuron")
+    gather_list = [torch.zeros_like(tensor_neuron) for _ in range(world_size)]
+
+    # Perform async all_gather and get the future
+    work = dist.all_gather(gather_list, tensor_neuron, async_op=True)
+    fut = work.get_future()
+
+    # Wait for completion
+    fut.wait()
+
+    # Access result using the pattern: future.value()[0][rank]
+    # This is how DDP hooks access results
+    result = fut.value()
+
+    # result should be a list containing the output_list
+    assert len(result) == 1, f"Expected result length 1, got {len(result)}"
+    output_list = result[0]
+    assert len(output_list) == world_size, f"Expected {world_size} tensors, got {len(output_list)}"
+
+    # Test accessing by rank index - this is the critical pattern
+    for i in range(world_size):
+        expected = torch.full((10,), float(i), dtype=torch.float32)
+        actual = output_list[i].cpu()
+        assert torch.allclose(actual, expected), (
+            f"Rank {rank}: output_list[{i}] mismatch. " f"Expected {expected}, got {actual}"
+        )
+
+    # Specifically verify the pattern used in hooks: result[0][rank]
+    my_tensor = result[0][rank].cpu()
+    expected_my_tensor = torch.full((10,), float(rank), dtype=torch.float32)
+    assert torch.allclose(my_tensor, expected_my_tensor), (
+        f"Rank {rank}: result[0][rank] (result[0][{rank}]) mismatch. "
+        f"Expected {expected_my_tensor}, got {my_tensor}"
+    )
+
+
 def run_group_argument_test(rank, world_size, kwargs):
     group = dist.new_group([0, 1])
     tensor = torch.ones(10)
@@ -233,6 +281,10 @@ class TestAllGather(BaseCollectiveOpTest):
     def test_async_operation(self):
         """Test asynchronous all_gather operation."""
         self.distributed_tester.run_test(run_async_operations)
+
+    def test_future_index_by_rank(self):
+        """Test accessing results via future.value()[0][rank] pattern used by DDP hooks."""
+        self.distributed_tester.run_test(run_future_index_by_rank_test)
 
     def test_group_operation(self):
         """Test all_gather with specific process groups."""

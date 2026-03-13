@@ -126,7 +126,7 @@ class BaseNeuronKernel:
                 idx >= 0 for idx in static_indices
             ), "static_indices must not contain negative values"
 
-        parts = [op_name]
+        parts = [f"{op_name}--"]
 
         def _process_parts(key, inp):
             if isinstance(inp, torch.Tensor):

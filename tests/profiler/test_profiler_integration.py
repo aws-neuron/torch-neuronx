@@ -19,7 +19,7 @@ import os
 import pytest
 import torch
 from torch._C._profiler import _ExperimentalConfig
-from torch.profiler import ProfilerActivity, profile, record_function
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
 from torch_neuronx.profiling import NeuronConfig, ProfileMode
@@ -103,7 +103,18 @@ class TestNeuronProfilerIntegration:
         assert len(subdirs) == 1, f"Expected exactly one instance subdirectory, found: {subdirs}"
 
         instance_dir = os.path.join(output_dir, subdirs[0])
-        files = os.listdir(instance_dir)
+        top_level = os.listdir(instance_dir)
+
+        # NRT places files inside a numeric timestamp subdirectory within the instance dir
+        numeric_subdirs = [
+            d for d in top_level if os.path.isdir(os.path.join(instance_dir, d)) and d.isdigit()
+        ]
+        assert (
+            len(numeric_subdirs) >= 1
+        ), f"Expected at least one numeric subdirectory inside {subdirs[0]}, found: {top_level}"
+
+        trace_dir = os.path.join(instance_dir, numeric_subdirs[0])
+        files = os.listdir(trace_dir)
 
         # Check all required protobuf files
         required_pb_files = ["trace_info.pb", "ntrace.pb", "cpu_util.pb", "host_mem.pb"]
@@ -157,7 +168,17 @@ class TestNeuronProfilerIntegration:
         assert len(subdirs) == 1, f"Expected exactly one instance subdirectory, found: {subdirs}"
 
         instance_dir = os.path.join(output_dir, subdirs[0])
-        files = os.listdir(instance_dir)
+        top_level = os.listdir(instance_dir)
+
+        # NRT places files inside a numeric timestamp subdirectory within the instance dir
+        numeric_subdirs = [
+            d for d in top_level if os.path.isdir(os.path.join(instance_dir, d)) and d.isdigit()
+        ]
+        assert (
+            len(numeric_subdirs) >= 1
+        ), f"Expected at least one numeric subdirectory inside {subdirs[0]}, found: {top_level}"
+
+        files = os.listdir(os.path.join(instance_dir, numeric_subdirs[0]))
 
         # .ntff device trace files (mode-dependent: DEVICE mode)
         ntff_files = [f for f in files if f.endswith(".ntff")]
@@ -519,6 +540,103 @@ class TestNeuronProfilerIntegration:
         for evt in runtime_evts + driver_evts:
             assert evt.get("ts", 0) > 0, f"Zero ts: {evt['name']}"
             assert evt.get("dur", -1) >= 0, f"Negative dur: {evt['name']}"
+
+    def test_schedule(self):
+        """Schedule-driven profiling with two cycles.
+
+        Exercises the session lifecycle across multiple cycles:
+        schedule(wait=1, warmup=1, active=1, repeat=2) produces 6 steps:
+
+        Cycle 1: step 0 (NONE), step 1 (WARMUP), step 2 (RECORD_AND_SAVE)
+          → stop_trace, on_trace_ready fires, session #1 destroyed
+        Cycle 2: step 3 (NONE), step 4 (WARMUP), step 5 (RECORD_AND_SAVE)
+          → __exit__: stop_trace, on_trace_ready fires, session #2 destroyed
+
+        The critical transition is step 2→3 where session #1 is torn down, then
+        step 3→4 where session #2 is created. This validates that the
+        s_sessionActive atomic guard is properly released between cycles.
+        """
+        output_dir = self.test_dir
+
+        cycle_0_dir = os.path.join(output_dir, "cycle_0")
+        os.makedirs(cycle_0_dir, exist_ok=True)
+        exp_config = NeuronConfig(profile_output_dir=cycle_0_dir)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+        traces_captured = []
+        num_cycles = 2
+
+        def on_trace_ready(prof):
+            cycle_dir = os.path.join(output_dir, f"cycle_{len(traces_captured)}")
+            trace_file = os.path.join(cycle_dir, "trace.json")
+            prof.export_chrome_trace(trace_file)
+            with open(trace_file) as f:
+                traces_captured.append(json.load(f))
+            # Point next cycle's NRT output at its own subdirectory (skip on last cycle)
+            if len(traces_captured) < num_cycles:
+                next_dir = os.path.join(output_dir, f"cycle_{len(traces_captured)}")
+                os.makedirs(next_dir, exist_ok=True)
+                prof.experimental_config = NeuronConfig(profile_output_dir=next_dir)
+
+        step_labels = [
+            "cycle1_step0_wait",
+            "cycle1_step1_warmup",
+            "cycle1_step2_active",
+            "cycle2_step3_wait",
+            "cycle2_step4_warmup",
+            "cycle2_step5_active",
+        ]
+
+        with profile(
+            activities=activities,
+            schedule=schedule(wait=1, warmup=1, active=1, repeat=num_cycles),
+            on_trace_ready=on_trace_ready,
+            experimental_config=exp_config,
+        ) as prof:
+            for step_idx in range(6):
+                with record_function(step_labels[step_idx]):
+                    self._run_neuron_workload()
+                if step_idx < 5:
+                    prof.step()
+
+        # on_trace_ready fired exactly twice (once per cycle)
+        assert len(traces_captured) == 2, f"Expected 2 trace captures, got {len(traces_captured)}"
+
+        # Both cycles produced valid RUNTIME and DRIVER events
+        for cycle_idx, trace in enumerate(traces_captured):
+            events = trace["traceEvents"]
+            trace_events = [e for e in events if e.get("ph") == "X"]
+            diag = self._trace_diagnostics(trace)
+
+            runtime_evts = [e for e in trace_events if e.get("cat") == "privateuse1_runtime"]
+            driver_evts = [e for e in trace_events if e.get("cat") == "privateuse1_driver"]
+            assert len(runtime_evts) > 0, f"Cycle {cycle_idx}: No RUNTIME events. {diag}"
+            assert len(driver_evts) > 0, f"Cycle {cycle_idx}: No DRIVER events. {diag}"
+
+            # Valid timestamps and durations
+            for evt in runtime_evts + driver_evts:
+                assert evt.get("ts", 0) > 0, f"Cycle {cycle_idx}: Zero ts: {evt['name']}"
+                assert evt.get("dur", -1) >= 0, f"Cycle {cycle_idx}: Negative dur: {evt['name']}"
+
+        # Helper to collect all event names from a trace
+        def event_names(trace):
+            return {e.get("name") for e in trace["traceEvents"]}
+
+        # Active-phase labels appear in the corresponding cycle's trace
+        assert "cycle1_step2_active" in event_names(
+            traces_captured[0]
+        ), "Cycle 0 trace missing active-phase label 'cycle1_step2_active'"
+        assert "cycle2_step5_active" in event_names(
+            traces_captured[1]
+        ), "Cycle 1 trace missing active-phase label 'cycle2_step5_active'"
+
+        # Wait-phase labels should NOT appear in either trace
+        all_names = event_names(traces_captured[0]) | event_names(traces_captured[1])
+        assert (
+            "cycle1_step0_wait" not in all_names
+        ), "Wait-phase label 'cycle1_step0_wait' should not appear in any trace"
+        assert (
+            "cycle2_step3_wait" not in all_names
+        ), "Wait-phase label 'cycle2_step3_wait' should not appear in any trace"
 
 
 class TestProfileMode:

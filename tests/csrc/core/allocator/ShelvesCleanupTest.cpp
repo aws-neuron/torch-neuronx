@@ -8,7 +8,8 @@ namespace {
 
 TEST(ShelvesCleanupTest, RegisterAndTrigger) {
   int call_count = 0;
-  auto id = ShelvesCleanupRegistry::instance().registerCleanup([&]() { ++call_count; });
+  int key = 0;
+  ShelvesCleanupRegistry::instance().registerCleanup(&key, [&]() { ++call_count; });
 
   size_t before = ShelvesCleanupRegistry::instance().getTriggerCount();
   triggerShelvesCleanup();
@@ -18,21 +19,18 @@ TEST(ShelvesCleanupTest, RegisterAndTrigger) {
   triggerShelvesCleanup();
   EXPECT_EQ(call_count, 2);
 
-  ShelvesCleanupRegistry::instance().unregisterCleanup(id);
+  ShelvesCleanupRegistry::instance().unregisterCleanup(&key);
   triggerShelvesCleanup();
   EXPECT_EQ(call_count, 2);  // No longer called
 }
 
 TEST(ShelvesCleanupTest, UnregisterNonexistentIdIsSafe) {
-  EXPECT_NO_THROW(ShelvesCleanupRegistry::instance().unregisterCleanup(999999));
+  int dummy = 0;
+  EXPECT_NO_THROW(ShelvesCleanupRegistry::instance().unregisterCleanup(&dummy));
 }
 
-// Verify the allocator's OOM retry path calls triggerShelvesCleanup.
-// This test ensures the integration exists - if someone removes the call
-// from NeuronCachingAllocator.cpp, this test documents the expected behavior.
-//
-// The actual call verification happens via getTriggerCount() in integration tests,
-// but this test ensures the API contract is maintained.
+// Verify triggerShelvesCleanup increments the counter on each call.
+// The allocator's OOM retry path uses this to trigger cleanup.
 TEST(ShelvesCleanupTest, TriggerCountIncrementsOnEachCall) {
   size_t count1 = ShelvesCleanupRegistry::instance().getTriggerCount();
   triggerShelvesCleanup();
@@ -46,10 +44,11 @@ TEST(ShelvesCleanupTest, TriggerCountIncrementsOnEachCall) {
 
 TEST(ShelvesCleanupTest, MultipleCallbacksAllCalled) {
   int count1 = 0, count2 = 0, count3 = 0;
+  int key1 = 1, key2 = 2, key3 = 3;
 
-  auto id1 = ShelvesCleanupRegistry::instance().registerCleanup([&]() { ++count1; });
-  auto id2 = ShelvesCleanupRegistry::instance().registerCleanup([&]() { ++count2; });
-  auto id3 = ShelvesCleanupRegistry::instance().registerCleanup([&]() { ++count3; });
+  ShelvesCleanupRegistry::instance().registerCleanup(&key1, [&]() { ++count1; });
+  ShelvesCleanupRegistry::instance().registerCleanup(&key2, [&]() { ++count2; });
+  ShelvesCleanupRegistry::instance().registerCleanup(&key3, [&]() { ++count3; });
 
   triggerShelvesCleanup();
 
@@ -58,15 +57,15 @@ TEST(ShelvesCleanupTest, MultipleCallbacksAllCalled) {
   EXPECT_EQ(count3, 1);
 
   // Unregister one
-  ShelvesCleanupRegistry::instance().unregisterCleanup(id2);
+  ShelvesCleanupRegistry::instance().unregisterCleanup(&key2);
   triggerShelvesCleanup();
 
   EXPECT_EQ(count1, 2);
   EXPECT_EQ(count2, 1);  // Not called
   EXPECT_EQ(count3, 2);
 
-  ShelvesCleanupRegistry::instance().unregisterCleanup(id1);
-  ShelvesCleanupRegistry::instance().unregisterCleanup(id3);
+  ShelvesCleanupRegistry::instance().unregisterCleanup(&key1);
+  ShelvesCleanupRegistry::instance().unregisterCleanup(&key3);
 }
 
 }  // namespace

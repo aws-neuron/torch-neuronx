@@ -1,11 +1,13 @@
 #include "CopyUtils.h"
 
+#include <c10/util/Logging.h>
+
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
-#include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
 #include "torch_neuronx/csrc/utils/NonTemporalMemcpy.h"
 
@@ -40,34 +42,33 @@ void copy_cpu_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   int device = dst.device().index();
   size_t byte_offset = dst.storage_offset() * dst.element_size();
 
-  if (!at::neuron::utils::IsSyncModeEnabled()) {
-    void* dst_ptr = dst.storage().mutable_data();
-    auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
+  void* dst_ptr = dst.storage().mutable_data();
+  auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
 
-    auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
-        "neuron::copy::cpu_to_neuron", src.data_ptr(),
-        at::neuron::TensorDataRef{std::move(dst_tensor_ptr), dst_ptr}, byte_offset, size_bytes,
-        device);
+  auto write_kernel = std::make_unique<at::neuron::WriteDirectKernelExecution>(
+      "neuron::copy::cpu_to_neuron", src.data_ptr(),
+      at::neuron::TensorDataRef{std::move(dst_tensor_ptr), dst_ptr}, byte_offset, size_bytes,
+      device);
 
-    bool use_bounce = non_blocking || src.numel() == 1;
-    if (use_bounce) {
+  auto stream = at::neuron::getCurrentNeuronStream(device);
+  bool use_bounce = non_blocking || src.numel() == 1;
+
+  if (use_bounce) {
+    auto* host_alloc = torch_neuronx::GetNeuronHostAllocatorAsHostAllocator();
+    bool recorded = host_alloc->record_event(src.data_ptr(), src.storage().data_ptr().get_context(),
+                                             c10::Stream(stream.unwrap()));
+    // record_event returns false when src wasn't allocated by NeuronHostAllocator
+    // (e.g. regular CPU tensor), so fall back to bounce buffer for safe async copy.
+    if (!recorded) {
       write_kernel->AllocateBounceBuffer(size_bytes);
     }
-
-    auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
-    auto stream = at::neuron::getCurrentNeuronStream(device);
-    at::neuron::SubmitOperationContext(stream, std::move(context));
-    if (!use_bounce) {
-      stream.synchronize();
-    }
-    return;
   }
 
-  nrt_tensor_t* nrt_dst = get_nrt_tensor(dst, non_blocking);
-  TORCH_CHECK(nrt_dst != nullptr, "Failed to get Neuron tensor handle");
-
-  void* src_data_ptr = src.data_ptr();
-  nrt_copy_cpu_to_neuron(src_data_ptr, nrt_dst, byte_offset, size_bytes);
+  auto context = std::make_unique<at::neuron::OperationContext>(std::move(write_kernel));
+  at::neuron::SubmitOperationContext(stream, std::move(context));
+  if (!use_bounce) {
+    stream.synchronize();
+  }
 }
 
 void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blocking) {
@@ -95,24 +96,26 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   // Calculate offset based on tensor's storage offset
   size_t byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
 
-  if (!at::neuron::utils::IsSyncModeEnabled()) {
-    auto stream = at::neuron::getCurrentNeuronStream(device);
-    void* src_ptr = src_to_copy.storage().mutable_data();
-    auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
-    auto read_kernel = std::make_unique<at::neuron::ReadDirectKernelExecution>(
-        "neuron::copy::neuron_to_cpu",
-        at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr}, dst_data_ptr, byte_offset,
-        size_bytes, device);
-    auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
-    at::neuron::SubmitOperationContext(stream, std::move(context));
+  auto stream = at::neuron::getCurrentNeuronStream(device);
+  void* src_ptr = src_to_copy.storage().mutable_data();
+  auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
+  auto read_kernel = std::make_unique<at::neuron::ReadDirectKernelExecution>(
+      "neuron::copy::neuron_to_cpu", at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr},
+      dst_data_ptr, byte_offset, size_bytes, device);
+  auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
+  at::neuron::SubmitOperationContext(stream, std::move(context));
+  if (non_blocking) {
+    auto* host_alloc = torch_neuronx::GetNeuronHostAllocatorAsHostAllocator();
+    bool recorded = host_alloc->record_event(dst_data_ptr, dst.storage().data_ptr().get_context(),
+                                             c10::Stream(stream.unwrap()));
+    // record_event returns false when dst wasn't allocated by NeuronHostAllocator
+    // (e.g. regular CPU tensor), so fall back to synchronize for safety.
+    if (!recorded) {
+      stream.synchronize();
+    }
+  } else {
     stream.synchronize();
-    return;
   }
-
-  nrt_tensor_t* nrt_src = get_nrt_tensor(src_to_copy, non_blocking);
-  TORCH_CHECK(nrt_src != nullptr, "Failed to get Neuron tensor handle");
-
-  nrt_copy_neuron_to_cpu(nrt_src, dst_data_ptr, byte_offset, size_bytes);
 }
 
 void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size_t src_offset,
@@ -138,7 +141,7 @@ void nrt_copy_cpu_to_neuron(void* src_data_ptr, nrt_tensor_t* dst_data_ptr, size
   }
 }
 
-void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_blocking) {
+void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "Source must be Neuron tensor");
   TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
               "Destination must be Neuron tensor");
@@ -171,35 +174,18 @@ void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst, bool non_bloc
   size_t src_byte_offset = src_to_copy.storage_offset() * src_to_copy.element_size();
   size_t dst_byte_offset = dst.storage_offset() * dst.element_size();
 
-  if (!at::neuron::utils::IsSyncModeEnabled()) {
-    void* src_ptr = src_to_copy.storage().mutable_data();
-    void* dst_ptr = dst.storage().mutable_data();
-    auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
-    auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
-    auto copy_kernel = std::make_unique<at::neuron::CopyDirectKernelExecution>(
-        "neuron::copy::neuron_to_neuron",
-        at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr},
-        at::neuron::TensorDataRef{std::move(dst_tensor_ptr), dst_ptr}, src_byte_offset,
-        dst_byte_offset, size_bytes, device);
-    auto context = std::make_unique<at::neuron::OperationContext>(std::move(copy_kernel));
-    auto stream = at::neuron::getCurrentNeuronStream(device);
-    at::neuron::SubmitOperationContext(stream, std::move(context));
-
-    if (!non_blocking) {
-      stream.synchronize();
-    }
-    return;
-  }
-
-  nrt_tensor_t* nrt_src = get_nrt_tensor(src_to_copy, non_blocking);
-  nrt_tensor_t* nrt_dst = get_nrt_tensor(dst, non_blocking);
-  TORCH_CHECK(nrt_src != nullptr, "Failed to get source Neuron tensor handle");
-  TORCH_CHECK(nrt_dst != nullptr, "Failed to get destination Neuron tensor handle");
-  NRT_STATUS status = nrt_tensor_copy(nrt_src, src_byte_offset,  // src + offset
-                                      nrt_dst, dst_byte_offset,  // dst + offset
-                                      size_bytes);
-
-  TORCH_CHECK(status == NRT_SUCCESS, "Failed to copy between Neuron tensors. Status: ", status);
+  void* src_ptr = src_to_copy.storage().mutable_data();
+  void* dst_ptr = dst.storage().mutable_data();
+  auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
+  auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
+  auto copy_kernel = std::make_unique<at::neuron::CopyDirectKernelExecution>(
+      "neuron::copy::neuron_to_neuron",
+      at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr},
+      at::neuron::TensorDataRef{std::move(dst_tensor_ptr), dst_ptr}, src_byte_offset,
+      dst_byte_offset, size_bytes, device);
+  auto context = std::make_unique<at::neuron::OperationContext>(std::move(copy_kernel));
+  auto stream = at::neuron::getCurrentNeuronStream(device);
+  at::neuron::SubmitOperationContext(stream, std::move(context));
 }
 
 }  // namespace utils

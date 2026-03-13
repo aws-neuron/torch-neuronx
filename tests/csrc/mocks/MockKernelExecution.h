@@ -19,9 +19,7 @@ class MockNeuronKernelExecution : public NeuronKernelExecution {
   MOCK_METHOD(KernelTypeEnum, GetKernelType, (), (const, override));
   MOCK_METHOD(bool, RequiresCompilation, (), (const, override));
   MOCK_METHOD(bool, ValidateImpl, (), (const, override));
-  MOCK_METHOD(void, Execute, (), (const, override));
-  MOCK_METHOD(void, ExecuteOrSchedule, (nrt::ErrorTrackerHandle*, nrt::SequenceId*, c10::StreamId),
-              (const, override));
+  MOCK_METHOD(bool, Schedule, (NRT_STATUS*, nrt::SequenceId*, c10::StreamId), (const, override));
   MOCK_METHOD(bool, RequiresPrepare, (), (const, override));
   MOCK_METHOD(void, Prepare, (), (const, override));
 };
@@ -44,15 +42,12 @@ class MockCompilableKernelExecution
     ON_CALL(*this, CompileToNeff())
         .WillByDefault(::testing::Return(std::vector<uint8_t>{0x01, 0x02, 0x03}));
     ON_CALL(*this, ValidateImpl()).WillByDefault(::testing::Return(true));
-    ON_CALL(*this, Execute()).WillByDefault(::testing::Return());
   }
 
   MOCK_METHOD(KernelTypeEnum, GetKernelType, (), (const, override));
   MOCK_METHOD(std::vector<uint8_t>, CompileToNeff, (), (const, override));
   MOCK_METHOD(bool, ValidateImpl, (), (const, override));
-  MOCK_METHOD(void, Execute, (), (const, override));
-  MOCK_METHOD(void, ExecuteOrSchedule, (nrt::ErrorTrackerHandle*, nrt::SequenceId*, c10::StreamId),
-              (const, override));
+  MOCK_METHOD(bool, Schedule, (NRT_STATUS*, nrt::SequenceId*, c10::StreamId), (const, override));
 };
 
 // GMock-based mock for XLACompilableKernelExecution (for concatenation tests)
@@ -93,7 +88,6 @@ class MockXLACompilableKernelExecution : public XLACompilableKernelExecution {
 
   MOCK_METHOD(std::vector<uint8_t>, CompileToNeff, (), (const, override));
   MOCK_METHOD(bool, ValidateImpl, (), (const, override));
-  MOCK_METHOD(void, Execute, (), (const, override));
   MOCK_METHOD(bool, HasCollectives, (), (const));
 
  private:
@@ -101,7 +95,6 @@ class MockXLACompilableKernelExecution : public XLACompilableKernelExecution {
     ON_CALL(*this, CompileToNeff())
         .WillByDefault(::testing::Return(std::vector<uint8_t>{0x01, 0x02, 0x03}));
     ON_CALL(*this, ValidateImpl()).WillByDefault(::testing::Return(true));
-    ON_CALL(*this, Execute()).WillByDefault(::testing::Return());
     ON_CALL(*this, HasCollectives()).WillByDefault(::testing::Return(false));
   }
 
@@ -129,6 +122,20 @@ module {
     }
     return refs;
   }
+};
+
+// GMock-based mock for EventDirectKernelExecution (for IsSchedulable event tests)
+class MockEventDirectKernelExecution : public EventDirectKernelExecution {
+ public:
+  // Constructor that creates an event kernel execution with mockable IsReady()
+  MockEventDirectKernelExecution(const std::string& op_name = "mock_event_op",
+                                 EventAction action = EventAction::kWait, int device_id = 0)
+      : EventDirectKernelExecution(op_name, NeuronEvent(device_id), action, device_id) {
+    // Default: event is not ready
+    ON_CALL(*this, IsReady()).WillByDefault(::testing::Return(false));
+  }
+
+  MOCK_METHOD(bool, IsReady, (), (const));
 };
 
 }  // namespace at::neuron::testing

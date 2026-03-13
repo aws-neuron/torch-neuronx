@@ -269,29 +269,29 @@ NRT_STATUS nrta_get_sequence(uint32_t lnc, nrta_xu_t xu, int queue, nrta_seq_t* 
 }
 
 NRT_STATUS nrta_tensor_write(nrt_tensor_t* tensor, const void* buf, uint64_t offset, uint64_t size,
-                             int queue, nrta_error_tracker_t* err_tracker, nrta_seq_t* req_seq) {
+                             int lnc_idx, int queue, NRT_STATUS* ret, nrta_seq_t* req_seq) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrta_tensor_write(
-        tensor, buf, offset, size, queue, err_tracker, req_seq);
+        tensor, buf, offset, size, lnc_idx, queue, ret, req_seq);
   }
   return NRT_FAILURE;
 }
 
 NRT_STATUS nrta_tensor_read(void* buf, nrt_tensor_t* tensor, uint64_t offset, uint64_t size,
-                            int queue, nrta_error_tracker_t* err_tracker, nrta_seq_t* req_seq) {
+                            int lnc_idx, int queue, NRT_STATUS* ret, nrta_seq_t* req_seq) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrta_tensor_read(
-        buf, tensor, offset, size, queue, err_tracker, req_seq);
+        buf, tensor, offset, size, lnc_idx, queue, ret, req_seq);
   }
   return NRT_FAILURE;
 }
 
 NRT_STATUS nrta_tensor_copy(nrt_tensor_t* src, uint64_t src_offset, nrt_tensor_t* dst,
-                            uint64_t dst_offset, uint64_t size, int queue,
-                            nrta_error_tracker_t* err_tracker, nrta_seq_t* req_seq) {
+                            uint64_t dst_offset, uint64_t size, int lnc_idx, int queue,
+                            NRT_STATUS* ret, nrta_seq_t* req_seq) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrta_tensor_copy(
-        src, src_offset, dst, dst_offset, size, queue, err_tracker, req_seq);
+        src, src_offset, dst, dst_offset, size, lnc_idx, queue, ret, req_seq);
   }
   return NRT_FAILURE;
 }
@@ -303,35 +303,12 @@ NRT_STATUS nrta_is_completed(nrta_seq_t seq, bool* is_completed) {
   return NRT_FAILURE;
 }
 
-NRT_STATUS nrta_error_tracker_create(uint32_t lnc_idx, nrta_error_tracker_t** tracker) {
-  if (g_mocks_initialized) {
-    return torch_neuronx::testing::MockNRT::GetInstance()->nrta_error_tracker_create(lnc_idx,
-                                                                                     tracker);
-  }
-  return NRT_FAILURE;
-}
-
-void nrta_error_tracker_destroy(nrta_error_tracker_t* tracker) {
-  if (g_mocks_initialized) {
-    torch_neuronx::testing::MockNRT::GetInstance()->nrta_error_tracker_destroy(tracker);
-  }
-}
-
-NRT_STATUS nrta_error_tracker_get_list(nrta_error_tracker_t* tracker, const nrta_error_t** errors,
-                                       size_t* count) {
-  if (g_mocks_initialized) {
-    return torch_neuronx::testing::MockNRT::GetInstance()->nrta_error_tracker_get_list(
-        tracker, errors, count);
-  }
-  return NRT_FAILURE;
-}
-
 NRT_STATUS nrta_execute_schedule(nrt_model_t* model, const nrt_tensor_set_t* input_set,
-                                 nrt_tensor_set_t* output_set, int queue,
-                                 nrta_error_tracker_t* err_tracker, nrta_seq_t* req_seq) {
+                                 nrt_tensor_set_t* output_set, int queue, NRT_STATUS* ret,
+                                 nrta_seq_t* req_seq) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrta_execute_schedule(
-        model, input_set, output_set, queue, err_tracker, req_seq);
+        model, input_set, output_set, queue, ret, req_seq);
   }
   return NRT_FAILURE;
 }

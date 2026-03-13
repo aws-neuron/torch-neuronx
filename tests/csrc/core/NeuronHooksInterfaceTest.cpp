@@ -70,6 +70,18 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
     EXPECT_CALL(*mock_nrt_, nrt_tensor_write(_, _, _, _)).WillRepeatedly(Return(NRT_SUCCESS));
     EXPECT_CALL(*mock_nrt_, nrt_tensor_read(_, _, _, _)).WillRepeatedly(Return(NRT_SUCCESS));
 
+    // Set up mock expectations for async NRT operations
+    static std::atomic<nrta_seq_t> seq_counter{1};
+    EXPECT_CALL(*mock_nrt_, nrta_tensor_copy(_, _, _, _, _, _, _, _, _))
+        .WillRepeatedly([](nrt_tensor_t*, uint64_t, nrt_tensor_t*, uint64_t, uint64_t, int, int,
+                           NRT_STATUS* ret, nrta_seq_t* seq) {
+          *ret = NRT_SUCCESS;
+          *seq = seq_counter.fetch_add(1);
+          return NRT_SUCCESS;
+        });
+    EXPECT_CALL(*mock_nrt_, nrta_is_completed(_, _))
+        .WillRepeatedly(DoAll(SetArgPointee<1>(true), Return(NRT_SUCCESS)));
+
     // Register neuron device to ensure proper initialization
     torch_neuronx::register_neuron_device();
 

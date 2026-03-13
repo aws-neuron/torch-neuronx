@@ -157,8 +157,7 @@ def neuron_backend_fx_compiler(
 
     logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
     logger.debug(
-        f"Example inputs: "
-        f"{[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
+        f"Example inputs: {[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
     )
 
     # Reset timestamp for new compilation (each graph segment gets unique timestamp)
@@ -202,7 +201,18 @@ def neuron_backend_fx_compiler(
                 aliasing_info,
                 random_input_info,
             )
-            compile_graph = CompileGraph(stablehlo_mlir, model_name, segment_id, has_collectives)
+
+            use_tensorizer_backend = (
+                options.get("use_tensorizer_backend", False) if options else False
+            )
+            compile_graph = CompileGraph(
+                stablehlo_mlir,
+                model_name,
+                segment_id,
+                graph_name,
+                has_collectives,
+                use_tensorizer=use_tensorizer_backend,
+            )
             final_cache_key = compile_graph.compile()
 
             # Record compilation metrics (stablehlo_to_neff timing populated lazily at sync)

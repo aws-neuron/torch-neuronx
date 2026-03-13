@@ -27,10 +27,16 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
   static void ResetCompileCounter() { GetCompileCounter().store(0); }
 
   MockNeuronKernelExecution(const std::string& cache_key)
-      : CompilableKernelExecution(cache_key, "", "", false) {}
+      : CompilableKernelExecution(cache_key, "", "", false), hlo_bytes_({'H', 'L', 'O', '_'}) {
+    hlo_bytes_.insert(hlo_bytes_.end(), cache_key.begin(), cache_key.end());
+    GetCompilationCacheKey().SetHloBytesPtr(&hlo_bytes_);
+  }
 
   MockNeuronKernelExecution(const std::string& cache_key, const std::vector<uint8_t>& hlo_bytes)
-      : CompilableKernelExecution(cache_key, "", "", false), hlo_bytes_(hlo_bytes) {}
+      : CompilableKernelExecution(CompilationCacheKey(cache_key, "", ""), "", "", false),
+        hlo_bytes_(hlo_bytes) {
+    GetCompilationCacheKey().SetHloBytesPtr(&hlo_bytes_);
+  }
 
   // Mock compilation that returns dummy NEFF data
   std::vector<uint8_t> CompileToNeff() const override {
@@ -52,6 +58,8 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
   std::vector<uint8_t> hlo_bytes_;
 };
 
+// Helper: generates the full cache key string from a base key.
+
 class CompilationCacheTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -62,6 +70,10 @@ class CompilationCacheTest : public ::testing::Test {
     SaveEnvVar("TORCH_NEURONX_NEFF_CACHE_DIR");
     SaveEnvVar("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+    SaveEnvVar("NEURON_COMPILE_SERVICE");
+
+    // Force local backend for unit tests (service backend calls real neuronx-cc)
+    setenv("NEURON_COMPILE_SERVICE", "0", 1);
 
     // Create temp directories for persistent and local cache
     temp_dir_ = std::make_unique<TempDirectory>("compilation_cache_test_");
@@ -528,10 +540,10 @@ TEST_F(CompilationCacheTest, AdditionalArgsInCompilation) {
 
 TEST_F(CompilationCacheTest, ErrorHandlingInCompilation) {
   // Create a mock that will throw during compilation
-  class ThrowingMockKernelExecution : public CompilableKernelExecution {
+  class ThrowingMockKernelExecution : public MockNeuronKernelExecution {
    public:
     ThrowingMockKernelExecution(const std::string& cache_key)
-        : CompilableKernelExecution(cache_key, "", "", false) {}
+        : MockNeuronKernelExecution(cache_key) {}
 
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("Compilation failed");
@@ -678,10 +690,10 @@ TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
   uint32_t stream_id = 1;
 
   // Create a mock that will throw during compilation
-  class ThrowingMockKernelExecution : public CompilableKernelExecution {
+  class ThrowingMockKernelExecution : public MockNeuronKernelExecution {
    public:
     ThrowingMockKernelExecution(const std::string& cache_key)
-        : CompilableKernelExecution(cache_key, "", "", false) {}
+        : MockNeuronKernelExecution(cache_key) {}
 
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("Compilation failed");
@@ -881,6 +893,9 @@ class CompilationCacheEnvTest : public ::testing::Test {
     // Save original environment variables
     original_max_size_ = getenv("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
     original_max_entries_ = getenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
+    original_service_env_ = getenv("NEURON_COMPILE_SERVICE");
+    // Force local backend
+    setenv("NEURON_COMPILE_SERVICE", "0", 1);
   }
 
   void TearDown() override {
@@ -896,10 +911,17 @@ class CompilationCacheEnvTest : public ::testing::Test {
     } else {
       unsetenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
     }
+
+    if (original_service_env_) {
+      setenv("NEURON_COMPILE_SERVICE", original_service_env_, 1);
+    } else {
+      unsetenv("NEURON_COMPILE_SERVICE");
+    }
   }
 
   const char* original_max_size_ = nullptr;
   const char* original_max_entries_ = nullptr;
+  const char* original_service_env_ = nullptr;
 };
 
 TEST_F(CompilationCacheEnvTest, EnvironmentVariableConfiguration) {
@@ -942,6 +964,21 @@ TEST_F(CompilationCacheEnvTest, DefaultValuesWithoutEnvironment) {
   // Should use default constants
   EXPECT_EQ(default_cache->GetMaxCacheSizeBytes(), CompilationCache::kDefaultMaxCacheSizeBytes);
   EXPECT_EQ(default_cache->GetMaxCacheEntries(), CompilationCache::kDefaultMaxCacheEntries);
+}
+
+TEST_F(CompilationCacheEnvTest, BackendSwitchingViaEnvVar) {
+  // Disabled: NEURON_COMPILE_SERVICE=0 → local backend
+  setenv("NEURON_COMPILE_SERVICE", "0", 1);
+  auto local_cache = std::make_unique<CompilationCache>();
+  EXPECT_FALSE(local_cache->IsServiceBackend());
+  EXPECT_EQ(local_cache->GetBackendName(), "local");
+  local_cache.reset();
+
+  // Default (unset): service backend enabled (may fall back to local if service fails)
+  unsetenv("NEURON_COMPILE_SERVICE");
+  auto default_cache = std::make_unique<CompilationCache>();
+  std::string name = default_cache->GetBackendName();
+  EXPECT_TRUE(name == "service" || name == "local");
 }
 
 TEST_F(CompilationCacheTest, NestedLocks) {
@@ -1910,13 +1947,13 @@ TEST_F(CompilationCacheTest, LockFilesWrittenToLocalCacheDir) {
 TEST_F(CompilationCacheTest, FailedEntryFastFailsWithoutRecompilation) {
   // Verify that a failed compilation is cached and subsequent attempts
   // fail immediately without triggering another compilation.
-  class ThrowingKernel : public CompilableKernelExecution {
+  class ThrowingKernel : public MockNeuronKernelExecution {
    public:
     static std::atomic<int>& CompileCount() {
       static std::atomic<int> count{0};
       return count;
     }
-    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
     std::vector<uint8_t> CompileToNeff() const override {
       CompileCount()++;
       throw std::runtime_error("bad input");
@@ -1938,9 +1975,9 @@ TEST_F(CompilationCacheTest, FailedEntryFastFailsWithoutRecompilation) {
 }
 
 TEST_F(CompilationCacheTest, FailedEntryPreservesErrorMessage) {
-  class ThrowingKernel : public CompilableKernelExecution {
+  class ThrowingKernel : public MockNeuronKernelExecution {
    public:
-    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("specific error: invalid flag --xyz");
     }
@@ -1958,9 +1995,9 @@ TEST_F(CompilationCacheTest, FailedEntryPreservesErrorMessage) {
 }
 
 TEST_F(CompilationCacheTest, FailedEntryDoesNotAffectOtherKeys) {
-  class ThrowingKernel : public CompilableKernelExecution {
+  class ThrowingKernel : public MockNeuronKernelExecution {
    public:
-    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("compilation failed");
     }
@@ -1983,9 +2020,9 @@ TEST_F(CompilationCacheTest, FailedEntryDoesNotAffectOtherKeys) {
 }
 
 TEST_F(CompilationCacheTest, FailedEntryClearedOnCacheClear) {
-  class ThrowingKernel : public CompilableKernelExecution {
+  class ThrowingKernel : public MockNeuronKernelExecution {
    public:
-    ThrowingKernel(const std::string& key) : CompilableKernelExecution(key, "", "", false) {}
+    ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
     std::vector<uint8_t> CompileToNeff() const override {
       throw std::runtime_error("compilation failed");
     }
@@ -1999,6 +2036,226 @@ TEST_F(CompilationCacheTest, FailedEntryClearedOnCacheClear) {
   // Clear should remove it
   cache_->ClearInMemoryCache();
   EXPECT_EQ(cache_->GetAllCacheKeys().size(), 0);
+}
+
+// Test for race condition between double-check and pending registration.
+TEST_F(CompilationCacheTest, RaceConditionDoubleCheckToRegistration) {
+  // Disable persistent cache to isolate the in-memory coordination bug
+  setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
+  cache_ = std::make_unique<CompilationCache>();
+
+  const int num_threads = 8;
+  const int num_iterations = 50;
+  std::atomic<int> promise_errors{0};
+
+  for (int iter = 0; iter < num_iterations; ++iter) {
+    cache_->Clear();
+    MockNeuronKernelExecution::ResetCompileCounter();
+
+    std::string cache_key = "race_test_key_" + std::to_string(iter);
+    std::atomic<int> threads_ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+      threads.emplace_back([&, i]() {
+        threads_ready++;
+        while (!start.load()) {
+          std::this_thread::yield();
+        }
+        try {
+          MockNeuronKernelExecution kernel_exec(cache_key);
+          cache_->GetOrCompileNeff(kernel_exec, i + 1);
+        } catch (const std::future_error& e) {
+          // "Promise already satisfied" indicates the race condition
+          promise_errors++;
+        }
+      });
+    }
+
+    while (threads_ready.load() < num_threads) {
+      std::this_thread::yield();
+    }
+    start.store(true);
+
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    // Should have exactly 1 compilation per iteration
+    if (MockNeuronKernelExecution::GetCompileCounter().load() != 1) {
+      ADD_FAILURE() << "Iteration " << iter << ": Expected 1 compilation, got "
+                    << MockNeuronKernelExecution::GetCompileCounter().load();
+    }
+  }
+
+  EXPECT_EQ(promise_errors.load(), 0)
+      << "Caught " << promise_errors.load()
+      << " 'Promise already satisfied' errors - race condition detected!";
+
+  unsetenv("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+}
+
+// =============================================================================
+// Dual-Path Routing Tests
+// =============================================================================
+
+// Verify that with local backend, sync GetOrCompileNeff works and
+// IsServiceBackend returns false (ProcessCompilationTask takes sync path).
+TEST_F(CompilationCacheTest, LocalBackendUsesSyncPath) {
+  EXPECT_FALSE(cache_->IsServiceBackend());
+  EXPECT_EQ(cache_->GetBackendName(), "local");
+
+  MockNeuronKernelExecution::ResetCompileCounter();
+  MockNeuronKernelExecution kernel("sync_path_test");
+
+  // Sync path: compiles directly on this thread, returns with NEFF set
+  cache_->GetOrCompileNeff(kernel, 1);
+  EXPECT_TRUE(kernel.HasCachedNeff());
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+// Verify that with local backend, async GetOrCompileNeffAsync also works
+// (uses thread pool). This is the path taken when service is active.
+TEST_F(CompilationCacheTest, AsyncPathWorksWithLocalBackend) {
+  MockNeuronKernelExecution::ResetCompileCounter();
+  MockNeuronKernelExecution kernel("async_path_test");
+
+  std::atomic<bool> done{false};
+  bool success = false;
+
+  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool s) {
+    success = s;
+    done = true;
+  });
+
+  for (int i = 0; i < 100 && !done.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_TRUE(done.load());
+  EXPECT_TRUE(success);
+  EXPECT_TRUE(kernel.HasCachedNeff());
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+// =============================================================================
+// GetOrCompileNeffAsync Tests (local backend + thread pool)
+// =============================================================================
+
+TEST_F(CompilationCacheTest, AsyncCacheHit) {
+  MockNeuronKernelExecution kernel("async_hit_test");
+  cache_->GetOrCompileNeff(kernel, 1);
+  ASSERT_TRUE(kernel.HasCachedNeff());
+
+  MockNeuronKernelExecution kernel2("async_hit_test");
+  std::atomic<bool> callback_invoked{false};
+  bool callback_success = false;
+
+  cache_->GetOrCompileNeffAsync(kernel2, 1, [&](bool success) {
+    callback_success = success;
+    callback_invoked = true;
+  });
+
+  for (int i = 0; i < 100 && !callback_invoked.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_TRUE(callback_invoked.load());
+  EXPECT_TRUE(callback_success);
+  EXPECT_TRUE(kernel2.HasCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, AsyncCacheMiss) {
+  MockNeuronKernelExecution::ResetCompileCounter();
+  MockNeuronKernelExecution kernel("async_miss_test");
+
+  std::atomic<bool> callback_invoked{false};
+  bool callback_success = false;
+
+  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool success) {
+    callback_success = success;
+    callback_invoked = true;
+  });
+
+  for (int i = 0; i < 100 && !callback_invoked.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_TRUE(callback_invoked.load());
+  EXPECT_TRUE(callback_success);
+  EXPECT_TRUE(kernel.HasCachedNeff());
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, AsyncPendingCompilation) {
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::atomic<int> callbacks_invoked{0};
+  std::atomic<int> callbacks_success{0};
+
+  std::vector<std::unique_ptr<MockNeuronKernelExecution>> kernels;
+  for (int i = 0; i < 4; ++i)
+    kernels.push_back(std::make_unique<MockNeuronKernelExecution>("async_pending_test"));
+
+  for (auto& kernel : kernels) {
+    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success) {
+      if (success) callbacks_success++;
+      callbacks_invoked++;
+    });
+  }
+
+  for (int i = 0; i < 100 && callbacks_invoked.load() < 4; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_EQ(callbacks_invoked.load(), 4);
+  EXPECT_EQ(callbacks_success.load(), 4);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  for (auto& kernel : kernels) EXPECT_TRUE(kernel->HasCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, AsyncMultipleDifferentKeys) {
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::atomic<int> callbacks_invoked{0};
+  const int num_keys = 4;
+
+  std::vector<std::unique_ptr<MockNeuronKernelExecution>> kernels;
+  for (int i = 0; i < num_keys; ++i)
+    kernels.push_back(
+        std::make_unique<MockNeuronKernelExecution>("async_multi_" + std::to_string(i)));
+
+  for (auto& kernel : kernels)
+    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool) { callbacks_invoked++; });
+
+  for (int i = 0; i < 100 && callbacks_invoked.load() < num_keys; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_EQ(callbacks_invoked.load(), num_keys);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), num_keys);
+}
+
+TEST_F(CompilationCacheTest, AsyncFutureCaptureRace) {
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  std::atomic<int> callbacks_invoked{0};
+  std::atomic<int> callbacks_success{0};
+
+  std::vector<std::unique_ptr<MockNeuronKernelExecution>> kernels;
+  for (int i = 0; i < 8; ++i)
+    kernels.push_back(std::make_unique<MockNeuronKernelExecution>("async_race_test"));
+
+  for (auto& kernel : kernels) {
+    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success) {
+      if (success) callbacks_success++;
+      callbacks_invoked++;
+    });
+  }
+
+  for (int i = 0; i < 200 && callbacks_invoked.load() < 8; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  EXPECT_EQ(callbacks_invoked.load(), 8);
+  EXPECT_EQ(callbacks_success.load(), 8);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
 }
 
 int main(int argc, char** argv) {

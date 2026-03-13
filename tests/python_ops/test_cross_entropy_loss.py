@@ -7,339 +7,355 @@ import torch
 import torch.nn.functional as functional
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import (
-    assert_op_runs_on_neuron,
-    assert_raises,
-    track_neuron_ops,
-)
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 
-@pytest.mark.xfail(
-    reason="Enable once we support cross_entropy loss, change was "
-    "reverted due to missing backward registration"
-)
+def _run_cross_entropy(logits_cpu, targets_cpu, backward=False, rtol=1e-4, atol=1e-4, **kwargs):
+    """Run cross_entropy on CPU and Neuron, compare results and optionally gradients."""
+    if backward:
+        logits_cpu = logits_cpu.clone().detach().requires_grad_(True)
+
+    loss_cpu = functional.cross_entropy(logits_cpu, targets_cpu, **kwargs)
+
+    if backward:
+        (loss_cpu.sum() if loss_cpu.dim() > 0 else loss_cpu).backward()
+
+    # Neuron
+    logits_neuron = logits_cpu.detach().clone().to("neuron")
+    if backward:
+        logits_neuron.requires_grad_(True)
+    targets_neuron = targets_cpu.to("neuron")
+
+    # Move weight to neuron if present
+    nkwargs = {
+        k: v.to("neuron") if k == "weight" and v is not None else v for k, v in kwargs.items()
+    }
+
+    with track_neuron_ops():
+        loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron, **nkwargs)
+        assert_op_runs_on_neuron("aten::cross_entropy_loss")
+
+    if backward:
+        (loss_neuron.sum() if loss_neuron.dim() > 0 else loss_neuron).backward()
+
+    assert loss_cpu.shape == loss_neuron.shape
+    assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=rtol, atol=atol)
+
+    if backward:
+        assert logits_cpu.grad.shape == logits_neuron.grad.shape
+        assert torch.allclose(logits_cpu.grad, logits_neuron.grad.cpu(), rtol=rtol, atol=atol)
+
+
+# ── Test data for parametrized core tests ────────────────────────────────
+# (id, logits, targets, kwargs)
+_CORE_CASES = [
+    ("minimal", torch.randn(4, 5), torch.tensor([0, 1, 2, 3], dtype=torch.long), {}),
+    (
+        "weights",
+        torch.tensor([[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]]),
+        torch.tensor([0, 2, 1], dtype=torch.long),
+        {"weight": torch.tensor([0.1, 1.0, 2.0])},
+    ),
+    (
+        "ignore_index",
+        torch.tensor([[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]]),
+        torch.tensor([0, -100, 1], dtype=torch.long),
+        {"ignore_index": -100},
+    ),
+    (
+        "label_smoothing",
+        torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]]),
+        torch.tensor([0, 2], dtype=torch.long),
+        {"label_smoothing": 0.1},
+    ),
+    (
+        "prob_targets",
+        torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]]),
+        torch.tensor([[0.2, 0.7, 0.1], [0.05, 0.15, 0.8]]),
+        {},
+    ),
+    (
+        "all_params_index",
+        torch.tensor([[2.0, 0.5, 1.0, -0.3], [0.5, 1.0, 2.0, 0.7], [0.1, 0.7, 3.0, 1.2]]),
+        torch.tensor([0, -100, 3], dtype=torch.long),
+        {
+            "weight": torch.tensor([0.1, 1.0, 2.0, 0.5]),
+            "ignore_index": -100,
+            "reduction": "sum",
+            "label_smoothing": 0.2,
+        },
+    ),
+    (
+        "all_params_prob",
+        torch.tensor([[2.0, 0.5, 1.0, -0.3], [0.5, 1.0, 2.0, 0.7]]),
+        torch.tensor([[0.2, 0.3, 0.4, 0.1], [0.05, 0.15, 0.5, 0.3]]),
+        {
+            "weight": torch.tensor([0.1, 1.0, 2.0, 0.5]),
+            "reduction": "sum",
+            "label_smoothing": 0.1,
+        },
+    ),
+]
+
+
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 class TestCrossEntropy:
     def setup(self):
         """Set up test environment before each test method."""
         torch.manual_seed(42)
 
+    # ── Core forward + backward ──────────────────────────────────────────
+
+    @pytest.mark.parametrize("backward", [False, True])
+    @pytest.mark.parametrize(
+        "logits, targets, kwargs",
+        [pytest.param(lg, t, k, id=name) for name, lg, t, k in _CORE_CASES],
+    )
+    def test_cross_entropy(self, logits, targets, kwargs, backward):
+        """Test cross_entropy forward/backward across core input combinations."""
+        _run_cross_entropy(logits, targets, backward=backward, **kwargs)
+
+    @pytest.mark.parametrize("backward", [False, True])
     @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
-    def test_cross_entropy_reduction(self, reduction):
+    def test_cross_entropy_reduction(self, reduction, backward):
         """Test cross_entropy with different reduction modes."""
-        logits_cpu = torch.tensor(
-            [[2.0, 1.5, 0.3, -1.0, 0.5], [0.5, 0.8, 1.2, 2.0, -0.1], [0.1, -0.3, 0.7, 1.8, -0.2]],
-            requires_grad=True,
+        _run_cross_entropy(
+            torch.tensor(
+                [
+                    [2.0, 1.5, 0.3, -1.0, 0.5],
+                    [0.5, 0.8, 1.2, 2.0, -0.1],
+                    [0.1, -0.3, 0.7, 1.8, -0.2],
+                ]
+            ),
+            torch.tensor([0, 3, 3], dtype=torch.long),
+            backward=backward,
+            reduction=reduction,
         )
-        targets_cpu = torch.tensor([0, 3, 3], dtype=torch.long)
 
-        # Get CPU result
-        loss_cpu = functional.cross_entropy(logits_cpu, targets_cpu, reduction=reduction)
-
-        # Create identical tensors on Neuron device
-        logits_neuron = logits_cpu.detach().clone().to("neuron")
-        targets_neuron = targets_cpu.detach().clone().to("neuron")
-
-        # Run on Neuron device and track ops
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(
-                logits_neuron, targets_neuron, reduction=reduction
-            )
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        # Check results match
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
-        # Verify expected shape based on reduction
-        expected_shape = torch.Size([3]) if reduction == "none" else torch.Size([])
-        assert loss_cpu.size() == expected_shape
-        assert loss_neuron.size() == expected_shape
-
-    def test_cross_entropy_with_weights(self):
-        """Test cross_entropy with class weights."""
-        logits = torch.tensor(
-            [[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]], requires_grad=True
-        )
-        targets = torch.tensor([0, 2, 1], dtype=torch.long)
-        weight = torch.tensor([0.1, 1.0, 2.0])  # Class 2 is 20x more important than class 0
-
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets, weight=weight)
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-        weight_neuron = weight.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(
-                logits_neuron, targets_neuron, weight=weight_neuron
-            )
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
+    @pytest.mark.parametrize("backward", [False, True])
     @pytest.mark.parametrize("smoothing", [0.0, 0.1, 0.3])
-    def test_cross_entropy_label_smoothing(self, smoothing):
-        """Test cross_entropy with label smoothing."""
-        logits = torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]], requires_grad=True)
-        targets = torch.tensor([0, 2], dtype=torch.long)
-
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets, label_smoothing=smoothing)
-
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(
-                logits_neuron, targets_neuron, label_smoothing=smoothing
-            )
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
-    def test_cross_entropy_ignore_index(self):
-        """Test cross_entropy with ignore_index."""
-        logits = torch.tensor(
-            [[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]], requires_grad=True
-        )
-        targets = torch.tensor([0, -100, 1], dtype=torch.long)
-
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets, ignore_index=-100)
-
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron, ignore_index=-100)
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
-    def test_cross_entropy_probability_targets(self):
-        """Test cross_entropy with probability targets."""
-        logits = torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]], requires_grad=True)
-
-        # Create soft targets (probability distributions)
-        targets = torch.tensor(
-            [
-                [0.2, 0.7, 0.1],  # First sample is mostly class 1
-                [0.05, 0.15, 0.8],  # Second sample is mostly class 2
-            ]
+    def test_cross_entropy_label_smoothing_sweep(self, smoothing, backward):
+        """Test cross_entropy across label smoothing values."""
+        _run_cross_entropy(
+            torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]]),
+            torch.tensor([0, 2], dtype=torch.long),
+            backward=backward,
+            label_smoothing=smoothing,
         )
 
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets)
+    @pytest.mark.parametrize("backward", [False, True])
+    @pytest.mark.parametrize("shape", [(2, 3, 4, 4), (2, 3, 2, 3, 2)])
+    def test_cross_entropy_multidimensional(self, shape, backward):
+        """Test cross_entropy with multi-dimensional inputs (spatial)."""
+        logits = torch.randn(shape)
+        targets = torch.randint(0, shape[1], (shape[0], *shape[2:]), dtype=torch.long)
+        _run_cross_entropy(logits, targets, backward=backward)
 
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron)
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
+    # ── Batch size edge cases ────────────────────────────────────────────
 
     @pytest.mark.parametrize(
-        "shape",
-        [
-            (2, 3, 2, 2),  # 2D spatial (e.g., image)
-            (2, 3, 4, 5, 2),  # 3D spatial (e.g., video)
-        ],
+        "batch, n_classes",
+        [(1, 5), (128, 10)],
+        ids=["single", "large"],
     )
-    def test_cross_entropy_multidimensional(self, shape):
-        """Test cross_entropy with multi-dimensional inputs."""
-        # Create multi-dimensional logits
-        logits = torch.randn(shape, requires_grad=True)
+    def test_cross_entropy_batch_sizes(self, batch, n_classes):
+        """Test backward with various batch sizes."""
+        _run_cross_entropy(
+            torch.randn(batch, n_classes),
+            torch.randint(0, n_classes, (batch,)),
+            backward=True,
+        )
 
-        # Create corresponding targets (without the channel dimension)
-        target_shape = (shape[0],) + shape[2:]
-        targets = torch.randint(0, shape[1], target_shape, dtype=torch.long)
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets)
+    # ── Gradient shape / structural tests ────────────────────────────────
 
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
+    @pytest.mark.parametrize(
+        "shape, targets",
+        [
+            ((4, 5), torch.tensor([0, 1, 2, 3])),
+            ((2, 3, 4, 4), torch.randint(0, 3, (2, 4, 4))),
+            ((1, 10), torch.tensor([5])),
+        ],
+        ids=["2d", "spatial", "single"],
+    )
+    def test_cross_entropy_gradient_shape(self, shape, targets):
+        """Test that gradient shape always matches input shape."""
+        _run_cross_entropy(torch.randn(shape), targets, backward=True)
+
+    def test_cross_entropy_no_grad_on_targets(self):
+        """Test that targets don't receive gradients."""
+        logits = torch.randn(3, 4).to("neuron").requires_grad_(True)
+        targets = torch.tensor([0, 1, 2], dtype=torch.long).to("neuron")
 
         with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron)
+            loss = functional.cross_entropy(logits, targets)
             assert_op_runs_on_neuron("aten::cross_entropy_loss")
 
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
+        loss.backward()
+        assert logits.grad is not None
+        assert targets.grad is None
 
-    def test_cross_entropy_all_params_with_indices(self):
-        """Test cross_entropy with all parameters active (using class indices)."""
-        logits = torch.tensor(
-            [[2.0, 0.5, 1.0, -0.3], [0.5, 1.0, 2.0, 0.7], [0.1, 0.7, 3.0, 1.2]], requires_grad=True
+    # ── Ignore-index special cases ───────────────────────────────────────
+
+    def test_cross_entropy_ignore_index_zero_gradient(self):
+        """Test that ignored samples produce zero gradient."""
+        logits_cpu = torch.tensor(
+            [[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]], requires_grad=True
         )
-        targets = torch.tensor([0, -100, 3], dtype=torch.long)  # One target is ignored
-        weight = torch.tensor([0.1, 1.0, 2.0, 0.5])  # Custom weights for all classes
+        targets_cpu = torch.tensor([0, -100, 1], dtype=torch.long)
 
-        # CPU computation with all parameters active
-        loss_cpu = functional.cross_entropy(
-            logits, targets, weight=weight, ignore_index=-100, reduction="sum", label_smoothing=0.2
-        )
+        loss_cpu = functional.cross_entropy(logits_cpu, targets_cpu, ignore_index=-100)
+        loss_cpu.backward()
 
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-        weight_neuron = weight.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(
-                logits_neuron,
-                targets_neuron,
-                weight=weight_neuron,
-                ignore_index=-100,
-                reduction="sum",
-                label_smoothing=0.2,
-            )
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
-    def test_cross_entropy_all_params_with_probs(self):
-        """Test cross_entropy with all parameters active (using probability targets)."""
-        logits = torch.tensor(
-            [
-                [2.0, 0.5, 1.0, -0.3],
-                [0.5, 1.0, 2.0, 0.7],
-            ],
-            requires_grad=True,
-        )
-
-        # Probability targets
-        targets = torch.tensor([[0.2, 0.3, 0.4, 0.1], [0.05, 0.15, 0.5, 0.3]])
-
-        weight = torch.tensor([0.1, 1.0, 2.0, 0.5])  # Custom weights for all classes
-
-        # CPU computation with all parameters active
-        loss_cpu = functional.cross_entropy(
-            logits, targets, weight=weight, reduction="sum", label_smoothing=0.1
-        )
-
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-        weight_neuron = weight.detach().clone().to("neuron")
-
-        with track_neuron_ops():
-            loss_neuron = functional.cross_entropy(
-                logits_neuron,
-                targets_neuron,
-                weight=weight_neuron,
-                reduction="sum",
-                label_smoothing=0.1,
-            )
-            assert_op_runs_on_neuron("aten::cross_entropy_loss")
-
-        assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=1e-4, atol=1e-4)
-
-    @assert_raises(RuntimeError, match="Expected target size")
-    def test_cross_entropy_invalid_target_shape(self):
-        """Test cross_entropy with invalid target shape (should fail with same error)."""
-        logits = torch.randn((2, 3, 4, 4), requires_grad=True)  # [N, C, H, W]
-
-        # Invalid target shape - missing spatial dimension
-        targets = torch.tensor([0, 1], dtype=torch.long)
-
-        # Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        functional.cross_entropy(logits_neuron, targets_neuron)
-
-    @assert_raises((IndexError, RuntimeError), match="out of range")
-    def test_cross_entropy_out_of_range_targets(self):
-        """Test cross_entropy with targets outside valid class range."""
-        logits = torch.randn((2, 3), requires_grad=True)
-
-        # Target class 5 is invalid (only 0,1,2 are valid)
-        targets = torch.tensor([1, 5], dtype=torch.long)
-
-        # Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        functional.cross_entropy(logits_neuron, targets_neuron)
-
-    @assert_raises(RuntimeError, match="weight tensor should be defined either for all")
-    def test_cross_entropy_invalid_weight_size(self):
-        """Test cross_entropy with invalid weight size."""
-        logits = torch.randn((2, 3), requires_grad=True)
-        targets = torch.tensor([1, 2], dtype=torch.long)
-
-        # Weight should have size 3, but has size 2
-        weight = torch.tensor([0.5, 1.5])
-
-        # Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-        weight_neuron = weight.detach().clone().to("neuron")
-
-        functional.cross_entropy(logits_neuron, targets_neuron, weight=weight_neuron)
-
-    @assert_raises((RuntimeError, Exception), match="Expected target size")
-    def test_cross_entropy_probability_shape_mismatch(self):
-        """Test cross_entropy when probability targets have wrong shape."""
-        logits = torch.randn((2, 3), requires_grad=True)
-
-        # Target has wrong number of classes (4 instead of 3)
-        targets = torch.tensor([[0.2, 0.3, 0.4, 0.1], [0.1, 0.2, 0.3, 0.4]])
-
-        # Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        functional.cross_entropy(logits_neuron, targets_neuron)
-
-    @assert_raises((ValueError, Exception), match="is not a valid value for reduction")
-    def test_cross_entropy_invalid_reduction(self):
-        """Test cross_entropy with invalid reduction mode."""
-        logits = torch.randn((2, 3), requires_grad=True)
-        targets = torch.tensor([0, 1], dtype=torch.long)
-
-        # Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
-
-        functional.cross_entropy(logits_neuron, targets_neuron, reduction="invalid")
-
-    def test_cross_entropy_all_ignored(self):
-        """Test cross_entropy when all targets are ignored."""
-        logits = torch.randn((3, 4), requires_grad=True)
-        targets = torch.tensor([-100, -100, -100], dtype=torch.long)  # All targets are ignore_index
-
-        # CPU computation
-        loss_cpu = functional.cross_entropy(logits, targets, ignore_index=-100)
-
-        # Neuron computation
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
+        logits_neuron = logits_cpu.detach().clone().to("neuron").requires_grad_(True)
+        targets_neuron = targets_cpu.to("neuron")
 
         with track_neuron_ops():
             loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron, ignore_index=-100)
             assert_op_runs_on_neuron("aten::cross_entropy_loss")
 
-        # Verify both return NaN
+        loss_neuron.backward()
+
+        assert torch.allclose(logits_cpu.grad[1], torch.zeros(3), atol=1e-6)
+        assert torch.allclose(logits_neuron.grad.cpu()[1], torch.zeros(3), atol=1e-6)
+
+    @pytest.mark.parametrize("backward", [False, True])
+    def test_cross_entropy_all_ignored(self, backward):
+        """Test cross_entropy when all targets are ignored — loss should be NaN."""
+        logits_cpu = torch.randn(3, 4)
+        targets_cpu = torch.tensor([-100, -100, -100], dtype=torch.long)
+
+        if backward:
+            logits_cpu = logits_cpu.requires_grad_(True)
+
+        loss_cpu = functional.cross_entropy(logits_cpu, targets_cpu, ignore_index=-100)
+
+        logits_neuron = logits_cpu.detach().clone().to("neuron")
+        if backward:
+            logits_neuron.requires_grad_(True)
+        targets_neuron = targets_cpu.to("neuron")
+
+        with track_neuron_ops():
+            loss_neuron = functional.cross_entropy(logits_neuron, targets_neuron, ignore_index=-100)
+            assert_op_runs_on_neuron("aten::cross_entropy_loss")
+
         assert torch.isnan(loss_cpu)
         assert torch.isnan(loss_neuron.cpu())
 
-    @assert_raises((RuntimeError, Exception), match="Expected target size")
+        if backward:
+            loss_cpu.backward()
+            loss_neuron.backward()
+            assert logits_cpu.grad.shape == logits_neuron.grad.shape
+            assert torch.isnan(logits_cpu.grad).all() == torch.isnan(logits_neuron.grad.cpu()).all()
+
+    # ── Error / validation tests ─────────────────────────────────────────
+
+    def test_cross_entropy_invalid_target_shape(self):
+        """Test cross_entropy with invalid target shape."""
+        logits = torch.randn(2, 3, 4, 4)
+        targets = torch.tensor([0, 1], dtype=torch.long)
+
+        with pytest.raises(RuntimeError) as cpu_exc:
+            functional.cross_entropy(logits, targets)
+
+        with pytest.raises(RuntimeError, match=re.escape(str(cpu_exc.value))):
+            functional.cross_entropy(logits.to("neuron"), targets.to("neuron"))
+
+    def test_cross_entropy_out_of_range_targets(self):
+        """Test cross_entropy with targets outside valid class range."""
+        logits = torch.randn(2, 3)
+        targets = torch.tensor([1, 5], dtype=torch.long)
+
+        with pytest.raises(IndexError) as cpu_exc:
+            functional.cross_entropy(logits, targets)
+
+        with pytest.raises(IndexError, match=re.escape(str(cpu_exc.value))):
+            functional.cross_entropy(logits.to("neuron"), targets.to("neuron"))
+
+    def test_cross_entropy_invalid_weight_size(self):
+        """Test cross_entropy with invalid weight size."""
+        logits = torch.randn(2, 3)
+        targets = torch.tensor([1, 2], dtype=torch.long)
+        weight = torch.tensor([0.5, 1.5])
+
+        with pytest.raises(RuntimeError) as cpu_exc:
+            functional.cross_entropy(logits, targets, weight=weight)
+
+        with pytest.raises(RuntimeError, match=re.escape(str(cpu_exc.value))):
+            functional.cross_entropy(
+                logits.to("neuron"), targets.to("neuron"), weight=weight.to("neuron")
+            )
+
+    def test_cross_entropy_probability_shape_mismatch(self):
+        """Test cross_entropy when probability targets have wrong shape."""
+        logits = torch.randn(2, 3)
+        targets = torch.tensor([[0.2, 0.3, 0.4, 0.1], [0.1, 0.2, 0.3, 0.4]])
+
+        with pytest.raises(RuntimeError) as cpu_exc:
+            functional.cross_entropy(logits, targets)
+
+        with pytest.raises(Exception, match=re.escape(str(cpu_exc.value))):
+            functional.cross_entropy(logits.to("neuron"), targets.to("neuron"))
+
+    def test_cross_entropy_invalid_reduction(self):
+        """Test cross_entropy with invalid reduction mode."""
+        logits = torch.randn(2, 3)
+        targets = torch.tensor([0, 1], dtype=torch.long)
+
+        with pytest.raises(ValueError) as cpu_exc:
+            functional.cross_entropy(logits, targets, reduction="invalid")
+
+        with pytest.raises(Exception, match=re.escape(str(cpu_exc.value))):
+            functional.cross_entropy(logits.to("neuron"), targets.to("neuron"), reduction="invalid")
+
     def test_cross_entropy_incompatible_spatial_dimensions(self):
         """Test cross_entropy with incompatible spatial dimensions."""
-        logits = torch.randn((2, 3, 4, 4), requires_grad=True)  # [N, C, H, W]
-
-        # Target has wrong spatial dimensions (5x5 instead of 4x4)
+        logits = torch.randn(2, 3, 4, 4)
         targets = torch.randint(0, 3, (2, 5, 5), dtype=torch.long)
 
-        # Now Verify that Neuron raises error
-        logits_neuron = logits.detach().clone().to("neuron")
-        targets_neuron = targets.detach().clone().to("neuron")
+        with pytest.raises(RuntimeError):
+            functional.cross_entropy(logits, targets)
 
-        functional.cross_entropy(logits_neuron, targets_neuron)
+        with pytest.raises(RuntimeError):
+            functional.cross_entropy(logits.to("neuron"), targets.to("neuron"))
+
+    # ── Large vocab tests (exercise multi-chunk code path) ───────────────
+
+    @pytest.mark.parametrize("vocab_size", [8192, 32768])
+    @pytest.mark.parametrize("backward", [False, True])
+    def test_cross_entropy_large_vocab(self, vocab_size, backward):
+        """Test forward/backward with vocab > _CHUNK_SIZE (4096)."""
+        _run_cross_entropy(
+            torch.randn(32, vocab_size),
+            torch.randint(0, vocab_size, (32,)),
+            backward=backward,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+    def test_cross_entropy_large_vocab_reductions(self, reduction):
+        """Test all reductions with large vocab to cover chunked reduction paths."""
+        _run_cross_entropy(
+            torch.randn(16, 10000),
+            torch.randint(0, 10000, (16,)),
+            backward=True,
+            reduction=reduction,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_cross_entropy_large_vocab_with_weights_and_smoothing(self):
+        """Test chunked path with weights, ignore_index, and label smoothing."""
+        batch, vocab = 16, 8192
+        targets = torch.randint(0, vocab, (batch,))
+        targets[3] = -100
+        _run_cross_entropy(
+            torch.randn(batch, vocab),
+            targets,
+            backward=True,
+            weight=torch.rand(vocab).abs() + 0.1,
+            ignore_index=-100,
+            label_smoothing=0.1,
+            rtol=1e-3,
+            atol=1e-3,
+        )

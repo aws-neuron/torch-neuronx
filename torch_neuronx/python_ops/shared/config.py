@@ -96,12 +96,20 @@ class IndexOps:
     """
 
     # Index operation names
-    INDEX_OPS: ClassVar[set] = {"scatter", "scatter_add"}
+    INDEX_OPS: ClassVar[set] = {"scatter", "scatter_add", "_index_put_impl_"}
 
     # Registry mapping operation names to index argument positions
-    INDEX_ARGNUM_REGISTRY: ClassVar[dict[str, int | None]] = {"scatter": 2, "scatter_add": 2}
+    INDEX_ARGNUM_REGISTRY: ClassVar[dict[str, int | None]] = {
+        "scatter": 2,
+        "scatter_add": 2,
+        "_index_put_impl_": 1,
+    }
 
-    INPUT_ARGNUM_REGISTRY: ClassVar[dict[str, int | None]] = {"scatter": 0, "scatter_add": 0}
+    INPUT_ARGNUM_REGISTRY: ClassVar[dict[str, int | None]] = {
+        "scatter": 0,
+        "scatter_add": 0,
+        "_index_put_impl_": 0,
+    }
 
     @classmethod
     def is_index(cls, op_name: str) -> bool:

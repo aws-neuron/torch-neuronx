@@ -74,20 +74,15 @@ class MockNRT {
   // Async NRT functions
   MOCK_METHOD(NRT_STATUS, nrta_get_sequence, (uint32_t, nrta_xu_t, int, nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_tensor_write,
-              (nrt_tensor_t*, const void*, uint64_t, uint64_t, int, nrta_error_tracker_t*,
-               nrta_seq_t*));
+              (nrt_tensor_t*, const void*, uint64_t, uint64_t, int, int, NRT_STATUS*, nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_tensor_read,
-              (void*, nrt_tensor_t*, uint64_t, uint64_t, int, nrta_error_tracker_t*, nrta_seq_t*));
+              (void*, nrt_tensor_t*, uint64_t, uint64_t, int, int, NRT_STATUS*, nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_tensor_copy,
-              (nrt_tensor_t*, uint64_t, nrt_tensor_t*, uint64_t, uint64_t, int,
-               nrta_error_tracker_t*, nrta_seq_t*));
+              (nrt_tensor_t*, uint64_t, nrt_tensor_t*, uint64_t, uint64_t, int, int, NRT_STATUS*,
+               nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_is_completed, (nrta_seq_t, bool*));
-  MOCK_METHOD(NRT_STATUS, nrta_error_tracker_create, (uint32_t, nrta_error_tracker_t**));
-  MOCK_METHOD(void, nrta_error_tracker_destroy, (nrta_error_tracker_t*));
-  MOCK_METHOD(NRT_STATUS, nrta_error_tracker_get_list,
-              (nrta_error_tracker_t*, const nrta_error_t**, size_t*));
   MOCK_METHOD(NRT_STATUS, nrta_execute_schedule,
-              (nrt_model_t*, const nrt_tensor_set_t*, nrt_tensor_set_t*, int, nrta_error_tracker_t*,
+              (nrt_model_t*, const nrt_tensor_set_t*, nrt_tensor_set_t*, int, NRT_STATUS*,
                nrta_seq_t*));
 
  private:

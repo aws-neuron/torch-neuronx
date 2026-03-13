@@ -47,6 +47,8 @@
 // Include Distributed Work and Watchdog (for async collective completion tracking)
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
+// Include memory snapshot
+#include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
 // Copy helpers
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
 // Runtime utilities (including profiling)
@@ -655,11 +657,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("non_blocking") = false);
   m.def(
       "_nrt_copy_neuron_to_neuron_tensor",
-      [](const at::Tensor& src_neuron, at::Tensor& dst_neuron, bool non_blocking = false) {
-        torch_neuronx::utils::copy_neuron_to_neuron(src_neuron, dst_neuron, non_blocking);
+      [](const at::Tensor& src_neuron, at::Tensor& dst_neuron) {
+        torch_neuronx::utils::copy_neuron_to_neuron(src_neuron, dst_neuron);
       },
       "Copy from Neuron tensor to Neuron tensor (same device) using NRT", py::arg("src_neuron"),
-      py::arg("dst_neuron"), py::arg("non_blocking") = false);
+      py::arg("dst_neuron"));
 
   m.def("version", []() { return "0.1.0"; });
   m.def(
@@ -728,6 +730,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       [](c10::StreamId stream_id, c10::DeviceIndex device_index, int64_t device_type) {
         TORCH_CHECK(device_type == static_cast<int64_t>(c10::DeviceType::PrivateUse1),
                     "Expected Neuron device type");
+        if (c10_neuron::current_device() != device_index) {
+          c10_neuron::set_device(device_index);
+        }
         auto stream =
             at::neuron::NeuronStream(stream_id, device_index, at::neuron::NeuronStream::UNCHECKED);
         at::neuron::setCurrentNeuronStream(stream);
@@ -1019,7 +1024,61 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Get the list of operations that executed on Neuron");
 
   m.def("_clear_op_tracking", &torch_neuronx::clearOpTracking,
-        "Clear both fallback and executed operation tracking");
+        "Clear fallback, executed, and concatenated operation tracking");
+
+  m.def(
+      "_get_concatenated_ops",
+      []() {
+        auto ops = torch_neuronx::getConcatenatedOps();
+        py::dict result;
+        for (const auto& [concat_name, original_names] : ops) {
+          result[py::cast(concat_name)] = py::cast(original_names);
+        }
+        return result;
+      },
+      "Get mapping of concatenated op names to their original constituent op names");
+
+  m.def(
+      "_get_concatenated_op_execution_counts",
+      []() {
+        auto counts = torch_neuronx::getConcatenatedOpExecutionCounts();
+        py::dict result;
+        for (const auto& [op_name, count] : counts) {
+          result[py::cast(op_name)] = py::cast(count);
+        }
+        return result;
+      },
+      "Get per-op execution counts for concatenated ops (count=1 means uncached first execution, "
+      "count>1 means subsequent executions were cache hits)");
+
+  m.def(
+      "_get_concatenation_profiles",
+      []() {
+        auto profiles = torch_neuronx::getConcatenationProfiles();
+        py::dict result;
+        for (const auto& [op_name, profile] : profiles) {
+          py::dict profile_dict;
+          profile_dict["merge_times_ns"] = py::cast(profile.merge_times_ns);
+          profile_dict["group_sizes"] = py::cast(profile.group_sizes);
+          profile_dict["invocation_count"] = py::cast(profile.invocation_count);
+          result[py::cast(op_name)] = profile_dict;
+        }
+        return result;
+      },
+      "Get per-concatenation-type profiling data (merge times, group sizes, invocation counts)");
+
+  m.def(
+      "_set_concatenation_profiling_enabled",
+      [](bool enabled) {
+        torch_neuronx::ConcatenationProfiler::getInstance().set_enabled(enabled);
+      },
+      "Enable/disable detailed per-type concatenation profiling (debug feature, default: off)",
+      py::arg("enabled"));
+
+  m.def(
+      "_is_concatenation_profiling_enabled",
+      []() { return torch_neuronx::ConcatenationProfiler::getInstance().is_enabled(); },
+      "Check if per-type concatenation profiling is enabled");
 
   m.def(
       "_get_instance_type", []() -> std::string { return at::neuron::utils::GetInstanceType(); },
@@ -1302,6 +1361,129 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Reset accumulated memory statistics", py::arg("device_index"));
 
+  // ============================================================================
+  // Memory Snapshot Bindings
+  // ============================================================================
+
+  m.def(
+      "_neuron_record_memory_history",
+      [](py::object enabled_obj, py::object context_obj, py::object stacks_obj, size_t max_entries,
+         bool clear_history) {
+        // Parse enabled parameter
+        bool enabled = true;
+        if (!enabled_obj.is_none()) {
+          if (py::isinstance<py::bool_>(enabled_obj)) {
+            enabled = enabled_obj.cast<bool>();
+          } else if (py::isinstance<py::str>(enabled_obj)) {
+            std::string enabled_str = enabled_obj.cast<std::string>();
+            enabled = (enabled_str != "none" && enabled_str != "never");
+          }
+        }
+
+        // Parse context parameter
+        c10_neuron::NeuronMemorySnapshot::RecordContext when =
+            c10_neuron::NeuronMemorySnapshot::RecordContext::ALLOC;
+        if (!context_obj.is_none()) {
+          std::string context_str = context_obj.cast<std::string>();
+          try {
+            when = c10_neuron::NeuronMemorySnapshot::StringToRecordContext(context_str);
+          } catch (const std::invalid_argument& e) {
+            throw py::value_error(e.what());
+          }
+        }
+
+        // Parse stacks parameter (for include_cpp_frames)
+        bool include_cpp_frames = false;
+        if (!stacks_obj.is_none()) {
+          std::string stacks_str = stacks_obj.cast<std::string>();
+          include_cpp_frames = (stacks_str == "all");
+        }
+
+        c10_neuron::NeuronMemorySnapshot::RecordHistory(enabled, when, include_cpp_frames,
+                                                        max_entries, clear_history);
+      },
+      "Enable or disable memory history recording", py::arg("enabled") = py::none(),
+      py::arg("context") = py::none(), py::arg("stacks") = py::none(), py::arg("max_entries") = 1,
+      py::arg("clear_history") = false);
+
+  m.def(
+      "_neuron_memory_snapshot",
+      []() -> py::dict {
+        auto snapshot_info = c10_neuron::NeuronMemorySnapshot::snapshot();
+
+        // Convert StackContext frames to Python list
+        auto framesToPyList =
+            [](const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& ctx)
+            -> py::list {
+          py::list frames;
+          if (ctx) {
+            for (const auto& frame : ctx->frames) {
+              py::dict frame_dict;
+              frame_dict["filename"] = frame.filename;
+              frame_dict["name"] = frame.funcname;
+              frame_dict["line"] = frame.lineno;
+              frames.append(frame_dict);
+            }
+          }
+          return frames;
+        };
+
+        // Convert segments
+        py::list segments;
+        for (const auto& seg : snapshot_info.segments) {
+          py::dict seg_dict;
+          seg_dict["device"] = seg.device;
+          seg_dict["address"] = seg.address;
+          seg_dict["total_size"] = seg.total_size;
+          seg_dict["allocated_size"] = seg.allocated_size;
+          seg_dict["active_size"] = seg.active_size;
+          seg_dict["stream"] = seg.stream;
+          seg_dict["is_large"] = seg.is_large;
+
+          py::list blocks;
+          for (const auto& block : seg.blocks) {
+            py::dict block_dict;
+            block_dict["size"] = block.size;
+            block_dict["requested_size"] = block.requested_size;
+            block_dict["address"] = block.address;
+            block_dict["state"] = block.allocated ? "active_allocated" : "inactive";
+            block_dict["frames"] = framesToPyList(block.context);
+            blocks.append(block_dict);
+          }
+          seg_dict["blocks"] = blocks;
+          segments.append(seg_dict);
+        }
+
+        // Convert device traces with absolute timestamps
+        py::list device_traces;
+        for (const auto& traces : snapshot_info.device_traces) {
+          py::list trace_list;
+          for (const auto& entry : traces) {
+            py::dict entry_dict;
+            entry_dict["action"] =
+                c10_neuron::NeuronMemorySnapshot::TraceActionToString(entry.action);
+            entry_dict["device"] = entry.device;
+            entry_dict["addr"] = entry.addr;
+            entry_dict["size"] = entry.size;
+            entry_dict["stream"] = entry.stream;
+            // Use absolute timestamp for pytorch.org/memory_viz compatibility
+            entry_dict["time_us"] = entry.timestamp_us;
+            entry_dict["frames"] = framesToPyList(entry.context);
+            if (entry.action == c10_neuron::NeuronMemorySnapshot::TraceAction::OOM) {
+              entry_dict["device_free"] = entry.device_free;
+            }
+            trace_list.append(entry_dict);
+          }
+          device_traces.append(trace_list);
+        }
+
+        py::dict result;
+        result["segments"] = segments;
+        result["device_traces"] = device_traces;
+        return result;
+      },
+      "Capture current memory snapshot");
+
   m.def(
       "_submit_xla_task_to_pipeline",
       [](const std::string& op_name, const std::vector<torch::Tensor>& inputs,
@@ -1410,25 +1592,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("replica_groups"), py::arg("stream"), py::arg("python_stack_trace"),
       py::arg("cpu_fallback_context") = py::none());
 
-  // torch.compile: compile StableHLO to NEFF and store in cache
+  // torch.compile: compile MLIR to NEFF and store in cache.
   m.def(
       "compile_graph",
-      [](const std::string& base_cache_key, py::bytes stablehlo_bytes,
-         bool has_collectives) -> std::string {
-        // Convert StableHLO bytes
-        std::string_view stablehlo_str = stablehlo_bytes.cast<std::string_view>();
-        std::vector<uint8_t> stablehlo_vec(stablehlo_str.begin(), stablehlo_str.end());
+      [](const std::string& base_cache_key, py::bytes mlir_bytes, bool has_collectives,
+         bool use_tensorizer) -> std::string {
+        std::string_view mlir_str = mlir_bytes.cast<std::string_view>();
+        std::vector<uint8_t> mlir_vec(mlir_str.begin(), mlir_str.end());
 
-        // Create compile kernel and get final cache key
         auto compile_kernel = std::make_unique<at::neuron::CompileOnlyKernelExecution>(
-            base_cache_key, stablehlo_vec, has_collectives);
-
-        // Get final cache key before moving kernel
+            base_cache_key, mlir_vec, has_collectives, use_tensorizer);
         std::string cache_key = compile_kernel->GetCacheKey();
 
-        // Create OperationContext for compilation
-        std::vector<at::neuron::TensorContext> empty_input_context;
-        std::vector<at::neuron::TensorContext> empty_output_context;
         auto context =
             std::make_unique<at::neuron::OperationContext>(std::move(compile_kernel), "");
 
@@ -1437,8 +1612,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         at::neuron::SubmitOperationContext(stream, std::move(context));
         return cache_key;
       },
-      "Compile StableHLO to NEFF and store in cache, return final cache key",
-      py::arg("base_cache_key"), py::arg("stablehlo_bytes"), py::arg("has_collectives"));
+      "Compile MLIR to NEFF and store in cache, return final cache key", py::arg("base_cache_key"),
+      py::arg("mlir_bytes"), py::arg("has_collectives"), py::arg("use_tensorizer") = false);
 
   // torch.compile: execute compiled graph using cache key
   m.def(
@@ -1551,6 +1726,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             fw_dict["th_id"] = fw_id.th_id;
             fw_dict["stream_id"] = fw_id.stream_id;
             fw_dict["os_tid"] = fw_id.os_tid;
+            fw_dict["event_id"] = fw_id.event_id;
             fw_list.append(fw_dict);
           }
           py::dict entry;
@@ -1740,16 +1916,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Record start event for timing", py::arg("stream") = py::none())
       .def(
           "record_end_event",
-          [](torch_neuronx::distributed::NeuronWork& self, py::object stream_obj) {
+          [](torch_neuronx::distributed::NeuronWork& self, py::object stream_obj, bool async_op) {
             at::neuron::NeuronStream* stream_ptr = nullptr;
             at::neuron::NeuronStream stream;
             if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
               stream = THNPStream_Unpack(stream_obj.ptr());
               stream_ptr = &stream;
             }
-            self.recordEndEvent(stream_ptr);
+            self.recordEndEvent(stream_ptr, async_op);
           },
-          "Record end event for completion tracking", py::arg("stream") = py::none())
+          "Record end event for completion tracking", py::arg("stream") = py::none(),
+          py::arg("async_op") = true)
       .def("stash", &torch_neuronx::distributed::NeuronWork::stash,
            "Stash tensors to keep them alive until work completes", py::arg("tensors"))
       .def("unstash_tensors", &torch_neuronx::distributed::NeuronWork::unstashTensors,

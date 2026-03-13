@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 
+#include "nrt/nrt.h"
 #include "torch_neuronx/csrc/core/utils/TensorContext.h"
 
 namespace at::neuron {
@@ -106,9 +107,8 @@ struct CPUFallbackContext {
   // Order: positional tensors first (flattened, including TensorLists), then kwarg tensors
   std::vector<TensorContext> tensor_metadata;
 
-  // Data pointers for tensor inputs, extracted from original tensor inputs
-  // Same order as tensor_metadata
-  std::vector<void*> tensor_data_ptrs;
+  // Data tensor pointers for tensor inputs, in the same order as tensor_metadata.
+  std::vector<nrt_tensor_t*> tensor_data_ptrs;
 
   // Default constructor creates empty context
   CPUFallbackContext()

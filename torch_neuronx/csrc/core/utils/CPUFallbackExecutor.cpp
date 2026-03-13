@@ -233,14 +233,10 @@ void CPUFallbackExecutor::LoadConfiguration() {
 void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
   const auto& fallback_ctx = operation->cpu_fallback_context;
 
-  // Convert void* to nrt_tensor_t* using allocator
-  TORCH_NEURONX_DEBUG("size of tensors_data_ptrs in fallback context - ",
-                      fallback_ctx.tensor_data_ptrs.size());
   std::vector<nrt_tensor_t*> src_ptrs;
   src_ptrs.reserve(fallback_ctx.tensor_data_ptrs.size());
-  for (void* ptr : fallback_ctx.tensor_data_ptrs) {
-    nrt_tensor_t* nrt_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ptr);
-    TORCH_CHECK(nrt_ptr, "Invalid input data pointer for CPU fallback");
+  for (nrt_tensor_t* nrt_ptr : fallback_ctx.tensor_data_ptrs) {
+    TORCH_CHECK(nrt_ptr, "Invalid input data tensor pointer for CPU fallback");
     src_ptrs.push_back(nrt_ptr);
   }
 

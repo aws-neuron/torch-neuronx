@@ -232,7 +232,7 @@ TEST_F(StreamImplTest, LastScheduledInfoInitiallyInvalid) {
   auto& info = stream_->GetLastScheduledInfo();
   EXPECT_FALSE(info.valid);
   EXPECT_EQ(info.sequence_id, 0);
-  EXPECT_EQ(info.kernel_type, KernelTypeEnum::kHLO);  // Default value
+  EXPECT_EQ(info.xu, NRTA_XU_COMPUTE);  // Default value
 }
 
 TEST_F(StreamImplTest, LastScheduledInfoModifiable) {
@@ -240,13 +240,13 @@ TEST_F(StreamImplTest, LastScheduledInfoModifiable) {
 
   info.valid = true;
   info.sequence_id = 12345;
-  info.kernel_type = KernelTypeEnum::kRead;
+  info.xu = NRTA_XU_TENSOR_OP;
 
   // Verify changes persist
   const auto& const_info = stream_->GetLastScheduledInfo();
   EXPECT_TRUE(const_info.valid);
   EXPECT_EQ(const_info.sequence_id, 12345);
-  EXPECT_EQ(const_info.kernel_type, KernelTypeEnum::kRead);
+  EXPECT_EQ(const_info.xu, NRTA_XU_TENSOR_OP);
 }
 
 TEST_F(StreamImplTest, HasPendingAsyncOperationsEmptyStream) {

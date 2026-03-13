@@ -117,19 +117,56 @@ def clear_all() -> None:
     _C._neuron_clear_metrics()
 
 
+def set_concatenation_profiling_enabled(enabled: bool) -> None:
+    """Enable or disable detailed per-type concatenation profiling.
+
+    This is a debug feature that records per-invocation merge times and
+    group sizes for each unique concatenation type. It uses unbounded
+    memory (vectors grow with each invocation), so it should only be
+    enabled for analysis, not in production.
+
+    Can also be enabled via env var: TORCH_NEURONX_CONCATENATION_PROFILING=1
+
+    Args:
+        enabled: True to enable profiling, False to disable.
+    """
+    _C._set_concatenation_profiling_enabled(enabled)
+
+
 # =============================================================================
-# Convenience functions for common metric categories
+# Structured metrics access
 # =============================================================================
 
 
-def get_compilation_metrics() -> dict[str, Any]:
-    """Get compilation-related metrics."""
+def get_metrics_dict(prefix: str | None = None) -> dict[str, Any]:
+    """Get all metrics as a structured dictionary, optionally filtered by prefix.
+
+    Returns counters as integer values and metrics as dicts with
+    accumulator, total_samples, and formatted fields. This is the
+    structured-data counterpart to report() and report_filtered().
+
+    Args:
+        prefix: Optional prefix to filter metrics by (e.g., "Concatenation",
+                "CompilationCache"). If None, returns all metrics.
+
+    Returns:
+        Dictionary mapping metric/counter names to their values.
+
+    Example:
+        >>> import torch_neuronx.metrics as met
+        >>> met.set_enabled(True)
+        >>> # ... run model ...
+        >>> torch.neuron.synchronize()
+        >>> all_metrics = met.get_metrics_dict()
+        >>> concat_metrics = met.get_metrics_dict("Concatenation")
+        >>> compilation_metrics = met.get_metrics_dict("CompilationCache")
+    """
     result = {}
     for name in get_counter_names():
-        if "Compilation" in name:
+        if prefix is None or prefix in name:
             result[name] = get_counter_value(name)
     for name in get_metric_names():
-        if "Compilation" in name:
+        if prefix is None or prefix in name:
             data = get_metric_data(name)
             if data:
                 result[name] = {

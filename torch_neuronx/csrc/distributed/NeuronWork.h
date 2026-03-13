@@ -163,8 +163,11 @@ class NeuronWork : public c10d::Work {
    * This must be called for the work to track completion properly.
    *
    * @param stream Stream to record on (nullptr = use work's stream)
+   * @param async_op If true (async collective), store output tensors in the
+   *        Future for retrieval via future.value(). If false (sync collective),
+   *        Future is completed with an empty list.
    */
-  void recordEndEvent(at::neuron::NeuronStream* stream = nullptr);
+  void recordEndEvent(at::neuron::NeuronStream* stream = nullptr, bool async_op = true);
 
   /**
    * Register this work with output tensors for wait_tensor() support.
@@ -336,12 +339,8 @@ class NeuronWork : public c10d::Work {
   void checkAndSetException();
   std::string logPrefix() const;
   void markFutureWithError();
-  void markFutureComplete();
 
  public:
-  // Public method for watchdog to mark future complete
-  // This matches NCCL behavior
-  void markFutureCompleteIfNeeded();
   void handleException();
 };
 

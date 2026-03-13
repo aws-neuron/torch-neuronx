@@ -13,9 +13,12 @@
 #include <unordered_set>
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
+#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
 #include "torch_neuronx/csrc/core/cache/FileLock.h"
 #include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/compilation/CacheEntry.h"
+#include "torch_neuronx/csrc/core/compilation/CompilationBackend.h"
+#include "torch_neuronx/csrc/core/compilation/CompilationThreadPool.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 
 namespace at::neuron {
@@ -58,25 +61,6 @@ class CompilationCache {
   CompilationCache(const CompilationCache&) = delete;
   CompilationCache& operator=(const CompilationCache&) = delete;
 
-  // Checks cache and coordinates compilation work across threads.
-  //
-  // This method implements the core cache coordination logic:
-  // - Cache hit: Sets cached NEFF on kernel_execution and returns true
-  // - Pending compilation: Returns true (caller should wait)
-  // - Cache miss: Registers pending compilation and returns false (caller should compile)
-  //
-  // Args:
-  //   cache_key: Unique identifier for the compilation unit
-  //   kernel_execution: Execution context to receive cached NEFF on hit
-  //   stream_id: Stream identifier for logging and debugging
-  //
-  // Returns:
-  //   true if work should be skipped (cache hit or pending compilation)
-  //   false if work should proceed (cache miss, caller is first thread)
-  bool CheckCacheAndCoordinateWork(const std::string& cache_key,
-                                   const CompilableKernelExecution& kernel_execution,
-                                   uint32_t stream_id);
-
   // Gets NEFF from cache or compiles IR to NEFF.
   //
   // This is the main entry point for cache operations. It handles the complete
@@ -87,6 +71,25 @@ class CompilationCache {
   //   kernel_execution: Execution context containing IR and receiving compiled NEFF
   //   stream_id: Stream identifier for logging and debugging
   void GetOrCompileNeff(const CompilableKernelExecution& kernel_execution, uint32_t stream_id);
+
+  // Async compilation with callback. Delegates to the active CompilationBackend.
+  //
+  // Callback contract:
+  //   - callback(true) on success, kernel.HasCachedNeff() == true
+  //   - callback(false) on failure
+  //   - Invoked exactly once, synchronously (cache hit) or from another thread
+  //
+  // The backend is selected at construction time:
+  //   - NEURON_COMPILE_SERVICE=0 → LocalCompilationBackend
+  //   - Otherwise → ServiceCompilationBackend (with fallback to local)
+  void GetOrCompileNeffAsync(const CompilableKernelExecution& kernel_execution, uint32_t stream_id,
+                             std::function<void(bool success)> callback);
+
+  // Returns the name of the active compilation backend ("local" or "service").
+  std::string GetBackendName() const;
+
+  // Returns true if the service backend is active.
+  bool IsServiceBackend() const { return backend_ && backend_->GetName() == "service"; }
 
   // Detailed information about a single cache entry.
   struct CacheEntryInfo {
@@ -217,6 +220,12 @@ class CompilationCache {
   // Persistent cache backend (NFS/local disk)
   std::unique_ptr<PersistentCacheBackend> persistent_cache_;
 
+  // Compilation backend (local per-rank or shared service)
+  std::unique_ptr<CompilationBackend> backend_;
+
+  // Thread pool for parallel compilation (submits to backend)
+  std::unique_ptr<CompilationThreadPool> compilation_pool_;
+
   // Checks if cache limits are exceeded and triggers LRU eviction if needed.
   // Called after adding new entries to maintain cache within configured limits.
   void CheckAndEvictIfNeeded();
@@ -255,7 +264,7 @@ class CompilationCache {
   // Returns:
   //   true if cache hit (NEFF set on kernel_execution) or pending compilation found
   //   false if cache miss (no entry found, no pending compilation)
-  bool CheckInMemoryCacheAndPending(const std::string& cache_key,
+  bool CheckInMemoryCacheAndPending(const CompilationCacheKey& key,
                                     const CompilableKernelExecution& kernel_execution);
 
   // Checks both in-memory and persistent cache if enabled, coordinates compilation work across
@@ -272,9 +281,9 @@ class CompilationCache {
   // Returns:
   //   true if cache hit or pending compilation (caller should not compile)
   //   false if cache miss (caller should compile)
-  bool CheckCacheAndCoordinateWork(const std::string& cache_key,
+  bool CheckCacheAndCoordinateWork(const CompilationCacheKey& key,
                                    const CompilableKernelExecution& kernel_execution,
-                                   uint32_t stream_id, std::string* persistent_cache_key);
+                                   uint32_t stream_id);
 
   // Waits for another thread's pending compilation to complete.
   // Blocks until the compilation result is available, then sets NEFF on kernel_execution.
@@ -283,7 +292,7 @@ class CompilationCache {
   //   cache_key: Cache key of the pending compilation
   //   kernel_execution: Execution context to receive the compiled NEFF
   //   stream_id: Stream identifier for logging
-  void WaitForPendingCompilation(const std::string& cache_key,
+  void WaitForPendingCompilation(const CompilationCacheKey& key,
                                  const CompilableKernelExecution& kernel_execution,
                                  uint32_t stream_id);
 
@@ -297,8 +306,8 @@ class CompilationCache {
   //   stream_id: Stream identifier for logging
   //   persistent_cache_key: Persistent cache key for file locking and cache storage.
   //                         If nullptr, will be computed internally.
-  void Compile(const std::string& cache_key, const CompilableKernelExecution& kernel_execution,
-               uint32_t stream_id, std::string* persistent_cache_key);
+  void Compile(const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution,
+               uint32_t stream_id);
 
   // Performs actual compilation with file locking for cross-process coordination.
   // Acquires a file lock to prevent duplicate compilations across processes,
@@ -313,8 +322,7 @@ class CompilationCache {
   // Returns:
   //   Shared pointer to the newly created cache entry
   std::shared_ptr<CacheEntry> CompileAndCache(const CompilableKernelExecution& kernel_execution,
-                                              const std::string& cache_key,
-                                              std::string* persistent_cache_key);
+                                              const CompilationCacheKey& key);
 
   // Handles compilation failure by notifying waiting threads and cleaning up.
   // Sets an exception on the promise so waiting threads receive the error.
@@ -323,13 +331,13 @@ class CompilationCache {
   //   cache_key: Cache key of the failed compilation
   //   promise: Promise to set exception on (notifies waiting threads)
   //   error_message: Description of the compilation failure
-  void HandleCompilationFailure(const std::string& cache_key,
+  void HandleCompilationFailure(const CompilationCacheKey& key,
                                 std::shared_ptr<std::promise<std::shared_ptr<CacheEntry>>> promise,
                                 const std::string& error_message);
 
   // Removes a pending compilation entry from the tracking map.
   // Called after successful compilation or failure handling.
-  void CleanupPendingCompilation(const std::string& cache_key);
+  void CleanupPendingCompilation(const CompilationCacheKey& key);
 
   // Logs error and throws a runtime_error for compilation failures.
   // Marked [[noreturn]] as it always throws.
@@ -337,7 +345,8 @@ class CompilationCache {
   // Args:
   //   cache_key: Cache key associated with the error
   //   message: Error description
-  [[noreturn]] void ThrowCompilationError(const std::string& cache_key, const std::string& message);
+  [[noreturn]] void ThrowCompilationError(const CompilationCacheKey& key,
+                                          const std::string& message);
 };
 
 }  // namespace at::neuron

@@ -96,30 +96,6 @@ void NeuronWork::markFutureWithError() {
   }
 }
 
-void NeuronWork::markFutureComplete() {
-  if (future_ && !future_->completed()) {
-    future_->markCompleted(at::IValue(outputs_));
-  }
-}
-
-void NeuronWork::markFutureCompleteIfNeeded() {
-  // Called by watchdog when work completes without wait() being called.
-  if (isCompleted() && future_ && !future_->completed()) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (exception_) {
-      // markFutureWithError() also locks, but that's fine - we can release and reacquire
-      // Or just inline the logic here
-      if (!future_->completed()) {
-        future_->setError(exception_);
-      }
-    } else {
-      if (!future_->completed()) {
-        future_->markCompleted(at::IValue(outputs_));
-      }
-    }
-  }
-}
-
 void NeuronWork::handleException() {
   if (!exception_) {
     return;
@@ -219,7 +195,7 @@ void NeuronWork::recordStartEvent(at::neuron::NeuronStream* stream) {
   start_event_.record(record_stream);
 }
 
-void NeuronWork::recordEndEvent(at::neuron::NeuronStream* stream) {
+void NeuronWork::recordEndEvent(at::neuron::NeuronStream* stream, bool async_op) {
   at::neuron::NeuronStream& record_stream = (stream != nullptr) ? *stream : stream_;
   end_event_.record(record_stream);
 
@@ -237,7 +213,15 @@ void NeuronWork::recordEndEvent(at::neuron::NeuronStream* stream) {
     future_ = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()), devices);
 
-    future_->markCompleted(at::IValue(outputs_));
+    // For async_op=True, store actual tensors so future.value() works.
+    // For async_op=False, use empty list to avoid holding tensor refs
+    if (async_op) {
+      future_->markCompleted(at::IValue(outputs_));
+    } else {
+      future_->markCompleted(at::IValue(std::vector<at::Tensor>{}));
+      std::lock_guard<std::mutex> lock(shelf_detach_mutex_);
+      outputs_.clear();
+    }
   }
 }
 

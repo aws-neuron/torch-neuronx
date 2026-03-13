@@ -867,6 +867,127 @@ static mlir::OwningOpRef<mlir::ModuleOp> runOptimizationPipeline(
 }
 
 /**
+ * @brief Adds input-output aliasing to merged StableHLO module
+ *
+ * Detects when input and output tensors share the same memory address and adds
+ * mhlo.input_output_alias attribute to enable buffer reuse optimization.
+ */
+static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
+                                             const std::vector<void*>& module1_input_addrs,
+                                             const std::vector<void*>& module1_output_addrs,
+                                             const std::vector<void*>& module2_input_addrs,
+                                             const std::vector<void*>& module2_output_addrs,
+                                             const DependencyAnalysis& analysis,
+                                             MergeMapping* mapping) {
+  if (!mapping) {
+    TORCH_NEURONX_DEBUG("addAliasingForConcatenatedModule: No mapping provided, skipping");
+    return;
+  }
+
+  TORCH_NEURONX_DEBUG("addAliasingForConcatenatedModule: Starting aliasing analysis");
+  TORCH_NEURONX_DEBUG("  Module1: ", module1_input_addrs.size(), " inputs, ",
+                      module1_output_addrs.size(), " outputs");
+  TORCH_NEURONX_DEBUG("  Module2: ", module2_input_addrs.size(), " inputs, ",
+                      module2_output_addrs.size(), " outputs");
+  TORCH_NEURONX_DEBUG("  Merged mapping: ", mapping->input_mapping.size(), " inputs, ",
+                      mapping->output_mapping.size(), " outputs");
+
+  auto mainFunc = mergedModule.lookupSymbol<mlir::func::FuncOp>("main");
+  if (!mainFunc) {
+    TORCH_NEURONX_WARN("addAliasingForConcatenatedModule: Main function not found");
+    return;
+  }
+
+  TORCH_NEURONX_DEBUG("  Main function has ", mainFunc.getNumArguments(), " args, ",
+                      mainFunc.getNumResults(), " results");
+
+  mlir::OpBuilder builder(mergedModule.getContext());
+  llvm::SmallVector<mlir::Attribute> aliasList;
+
+  // Check all merged outputs against all merged inputs
+  for (const auto& [merged_output_idx, output_info] : mapping->output_mapping) {
+    int output_module = output_info.first;
+    size_t orig_output_idx = output_info.second;
+
+    TORCH_NEURONX_DEBUG("Checking merged_output[", merged_output_idx, "] from module",
+                        output_module, " orig_idx=", orig_output_idx);
+
+    // Validate indices
+    if (output_module == 1 && orig_output_idx >= module1_output_addrs.size()) {
+      TORCH_NEURONX_ERROR("Invalid module1 output index: ", orig_output_idx,
+                          " >= ", module1_output_addrs.size());
+      continue;
+    }
+    if (output_module == 2 && orig_output_idx >= module2_output_addrs.size()) {
+      TORCH_NEURONX_ERROR("Invalid module2 output index: ", orig_output_idx,
+                          " >= ", module2_output_addrs.size());
+      continue;
+    }
+
+    // Get original output address
+    void* output_addr = (output_module == 1) ? module1_output_addrs[orig_output_idx]
+                                             : module2_output_addrs[orig_output_idx];
+
+    for (const auto& [merged_input_idx, input_info] : mapping->input_mapping) {
+      int input_module = input_info.first;
+      size_t orig_input_idx = input_info.second;
+
+      // Validate indices
+      if (input_module == 1 && orig_input_idx >= module1_input_addrs.size()) {
+        TORCH_NEURONX_ERROR("Invalid module1 input index: ", orig_input_idx,
+                            " >= ", module1_input_addrs.size());
+        continue;
+      }
+      if (input_module == 2 && orig_input_idx >= module2_input_addrs.size()) {
+        TORCH_NEURONX_ERROR("Invalid module2 input index: ", orig_input_idx,
+                            " >= ", module2_input_addrs.size());
+        continue;
+      }
+
+      // Get original input address
+      void* input_addr = (input_module == 1) ? module1_input_addrs[orig_input_idx]
+                                             : module2_input_addrs[orig_input_idx];
+
+      // Check if addresses match
+      if (input_addr == output_addr && input_addr != nullptr) {
+        TORCH_NEURONX_DEBUG("Found aliasing: merged_input[", merged_input_idx,
+                            "] == merged_output[", merged_output_idx, "] addr=", input_addr);
+
+        // Build alias attribute
+        auto paramNumAttr = builder.getI64IntegerAttr(merged_input_idx);
+        auto paramIdxAttr = builder.getDenseI64ArrayAttr({});
+        auto kindAttr = builder.getStringAttr("must_alias");
+
+        auto aliasInner =
+            builder.getDictionaryAttr({builder.getNamedAttr("kind", kindAttr),
+                                       builder.getNamedAttr("parameter_number", paramNumAttr),
+                                       builder.getNamedAttr("parameter_index", paramIdxAttr)});
+
+        auto outputIdxAttr =
+            builder.getDenseI64ArrayAttr({static_cast<int64_t>(merged_output_idx)});
+        auto aliasOuter =
+            builder.getDictionaryAttr({builder.getNamedAttr("alias", aliasInner),
+                                       builder.getNamedAttr("output_index", outputIdxAttr)});
+
+        aliasList.push_back(aliasOuter);
+        TORCH_NEURONX_DEBUG("Added alias entry #", aliasList.size());
+      }
+    }
+  }
+
+  if (!aliasList.empty()) {
+    TORCH_NEURONX_DEBUG("Creating ArrayAttr with ", aliasList.size(), " entries");
+    auto aliasArrayAttr = builder.getArrayAttr(aliasList);
+    TORCH_NEURONX_DEBUG("Setting mhlo.input_output_alias attribute on module");
+    mergedModule->setAttr("mhlo.input_output_alias", aliasArrayAttr);
+    TORCH_NEURONX_DEBUG("addAliasingForConcatenatedModule: Successfully added ", aliasList.size(),
+                        " aliasing relationships");
+  } else {
+    TORCH_NEURONX_DEBUG("addAliasingForConcatenatedModule: No aliasing relationships found");
+  }
+}
+
+/**
  * @brief Prepares arguments for the second-executing module
  * Now supports duplicate inputs (e.g., x + x) via vector-based dependencies
  */
@@ -1094,6 +1215,11 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
   }
 
   builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), results);
+
+  // Add aliasing for input-output tensors with same address
+  mlir::ModuleOp moduleOp = *mergedModule;
+  addAliasingForConcatenatedModule(moduleOp, module1_input_addrs, module1_output_addrs,
+                                   module2_input_addrs, module2_output_addrs, analysis, mapping);
 
   TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Successfully merged modules");
 

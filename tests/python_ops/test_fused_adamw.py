@@ -395,3 +395,67 @@ class TestFusedAdamW:
         assert (
             state["max_exp_avg_sq"].data_ptr() == max_exp_avg_sq_ptr
         ), "max_exp_avg_sq should be updated in-place with AMSGrad"
+
+    def test_fused_adamw_mixed_zero_size_params(self):
+        """Test AdamW with zero-size parameters mixed with normal ones.
+
+        Reproduces the FSDPv2 scenario where DTensor sharding produces zero-size
+        parameter shards. Without the fix in optimizer.py, neuronx-cc crashes
+        with NCC_ITEN404 when compiling the fused adamw HLO.
+        """
+        torch.manual_seed(42)
+
+        # Mix of normal and zero-size params in the same optimizer group,
+        # mirroring FSDPv2 last-rank shards from the actual failure logs
+        params_cpu = [
+            torch.randn(39, 768, requires_grad=True),
+            torch.randn(0, 768, requires_grad=True),  # zero-size shard
+            torch.randn(12, requires_grad=True),
+            torch.randn(12, 768, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.001, fused=True)
+
+        for _step in range(3):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_all_zero_size_params(self):
+        """Test AdamW where all parameters are zero-size."""
+        torch.manual_seed(42)
+
+        params_cpu = [
+            torch.randn(0, 768, requires_grad=True),
+            torch.randn(0, 12, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.001, fused=True)
+
+        for _step in range(3):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+            optimizer_neuron.step()
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)

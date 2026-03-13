@@ -358,34 +358,126 @@ class FlexAttentionLegalization(PassBase):
             torch.ops.aten.ne.Tensor,
         ]
 
-        if original_node.target in comparison_ops:
-            # Comparison ops broadcast to (1, 1, L, S)
-            bool_shape = torch.Size([1, 1, shapes.L, shapes.S])
-            new_node.meta["val"] = torch.empty(bool_shape, dtype=torch.bool)
-            new_node.meta["tensor_meta"] = TensorMetadata(
-                shape=bool_shape,
-                dtype=torch.bool,
-                requires_grad=False,
-                stride=(shapes.L * shapes.S, shapes.L * shapes.S, shapes.S, 1),
-                memory_format=torch.contiguous_format,
-                is_quantized=False,
-                qparams={},
-            )
-        elif original_node.target == torch.ops.aten.where.self:
-            # Where ops output shape matches scores
-            if "val" in scaled_scores.meta:
-                score_shape = scaled_scores.meta["val"].shape
-                score_dtype = scaled_scores.meta["val"].dtype
-                new_node.meta["val"] = torch.empty(score_shape, dtype=score_dtype)
+        scalar_comparison_ops = [
+            torch.ops.aten.ge.Scalar,
+            torch.ops.aten.le.Scalar,
+            torch.ops.aten.gt.Scalar,
+            torch.ops.aten.lt.Scalar,
+            torch.ops.aten.eq.Scalar,
+            torch.ops.aten.ne.Scalar,
+        ]
+
+        arithmetic_ops = [
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.mul.Tensor,
+        ]
+
+        bitwise_ops = [
+            torch.ops.aten.bitwise_or.Tensor,
+            torch.ops.aten.bitwise_and.Tensor,
+        ]
+
+        masked_fill_ops = [
+            torch.ops.aten.masked_fill.Scalar,
+        ]
+
+        if original_node.target in scalar_comparison_ops and len(new_node.args) >= 1:
+            # Scalar comparison: result shape matches first operand
+            arg1 = new_node.args[0]
+            if hasattr(arg1, "meta") and "val" in arg1.meta:
+                result_shape = list(arg1.meta["val"].shape)
+                new_node.meta["val"] = torch.empty(
+                    result_shape, dtype=torch.bool, device=arg1.meta["val"].device
+                )
                 new_node.meta["tensor_meta"] = TensorMetadata(
-                    shape=score_shape,
-                    dtype=score_dtype,
+                    shape=torch.Size(result_shape),
+                    dtype=torch.bool,
                     requires_grad=False,
-                    stride=tuple(range(len(score_shape) - 1, -1, -1)),
+                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
                     memory_format=torch.contiguous_format,
                     is_quantized=False,
                     qparams={},
                 )
+                return
+
+        if original_node.target in masked_fill_ops and len(new_node.args) >= 1:
+            # masked_fill: result shape and dtype match first operand
+            arg1 = new_node.args[0]
+            if hasattr(arg1, "meta") and "val" in arg1.meta:
+                result_shape = list(arg1.meta["val"].shape)
+                result_dtype = arg1.meta["val"].dtype
+                new_node.meta["val"] = torch.empty(
+                    result_shape, dtype=result_dtype, device=arg1.meta["val"].device
+                )
+                new_node.meta["tensor_meta"] = TensorMetadata(
+                    shape=torch.Size(result_shape),
+                    dtype=result_dtype,
+                    requires_grad=False,
+                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
+                    memory_format=torch.contiguous_format,
+                    is_quantized=False,
+                    qparams={},
+                )
+                return
+
+        if (
+            original_node.target in comparison_ops
+            or original_node.target in arithmetic_ops
+            or original_node.target in bitwise_ops
+        ) and len(new_node.args) >= 2:
+            # Compute broadcast shape from operands using the actual aten operation
+            # This provides wider coverage by using PyTorch's actual op semantics
+            arg1, arg2 = new_node.args[0], new_node.args[1]
+            if (
+                hasattr(arg1, "meta")
+                and "val" in arg1.meta
+                and hasattr(arg2, "meta")
+                and "val" in arg2.meta
+            ):
+                # Create meta tensors from the operands
+                meta_tensor1 = torch.empty(
+                    arg1.meta["val"].shape, dtype=arg1.meta["val"].dtype, device="meta"
+                )
+                meta_tensor2 = torch.empty(
+                    arg2.meta["val"].shape, dtype=arg2.meta["val"].dtype, device="meta"
+                )
+
+                # Apply the actual aten operation to compute broadcast shape and dtype
+                result = original_node.target(meta_tensor1, meta_tensor2)
+                result_shape = list(result.shape)
+                result_dtype = result.dtype
+
+                new_node.meta["val"] = torch.empty(
+                    result_shape, dtype=result_dtype, device=result.device
+                )
+                new_node.meta["tensor_meta"] = TensorMetadata(
+                    shape=torch.Size(result_shape),
+                    dtype=result_dtype,
+                    requires_grad=False,
+                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
+                    memory_format=torch.contiguous_format,
+                    is_quantized=False,
+                    qparams={},
+                )
+                return
+
+        # Fallback for where.self
+        if original_node.target == torch.ops.aten.where.self and "val" in scaled_scores.meta:
+            score_shape = scaled_scores.meta["val"].shape
+            score_dtype = scaled_scores.meta["val"].dtype
+            new_node.meta["val"] = torch.empty(
+                score_shape, dtype=score_dtype, device=scaled_scores.meta["val"].device
+            )
+            new_node.meta["tensor_meta"] = TensorMetadata(
+                shape=score_shape,
+                dtype=score_dtype,
+                requires_grad=False,
+                stride=tuple(range(len(score_shape) - 1, -1, -1)),
+                memory_format=torch.contiguous_format,
+                is_quantized=False,
+                qparams={},
+            )
 
     def _map_node_args(self, node_args: tuple, value_map: dict[fx.Node, fx.Node]) -> list:
         """Map node arguments through value_map, handling both Node and non-Node args."""
