@@ -149,7 +149,7 @@ def torch_batch_norm_backward_reduce(
 
 
 @register_aten(["aten::_fused_rms_norm"], static_argnums=(1, 3))
-def torch_fused_rms_norm(input, normalized_shape, weight=None, eps=1e-5):
+def torch_fused_rms_norm(input, normalized_shape, weight=None, eps=None):
     return torch.ops.aten._fused_rms_norm(input, normalized_shape, weight, eps)
 
 

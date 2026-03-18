@@ -568,6 +568,60 @@ class TestNeuronBackendFxCompiler:
             assert torch.equal(result, fallback_output)
             mock_gm.forward.assert_called_once()
 
+    def test_trivial_graph_returns_passthrough(self):
+        """Test that a trivial graph (no computation) returns passthrough."""
+        # Build a real trivial FX graph: just placeholder -> output
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        x = gm.graph.placeholder("x")
+        gm.graph.output((x,))
+        gm.recompile()
+
+        result = backend.neuron_backend_fx_compiler(gm, [torch.randn(2, 3)])
+
+        assert callable(result)
+        # Boxed calling convention: inputs as a list
+        out = result([torch.randn(2, 3)])
+        assert len(out) == 1
+
+    def test_non_trivial_graph_not_short_circuited(self):
+        """Test that a graph with call_function nodes is NOT treated as trivial."""
+        mock_gm = MagicMock()
+        # Simulate a graph with a call_function node
+        node_placeholder = MagicMock()
+        node_placeholder.op = "placeholder"
+        node_call = MagicMock()
+        node_call.op = "call_function"
+        node_output = MagicMock()
+        node_output.op = "output"
+        mock_gm.graph.nodes = [node_placeholder, node_call, node_output]
+
+        assert not backend._is_trivial_graph(mock_gm)
+
+
+class TestIsTrivialGraph:
+    """Test _is_trivial_graph helper function."""
+
+    def test_empty_graph_is_trivial(self):
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        gm.graph.output(())
+        gm.recompile()
+        assert backend._is_trivial_graph(gm)
+
+    def test_placeholder_output_only_is_trivial(self):
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        x = gm.graph.placeholder("x")
+        gm.graph.output((x,))
+        gm.recompile()
+        assert backend._is_trivial_graph(gm)
+
+    def test_graph_with_call_function_is_not_trivial(self):
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        x = gm.graph.placeholder("x")
+        add = gm.graph.call_function(torch.add, (x, x))
+        gm.graph.output((add,))
+        gm.recompile()
+        assert not backend._is_trivial_graph(gm)
+
 
 class TestCreateNeuronBackend:
     """Test create_neuron_backend factory function"""

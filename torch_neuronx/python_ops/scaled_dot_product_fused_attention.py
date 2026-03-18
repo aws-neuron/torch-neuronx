@@ -9,8 +9,12 @@ import math
 
 import torch
 
+from torch_neuronx.neuron_dynamo_backend.decompositions import (
+    _can_use_nki_flash_attention,
+    _can_use_nki_flash_attention_backward,
+)
+
 from .base import AttentionOpImpl, ExecutionResult, Operation
-from .nki_kernels.scaled_dot_product_attention import scaled_dot_product_attention_kernel
 
 
 class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
@@ -28,33 +32,12 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
         scale: float | None = None,
     ) -> bool:
         """Check if NKI implementation can handle the given inputs"""
-        # Check common attention constraints first
         if not super().can_handle(
             query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale
         ):
             return False
 
-        # NKI-specific constraints
-        _, _, seq_len_q, head_dim = query.shape
-        _, _, seq_len_k, _ = key.shape
-
-        if key.shape != value.shape:
-            return False
-
-        # Check sequence length constraint - must be multiple of 512 for flash attention
-        if seq_len_q % 512 != 0 or seq_len_k % 512 != 0:
-            return False
-
-        # NKI kernel does not support head_dim > 128
-        if head_dim > 128:
-            return False
-
-        # NKI dropout is not consistent with CPU behavior - fallback to XLAImpl
-        if dropout_p > 0:
-            return False
-
-        # attn_bias not yet supported in NKI
-        return attn_bias is None
+        return _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p=dropout_p)
 
     def _execute_impl(
         self,
@@ -69,29 +52,14 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
     ) -> ExecutionResult:
         """Execute the fused scaled dot-product attention operation"""
         try:
+            from .nki_kernels.scaled_dot_product_attention import (
+                scaled_dot_product_attention_kernel,
+            )
+
             # Extract dimensions
             batch_size, q_heads, seq_len_q, embed_dim = query.shape
             _, kv_heads, seq_len_k, _ = key.shape
             _, _, _, embed_v = value.shape
-
-            # Detect if GQA/MQA is being used
-            is_gqa = q_heads > kv_heads and q_heads % kv_heads == 0
-
-            # Transform inputs to NKI format
-            # From: (batch, heads, seq_len, embed_dim)
-            # To:   (batch, heads, embed_dim, seq_len)
-            q_nki = query.transpose(-2, -1)
-            k_nki = key.transpose(-2, -1)
-
-            # For V, we keep it in (batch, heads, seq_len, embed_dim) format
-            # and use should_transpose_v=False in the kernel config
-            v_nki = value
-
-            # Create output tensor
-            # Output shape: (batch, q_heads, seq_len_q, embed_v)
-            attn_output = torch.empty(
-                batch_size, q_heads, seq_len_q, embed_v, dtype=query.dtype, device=query.device
-            )
 
             # Calculate scale if not provided
             if scale is None:
@@ -141,16 +109,14 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
             # Debug mask (not supported)
             debug_attn_mask = None
 
-            # Call the NKI kernel
+            # Call the NKI kernel — inputs in ATen format, kernel handles transpose and GQA
             attn_output = scaled_dot_product_attention_kernel(
-                q_nki,
-                k_nki,
-                v_nki,
-                attn_output,
+                query,
+                key,
+                value,
                 is_causal=is_causal,
                 dropout_p=dropout_p,
                 scale=scale,
-                is_gqa=is_gqa,
                 training=training,
                 seed=philox_seed if dropout_p > 0.0 else None,
                 lse=lse if training else None,
@@ -254,26 +220,12 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
         key = args[2] if len(args) > 2 else kwargs.get("key")
         value = args[3] if len(args) > 3 else kwargs.get("value")
         attn_bias = args[4] if len(args) > 4 else kwargs.get("attn_bias")
+        dropout_p = args[12] if len(args) > 12 else kwargs.get("dropout_p", 0.0)
 
         if not super().can_handle(query, key, value, attn_bias):
             return False
 
-        # Extract dimensions
-        batch_size, q_heads, seq_len_q, head_dim = query.shape
-        batch_k, kv_heads, seq_len_k, embed_k = key.shape
-
-        if key.shape != value.shape:
-            return False
-
-        # Check sequence length constraint - must be multiple of 512 for flash attention
-        if seq_len_q % 512 != 0 or seq_len_k % 512 != 0:
-            return False
-
-        # NKI kernel does not support head_dim > 128
-        if head_dim > 128:
-            return False
-
-        return attn_bias is None
+        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
 
     def _execute_impl(self, *args, **kwargs) -> ExecutionResult:
         """Execute the backward pass"""
@@ -306,37 +258,19 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
                     success=False, error_msg="Attention bias gradient not yet supported"
                 )
 
-            # Handle GQA/MQA: expand K,V to match what was used in forward pass
-            q_heads = query.shape[1]
-            kv_heads = key.shape[1]
-            is_gqa = q_heads > kv_heads and q_heads % kv_heads == 0
-
-            if is_gqa:
-                repeat_factor = q_heads // kv_heads
-                key = key.repeat_interleave(repeat_factor, dim=1)
-                value = value.repeat_interleave(repeat_factor, dim=1)
-
-            # Get dimensions
-            batch_size, num_heads, seq_len_q, embed_dim = query.shape
-
-            # Transform inputs to NKI format (batch, heads, embed_dim, seq_len)
-            q_nki = query.transpose(-2, -1)
-            k_nki = key.transpose(-2, -1)
-            v_nki = value  # Keep in original format, will transpose in kernel
-
             # Calculate scale if not provided
             if scale is None:
-                scale = 1.0 / math.sqrt(embed_dim)
+                scale = 1.0 / math.sqrt(query.shape[-1])
 
             # Convert philox seed for NKI kernel (if dropout was used)
             seed = philox_seed if dropout_p > 0.0 and philox_seed.numel() > 0 else None
 
-            # Call the backward kernel
+            # Call the backward kernel — inputs in ATen format, kernel handles transpose
             grad_q, grad_k, grad_v = scaled_dot_product_attention_backward_kernel(
                 grad_out=grad_out,
-                q=q_nki,
-                k=k_nki,
-                v=v_nki,
+                q=query,
+                k=key,
+                v=value,
                 out=out,
                 lse=logsumexp,
                 is_causal=is_causal,
@@ -345,36 +279,10 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
                 seed=seed,
             )
 
-            # Transform gradients back to ATen format (batch, heads, seq_len, embed_dim)
-            grad_q_aten = grad_q.transpose(-2, -1)
-            grad_k_aten = grad_k.transpose(-2, -1)
-            grad_v_aten = grad_v.transpose(-2, -1)
-
-            # For GQA, reduce gradients back to original KV shapes
-            if is_gqa:
-                repeat_factor = q_heads // kv_heads
-                grad_k_aten = grad_k_aten.view(
-                    grad_k_aten.shape[0],
-                    kv_heads,
-                    repeat_factor,
-                    grad_k_aten.shape[2],
-                    grad_k_aten.shape[3],
-                ).sum(dim=2)
-
-                grad_v_aten = grad_v_aten.view(
-                    grad_v_aten.shape[0],
-                    kv_heads,
-                    repeat_factor,
-                    grad_v_aten.shape[2],
-                    grad_v_aten.shape[3],
-                ).sum(dim=2)
-
             # grad_attn_bias is None since we don't support it yet
             grad_attn_bias = None
 
-            return ExecutionResult(
-                success=True, output=(grad_q_aten, grad_k_aten, grad_v_aten, grad_attn_bias)
-            )
+            return ExecutionResult(success=True, output=(grad_q, grad_k, grad_v, grad_attn_bias))
         except Exception as e:
             return ExecutionResult(success=False, error_msg=str(e))
 

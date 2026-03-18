@@ -1,8 +1,13 @@
 import torch
 
 
-def rms_norm_neuron(input, normalized_shape, weight=None, eps=1e-5):
+def rms_norm_neuron(input, normalized_shape, weight=None, eps=None):
+    # eps=None is intentional: the downstream _fused_rms_norm kernel resolves it
+    # based on the actual computation dtype after any device-level downcasting
+    # (e.g. float64 -> float32 on neuron). Resolving eps in Python would use the
+    # original input dtype, producing a value too small for the actual precision.
     original_dtype = input.dtype
+
     if (
         weight is not None
         and weight.dtype != input.dtype

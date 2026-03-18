@@ -17,10 +17,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.profiler import ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
 from utils import printf
 
-from torch_neuronx.profiling import NeuronProfiler
+from torch_neuronx.profiling import NeuronConfig, NeuronProfiler
 
 
 def find_project_root(start_path):
@@ -352,15 +352,18 @@ def profile_block_step(
 
     for i in range(trace_steps):
         if neuron_profile:
-            profiler_ctx = NeuronProfiler(
-                pytorch_activities=[ProfilerActivity.CPU],
+            neuron_config = NeuronConfig(
+                profile_output_dir="./output",
+            )
+            neuron_profiler = NeuronProfiler(neuron_config)
+            profiler_ctx = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
                 record_shapes=True,
-                neuron_output_dir="./output",
-                with_stack=with_stack,  # Pass-through to torch.profiler.profile
+                experimental_config=neuron_config,
+                with_stack=with_stack,
             )
         else:
-            from torch.profiler import profile
-
+            neuron_profiler = None
             profiler_ctx = profile(
                 activities=[ProfilerActivity.CPU],
                 record_shapes=True,
@@ -384,17 +387,13 @@ def profile_block_step(
         printf(f"{prefix}Run {i} total ms for run_block_step: {total_ms}.")
 
     if neuron_profile:
-        if prof._pytorch_profiler:
-            printf("\nDetailed Time Breakdown (sorted by self CPU time):")
-            printf(
-                prof._pytorch_profiler.key_averages().table(
-                    sort_by="self_cpu_time_total", row_limit=20
-                )
-            )
+        printf("\nDetailed Time Breakdown (sorted by self CPU time):")
+        printf(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
         if trace_json:
             rank = dist.get_rank() if dist.is_initialized() else 0
             if rank == 0:
-                printf(f"\nTrace exported to: {prof.pytorch_trace_file}")
+                neuron_profiler.export_trace(prof, filename="trace.json")
+                printf(f"\nTrace exported to: " f"{neuron_config.get_session_dir()}/trace.json")
             if dist.is_initialized():
                 dist.barrier()
     else:

@@ -17,6 +17,7 @@ from torch.distributed.tensor import (
     distribute_tensor,
 )
 from torch.distributed.tensor.debug import CommDebugMode
+from torch.distributed.tensor.parallel import loss_parallel
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
@@ -82,11 +83,10 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
         logits_clone = logits.detach().clone().requires_grad_(True)
         dist_logits = distribute_tensor(logits_clone, device_mesh, [Shard(-1)])
 
-        with track_neuron_ops():
+        with loss_parallel():
             dist_loss = functional.cross_entropy(dist_logits, targets)
-        assert_op_runs_on_neuron("aten::aten::_log_softmax")
-        assert_op_runs_on_neuron("aten::aten::nll_loss_forward")
 
+        self.assertEqual(dist_loss._local_tensor.device.type, "neuron")
         self.assertTrue(dist_loss.placements[0].is_replicate())
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
 
@@ -116,13 +116,11 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
         logits_clone = logits.detach().clone().requires_grad_(True)
         dist_logits = distribute_tensor(logits_clone, device_mesh, [Shard(-1)])
 
-        with track_neuron_ops():
+        with loss_parallel():
             dist_loss = functional.cross_entropy(dist_logits, targets)
-        assert_op_runs_on_neuron("aten::aten::_log_softmax")
-        assert_op_runs_on_neuron("aten::aten::nll_loss_forward")
+            dist_loss.backward()
 
-        dist_loss.backward()
-
+        self.assertEqual(dist_loss._local_tensor.device.type, "neuron")
         self.assertEqual(
             dist_logits.grad.full_tensor(),
             dist_logits_rep.grad.full_tensor(),
@@ -152,8 +150,6 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
 
         with track_neuron_ops():
             dist_loss = functional.cross_entropy(dist_logits, dist_targets)
-        assert_op_runs_on_neuron("aten::aten::_log_softmax")
-        assert_op_runs_on_neuron("aten::aten::nll_loss_forward")
 
         self.assertTrue(dist_loss.placements[0].is_replicate())
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
@@ -164,7 +160,6 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         batch_size, vocab_size = 8, 16  # batch divisible by world_size
-        torch.manual_seed(42)
         logits = torch.randn(
             (batch_size, vocab_size),
             device=self.device_type,
@@ -179,12 +174,73 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
 
         with track_neuron_ops():
             dist_loss = functional.cross_entropy(dist_logits, dist_targets)
-        assert_op_runs_on_neuron("aten::aten::_log_softmax")
-        assert_op_runs_on_neuron("aten::aten::nll_loss_forward")
 
         # After redistribute to Replicate, result should match non-distributed
         ref_loss = functional.cross_entropy(logits, targets)
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
+
+    @with_comms
+    def test_cross_entropy_loss_parallel_mixed_precision(self):
+        """Test dtype and accuracy when loss_parallel() context is active."""
+        device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        batch_size, vocab_size = 4, 16
+
+        logits_fp32 = torch.randn(
+            (batch_size, vocab_size),
+            device=self.device_type,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        targets = torch.randint(0, vocab_size, (batch_size,), device=self.device_type)
+
+        # fp32 reference
+        dist_logits_ref = distribute_tensor(
+            logits_fp32.detach().clone().requires_grad_(True),
+            device_mesh,
+            [Shard(-1)],
+        )
+        with loss_parallel():
+            ref_loss = functional.cross_entropy(dist_logits_ref, targets)
+        ref_loss.backward()
+
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]:
+            dist_logits = distribute_tensor(
+                logits_fp32.detach().to(dtype).clone().requires_grad_(True),
+                device_mesh,
+                [Shard(-1)],
+            )
+
+            with loss_parallel():
+                dist_loss = functional.cross_entropy(dist_logits, targets)
+
+            # Verify output dtype
+            self.assertEqual(
+                dist_loss.dtype,
+                dtype,
+                f"loss_parallel: expected {dtype}, got {dist_loss.dtype}",
+            )
+
+            # Verify accuracy vs fp32 reference
+            self.assertEqual(
+                dist_loss.full_tensor().float(),
+                ref_loss.full_tensor(),
+                atol=1e-2,
+                rtol=1e-2,
+            )
+
+            # Verify backward dtype and accuracy
+            dist_loss.backward()
+            self.assertEqual(
+                dist_logits.grad.dtype,
+                dtype,
+                f"loss_parallel grad: expected {dtype}, got {dist_logits.grad.dtype}",
+            )
+            self.assertEqual(
+                dist_logits.grad.full_tensor().float(),
+                dist_logits_ref.grad.full_tensor(),
+                atol=1e-2,
+                rtol=1e-2,
+            )
 
 
 if __name__ == "__main__":

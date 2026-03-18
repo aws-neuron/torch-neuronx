@@ -20,11 +20,11 @@ class TestToCopy:
         """Get the neuron device."""
         return torch.device("neuron")
 
-    @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.bfloat16, torch.float8_e5m2])
+    @pytest.mark.parametrize(
+        "torch_dtype", [torch.float32, torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
+    )
     def test_nonzero_static_basic_shapes(self, device, torch_dtype):
         """Test nonzero_static with various tensor shapes."""
-        if torch_dtype == torch.float8_e5m2:
-            pytest.skip("Skip float8_e5m2 - not fully supported")
 
         with track_neuron_ops():
             # TESTING CPU -> NEURON

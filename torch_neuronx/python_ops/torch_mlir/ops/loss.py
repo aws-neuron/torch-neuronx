@@ -296,7 +296,7 @@ def _ce_chunked_fwd_inner(
     num_samples = input.shape[0]
     chunk_size = min(_CHUNK_SIZE, n_classes)
 
-    valid_mask = (target != ignore_index).float()
+    valid_mask = (target != ignore_index).to(input.dtype)
     safe_target = target.clamp(min=0, max=n_classes - 1)
 
     # Online logsumexp accumulators (Milakov & Gimelshein, 2018).
@@ -347,7 +347,7 @@ def _ce_chunked_fwd_inner(
         # flow, which is not supported during tracing.
         local_idx = (safe_target - start).clamp(0, end - start - 1)
         gathered = chunk.gather(dim=-1, index=local_idx.unsqueeze(-1)).squeeze(-1)
-        in_chunk = ((safe_target >= start) & (safe_target < end)).float()
+        in_chunk = ((safe_target >= start) & (safe_target < end)).to(input.dtype)
         target_logit = target_logit + gathered * in_chunk
 
         # ── Accumulate sums for label smoothing ──
@@ -550,7 +550,7 @@ def _ce_chunked_bwd_inner(
     num_samples = input.shape[0]
     chunk_size = min(_CHUNK_SIZE, n_classes)
 
-    valid_mask = (target != ignore_index).float()
+    valid_mask = (target != ignore_index).to(input.dtype)
     safe_target = target.clamp(min=0, max=n_classes - 1)
 
     # ── Pass 1: global logsumexp (same online algorithm as forward) ──
@@ -611,7 +611,7 @@ def _ce_chunked_bwd_inner(
         local_idx = (safe_target - start).clamp(0, end - start - 1)
         oh = torch.zeros_like(sm)
         oh.scatter_(1, local_idx.unsqueeze(-1), 1.0)
-        in_chunk = ((safe_target >= start) & (safe_target < end)).float().unsqueeze(-1)
+        in_chunk = ((safe_target >= start) & (safe_target < end)).to(input.dtype).unsqueeze(-1)
         oh = oh * in_chunk * valid_col
 
         if label_smoothing > 0.0 and weight is not None:
@@ -823,7 +823,7 @@ def cross_entropy_autograd_privateuse1(*args, **kwargs):
 
         reduction_str = {0: "none", 1: "mean", 2: "sum"}.get(reduction_int, "mean")
 
-        log_softmax = torch.nn.functional.log_softmax(x, dim=1, dtype=torch.float32)
+        log_softmax = torch.nn.functional.log_softmax(x, dim=1)
         return torch.nn.functional.nll_loss(
             log_softmax,
             target,

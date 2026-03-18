@@ -3,7 +3,7 @@
 import torch
 
 from .base import ExecutionResult, Operation, OperationImplementation
-from .nki_kernels.native_multi_head_attn_mid import native_multi_head_attn_mid_kernel_with_grid
+from .nki_kernels.scaled_dot_product_attention import scaled_dot_product_attention_kernel
 
 
 class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
@@ -91,13 +91,19 @@ class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
         try:
             batch_size, num_heads, d_head, seq_len = query.shape
 
-            # Create output tensor if not provided
-            if out is None:
-                attn_output = torch.empty(
-                    batch_size, num_heads, seq_len, d_head, dtype=query.dtype, device=query.device
-                )
-            else:
-                attn_output = out
+            # Call the NKI kernel
+            attn_output = scaled_dot_product_attention_kernel(
+                query.transpose(-2, -1),
+                key.transpose(-2, -1),
+                value.transpose(-2, -1),
+                is_causal=use_causal_mask,
+                dropout_p=dropout_p,
+                scale=None,
+                training=training,
+                seed=None,
+                lse=None,
+            )
+            if out is not None:
                 # Validate output shape
                 if attn_output.shape != (batch_size, num_heads, seq_len, d_head):
                     raise ValueError(
@@ -105,16 +111,8 @@ class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
                         f"shape ({batch_size}, {num_heads}, {seq_len}, {d_head})"
                     )
 
-            # Call the NKI kernel
-            native_multi_head_attn_mid_kernel_with_grid(
-                query,
-                key,
-                value,
-                attn_output,
-                use_causal_mask=use_causal_mask,
-                dropout_p=dropout_p,
-                training=training,
-            )
+                out.copy_(attn_output)
+                attn_output = out
 
             return ExecutionResult(success=True, output=attn_output)
 

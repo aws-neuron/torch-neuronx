@@ -52,7 +52,6 @@
     "test_pad_neuron_complex128",
     "test_pad_neuron_float64",
     "test_rmsnorm_epsilon_neuron_float64",
-    "test_rmsnorm_numeric_neuron_float16",
     "test_rnn_retain_variables_neuron_float64",
     "test_silu_inplace_overlap_neuron",
     "test_softmax_results_neuron_float32",

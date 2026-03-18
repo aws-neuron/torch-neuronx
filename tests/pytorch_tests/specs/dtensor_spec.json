@@ -114,21 +114,6 @@
           ]
         },
         {
-          "reason": "Optimizer backward failures - linear_backward execution failure on Neuron (10 tests)",
-          "tests": [
-            "test_RMSprop_1d_sharding",
-            "test_adadelta_1d_sharding",
-            "test_adagrad_1d_sharding",
-            "test_adam_1d_sharding",
-            "test_adamax_1d_sharding",
-            "test_adamw_1d_sharding",
-            "test_asgd_1d_sharding",
-            "test_nadam_1d_sharding",
-            "test_radam_1d_sharding",
-            "test_sgd_1d_sharding"
-          ]
-        },
-        {
           "reason": "Unexpected success (xfailed test passed) (7 tests)",
           "tests": [
             "test_dtensor_op_db_as_strided_copy_neuron_float32",
@@ -296,9 +281,11 @@
           ]
         },
         {
-          "reason": "AdamW fused across meshes - einop label size mismatch (1 test)",
+          "reason": "RuntimeError: Non-scalar tensor kwarg 'lr' is on cpudevice, expected neuron",
           "tests": [
-            "test_admaw_fused_across_meshes"
+            "test_admaw_fused_across_meshes",
+            "test_adamw_1d_sharding",
+            "test_adam_1d_sharding"
           ]
         },
         {

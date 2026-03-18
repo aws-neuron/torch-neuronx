@@ -1,6 +1,5 @@
 """Test that clamp and clamp_min operations are properly registered with PyTorch dispatcher."""
 
-import os
 import re
 
 import pytest
@@ -264,7 +263,6 @@ class TestClamp:
                 "aten::clamp_max",
                 {"max": 10.0},
                 marks=pytest.mark.xfail(
-                    condition=os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
                     reason="-inf preservation issues in torch.clamp_max for multi-element tensors",
                 ),
             ),
@@ -331,11 +329,6 @@ class TestClamp:
     )
     def test_clamp_ops_broadcasting(self, op_name, op_func):
         """Test clamp operations with broadcasted tensors."""
-        suffix = (
-            ".Tensor" if os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1" else ".Tensor_out"
-        )
-        aten_name = f"aten::{op_name}{suffix}"
-
         with track_neuron_ops():
             # 2x3 input tensor
             input_cpu = torch.tensor([[1.0, 5.0, 9.0], [2.0, 6.0, 10.0]])
@@ -360,4 +353,53 @@ class TestClamp:
                 result = op_func(input_arr, max=max_cpu.to("neuron"))
 
             assert torch.all(result.cpu() == expected)
-            assert_op_runs_on_neuron(aten_name)
+            assert_op_runs_on_neuron(f"aten::{op_name}.Tensor")
+
+    @pytest.mark.parametrize(
+        "op_name,op_func",
+        [
+            ("clamp_min", torch.clamp_min),
+            ("clamp_max", torch.clamp_max),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int32, torch.float32])
+    def test_clamp_ops_broadcasting_rank_mismatch(self, op_name, op_func, dtype):
+        """Regression test: input [5,1] vs bound [5] triggers StableHLO broadcast_dimensions
+        error with clamp; use maximum/minimum instead to handle rank mismatch."""
+        input_cpu = torch.tensor([[1], [3], [5], [7], [9]], dtype=dtype)
+        bound_cpu = torch.tensor([2, 2, 6, 6, 6], dtype=dtype)
+        bound_kwarg = "min" if op_name == "clamp_min" else "max"
+        expected = op_func(input_cpu, **{bound_kwarg: bound_cpu})
+        with track_neuron_ops():
+            result = op_func(input_cpu.to("neuron"), **{bound_kwarg: bound_cpu.to("neuron")})
+            assert result.shape == expected.shape
+            assert torch.all(result.cpu() == expected)
+            assert_op_runs_on_neuron(f"aten::{op_name}.Tensor")
+
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int32, torch.float32])
+    @pytest.mark.parametrize(
+        "use_min,use_max",
+        [(True, True), (True, False), (False, True)],
+        ids=["both", "min_only", "max_only"],
+    )
+    def test_clamp_broadcasting_rank_mismatch(self, dtype, use_min, use_max):
+        """Regression test: torch.clamp with tensor min/max that have different ranks than input.
+        Input [5,1] vs bound [5] can trigger StableHLO broadcast_dimensions errors."""
+        input_cpu = torch.tensor([[1], [3], [5], [7], [9]], dtype=dtype)
+        kwargs_cpu = {}
+        kwargs_neuron = {}
+        if use_min:
+            min_cpu = torch.tensor([0, 2, 2, 4, 4], dtype=dtype)
+            kwargs_cpu["min"] = min_cpu
+            kwargs_neuron["min"] = min_cpu.to("neuron")
+        if use_max:
+            max_cpu = torch.tensor([2, 4, 6, 8, 8], dtype=dtype)
+            kwargs_cpu["max"] = max_cpu
+            kwargs_neuron["max"] = max_cpu.to("neuron")
+
+        expected = torch.clamp(input_cpu, **kwargs_cpu)
+        with track_neuron_ops():
+            result = torch.clamp(input_cpu.to("neuron"), **kwargs_neuron)
+            assert result.shape == expected.shape
+            assert torch.all(result.cpu() == expected)
+            assert_op_runs_on_neuron("aten::clamp.Tensor")

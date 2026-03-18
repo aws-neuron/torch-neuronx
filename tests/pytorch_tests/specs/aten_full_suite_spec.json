@@ -14,7 +14,15 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_ops.py"
+      "file": "test_ops.py",
+      "skip_test_patterns": [
+        "fft_",
+        "_conversions_cfloat",
+        "_conversions_cdouble",
+        "_conversions_chalf",
+        "_conversions_complex"
+      ],
+      "skip_test_patterns_reason": "FFT ops (fft, ifft, rfft, hfft, etc.) and complex dtype conversions (cfloat, cdouble, chalf) are not supported on Neuron hardware"
     },
     {
       "class": "TestTorchDeviceType",

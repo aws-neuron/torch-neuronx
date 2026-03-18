@@ -32,6 +32,10 @@ def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
     static_argnums=(1, 2),
 )
 def torch_mean(x, dim=None, keepdim=False, dtype=None, out=None):
+    # Scalar tensor with dim: short-circuit to avoid MLIR crash
+    if x.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return x.clone().to(dtype) if dtype else x.clone()
     if dim is None:
         return torch.mean(x, dtype=dtype)
     return torch.mean(x, dim, keepdim, dtype=dtype)
@@ -42,10 +46,21 @@ def torch_mean(x, dim=None, keepdim=False, dtype=None, out=None):
     static_argnums=(1, 2),
     output_params=("max", "max_values"),
 )
-def torch_max(x, dim=None, keepdim=False, **kwargs):
+def torch_max(x, dim=None, keepdim=False, out=None, **kwargs):
     if dim is None:
         return torch.max(x)
     return torch.max(x, dim, keepdim)
+
+
+@register_aten(
+    ["aten::min", "aten::min.unary_out", "aten::min.dim", "aten::min.dim_min"],
+    static_argnums=(1, 2),
+    output_params=("min", "min_indices"),
+)
+def torch_min(x, dim=None, keepdim=False, out=None, **kwargs):
+    if dim is None:
+        return torch.min(x)
+    return torch.min(x, dim, keepdim)
 
 
 @register_aten(["aten::amax", "aten::amax.out"], static_argnums=(1, 2))
@@ -74,25 +89,34 @@ def torch_amin(self, dim=None, keepdim=False, out=None):
     return torch.amin(self, dim, keepdim)
 
 
+def _bool_reduction(op, x, dim=None, keepdim=False):
+    """Shared logic for all/any reductions.
+
+    Handles scalar tensors and non-bool input casting to work around
+    Torch-MLIR StableHLO lowering limitations. Output dtype follows
+    PyTorch convention: uint8 in -> uint8 out, otherwise bool.
+    """
+    input_dtype = x.dtype
+    # Scalar tensor with dim: short-circuit to avoid MLIR crash
+    if x.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        result = x.clone().to(torch.bool)
+    else:
+        # Cast to bool before reduction; Torch-MLIR may not lower all/any on non-bool dtypes.
+        x = x.to(torch.bool)
+        result = op(x) if dim is None else op(x, dim, keepdim)
+    # Reference: https://docs.pytorch.org/docs/stable/generated/torch.any.html
+    return result.to(torch.uint8) if input_dtype == torch.uint8 else result
+
+
 @register_aten(["aten::all", "aten::all.out", "aten::all.all_out"], static_argnums=(1, 2))
 def torch_all(x, dim=None, keepdim=False, out=None):
-    if dim is None:
-        return torch.all(x)
-    return torch.all(x, dim, keepdim)
+    return _bool_reduction(torch.all, x, dim, keepdim)
 
 
 @register_aten(["aten::any", "aten::any.out", "aten::any.all_out"], static_argnums=(1, 2))
 def torch_any(x, dim=None, keepdim=False, out=None):
-    if dim is None:
-        result = torch.any(x).to(torch.bool)
-    else:
-        result = torch.any(x, dim, keepdim).to(torch.bool)
-
-    # Reference for dtype https://docs.pytorch.org/docs/stable/generated/torch.any.html
-    if x.dtype == torch.uint8:
-        return result.to(torch.uint8)
-    else:
-        return result
+    return _bool_reduction(torch.any, x, dim, keepdim)
 
 
 @register_aten(

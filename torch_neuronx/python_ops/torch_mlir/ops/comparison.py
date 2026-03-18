@@ -43,13 +43,14 @@ def torch_clamp(x, min=None, max=None, out=None):
     if min is None and max is None:
         raise RuntimeError("torch.clamp: At least one of 'min' or 'max' must not be None")
 
-    # Ensure tensor min/max have same dtype as input
-    if min is not None and isinstance(min, torch.Tensor):
-        min = min.to(x.dtype)
-    if max is not None and isinstance(max, torch.Tensor):
-        max = max.to(x.dtype)
+    # Handle tensor bounds with torch.maximum/minimum to avoid StableHLO
+    # broadcast_dimensions errors on rank mismatch.
+    if isinstance(min, torch.Tensor):
+        x, min = torch.maximum(x, min.to(x.dtype)), None
+    if isinstance(max, torch.Tensor):
+        x, max = torch.minimum(x, max.to(x.dtype)), None
 
-    return torch.clamp(x, min=min, max=max)
+    return torch.clamp(x, min=min, max=max) if min is not None or max is not None else x
 
 
 @register_aten(
@@ -63,7 +64,9 @@ def torch_clamp(x, min=None, max=None, out=None):
 def torch_clamp_max(x, max, out=None):
     # Ensure tensor max has same dtype as input
     if isinstance(max, torch.Tensor):
-        max = max.to(x.dtype)
+        # Use torch.minimum instead of torch.clamp_max: it handles broadcasting
+        # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
+        return torch.minimum(x, max.to(x.dtype))
     return torch.clamp_max(x, max)
 
 
@@ -78,7 +81,9 @@ def torch_clamp_max(x, max, out=None):
 def torch_clamp_min(x, min, out=None):
     # Ensure tensor min has same dtype as input
     if isinstance(min, torch.Tensor):
-        min = min.to(x.dtype)
+        # Use torch.maximum instead of torch.clamp_min: it handles broadcasting
+        # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
+        return torch.maximum(x, min.to(x.dtype))
     return torch.clamp_min(x, min)
 
 

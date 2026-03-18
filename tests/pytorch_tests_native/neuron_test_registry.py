@@ -8,12 +8,13 @@ Organization:
     Each SkipGroup represents ONE root cause. When the root cause is fixed,
     delete the entire group and all its tests are re-enabled.
 
-    Five levels of granularity per group:
-    - folders:  skip entire directories (e.g., "distributed/", "test/inductor/")
-    - files:    skip entire test files (e.g., "test_sparse.py")
-    - classes:  skip entire test classes (e.g., "TestSparseOps")
-    - tests:    exact test IDs (e.g., "TestClass::test_method")
-    - patterns: glob patterns against test name (e.g., "*_neuron_complex*")
+    Three levels of granularity per group:
+    - folders:  skip entire directories (e.g., "distributed/")
+    - tests:    contiguous component match against nodeid split by :: and /
+                Supports any combination: "test_method", "TestClass",
+                "test_sparse.py", "test_sparse.py::TestClass",
+                "distributed::test_comm.py::TestComm", etc.
+    - patterns: glob patterns against test function name
 """
 
 import fnmatch
@@ -29,8 +30,6 @@ class SkipGroup:
     reason: str
     tests: list[str] = field(default_factory=list)
     patterns: list[str] = field(default_factory=list)
-    files: list[str] = field(default_factory=list)
-    classes: list[str] = field(default_factory=list)
     folders: list[str] = field(default_factory=list)
 
 
@@ -63,35 +62,63 @@ _load_skip_registry()
 # =============================================================================
 
 
-def _group_matches(group: SkipGroup, nodeid: str, filename: str) -> bool:
-    """Check if a test matches any entry in a group."""
-    # Folder match: anchored to test/ directory (e.g., "distributed" matches "test/distributed/")
+def _split_nodeid(nodeid: str) -> list[str]:
+    """Split a nodeid into components (path segments + class + test)."""
+    return nodeid.replace("/", "::").split("::")
+
+
+def _is_contiguous_match(skip_entry: list, pytest_nodeid: list) -> bool:
+    """Check if skip_entry appears as a contiguous subsequence in pytest_nodeid.
+
+    Example:
+        pytest_nodeid: "tests/.../test_fsdp.py::TestFSDP::test_something"
+                       → ["tests", ..., "test_fsdp.py", "TestFSDP", "test_something"]
+        skip_entry:    "test_fsdp.py::TestFSDP" → ["test_fsdp.py", "TestFSDP"]
+        Result: True (contiguous match)
+
+    Pytest nodeids are always fully qualified, so they will always have more
+    components than any skip entry. If skip_entry is longer, returns False.
+    """
+    return any(
+        pytest_nodeid[i : i + len(skip_entry)] == skip_entry
+        for i in range(len(pytest_nodeid) - len(skip_entry) + 1)
+    )
+
+
+def _group_matches(group: SkipGroup, nodeid: str) -> bool:
+    """Check if a test matches any entry in a group.
+
+    Matching order (first match wins):
+    1. folders — checks if "test/{folder}" is in the file path
+    2. tests   — splits nodeid into components by / and ::, then
+                 checks if the entry is a contiguous subsequence.
+                 Supports any combination: "test_name", "TestClass",
+                 "test_file.py", "test_file.py::TestClass", etc.
+    3. patterns — glob match against the test function name only
+
+    Note: pytest nodeids are always fully qualified paths like
+    "tests/pytorch_tests_native/test/distributed/file.py::TestClass::test_method"
+    so they will always be longer than or equal to any skip entry we define.
+    """
     filepath = nodeid.split("::")[0]
     if any(f"test/{f}" in filepath for f in group.folders):
         return True
-    if filename in group.files:
+    pytest_nodeid_parts = _split_nodeid(nodeid)
+    if any(_is_contiguous_match(_split_nodeid(t), pytest_nodeid_parts) for t in group.tests):
         return True
-    # Extract class name from nodeid (e.g., "path/test.py::TestClass::test_method")
-    parts = nodeid.split("::")
-    if len(parts) >= 2 and parts[1] in group.classes:
-        return True
-    if any(t in nodeid for t in group.tests):
-        return True
-    test_name = parts[-1] if len(parts) > 1 else nodeid
-    return any(fnmatch.fnmatch(test_name, p) for p in group.patterns)
+    return any(fnmatch.fnmatch(pytest_nodeid_parts[-1], p) for p in group.patterns)
 
 
 def apply_markers(item: pytest.Item) -> None:
     """Apply skip/xfail markers to a pytest item based on the registry."""
-    filename = item.fspath.basename
     nodeid = item.nodeid
 
     for group in SKIP_GROUPS:
-        if _group_matches(group, nodeid, filename):
+        if _group_matches(group, nodeid):
             item.add_marker(pytest.mark.skip(reason=group.reason))
             return
 
     for group in XFAIL_GROUPS:
-        if _group_matches(group, nodeid, filename):
+        if _group_matches(group, nodeid):
             item.add_marker(pytest.mark.xfail(reason=group.reason, strict=False))
             return

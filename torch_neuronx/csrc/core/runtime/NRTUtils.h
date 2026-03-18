@@ -373,6 +373,18 @@ inline NRT_STATUS BeginInspectWithOptions(nrt_inspect_config_t* options) {
   return nrt_inspect_begin_with_options(options);
 }
 
+/**
+ * Get the instance-specific output directory path used by NRT profiling
+ * @param output_dir Base output directory
+ * @param instance_dir_buf Buffer to store the instance directory path
+ * @param buf_size Size of the buffer
+ * @return NRT_STATUS indicating success or failure
+ */
+inline NRT_STATUS GetInstanceOutputDir(const char* output_dir, char* instance_dir_buf,
+                                       size_t buf_size) {
+  return nrt_inspect_get_instance_output_dir(output_dir, instance_dir_buf, buf_size);
+}
+
 // ============================================================================
 // Asynchronous NRT operations
 // ============================================================================

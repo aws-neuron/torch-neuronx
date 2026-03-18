@@ -119,6 +119,15 @@ def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     return False
 
 
+def _is_trivial_graph(gm: torch.fx.GraphModule) -> bool:
+    """Check if graph has no computation (only placeholders, output, get_attr).
+
+    Graph breaks (e.g. from dist.all_gather_object using pickle) produce trivial
+    passthrough subgraphs that don't need NEFF compilation.
+    """
+    return all(node.op in ("placeholder", "output", "get_attr") for node in gm.graph.nodes)
+
+
 def neuron_backend_fx_compiler(
     gm: torch.fx.GraphModule, example_inputs, pre_processing_analysis_info=None, options=None
 ):
@@ -141,6 +150,13 @@ def neuron_backend_fx_compiler(
     Raises:
         RuntimeError: If compilation fails at any stage.
     """
+
+    # Short-circuit trivial graphs produced by graph breaks. When dynamo can't trace
+    # an op (e.g. dist.all_gather_object uses pickle), it breaks the graph and may
+    # produce empty passthrough subgraphs that have no real computation.
+    if _is_trivial_graph(gm):
+        logger.debug("Trivial graph detected (graph break artifact), using passthrough")
+        return make_boxed_func(gm.forward)
 
     logger.debug("Applying FX graph transformations...")
     with dynamo_timed("torch_neuronx_fx_passes"):
