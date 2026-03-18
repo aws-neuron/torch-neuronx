@@ -1,4 +1,4 @@
-# ruff: noqa: N806, E402, F841
+# ruff: noqa: N806, E402
 """
 Custom decompositions for torch.compile neuron backend
 
@@ -15,15 +15,15 @@ import math
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
+import nki
 import torch
 import torch._decomp as decomp
 import torch.nn.functional as F  # noqa: N812
-from neuronxcc.nki.kernels import flash_attn_bwd, flash_fwd
-from neuronxcc.nki.kernels.attention import FlashConfig
+from nkilib.core.attention.attention_bwd import attention_bwd
+from nkilib.core.attention.attention_cte import attention_cte
 from torch._decomp import get_decompositions
 
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
-from torch_neuronx.nki_hop import wrap_nki
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -32,8 +32,9 @@ aten = torch.ops.aten
 from torch_neuronx.utils import get_logical_neuron_cores
 
 logger = logging.getLogger(__name__)
-wrapped_flash_fwd = wrap_nki(flash_fwd)
-wrapped_flash_bwd = wrap_nki(flash_attn_bwd)
+
+wrapped_flash_fwd = nki.jit(mode="torch")(attention_cte)
+wrapped_flash_bwd = nki.jit(mode="torch")(attention_bwd)
 
 # Build the base decomposition table from standard PyTorch decompositions
 # for ops that are not supported by the backend (yet)
@@ -75,7 +76,6 @@ neuron_decompositions = get_decompositions(
         aten.select_backward,
         aten.slice_backward,
         aten.softplus_backward,
-        aten.index_select_backward,
         aten.col2im,  # accuracy mismatch on neuron, pending NCF-486
         aten.lerp,
         aten.elu,
@@ -303,6 +303,98 @@ def scaled_dot_product_attention_decomposition(
     return (output, lse, dropout_mask)
 
 
+def _can_use_nki_flash_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+) -> bool:
+    """Check if NKI flash attention kernel can be used.
+
+    Args:
+        query (torch.Tensor): Query tensor of shape (B, H, L, E).
+        key (torch.Tensor): Key tensor of shape (B, H, S, E).
+        value (torch.Tensor): Value tensor of shape (B, H, S, E).
+        attn_bias (torch.Tensor | None): Optional attention bias.
+        dropout_p (float): Dropout probability.
+
+    Returns:
+        bool: True if NKI kernel constraints are satisfied.
+    """
+    if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
+        return False
+
+    B, H, L, E = query.shape
+    S = key.shape[-2]
+    D = key.shape[-1]
+
+    # Conditions to use NKI SDPA kernel
+    # NOTE: Limit for B * H needs to be set according to attention_cte kernel
+    return (
+        key.shape == value.shape
+        and L % 512 == 0
+        and S % 512 == 0
+        and D <= 128
+        and B * H <= 512
+        and attn_bias is None
+        and dropout_p == 0
+    )
+
+
+def _compute_attention_nki(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+    training: bool,
+):
+    logical_neuron_cores = int(get_logical_neuron_cores())
+    grid = (logical_neuron_cores,)
+
+    B, H, L, E = query.shape
+    _, H_kv, S, D = key.shape
+    q_nki = query.reshape(B * H, L, E)
+    k_nki = key.reshape(B * H_kv, S, D)
+    v_nki = value.reshape(B * H_kv, S, D)
+
+    # attention_cte NKI kernel uses different default scale value
+    if scale is None:
+        scale = 1.0 / math.sqrt(E)
+
+    if training:
+        output, neg_max, out_sum_recip = wrapped_flash_fwd[grid](
+            q_nki,
+            k_nki,
+            v_nki,
+            tp_q=True,
+            tp_k=True,
+            scale=scale,
+            causal_mask=is_causal,
+            cache_softmax=True,
+        )
+
+        # Compute LSE
+        logsumexp = -(neg_max + torch.log(out_sum_recip))
+        logsumexp = logsumexp.to(torch.float32).reshape(B, H, *logsumexp.shape[-2:])
+        output = output.reshape(B, H, L, D)
+        return output, logsumexp
+    else:
+        output = wrapped_flash_fwd[grid](
+            q_nki,
+            k_nki,
+            v_nki,
+            tp_q=True,
+            tp_k=True,
+            scale=scale,
+            causal_mask=is_causal,
+            cache_softmax=False,
+        )
+        output = output.reshape(B, H, L, D)
+        return output
+
+
 @register_decomposition([aten._scaled_dot_product_fused_attention_overrideable.default])
 def sdpa_fused_overrideable(
     query: torch.Tensor,
@@ -333,41 +425,11 @@ def sdpa_fused_overrideable(
         tuple: (attention_output, logsumexp, philox_seed, philox_offset, debug_mask).
     """
     B, H, L, E = query.shape
-    S = key.shape[-2]
-    D = key.shape[-1]
-    nki_attention_enabled = _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True)
-    # Dynamically determine seq_tile_size based on sequence length
-    # Get default from FlashConfig
-    default_seq_tile_size = FlashConfig().seq_tile_size
-    # Force training=True, since torch.is_grad_enabled() remains False
-    training = True
-    # Prefer default tile size when possible for optimal memory usage
-    if S % default_seq_tile_size == 0:
-        # Keep the default - this is the preferred case
-        seq_tile_size = default_seq_tile_size
-    else:
-        # Only change if we must - prefer larger tiles up to default for better perf
-        # We know this works due to our can_handle check (seq_len % 512 == 0)
-        seq_tile_size = 1024 if S % 1024 == 0 else 512
-
-    # Conditions to use NKI SDPA kernel
-    can_use_nki_sdpa = L % 128 == 0 and S % 128 == 0 and D <= 128
-    can_use_nki_sdpa = can_use_nki_sdpa and S % seq_tile_size == 0
-    # Attn_bias is not yet supported
-    can_use_nki_sdpa = can_use_nki_sdpa and attn_bias is None
-    can_use_nki_sdpa = can_use_nki_sdpa and nki_attention_enabled
-    can_use_nki_sdpa = can_use_nki_sdpa and dropout_p == 0
-
-    # Detect GQA
-    _, kv_heads, _, _ = key.shape
-    is_gqa = kv_heads < H and H % kv_heads == 0
-    if kv_heads < H and H % kv_heads != 0:
+    _, Hkv, S, D = key.shape
+    if Hkv < H and H % Hkv != 0:
         raise RuntimeError(
             "Number of heads in key and value must divide the number of heads in query"
         )
-
-    # Create config with custom seq_tile_size
-    config = FlashConfig(training=training, seq_tile_size=seq_tile_size, should_transpose_v=False)
 
     if dropout_p > 0.0:
         philox_seed = torch.randint(0, 2**31 - 1, (1,), device=query.device, dtype=torch.int32)
@@ -376,36 +438,10 @@ def sdpa_fused_overrideable(
         philox_seed = (query.flatten()[0] * 0).to(torch.int32)
         philox_offset = (query.flatten()[0] * 0).to(torch.int32)
 
-    if can_use_nki_sdpa and nki_attention_enabled:
+    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p):
         try:
-            # Handle GQA
-            if is_gqa:
-                repeat_factor = H // kv_heads
-                key = key.repeat_interleave(repeat_factor, dim=1)
-                value = value.repeat_interleave(repeat_factor, dim=1)
-
-            seed = (
-                philox_seed
-                if dropout_p > 0.0 and philox_seed is not None and philox_seed.numel() > 0
-                else None
-            )
-            q = query.transpose(2, 3)
-            k = key.transpose(2, 3)
-            v = value
-            grid_heads = H
-
-            output, logsumexp = wrapped_flash_fwd[B, grid_heads](
-                q,
-                k,
-                v,
-                seed,
-                logit_bias=attn_bias,
-                softmax_scale=scale,
-                use_causal_mask=is_causal,
-                sliding_window=-1,
-                mixed_precision=True,
-                dropout_p=dropout_p,
-                config=config,
+            output, logsumexp = _compute_attention_nki(
+                query, key, value, is_causal, scale, training=True
             )
             return (
                 output,
@@ -453,22 +489,18 @@ def sdpa_fused_overrideable(
 
 
 def _can_use_nki_flash_attention_backward(
-    grad_out: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    lse: torch.Tensor,
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
 ) -> bool:
     """Check if NKI flash attention backward kernel can be used.
 
     Args:
-        grad_out (torch.Tensor): Gradient of attention output.
         query (torch.Tensor): Query tensor of shape (B, H, L, E).
         key (torch.Tensor): Key tensor of shape (B, H, S, E).
         value (torch.Tensor): Value tensor of shape (B, H, S, E).
-        lse (torch.Tensor): Logsumexp from forward pass.
         attn_bias (torch.Tensor | None): Optional attention bias.
         dropout_p (float): Dropout probability.
 
@@ -481,15 +513,72 @@ def _can_use_nki_flash_attention_backward(
     if attn_bias is not None:
         return False
 
-    B, q_heads, L, E = query.shape
-    _, kv_heads, S, _ = key.shape
-    if key.shape != value.shape:
-        return False
-    if L % 512 != 0 or S % 512 != 0:
-        return False
-    if dropout_p > 0:
-        return False
-    return not E > 128
+    _, _, L, E = query.shape
+    _, _, S, _ = key.shape
+    return (
+        key.shape == value.shape
+        and L % 512 == 0
+        and S % 512 == 0
+        and dropout_p == 0
+        and E % math.ceil(E / 128) == 0
+    )
+
+
+def _compute_attention_backward_nki(
+    grad_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    logsumexp: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+):
+    B, q_heads, L = query.shape[:3]
+    kv_heads = key.shape[1]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.shape[-1])
+
+    # Transform inputs to NKI format
+    q_nki = query.transpose(-2, -1)
+    k_nki = key.transpose(-2, -1)
+    v_nki = value.transpose(-2, -1)
+    out_nki = out.transpose(-2, -1) if out is not None else None
+    grad_out_nki = grad_out.transpose(-2, -1)
+
+    # reshape LSE for NKI
+    if logsumexp.ndim == 3:
+        tile_size = 128
+        n_tiles = L // tile_size
+        if L % tile_size == 0:
+            lse_4d = logsumexp.view(B, q_heads, n_tiles, tile_size).transpose(-2, -1)
+        else:
+            raise ValueError(f"Sequence length {L} must be divisible by tile size {tile_size}")
+    else:
+        lse_4d = logsumexp
+
+    logical_neuron_cores = int(get_logical_neuron_cores())
+    grid = (logical_neuron_cores,) if B * kv_heads % logical_neuron_cores == 0 else (1,)
+
+    # Call NKI bwd kernel
+    grad_q_nki, grad_k_nki, grad_v_nki = wrapped_flash_bwd[grid](
+        q_nki,
+        k_nki,
+        v_nki,
+        out_nki,
+        grad_out_nki,
+        lse_4d,
+        use_causal_mask=is_causal,
+        mixed_precision=True,
+        softmax_scale=scale,
+    )
+
+    # Transform gradients back to ATen format
+    grad_q = grad_q_nki.transpose(-2, -1)
+    grad_k = grad_k_nki.transpose(-2, -1)
+    grad_v = grad_v_nki.transpose(-2, -1)
+    return grad_q, grad_k, grad_v
 
 
 def compute_attention_backward_decomposition(
@@ -692,77 +781,19 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
     Returns:
         tuple: (grad_query, grad_key, grad_value, grad_attn_bias).
     """
-    can_use_nki = _can_use_nki_flash_attention_backward(
-        grad_out, query, key, value, logsumexp, attn_bias, dropout_p
-    )
-    orig_k_shape = key.shape
-
-    # Prepare common inputs
-    B, q_heads, L, E, S, orig_kv_heads, scale, is_gqa, key, value = _prepare_backward_inputs(
-        query, key, value, orig_k_shape, scale
-    )
+    can_use_nki = _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
     # Try NKI
     if can_use_nki:
         try:
-            # Transform inputs to NKI format
-            q_nki = query.transpose(-2, -1)
-            k_nki = key.transpose(-2, -1)
-            v_nki = value.transpose(-2, -1)
-            out_nki = out.transpose(-2, -1) if out is not None else None
-            grad_out_nki = grad_out.transpose(-2, -1)
-
-            # reshape LSE for NKI
-            if logsumexp.ndim == 3:
-                tile_size = 128
-                n_tiles = L // tile_size
-                if L % tile_size == 0:
-                    lse_4d = logsumexp.view(B, q_heads, n_tiles, tile_size).transpose(-2, -1)
-                else:
-                    raise ValueError(
-                        f"Sequence length {L} must be divisible by tile size {tile_size}"
-                    )
-            else:
-                lse_4d = logsumexp
-
-            # Prepare seed and grid
-            seed = (
-                philox_seed
-                if dropout_p > 0.0 and philox_seed is not None and philox_seed.numel() > 0
-                else None
-            )
-            logical_neuron_cores = int(get_logical_neuron_cores())
-            if logical_neuron_cores > 1 and q_heads % logical_neuron_cores == 0:
-                import neuronxcc.nki.language as nl
-
-                grid = (B, nl.nc(logical_neuron_cores) * (q_heads // logical_neuron_cores))
-            else:
-                grid = (B, q_heads)
-
-            seed_1d = seed.view(-1)[0:1] if seed is not None and seed.numel() > 0 else None
-
-            # Call NKI bwd kernel
-            grad_q_nki, grad_k_nki, grad_v_nki = wrapped_flash_bwd[grid](
-                q_nki,
-                k_nki,
-                v_nki,
-                out_nki,
-                grad_out_nki,
-                lse_4d,
-                seed_1d,
-                use_causal_mask=is_causal,
-                mixed_precision=True,
-                dropout_p=dropout_p,
-                softmax_scale=scale,
-            )
-
-            # Transform gradients back to ATen format
-            grad_q = grad_q_nki.transpose(-2, -1)
-            grad_k = grad_k_nki.transpose(-2, -1)
-            grad_v = grad_v_nki.transpose(-2, -1)
-
-            # Reduce gradients for GQA
-            grad_k, grad_v = _reduce_gqa_gradients(
-                grad_k, grad_v, is_gqa, B, orig_kv_heads, q_heads, S, E
+            grad_q, grad_k, grad_v = _compute_attention_backward_nki(
+                grad_out,
+                query,
+                key,
+                value,
+                out,
+                logsumexp,
+                is_causal,
+                scale,
             )
 
             return grad_q, grad_k, grad_v, None
@@ -772,6 +803,13 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
             pass
 
     # Fallback to manual backward decomposition
+    orig_k_shape = key.shape
+
+    # Prepare common inputs
+    B, q_heads, L, E, S, orig_kv_heads, scale, is_gqa, key, value = _prepare_backward_inputs(
+        query, key, value, orig_k_shape, scale
+    )
+
     if attn_bias is None:
         attn_bias = torch.zeros((1,), dtype=query.dtype, device=query.device)
 
@@ -1013,306 +1051,6 @@ def linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
     result = torch.where(has_nan, torch.full_like(result, float("nan")), result)
 
     return result
-
-
-def index_put_decomposition(input, indices, values, accumulate=False):
-    """
-    Decomposition of aten.index_put that handles negative indices and boolean masks
-
-    This function decomposes index_put into simpler operations (torch.where or torch.scatter)
-
-    Args:
-        input (torch.Tensor): The tensor to be modified.
-        indices (tuple[torch.Tensor | None, ...]): A tuple of index tensors or None values.
-            - None represents a full slice (:) for that dimension
-            - Boolean tensors are converted to integer indices via nonzero()
-            - Integer tensors specify explicit indices (negative values supported)
-            - Lists/tuples are converted to tensors
-        values (torch.Tensor): Values to place into the tensor at the specified indices.
-            Must be broadcastable to the shape of the indexed region.
-        accumulate (bool, optional): If True, values are added to existing values
-            using scatter_add. If False, values replace existing values using scatter.
-            Defaults to False.
-
-    Returns:
-        torch.Tensor: A new tensor with values placed at the specified indices.
-
-    Raises:
-        IndexError: If indices are out of bounds after negative index normalization.
-        IndexError: If index tensors cannot be broadcast together.
-        IndexError: If values cannot be broadcast to the indexed region shape.
-    """
-
-    def try_get_where_mask(x, indices, values):
-        """
-        Returns prepared mask if operation can use torch.where
-        and returns None otherwise
-        """
-        if values.numel() != 1 or accumulate:
-            return None
-
-        num_defined_indices = 0
-        mask = None
-
-        for index in indices:
-            if index is not None:
-                if hasattr(index, "dtype") and index.dtype == torch.bool:
-                    if mask is not None:
-                        return None
-                    mask = index
-                    for j in range(index.ndim):
-                        if index.shape[j] != x.shape[num_defined_indices + j]:
-                            return None
-                    num_defined_indices += index.ndim
-                else:
-                    return None
-            else:
-                num_defined_indices += 1
-
-        if mask is None:
-            return None
-
-        if mask.ndim < x.ndim:
-            for _ in range(x.ndim - mask.ndim):
-                mask = mask.unsqueeze(-1)
-
-        return mask
-
-    if (mask := try_get_where_mask(input, indices, values)) is not None:
-        return torch.where(mask, values.to(input.dtype), input)
-
-    if (
-        any(isinstance(idx, torch.Tensor) and idx.dtype == torch.bool for idx in indices)
-        and values.numel() == 1
-    ):
-        bool_info = None
-        int_info = None
-
-        for i, idx in enumerate(indices):
-            if isinstance(idx, torch.Tensor):
-                if idx.dtype == torch.bool and idx.dim() == 1:
-                    bool_info = (i, idx)
-                elif idx.dtype in (torch.int32, torch.int64):
-                    int_info = (i, idx)
-
-        if bool_info and int_info:
-            bool_dim, bool_idx = bool_info
-            int_dim, int_idx = int_info
-            int_idx = torch.where(int_idx < 0, int_idx + input.shape[int_dim], int_idx)
-
-            k = bool_idx.sum()
-            m = int_idx.numel()
-
-            arange = torch.arange(input.shape[int_dim], device=input.device)
-
-            # broadcast mask: for k==1 or m==1 cases
-            int_mask = torch.zeros(input.shape[int_dim], dtype=torch.bool, device=input.device)
-            int_mask = int_mask.scatter(0, int_idx.flatten(), True)
-            mask_broadcast = bool_idx.unsqueeze(1) & int_mask.unsqueeze(0)
-
-            # paired mask: for k==m case
-            cumsum = torch.cumsum(bool_idx.to(torch.int64), dim=0) - 1
-            cumsum = torch.clamp(cumsum, min=0, max=m - 1)
-            int_idx_selected = int_idx.flatten()[cumsum]  # index, not expand
-            mask_paired = bool_idx.unsqueeze(1) & (arange == int_idx_selected.unsqueeze(1))
-
-            # select mask based on k == m
-            mask = torch.where(k == m, mask_paired, mask_broadcast)
-
-            if bool_dim > int_dim:
-                mask = mask.T
-
-            for _ in range(2, input.dim()):
-                mask = mask.unsqueeze(-1)
-            mask = mask.expand(input.shape)
-
-            values = values.to(input.dtype).expand(input.shape)
-            if accumulate:
-                return torch.where(mask, input + values, input)
-            return torch.where(mask, values, input)
-
-    def convert_indices(indices, device):
-        for index in indices:
-            if index is None:
-                yield index
-            elif isinstance(index, list | tuple):
-                yield torch.tensor(index, device=device)
-            elif isinstance(index, torch.Tensor) and index.dtype == torch.bool:
-                raise RuntimeError(
-                    "Boolean index_put is not supported in torch.compile on Neuron. "
-                    "Boolean indices require nonzero() which produces dynamic shapes."
-                )
-            else:
-                yield index
-
-    converted_indices = convert_indices(indices, input.device)
-
-    # normalize negative indices
-    normalized_indices = []
-    for i, idx in enumerate(converted_indices):
-        if idx is None:
-            normalized_indices.append(None)
-        elif isinstance(idx, torch.Tensor):
-            if idx.dtype in (torch.int32, torch.int64):
-                dim_size = input.shape[i]
-                idx = torch.where(idx < 0, idx + dim_size, idx)
-            if idx.dim() == 0:
-                idx = idx.unsqueeze(0)
-            normalized_indices.append(idx)
-        else:
-            normalized_indices.append(idx)
-
-    # separate indexed dims from kept dims
-    indexed_dims = []  # list of (dim_index, index_tensor)
-    for i, idx in enumerate(normalized_indices):
-        if idx is not None:
-            indexed_dims.append((i, idx))
-
-    if len(indexed_dims) == 0:
-        return input
-
-    indexed_positions = [d for d, _ in indexed_dims]
-    indexed_dim_set = set(indexed_positions)
-    kept_dims = [d for d in range(input.dim()) if d not in indexed_dim_set]
-
-    # broadcast index tensors
-    idx_tensors = [idx for _, idx in indexed_dims]
-
-    if len(idx_tensors) > 1:
-        try:
-            broadcast_shape = torch.broadcast_shapes(*[t.shape for t in idx_tensors])
-        except RuntimeError as e:
-            shapes_str = ", ".join([str(list(t.shape)) for t in idx_tensors])
-            raise IndexError(
-                f"shape mismatch: indexing tensors could not be broadcast together "
-                f"with shapes {shapes_str}"
-            ) from e
-        broadcasted = [t.expand(broadcast_shape) for t in idx_tensors]
-    else:
-        broadcast_shape = list(idx_tensors[0].shape)
-        broadcasted = idx_tensors
-
-    broadcast_shape = list(broadcast_shape)
-
-    # determine output shape based on indexing pattern
-    # rules:
-    # i. Adjacent indexed dims: broadcast shape replaces them in-place
-    # ii. Non-adjacent indexed dims: broadcast shape goes to front
-
-    are_adjacent = (
-        all(
-            indexed_positions[i + 1] - indexed_positions[i] == 1
-            for i in range(len(indexed_positions) - 1)
-        )
-        if len(indexed_positions) > 1
-        else True
-    )
-
-    if are_adjacent:
-        # build shape with broadcast dims at position of first indexed dim
-        expected_shape = []
-        broadcast_inserted = False
-        for d in range(input.dim()):
-            if d in indexed_dim_set:
-                if not broadcast_inserted:
-                    expected_shape.extend(broadcast_shape)
-                    broadcast_inserted = True
-                # skip subsequent indexed dims
-            else:
-                expected_shape.append(input.shape[d])
-        first_indexed_pos = indexed_positions[0]
-    else:
-        # non-adjacent: broadcast shape at front, then kept dims
-        kept_shape = [input.shape[d] for d in kept_dims]
-        expected_shape = broadcast_shape + kept_shape
-        # broadcast dims are at front
-        first_indexed_pos = 0
-
-    # broadcast values to expected shape
-    values = values.to(input.dtype)
-
-    if values.numel() == 1:
-        values = values.expand(expected_shape)
-    elif list(values.shape) == expected_shape:
-        pass
-    else:
-        try:
-            values = values.expand(expected_shape)
-        except RuntimeError:
-            raise IndexError(
-                f"shape mismatch: value tensor of shape {list(values.shape)} "
-                f"cannot be broadcast to indexing result of shape {expected_shape}"
-            ) from None
-
-    # compute strides
-    strides = []
-    for i in range(input.dim()):
-        stride = 1
-        for j in range(i + 1, input.dim()):
-            stride *= input.shape[j]
-        strides.append(stride)
-
-    # build linear index tensor
-    flat_idx = torch.zeros(expected_shape, dtype=torch.int64, device=input.device)
-
-    # add contribution from indexed dimensions
-    for idx_num, (dim, _) in enumerate(indexed_dims):
-        idx_tensor = broadcasted[idx_num]
-
-        # reshape index tensor to align with expected_shape
-        if are_adjacent:
-            # broadcast dims are at first_indexed_pos
-            # idx_tensor has shape broadcast_shape, needs to be at position first_indexed_pos
-            shape = [1] * len(expected_shape)
-            for i, s in enumerate(broadcast_shape):
-                shape[first_indexed_pos + i] = s
-        else:
-            # broadcast dims are at front
-            shape = [1] * len(expected_shape)
-            for i, s in enumerate(broadcast_shape):
-                shape[i] = s
-
-        idx_reshaped = idx_tensor.view(shape).expand(expected_shape)
-        flat_idx = flat_idx + idx_reshaped.to(torch.int64) * strides[dim]
-
-    # add contribution from kept dimensions (full slices)
-    for kept_idx, dim in enumerate(kept_dims):
-        arange = torch.arange(input.shape[dim], dtype=torch.int64, device=input.device)
-
-        # find position of this kept dim in expected_shape
-        if are_adjacent:
-            # count kept dims before this one
-            kept_before = sum(1 for d in kept_dims[:kept_idx] if d < first_indexed_pos)
-            # position is either before broadcast (if dim < first_indexed_pos)
-            # or after broadcast (if dim > last indexed pos)
-            if dim < first_indexed_pos:
-                pos = kept_before
-            else:
-                pos = first_indexed_pos + len(broadcast_shape) + (kept_idx - kept_before)
-        else:
-            # kept dims come after broadcast dims
-            pos = len(broadcast_shape) + kept_idx
-
-        shape = [1] * len(expected_shape)
-        shape[pos] = input.shape[dim]
-        arange = arange.view(shape)
-        flat_idx = flat_idx + arange * strides[dim]
-
-    # handle empty indices
-    if flat_idx.numel() == 0:
-        return input
-
-    # flatten and scatter
-    flat_input = input.flatten()
-    flat_values = values.flatten()
-    flat_idx = flat_idx.flatten()
-
-    if accumulate:
-        result = torch.scatter_add(flat_input, 0, flat_idx, flat_values)
-    else:
-        result = torch.scatter(flat_input, 0, flat_idx, flat_values)
-
-    return result.reshape(input.shape)
 
 
 @register_decomposition([aten.sigmoid_backward.default])
@@ -1848,6 +1586,50 @@ def histc_decomposition(input, bins=100, min=0, max=0):
     return result
 
 
+@register_decomposition([aten.index_select_backward])
+def index_select_backward_decomposition(grad_output, input_sizes, dim, index):
+    """Decompose index_select_backward for torch.compile compatibility.
+
+    This needs to be decomposed here otherwise will fail lowering in torch-mlir.
+    """
+    if dim < 0:
+        dim = len(input_sizes) + dim
+
+    grad_input = torch.zeros(input_sizes, dtype=grad_output.dtype, device=grad_output.device)
+
+    shape = [1] * grad_output.ndim
+    shape[dim] = -1
+    index_expanded = index.view(shape).expand_as(grad_output)
+
+    return grad_input.scatter_add(dim, index_expanded, grad_output)
+
+
+@register_decomposition([aten.repeat_interleave.Tensor])
+def repeat_interleave_tensor_decomposition(repeats, output_size=None):
+    """Decompose repeat_interleave.Tensor for torch.compile compatibility.
+
+    Computes output size upfront to avoid graph breaks from .item() calls.
+    """
+    if repeats.numel() == 0:
+        return torch.empty_like(repeats)
+
+    # Compute output size without graph break
+    if output_size is None:
+        output_size = repeats.sum()
+
+    # Compute cumsum for indexing
+    cumsum = repeats.cumsum(0)
+
+    # Create result indices using arange and comparison
+    indices = torch.arange(output_size, device=repeats.device)
+
+    # For each position, find which repeat group it belongs to
+    # by comparing against cumsum boundaries
+    group_ids = (indices.unsqueeze(1) >= cumsum.unsqueeze(0)).sum(1)
+
+    return group_ids
+
+
 @register_decomposition([aten.argsort.default, aten.argsort.stable])
 def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     """Decompose argsort to sort"""
@@ -1874,5 +1656,4 @@ def get_compile_decomposition_table() -> dict:
     """
     return {
         **neuron_decompositions,
-        aten.index_put.default: index_put_decomposition,
     }

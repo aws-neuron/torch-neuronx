@@ -1,8 +1,3 @@
-"""ATen test skips for upstream PyTorch tests on Neuron.
-
-Tests that crash, timeout, or segfault.
-"""
-
 from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 
 SKIP_GROUPS: list[SkipGroup] = [
@@ -22,6 +17,20 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_conv_transpose_with_output_size_and_no_batch_dim_ConvTranspose3d_neuron",
         ],
     ),
+    SkipGroup(
+        reason="Functionality Gap: We do not support quantization_per_channel format currently",
+        tests=[
+            "test_ddp_hooks.py::DistributedDataParallelCommHookTest::test_ddp_comm_hook_quantize_per_channel_hook",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "NotImplementedError: Could not run "
+            "aten::_sparse_coo_tensor_with_dims_and_tensors "
+            "with arguments from the Sparseneuron backend"
+        ),
+        tests=[
+            "test_c10d_nccl.py::SparseCollective::test_ddp_set_sparse_metadata",
+        ],
+    ),
 ]
-
-XFAIL_GROUPS: list[SkipGroup] = []

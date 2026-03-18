@@ -5,6 +5,7 @@ import pytest
 
 import torch_neuronx
 from tests.pytorch_tests.utils import (
+    _apply_gradcheck_patches,
     _apply_opinfo_patches,
     create_pytorch_test_wrappers,
     setup_pytorch_tests,
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Apply OpInfo patches once before any test module imports
 _apply_opinfo_patches()
+_apply_gradcheck_patches()
 
 SPEC_FILE = os.environ.get("ATEN_SPEC_FILE", "aten_spec.json")
 CLASS_NAME_FILTER = os.environ.get("ATEN_CLASS_NAME", None)

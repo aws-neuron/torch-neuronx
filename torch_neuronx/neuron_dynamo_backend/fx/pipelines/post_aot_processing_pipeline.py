@@ -20,8 +20,14 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.dtensor_redistribute_optimiza
 from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
     FlexAttentionLegalization,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_nki_lowering import (
+    FlexAttentionNKILowering,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
     FunctionalizeCopyInplacePass,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_index_indices import (
+    LegalizeIndexIndices,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.passes.random_op_legalization import (
     RandomOpLegalization,
@@ -46,8 +52,10 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
     Returns:
         PostAOTProcessingResults containing the graph and analysis results
     """
+    flex_lowering_pass = FlexAttentionNKILowering()
     flex_attention_pass = FlexAttentionLegalization()
     functionalize_pass = FunctionalizeCopyInplacePass()
+    legalize_index_indices_pass = LegalizeIndexIndices()
     random_op_pass = RandomOpLegalization()
     remove_none_outputs = RemoveNoneOutputs()
     collective_legalization = CollectiveLegalization()
@@ -55,8 +63,10 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
 
     pm = PassManager(
         passes=[
+            flex_lowering_pass,
             flex_attention_pass,
             functionalize_pass,
+            legalize_index_indices_pass,
             random_op_pass,
             remove_none_outputs,
             dtensor_redistribute,  # Before collective legalization

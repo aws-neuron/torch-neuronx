@@ -74,6 +74,33 @@ def _apply_opinfo_patches():
     DeviceTypeTestBase._get_dtypes = patched_get_dtypes
 
 
+def _apply_gradcheck_patches():
+    """Patch gradcheck/gradgradcheck with float32-appropriate eps for Neuron.
+
+    Neuron doesn't natively support float64 — it downcasts to float32, computes,
+    then upcasts back to float64, so we use torch.finfo(torch.float32).eps as the
+    finite-difference step size.
+    """
+    import torch
+    from torch.testing._internal import common_utils
+
+    _f32_eps = torch.finfo(torch.float32).eps
+
+    orig_gradcheck = common_utils.gradcheck
+    orig_gradgradcheck = common_utils.gradgradcheck
+
+    def patched_gradcheck(*args, **kwargs):
+        kwargs.setdefault("eps", _f32_eps)
+        return orig_gradcheck(*args, **kwargs)
+
+    def patched_gradgradcheck(*args, **kwargs):
+        kwargs.setdefault("eps", _f32_eps)
+        return orig_gradgradcheck(*args, **kwargs)
+
+    common_utils.gradcheck = patched_gradcheck
+    common_utils.gradgradcheck = patched_gradgradcheck
+
+
 @dataclass
 class PytorchTestConfig:
     """Configuration for a single test file/class combination."""
@@ -178,6 +205,14 @@ def _create_test_config(
         class_skip_tests = [{method: {"reason": skip_reason}} for method in test_methods]
         normalized_skip_tests.extend(class_skip_tests)
 
+    # Handle skip_test_patterns - skip tests matching substring patterns
+    skip_patterns = config.get("skip_test_patterns", [])
+    if skip_patterns:
+        pattern_reason = config.get("skip_test_patterns_reason", "Matched skip pattern")
+        for method in test_methods:
+            if any(p in method for p in skip_patterns):
+                normalized_skip_tests.append({method: {"reason": pattern_reason}})
+
     if normalized_skip_tests:
         skip_test_names = set()
         default_skip_reason = "No reason provided, should provide valid reason to skip test"
@@ -191,7 +226,7 @@ def _create_test_config(
         # Remove skipped tests from the methods list unless collect_skipped_tests is True
         # When True, tests remain in list and pytest.mark.skip is applied in test wrapper
         # For skip_class, always keep tests to show them as skipped
-        if not collect_skipped_tests and not config.get("skip_class"):
+        if not collect_skipped_tests and not config.get("skip_class") and not skip_patterns:
             test_methods = [method for method in test_methods if method not in skip_test_names]
             logger.info(
                 f"After applying skip_tests filter, {len(test_methods)} test methods remain"

@@ -359,3 +359,76 @@ class TestCrossEntropy:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "reduction, backward, extra_kwargs",
+        [
+            ("mean", False, {}),
+            ("sum", False, {}),
+            ("none", False, {}),
+            ("mean", True, {}),
+            ("mean", False, {"ignore_index": -100}),
+            ("mean", False, {"label_smoothing": 0.1}),
+            ("mean", False, {"use_weight": True}),
+            ("mean", False, {"prob_targets": True}),
+            ("mean", False, {"large_vocab": True}),
+        ],
+        ids=[
+            "mean",
+            "sum",
+            "none",
+            "mean-bwd",
+            "ignore_index",
+            "label_smoothing",
+            "weight",
+            "prob_targets",
+            "large_vocab",
+        ],
+    )
+    def test_cross_entropy_mixed_precision(self, dtype, reduction, backward, extra_kwargs):
+        """Test that loss and gradient dtypes match input dtype and results
+        are numerically close to CPU across all code paths."""
+        n_classes = 8192 if extra_kwargs.get("large_vocab") else 10
+        logits = torch.randn(4, n_classes, dtype=dtype)
+        targets = torch.randint(0, n_classes, (4,), dtype=torch.long)
+
+        kwargs = {"reduction": reduction}
+        cpu_kwargs = dict(kwargs)
+        if extra_kwargs.get("ignore_index") == -100:
+            targets[1] = -100
+            kwargs["ignore_index"] = -100
+            cpu_kwargs["ignore_index"] = -100
+        if extra_kwargs.get("use_weight"):
+            weight = torch.rand(n_classes, dtype=dtype)
+            kwargs["weight"] = weight.to("neuron")
+            cpu_kwargs["weight"] = weight
+        if "label_smoothing" in extra_kwargs:
+            kwargs["label_smoothing"] = extra_kwargs["label_smoothing"]
+            cpu_kwargs["label_smoothing"] = extra_kwargs["label_smoothing"]
+        if extra_kwargs.get("prob_targets"):
+            targets = torch.rand(4, n_classes, dtype=dtype).softmax(dim=-1)
+
+        # CPU reference
+        logits_cpu = logits.clone()
+        if backward:
+            logits_cpu = logits_cpu.requires_grad_(True)
+        loss_cpu = functional.cross_entropy(logits_cpu, targets, **cpu_kwargs)
+
+        # Neuron
+        logits_neuron = logits.to("neuron")
+        if backward:
+            logits_neuron = logits_neuron.requires_grad_(True)
+        targets_neuron = targets.to("neuron")
+
+        loss = functional.cross_entropy(logits_neuron, targets_neuron, **kwargs)
+        assert loss.dtype == dtype, f"Expected {dtype}, got {loss.dtype}"
+        assert torch.allclose(loss.cpu(), loss_cpu, rtol=1e-2, atol=1e-2)
+
+        if backward:
+            (loss.sum() if loss.dim() > 0 else loss).backward()
+            (loss_cpu.sum() if loss_cpu.dim() > 0 else loss_cpu).backward()
+            assert (
+                logits_neuron.grad.dtype == dtype
+            ), f"Grad dtype {logits_neuron.grad.dtype} != {dtype}"
+            assert torch.allclose(logits_neuron.grad.cpu(), logits_cpu.grad, rtol=1e-2, atol=1e-2)

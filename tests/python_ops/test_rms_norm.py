@@ -191,3 +191,61 @@ class TestRMSNormOperations:
         torch.testing.assert_close(
             weight_neuron.grad.cpu(), weight_cpu.grad, rtol=1.3e-6, atol=1e-5
         )
+
+    @pytest.mark.parametrize(
+        "input_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+    )
+    def test_rms_norm_default_eps(self, input_dtype):
+        """Test rms_norm with default eps (None) resolves correctly per dtype.
+
+        Regression test: eps default changed from 1e-5 to None so the kernel
+        resolves it based on the actual computation dtype (float32 on Neuron).
+        This was the root cause of test_rmsnorm_numeric_neuron_float16 failing.
+        """
+        input_cpu = torch.randn(4, 8, dtype=input_dtype)
+        input_neuron = input_cpu.to("neuron")
+        weight_cpu = torch.randn(8, dtype=input_dtype)
+        weight_neuron = weight_cpu.to("neuron")
+
+        with track_neuron_ops():
+            # No eps argument — exercises the eps=None default path
+            output_cpu = func.rms_norm(input_cpu, (8,), weight_cpu)
+            output_neuron = func.rms_norm(input_neuron, (8,), weight_neuron)
+            if HAS_FUSED_RMS_NORM:
+                assert_op_runs_on_neuron("aten::_fused_rms_norm")
+
+        torch.testing.assert_close(output_neuron.cpu(), output_cpu)
+
+    def test_rms_norm_default_eps_without_weight(self):
+        """Test rms_norm with default eps and no weight."""
+        input_cpu = torch.randn(4, 8, dtype=torch.float16)
+        input_neuron = input_cpu.to("neuron")
+
+        with track_neuron_ops():
+            output_cpu = func.rms_norm(input_cpu, (8,))
+            output_neuron = func.rms_norm(input_neuron, (8,))
+            if HAS_FUSED_RMS_NORM:
+                assert_op_runs_on_neuron("aten::_fused_rms_norm")
+
+        torch.testing.assert_close(output_neuron.cpu(), output_cpu)
+
+    def test_rms_norm_default_eps_backward(self):
+        """Test backward pass with default eps (None)."""
+        input_cpu = torch.randn(4, 8, requires_grad=True)
+        input_neuron = input_cpu.detach().clone().to("neuron").requires_grad_(True)
+        weight_cpu = torch.randn(8, requires_grad=True)
+        weight_neuron = weight_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        with track_neuron_ops():
+            output_cpu = func.rms_norm(input_cpu, (8,), weight_cpu)
+            output_neuron = func.rms_norm(input_neuron, (8,), weight_neuron)
+            if HAS_FUSED_RMS_NORM:
+                assert_op_runs_on_neuron("aten::_fused_rms_norm")
+            output_cpu.sum().backward()
+            output_neuron.sum().backward()
+            if HAS_FUSED_RMS_NORM:
+                assert_op_runs_on_neuron("aten::_fused_rms_norm_backward")
+
+        torch.testing.assert_close(input_neuron.grad.cpu(), input_cpu.grad)
+        torch.testing.assert_close(weight_neuron.grad.cpu(), weight_cpu.grad)

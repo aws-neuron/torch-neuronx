@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import torch_neuronx
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -137,3 +138,31 @@ class TestMeanRegistration:
         assert c.shape == (4,)  # Dimensions 1 and 2 are reduced
         expected = torch.ones(4, dtype=torch.float32) * 2  # Mean of 2's is 2
         torch.testing.assert_close(c.cpu(), expected)
+
+    @pytest.mark.parametrize(
+        "dtype_in, dim, keepdim, dtype_out, expected_dtype",
+        [
+            (torch.float32, 0, True, None, torch.float32),
+            (torch.float16, 0, False, torch.float32, torch.float32),
+            (torch.float32, 0, False, None, torch.float32),
+        ],
+    )
+    def test_mean_scalar_tensor_with_dim(self, dtype_in, dim, keepdim, dtype_out, expected_dtype):
+        """Test mean on scalar (0-dim) tensor with dim argument.
+
+        Regression test: scalar tensors with a dim argument previously crashed
+        during Torch-MLIR StableHLO lowering.
+        """
+        x = torch.tensor(3.0, dtype=dtype_in).to("neuron")
+
+        kwargs = {"dim": dim, "keepdim": keepdim}
+        if dtype_out is not None:
+            kwargs["dtype"] = dtype_out
+
+        with track_neuron_ops():
+            result = torch.mean(x, **kwargs)
+            assert_op_runs_on_neuron("aten::mean")
+
+        assert result.dtype == expected_dtype
+        expected = torch.tensor(3.0, dtype=expected_dtype)
+        torch.testing.assert_close(result.cpu(), expected)

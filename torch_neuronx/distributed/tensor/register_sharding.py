@@ -6,11 +6,9 @@ to pytorch
 import torch
 from torch.distributed.tensor._dtensor_spec import (
     DTensorSpec,
-    TensorMeta,
 )
 from torch.distributed.tensor._op_schema import (
     OpSchema,
-    OpSpec,
     OpStrategy,
     PlacementList,
     RuntimeSchemaInfo,
@@ -24,9 +22,6 @@ from torch.distributed.tensor._ops import (
     register_op_strategy,
 )
 from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
-from torch.distributed.tensor._ops._matrix_ops import (
-    _mm_like_strategy,
-)
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,
@@ -301,40 +296,6 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
     )
 
 
-def derive_bias_spec_from_grad_output(grad_output_spec, mesh):
-    """
-    grad_bias = grad_output.sum(0) - sum over batch dimensions
-    grad_bias shape: [out_features]
-    grad_bias placement: same as grad_output's last dimension
-    """
-
-    # grad_bias is 1D with shape [out_features]
-    # out_features is the last dimension of grad_output
-    out_features = grad_output_spec.shape[-1]
-
-    # Create TensorMeta for 1D bias tensor
-    bias_tensor_meta = TensorMeta(
-        shape=torch.Size([out_features]), stride=(1,), dtype=grad_output_spec.tensor_meta.dtype
-    )
-
-    # grad_bias is 1D, so adjust sharding dimensions
-    bias_placements = []
-    for placement in grad_output_spec.placements:
-        if isinstance(placement, Shard):
-            # For bias (1D), any sharding becomes Shard(0)
-            if placement.dim == -1 or placement.dim == len(grad_output_spec.shape) - 1:
-                # grad_output sharded on last dim (features) -> bias sharded on dim 0
-                bias_placements.append(Shard(0))
-            else:
-                # grad_output sharded on batch dims -> bias becomes replicated (sum reduces it)
-                bias_placements.append(Replicate())
-        else:
-            # Replicate, Partial stay the same
-            bias_placements.append(placement)
-
-    return DTensorSpec(mesh=mesh, placements=tuple(bias_placements), tensor_meta=bias_tensor_meta)
-
-
 @register_op_strategy(aten.linear.default)
 def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
     """
@@ -419,102 +380,94 @@ def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
 
 @register_op_strategy(aten.linear_backward.default)
 def linear_backward_strategy(op_schema: OpSchema) -> OpStrategy:
+    """
+    Sharding strategy for linear_backward.
+
+    linear_backward(input[*,k], grad_output[*,n], weight[n,k], output_mask)
+    -> (grad_input[*,k], grad_weight[n,k], grad_bias[n])
+
+    Three computations:
+      grad_input  = einsum("...j, ji -> ...i", grad_output, weight)   contracts n
+      grad_weight = einsum("...j, ...i -> ji", grad_output, input)    contracts batch
+      grad_bias   = einsum("...j -> j", grad_output)                  contracts batch
+
+    Dimensions:
+      batch dims (0..ndim-2): free in grad_input, contracting in grad_weight/grad_bias
+      n (out_features):       contracting in grad_input, free in grad_weight/grad_bias
+      k (in_features):        free in grad_input/grad_weight, not in grad_bias
+    """
     mesh = op_schema.get_mesh_from_args(validate=False)
     input_strategy, grad_output_strategy, weight_strategy, output_mask = op_schema.args_schema
 
+    assert isinstance(input_strategy, OpStrategy)
+    assert isinstance(grad_output_strategy, OpStrategy)
+    assert isinstance(weight_strategy, OpStrategy)
+
     input_ndim = len(input_strategy.shape)
-    if input_ndim <= 2:  # if there're more than 1 batch dim, einsum strategy will break
-        batch_dims = "".join(chr(ord("a") + j) for j in range(input_ndim - 1))
-        grad_input_eq = f"{batch_dims}k,kn->{batch_dims}n"
 
-        grad_input_schema = OpSchema(
-            op=aten.mm.default,
-            args_schema=(grad_output_strategy, weight_strategy),
-            kwargs_schema={},
-        )
-        grad_input_mm_strategies = _mm_like_strategy(grad_input_eq, mesh, grad_input_schema)
+    # Helper: mask output placements based on output_mask, align with meta registration
+    def _mask(grad_input_p, grad_weight_p, grad_bias_p):
+        return [
+            grad_input_p if output_mask[0] else None,
+            grad_weight_p if output_mask[1] or output_mask[2] else None,
+            grad_bias_p if output_mask[1] or output_mask[2] else None,
+        ]
 
-    strategies = []
+    # PlacementList order: [grad_input, grad_weight, grad_bias, input, grad_output, weight]
 
-    # Iterate through each strategy combination
-    num_strategies = len(input_strategy.strategies)
+    single_mesh_dim_strategies: list[PlacementList] = []
 
-    for i in range(num_strategies):
-        input_spec = input_strategy.strategies[i].output_spec
-        grad_output_spec = grad_output_strategy.strategies[i].output_spec
-        weight_spec = weight_strategy.strategies[i].output_spec
+    # Strategy 0: All replicate
+    single_mesh_dim_strategies.append(
+        [*_mask(Replicate(), Replicate(), Replicate()), Replicate(), Replicate(), Replicate()]
+    )
 
-        output_specs = []
-
-        # grad_input = grad_output @ weight.T - use mm_strategy
-        if output_mask[0] and input_ndim <= 2:
-            # Create single-strategy OpStrategy for this iteration
-            grad_input_spec = None
-            for mm_strtg in grad_input_mm_strategies.strategies:
-                if (
-                    mm_strtg.input_specs[0].placements == grad_output_spec.placements
-                    and mm_strtg.input_specs[1].placements == weight_spec.placements
-                ):
-                    grad_input_spec = mm_strtg.output_spec
-                    break
-            assert grad_input_spec is not None
-            output_specs.append(grad_input_spec)
-        elif output_mask[0]:
-            grad_input_placements = []
-            grad_out_ndim = len(grad_output_spec.shape)
-
-            for mesh_dim_idx in range(mesh.ndim):
-                grad_out_placement = grad_output_spec.placements[mesh_dim_idx]
-                weight_placement = weight_spec.placements[mesh_dim_idx]
-
-                # Check if grad_output is sharded on last dim (output features)
-                # and weight is sharded on dim 1 (columns, which become rows when transposed)
-                if isinstance(grad_out_placement, Shard):
-                    # Normalize dimension to positive index
-                    grad_out_shard_dim = grad_out_placement.dim
-                    if grad_out_shard_dim < 0:
-                        grad_out_shard_dim = grad_out_ndim + grad_out_shard_dim
-
-                    # If grad_output sharded on last dim AND weight sharded on columns
-                    # Result is Partial (needs all_reduce)
-                    if (
-                        grad_out_shard_dim == grad_out_ndim - 1
-                        and isinstance(weight_placement, Shard)
-                        and weight_placement.dim == 0
-                    ):
-                        grad_input_placements.append(Partial())
-                    else:
-                        grad_input_placements.append(input_spec.placements[mesh_dim_idx])
-                else:
-                    # grad_output not sharded, match input's placement
-                    grad_input_placements.append(input_spec.placements[mesh_dim_idx])
-
-                grad_input_spec = DTensorSpec(
-                    mesh=mesh,
-                    placements=tuple(grad_input_placements),
-                    tensor_meta=input_spec.tensor_meta,  # grad_input matches input dtype/shape meta
-                )
-            output_specs.append(grad_input_spec)
-        else:
-            output_specs.append(None)
-
-        if output_mask[1] or output_mask[2]:  # same logic as in meta function
-            # grad_weight = grad_output.T @ input
-            grad_weight_spec = weight_spec  # Match original weight sharding
-            output_specs.append(grad_weight_spec)
-            # grad_bias = grad_output.sum(0)
-            grad_bias_spec = derive_bias_spec_from_grad_output(grad_output_spec, mesh)
-            output_specs.append(grad_bias_spec)
-        else:
-            output_specs.append(None)
-            output_specs.append(None)
-
-        strategies.append(
-            OpSpec(
-                output_specs=tuple(output_specs),
-                input_specs=(input_spec, grad_output_spec, weight_spec),
-                redistribute_cost=[[0.0], [0.0], [0.0]],
-            )
+    # Strategy 1: Shard batch dim i (for each i in 0..ndim-2)
+    # batch is free in grad_input, contracting in grad_weight and grad_bias
+    for i in range(input_ndim - 1):
+        single_mesh_dim_strategies.append(
+            [*_mask(Shard(i), Partial(), Partial()), Shard(i), Shard(i), Replicate()]
         )
 
-    return OpStrategy(strategies=strategies)
+    # Strategy 2: Shard n (out_features)
+    # n is contracting in grad_input, free (dim 0) in grad_weight, free (dim 0) in grad_bias
+    single_mesh_dim_strategies.append(
+        [*_mask(Partial(), Shard(0), Shard(0)), Replicate(), Shard(input_ndim - 1), Shard(0)]
+    )
+
+    # Strategy 3: Shard k (in_features)
+    # k is free in grad_input (last dim) and grad_weight (dim 1), not in grad_bias
+    single_mesh_dim_strategies.append(
+        [
+            *_mask(Shard(input_ndim - 1), Shard(1), Replicate()),
+            Shard(input_ndim - 1),
+            Replicate(),
+            Shard(1),
+        ]
+    )
+
+    # Linearity strategies for sum and avg reduce ops.
+    # Linearity holds for sum and avg: f(a + b) = f(a) + f(b).
+    # min/max are NOT linear and must be redistributed by the planner.
+    for reduce_op in ("sum", "avg"):
+        p = Partial(reduce_op)
+
+        # Strategy 4: Linearity - grad_output Partial
+        # grad_output is used linearly in all three computations
+        single_mesh_dim_strategies.append([*_mask(p, p, p), Replicate(), p, Replicate()])
+
+        # Strategy 5: Linearity - input Partial
+        # input is used linearly only in grad_weight = grad_output^T @ input
+        single_mesh_dim_strategies.append(
+            [*_mask(Replicate(), p, Replicate()), p, Replicate(), Replicate()]
+        )
+
+        # Strategy 6: Linearity - weight Partial
+        # weight is used linearly only in grad_input = grad_output @ weight
+        single_mesh_dim_strategies.append(
+            [*_mask(p, Replicate(), Replicate()), Replicate(), Replicate(), p]
+        )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=3
+    )

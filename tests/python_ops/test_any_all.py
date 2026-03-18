@@ -142,3 +142,37 @@ class TestAnyAllRegistration:
         expected = op_func(d, dim=1, keepdim=True)
         assert result.shape == (2, 1, 4)
         torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize(
+        "op_name,op_func,dtype,keepdim",
+        [
+            pytest.param("any", torch.any, torch.int32, True, id="any_scalar_int32_keepdim"),
+            pytest.param("any", torch.any, torch.float32, True, id="any_scalar_float32_keepdim"),
+            pytest.param("any", torch.any, torch.bool, True, id="any_scalar_bool_keepdim"),
+            pytest.param("all", torch.all, torch.int32, True, id="all_scalar_int32_keepdim"),
+            pytest.param("all", torch.all, torch.float32, True, id="all_scalar_float32_keepdim"),
+            pytest.param("all", torch.all, torch.bool, True, id="all_scalar_bool_keepdim"),
+            pytest.param("any", torch.any, torch.int32, False, id="any_scalar_int32"),
+            pytest.param("any", torch.any, torch.float32, False, id="any_scalar_float32"),
+            pytest.param("any", torch.any, torch.bool, False, id="any_scalar_bool"),
+            pytest.param("all", torch.all, torch.int32, False, id="all_scalar_int32"),
+            pytest.param("all", torch.all, torch.float32, False, id="all_scalar_float32"),
+            pytest.param("all", torch.all, torch.bool, False, id="all_scalar_bool"),
+        ],
+    )
+    def test_any_all_scalar_tensor_with_dim(self, op_name, op_func, dtype, keepdim):
+        """Test any/all on scalar (0-dim) tensor with dim=0.
+
+        Regression test: scalar tensors with a dim argument previously crashed
+        during Torch-MLIR StableHLO lowering.
+        """
+        value = True if dtype == torch.bool else 5
+        x = torch.tensor(value, dtype=dtype)
+        x_neuron = x.to("neuron")
+
+        with track_neuron_ops():
+            result = op_func(x_neuron, dim=0, keepdim=keepdim)
+            assert_op_runs_on_neuron(f"aten::{op_name}")
+
+        expected = op_func(x, dim=0, keepdim=keepdim)
+        torch.testing.assert_close(result.cpu(), expected)

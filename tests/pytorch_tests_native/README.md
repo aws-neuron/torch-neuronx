@@ -62,16 +62,48 @@ Each entry is a `SkipGroup` tied to one root cause. When the root cause is fixed
 ```python
 SkipGroup(
     reason="NCCL log comparison does not apply to Neuron",
-    tests=["test_fully_shard_force_sum_both_reductions"],  # exact match in nodeid
+    tests=["test_fully_shard_force_sum_both_reductions"],  # exact component match in nodeid
     patterns=["*nccl*"],                                     # glob against test name
-    files=["test_sparse.py"],                                # skip entire file
+    folders=["inductor/"],                                   # skip entire directory
 )
 ```
 
 Three granularity levels:
-- **files** — skip all tests in a file
-- **tests** — exact test name (matched anywhere in the nodeid)
-- **patterns** — glob patterns against the test function name
+- **folders** — skip all tests under a directory (e.g., `"distributed/"`)
+- **tests** — exact component match against the nodeid. The nodeid is split by `::` and `/` into components, and entries are matched as contiguous subsequences. This means you can target at any specificity:
+  - `"test_coo"` — a single test function (across all files/classes)
+  - `"TestSparse"` — an entire class (across all files)
+  - `"test_sparse.py"` — an entire file
+  - `"test_sparse.py::TestSparse"` — a class in a specific file
+  - `"TestSparse::test_coo"` — a test in a specific class
+  - `"test_sparse.py::TestSparse::test_coo"` — fully qualified
+  - `"distributed::test_comm.py::TestComm"` — a class in a specific folder/file
+
+  Partial prefixes never match: `"test_add"` won't match `"test_add_scalar"`.
+- **patterns** — glob patterns matched against the test function name only
+
+### Reason naming convention
+
+Use a short, standardized label that describes the **capability gap**, not the symptom:
+
+| Reason | What it covers |
+|--------|---------------|
+| `"Contiguous tensor required"` | Ops that fail because Neuron only supports contiguous tensors |
+| `"Complex dtypes not supported"` | Tests using complex64/complex128 |
+| `"Sparse ops not implemented"` | COO, CSR, semi-structured sparse |
+| `"Float64 precision required"` | Tests that need true float64 (not just gradcheck tolerance) |
+| `"FFT ops not implemented"` | torch.fft.* family |
+| `"CUDA-specific feature"` | cudagraphs, NCCL, cuda streams |
+| `"Op not implemented: <op_name>"` | Single missing aten op (use sparingly — group when possible) |
+| `"Gradcheck float32 tolerance"` | Gradcheck failures from float64→float32 autocast |
+
+### Rules
+
+1. **Group by root cause, not by test file.** A `SkipGroup` for "Complex dtypes not supported" should contain tests from `test_ops.py`, `test_linalg.py`, `test_fft.py`, etc. — wherever complex tests live.
+2. **One fix = one group deleted.** If fixing contiguous tensor support wouldn't also fix complex dtype tests, they belong in separate groups.
+3. **Don't duplicate.** A test should appear in at most one group. The first matching group wins (skips checked before xfails).
+4. **Prefer patterns over listing individual tests.** `"*_neuron_complex*"` is better than listing 200 test IDs — unless the pattern would over-match.
+5. **Use xfail (not skip) when the test runs but gives wrong results.** Skip = crashes/hangs/missing feature. Xfail = runs but fails with known wrong output.
 
 ### Adding entries
 

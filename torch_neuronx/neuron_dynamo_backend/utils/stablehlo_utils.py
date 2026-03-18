@@ -74,6 +74,7 @@ MLIR_TO_TORCH_DTYPE = {
     "complex<f32>": torch.complex64,
     "complex<f64>": torch.complex128,
     "f8E5M2": torch.float8_e5m2,
+    "f8E4M3FN": torch.float8_e4m3fn,
 }
 
 

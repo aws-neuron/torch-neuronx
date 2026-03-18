@@ -48,7 +48,13 @@ def is_launcher_env(session):
 def pytest_addoption(parser):
     """Register custom command line options."""
     parser.addoption(
-        "--test_suite_path", action="store", default="tests/", help="Path to test suite to run"
+        "--test_suite_path",
+        action="store",
+        default="tests/",
+        help=(
+            "Path to test suite to run. Supports comma-separated paths "
+            "e.g. 'tests/a.py,tests/b.py'."
+        ),
     )
     parser.addoption(
         "--num_workers",

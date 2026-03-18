@@ -9,6 +9,7 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
+#include <climits>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -1852,6 +1853,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return static_cast<int>(at::neuron::nrt::BeginInspectWithOptions(options));
       },
       "Begin NRT profiling with configuration options", py::arg("config_capsule"));
+
+  m.def(
+      "_nrt_inspect_get_instance_output_dir",
+      [](const std::string& output_dir) -> std::string {
+        char buffer[PATH_MAX] = {0};
+        NRT_STATUS status =
+            at::neuron::nrt::GetInstanceOutputDir(output_dir.c_str(), buffer, sizeof(buffer));
+        if (status != NRT_SUCCESS) {
+          throw std::runtime_error("Failed to get instance output directory. Status: " +
+                                   std::to_string(static_cast<int>(status)));
+        }
+        return std::string(buffer);
+      },
+      "Get the instance-specific output directory path used by NRT profiling",
+      py::arg("output_dir"));
 
   // Create a capsule that will call cleanup_streams_func when the module is destroyed
   auto cleanup_capsule = py::capsule(cleanup_streams_func);

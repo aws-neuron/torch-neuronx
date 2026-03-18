@@ -22,7 +22,7 @@ from torch._C._profiler import _ExperimentalConfig
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
-from torch_neuronx.profiling import NeuronConfig, ProfileMode
+from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
 
 
 @pytest.mark.skipif(
@@ -637,6 +637,54 @@ class TestNeuronProfilerIntegration:
         assert (
             "cycle2_step3_wait" not in all_names
         ), "Wait-phase label 'cycle2_step3_wait' should not appear in any trace"
+
+    def test_neuron_profiler_export_trace(self):
+        """Test that NeuronProfiler.export_trace writes the trace into
+        the NRT instance directory."""
+        exp_config = NeuronConfig(
+            profile_output_dir=self.test_dir,
+        )
+        profiler = NeuronProfiler(exp_config)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+
+        with profile(activities=activities, experimental_config=exp_config) as prof:
+            self._run_neuron_workload()
+
+        profiler.export_trace(prof)
+
+        # The trace should be inside the NRT instance subdirectory, not the root
+        session_dir = exp_config.get_session_dir()
+        trace_path = os.path.join(session_dir, "trace.json")
+        assert os.path.exists(trace_path), f"trace.json not found at {trace_path}"
+        assert os.path.getsize(trace_path) > 0, "trace.json is empty"
+
+        # Verify it's NOT in the root output directory
+        root_files = [
+            f for f in os.listdir(self.test_dir) if os.path.isfile(os.path.join(self.test_dir, f))
+        ]
+        assert (
+            "trace.json" not in root_files
+        ), f"trace.json should not be in root directory. Root files: {root_files}"
+
+    def test_neuron_profiler_on_trace_ready(self):
+        """Test NeuronProfiler.export_trace used as on_trace_ready callback."""
+        exp_config = NeuronConfig(
+            profile_output_dir=self.test_dir,
+        )
+        profiler = NeuronProfiler(exp_config)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+
+        with profile(
+            activities=activities,
+            experimental_config=exp_config,
+            on_trace_ready=profiler.export_trace,
+        ):
+            self._run_neuron_workload()
+
+        session_dir = exp_config.get_session_dir()
+        trace_path = os.path.join(session_dir, "trace.json")
+        assert os.path.exists(trace_path), f"trace.json not found at {trace_path}"
+        assert os.path.getsize(trace_path) > 0, "trace.json is empty"
 
 
 class TestProfileMode:

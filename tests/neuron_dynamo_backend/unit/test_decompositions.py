@@ -2203,6 +2203,96 @@ class TestHistcDecompositionE2E:
         torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=1e-4, atol=1e-4)
 
 
+class TestIndexSelectBackwardDecomposition:
+    """Tests for index_select_backward decomposition"""
+
+    @pytest.mark.parametrize("dim", [0, 1])
+    def test_basic_accuracy(self, dim):
+        """Test index_select_backward decomposition accuracy"""
+        input_sizes = [3, 4]
+        grad_output = torch.ones(2, 4) if dim == 0 else torch.ones(3, 2)
+        index = torch.tensor([0, 2])
+
+        result = decompositions.index_select_backward_decomposition(
+            grad_output, input_sizes, dim, index
+        )
+
+        x = torch.zeros(input_sizes, requires_grad=True)
+        selected = torch.index_select(x, dim, index)
+        selected.backward(grad_output)
+        expected = x.grad
+
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("dim", [1])
+    @pytest.mark.parametrize("compile_mode", [None, "neuron"])
+    def test_neuron_device(self, dim, compile_mode):
+        """Test index_select_backward on neuron device"""
+
+        input_sizes = [3, 4]
+        grad_output_cpu = torch.ones(2, 4) if dim == 0 else torch.ones(3, 2)
+        index_cpu = torch.tensor([0, 2], dtype=torch.int32)
+
+        grad_output = grad_output_cpu.to("neuron")
+        index = index_cpu.to("neuron")
+
+        fn = decompositions.index_select_backward_decomposition
+        if compile_mode:
+            fn = torch.compile(fn, backend=compile_mode)
+
+        result = fn(grad_output, input_sizes, dim, index)
+
+        x = torch.zeros(input_sizes, requires_grad=True)
+        selected = torch.index_select(x, dim, index_cpu)
+        selected.backward(grad_output_cpu)
+        expected = x.grad
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+
+class TestRepeatInterleaveDecomposition:
+    """Tests for repeat_interleave.Tensor decomposition"""
+
+    @pytest.mark.parametrize(
+        "repeats,expected",
+        [
+            ([2, 1, 3], [0, 0, 1, 2, 2, 2]),
+            ([1, 1, 1], [0, 1, 2]),
+            ([3, 0, 2], [0, 0, 0, 2, 2]),
+        ],
+    )
+    def test_basic_accuracy(self, repeats, expected):
+        """Test repeat_interleave decomposition accuracy"""
+        repeats_t = torch.tensor(repeats)
+        output_size = sum(repeats)
+        result = decompositions.repeat_interleave_tensor_decomposition(repeats_t, output_size)
+        expected_t = torch.tensor(expected)
+        torch.testing.assert_close(result, expected_t)
+
+    @pytest.mark.parametrize(
+        "repeats,expected",
+        [
+            ([2, 1, 3], [0, 0, 1, 2, 2, 2]),
+            ([1, 1, 1], [0, 1, 2]),
+            ([3, 0, 2], [0, 0, 0, 2, 2]),
+        ],
+    )
+    @pytest.mark.parametrize("compile_mode", [None, "neuron"])
+    def test_neuron_device(self, repeats, expected, compile_mode):
+        """Test repeat_interleave on neuron device"""
+
+        repeats_t = torch.tensor(repeats, device="neuron")
+        output_size = sum(repeats)
+
+        fn = decompositions.repeat_interleave_tensor_decomposition
+        if compile_mode:
+            fn = torch.compile(fn, backend=compile_mode)
+
+        result = fn(repeats_t, output_size)
+        expected_t = torch.tensor(expected)
+        torch.testing.assert_close(result.cpu(), expected_t)
+
+
 class TestIndexPutNegativeIndicesE2E:
     """End-to-end tests for index_put negative indices handling"""
 

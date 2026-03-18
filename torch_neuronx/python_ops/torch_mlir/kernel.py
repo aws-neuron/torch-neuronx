@@ -630,6 +630,16 @@ class TorchMlirKernel(BaseNeuronKernel):
 
     def _should_handle_empty(self, args) -> bool:
         """Check if any input tensors are empty."""
+        # For index ops, only check the index argument position
+        if IndexOps.is_index(self.op_name):
+            for arg in args:
+                if isinstance(arg, torch.Tensor) and arg.numel() == 0:
+                    return True
+                if isinstance(arg, tuple | list) and any(
+                    isinstance(t, torch.Tensor) and t.numel() == 0 for t in arg if t is not None
+                ):
+                    return True
+            return False
         return any(isinstance(arg, torch.Tensor) and arg.numel() == 0 for arg in args)
 
     def _prepare_execution_tensors(self, provided_output, downcasted_outputs=None):
