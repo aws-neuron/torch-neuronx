@@ -667,23 +667,22 @@ TEST_F(CompilationCacheTest, SpecialCharactersInCacheKeys) {
 TEST_F(CompilationCacheTest, EmptyAndMinimalCacheKeys) {
   uint32_t stream_id = 1;
 
-  // Test empty cache key
-  MockNeuronKernelExecution kernel_exec_empty("");
-  cache_->GetOrCompileNeff(kernel_exec_empty, stream_id);
-  EXPECT_TRUE(kernel_exec_empty.HasCachedNeff());
-  EXPECT_FALSE(kernel_exec_empty.GetCachedNeff().empty());
+  // Test minimal cache key (single char)
+  MockNeuronKernelExecution kernel_exec_a("a");
+  cache_->GetOrCompileNeff(kernel_exec_a, stream_id);
+  EXPECT_TRUE(kernel_exec_a.HasCachedNeff());
+  EXPECT_FALSE(kernel_exec_a.GetCachedNeff().empty());
 
-  // Verify cache hit with same empty key
-  MockNeuronKernelExecution kernel_exec_empty2("");
-  cache_->GetOrCompileNeff(kernel_exec_empty2, stream_id);
-  EXPECT_TRUE(kernel_exec_empty2.HasCachedNeff());
-  EXPECT_EQ(kernel_exec_empty.GetCachedNeff(), kernel_exec_empty2.GetCachedNeff());
+  // Verify cache hit with same key
+  MockNeuronKernelExecution kernel_exec_a2("a");
+  cache_->GetOrCompileNeff(kernel_exec_a2, stream_id);
+  EXPECT_TRUE(kernel_exec_a2.HasCachedNeff());
+  EXPECT_EQ(kernel_exec_a.GetCachedNeff(), kernel_exec_a2.GetCachedNeff());
 
-  // Test single character keys
-  MockNeuronKernelExecution kernel_exec_single("a");
-  cache_->GetOrCompileNeff(kernel_exec_single, stream_id);
-  EXPECT_NE(kernel_exec_empty.GetCachedNeff(),
-            kernel_exec_single.GetCachedNeff());  // Should be different from empty key
+  // Different key should produce different NEFF
+  MockNeuronKernelExecution kernel_exec_b("b");
+  cache_->GetOrCompileNeff(kernel_exec_b, stream_id);
+  EXPECT_NE(kernel_exec_a.GetCachedNeff(), kernel_exec_b.GetCachedNeff());
 }
 
 TEST_F(CompilationCacheTest, CacheStateAfterCompilationError) {
@@ -1508,17 +1507,14 @@ TEST_F(CompilationCacheTest, CentralizedMetricsCompilationTracking) {
 }
 
 TEST_F(CompilationCacheTest, SameCacheKeyDifferentIRBytesCacheMiss) {
-  // Test that same cache key with different IR bytes produces different persistent cache entries
-  // This simulates what happens when torch-mlir or neuronxcc version changes
+  // Version changes are captured in the base_key
+  // Different base_keys produce different persistent keys.
   uint32_t stream_id = 1;
-  const std::string cache_key = "version_test_key";
-  std::vector<uint8_t> ir_v1 = {0x01, 0x02, 0x03};  // "Version 1" IR
-  std::vector<uint8_t> ir_v2 = {0x04, 0x05, 0x06};  // "Version 2" IR
 
   MockNeuronKernelExecution::ResetCompileCounter();
 
-  // Compile with IR version 1
-  MockNeuronKernelExecution kernel_exec_v1(cache_key, ir_v1);
+  // Simulate version 1 (different base_key)
+  MockNeuronKernelExecution kernel_exec_v1("version_test_key_v1");
   cache_->GetOrCompileNeff(kernel_exec_v1, stream_id);
   EXPECT_TRUE(kernel_exec_v1.HasCachedNeff());
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
@@ -1526,14 +1522,13 @@ TEST_F(CompilationCacheTest, SameCacheKeyDifferentIRBytesCacheMiss) {
   // Clear in-memory cache to force persistent cache lookup
   cache_->ClearInMemoryCache();
 
-  // Compile with IR version 2 (simulates toolchain version change)
-  MockNeuronKernelExecution kernel_exec_v2(cache_key, ir_v2);
+  // Simulate version 2 (different base_key from new global version hash)
+  MockNeuronKernelExecution kernel_exec_v2("version_test_key_v2");
   cache_->GetOrCompileNeff(kernel_exec_v2, stream_id);
   EXPECT_TRUE(kernel_exec_v2.HasCachedNeff());
 
-  // Should have compiled again because IR bytes are different
-  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2)
-      << "Expected recompilation when IR bytes change (simulating toolchain version change)";
+  // Should have compiled again because base_key is different
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2);
 }
 
 TEST_F(CompilationCacheTest, SameCacheKeySameIRBytesCacheHit) {
@@ -1599,16 +1594,13 @@ TEST_F(CompilationCacheTest, InMemoryCacheKeyDifferentFromPersistentKey) {
 }
 
 TEST_F(CompilationCacheTest, VersionChangeInvalidatesPersistentCacheOnly) {
-  // Test that toolchain version change causes persistent cache miss but in-memory works
+  // Toolchain version changes produce different base_keys
   uint32_t stream_id = 1;
-  const std::string cache_key = "version_invalidation_test";
-  std::vector<uint8_t> old_ir = {0x10, 0x20, 0x30};  // Old toolchain IR
-  std::vector<uint8_t> new_ir = {0x40, 0x50, 0x60};  // New toolchain IR
 
   MockNeuronKernelExecution::ResetCompileCounter();
 
   // Simulate old toolchain compilation
-  MockNeuronKernelExecution old_kernel(cache_key, old_ir);
+  MockNeuronKernelExecution old_kernel("version_invalidation_test_old");
   cache_->GetOrCompileNeff(old_kernel, stream_id);
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
 
@@ -1616,11 +1608,11 @@ TEST_F(CompilationCacheTest, VersionChangeInvalidatesPersistentCacheOnly) {
   cache_.reset();
   cache_ = std::make_unique<CompilationCache>();
 
-  // Simulate new toolchain version - different IR for same operation
-  MockNeuronKernelExecution new_kernel(cache_key, new_ir);
+  // Simulate new toolchain version - different base_key for same operation
+  MockNeuronKernelExecution new_kernel("version_invalidation_test_new");
   cache_->GetOrCompileNeff(new_kernel, stream_id);
 
-  // Should recompile because persistent cache key includes IR hash
+  // Should recompile because base_key is different (version hash changed)
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2)
       << "Expected recompilation after toolchain version change";
 }

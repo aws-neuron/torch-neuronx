@@ -113,6 +113,10 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Cleanup timeout configuration
   std::chrono::milliseconds operation_timeout_;
 
+  // Stashed exception from runtime thread - rethrown on Synchronize()
+  std::exception_ptr stashed_exception_;
+  std::mutex stashed_exception_mutex_;
+
   // Completion tracking for synchronization
   std::condition_variable completion_cv;
 
@@ -129,12 +133,7 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   void CompleteOperation(OperationContext* operation);
 
   // Ensure all prior operations preceding the given one are completed.
-  void WaitForPriorOperationsToComplete(const OperationContext* operation);
-
   c10::StreamId GetStreamId() const { return stream_id; }
-
-  // For execution worker polling
-  OperationContext* GetNextReadyOperation();
 
   // For async execution worker (operation scheduling)
   OperationContext* GetNextOperationToSchedule();
@@ -173,6 +172,15 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Handle the respective error for the current operation
   template <typename ExceptionType>
   void HandleErrorWithCleanup(OperationContext* operation, const ExceptionType& e);
+
+  void HandleErrorWithExceptionPtr(OperationContext* operation, std::exception_ptr eptr);
+
+  void StashException(std::exception_ptr eptr) {
+    std::lock_guard<std::mutex> lock(stashed_exception_mutex_);
+    if (!stashed_exception_) {
+      stashed_exception_ = std::move(eptr);
+    }
+  }
 };
 
 }  // namespace at::neuron

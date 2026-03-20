@@ -14,6 +14,7 @@
 #include "torch_neuronx/csrc/core/compilation/NeuronCompiler.h"
 #include "torch_neuronx/csrc/core/compilation/service/ServiceCompilationBackend.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 
 namespace at::neuron {
@@ -740,7 +741,8 @@ void CompilationCache::HandleCompilationFailure(
 
   // Notify all waiting threads of the compilation failure.
   if (promise) {
-    promise->set_exception(std::make_exception_ptr(std::runtime_error(full_error_msg)));
+    promise->set_exception(
+        std::make_exception_ptr(torch_neuronx::CompilationRuntimeException(full_error_msg)));
   }
 
   CleanupPendingCompilation(key);
@@ -761,8 +763,8 @@ std::filesystem::path CompilationCache::GetLockPath(const std::string& key) cons
                                                           const std::string& message) {
   TORCH_NEURONX_ERROR("Compilation error", "CompilationCacheKey=", key.ToString(),
                       "error=", message);
-  throw std::runtime_error("Compilation failed for CompilationCacheKey '" + key.ToString() +
-                           "': " + message);
+  throw torch_neuronx::CompilationRuntimeException("Compilation failed for CompilationCacheKey '" +
+                                                   key.ToString() + "': " + message);
 }
 
 }  // namespace at::neuron

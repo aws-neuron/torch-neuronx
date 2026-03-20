@@ -79,7 +79,8 @@ PrologueResult OperationPrologue::GeneratePrologue(
     const std::vector<void*>& input_ptrs,
     const std::vector<at::neuron::TensorContext>& input_contexts, const std::string& op_name,
     const std::vector<std::vector<TensorTransformation>>& kernel_transforms,
-    const std::string& prologue_cache_key) {
+    const std::string& prologue_cache_key, const std::vector<size_t>& input_dedup_map,
+    size_t deduped_input_count) {
   // TODO: Add counter for prologue generation latency here
 
   // Step 1: Collect all transformation tasks from kernel transforms
@@ -97,8 +98,9 @@ PrologueResult OperationPrologue::GeneratePrologue(
   TORCH_NEURONX_DEBUG("OperationPrologue: Collected transformation tasks", "op=", op_name,
                       "num_tasks=", tasks.size());
 
-  // Step 3: Merge transformations into prologue using pre-computed cache key
-  auto result = MergeTransformations(tasks, op_name, input_ptrs, prologue_cache_key);
+  // Step 3: Merge transformations into prologue using pre-computed cache key and dedup info
+  auto result = MergeTransformations(tasks, op_name, input_ptrs.size(), prologue_cache_key,
+                                     input_dedup_map, deduped_input_count);
 
   TORCH_NEURONX_DEBUG("OperationPrologue: Generated prologue", "op=", op_name,
                       "has_transformations=", result.has_transformations);
@@ -261,15 +263,17 @@ std::vector<TransformationTask> OperationPrologue::CollectTransformationTasks(
 
 PrologueResult OperationPrologue::MergeTransformations(const std::vector<TransformationTask>& tasks,
                                                        const std::string& op_name,
-                                                       const std::vector<void*>& all_input_ptrs,
-                                                       const std::string& prologue_cache_key) {
+                                                       size_t num_inputs,
+                                                       const std::string& prologue_cache_key,
+                                                       const std::vector<size_t>& input_dedup_map,
+                                                       size_t deduped_input_count) {
   PrologueResult result;
   result.success = true;
   result.has_transformations = true;
   result.tasks = tasks;
 
   // Initialize metadata
-  result.input_was_transformed.resize(all_input_ptrs.size(), false);
+  result.input_was_transformed.resize(num_inputs, false);
 
   // STEP 1: Use provided cache key (computed once by caller)
   std::string merged_cache_key = prologue_cache_key;
@@ -295,9 +299,9 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
 
   // Assert: Every input has at least one transformation (including NONE)
   // This invariant is critical for order conservation
-  TORCH_CHECK(tasks.size() == all_input_ptrs.size(),
+  TORCH_CHECK(tasks.size() == num_inputs,
               "Expected one transformation per input (including NONE) for operation '", op_name,
-              "'. Got ", tasks.size(), " tasks for ", all_input_ptrs.size(), " inputs. ",
+              "'. Got ", tasks.size(), " tasks for ", num_inputs, " inputs. ",
               "This violates the invariant that every input must have a transformation task.");
 
   // Group tasks by input_index for verification
@@ -354,22 +358,23 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
   }
 
   // STEP 5: Merge all per-input transformation chains together
-  // Each chain gets a unique slot; slot addresses serve as unique identifiers
+  // Use deduplication info computed by caller to share input slots
   TORCH_NEURONX_DEBUG("Merging all transformation chains", "op=", op_name,
-                      "num_chains=", per_input_transform_mlirs.size());
+                      "num_chains=", per_input_transform_mlirs.size(),
+                      "deduped_inputs=", deduped_input_count);
 
-  // Create slot vectors - each element's address is unique
-  std::vector<size_t> input_slots(per_input_transform_mlirs.size());
+  // Create slot vectors - deduped_input_count unique input slots, one output slot per chain
+  std::vector<size_t> input_slots(deduped_input_count);
   std::vector<size_t> output_slots(per_input_transform_mlirs.size());
 
   // Start with the first transformation chain
   std::string accumulated_mlir = per_input_transform_mlirs[0];
-  std::vector<void*> accumulated_input_addrs = {&input_slots[0]};
+  std::vector<void*> accumulated_input_addrs = {&input_slots[input_dedup_map[0]]};
   std::vector<void*> accumulated_output_addrs = {&output_slots[0]};
 
   // Merge remaining chains as parallel operations
   for (size_t i = 1; i < per_input_transform_mlirs.size(); ++i) {
-    std::vector<void*> chain_input_addrs = {&input_slots[i]};
+    std::vector<void*> chain_input_addrs = {&input_slots[input_dedup_map[i]]};
     std::vector<void*> chain_output_addrs = {&output_slots[i]};
 
     TORCH_NEURONX_DEBUG("Merging chain", "chain_index=", i);
@@ -387,14 +392,17 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
 
     accumulated_mlir = merged_mlir;
 
-    // Verify order conservation
-    TORCH_CHECK(merge_mapping.total_inputs == i + 1, "Expected ", i + 1,
-                " inputs after merging chain ", i, " but got ", merge_mapping.total_inputs);
+    // Verify output count conservation (inputs may be deduped)
     TORCH_CHECK(merge_mapping.total_outputs == i + 1, "Expected ", i + 1,
                 " outputs after merging chain ", i, " but got ", merge_mapping.total_outputs);
 
     // Append addresses for this chain
-    accumulated_input_addrs.push_back(&input_slots[i]);
+    // Only add input addr if this deduped slot hasn't been added yet
+    void* input_addr = &input_slots[input_dedup_map[i]];
+    if (std::find(accumulated_input_addrs.begin(), accumulated_input_addrs.end(), input_addr) ==
+        accumulated_input_addrs.end()) {
+      accumulated_input_addrs.push_back(input_addr);
+    }
     accumulated_output_addrs.push_back(&output_slots[i]);
 
     TORCH_NEURONX_DEBUG("Merged chain", "chain_index=", i,
@@ -403,6 +411,8 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
 
   // With order conservation verified, just store the MLIR
   result.prologue_mlir_str = accumulated_mlir;
+  result.input_dedup_map = input_dedup_map;
+  result.deduped_input_count = deduped_input_count;
 
   // STEP 6: Cache the merged MLIR directly (no need to store indices since order is conserved)
   {

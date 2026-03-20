@@ -7,15 +7,25 @@ from collections.abc import Callable
 import torch
 import torch._dynamo as dynamo
 import torch.utils._pytree as pytree
-from torch._dynamo.backends.common import aot_autograd
+from torch._dispatch.python import enable_python_dispatcher
+from torch._functorch._aot_autograd.functional_utils import (
+    from_fun,
+    has_data_mutation,
+    to_fun,
+)
 from torch._functorch._aot_autograd.utils import create_tree_flattened_fn
+from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
+from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
+    FunctionalizeCopyInplacePass,
+)
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
 from torch_neuronx.python_ops.shared import (
@@ -24,7 +34,7 @@ from torch_neuronx.python_ops.shared import (
     IndexOps,
     ReductionOps,
 )
-from torch_neuronx.utils import is_sync_mode_enabled
+from torch_neuronx.utils import global_version_hash, is_sync_mode_enabled
 
 from ..handlers.output import BaseOutputHandler
 from ..processors import ArgumentProcessor
@@ -96,7 +106,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         # Add kwargs
         key_with_kwargs = self.arg_processor.add_static_to_cache_key(base_key, kwargs)
 
-        return key_with_kwargs
+        return f"{key_with_kwargs}:{global_version_hash()}"
 
     def _get_compilation_kwargs(self, kwargs):
         """Process kwargs for lowering."""
@@ -195,12 +205,53 @@ class TorchMlirKernel(BaseNeuronKernel):
                 result = flat_fn(*args)
                 return result[0] if len(result) == 1 else tuple(result)
 
-            # Use make_fx with the wrapped function and flattened args
-            decomposed_gm = make_fx(wrapped_fn, decomposition_table=decomposition_table)(*flat_args)
+            # Use FunctionalTensorMode with ExcludeDispatchKeyGuard(Functionalize)
+            # matching aot_autograd's _functionalized_f_helper pattern. This:
+            # 1. Disables C++ Functionalize dispatch key (which breaks proxy tracing
+            #    in distributed/PrivateUse1 contexts)
+            # 2. Uses Python FunctionalTensorMode which properly handles in-place ops
+            #    and triggers nki_op decompositions via register_torch_dispatch
+            # Inputs are wrapped with to_fun and outputs unwrapped with from_fun.
+            # Mutated inputs are detected and appended to outputs so the graph
+            # reflects NKI kernel output aliasing.
+            def functionalized_fn(*args):
+                # Wrap inputs as FunctionalTensor (like aot_autograd's to_fun)
+                func_args = [to_fun(a) if isinstance(a, torch.Tensor) else a for a in args]
+                result = wrapped_fn(*func_args)
+                if not isinstance(result, tuple):
+                    result = (result,)
+
+                # Detect mutated tensor inputs and append them to outputs
+                # (mirrors aot_autograd's fn_input_mutations_to_outputs)
+                mutated_inputs = []
+                for a in func_args:
+                    if isinstance(a, torch.Tensor) and has_data_mutation(a):
+                        mutated_inputs.append(a)
+
+                # Unwrap all outputs and mutated inputs
+                unwrapped = tuple(from_fun(r) if isinstance(r, torch.Tensor) else r for r in result)
+                unwrapped_mutated = tuple(from_fun(a) for a in mutated_inputs)
+                return unwrapped + unwrapped_mutated if unwrapped_mutated else unwrapped
+
+            disable_functionalize = torch._C._ExcludeDispatchKeyGuard(
+                torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
+            )
+            with disable_functionalize, enable_python_dispatcher(), FunctionalTensorMode():
+                decomposed_gm = make_fx(functionalized_fn, decomposition_table=decomposition_table)(
+                    *flat_args
+                )
+
+            # NKI functionalization inserts non-functional copy_
+            decomposed_gm = FunctionalizeCopyInplacePass()(decomposed_gm).graph_module
         return decomposed_gm
 
     def _generate_hlo(
-        self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
+        self,
+        inputs: tuple,
+        kwargs: dict,
+        context: ExecutionContext | None = None,
+        *,
+        job: CompilationJob,
     ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple, dict]:
         """Generate HLO from PyTorch function.
 
@@ -208,6 +259,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             inputs: Preprocessed inputs (potentially downcasted)
             kwargs: Keyword arguments
             context: Execution context with original inputs
+            job: Compilation job for artifact saving and workdir management.
 
         Returns:
             Tuple of (HLO bytes, io_spec, cast_spec, kept_input_indices, kept_output_indices,
@@ -217,9 +269,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         # Create fake tensors and track flattened indices
         fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs, compilation_kwargs)
-
-        # Get the same decomposition table used by neuron_backend
-        decomposition_table = get_decomposition_table(decompose_all=False)
 
         # Generate original_outputs by running meta eval
         original_outputs = self.infer_outputs_from_meta(
@@ -242,14 +291,8 @@ class TorchMlirKernel(BaseNeuronKernel):
             decomposed_gm, original_output_args
         )
 
-        assert (
-            len(original_outputs) == len(original_output_args)
-            if isinstance(original_outputs, tuple | list)
-            else len(original_output_args) == 1
-        ), (
-            f"Meta eval expects {len(original_outputs)} outputs "
-            f"while FX Graph expects {len(original_output_args)} outputs"
-        )
+        # Save FX graph artifact
+        job.save_fx_graph(self.op_name, decomposed_gm)
 
         captured_gm = decomposed_gm
         kept_input_indices = []
@@ -320,17 +363,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                         kept_output_indices.append(i)
                         break
 
-            # Use aot_autograd with decompositions but capture the graph module
-            def fw_compiler(decomposed_gm, inputs):
-                nonlocal captured_gm
-                captured_gm = decomposed_gm
-                return decomposed_gm  # Return the graph module itself
-
-            aot_backend = aot_autograd(
-                fw_compiler=fw_compiler,
-                decompositions=decomposition_table,
-            )
-            return aot_backend(gm, filtered_inputs)
+            return gm
 
         # Configure dynamo for graph capture only (not execution)
         with (
@@ -354,7 +387,10 @@ class TorchMlirKernel(BaseNeuronKernel):
             gm = captured_gm
 
         # Convert to StableHLO
-        stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs)
+        stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs, job=job)
+
+        # Save stablehlo artifact
+        job.save_stablehlo(self.op_name, stablehlo_module)
 
         # Remove torch.debug_dump_path to avoid non-deterministicmlir path cause recompilation
         if "torch.debug_dump_path" in stablehlo_module.operation.attributes:
@@ -740,7 +776,12 @@ class TorchMlirKernel(BaseNeuronKernel):
         return flattened
 
     def _get_or_compile_hlo(
-        self, inputs: tuple, kwargs: dict, context: ExecutionContext | None = None
+        self,
+        inputs: tuple,
+        kwargs: dict,
+        context: ExecutionContext | None = None,
+        *,
+        job: CompilationJob,
     ) -> tuple[bytes, list[int], list[int], tuple, tuple, str]:
         """Get HLO from cache or compile if needed.
 
@@ -748,6 +789,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             inputs: Preprocessed inputs
             kwargs: Keyword arguments
             context: Execution context with original inputs
+            job: Compilation job for artifact saving and workdir management.
 
         Returns:
             Tuple of (hlo_bytes, kept_input_indices, kept_output_indices, downcasted_outputs,
@@ -769,17 +811,43 @@ class TorchMlirKernel(BaseNeuronKernel):
                 passthrough_mappings,
             ) = self.hlo_cache[cache_key]
         else:
-            # Generate HLO
-            (
-                hlo_bytes,
-                io_spec,
-                cast_spec,
-                kept_input_indices,
-                kept_output_indices,
-                downcasted_outputs,
-                original_outputs,
-                passthrough_mappings,
-            ) = self._generate_hlo(inputs, kwargs, context)
+            # Check persistent disk cache
+            from torch_neuronx.python_ops.compilation.hlo_cache import get as _hlo_cache_get
+            from torch_neuronx.python_ops.compilation.hlo_cache import put as _hlo_cache_put
+
+            disk_entry = _hlo_cache_get(cache_key)
+            if disk_entry is not None:
+                (
+                    hlo_bytes,
+                    io_spec,
+                    kept_input_indices,
+                    kept_output_indices,
+                    downcasted_outputs,
+                    original_outputs,
+                    passthrough_mappings,
+                ) = disk_entry
+            else:
+                # Generate HLO
+                (
+                    hlo_bytes,
+                    io_spec,
+                    cast_spec,
+                    kept_input_indices,
+                    kept_output_indices,
+                    downcasted_outputs,
+                    original_outputs,
+                    passthrough_mappings,
+                ) = self._generate_hlo(inputs, kwargs, context, job=job)
+                _hlo_cache_put(
+                    cache_key,
+                    hlo_bytes,
+                    io_spec,
+                    kept_input_indices,
+                    kept_output_indices,
+                    downcasted_outputs,
+                    original_outputs,
+                    passthrough_mappings,
+                )
             self.hlo_cache[cache_key] = (
                 hlo_bytes,
                 io_spec,
@@ -801,12 +869,15 @@ class TorchMlirKernel(BaseNeuronKernel):
             cache_key,
         )
 
-    def _get_or_compile_neff(self, hlo_bytes: bytes, cache_key: str) -> bytes:
+    def _get_or_compile_neff(
+        self, hlo_bytes: bytes, cache_key: str, *, job: CompilationJob
+    ) -> bytes:
         """Get NEFF from cache or compile if needed.
 
         Args:
             hlo_bytes: Compiled HLO bytes
             cache_key: Cache key for lookup
+            job: Compilation job that provides the neuronx-cc working directory
 
         Returns:
             NEFF bytes
@@ -817,7 +888,9 @@ class TorchMlirKernel(BaseNeuronKernel):
             return neff_bytes
 
         # Compile HLO to NEFF
-        neff_bytes = self.hlo_compiler.compile_to_neff(hlo_bytes, ir_type="StableHLO")
+        neff_bytes = self.hlo_compiler.compile_to_neff(
+            hlo_bytes, ir_type="StableHLO", neff_cache_key=cache_key, job=job
+        )
 
         # Store in cache
         self.cache.store_neff(cache_key, neff_bytes)
@@ -832,6 +905,12 @@ class TorchMlirKernel(BaseNeuronKernel):
         if not args and not kwargs:
             return None
 
+        with compilation_job(self.op_name) as job:
+            return self._execute_kernel(args, context, kwargs, job=job)
+
+    def _execute_kernel(
+        self, args, context: ExecutionContext | None, kwargs, *, job: CompilationJob
+    ):
         self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
 
         # Preprocess inputs
@@ -877,7 +956,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             original_outputs,
             passthrough_mappings,
             cache_key,
-        ) = self._get_or_compile_hlo(processed_inputs, processed_kwargs, context)
+        ) = self._get_or_compile_hlo(processed_inputs, processed_kwargs, context, job=job)
 
         # Early return if no valid outputs
         if original_outputs is None or (
@@ -952,7 +1031,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 cpu_fallback_context,
             )
         else:
-            neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key)
+            neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key, job=job)
             self._execute_sync(
                 filtered_inputs,
                 exec_tensors,

@@ -13,22 +13,15 @@ from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 
 # Import process group variable tracking (needed for registration side effect)
+from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
 from torch_neuronx.neuron_dynamo_backend import process_group_variable
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
 from torch_neuronx.neuron_dynamo_backend.config import (
-    get_current_timestamp,
-    get_fx_graph_path,
     get_model_name,
-    get_stablehlo_path,
-    managed_artifacts_directory,
-    reset_timestamp,
 )
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_compile_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
-from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
-    convert_fx_to_stablehlo,
-    save_mlir_bytecode,
-)
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
     post_aot_processing,
 )
@@ -39,7 +32,6 @@ from torch_neuronx.neuron_dynamo_backend.metrics import (
 )
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
-from torch_neuronx.neuron_dynamo_backend.utils.io_utils import save_fx_graph_txt
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import RandomInputInfo
 
 logger = logging.getLogger(__name__)
@@ -53,7 +45,7 @@ def _compile_fx_to_stablehlo(
     example_inputs,
     model_name: str,
     segment_id: str,
-    preserve_artifacts: bool,
+    job: CompilationJob,
     aliasing_info: AliasingInfo = None,
     random_input_info: RandomInputInfo = None,
 ):
@@ -64,7 +56,7 @@ def _compile_fx_to_stablehlo(
         example_inputs: Example input tensors.
         model_name (str): Model name for logging and artifact naming.
         segment_id (str): Segment ID for statistics tracking.
-        preserve_artifacts (bool): Whether to save intermediate artifacts.
+        job (CompilationJob): Compilation job for artifact management.
         aliasing_info (AliasingInfo): Input-output aliasing information.
         random_input_info: Optional metadata about random inputs added to the graph
 
@@ -81,15 +73,13 @@ def _compile_fx_to_stablehlo(
         gm,
         example_inputs,
         aliasing_info,
-        preserve_artifacts=preserve_artifacts,
+        job=job,
         random_input_info=random_input_info,
     )
     logger.debug("FX Graph to StableHLO conversion completed")
 
     # Save stablehlo to artifacts dir
-    artifacts_stablehlo = get_stablehlo_path(model_name)
-    save_mlir_bytecode(stablehlo_mlir, artifacts_stablehlo)
-    logger.debug(f"StableHLO saved to artifacts directory: {artifacts_stablehlo}")
+    artifacts_stablehlo = job.save_stablehlo(model_name, stablehlo_mlir)
 
     return stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec
 
@@ -176,11 +166,6 @@ def neuron_backend_fx_compiler(
         f"Example inputs: {[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
     )
 
-    # Reset timestamp for new compilation (each graph segment gets unique timestamp)
-    # TODO (NF-23): Improve graph unique ID generation logic (use unique graph/rank info)
-    reset_timestamp()
-    segment_id = get_current_timestamp()  # Use timestamp as segment ID
-
     # Get model name from global variable
     model_name = get_model_name() if options is None else options.get("model_name", "model_default")
 
@@ -194,26 +179,27 @@ def neuron_backend_fx_compiler(
     compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
     graph_name = f"{model_name}_{compile_id}"  # e.g., "LlamaForCausalLM_0_inference_0"
 
-    logger.debug(f"Model name: {model_name}")
-    logger.debug(f"Segment ID: {segment_id}")
+    # Create a CompilationJob for this compilation using context manager for automatic cleanup
+    with compilation_job(op_name=model_name) as job:
+        segment_id = job.timestamp  # Use job timestamp as segment ID
 
-    # Use managed artifacts directory context manager for all compilation artifacts
-    with managed_artifacts_directory() as (_, preserve_artifacts):
+        logger.debug(f"Model name: {model_name}")
+        logger.debug(f"Segment ID: {segment_id}")
+
         try:
             # Detect collectives early in the pipeline
             has_collectives = _has_collectives_in_graph(gm)
             logger.debug(f"Graph contains collectives: {has_collectives}")
 
             # Save the FX graph we received
-            graph_path = get_fx_graph_path(model_name)
-            save_fx_graph_txt(gm, graph_path)
+            job.save_fx_graph(model_name, gm)
 
             stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
                 gm,
                 example_inputs,
                 model_name,
                 segment_id,
-                preserve_artifacts,
+                job,
                 aliasing_info,
                 random_input_info,
             )
@@ -309,8 +295,8 @@ def create_neuron_backend():
     decomposition_table = get_compile_decomposition_table()
 
     def neuron_backend_wrapper(gm, example_inputs, *, options=None, mode="default"):
-        # There are 4 torch.compile mode: “default”, “reduce-overhead”,
-        #   “max-autotune” or “max-autotune-no-cudagraphs”
+        # There are 4 torch.compile mode: "default", "reduce-overhead",
+        #   "max-autotune" or "max-autotune-no-cudagraphs"
         # Currently, we only support mode "default".
         if mode != "default":
             logging.warning(

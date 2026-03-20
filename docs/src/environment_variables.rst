@@ -39,17 +39,25 @@ This document provides an overview of the different environment variables availa
 Artifact Directory Structure
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When ``TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1``::
+Both ``torch.compile`` and eager execution use the same unified job-based artifact hierarchy.
+The working directory used by all neuronx-cc calls is preserved under ``TORCH_NEURONX_DEBUG_DIR``::
 
     {TORCH_NEURONX_DEBUG_DIR}/
-    ├── fx_graphs/
-    │   └── proc_{rank}/{model}_{timestamp}.fx.txt
-    ├── stablehlo/
-    │   └── proc_{rank}/{model}_{timestamp}.stablehlo.mlir
-    ├── raw/
-    │   └── proc_{rank}/{model}_{timestamp}.torch_raw.mlir
-    └── neff/
-        └── proc_{rank}/{model}_{timestamp}.neff
+    ├── {job_id}/
+    │   ├── fx_graphs/{model}_{ts}.fx.txt
+    │   ├── transformed_fx/{model}_{ts}.transformed.fx.txt
+    │   ├── raw/{model}_{ts}.torch_raw.mlir
+    │   ├── stablehlo/{model}_{ts}.stablehlo.mlir
+    │   └── torch_mlir_error/{model}_{ts}.mlir  # Populated when torch-mlir fails
+    └── neuronx-cc/
+        └── {hash}/
+            ├── log-neuron-cc.txt
+            ├── module.mlir (or module.hlo.pb)
+            ├── module.neff
+            ├── metadata.txt
+            └── compiler_args.txt
+
+When ``TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1``, all directories and their contents are preserved for debugging and analysis.
 
 Compiler
 --------

@@ -143,10 +143,13 @@ class BaseNeuronKernel:
                     part = self.get_cache_key(f"sub_arg{key}_{j}", sub_inp)
                     parts.append(part)
             else:
-                # For scalars, include only type (not value)
+                # For positional scalars, include only type (not value)
                 # Values are runtime parameters, not compile-time constants
                 if isinstance(key, int):
                     parts.extend([f"s{key}", str(type(inp).__name__)])
+                elif isinstance(inp, torch.dtype):
+                    # dtype kwargs affect tracing output, must be in key
+                    parts.extend([key, str(inp)])
                 else:
                     parts.extend([key, str(type(inp).__name__)])
 

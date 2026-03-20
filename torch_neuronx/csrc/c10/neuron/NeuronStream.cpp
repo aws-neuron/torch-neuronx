@@ -334,7 +334,7 @@ StreamImpl* GetPoolStreamImpl(c10::DeviceIndex device_index, int pool_index) {
   return stream_pools[device_index][pool_index];
 }
 
-// Helper for ExecutionWorker to iterate all streams on a device
+// Helper for RuntimeWorker to iterate all streams on a device
 void ForEachStreamImpl(c10::DeviceIndex device_index,
                        const std::function<bool(StreamImpl*)>& callback) {
   auto* default_stream = default_streams[device_index];

@@ -6,6 +6,7 @@ from torch_neuronx.nki_hop import nki_kernel_wrapper
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
+from torch_neuronx.utils import global_version_hash
 
 
 def nki_torch_fn(*args, **nki_params):
@@ -18,11 +19,19 @@ class NkiKernel(TorchMlirKernel):
 
     def _generate_unified_cache_key(self, inputs: tuple, kwargs: dict, context=None) -> str:
         """Use kernel_idx and constant_args hash_key for NKI caching."""
+        from torch_neuronx.nki_hop import kernel_registry
+
         kernel_idx = kwargs.get("kernel_idx", 0)
         constant_args_key = kwargs.get("constant_args_key", 0)
+        kernel = kernel_registry.get_kernel(kernel_idx)
+        kernel_name = kernel.func.__qualname__
         # Include tensor shapes/dtypes for cache differentiation
         tensor_info = tuple((t.shape, t.dtype) for t in inputs if isinstance(t, torch.Tensor))
-        return f"nki_{kernel_idx}_{constant_args_key}_{hash(tensor_info)}"
+        return (
+            f"nki_{kernel_idx}_{kernel_name}"
+            f"_{constant_args_key}_{tensor_info}"
+            f":{global_version_hash()}"
+        )
 
     def _pad_outputs_for_aliasing(
         self,

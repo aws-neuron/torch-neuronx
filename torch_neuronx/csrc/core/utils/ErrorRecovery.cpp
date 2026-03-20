@@ -59,8 +59,6 @@ OperationContextResult ErrorRecovery::AttemptCompilableRecovery(OperationContext
     return {};
   }
 
-  auto* stream = operation->stream;
-  stream->WaitForPriorOperationsToComplete(operation);
   return ExecuteCpuFallback(operation);
 }
 

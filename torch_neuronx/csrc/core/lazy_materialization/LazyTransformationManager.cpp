@@ -21,7 +21,13 @@ namespace {
 // MergedOperationCache: Cache for merged prologue + operation MLIR bytes
 // This caches the final result of merging prologue with operation,
 // avoiding expensive MLIR merge operations on every call.
-static std::unordered_map<std::string, std::vector<uint8_t>> g_merged_operation_cache;
+struct MergedOperationCacheEntry {
+  std::vector<uint8_t> mlir_bytes;
+  std::vector<size_t> input_dedup_map;  // empty if no dedup
+  size_t deduped_input_count = 0;
+  std::vector<std::vector<int64_t>> deduped_input_shapes;  // shape per deduped slot
+};
+static std::unordered_map<std::string, MergedOperationCacheEntry> g_merged_operation_cache;
 static std::mutex g_merged_operation_cache_mutex;
 
 // Helper to apply cached MLIR bytes to kernel (in-place update)
@@ -34,6 +40,41 @@ void ApplyCachedMlirToKernel(at::neuron::XLACompilableKernelExecution* kernel,
   // Update kernel's cache key since MLIR has changed
   // Operations with different prologues must have different kernel cache keys
   kernel->UpdateCacheKey(merged_operation_cache_key);
+}
+
+// Helper to apply input deduplication to kernel src data
+void ApplyInputDedup(at::neuron::XLACompilableKernelExecution* kernel,
+                     const std::vector<size_t>& dedup_map, size_t deduped_count,
+                     const std::vector<std::vector<int64_t>>& deduped_shapes,
+                     const std::string& op_name) {
+  if (deduped_count == 0 || deduped_count >= dedup_map.size()) return;
+
+  const auto& orig_src_refs = kernel->GetSrcRefs();
+  const auto& orig_src_ctxs = kernel->GetSrcTensorContexts();
+
+  std::vector<at::neuron::TensorDataRef> deduped_refs(deduped_count);
+  std::vector<at::neuron::TensorContext> deduped_ctxs(deduped_count);
+  std::vector<bool> slot_filled(deduped_count, false);
+
+  for (size_t i = 0; i < dedup_map.size(); ++i) {
+    size_t slot = dedup_map[i];
+    if (!slot_filled[slot]) {
+      deduped_refs[slot] = at::neuron::TensorDataRef(orig_src_refs[i]);
+      deduped_ctxs[slot] = orig_src_ctxs[i];
+      deduped_ctxs[slot].storage_offset = 0;
+      const auto& shape = deduped_shapes[slot];
+      size_t full_numel = 1;
+      for (auto d : shape) full_numel *= d;
+      deduped_ctxs[slot].size_bytes = full_numel * deduped_ctxs[slot].element_size;
+      deduped_ctxs[slot].numel = full_numel;
+      deduped_ctxs[slot].shape = shape;
+      slot_filled[slot] = true;
+    }
+  }
+
+  kernel->UpdateSrcData(std::move(deduped_refs), deduped_ctxs);
+  TORCH_NEURONX_DEBUG("Applied input dedup", "op=", op_name, "original=", dedup_map.size(),
+                      "deduped=", deduped_count);
 }
 
 }  // anonymous namespace
@@ -55,11 +96,14 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
                       "op=", op_name);
 
   // Create slot vectors - each element's address serves as a unique identifier for merge API
-  // This replaces the old dummy address ranges with natural object addresses
+  // Account for input deduplication from prologue
   size_t num_inputs = original_input_ptrs.size();
   size_t num_outputs = original_output_ptrs.size();
+  bool has_dedup =
+      prologue_result.deduped_input_count > 0 && prologue_result.deduped_input_count < num_inputs;
+  size_t num_prologue_inputs = has_dedup ? prologue_result.deduped_input_count : num_inputs;
 
-  std::vector<size_t> prologue_input_slots(num_inputs);
+  std::vector<size_t> prologue_input_slots(num_prologue_inputs);
   std::vector<size_t> prologue_output_slots(num_inputs);
   std::vector<size_t> operation_input_slots(num_inputs);
   std::vector<size_t> operation_output_slots(num_outputs);
@@ -68,8 +112,10 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
   std::vector<void*> prologue_input_addrs, prologue_output_addrs;
   std::vector<void*> operation_input_addrs, operation_output_addrs;
 
-  for (size_t i = 0; i < num_inputs; ++i) {
+  for (size_t i = 0; i < num_prologue_inputs; ++i) {
     prologue_input_addrs.push_back(&prologue_input_slots[i]);
+  }
+  for (size_t i = 0; i < num_inputs; ++i) {
     prologue_output_addrs.push_back(&prologue_output_slots[i]);
     // Operation inputs connect to prologue outputs (same slot = data flows through)
     operation_input_addrs.push_back(&prologue_output_slots[i]);
@@ -89,11 +135,10 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
   // With NONE transformations, every input has a transformation task, so input order is conserved.
   // Assert this invariant and use original pointers directly.
 
-  // Assert: Input count must match
-  TORCH_CHECK(final_merge_mapping.total_inputs == original_input_ptrs.size(),
+  // Assert: Input count must match (accounting for deduplication)
+  TORCH_CHECK(final_merge_mapping.total_inputs == num_prologue_inputs,
               "Input count mismatch after merge for operation '", op_name,
-              "': ", "expected=", original_input_ptrs.size(),
-              ", got=", final_merge_mapping.total_inputs);
+              "': ", "expected=", num_prologue_inputs, ", got=", final_merge_mapping.total_inputs);
 
   // Assert: Output count must match
   TORCH_CHECK(final_merge_mapping.total_outputs == original_output_ptrs.size(),
@@ -103,15 +148,18 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
 
   // Assert: Input order is conserved via prologue outputs
   // With NONE transformations, all inputs flow through prologue in order
-  for (size_t i = 0; i < original_input_ptrs.size(); ++i) {
-    auto it = final_merge_mapping.input_mapping.find(i);
-    TORCH_CHECK(
-        it != final_merge_mapping.input_mapping.end() && it->second.first == 1 &&
-            it->second.second == i,
-        "Input order not conserved at index ", i, " for operation '", op_name, "'. ",
-        "Expected mapping to prologue output ", i, " (module 1). ",
-        "Got module=", (it != final_merge_mapping.input_mapping.end() ? it->second.first : -1),
-        ", index=", (it != final_merge_mapping.input_mapping.end() ? it->second.second : -1));
+  // Skip strict mapping check when dedup is active (mapping changes)
+  if (!has_dedup) {
+    for (size_t i = 0; i < original_input_ptrs.size(); ++i) {
+      auto it = final_merge_mapping.input_mapping.find(i);
+      TORCH_CHECK(
+          it != final_merge_mapping.input_mapping.end() && it->second.first == 1 &&
+              it->second.second == i,
+          "Input order not conserved at index ", i, " for operation '", op_name, "'. ",
+          "Expected mapping to prologue output ", i, " (module 1). ",
+          "Got module=", (it != final_merge_mapping.input_mapping.end() ? it->second.first : -1),
+          ", index=", (it != final_merge_mapping.input_mapping.end() ? it->second.second : -1));
+    }
   }
 
   TORCH_NEURONX_DEBUG("Merged prologue with operation", "op=", op_name);
@@ -154,8 +202,40 @@ void LazyTransformationManager::ProcessOperationInputs(
   std::string prologue_cache_key = OperationPrologue::ComputePrologueCacheKey(
       input_ptrs, input_contexts, op_name, kernel_transforms);
 
-  // Generate merged operation cache key (prologue + operation)
-  std::string merged_operation_cache_key = prologue_cache_key + "_" + xla_compilable->GetCacheKey();
+  // Compute input deduplication by comparing storage base pointers.
+  // This must happen before cache lookup so the dedup signature is part of the key.
+  std::unordered_map<uintptr_t, size_t> base_to_deduped_idx;
+  std::vector<size_t> input_dedup_map(input_ptrs.size());
+  size_t deduped_input_count = 0;
+
+  for (size_t i = 0; i < input_ptrs.size(); ++i) {
+    uintptr_t base_ptr =
+        reinterpret_cast<uintptr_t>(input_ptrs[i]) -
+        (input_contexts[i].get_storage_offset() * input_contexts[i].get_element_size());
+    auto it = base_to_deduped_idx.find(base_ptr);
+    if (it != base_to_deduped_idx.end()) {
+      input_dedup_map[i] = it->second;
+    } else {
+      base_to_deduped_idx[base_ptr] = deduped_input_count;
+      input_dedup_map[i] = deduped_input_count;
+      deduped_input_count++;
+    }
+  }
+
+  // Include dedup signature in cache key so different storage layouts get different entries
+  std::string dedup_suffix;
+  if (deduped_input_count < input_ptrs.size()) {
+    std::stringstream ss;
+    ss << "_dedup";
+    for (size_t slot : input_dedup_map) {
+      ss << "_" << slot;
+    }
+    dedup_suffix = ss.str();
+  }
+
+  // Generate merged operation cache key (prologue + dedup + operation)
+  std::string merged_operation_cache_key =
+      prologue_cache_key + dedup_suffix + "_" + xla_compilable->GetCacheKey();
 
   // Check MergedOperationCache FIRST - avoid prologue generation if cached result exists
   {
@@ -167,7 +247,10 @@ void LazyTransformationManager::ProcessOperationInputs(
                           "key=", merged_operation_cache_key);
 
       // Apply cached MLIR bytes to kernel (updates in-place)
-      ApplyCachedMlirToKernel(xla_compilable, it->second, merged_operation_cache_key);
+      ApplyCachedMlirToKernel(xla_compilable, it->second.mlir_bytes, merged_operation_cache_key);
+      // Apply input deduplication if cached entry has it
+      ApplyInputDedup(xla_compilable, it->second.input_dedup_map, it->second.deduped_input_count,
+                      it->second.deduped_input_shapes, op_name);
       return;
     }
   }
@@ -176,9 +259,10 @@ void LazyTransformationManager::ProcessOperationInputs(
   TORCH_NEURONX_DEBUG("MergedOperationCache MISS", "op=", op_name,
                       "key=", merged_operation_cache_key);
 
-  // Generate prologue using pointers and contexts, passing the pre-computed cache key
-  auto prologue_result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, op_name,
-                                                             kernel_transforms, prologue_cache_key);
+  // Generate prologue using pointers and contexts, passing the pre-computed cache key and dedup
+  auto prologue_result =
+      OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, op_name, kernel_transforms,
+                                          prologue_cache_key, input_dedup_map, deduped_input_count);
 
   // Check for errors
   if (!prologue_result.success) {
@@ -193,9 +277,29 @@ void LazyTransformationManager::ProcessOperationInputs(
   // Apply merged MLIR bytes to kernel
   ApplyCachedMlirToKernel(xla_compilable, merged_mlir_bytes, merged_operation_cache_key);
 
+  // Build deduped input shapes for cache entry
+  std::vector<std::vector<int64_t>> deduped_shapes;
+  if (prologue_result.deduped_input_count > 0 &&
+      prologue_result.deduped_input_count < input_ptrs.size()) {
+    deduped_shapes.resize(prologue_result.deduped_input_count);
+    std::vector<bool> filled(prologue_result.deduped_input_count, false);
+    for (size_t i = 0; i < input_ptrs.size(); ++i) {
+      size_t slot = prologue_result.input_dedup_map[i];
+      if (!filled[slot]) {
+        deduped_shapes[slot] = prologue_result.tasks[i].input_shape;
+        filled[slot] = true;
+      }
+    }
+    // Apply dedup to kernel src data
+    ApplyInputDedup(xla_compilable, prologue_result.input_dedup_map,
+                    prologue_result.deduped_input_count, deduped_shapes, op_name);
+  }
+
   // Cache the result for future use
   std::lock_guard<std::mutex> lock(g_merged_operation_cache_mutex);
-  g_merged_operation_cache[merged_operation_cache_key] = merged_mlir_bytes;
+  g_merged_operation_cache[merged_operation_cache_key] =
+      MergedOperationCacheEntry{merged_mlir_bytes, prologue_result.input_dedup_map,
+                                prologue_result.deduped_input_count, deduped_shapes};
   TORCH_NEURONX_DEBUG("Cached merged result", "op=", op_name);
 }
 

@@ -131,12 +131,6 @@ TEST_F(StreamImplTest, ConcurrentSynchronizationEmptyStream) {
 // Test error handler initialization
 TEST_F(StreamImplTest, ErrorHandlerInitialization) { EXPECT_NE(stream_->error_handler_, nullptr); }
 
-// Test GetNextReadyOperation on empty stream returns nullptr
-TEST_F(StreamImplTest, GetNextReadyOperationEmptyStream) {
-  auto* result = stream_->GetNextReadyOperation();
-  EXPECT_EQ(result, nullptr);
-}
-
 // Test active_operations_ starts empty
 TEST_F(StreamImplTest, ActiveOperationsStartsEmpty) {
   // Query returns true when no active operations

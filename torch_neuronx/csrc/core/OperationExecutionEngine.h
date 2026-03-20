@@ -67,8 +67,7 @@ class OperationExecutionEngine {
  private:
   // Worker threads
   std::thread concatenation_thread_;
-  std::thread compilation_thread_;
-  std::thread execution_thread_;
+  std::thread runtime_thread_;
 
   // Concatenation infrastructure (only initialized if flag is enabled)
   std::unique_ptr<ConcatenationEngine> concatenation_engine_;
@@ -79,12 +78,9 @@ class OperationExecutionEngine {
 
   std::deque<OperationContext*> compilation_queue_;
 
-  mutable std::mutex compilation_mutex_;
-  std::condition_variable compilation_cv_;
-
-  mutable std::mutex execution_mutex_;
-  std::condition_variable execution_cv_;
-  bool execution_pending_{false};
+  mutable std::mutex runtime_mutex_;
+  std::condition_variable runtime_cv_;
+  bool runtime_pending_{false};
 
   // Shutdown coordination
   std::atomic<bool> shutdown_requested_{false};
@@ -98,8 +94,8 @@ class OperationExecutionEngine {
 
   // Worker thread implementations
   void ConcatenationWorker();
-  void CompilationWorker();
-  void AsyncExecutionWorker();
+  void RuntimeWorker();
+  bool CompileNextPending();
 
   // Async execution helpers
   bool HasPendingAsyncOperations() const { return pending_async_ops_count_.load() > 0; }

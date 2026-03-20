@@ -19,19 +19,33 @@ namespace at::neuron {
 // Uses POSIX nftw instead of std::filesystem::remove_all to avoid bugs in some libstdc++ versions.
 class TempDirectory {
  public:
-  // Creates a temporary directory with the given prefix.
-  // Default prefix is "neuron_temp_".
-  explicit TempDirectory(const std::string& prefix = "neuron_temp_") {
-    std::string temp_template = "/tmp/" + prefix + "XXXXXX";
-    std::vector<char> temp_buf(temp_template.begin(), temp_template.end());
-    temp_buf.push_back('\0');
+  // Creates or uses a directory.
+  // If is_full_path is false (default): path_or_prefix is treated as a prefix for a temp directory
+  //   under /tmp (e.g., "neuron_temp_" -> "/tmp/neuron_temp_XXXXXX").
+  // If is_full_path is true: path_or_prefix is the exact directory path to use/create.
+  // If preserve is true: the directory will NOT be cleaned up on destruction.
+  explicit TempDirectory(const std::string& path_or_prefix = "neuron_temp_",
+                         bool is_full_path = false, bool preserve = false)
+      : preserve_(preserve) {
+    if (is_full_path) {
+      // Use the exact path provided, create if it doesn't exist
+      if (!std::filesystem::exists(path_or_prefix)) {
+        std::filesystem::create_directories(path_or_prefix);
+      }
+      path_ = path_or_prefix;
+    } else {
+      // Create a temp directory with the given prefix under /tmp
+      std::string temp_template = "/tmp/" + path_or_prefix + "XXXXXX";
+      std::vector<char> temp_buf(temp_template.begin(), temp_template.end());
+      temp_buf.push_back('\0');
 
-    char* temp_dir = mkdtemp(temp_buf.data());
-    if (!temp_dir) {
-      throw std::runtime_error("Failed to create temporary directory: " +
-                               std::string(strerror(errno)));
+      char* temp_dir = mkdtemp(temp_buf.data());
+      if (!temp_dir) {
+        throw std::runtime_error("Failed to create temporary directory: " +
+                                 std::string(strerror(errno)));
+      }
+      path_ = temp_dir;
     }
-    path_ = temp_dir;
   }
 
   ~TempDirectory() { Cleanup(); }
@@ -41,7 +55,8 @@ class TempDirectory {
   TempDirectory& operator=(const TempDirectory&) = delete;
 
   // Movable
-  TempDirectory(TempDirectory&& other) noexcept : path_(std::move(other.path_)) {
+  TempDirectory(TempDirectory&& other) noexcept
+      : path_(std::move(other.path_)), preserve_(other.preserve_) {
     other.path_.clear();
   }
 
@@ -49,6 +64,7 @@ class TempDirectory {
     if (this != &other) {
       Cleanup();
       path_ = std::move(other.path_);
+      preserve_ = other.preserve_;
       other.path_.clear();
     }
     return *this;
@@ -65,9 +81,12 @@ class TempDirectory {
   // Reads a file within this temp directory as bytes.
   std::vector<uint8_t> ReadFile(const std::string& filename) const;
 
+  // Returns whether this directory will be preserved on destruction
+  bool preserve() const { return preserve_; }
+
  private:
   void Cleanup() {
-    if (!path_.empty()) {
+    if (!path_.empty() && !preserve_) {
       // Use POSIX nftw instead of std::filesystem::remove_all to avoid
       // segfault bugs in some libstdc++ versions (e.g., PyTorch 2.9 environment)
       nftw(
@@ -79,6 +98,7 @@ class TempDirectory {
   }
 
   std::string path_;
+  bool preserve_ = false;
 };
 
 }  // namespace at::neuron

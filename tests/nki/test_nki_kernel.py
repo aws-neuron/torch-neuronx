@@ -9,6 +9,20 @@ from neuronxcc import nki
 
 from tests.utils.neuron_test_utils import assert_raises
 from torch_neuronx import wrap_nki
+from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
+
+
+@pytest.fixture(autouse=True)
+def _disable_hlo_disk_cache():
+    """Disable HLO persistent cache for inline NKI kernel tests.
+
+    Inline @nki.jit kernels get kernel_idx assigned at runtime, which
+    can differ across forked test workers sharing the same disk cache.
+    """
+    orig = _hlo_cache_mod._enabled
+    _hlo_cache_mod._enabled = False
+    yield
+    _hlo_cache_mod._enabled = orig
 
 
 class TestBasicExecution:

@@ -53,24 +53,25 @@ CompilationCacheKey::CompilationCacheKey(const std::string& key, CacheKeySource 
     : base_key_(key), source_(source) {}
 
 const std::string* CompilationCacheKey::GetPersistentKey() const {
-  if (hlo_bytes_ptr_ == nullptr || hlo_bytes_ptr_->empty()) {
+  if (base_key_.empty()) {
     return nullptr;
   }
   if (persistent_key_.empty()) {
-    persistent_key_ = ComputePersistentKey(*hlo_bytes_ptr_);
-    // Invalidate cached ToString so it includes the persistent key.
+    // Use base_key for persistent key
+    persistent_key_ = ComputePersistentKey();
     key_str_.clear();
   }
   return &persistent_key_;
 }
 
-std::string CompilationCacheKey::ComputePersistentKey(const std::vector<uint8_t>& hlo_bytes) const {
-  // Build the hash input: hlo_bytes || 0xFF || compiler_config
+std::string CompilationCacheKey::ComputePersistentKey() const {
+  // Build the hash input: base_key || 0xFF || compiler_config
   std::string compiler_config = BuildCompilerExtension();
   std::vector<uint8_t> combined;
-  combined.reserve(hlo_bytes.size() + 1 + compiler_config.size());
+  combined.reserve(base_key_.size() + 1 + compiler_config.size());
 
-  combined.insert(combined.end(), hlo_bytes.begin(), hlo_bytes.end());
+  combined.insert(combined.end(), reinterpret_cast<const uint8_t*>(base_key_.data()),
+                  reinterpret_cast<const uint8_t*>(base_key_.data()) + base_key_.size());
   combined.push_back(kFieldSeparator);
 
   combined.insert(
