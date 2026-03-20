@@ -9,8 +9,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "BatchNorm buffer sync in DDP multi-forward"
-            " does inplace op corrupting autograd graph."
+            "BatchNorm buffer sync in DDP multi-forward does inplace op corrupting autograd graph."
         ),
         tests=[
             "test_c10d_nccl.py::DistributedDataParallelTest::test_ddp_buffer_sync_multi_forward_with_batchnorm",

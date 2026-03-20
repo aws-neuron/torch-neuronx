@@ -38,14 +38,6 @@ def _scaled_dot_product_attention_kernel(
             lse.copy_(lse_ret)
     else:
         attn_output = _compute_attention_nki(q, k, v, is_causal, scale, training)
-
-    # TODO: the attn_output needs to be initialized with this layout, since
-    # pytorch expects it to be in this layout:
-    # https://github.com/pytorch/pytorch/blob/main/torch/_meta_registrations.py#L5761
-    # For single chip, this tranpose operations are not adding a perf hit on the
-    # block test,so for now we are good, but need to fix the nki kernel to
-    # produce output in this layout
-    attn_output = attn_output.transpose(1, 2).contiguous().transpose(1, 2)
     return attn_output
 
 

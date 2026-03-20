@@ -3,6 +3,7 @@ Compilation phase for torch.compile backend.
 Dispatches to compilation worker.
 """
 
+import hashlib
 import io
 import logging
 import threading
@@ -125,10 +126,14 @@ class CompileGraph:
         self.mlir.operation.write_bytecode(bytecode_buffer)
         mlir_bytes = bytecode_buffer.getvalue()
 
-        # Use graph_name as base cache key — deterministic across ranks for SPMD.
-        # Built from model_name + AOT compile ID.
+        # Use content-based cache key for persistent NEFF caching
+
+        from torch_neuronx.utils import global_version_hash
+
+        content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
+
         exec_handle = torch_neuronx._C.compile_graph(
-            self.graph_name,
+            content_key,
             mlir_bytes,
             self.has_collectives,
             use_tensorizer=self.use_tensorizer,

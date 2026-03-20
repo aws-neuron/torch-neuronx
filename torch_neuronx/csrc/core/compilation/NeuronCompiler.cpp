@@ -2,11 +2,12 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
+#include "torch_neuronx/csrc/core/cache/CacheUtils.h"
 #include "torch_neuronx/csrc/core/compilation/CompilerDebugUtils.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/core/utils/ProcessExecutor.h"
@@ -53,26 +54,26 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
                                                       const std::string& op_name,
                                                       const std::string& cache_key,
                                                       const std::string& kernel_class_name) {
-  // Create temporary directory using RAII wrapper
-  TempDirectory temp_compilation_dir("neuron_compile_");
+  std::string workdir = cache_utils::GetCompilationWorkdir();
+  bool preserve = cache_utils::ShouldPreserveCompilationArtifacts();
+  TempDirectory temp_compilation_dir(workdir, /*is_full_path=*/true, preserve);
+  const std::string& workdir_str = temp_compilation_dir.path();
 
   // Determine file format based on ir_type parameter
   // "BIR" requires sg00/ subdirectory, "StableHLO" uses MLIR format, "XLA" (default) uses HLO
   // protobuf
   std::string hlo_input_file;
   if (ir_type == "BIR") {
-    std::string sg00_dir = temp_compilation_dir.path() + "/sg00";
-    std::filesystem::create_directories(sg00_dir);
-    hlo_input_file = sg00_dir + "/" + kBirFilename;
+    std::filesystem::create_directories(temp_compilation_dir.path() + "/sg00");
+    hlo_input_file = std::string("sg00/") + kBirFilename;
+  } else if (ir_type == "StableHLO") {
+    hlo_input_file = kMlirFilename;
   } else {
-    hlo_input_file =
-        temp_compilation_dir.path() + "/" + (ir_type == "StableHLO" ? kMlirFilename : kHloFilename);
+    hlo_input_file = kHloFilename;
   }
-  std::string neff_output_file = temp_compilation_dir.path() + "/" + kNeffFilename;
 
   // Write HLO bytes to temporary file
-  temp_compilation_dir.WriteFile(hlo_input_file.substr(temp_compilation_dir.path().size() + 1),
-                                 hlo_bytes);
+  temp_compilation_dir.WriteFile(hlo_input_file, hlo_bytes);
 
   // Build neuronx-cc command arguments using config
   // execvp will search PATH automatically
@@ -95,13 +96,35 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
     compiler_args.push_back(single_arg);
   }
 
-  // Add output specification
   compiler_args.push_back(kOutputFlag);
-  compiler_args.push_back(neff_output_file);
+  compiler_args.push_back(kNeffFilename);
 
-  // Execute neuronx-cc in the temporary directory
+  if (preserve) {
+    std::string metadata_path = workdir_str + "/metadata.txt";
+    std::ofstream metadata(metadata_path);
+    if (metadata) {
+      metadata << op_name << "\n";
+      metadata << cache_key << "\n";
+      metadata << kernel_class_name << "\n";
+      metadata << config.framework << "\n";
+      metadata << config.platform_target << "\n";
+      metadata << config.logical_neuron_cores << "\n";
+      metadata << config.optimization_level << "\n";
+      metadata << ir_type << "\n";
+    }
+
+    std::string compiler_args_path = workdir_str + "/compiler_args.txt";
+    std::ofstream compiler_args_file(compiler_args_path);
+    if (compiler_args_file) {
+      for (const auto& arg : compiler_args) {
+        compiler_args_file << arg << "\n";
+      }
+    }
+  }
+
+  // Execute neuronx-cc in the workdir
   ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCExecutable) + " compilation",
-                           temp_compilation_dir.path());
+                           workdir_str);
 
   return temp_compilation_dir.ReadFile(kNeffFilename);
 }

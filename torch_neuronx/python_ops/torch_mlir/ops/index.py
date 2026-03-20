@@ -4,6 +4,7 @@ import logging
 
 import torch
 
+from torch_neuronx.kernels.cache_utils import compilation_job
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 from torch_neuronx.python_ops.torch_mlir.ops.indexing import convert_indices, index_checking
@@ -56,9 +57,10 @@ class IndexMLIRImpl(OperationImplementation):
         """Handle empty output tensor case"""
         try:
             if out is None:
-                _, _, _, _, _, outputs, _, _ = self.kernel._get_or_compile_hlo(
-                    (tensor, indices), {"out": out}
-                )
+                with compilation_job(self.kernel.op_name) as job:
+                    _, _, _, _, _, outputs, _, _ = self.kernel._get_or_compile_hlo(
+                        (tensor, indices), {"out": out}, job=job
+                    )
                 result = torch.empty(outputs.shape, dtype=tensor.dtype, device=tensor.device)
             else:
                 result = out

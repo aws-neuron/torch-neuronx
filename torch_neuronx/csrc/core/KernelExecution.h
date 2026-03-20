@@ -346,6 +346,15 @@ class XLACompilableKernelExecution
     GetCompilationCacheKey().InvalidateCachedStrings();
   }
 
+  // Update source data pointers and contexts (for input deduplication)
+  void UpdateSrcData(std::vector<TensorDataRef>&& new_src_refs,
+                     const std::vector<TensorContext>& new_src_ctxs) {
+    src_data_ptrs_ = std::move(new_src_refs);
+    src_tensor_ctxs_ = new_src_ctxs;
+  }
+
+  const std::vector<TensorDataRef>& GetSrcRefs() const { return src_data_ptrs_; }
+
   const std::vector<TensorContext>& GetInputContexts() const { return GetSrcTensorContexts(); }
   const std::vector<TensorContext>& GetOutputContexts() const { return GetDstTensorContexts(); }
 

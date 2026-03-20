@@ -98,12 +98,11 @@ class CompilationCacheKey {
   const std::string* GetPersistentKey() const;
 
   /**
-   * @brief Compute the persistent cache key from explicit HLO bytes.
+   * @brief Compute the persistent cache key from base_key + compiler config.
    *
-   * @param hlo_bytes Serialized HLO or StableHLO MLIR bytes
-   * @return 32-char hex string (XXH3_128 of hlo_bytes || compiler_config)
+   * @return 32-char hex string (XXH3_128 of base_key || compiler_config)
    */
-  std::string ComputePersistentKey(const std::vector<uint8_t>& hlo_bytes) const;
+  std::string ComputePersistentKey() const;
 
   /**
    * @brief Check if this key is empty/invalid.

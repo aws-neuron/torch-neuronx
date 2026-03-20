@@ -7,6 +7,7 @@ from torch.fx.passes.pass_manager import PassManager
 from torch_mlir.ir import DenseI64ArrayAttr, IntegerAttr, Module
 
 from tests.neuron_dynamo_backend.unit.utils.test_utils import CapturedGraphs, get_aot_graphs
+from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.neuron_dynamo_backend import backend
 from torch_neuronx.neuron_dynamo_backend.fx.passes.aliasing_analysis import AliasingAnalysis
 
@@ -25,13 +26,14 @@ def compile_to_stablehlo(captured: CapturedGraphs) -> Module:
     pre_aot = captured.pre_aot_graph
     post_aot = captured.post_aot_forward_graph
     aliasing_info = run_aliasing_analysis(pre_aot)
+    job = CompilationJob(op_name="torch_compile_test")
 
     stablehlo_mlir, *_ = backend._compile_fx_to_stablehlo(
         post_aot,
         [],
         model_name="test_model",
         segment_id="segment_123",
-        preserve_artifacts=False,
+        job=job,
         aliasing_info=aliasing_info,
     )
     return stablehlo_mlir

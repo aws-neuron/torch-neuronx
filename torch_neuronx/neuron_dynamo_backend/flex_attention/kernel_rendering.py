@@ -7,9 +7,9 @@ from pathlib import Path
 import jinja2
 import torch
 
+from torch_neuronx.kernels.cache_utils import get_artifacts_directory
 from torch_neuronx.neuron_dynamo_backend._nki.ast import NKIArray
 from torch_neuronx.neuron_dynamo_backend._nki.subgraph_lowering import NISAPointwiseSubgraphLowering
-from torch_neuronx.neuron_dynamo_backend.config import get_artifacts_directory
 
 logger = logging.getLogger(__name__)
 

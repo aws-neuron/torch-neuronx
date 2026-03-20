@@ -3,7 +3,6 @@ FX Graph to StableHLO conversion utilities
 """
 
 import logging
-from pathlib import Path
 
 import torch
 from torch._dynamo.utils import dynamo_timed
@@ -12,11 +11,8 @@ from torch_mlir import ir as mlir_ir
 from torch_mlir.compiler_utils import OutputType, run_pipeline_with_repro_report
 from torch_mlir.ir import Module
 
-from torch_neuronx.neuron_dynamo_backend.config import (
-    get_err_mlir_path,
-    get_raw_torch_path,
-    get_transformed_fx_path,
-)
+from torch_neuronx.kernels.cache_utils import CompilationJob
+from torch_neuronx.neuron_dynamo_backend.config import get_model_name
 from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
@@ -149,7 +145,8 @@ def convert_fx_to_stablehlo(
     gm: torch.fx.GraphModule,
     example_inputs,
     aliasing_info: AliasingInfo = None,
-    preserve_artifacts: bool = False,
+    *,
+    job: CompilationJob,
     random_input_info: RandomInputInfo | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
     """
@@ -165,7 +162,7 @@ def convert_fx_to_stablehlo(
     Args:
         gm: FX GraphModule with Aten operations (from AOTAutograd)
         example_inputs: Example input tensors
-        preserve_artifacts: Save artifacts
+        job: CompilationJob for artifact management (always saves artifacts)
         random_input_info: Optional metadata about random inputs added to the graph
 
     Returns:
@@ -174,12 +171,10 @@ def convert_fx_to_stablehlo(
             - io_spec (FunctionIO): Input/output specifications for Executor.
             - cast_spec (list[TensorSpec]): Output specifications for dtype preservation.
     """
+    model_name = get_model_name()
+
     # Save transformed fx graph for debugging
-    if preserve_artifacts:
-        transformed_fx_path = get_transformed_fx_path()
-        with open(transformed_fx_path, "w") as f:
-            f.write(gm.print_readable(print_output=False))
-        logger.debug(f"Saved transformed fx graph to {transformed_fx_path}")
+    job.save_transformed_fx(model_name, gm)
 
     # Torch-MLIR lowering: FX → RAW → Torch Backend → StableHLO
     with dynamo_timed("torch_neuronx_lower"):
@@ -193,12 +188,11 @@ def convert_fx_to_stablehlo(
         )
 
         # Save RAW module for debugging
-        if preserve_artifacts:
-            raw_path = get_raw_torch_path()
-            save_mlir_bytecode(raw_module, raw_path)
-            logger.debug(f"Saved RAW Torch module to {raw_path}")
+        job.save_raw_torch(model_name, raw_module)
+
+        err_mlir_path = job.get_err_mlir_path(model_name)
         raw_module.operation.attributes["torch.debug_dump_path"] = mlir_ir.StringAttr.get(
-            str(get_err_mlir_path()), raw_module.context
+            str(err_mlir_path), raw_module.context
         )
 
         # Custom Neuron RAW lowerings/transformations
@@ -247,26 +241,3 @@ def convert_fx_to_stablehlo(
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
     return raw_module, io_spec, cast_spec
-
-
-def save_mlir_bytecode(mlir: mlir_ir.Module, output_path: Path) -> Path:
-    """Save MLIR bytecode to file.
-
-    Args:
-        mlir (mlir_ir.Module): MLIR module to save.
-        output_path (Path): Path to save the file.
-
-    Returns:
-        Path: Path to the saved file.
-    """
-    logger.debug(f"Saving MLIR to {output_path}")
-    with open(output_path, "wb") as f:
-        mlir.operation.write_bytecode(f)
-    return output_path
-
-
-def save_mlir_text(mlir: mlir_ir.Module, output_path: Path) -> Path:
-    """Save MLIR as human-readable text."""
-    with open(output_path, "w") as f:
-        f.write(str(mlir))
-    return output_path

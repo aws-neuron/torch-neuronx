@@ -69,6 +69,14 @@ def mock_config():
 
 
 @pytest.fixture
+def mock_job():
+    """Mock CompilationJob."""
+    job = Mock()
+    job.get_neuronx_cc_workdir.return_value = Path("/tmp/mock_workdir")
+    return job
+
+
+@pytest.fixture
 def sample_hlo():
     """Sample HLO protobuf data."""
     return b"mock_hlo_protobuf_data"
@@ -166,13 +174,16 @@ def _node_process_for_multinode_test(args):
     """Node process for multi-node testing."""
     node_id, shared_nfs_dir, local_dir_base = args
     from pathlib import Path
-    from unittest.mock import patch
+    from unittest.mock import Mock, patch
 
     # Each node has its own local cache
     node_local_dir = Path(local_dir_base) / f"node_{node_id}"
     node_local_dir.mkdir(exist_ok=True)
 
     compiler = CompilerSubprocess(nfs_cache_dir=shared_nfs_dir, local_cache_dir=str(node_local_dir))
+
+    mock_job = Mock()
+    mock_job.get_neuronx_cc_workdir.return_value = Path("/tmp/mock_workdir")
 
     results = []
     for _ in range(3):
@@ -187,7 +198,7 @@ def _node_process_for_multinode_test(args):
                 mock.return_value = b"shared_cached_result"
 
                 result = compiler.get_or_compile(
-                    b"shared_hlo_data", MockCompilerConfig("shared_config"), "shared_lnc"
+                    b"shared_hlo_data", MockCompilerConfig("shared_config"), mock_job, "shared_lnc"
                 )
                 results.append(result.decode())
                 time.sleep(0.01)
@@ -379,7 +390,7 @@ class TestCompilerSubprocess:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_caching_disabled_bypasses_cache(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff, monkeypatch
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff, monkeypatch
     ):
         """Test that caching disabled bypasses all cache logic."""
         monkeypatch.setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true")
@@ -389,17 +400,17 @@ class TestCompilerSubprocess:
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
 
-        result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"])
+        result = compiler.get_or_compile(sample_hlo, mock_config, mock_job, "lnc1", "XLA")
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(
-            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"], None, None
-        )
+        mock_compile.assert_called_once_with(sample_hlo, mock_config, mock_job, "lnc1", "XLA")
 
     @patch(
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
-    def test_nfs_cache_hit(self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff):
+    def test_nfs_cache_hit(
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
+    ):
         """Test NFS cache hit scenario."""
         compiler = CompilerSubprocess(
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
@@ -412,7 +423,7 @@ class TestCompilerSubprocess:
         nfs_path.write_bytes(sample_neff)
 
         with patch("neuronxcc.__version__", "v1.0"):
-            result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+            result = compiler.get_or_compile(sample_hlo, mock_config, mock_job, "lnc1")
 
         assert result == sample_neff
         mock_compile.assert_not_called()
@@ -421,9 +432,9 @@ class TestCompilerSubprocess:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_nfs_cache_hit_with_output(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
     ):
-        """Test cache hit writes to output file (async mode)."""
+        """Test cache hit writes to output file."""
         compiler = CompilerSubprocess(
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
@@ -435,21 +446,15 @@ class TestCompilerSubprocess:
         nfs_path.parent.mkdir(parents=True, exist_ok=True)
         nfs_path.write_bytes(sample_neff)
 
-        # Setup async mode directories/files
-        workdir = temp_dirs["local"] / "workdir"
-        workdir.mkdir(parents=True, exist_ok=True)
-        input_file = workdir / "input.hlo.pb"
-        output_file = workdir / "output.neff"
-        input_file.write_bytes(sample_hlo)
+        # Setup output file
+        output_file = temp_dirs["local"] / "output.neff"
 
         with patch("neuronxcc.__version__", "v1.0"):
-            # Call with all async mode parameters
             result = compiler.get_or_compile(
                 sample_hlo,
                 mock_config,
+                mock_job,
                 "lnc1",
-                workdir=str(workdir),
-                input_file=str(input_file),
                 output_file=str(output_file),
             )
 
@@ -467,7 +472,7 @@ class TestCompilerSubprocess:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_nfs_cache_miss_compilation(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
     ):
         """Test NFS cache miss triggers compilation."""
         mock_compile.return_value = sample_neff
@@ -477,14 +482,10 @@ class TestCompilerSubprocess:
         )
 
         with patch("neuronxcc.__version__", "v1.0"):
-            result = compiler.get_or_compile(
-                sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"]
-            )
+            result = compiler.get_or_compile(sample_hlo, mock_config, mock_job, "lnc1")
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(
-            sample_hlo, mock_config, "lnc1", "XLA", temp_dirs["local"], None, None
-        )
+        mock_compile.assert_called_once_with(sample_hlo, mock_config, mock_job, "lnc1", "XLA")
 
         # Verify NFS cache was populated
         key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")
@@ -496,30 +497,23 @@ class TestCompilerSubprocess:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_cache_miss_with_output_file_triggers_compilation(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
     ):
-        """Test cache miss with output_file triggers compilation."""
+        """Test cache miss with output_file triggers compilation and writes output."""
         mock_compile.return_value = sample_neff
 
         compiler = CompilerSubprocess(
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
 
-        # Setup async mode directories/files
-        workdir = temp_dirs["local"] / "workdir"
-        workdir.mkdir(parents=True, exist_ok=True)
-        input_file = workdir / "input.hlo.pb"
-        output_file = workdir / "output.neff"
-        input_file.write_bytes(sample_hlo)
+        output_file = temp_dirs["local"] / "output.neff"
 
         with patch("neuronxcc.__version__", "v1.0"):
-            # Call with all async mode parameters
             result = compiler.get_or_compile(
                 sample_hlo,
                 mock_config,
+                mock_job,
                 "lnc1",
-                workdir=str(workdir),
-                input_file=str(input_file),
                 output_file=str(output_file),
             )
 
@@ -527,6 +521,10 @@ class TestCompilerSubprocess:
 
         # Compilation should have been called
         mock_compile.assert_called_once()
+
+        # Output file should be written
+        assert output_file.exists()
+        assert output_file.read_bytes() == sample_neff
 
         # NFS cache should be populated
         with patch("neuronxcc.__version__", "v1.0"):
@@ -543,7 +541,7 @@ class TestConcurrency:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_concurrent_compilation_same_key(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
     ):
         """Test concurrent compilation with same cache key."""
 
@@ -560,7 +558,7 @@ class TestConcurrency:
 
         def compile_task():
             with patch("neuronxcc.__version__", "v1.0"):
-                return compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+                return compiler.get_or_compile(sample_hlo, mock_config, mock_job, "lnc1")
 
         # Run multiple threads concurrently
         with ThreadPoolExecutor(max_workers=5) as executor:
@@ -577,7 +575,7 @@ class TestConcurrency:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_concurrent_compilation_different_keys(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff
     ):
         """Test concurrent compilation with different cache keys."""
         mock_compile.return_value = sample_neff
@@ -588,7 +586,7 @@ class TestConcurrency:
 
         def compile_task(lnc_override):
             with patch("neuronxcc.__version__", "v1.0"):
-                return compiler.get_or_compile(sample_hlo, mock_config, lnc_override)
+                return compiler.get_or_compile(sample_hlo, mock_config, mock_job, lnc_override)
 
         # Run with different LNC overrides
         with ThreadPoolExecutor(max_workers=3) as executor:
@@ -625,7 +623,7 @@ class TestConcurrency:
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
     )
     def test_lock_timeout_handling(
-        self, mock_compile, temp_dirs, mock_config, sample_hlo, sample_neff, monkeypatch
+        self, mock_compile, temp_dirs, mock_config, mock_job, sample_hlo, sample_neff, monkeypatch
     ):
         """Test lock timeout handling."""
         monkeypatch.setenv("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "1")  # 1 second timeout
@@ -643,7 +641,7 @@ class TestConcurrency:
 
         def compile_task():
             with patch("neuronxcc.__version__", "v1.0"):
-                return compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
+                return compiler.get_or_compile(sample_hlo, mock_config, mock_job, "lnc1")
 
         # First task will acquire lock and start slow compilation
         # Second task should timeout waiting for lock
@@ -693,56 +691,30 @@ class TestIntegration:
 
     @patch("subprocess.run")
     @patch("shutil.which")
-    def test_end_to_end_compilation_sync(
+    def test_end_to_end_compilation(
         self, mock_which, mock_run, temp_dirs, mock_config, sample_hlo, sample_neff
     ):
-        """Test end-to-end compilation flow (sync mode)."""
+        """Test end-to-end compilation flow."""
         mock_which.return_value = "/usr/bin/neuronx-cc"
         mock_run.return_value = Mock(returncode=0, stderr="")
 
-        # Mock the file operations in compile_hlo_protobuf_to_neff
+        # Create a mock job that returns a real temp dir as workdir
+        mock_job = Mock()
+        workdir = temp_dirs["local"] / "workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        mock_job.get_neuronx_cc_workdir.return_value = workdir
+
         with (
-            patch("tempfile.TemporaryDirectory") as mock_tmpdir,
             patch("pathlib.Path.write_bytes"),
             patch("pathlib.Path.read_bytes", return_value=sample_neff),
         ):
-            mock_tmpdir.return_value.__enter__.return_value = "/tmp/test"
             result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                sample_hlo, mock_config, "lnc1"
+                sample_hlo, mock_config, mock_job, "lnc1"
             )
 
         assert result == sample_neff
         mock_run.assert_called_once()
-
-    @patch("subprocess.run")
-    @patch("shutil.which")
-    def test_end_to_end_compilation_async(
-        self, mock_which, mock_run, temp_dirs, mock_config, sample_hlo, sample_neff
-    ):
-        """Test end-to-end compilation flow (async mode)."""
-        # Setup async mode directories/files
-        workdir = temp_dirs["local"] / "workdir"
-        workdir.mkdir(parents=True, exist_ok=True)
-        input_file = workdir / "input.hlo.pb"
-        output_file = workdir / "output.neff"
-        input_file.write_bytes(sample_hlo)
-
-        # Setup mocks
-        def mock_side_effect(*args, **kwargs):
-            output_file.write_bytes(sample_neff)
-            return Mock(returncode=0, stderr="")
-
-        mock_which.return_value = "/usr/bin/neuronx-cc"
-        mock_run.side_effect = mock_side_effect
-
-        result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-            sample_hlo, mock_config, "lnc1", "XLA", workdir, input_file, output_file
-        )
-
-        assert output_file.exists()
-        assert output_file.read_bytes() == sample_neff
-        assert result == sample_neff
-        mock_run.assert_called_once()
+        mock_job.get_neuronx_cc_workdir.assert_called_once()
 
 
 class TestRaceConditions:
@@ -777,7 +749,7 @@ class TestRaceConditions:
         success_count = sum(1 for r in all_results if r.startswith("success"))
         assert success_count > 0
 
-    def test_cache_key_collision_handling(self, temp_dirs):
+    def test_cache_key_collision_handling(self, temp_dirs, mock_job):
         """Test handling of cache key collisions with concurrent access."""
         compiler = CompilerSubprocess(
             nfs_cache_dir=str(temp_dirs["nfs"]), local_cache_dir=str(temp_dirs["local"])
@@ -796,7 +768,7 @@ class TestRaceConditions:
         ]
 
         def compile_task(hlo_data, config, lnc_override):
-            return compiler.get_or_compile(hlo_data, config, lnc_override)
+            return compiler.get_or_compile(hlo_data, config, mock_job, lnc_override)
 
         # Apply patches at test level, not inside threads
         with (
@@ -810,7 +782,8 @@ class TestRaceConditions:
                 # Return different results based on input
                 hlo_data = args[0]
                 config = args[1]
-                lnc_override = args[2] if len(args) > 2 else None
+                # args[2] is job, args[3] is lnc_override
+                lnc_override = args[3] if len(args) > 3 else None
                 return f"compiled_{hash((hlo_data, str(config), lnc_override))}".encode()
 
             mock_compile.side_effect = mock_side_effect
@@ -825,7 +798,7 @@ class TestRaceConditions:
         # Others should be different
         assert len(set(results)) == 3  # 3 unique results from 4 tasks
 
-    def test_lock_contention_stress(self, temp_dirs, monkeypatch):
+    def test_lock_contention_stress(self, temp_dirs, mock_job, monkeypatch):
         """Stress test lock contention with many concurrent workers."""
         monkeypatch.setenv("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "5")  # 5 second timeout
 
@@ -853,7 +826,7 @@ class TestRaceConditions:
                     ),
                 ):
                     _ = compiler.get_or_compile(
-                        b"same_hlo_data", MockCompilerConfig("same_config"), "same_lnc"
+                        b"same_hlo_data", MockCompilerConfig("same_config"), mock_job, "same_lnc"
                     )
                 return f"success_{task_id}"
             except Exception as e:
@@ -872,7 +845,7 @@ class TestRaceConditions:
         # Only one compilation should have occurred due to locking
         assert compilation_count == 1
 
-    def test_process_cancellation_during_write(self, temp_dirs, sample_neff):
+    def test_process_cancellation_during_write(self, temp_dirs, mock_job, sample_neff):
         """Test atomic writes prevent corruption when process is cancelled."""
         nfs_dir = temp_dirs["nfs"]
         test_file = nfs_dir / "cancellation_test.neff"
@@ -906,7 +879,7 @@ class TestRaceConditions:
             ),
             patch("neuronxcc.__version__", "v1.0"),
         ):
-            result = compiler.get_or_compile(sample_hlo_data, mock_cfg, "lnc1")
+            result = compiler.get_or_compile(sample_hlo_data, mock_cfg, mock_job, "lnc1")
 
         # File should contain complete atomic data, not partial data
         assert result == sample_neff
@@ -915,7 +888,7 @@ class TestRaceConditions:
 class TestDeadlockPrevention:
     """Test deadlock prevention mechanisms."""
 
-    def test_no_deadlock_with_nested_locks(self, temp_dirs):
+    def test_no_deadlock_with_nested_locks(self, temp_dirs, mock_job):
         """Test that nested lock scenarios don't cause deadlocks."""
         compiler1 = CompilerSubprocess(
             nfs_cache_dir=str(temp_dirs["nfs"]), local_cache_dir=str(temp_dirs["local"])
@@ -926,10 +899,14 @@ class TestDeadlockPrevention:
         )
 
         def task1():
-            return compiler1.get_or_compile(b"hlo1", MockCompilerConfig("config1"), "lnc1")
+            return compiler1.get_or_compile(
+                b"hlo1", MockCompilerConfig("config1"), mock_job, "lnc1"
+            )
 
         def task2():
-            return compiler2.get_or_compile(b"hlo2", MockCompilerConfig("config2"), "lnc2")
+            return compiler2.get_or_compile(
+                b"hlo2", MockCompilerConfig("config2"), mock_job, "lnc2"
+            )
 
         # Run tasks that might compete for resources
         with (
@@ -951,7 +928,7 @@ class TestDeadlockPrevention:
         cache_files = list(nfs_dir.rglob("*.neff"))
         assert len(cache_files) == 2  # Two unique cache files created
 
-    def test_lock_timeout_prevents_deadlock(self, temp_dirs, monkeypatch):
+    def test_lock_timeout_prevents_deadlock(self, temp_dirs, mock_job, monkeypatch):
         """Test that lock timeouts prevent indefinite blocking."""
         monkeypatch.setenv("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "2")  # 2 second timeout
 
@@ -972,7 +949,9 @@ class TestDeadlockPrevention:
                     side_effect=very_slow_compile,
                 ),
             ):
-                return compiler.get_or_compile(b"hlo", MockCompilerConfig("config"), "lnc")
+                return compiler.get_or_compile(
+                    b"hlo", MockCompilerConfig("config"), mock_job, "lnc"
+                )
 
         def quick_task():
             with (
@@ -982,7 +961,9 @@ class TestDeadlockPrevention:
                 ) as mock,
             ):
                 mock.return_value = b"quick_result"
-                return compiler.get_or_compile(b"hlo", MockCompilerConfig("config"), "lnc")
+                return compiler.get_or_compile(
+                    b"hlo", MockCompilerConfig("config"), mock_job, "lnc"
+                )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Start long task first
@@ -1001,6 +982,291 @@ class TestDeadlockPrevention:
 
             with pytest.raises(Timeout):  # FileLock timeout
                 quick_future.result(timeout=5)
+
+
+class TestCompileHloProtobufToNeffWorkdir:
+    """Test compile_hlo_protobuf_to_neff working directory handling."""
+
+    @pytest.fixture
+    def mock_run_neuronx_cc(self):
+        """Mock run_neuronx_cc to avoid actual compilation."""
+        with patch.object(CompilerSubprocess, "run_neuronx_cc") as mock:
+            yield mock
+
+    def test_absolute_path_workdir_nonexistent(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that absolute path workdir is created if nonexistent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a path that doesn't exist yet
+            workdir = Path(tmpdir) / "nonexistent" / "nested" / "workdir"
+            assert not workdir.exists()
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            # Mock output file reading
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            # Verify workdir was created
+            assert workdir.exists()
+            assert workdir.is_dir()
+            assert result == expected_neff
+
+    def test_absolute_path_workdir_existent(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that existing absolute path workdir is used without error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "existing_workdir"
+            workdir.mkdir(parents=True)
+            assert workdir.exists()
+
+            # Add a pre-existing file to verify we don't destroy content
+            existing_file = workdir / "existing_file.txt"
+            existing_file.write_text("pre-existing content")
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            # Verify workdir still exists and pre-existing content preserved
+            assert workdir.exists()
+            assert existing_file.exists()
+            assert existing_file.read_text() == "pre-existing content"
+            assert result == expected_neff
+
+    def test_relative_path_workdir_nonexistent(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that relative path workdir is created if nonexistent."""
+        # Use a relative path within a temp directory context
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+
+                # Relative path that doesn't exist
+                relative_workdir = Path("relative") / "nested" / "workdir"
+                assert not relative_workdir.exists()
+
+                mock_job = Mock()
+                mock_job.get_neuronx_cc_workdir.return_value = relative_workdir
+
+                expected_neff = b"compiled_neff_data"
+                with patch.object(Path, "read_bytes", return_value=expected_neff):
+                    result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                        sample_hlo, mock_config, mock_job, "lnc1"
+                    )
+
+                # Verify relative workdir was created
+                assert relative_workdir.exists()
+                assert relative_workdir.is_dir()
+                assert result == expected_neff
+            finally:
+                os.chdir(original_cwd)
+
+    def test_relative_path_workdir_existent(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that existing relative path workdir is used without error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+
+                relative_workdir = Path("existing_relative_workdir")
+                relative_workdir.mkdir(parents=True)
+                assert relative_workdir.exists()
+
+                mock_job = Mock()
+                mock_job.get_neuronx_cc_workdir.return_value = relative_workdir
+
+                expected_neff = b"compiled_neff_data"
+                with patch.object(Path, "read_bytes", return_value=expected_neff):
+                    result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                        sample_hlo, mock_config, mock_job, "lnc1"
+                    )
+
+                assert relative_workdir.exists()
+                assert result == expected_neff
+            finally:
+                os.chdir(original_cwd)
+
+    def test_workdir_files_created_correctly(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that HLO input file is created in workdir with correct content."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "workdir"
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+
+            # Use actual file operations to verify HLO file creation
+            def mock_read_bytes(self):
+                # Only return NEFF for output file
+                if self.name == "module.neff":
+                    return expected_neff
+                raise FileNotFoundError(f"Unexpected read: {self}")
+
+            with patch.object(Path, "read_bytes", mock_read_bytes):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            # Verify HLO file was created with correct content
+            hlo_file = workdir / "module.hlo.pb"
+            assert hlo_file.exists()
+            assert hlo_file.read_bytes() == sample_hlo
+            assert result == expected_neff
+
+    def test_workdir_stablehlo_ir_type(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that StableHLO IR type creates correct input file name."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "workdir"
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+
+            def mock_read_bytes(self):
+                if self.name == "module.neff":
+                    return expected_neff
+                raise FileNotFoundError(f"Unexpected read: {self}")
+
+            with patch.object(Path, "read_bytes", mock_read_bytes):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1", ir_type="StableHLO"
+                )
+
+            # Verify MLIR file was created (not HLO)
+            mlir_file = workdir / "module.mlir"
+            hlo_file = workdir / "module.hlo.pb"
+            assert mlir_file.exists()
+            assert not hlo_file.exists()
+            assert mlir_file.read_bytes() == sample_hlo
+            assert result == expected_neff
+
+    def test_workdir_run_neuronx_cc_called_with_correct_args(
+        self, mock_run_neuronx_cc, mock_config, sample_hlo
+    ):
+        """Test that run_neuronx_cc is called with correct file names and workdir."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "workdir"
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc_override"
+                )
+
+            # Verify run_neuronx_cc was called with correct arguments
+            mock_run_neuronx_cc.assert_called_once_with(
+                mock_config,
+                "module.hlo.pb",  # Input file name (relative)
+                "module.neff",  # Output file name (relative)
+                "lnc_override",
+                str(workdir),  # Working directory
+            )
+
+    def test_workdir_deeply_nested_path(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that deeply nested workdir paths are created correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a deeply nested path
+            workdir = Path(tmpdir) / "a" / "b" / "c" / "d" / "e" / "workdir"
+            assert not workdir.exists()
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            # Verify entire path structure was created
+            assert workdir.exists()
+            assert workdir.is_dir()
+            assert (Path(tmpdir) / "a" / "b" / "c" / "d" / "e").exists()
+            assert result == expected_neff
+
+    def test_workdir_with_special_characters_in_path(
+        self, mock_run_neuronx_cc, mock_config, sample_hlo
+    ):
+        """Test workdir with special characters in path name."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Path with spaces and special chars (common in user directories)
+            workdir = Path(tmpdir) / "work dir" / "test-path_123"
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            assert workdir.exists()
+            assert result == expected_neff
+
+    def test_workdir_symlink_path(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test that symlinked workdir path works correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create actual directory and symlink to it
+            actual_dir = Path(tmpdir) / "actual_workdir"
+            actual_dir.mkdir()
+            symlink_path = Path(tmpdir) / "symlink_workdir"
+            symlink_path.symlink_to(actual_dir)
+
+            mock_job = Mock()
+            mock_job.get_neuronx_cc_workdir.return_value = symlink_path
+
+            expected_neff = b"compiled_neff_data"
+            with patch.object(Path, "read_bytes", return_value=expected_neff):
+                result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    sample_hlo, mock_config, mock_job, "lnc1"
+                )
+
+            # Verify symlink is followed
+            assert symlink_path.exists()
+            assert symlink_path.is_symlink()
+            # HLO file should be created in actual directory via symlink
+            hlo_file = symlink_path / "module.hlo.pb"
+            assert hlo_file.exists()
+            assert result == expected_neff
+
+    def test_workdir_current_directory(self, mock_run_neuronx_cc, mock_config, sample_hlo):
+        """Test using current directory (.) as workdir."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+
+                workdir = Path(".")
+
+                mock_job = Mock()
+                mock_job.get_neuronx_cc_workdir.return_value = workdir
+
+                expected_neff = b"compiled_neff_data"
+                with patch.object(Path, "read_bytes", return_value=expected_neff):
+                    result = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                        sample_hlo, mock_config, mock_job, "lnc1"
+                    )
+
+                # Verify files created in current directory
+                hlo_file = Path(".") / "module.hlo.pb"
+                assert hlo_file.exists()
+                assert result == expected_neff
+            finally:
+                os.chdir(original_cwd)
 
 
 class TestMultiNodeSimulation:
@@ -1035,7 +1301,7 @@ class TestMultiNodeSimulation:
         unique_results = set(successful_results)
         assert len(unique_results) == 1  # Only one unique result due to caching
 
-    def test_node_failure_recovery(self, temp_dirs):
+    def test_node_failure_recovery(self, temp_dirs, mock_job):
         """Test recovery when a node fails during compilation."""
         nfs_dir = str(temp_dirs["nfs"])
         local_dir = str(temp_dirs["local"])
@@ -1056,7 +1322,9 @@ class TestMultiNodeSimulation:
                 ),
             ):
                 try:
-                    return compiler.get_or_compile(b"hlo", MockCompilerConfig("config"), "lnc")
+                    return compiler.get_or_compile(
+                        b"hlo", MockCompilerConfig("config"), mock_job, "lnc"
+                    )
                 except Exception as e:
                     return f"failed: {e}"
 
@@ -1073,7 +1341,9 @@ class TestMultiNodeSimulation:
                 ) as mock,
             ):
                 mock.return_value = b"recovery_success"
-                return compiler.get_or_compile(b"hlo", MockCompilerConfig("config"), "lnc")
+                return compiler.get_or_compile(
+                    b"hlo", MockCompilerConfig("config"), mock_job, "lnc"
+                )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             failing_future = executor.submit(failing_node)

@@ -97,11 +97,11 @@ class NKIRegistry:
         assert idx in self.kernel_default_args
         return self.kernel_default_args[idx]
 
-    def add_constant_args(self, args: dict[str, Any], hash_key: int):
+    def add_constant_args(self, args: dict[str, Any], hash_key: int | str):
         assert hash_key != -1
         self.constant_args[hash_key] = args
 
-    def get_constant_args(self, hash_key: int) -> dict[str, Any]:
+    def get_constant_args(self, hash_key: int | str) -> dict[str, Any]:
         # Returns the constant args
         assert hash_key in self.constant_args
         return self.constant_args[hash_key]
@@ -215,7 +215,6 @@ def nki_kernel_wrapper_meta(
 
 
 def get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key):
-    kernel = kernel_registry.get_kernel(kernel_idx)
     if constant_args_key == -1:
         tensor_args = []
         tensor_arg_names = []
@@ -227,7 +226,7 @@ def get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args
                 tensor_arg_names.append(name)
             else:
                 constant_args[name] = arg
-        constant_args_key = kernel._generate_hash_key(constant_args)
+        constant_args_key = str(tuple((k, v) for k, v in sorted(constant_args.items())))
         kernel_registry.add_constant_args(constant_args, constant_args_key)
     else:
         tensor_args = args

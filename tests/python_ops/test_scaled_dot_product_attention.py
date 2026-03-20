@@ -14,6 +14,7 @@ from tests.utils.neuron_test_utils import (
 )
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.python_ops.base import ExecutionResult
+from torch_neuronx.python_ops.compilation import hlo_cache
 from torch_neuronx.utils import use_mlir_aten_ops
 
 
@@ -512,36 +513,38 @@ def test_sdpa_ir_cache_correctness(mock_compiler):
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
 
-    device = torch.device("neuron", 0)
-    batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 128
+    # Disable persistent cache
+    with patch.object(hlo_cache, "_enabled", False):
+        device = torch.device("neuron", 0)
+        batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 128
 
-    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    initial_count = mock_compiler.call_count
+        initial_count = mock_compiler.call_count
 
-    # First call - should trace and cache IR
-    with torch.no_grad():
-        output1 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # First call - should trace and cache IR
+        with torch.no_grad():
+            output1 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
-    traced_call_count = mock_compiler.call_count
-    # Second call - should use cached IR (cache size unchanged)
-    with torch.no_grad():
-        output2 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
+        # Second call - should use cached IR (cache size unchanged)
+        with torch.no_grad():
+            output2 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
-    # Third call - should also use cached IR (cache size unchanged)
-    with torch.no_grad():
-        output3 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # Third call - should also use cached IR (cache size unchanged)
+        with torch.no_grad():
+            output3 = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
-    # Verify outputs are consistent
-    torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(output1.cpu(), output3.cpu(), rtol=1e-5, atol=1e-5)
+        # Verify outputs are consistent
+        torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(output1.cpu(), output3.cpu(), rtol=1e-5, atol=1e-5)
 
 
 @patch(
@@ -553,42 +556,44 @@ def test_sdpa_ir_cache_different_inputs_same_shape(mock_compiler):
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
 
-    device = torch.device("neuron", 0)
-    batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 64
+    # Disable persistent cache
+    with patch.object(hlo_cache, "_enabled", False):
+        device = torch.device("neuron", 0)
+        batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 64
 
-    # First call with specific input values
-    torch.manual_seed(42)
-    q1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    k1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    v1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        # First call with specific input values
+        torch.manual_seed(42)
+        q1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        k1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        v1 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    initial_count = mock_compiler.call_count
+        initial_count = mock_compiler.call_count
 
-    with torch.no_grad():
-        output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
+        with torch.no_grad():
+            output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
-    traced_call_count = mock_compiler.call_count
+        assert mock_compiler.call_count >= initial_count + 1, "Compiler was not called as expected"
+        traced_call_count = mock_compiler.call_count
 
-    # Second call with different input values but same shapes - should hit cache
-    torch.manual_seed(123)
-    q2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    k2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    v2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        # Second call with different input values but same shapes - should hit cache
+        torch.manual_seed(123)
+        q2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        k2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        v2 = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    with torch.no_grad():
-        output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
+        with torch.no_grad():
+            output2 = F.scaled_dot_product_attention(q2, k2, v2, dropout_p=0.0, is_causal=False)
 
-    assert mock_compiler.call_count == traced_call_count, "Compiler called again"
+        assert mock_compiler.call_count == traced_call_count, "Compiler called again"
 
-    # Verify shapes are the same
-    assert output1.shape == output2.shape
+        # Verify shapes are the same
+        assert output1.shape == output2.shape
 
-    # Verify outputs are different (since inputs are different)
-    # Use a threshold to ensure they're meaningfully different
-    # TODO: sub fails with non-contiguous tensors when MLIR is enabled, needs fix
-    diff = torch.abs(output1.cpu() - output2.cpu()).mean().item()
-    assert diff > 1e-3, f"Outputs should be different with different inputs, but diff={diff}"
+        # Verify outputs are different (since inputs are different)
+        # Use a threshold to ensure they're meaningfully different
+        # TODO: sub fails with non-contiguous tensors when MLIR is enabled, needs fix
+        diff = torch.abs(output1.cpu() - output2.cpu()).mean().item()
+        assert diff > 1e-3, f"Outputs should be different with different inputs, but diff={diff}"
 
 
 @patch(
@@ -597,6 +602,12 @@ def test_sdpa_ir_cache_different_inputs_same_shape(mock_compiler):
 )
 def test_sdpa_ir_cache_different_shapes(mock_compiler):
     """Test that IR cache creates separate entries for different shapes and different inputs."""
+    # Disable HLO persistent cache — this test asserts on tracer call counts
+    from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
+
+    _orig_enabled = _hlo_cache_mod._enabled
+    _hlo_cache_mod._enabled = False
+
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
 
@@ -606,9 +617,9 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
 
     # First shape: batch_size=2, num_heads=4, seq_len=128, head_dim=64
     torch.manual_seed(42)
-    q1 = torch.randn(2, 4, 512, 128, device=device)
-    k1 = torch.randn(2, 4, 512, 128, device=device)
-    v1 = torch.randn(2, 4, 512, 128, device=device)
+    q1 = torch.randn(1, 4, 512, 128, device=device)
+    k1 = torch.randn(1, 4, 512, 128, device=device)
+    v1 = torch.randn(1, 4, 512, 128, device=device)
 
     with torch.no_grad():
         output1 = F.scaled_dot_product_attention(q1, k1, v1, dropout_p=0.0, is_causal=False)
@@ -629,9 +640,9 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     traced_call_count = mock_compiler.call_count
     # Third call with first shape again - should hit cache (size stays at 2)
     torch.manual_seed(456)
-    q3 = torch.randn(2, 4, 512, 128, device=device)
-    k3 = torch.randn(2, 4, 512, 128, device=device)
-    v3 = torch.randn(2, 4, 512, 128, device=device)
+    q3 = torch.randn(1, 4, 512, 128, device=device)
+    k3 = torch.randn(1, 4, 512, 128, device=device)
+    v3 = torch.randn(1, 4, 512, 128, device=device)
 
     with torch.no_grad():
         output3 = F.scaled_dot_product_attention(q3, k3, v3, dropout_p=0.0, is_causal=False)
@@ -639,9 +650,11 @@ def test_sdpa_ir_cache_different_shapes(mock_compiler):
     assert mock_compiler.call_count == traced_call_count, "Compiler was not called as expected"
 
     # Verify output shapes
-    assert output1.shape == (2, 4, 512, 128)
+    assert output1.shape == (1, 4, 512, 128)
     assert output2.shape == (1, 8, 512, 128)
-    assert output3.shape == (2, 4, 512, 128)
+    assert output3.shape == (1, 4, 512, 128)
+
+    _hlo_cache_mod._enabled = _orig_enabled
 
 
 def test_scaled_dot_product_attention_uses_mlir_with_dropout():

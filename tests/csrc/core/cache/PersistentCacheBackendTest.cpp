@@ -156,13 +156,9 @@ TEST_F(PersistentCacheBackendTest, XXH3KeyFormat) {
 }
 
 TEST_F(PersistentCacheBackendTest, DifferentIRBytesDifferentKeys) {
-  // Verify that different IR bytes produce different cache keys
-  std::string base_key = "same_op_name";
-  std::vector<uint8_t> ir1 = {0x01, 0x02, 0x03};  // Version 1 IR
-  std::vector<uint8_t> ir2 = {0x04, 0x05, 0x06};  // Version 2 IR
-
-  std::string key1 = MakeCacheKey(base_key, ir1);
-  std::string key2 = MakeCacheKey(base_key, ir2);
+  // Verify that different base keys produce different cache keys
+  std::string key1 = MakeCacheKey("op_version_1");
+  std::string key2 = MakeCacheKey("op_version_2");
 
   std::vector<uint8_t> data1 = {0xAA};
   std::vector<uint8_t> data2 = {0xBB};

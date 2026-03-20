@@ -8,6 +8,7 @@ custom backends to provide their own optimized attention implementations.
 import math
 
 import torch
+from torch._meta_registrations import alloc_with_matching_layout
 
 from torch_neuronx.neuron_dynamo_backend.decompositions import (
     _can_use_nki_flash_attention,
@@ -15,6 +16,18 @@ from torch_neuronx.neuron_dynamo_backend.decompositions import (
 )
 
 from .base import AttentionOpImpl, ExecutionResult, Operation
+
+
+def match_layout(
+    source: torch.Tensor, reference: torch.Tensor, out: torch.Tensor = None
+) -> torch.Tensor:
+    """Return source with the same layout as reference, copying only if needed, in out tensor."""
+    if source.stride() == reference.stride():
+        return source
+    if out is None:
+        out = torch.empty_like(reference)
+    out.copy_(source)
+    return out
 
 
 class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
@@ -121,6 +134,20 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
                 seed=philox_seed if dropout_p > 0.0 else None,
                 lse=lse if training else None,
             )
+
+            # Create output tensor as done in meta__scaled_dot_product_fused_attention_overrideable
+            # Output shape: (batch_size, q_heads, seq_len_q, embed_v)
+            # https://github.com/pytorch/pytorch/blob/ca36c84c34589f26f98510addb89ad3e20acfe8b/torch/_meta_registrations.py#L5964
+            # Expected behavior is output should have same stride as input query tensor. So,
+            # attn_output should be contiguous if input query tensor is contiguous. Similarly,
+            # if input query is non-contiguous (most common), result should be non-contiguous.
+
+            # Previously, we did this, which works for non-contiguous input query
+            # tensor but runs into error for contiguous case.
+            # attn_output = attn_output.transpose(1, 2).contiguous().transpose(1, 2)
+
+            out = alloc_with_matching_layout(query, (batch_size, q_heads, seq_len_q, embed_v))
+            attn_output = match_layout(attn_output, out, out)
 
             # Check if this is the single-tensor version
             if hasattr(self, "_returns_single_tensor"):
@@ -278,6 +305,10 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
                 scale=scale,
                 seed=seed,
             )
+
+            grad_q = match_layout(grad_q, query)
+            grad_k = match_layout(grad_k, key)
+            grad_v = match_layout(grad_v, value)
 
             # grad_attn_bias is None since we don't support it yet
             grad_attn_bias = None

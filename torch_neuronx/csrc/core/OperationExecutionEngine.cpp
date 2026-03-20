@@ -73,15 +73,11 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
     }
   }
 
-  // Start worker threads
-  compilation_thread_ = std::thread(&OperationExecutionEngine::CompilationWorker, this);
-  // Start execution worker thread
-  execution_thread_ = std::thread(&OperationExecutionEngine::AsyncExecutionWorker, this);
+  runtime_thread_ = std::thread(&OperationExecutionEngine::RuntimeWorker, this);
 
   TORCH_NEURONX_DEBUG("OperationExecutionEngine worker threads started",
                       "concatenation_enabled=", concatenation_enabled_,
-                      "compilation_thread_id=", compilation_thread_.get_id(),
-                      "execution_thread_id=", execution_thread_.get_id());
+                      "runtime_thread_id=", runtime_thread_.get_id());
 }
 
 OperationExecutionEngine::~OperationExecutionEngine() { Shutdown(); }
@@ -97,44 +93,79 @@ void OperationExecutionEngine::Shutdown() {
   if (concatenation_enabled_) {
     concatenation_cv_.notify_all();
   }
-  compilation_cv_.notify_all();
-  execution_cv_.notify_all();
+  runtime_cv_.notify_all();
 
   if (concatenation_enabled_ && concatenation_thread_.joinable()) {
     concatenation_thread_.join();
   }
-  if (compilation_thread_.joinable()) {
-    compilation_thread_.join();
-  }
-  if (execution_thread_.joinable()) {
-    execution_thread_.join();
+  if (runtime_thread_.joinable()) {
+    runtime_thread_.join();
   }
   TORCH_NEURONX_DEBUG("OperationExecutionEngine shutdown complete");
 }
 
-void OperationExecutionEngine::CompilationWorker() {
-  TORCH_NEURONX_DEBUG("Compilation worker thread started");
+void OperationExecutionEngine::RuntimeWorker() {
+  TORCH_NEURONX_DEBUG("Runtime worker thread started");
+  auto devices = c10_neuron::get_visible_device_indices();
 
   while (true) {
-    // Wait for a task or shutdown signal
-    std::unique_lock<std::mutex> lock(compilation_mutex_);
-    compilation_cv_.wait(lock, [this] {
-      return !compilation_queue_.empty() || shutdown_requested_.load(std::memory_order_acquire);
-    });
+    bool work_done = false;
 
-    if (shutdown_requested_.load(std::memory_order_acquire) && compilation_queue_.empty()) {
+    CheckCompletions();
+
+    for (auto device : devices) {
+      ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
+        OperationContext* operation = stream_impl->GetNextOperationToSchedule();
+        if (operation != nullptr) {
+          DispatchAsyncExecutionTask(operation);
+          work_done = true;
+        }
+        return false;
+      });
+    }
+
+    if (CompileNextPending()) {
+      work_done = true;
+    }
+
+    if (work_done) {
+      continue;
+    }
+
+    if (HasPendingAsyncOperations()) {
+      if (shutdown_requested_.load(std::memory_order_acquire)) {
+        break;
+      }
+      continue;
+    }
+
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
       break;
     }
 
-    if (!compilation_queue_.empty()) {
-      OperationContext* operation = compilation_queue_.front();
-      compilation_queue_.pop_front();
-      lock.unlock();
-
-      ProcessPrepareTask(operation);
+    {
+      std::unique_lock<std::mutex> lock(runtime_mutex_);
+      runtime_cv_.wait(lock, [this] {
+        return runtime_pending_ || shutdown_requested_.load(std::memory_order_acquire);
+      });
+      runtime_pending_ = false;
     }
   }
-  TORCH_NEURONX_DEBUG("Compilation worker thread terminated");
+  TORCH_NEURONX_DEBUG("Runtime worker thread terminated");
+}
+
+bool OperationExecutionEngine::CompileNextPending() {
+  OperationContext* operation = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    if (compilation_queue_.empty()) {
+      return false;
+    }
+    operation = compilation_queue_.front();
+    compilation_queue_.pop_front();
+  }
+  ProcessPrepareTask(operation);
+  return true;
 }
 
 void OperationExecutionEngine::ProcessPrepareTask(OperationContext* operation) noexcept {
@@ -155,9 +186,9 @@ void OperationExecutionEngine::ProcessPrepareTask(OperationContext* operation) n
       operation->MarkExecutionReady();
     }
   } catch (const torch_neuronx::CompilationRuntimeException& e) {
-    stream->HandleErrorWithCleanup(operation, e);
-  } catch (const std::exception& e) {
-    stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(e.what()));
+    operation->MarkExecutionReady();
+  } catch (...) {
+    stream->HandleErrorWithExceptionPtr(operation, std::current_exception());
   }
   NotifyExecutionReady();
 }
@@ -177,9 +208,7 @@ void OperationExecutionEngine::HandleCompilationComplete(OperationContext* opera
   const std::string& op_name = operation->GetOpName();
 
   if (!operation->GetCompilableKernel().HasCachedNeff()) {
-    stream->HandleErrorWithCleanup(operation,
-                                   torch_neuronx::CompilationRuntimeException(
-                                       "NEFF creation failed for operation: " + op_name));
+    operation->MarkExecutionReady();
     return;
   }
 
@@ -196,16 +225,9 @@ void OperationExecutionEngine::HandleCompilationComplete(OperationContext* opera
     try {
       ProcessCompilationTask(concat_op);
     } catch (const torch_neuronx::CompilationRuntimeException& e) {
-      // Encountered compiler error fallback to op by op
-      TORCH_NEURONX_ERROR("Compilation failed for concatenated op:", concat_op, "op_name:", op_name,
-                          "with exception: ", e.what());
       concat_op->stream->HandleErrorWithCleanup(concat_op, e);
-    } catch (const std::exception& e) {
-      // Encountered compiler error fallback to op by op
-      TORCH_NEURONX_ERROR("Compilation failed for concatenated op:", concat_op, "op_name:", op_name,
-                          "with exception: ", e.what());
-      concat_op->stream->HandleErrorWithCleanup(
-          concat_op, torch_neuronx::CompilationRuntimeException(e.what()));
+    } catch (...) {
+      concat_op->stream->HandleErrorWithExceptionPtr(concat_op, std::current_exception());
     }
   }
 }
@@ -223,12 +245,10 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
   if (compilation_cache_->IsServiceBackend()) {
     // Service active: async path with thread pool
     compilation_cache_->GetOrCompileNeffAsync(kernel, stream_id, [this, operation](bool success) {
-      if (!success) {
-        operation->stream->HandleErrorWithCleanup(
-            operation, torch_neuronx::CompilationRuntimeException(
-                           "NEFF creation failed for operation: " + operation->GetOpName()));
-      } else {
+      if (success) {
         HandleCompilationComplete(operation);
+      } else {
+        operation->MarkExecutionReady();
       }
       NotifyExecutionReady();
     });
@@ -240,53 +260,12 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
   HandleCompilationComplete(operation);
 }
 
-void OperationExecutionEngine::AsyncExecutionWorker() {
-  TORCH_NEURONX_DEBUG("NRT-Asynchronous execution worker thread started");
-  auto devices = c10_neuron::get_visible_device_indices();
-
-  while (true) {
-    bool work_found;
-    do {
-      work_found = false;
-
-      // First, check for completions
-      CheckCompletions();
-
-      // Then dispatch new ready operations (only iterate visible devices)
-      for (auto device : devices) {
-        ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
-          OperationContext* operation = stream_impl->GetNextOperationToSchedule();
-          if (operation != nullptr) {
-            DispatchAsyncExecutionTask(operation);
-            work_found = true;
-          }
-          return false;
-        });
-      }
-    } while (work_found);
-
-    // Only wait if there are no pending operations to poll
-    if (!HasPendingAsyncOperations()) {
-      std::unique_lock<std::mutex> lock(execution_mutex_);
-      execution_cv_.wait(lock, [this] {
-        return execution_pending_ || shutdown_requested_.load(std::memory_order_acquire);
-      });
-      execution_pending_ = false;
-    }
-
-    if (shutdown_requested_.load(std::memory_order_acquire) && !HasPendingAsyncOperations()) {
-      break;
-    }
-  }
-  TORCH_NEURONX_DEBUG("NRT-Asynchronous execution worker thread terminated");
-}
-
 void OperationExecutionEngine::NotifyExecutionReady() {
   {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    execution_pending_ = true;
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    runtime_pending_ = true;
   }
-  execution_cv_.notify_one();
+  runtime_cv_.notify_one();
 }
 
 void OperationExecutionEngine::SubmitOperation(OperationContext* operation) {
@@ -317,10 +296,11 @@ void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation
   }
 
   {
-    std::lock_guard<std::mutex> lock(compilation_mutex_);
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
     compilation_queue_.push_back(operation);
+    runtime_pending_ = true;
   }
-  compilation_cv_.notify_one();
+  runtime_cv_.notify_one();
 }
 
 void OperationExecutionEngine::ConcatenationWorker() {
@@ -531,26 +511,41 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
   const std::string operation_name = operation->GetOpName();
 
   try {
+    // If the kernel is schedulable, requires compilation but does not have a
+    // cached NEFF, it denotes a failed compilation. Propagate the exception for
+    // recovery (e.g. CPU fallback). Ensure that prior ops complete first.
+    if (operation->RequiresCompilation() && !operation->GetCompilableKernel().HasCachedNeff()) {
+      if (!stream->HasPendingAsyncOperations()) {
+        stream->HandleErrorWithCleanup(
+            operation, torch_neuronx::CompilationRuntimeException(
+                           "NEFF creation failed for operation: " + operation_name));
+      }
+      return;
+    }
+
     TORCH_NEURONX_DEBUG("Processing async execution task", "stream_id=", stream->stream_id,
                         "operation_name=", operation_name);
     bool scheduled = ScheduleOperation(operation, stream);
 
-    if (scheduled && torch_neuronx::shouldLogExecuted(operation_name)) {
-      torch_neuronx::NeuronLogger::getInstance().log(
-          torch_neuronx::LogLevel::INFO, torch_neuronx::LogCategory::OPERATOR_EXECUTED,
-          "Operator '" + operation_name + "' executed on Neuron (async)");
-      torch_neuronx::markExecutedLogged(operation_name);
+    if (scheduled) {
+      torch_neuronx::logOperationExecuted(operation_name);
+      // Also log the concatenated op name if this cascading op has one,
+      // so it appears in the "Executed ops" report alongside individual ops
+      if (operation->HasConcatenatedOperation() && !operation->IsConcatenatedOperation()) {
+        auto* concat_op = operation->GetConcatenatedOperation();
+        torch_neuronx::logOperationExecuted(concat_op->GetOpName());
+      }
     }
   } catch (const torch_neuronx::ExecutionRuntimeException& e) {
     stream->HandleErrorWithCleanup(operation, e);
-  } catch (const std::exception& e) {
-    stream->HandleErrorWithCleanup(operation, torch_neuronx::ExecutionRuntimeException(e.what()));
+  } catch (...) {
+    stream->HandleErrorWithExceptionPtr(operation, std::current_exception());
   }
 }
 
 namespace {
 // Helper to check if an operation is complete using explicit nrta_is_completed API.
-bool IsOperationComplete(nrt::SequenceId seq_id, nrt::SequenceId completed_seq) {
+bool IsOperationComplete(nrt::SequenceId seq_id) {
   bool is_completed = false;
   NRT_STATUS status = nrt::IsNRTAsyncRequestCompleted(seq_id, &is_completed);
   if (status != NRT_SUCCESS) {
@@ -573,12 +568,8 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
       if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
         auto* concat_op = op_ptr->GetConcatenatedOperation();
         if (concat_op->nrt_async_state_.is_scheduled) {
-          size_t xu_idx = GetXUIndex(concat_op->GetKernelType());
-          int queue = nrt::GetHardwareQueue(static_cast<nrta_xu_t>(xu_idx), stream->stream_id);
           nrt::SequenceId concat_seq_id = concat_op->nrt_async_state_.sequence_id;
-          nrt::SequenceId completed_seq =
-              stream->xu_completed_seqs_.Get(static_cast<nrta_xu_t>(xu_idx), queue);
-          if (IsOperationComplete(concat_seq_id, completed_seq)) {
+          if (IsOperationComplete(concat_seq_id)) {
             ops_to_complete.push_back(op_ptr.get());
             continue;
           }
@@ -588,12 +579,8 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
 
       // Regular operation
       if (op_ptr->nrt_async_state_.is_scheduled) {
-        size_t xu_idx = GetXUIndex(op_ptr->GetKernelType());
-        int queue = nrt::GetHardwareQueue(static_cast<nrta_xu_t>(xu_idx), stream->stream_id);
         nrt::SequenceId op_seq_id = op_ptr->nrt_async_state_.sequence_id;
-        nrt::SequenceId completed_seq =
-            stream->xu_completed_seqs_.Get(static_cast<nrta_xu_t>(xu_idx), queue);
-        if (IsOperationComplete(op_seq_id, completed_seq)) {
+        if (IsOperationComplete(op_seq_id)) {
           ops_to_complete.push_back(op_ptr.get());
         } else {
           break;
@@ -616,8 +603,8 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
                                        op->stream_id);
         op->nrt_status_ = NRT_SUCCESS;  // Host-side ops don't submit NRT work
         stream->CompleteOperation(op);
-      } catch (const std::exception& e) {
-        stream->HandleErrorWithCleanup(op, torch_neuronx::ExecutionRuntimeException(e.what()));
+      } catch (...) {
+        stream->HandleErrorWithExceptionPtr(op, std::current_exception());
       }
       pending_async_ops_count_.fetch_sub(1);
     } else if (op->HasConcatenatedOperation() && !op->IsConcatenatedOperation()) {

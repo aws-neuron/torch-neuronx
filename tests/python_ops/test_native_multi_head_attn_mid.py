@@ -13,6 +13,7 @@ from tests.utils.neuron_test_utils import (
     track_neuron_ops,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
 from torch_neuronx.python_ops.native_multi_head_attn_mid import NativeMultiHeadAttnMidOp
 from torch_neuronx.python_ops.native_multi_head_attn_prefix import NativeMultiHeadAttnPrefixOp
 
@@ -322,9 +323,11 @@ class TestNativeMultiHeadAttnMid:
     )
     def test_mid_attn_ir_cache_correctness(self, mock_compiler):
         """Test that IR cache is properly incremented and hit on subsequent calls."""
+        _orig_enabled = _hlo_cache_mod._enabled
+        _hlo_cache_mod._enabled = False
 
-        batch_size = 2
-        num_heads = 4
+        batch_size = 1
+        num_heads = 2
         seq_len = 2048
         d_head = 128
 
@@ -345,6 +348,7 @@ class TestNativeMultiHeadAttnMid:
 
         # Verify outputs are consistent
         torch.testing.assert_close(output1.cpu(), output2.cpu(), rtol=1e-5, atol=1e-5)
+        _hlo_cache_mod._enabled = _orig_enabled
 
     @patch(
         "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
@@ -352,8 +356,10 @@ class TestNativeMultiHeadAttnMid:
     )
     def test_mid_attn_ir_cache_different_inputs_same_shape(self, mock_compiler):
         """Test IR cache hit with different inputs, same shapes."""
+        _orig_enabled = _hlo_cache_mod._enabled
+        _hlo_cache_mod._enabled = False
         batch_size = 2
-        num_heads = 4
+        num_heads = 5
         seq_len = 2048
         d_head = 128
 
@@ -391,6 +397,7 @@ class TestNativeMultiHeadAttnMid:
         print(
             f"Mid Attention IR Cache with different inputs: outputs differ by {diff:.6f} (expected)"
         )
+        _hlo_cache_mod._enabled = _orig_enabled
 
     @patch(
         "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
@@ -398,8 +405,10 @@ class TestNativeMultiHeadAttnMid:
     )
     def test_mid_attn_ir_cache_different_shapes(self, mock_compiler):
         """Test that IR cache creates separate entries for different shapes and different inputs."""
+        _orig_enabled = _hlo_cache_mod._enabled
+        _hlo_cache_mod._enabled = False
         batch_size = 2
-        num_heads = 4
+        num_heads = 6
         d_head = 128
 
         # First shape: seq_len = 2048
@@ -441,3 +450,4 @@ class TestNativeMultiHeadAttnMid:
         assert output1.shape == (batch_size, num_heads, seq_len1, d_head)
         assert output2.shape == (batch_size, num_heads, seq_len2, d_head)
         assert output3.shape == (batch_size, num_heads, seq_len1, d_head)
+        _hlo_cache_mod._enabled = _orig_enabled

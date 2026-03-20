@@ -37,10 +37,6 @@ except ImportError:
     DEFAULT_MLIR_ATEN_OPS = "1"
     DEFAULT_RETAIN_DEVICE_MODE = "0"
 
-# For some reason log level is being set to TRACE without this
-if "JAX_LOGGING_LEVEL" not in os.environ:
-    os.environ["JAX_LOGGING_LEVEL"] = "WARNING"
-
 # Set defaults from build-time configuration
 # Users can still override these at runtime
 os.environ.setdefault("NEURON_LAUNCH_BLOCKING", DEFAULT_SYNC_MODE)
@@ -66,6 +62,13 @@ os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
+
+# Set default debug directory
+os.environ.setdefault("TORCH_NEURONX_DEBUG_DIR", "/tmp/neuron_backend")
+
+# Disable artifact preservation by default
+os.environ.setdefault("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "0")
+
 # Import and register neuron device
 try:
     from . import _C
@@ -177,6 +180,9 @@ def _after_fork(arg):
 
 # Register fork handler
 os.register_at_fork(after_in_child=_after_fork)
+
+# HLO persistent cache configuration (enabled by default, disable with TORCH_NEURONX_HLO_CACHE=0)
+os.environ.setdefault("TORCH_NEURONX_HLO_CACHE", "1")
 
 # Register Python operations first
 python_ops.register_python_operations()

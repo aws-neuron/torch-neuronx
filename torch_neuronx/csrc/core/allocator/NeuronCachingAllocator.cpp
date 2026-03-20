@@ -402,6 +402,7 @@ class NeuronAllocator : public c10::Allocator {
   NeuronAllocator() = default;
 
   c10::DataPtr allocate(size_t size) override {
+    torch_neuronx::maybe_lazy_init();
     auto device = c10_neuron::current_device();
     auto stream = at::neuron::getCurrentNeuronStream(device);
     // Get memory stats for this device

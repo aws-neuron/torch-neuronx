@@ -363,3 +363,10 @@ def reset_dynamo(request):
     import torch._dynamo
 
     torch._dynamo.reset()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Print S3 results URL after all tests complete (outside pytest capture)."""
+    s3_url = getattr(session.config, "_aten_upstream_results_s3_url", None)
+    if s3_url:
+        print(f"\nINFO: [ATEN_UPSTREAM_RESULTS] S3 results folder: {s3_url}")

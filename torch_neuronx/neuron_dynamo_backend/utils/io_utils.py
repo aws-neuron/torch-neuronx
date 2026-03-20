@@ -6,7 +6,6 @@ in various formats for debugging and analysis purposes.
 """
 
 import logging
-import shutil
 from pathlib import Path
 
 import torch
@@ -198,25 +197,3 @@ def save_fx_graph_all_formats(
     logger.debug(f"Saved FX graph in {len(saved_files)} formats")
 
     return saved_files
-
-
-# ============================================================================
-# Artifacts
-# ============================================================================
-def cleanup_compilation_artifacts(temp_dir: Path, preserve: bool = True):
-    """
-    Clean up temporary compilation artifacts
-
-    Args:
-        temp_dir: Temporary directory to clean up
-        preserve: Whether to preserve artifacts
-    """
-    try:
-        if temp_dir.exists():
-            if preserve:
-                logger.debug(f"Preserving compilation artifacts for debugging: {temp_dir}")
-            else:
-                logger.debug(f"Cleaning up temporary directory: {temp_dir}")
-                shutil.rmtree(temp_dir)
-    except Exception as e:
-        logger.warning(f"Failed to clean up {temp_dir}: {e}")

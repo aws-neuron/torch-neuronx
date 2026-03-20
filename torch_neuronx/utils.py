@@ -1,16 +1,68 @@
 """Utility functions for torch-neuronx."""
 
+import functools
+import hashlib
 import os
 import typing as _t
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, get_args
 
 import numpy as np
 import torch
 from neuronxcc.starfish.support import dtype as _ndt
 from packaging.version import Version
+
+
+def deterministic_hash(obj) -> str:
+    """Generate a deterministic hash string from an object.
+
+    Uses SHA-256 of the object's repr for cross-process consistency.
+    """
+    return hashlib.sha256(repr(obj).encode()).hexdigest()[:16]
+
+
+@functools.lru_cache(maxsize=1)
+def global_version_hash() -> str:
+    """Version hash combining source code + package versions.
+
+    Hashes all .py files in torch_neuronx lowering directories plus
+    package versions into a single SHA-256 digest. Used to invalidate
+    persistent caches when code or package versions change.
+
+    """
+    import torch_neuronx
+
+    hasher = hashlib.sha256()
+
+    # Hash source files
+    root = Path(torch_neuronx.__file__).parent
+    for d in [root / "python_ops", root / "neuron_dynamo_backend"]:
+        if d.exists():
+            for py_file in sorted(d.rglob("*.py")):
+                hasher.update(str(py_file.relative_to(root)).encode())
+                hasher.update(py_file.read_bytes())
+
+    # Hash package versions
+    hasher.update(torch.__version__.encode())
+    hasher.update(getattr(torch_neuronx, "__version__", "unknown").encode())
+    try:
+        import torch_mlir
+
+        hasher.update(getattr(torch_mlir, "__version__", "unknown").encode())
+    except Exception:
+        pass
+    try:
+        import neuronxcc
+
+        hasher.update(neuronxcc.__version__.encode())
+    except Exception:
+        pass
+
+    return hasher.hexdigest()
+
 
 # ==================== Tensor Utilities ====================
 

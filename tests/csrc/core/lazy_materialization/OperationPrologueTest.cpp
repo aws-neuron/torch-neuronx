@@ -6,6 +6,7 @@
 
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "tests/csrc/mocks/MockNRT.h"
@@ -41,6 +42,28 @@ void ExtractInputPtrsAndContexts(const std::vector<at::Tensor>& inputs,
   }
 }
 
+// Helper to compute input deduplication map from pointers and contexts
+void ComputeDedup(const std::vector<void*>& input_ptrs,
+                  const std::vector<at::neuron::TensorContext>& input_contexts,
+                  std::vector<size_t>& dedup_map, size_t& deduped_count) {
+  std::unordered_map<uintptr_t, size_t> base_to_idx;
+  dedup_map.resize(input_ptrs.size());
+  deduped_count = 0;
+  for (size_t i = 0; i < input_ptrs.size(); ++i) {
+    uintptr_t base =
+        reinterpret_cast<uintptr_t>(input_ptrs[i]) -
+        (input_contexts[i].get_storage_offset() * input_contexts[i].get_element_size());
+    auto it = base_to_idx.find(base);
+    if (it != base_to_idx.end()) {
+      dedup_map[i] = it->second;
+    } else {
+      base_to_idx[base] = deduped_count;
+      dedup_map[i] = deduped_count;
+      deduped_count++;
+    }
+  }
+}
+
 // Helper to create a Neuron tensor with NeuronStorageImpl
 // Note: Transformations are no longer stored on the tensor itself,
 // they are passed as a parameter to OperationPrologue::GeneratePrologue
@@ -73,6 +96,39 @@ at::Tensor CreateNeuronTensor(const std::vector<int64_t>& shape, c10::ScalarType
 
   // Create at::Tensor from TensorImpl
   return at::Tensor(tensor_impl);
+}
+
+// Helper to create a view tensor sharing storage with a base tensor at a given element offset.
+// The view has shape `view_shape` and points into the same storage as `base` at `element_offset`.
+at::Tensor CreateNeuronView(const at::Tensor& base, const std::vector<int64_t>& view_shape,
+                            int64_t element_offset) {
+  // Share storage with base — get a copy then move it
+  c10::Storage storage = base.storage();
+
+  auto tensor_impl = c10::make_intrusive<c10_neuron::NeuronTensorImpl>(
+      std::move(storage), c10::scalarTypeToTypeMeta(base.scalar_type()));
+
+  tensor_impl->set_sizes_contiguous(view_shape);
+  tensor_impl->set_storage_offset(element_offset);
+
+  return at::Tensor(tensor_impl);
+}
+
+// Count the number of function arguments (%argN) in the MLIR func signature line.
+int CountMlirFuncArgs(const std::string& mlir) {
+  // Find the func signature line and count %arg occurrences in it
+  auto func_pos = mlir.find("func.func");
+  if (func_pos == std::string::npos) return -1;
+  auto paren_end = mlir.find(")", func_pos);
+  if (paren_end == std::string::npos) return -1;
+  std::string sig = mlir.substr(func_pos, paren_end - func_pos);
+  int count = 0;
+  size_t pos = 0;
+  while ((pos = sig.find("%arg", pos)) != std::string::npos) {
+    count++;
+    pos += 4;
+  }
+  return count;
 }
 
 //============================================================================
@@ -135,8 +191,11 @@ TEST_F(OperationPrologueTest, SingleInputSingleTranspose) {
                                                                      "test_op", kernel_transforms);
 
   // Call: Generate prologue with cache key
+  std::vector<size_t> dm1;
+  size_t dc1;
+  ComputeDedup(input_ptrs, input_contexts, dm1, dc1);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "test_op",
-                                                    kernel_transforms, cache_key);
+                                                    kernel_transforms, cache_key, dm1, dc1);
 
   // Assertions: Basic result structure
   EXPECT_TRUE(result.success) << "Prologue generation should succeed";
@@ -197,8 +256,11 @@ TEST_F(OperationPrologueTest, SingleInputMultipleTransposeTransformations) {
       input_ptrs, input_contexts, "test_complex_op", kernel_transforms);
 
   // Call: Generate prologue with cache key
+  std::vector<size_t> dm2;
+  size_t dc2;
+  ComputeDedup(input_ptrs, input_contexts, dm2, dc2);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "test_complex_op",
-                                                    kernel_transforms, cache_key);
+                                                    kernel_transforms, cache_key, dm2, dc2);
 
   // Assertions
   EXPECT_TRUE(result.success) << "Complex prologue generation should succeed";
@@ -266,8 +328,11 @@ TEST_F(OperationPrologueTest, TwoInputsOneTransformationEach) {
       input_ptrs, input_contexts, "test_multi_input", kernel_transforms);
 
   // Call: Generate prologue with cache key
+  std::vector<size_t> dm3;
+  size_t dc3;
+  ComputeDedup(input_ptrs, input_contexts, dm3, dc3);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "test_multi_input",
-                                                    kernel_transforms, cache_key);
+                                                    kernel_transforms, cache_key, dm3, dc3);
 
   // Assertions - Must succeed with 2 tasks
   ASSERT_TRUE(result.success) << "Multi-input prologue generation should succeed";
@@ -326,8 +391,11 @@ TEST_F(OperationPrologueTest, CacheHitVerification) {
       input_ptrs1, input_contexts1, "cache_test_op", kernel_transforms);
 
   // First call: Generate prologue with cache key
+  std::vector<size_t> dm4;
+  size_t dc4;
+  ComputeDedup(input_ptrs1, input_contexts1, dm4, dc4);
   auto result1 = OperationPrologue::GeneratePrologue(input_ptrs1, input_contexts1, "cache_test_op",
-                                                     kernel_transforms, cache_key1);
+                                                     kernel_transforms, cache_key1, dm4, dc4);
 
   EXPECT_TRUE(result1.success) << "First prologue generation should succeed";
   EXPECT_TRUE(result1.has_transformations) << "Should detect transformations";
@@ -347,8 +415,11 @@ TEST_F(OperationPrologueTest, CacheHitVerification) {
       input_ptrs2, input_contexts2, "cache_test_op", kernel_transforms);
 
   // Second call: Should hit cache
+  std::vector<size_t> dm5;
+  size_t dc5;
+  ComputeDedup(input_ptrs2, input_contexts2, dm5, dc5);
   auto result2 = OperationPrologue::GeneratePrologue(input_ptrs2, input_contexts2, "cache_test_op",
-                                                     kernel_transforms, cache_key2);
+                                                     kernel_transforms, cache_key2, dm5, dc5);
 
   EXPECT_TRUE(result2.success) << "Second prologue generation should succeed";
   EXPECT_TRUE(result2.has_transformations) << "Should detect transformations";
@@ -378,8 +449,11 @@ TEST_F(OperationPrologueTest, EmptyInputVector) {
   std::string cache_key =
       OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts, "empty_test", {});
 
-  auto result =
-      OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "empty_test", {}, cache_key);
+  std::vector<size_t> dm6;
+  size_t dc6;
+  ComputeDedup(input_ptrs, input_contexts, dm6, dc6);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "empty_test", {},
+                                                    cache_key, dm6, dc6);
 
   EXPECT_TRUE(result.success) << "Should handle empty input gracefully";
   EXPECT_FALSE(result.has_transformations) << "No inputs means no transformations";
@@ -403,8 +477,11 @@ TEST_F(OperationPrologueTest, TensorWithoutTransformations) {
   std::string cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
                                                                      "no_transform_test", {});
 
+  std::vector<size_t> dm7;
+  size_t dc7;
+  ComputeDedup(input_ptrs, input_contexts, dm7, dc7);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "no_transform_test",
-                                                    {}, cache_key);
+                                                    {}, cache_key, dm7, dc7);
 
   EXPECT_TRUE(result.success);
 
@@ -454,8 +531,11 @@ TEST_F(OperationPrologueTest, MixedNeuronAndCPUTensors) {
   std::string cache_key = OperationPrologue::ComputePrologueCacheKey(
       input_ptrs, input_contexts, "mixed_test", kernel_transforms);
 
+  std::vector<size_t> dm8;
+  size_t dc8;
+  ComputeDedup(input_ptrs, input_contexts, dm8, dc8);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "mixed_test",
-                                                    kernel_transforms, cache_key);
+                                                    kernel_transforms, cache_key, dm8, dc8);
 
   EXPECT_TRUE(result.success);
 
@@ -520,8 +600,11 @@ TEST_F(OperationPrologueTest, TwoChainsWithSameInputAddress) {
       input_ptrs, input_contexts, "test_two_chains_merge", kernel_transforms);
 
   // Call: Generate prologue with cache key - this will exercise STEP 5's merge logic
+  std::vector<size_t> dm9;
+  size_t dc9;
+  ComputeDedup(input_ptrs, input_contexts, dm9, dc9);
   auto result = OperationPrologue::GeneratePrologue(
-      input_ptrs, input_contexts, "test_two_chains_merge", kernel_transforms, cache_key);
+      input_ptrs, input_contexts, "test_two_chains_merge", kernel_transforms, cache_key, dm9, dc9);
 
   // Assertions: Verify successful merge
   ASSERT_TRUE(result.success) << "Merge should succeed";
@@ -609,8 +692,12 @@ TEST_F(OperationPrologueTest, SameTensorMixedTransform) {
 
   // Call: Generate prologue with cache key - this exercises STEP 5's merge logic
   // for handling mixed transformed and direct inputs with the same base address
-  auto result = OperationPrologue::GeneratePrologue(
-      input_ptrs, input_contexts, "test_concat_same_tensor_mixed", kernel_transforms, cache_key);
+  std::vector<size_t> dm10;
+  size_t dc10;
+  ComputeDedup(input_ptrs, input_contexts, dm10, dc10);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts,
+                                                    "test_concat_same_tensor_mixed",
+                                                    kernel_transforms, cache_key, dm10, dc10);
 
   // Assertions: Verify successful merge
   ASSERT_TRUE(result.success) << "Merge with mixed transformations should succeed";
@@ -700,8 +787,11 @@ TEST_F(OperationPrologueTest, ThreeIndependentTransformationChains) {
       input_ptrs, input_contexts, "test_three_chains", kernel_transforms);
 
   // Call: Generate prologue with cache key - this exercises the cumulative mapping logic
+  std::vector<size_t> dm11;
+  size_t dc11;
+  ComputeDedup(input_ptrs, input_contexts, dm11, dc11);
   auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "test_three_chains",
-                                                    kernel_transforms, cache_key);
+                                                    kernel_transforms, cache_key, dm11, dc11);
 
   // Assertions: Verify successful merge with cumulative tensor tracking
   ASSERT_TRUE(result.success) << "Three-chain merge should succeed";
@@ -733,6 +823,165 @@ TEST_F(OperationPrologueTest, ThreeIndependentTransformationChains) {
   EXPECT_TRUE(result.input_was_transformed[0]) << "Input 0 should be marked as transformed";
   EXPECT_TRUE(result.input_was_transformed[1]) << "Input 1 should be marked as transformed";
   EXPECT_TRUE(result.input_was_transformed[2]) << "Input 2 should be marked as transformed";
+}
+
+//============================================================================
+// Input Deduplication Tests
+// Validates that inputs sharing the same underlying storage are deduplicated
+// into a single MLIR function argument during prologue generation.
+//============================================================================
+
+TEST_F(OperationPrologueTest, Dedup_AllSameStorage) {
+  // 4 slice views from one [16,64] tensor → should dedup to 1 input
+  auto base = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
+  std::vector<int64_t> view_shape = {16, 16};
+
+  auto v0 = CreateNeuronView(base, view_shape, 0);
+  auto v1 = CreateNeuronView(base, view_shape, 16);
+  auto v2 = CreateNeuronView(base, view_shape, 32);
+  auto v3 = CreateNeuronView(base, view_shape, 48);
+
+  std::vector<at::Tensor> inputs = {v0, v1, v2, v3};
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
+
+  // Each input has a SLICE transformation from [16,64] → [16,16]
+  std::vector<std::vector<TensorTransformation>> kernel_transforms = {
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 0, 16})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 16, 32})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 32, 48})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 48, 64})},
+  };
+
+  auto cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
+                                                              "aten::cat", kernel_transforms);
+  std::vector<size_t> dm12;
+  size_t dc12;
+  ComputeDedup(input_ptrs, input_contexts, dm12, dc12);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "aten::cat",
+                                                    kernel_transforms, cache_key, dm12, dc12);
+
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(result.has_transformations);
+  EXPECT_EQ(result.deduped_input_count, 1) << "All 4 views share storage, should dedup to 1";
+  ASSERT_EQ(result.input_dedup_map.size(), 4);
+  EXPECT_EQ(result.input_dedup_map[0], 0);
+  EXPECT_EQ(result.input_dedup_map[1], 0);
+  EXPECT_EQ(result.input_dedup_map[2], 0);
+  EXPECT_EQ(result.input_dedup_map[3], 0);
+  EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 1) << "MLIR should have 1 %arg. Got:\n"
+                                                            << result.prologue_mlir_str;
+}
+
+TEST_F(OperationPrologueTest, Dedup_InterleavedTwoTensors) {
+  // a0, b0, a1, b1 from two different tensors → should dedup to 2 inputs
+  auto baseA = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
+  auto baseB = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
+  std::vector<int64_t> view_shape = {16, 16};
+
+  auto a0 = CreateNeuronView(baseA, view_shape, 0);
+  auto b0 = CreateNeuronView(baseB, view_shape, 0);
+  auto a1 = CreateNeuronView(baseA, view_shape, 16);
+  auto b1 = CreateNeuronView(baseB, view_shape, 16);
+
+  std::vector<at::Tensor> inputs = {a0, b0, a1, b1};
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
+
+  std::vector<std::vector<TensorTransformation>> kernel_transforms = {
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 0, 16})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 0, 16})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 16, 32})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 16, 32})},
+  };
+
+  auto cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
+                                                              "aten::cat", kernel_transforms);
+  std::vector<size_t> dm13;
+  size_t dc13;
+  ComputeDedup(input_ptrs, input_contexts, dm13, dc13);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "aten::cat",
+                                                    kernel_transforms, cache_key, dm13, dc13);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.deduped_input_count, 2) << "Two tensors, should dedup to 2";
+  EXPECT_EQ(result.input_dedup_map[0], 0);  // a0 → slot 0
+  EXPECT_EQ(result.input_dedup_map[1], 1);  // b0 → slot 1
+  EXPECT_EQ(result.input_dedup_map[2], 0);  // a1 → slot 0
+  EXPECT_EQ(result.input_dedup_map[3], 1);  // b1 → slot 1
+  EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 2) << "MLIR should have 2 %args. Got:\n"
+                                                            << result.prologue_mlir_str;
+}
+
+TEST_F(OperationPrologueTest, Dedup_NoSharedStorage) {
+  // 4 independent tensors — no dedup
+  auto t0 = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
+  auto t1 = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
+  auto t2 = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
+  auto t3 = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
+
+  std::vector<at::Tensor> inputs = {t0, t1, t2, t3};
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
+
+  // NONE transforms (identity) — no kernel transforms
+  std::vector<std::vector<TensorTransformation>> kernel_transforms = {{}, {}, {}, {}};
+
+  auto cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
+                                                              "aten::cat", kernel_transforms);
+  std::vector<size_t> dm14;
+  size_t dc14;
+  ComputeDedup(input_ptrs, input_contexts, dm14, dc14);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "aten::cat",
+                                                    kernel_transforms, cache_key, dm14, dc14);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.deduped_input_count, 4) << "All different storage, no dedup";
+  EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 4) << "MLIR should have 4 %args. Got:\n"
+                                                            << result.prologue_mlir_str;
+}
+
+TEST_F(OperationPrologueTest, Dedup_MixedSharedAndIndependent) {
+  // other, a0, a1, a2 — 1 independent + 3 from same storage → dedup to 2
+  auto base = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
+  auto other = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
+  std::vector<int64_t> view_shape = {16, 16};
+
+  auto a0 = CreateNeuronView(base, view_shape, 0);
+  auto a1 = CreateNeuronView(base, view_shape, 16);
+  auto a2 = CreateNeuronView(base, view_shape, 32);
+
+  std::vector<at::Tensor> inputs = {other, a0, a1, a2};
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
+
+  std::vector<std::vector<TensorTransformation>> kernel_transforms = {
+      {},  // other: no transform (NONE)
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 0, 16})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 16, 32})},
+      {TensorTransformation(TransformationType::SLICE, {16, 64}, {16, 16}, "f32", {0, 16, 32, 48})},
+  };
+
+  auto cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
+                                                              "aten::cat", kernel_transforms);
+  std::vector<size_t> dm15;
+  size_t dc15;
+  ComputeDedup(input_ptrs, input_contexts, dm15, dc15);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "aten::cat",
+                                                    kernel_transforms, cache_key, dm15, dc15);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(result.deduped_input_count, 2) << "1 independent + 3 shared = 2 deduped";
+  EXPECT_EQ(result.input_dedup_map[0], 0);  // other → slot 0
+  EXPECT_EQ(result.input_dedup_map[1], 1);  // a0 → slot 1
+  EXPECT_EQ(result.input_dedup_map[2], 1);  // a1 → slot 1
+  EXPECT_EQ(result.input_dedup_map[3], 1);  // a2 → slot 1
+  EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 2) << "MLIR should have 2 %args. Got:\n"
+                                                            << result.prologue_mlir_str;
 }
 
 }  // namespace

@@ -157,6 +157,16 @@ void StreamImpl::Synchronize() {
   // After synchronization completes, check for and propagate any pending exceptions
   error_handler_->CheckAndThrowPendingException(stream_id, /* clear exception */ true);
 
+  // Rethrow stashed exception from runtime thread
+  {
+    std::lock_guard<std::mutex> lock(stashed_exception_mutex_);
+    if (stashed_exception_) {
+      auto eptr = stashed_exception_;
+      stashed_exception_ = nullptr;
+      std::rethrow_exception(eptr);
+    }
+  }
+
   TORCH_NEURONX_DEBUG("Stream synchronization completed", "stream_id=", stream_id);
 }
 
@@ -257,15 +267,19 @@ void StreamImpl::HandleErrorWithCleanup(OperationContext* operation, const Excep
                 "ExceptionType must be CompilationRuntimeException or ExecutionRuntimeException");
 
   bool is_concatenated = operation->IsConcatenatedOperation();
-  auto status = error_handler_->HandleOperationError(operation, e);
+
+  OperationContextResult status;
+  try {
+    status = error_handler_->HandleOperationError(operation, e);
+  } catch (...) {
+    HandleErrorWithExceptionPtr(operation, std::current_exception());
+    return;
+  }
 
   if (status.IsSuccess()) {
     TORCH_NEURONX_DEBUG("Recovery succeeded", "stream_id=", stream_id,
                         "op=", operation->GetOpName());
 
-    // For concatenated operations, recovery (CPU fallback) invokes the failure callback
-    // which frees the ConcatenationState that owns the concat_op. Calling CompleteOperation
-    // would be use-after-free.
     if (!is_concatenated) {
       CompleteOperation(operation);
     }
@@ -284,43 +298,14 @@ template void StreamImpl::HandleErrorWithCleanup<torch_neuronx::CompilationRunti
 template void StreamImpl::HandleErrorWithCleanup<torch_neuronx::ExecutionRuntimeException>(
     OperationContext*, const torch_neuronx::ExecutionRuntimeException&);
 
-void StreamImpl::WaitForPriorOperationsToComplete(const OperationContext* operation) {
-  TORCH_NEURONX_DEBUG("Waiting for prior operations to complete before CPU fallback",
-                      "stream_id=", stream_id, "failed_op=", operation->GetOpName());
-  {
-    std::unique_lock<std::mutex> lock(active_operations_mutex_);
-
-    bool is_at_front = !active_operations_.empty() && active_operations_.front().get() == operation;
-    if (is_at_front) {
-      return;
-    }
-
-    completion_cv.wait(lock, [this, operation]() {
-      // Since active_operations_ is FIFO, we only need to check if the failed operation
-      // is at the front of the queue. If it is, there are no prior operations.
-      return active_operations_.empty() || active_operations_.front().get() == operation;
-    });
-  }
-  error_handler_->CheckAndThrowPendingException(stream_id, /* clear exception */ false);
-
-  TORCH_NEURONX_DEBUG(
-      "All prior operations completed successfully, safe to proceed with CPU fallback",
-      "stream_id=", stream_id, "failed_op=", operation->GetOpName());
-}
-
-OperationContext* StreamImpl::GetNextReadyOperation() {
-  std::lock_guard<std::mutex> lock(active_operations_mutex_);
-
-  if (active_operations_.empty()) {
-    return nullptr;
-  }
-
-  auto& first_op = active_operations_.front();
-  // Check if operation is compiled (if needed) and ready to execute
-  if (first_op->IsSchedulable()) {
-    return first_op.get();
-  }
-  return nullptr;
+void StreamImpl::HandleErrorWithExceptionPtr(OperationContext* operation, std::exception_ptr eptr) {
+  // Stash exception for rethrow on Synchronize() — don't call .what() here
+  StashException(eptr);
+  auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+  engine.DecrementExecutionQueueDepth(operation);
+  operation->promise.set_value(
+      OperationContextResult::CreateError("Operation failed on runtime thread"));
+  RemoveActiveOperation(operation);
 }
 
 OperationContext* StreamImpl::GetNextOperationToSchedule() {

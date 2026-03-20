@@ -504,6 +504,10 @@ class TestFusedAdamWNKI:
         from unittest.mock import patch
 
         from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+        from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
+
+        _orig_enabled = _hlo_cache_mod._enabled
+        _hlo_cache_mod._enabled = False
 
         torch.manual_seed(42)
         params = [
@@ -537,6 +541,8 @@ class TestFusedAdamWNKI:
             assert (
                 mock_compiler.call_count == count_after_step1
             ), f"Recompilation on LR change: {mock_compiler.call_count} vs {count_after_step1}"
+
+        _hlo_cache_mod._enabled = _orig_enabled
 
     def test_no_recompile_amsgrad(self):
         """AMSGrad variant should also not recompile across steps."""

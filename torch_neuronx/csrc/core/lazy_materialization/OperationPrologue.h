@@ -45,6 +45,12 @@ struct PrologueResult {
 
   // Original transformation tasks (for metadata updates in LazyTransformationManager)
   std::vector<TransformationTask> tasks;
+
+  // Input deduplication: maps original input index -> deduplicated input index
+  // When multiple inputs share the same storage, they map to the same deduped index.
+  // Empty if no deduplication occurred.
+  std::vector<size_t> input_dedup_map;
+  size_t deduped_input_count = 0;
 };
 
 // ============================================================================
@@ -83,7 +89,8 @@ class OperationPrologue {
       const std::vector<void*>& input_ptrs,
       const std::vector<at::neuron::TensorContext>& input_contexts, const std::string& op_name,
       const std::vector<std::vector<TensorTransformation>>& kernel_transforms,
-      const std::string& prologue_cache_key);
+      const std::string& prologue_cache_key, const std::vector<size_t>& input_dedup_map,
+      size_t deduped_input_count);
 
   // Compute prologue cache key efficiently without creating transformation tasks
   //
@@ -121,10 +128,13 @@ class OperationPrologue {
   //
   // Parameters:
   //   prologue_cache_key: Pre-computed cache key to use for caching this prologue
+  //   input_dedup_map: Maps original input index -> deduped slot index
+  //   deduped_input_count: Number of unique input slots after dedup
   static PrologueResult MergeTransformations(const std::vector<TransformationTask>& tasks,
-                                             const std::string& op_name,
-                                             const std::vector<void*>& all_input_ptrs,
-                                             const std::string& prologue_cache_key);
+                                             const std::string& op_name, size_t num_inputs,
+                                             const std::string& prologue_cache_key,
+                                             const std::vector<size_t>& input_dedup_map,
+                                             size_t deduped_input_count);
 };
 
 }  // namespace lazy

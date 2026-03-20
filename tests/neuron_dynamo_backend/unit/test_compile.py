@@ -60,6 +60,8 @@ class TestCompileGraph:
 
             # Verify calls
             mock_stablehlo_mlir.operation.write_bytecode.assert_called_once()
-            mock_compile_graph.assert_called_once_with(
-                "test_graph_1", mock_stablehlo_bytes, False, use_tensorizer=False
-            )
+            mock_compile_graph.assert_called_once()
+            args, kwargs = mock_compile_graph.call_args
+            assert args[1] == mock_stablehlo_bytes
+            assert args[2] is False
+            assert kwargs["use_tensorizer"] is False
