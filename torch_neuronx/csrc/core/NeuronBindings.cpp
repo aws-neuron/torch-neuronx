@@ -664,6 +664,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Copy from Neuron tensor to Neuron tensor (same device) using NRT", py::arg("src_neuron"),
       py::arg("dst_neuron"));
+  m.def(
+      "_nrt_copy_strided_neuron_to_neuron",
+      [](const at::Tensor& src_neuron, at::Tensor& dst_neuron) {
+        torch_neuronx::utils::copy_strided_neuron_to_neuron(src_neuron, dst_neuron);
+      },
+      "Strided copy between Neuron tensors — handles arbitrary src/dst strides", py::arg("src"),
+      py::arg("dst"));
 
   m.def("version", []() { return "0.1.0"; });
   m.def(

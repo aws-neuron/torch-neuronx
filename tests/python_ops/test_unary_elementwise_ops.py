@@ -414,3 +414,23 @@ class TestUnaryElementwiseOp:
             result2 = f.silu(input_tensor_device)
             torch.testing.assert_close(result.cpu(), result2.cpu(), rtol=1e-4, atol=1e-3)
             assert_op_runs_on_neuron("aten::silu")
+
+    @pytest.mark.parametrize("op", [torch.erf, torch.erfinv])
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.int32])
+    def test_erf_non_float_input(self, op, dtype, device):
+        """Test erf/erfinv with non-float dtype inputs (should cast to float internally)."""
+        with track_neuron_ops():
+            if dtype == torch.bool:
+                input_tensor = torch.tensor(
+                    [[True, False, True], [False, True, False]], dtype=torch.bool
+                )
+            else:
+                input_tensor = torch.tensor([0, 1, -1], dtype=dtype)
+            input_tensor_device = input_tensor.to(device)
+
+            result = op(input_tensor_device)
+            expected = op(input_tensor)
+            assert_op_runs_on_neuron(f"aten::{op.__name__}")
+
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-3, equal_nan=True)

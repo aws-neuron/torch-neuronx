@@ -54,6 +54,10 @@ def torch_log(x, out=None):
 
 @register_aten(["aten::erf", "aten::erf.out"])
 def torch_erf(x, out=None):
+    # Cast non-floating-point inputs (e.g. bool, int) to float,
+    # matching PyTorch CPU behavior where erf promotes to float.
+    if not x.is_floating_point():
+        x = x.to(torch.float32)
     # Handle NaN case: erf(NaN) should return NaN
     result = torch.erf(x)
     return torch.where(torch.isnan(x), x, result)
@@ -61,6 +65,11 @@ def torch_erf(x, out=None):
 
 @register_aten(["aten::erfinv", "aten::erfinv.out"])
 def torch_erfinv(y, out=None):
+    # Cast non-floating-point inputs (e.g. bool, int) to float,
+    # matching PyTorch CPU behavior where erfinv promotes to float.
+    if not y.is_floating_point():
+        y = y.to(torch.float32)
+
     a = [0.886226899, -1.645349621, 0.914624893, -0.140543331]
     b = [-2.118377725, 1.442710462, -0.329097515, 0.012229801]
     c = [-1.970840454, -1.624906493, 3.429567803, 1.641345311]

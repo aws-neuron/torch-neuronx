@@ -10,7 +10,24 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 PACKAGE_NAME = "torch_neuronx"
-version = "0.1.0"
+_base_version = "0.1.0"
+
+
+def _get_git_sha():
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return None
+
+
+_sha = _get_git_sha()
+version = f"{_base_version}+{_sha}" if _sha else _base_version
 
 # Disable autoload for builds
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"

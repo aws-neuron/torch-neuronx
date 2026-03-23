@@ -227,3 +227,225 @@ class TestContiguousOps:
         x = make_test_tensor((2, 3, 4, 5), device="neuron")
         y = x.contiguous(memory_format=torch.channels_last)
         assert y.is_contiguous(memory_format=torch.channels_last)
+
+    def test_contiguous_channels_last_from_broadcast(self):
+        """channels_last on broadcast source materializes before strided copy"""
+        # Create a broadcast view (stride=0 on expanded dims)
+        base = make_test_tensor((1, 3, 1, 1), device="neuron")
+        x = base.expand(2, 3, 4, 5)  # strides: (0, 1, 0, 0)
+        assert any(s == 0 for s in x.stride()), "Should have broadcast dims"
+
+        y = x.contiguous(memory_format=torch.channels_last)
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(y.cpu(), x.cpu().contiguous(memory_format=torch.channels_last))
+
+    def test_contiguous_channels_last_3d_from_broadcast(self):
+        """channels_last_3d on broadcast source materializes before strided copy"""
+        base = make_test_tensor((1, 3, 1, 1, 1), device="neuron")
+        x = base.expand(2, 3, 4, 5, 6)
+        assert any(s == 0 for s in x.stride()), "Should have broadcast dims"
+
+        y = x.contiguous(memory_format=torch.channels_last_3d)
+
+        assert y.is_contiguous(memory_format=torch.channels_last_3d)
+        torch.testing.assert_close(
+            y.cpu(), x.cpu().contiguous(memory_format=torch.channels_last_3d)
+        )
+
+    def test_contiguous_channels_last_non_contiguous_input(self):
+        """channels_last from transposed (non-contiguous) input"""
+        x = make_test_tensor((2, 3, 4, 5), device="neuron")
+        x_t = x.transpose(1, 2)  # Now non-contiguous
+        assert not x_t.is_contiguous()
+
+        y = x_t.contiguous(memory_format=torch.channels_last)
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(y.cpu(), x_t.cpu().contiguous(memory_format=torch.channels_last))
+
+    def test_fill_scalar_on_strided_view(self):
+        """fill_ on non-contiguous view should work correctly"""
+        base = torch.zeros((4, 5), device="neuron")
+        view = base[::2, :]  # shape (2, 5), non-contiguous
+        assert not view.is_contiguous()
+
+        view.fill_(42.0)
+
+        expected = torch.zeros((4, 5))
+        expected[::2, :] = 42.0
+        torch.testing.assert_close(base.cpu(), expected)
+
+    def test_fill_scalar_on_transposed_view(self):
+        """fill_ on transposed tensor should work correctly"""
+        base = torch.zeros((3, 4), device="neuron")
+        view = base.t()  # shape (4, 3), non-contiguous
+        assert not view.is_contiguous()
+
+        view.fill_(7.0)
+
+        torch.testing.assert_close(base.cpu(), torch.full((3, 4), 7.0))
+
+    def test_contiguous_channels_last_partial_broadcast(self):
+        """channels_last with some (not all) broadcast dims"""
+        base = make_test_tensor((2, 3, 1, 5), device="neuron")
+        x = base.expand(2, 3, 4, 5)  # strides: (15, 5, 0, 1)
+
+        y = x.contiguous(memory_format=torch.channels_last)
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(y.cpu(), x.cpu().contiguous(memory_format=torch.channels_last))
+
+
+class TestNrtStridedCopy:
+    """Tests for _nrt_copy_strided_neuron_to_neuron"""
+
+    def test_nrt_strided_copy_contiguous_to_contiguous(self):
+        """Fast path: both contiguous uses single bulk copy"""
+        import torch_neuronx._C as _C
+
+        src = make_test_tensor((4, 5), device="neuron")
+        dst = torch.empty_like(src)
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    def test_nrt_strided_copy_transposed_to_contiguous(self):
+        """Copy from transposed source to contiguous dest"""
+        import torch_neuronx._C as _C
+
+        base = make_test_tensor((3, 4), device="neuron")
+        src = base.t()  # shape (4, 3), strides (1, 4)
+        dst = torch.empty((4, 3), device="neuron")
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    def test_nrt_strided_copy_contiguous_to_strided(self):
+        """Copy from contiguous source to strided dest (channels_last pattern)"""
+        import torch_neuronx._C as _C
+
+        src = make_test_tensor((2, 3, 4, 5), device="neuron")
+        dst = torch.empty_like(src, memory_format=torch.channels_last)
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+        assert dst.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    def test_nrt_strided_copy_strided_to_strided(self):
+        """Both source and dest are strided"""
+        import torch_neuronx._C as _C
+
+        base_src = make_test_tensor((4, 6), device="neuron")
+        src = base_src[:, ::2]  # shape (4, 3), strided
+
+        base_dst = torch.zeros((4, 6), device="neuron")
+        dst = base_dst[:, ::2]  # shape (4, 3), strided
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    def test_nrt_strided_copy_broadcast_source(self):
+        """Copy from broadcast source (stride=0)"""
+        import torch_neuronx._C as _C
+
+        base = make_test_tensor((1, 3), device="neuron")
+        src = base.expand(4, 3)  # strides (0, 1)
+        dst = torch.empty((4, 3), device="neuron")
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    def test_nrt_strided_copy_empty_tensor(self):
+        """Empty tensor should be no-op"""
+        import torch_neuronx._C as _C
+
+        src = torch.empty((0, 3), device="neuron")
+        dst = torch.empty((0, 3), device="neuron")
+
+        _C._nrt_copy_strided_neuron_to_neuron(src, dst)  # Should not crash
+
+    def test_nrt_strided_copy_shape_mismatch_raises(self):
+        """Mismatched shapes should raise"""
+        import torch_neuronx._C as _C
+
+        src = make_test_tensor((3, 4), device="neuron")
+        dst = torch.empty((4, 3), device="neuron")
+
+        with pytest.raises(RuntimeError):
+            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+    def test_nrt_strided_copy_dtype_mismatch_raises(self):
+        """Mismatched dtypes should raise"""
+        import torch_neuronx._C as _C
+
+        src = make_test_tensor((3, 4), device="neuron", dtype=torch.float32)
+        dst = torch.empty((3, 4), device="neuron", dtype=torch.float16)
+
+        with pytest.raises(RuntimeError):
+            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+
+class TestChannelsLastCopyCount:
+    """Tests to verify copy optimization reduces number of operations"""
+
+    def test_channels_last_single_nrt_call_for_contiguous_input(self, monkeypatch):
+        """channels_last on contiguous input should use single strided copy, no intermediate"""
+        import torch_neuronx._C as _C
+
+        copy_calls = {"count": 0}
+        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+
+        def counting_copy(src, dst):
+            copy_calls["count"] += 1
+            return orig_copy(src, dst)
+
+        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+
+        x = make_test_tensor((2, 3, 4, 5), device="neuron")
+        assert x.is_contiguous()
+
+        y = x.contiguous(memory_format=torch.channels_last)
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        assert copy_calls["count"] == 1, f"Expected 1 NRT copy call, got {copy_calls['count']}"
+
+    def test_channels_last_broadcast_materializes_then_copies(self, monkeypatch):
+        """Broadcast input should clone first, then single strided copy"""
+        import torch_neuronx._C as _C
+
+        copy_calls = {"count": 0}
+        clone_calls = {"count": 0}
+        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+
+        def counting_copy(src, dst):
+            copy_calls["count"] += 1
+            # After materialization, src should NOT have stride=0
+            assert all(s != 0 for s in src.stride()), "Source should be materialized (no stride=0)"
+            return orig_copy(src, dst)
+
+        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+
+        # Patch clone to count materializations
+        orig_clone = torch.Tensor.clone
+
+        def counting_clone(self, *args, **kwargs):
+            clone_calls["count"] += 1
+            return orig_clone(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "clone", counting_clone)
+
+        base = make_test_tensor((1, 3, 1, 1), device="neuron")
+        x = base.expand(2, 3, 4, 5)
+        assert any(s == 0 for s in x.stride())
+
+        y = x.contiguous(memory_format=torch.channels_last)
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        assert clone_calls["count"] >= 1, "Broadcast source should be cloned"
+        assert copy_calls["count"] == 1, f"Expected 1 NRT copy call, got {copy_calls['count']}"

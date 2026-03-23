@@ -92,12 +92,10 @@ class ContiguousBroadcastImpl(OperationImplementation):
         if self_tensor.is_complex():
             return False
 
-        # Only handle contiguous-targeted formats
+        # Only handle contiguous_format - channels_last needs special stride handling
         if memory_format is not None and memory_format not in (
             torch.contiguous_format,
             torch.preserve_format,
-            torch.channels_last,
-            torch.channels_last_3d,
         ):
             return False
 
