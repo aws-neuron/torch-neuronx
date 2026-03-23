@@ -382,10 +382,10 @@ class XLABuilderKernel(BaseNeuronKernel):
         needs_avg_divide = reduce_op == ReduceOp.AVG
         if needs_avg_divide:
             reduce_op = ReduceOp.SUM
-            # Extract world_size from the divisor tensor appended by prepare_avg_inputs()
-            # and strip it from inputs so it's not passed to the collective operation
-            world_size = int(non_static_inputs[-1].item())
+            # Strip the divisor tensor appended by prepare_avg_inputs()
             non_static_inputs = non_static_inputs[:-1]
+            # Get world_size from replica_groups directly to avoid device-to-host sync
+            world_size = len(replica_groups[0]) if replica_groups else 1
 
         def submit(inputs, outputs):
             """Submit collective task to pipeline."""

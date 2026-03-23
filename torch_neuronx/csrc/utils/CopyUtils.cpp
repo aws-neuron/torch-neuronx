@@ -188,5 +188,80 @@ void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   at::neuron::SubmitOperationContext(stream, std::move(context));
 }
 
+void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
+  TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
+              "copy_strided: expected src to be a neuron tensor");
+  TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
+              "copy_strided: expected dst to be a neuron tensor");
+  TORCH_CHECK(src.sizes().equals(dst.sizes()),
+              "copy_strided: src and dst must have the same shape");
+  TORCH_CHECK(src.dtype() == dst.dtype(), "copy_strided: src and dst must have the same dtype");
+  TORCH_CHECK(src.device().index() == dst.device().index(),
+              "copy_strided: src and dst must be on the same Neuron core");
+
+  if (src.numel() == 0) {
+    return;
+  }
+
+  // Drain the stream so all pending operations complete before we issue
+  // direct nrt_tensor_copy calls outside the stream.
+  auto stream = at::neuron::getCurrentNeuronStream(src.device().index());
+  stream.synchronize();
+
+  const auto element_size = static_cast<size_t>(src.element_size());
+  const auto ndim = static_cast<int64_t>(src.dim());
+
+  // Resolve NRT handles
+  nrt_tensor_t* src_nrt = get_nrt_tensor(src);
+  nrt_tensor_t* dst_nrt = get_nrt_tensor(dst);
+  size_t src_base_offset = src.storage_offset() * element_size;
+  size_t dst_base_offset = dst.storage_offset() * element_size;
+
+  // Fast path: both contiguous — single bulk copy
+  if (src.is_contiguous() && dst.is_contiguous()) {
+    size_t nbytes = static_cast<size_t>(src.numel()) * element_size;
+    NRT_STATUS status = nrt_tensor_copy(src_nrt, src_base_offset, dst_nrt, dst_base_offset, nbytes);
+    TORCH_CHECK(status == NRT_SUCCESS,
+                "copy_strided: nrt_tensor_copy failed (status=", static_cast<int>(status), ")");
+    return;
+  }
+
+  // Recursive strided copy — walks dimensions and copies contiguous spans
+  auto sizes = src.sizes();
+  auto src_strides = src.strides();
+  auto dst_strides = dst.strides();
+
+  std::function<void(int64_t, size_t, size_t)> recurse = [&](int64_t dim, size_t src_off,
+                                                             size_t dst_off) {
+    if (dim == ndim) {
+      // Scalar element — copy single element
+      NRT_STATUS status = nrt_tensor_copy(src_nrt, src_off, dst_nrt, dst_off, element_size);
+      TORCH_CHECK(status == NRT_SUCCESS, "copy_strided: nrt_tensor_copy failed");
+      return;
+    }
+
+    const int64_t n = sizes[dim];
+    if (n == 0) return;
+
+    const int64_t src_step = src_strides[dim];
+    const int64_t dst_step = dst_strides[dim];
+
+    // If innermost dim and both strides are 1, copy the whole span at once
+    if (dim == ndim - 1 && src_step == 1 && dst_step == 1) {
+      size_t nbytes = static_cast<size_t>(n) * element_size;
+      NRT_STATUS status = nrt_tensor_copy(src_nrt, src_off, dst_nrt, dst_off, nbytes);
+      TORCH_CHECK(status == NRT_SUCCESS, "copy_strided: nrt_tensor_copy failed");
+      return;
+    }
+
+    for (int64_t i = 0; i < n; ++i) {
+      recurse(dim + 1, src_off + static_cast<size_t>(i * src_step) * element_size,
+              dst_off + static_cast<size_t>(i * dst_step) * element_size);
+    }
+  };
+
+  recurse(0, src_base_offset, dst_base_offset);
+}
+
 }  // namespace utils
 }  // namespace torch_neuronx

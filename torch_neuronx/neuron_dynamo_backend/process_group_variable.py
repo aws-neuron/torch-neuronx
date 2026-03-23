@@ -2,7 +2,10 @@
 Process group variable tracking for torch.dynamo integration
 """
 
-from torch._dynamo.variables.distributed import ProcessGroupVariable
+try:
+    from torch._dynamo.variables.distributed import ProcessGroupVariable
+except ImportError:
+    from torch._dynamo.variables.distributed import DistributedVariable as ProcessGroupVariable
 
 from torch_neuronx.distributed.backend import ProcessGroupNeuron
 

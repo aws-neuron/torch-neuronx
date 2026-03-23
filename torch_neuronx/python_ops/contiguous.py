@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import ClassVar
-
 import torch
 
 import torch_neuronx._C as _C
@@ -68,13 +66,10 @@ class ContiguousNKIImpl(OperationImplementation):
             if self_tensor.is_contiguous(memory_format=memory_format):
                 return ExecutionResult(success=True, output=self_tensor)
 
-            # For channels_last / channels_last_3d: use on-device permutation.
-            # channels_last (NCHW→NHWC) is permutation [0,2,3,1].
-            # channels_last_3d (NCDHW→NDHWC) is permutation [0,2,3,4,1].
-            # We permute on-device via MLIR, then flat-copy into an output
-            # tensor allocated with the target stride layout.
+            # For channels_last / channels_last_3d: use NRT strided copy
+            # to directly rearrange elements into the target layout.
             if memory_format in (torch.channels_last, torch.channels_last_3d):
-                return self._channels_last_via_permute(self_tensor, memory_format)
+                return self._make_channels_last(self_tensor, memory_format)
 
             # Create output tensor with the requested memory layout
             output = torch.empty_like(self_tensor, memory_format=memory_format)
@@ -109,48 +104,50 @@ class ContiguousNKIImpl(OperationImplementation):
 
     # -- channels_last helpers ------------------------------------------------
 
-    # Permutation tables: map contiguous dim order to channels-last dim order.
-    #   channels_last   (4-D): NCHW → NHWC  ⇒  [0, 2, 3, 1]
-    #   channels_last_3d (5-D): NCDHW → NDHWC ⇒  [0, 2, 3, 4, 1]
-    _CL_PERM: ClassVar[dict[torch.memory_format, tuple[int, ...]]] = {
-        torch.channels_last: (0, 2, 3, 1),
-        torch.channels_last_3d: (0, 2, 3, 4, 1),
-    }
-
-    def _channels_last_via_permute(
+    def _make_channels_last(
         self, self_tensor: torch.Tensor, memory_format: torch.memory_format
     ) -> ExecutionResult:
-        """Reorder a contiguous tensor to channels_last layout on-device.
+        """Reorder a tensor to channels_last layout on-device.
 
-        Uses the existing MLIR permute path (_apply_permutation_xla) to
-        rearrange data without a CPU roundtrip, then flat-copies the result
-        into an output tensor allocated with the target stride layout.
+        Uses NRT strided copy to directly copy elements from the source layout
+        into a channels_last-strided output in a single pass, with no
+        intermediate allocations or MLIR compilation.
+
+        TODO(perf): The current NRT strided copy implementation may issue O(numel)
+        individual copy calls for non-trivial stride patterns (e.g., NCHW->NHWC
+        where innermost strides differ). For large tensors, consider implementing
+        an NKI kernel that uses tiled DMA and SPMD sharding for better performance.
         """
-        from .cast_policy import _apply_permutation_xla
+        src = self_tensor
+        # Materialize broadcast sources (stride=0) to avoid O(numel) NRT copy calls.
+        # The strided copy recurses element-by-element when source strides are 0.
+        if any(s == 0 for s in src.stride()):
+            src = src.clone()
 
-        perm = self._CL_PERM[memory_format]
-
-        # Ensure source is standard-contiguous before permuting.
-        if not self_tensor.is_contiguous():
-            from .cast_policy import ensure_contiguous_on_device
-
-            self_tensor = ensure_contiguous_on_device(self_tensor)
-
-        # On-device permute: physically reorders elements into NHWC / NDHWC order.
-        permuted = _apply_permutation_xla(self_tensor, list(perm))
-
-        # Allocate output with channels_last strides, then flat-copy the
-        # permuted storage into it.  Both tensors have the same number of
-        # elements so a 1-D copy is safe.
-        from torch_neuronx.python_ops import io_tensor
-
-        output = io_tensor.empty_like(self_tensor, memory_format=memory_format)
-
-        dst_flat = output.as_strided((output.numel(),), (1,), 0)
-        src_flat = permuted.as_strided((permuted.numel(),), (1,), 0)
-        _C._nrt_copy_neuron_to_neuron_tensor(src_flat, dst_flat)
-
+        # Compute channels_last strides explicitly
+        shape = self_tensor.shape
+        strides = self._channels_last_strides(shape, memory_format)
+        output = torch.empty_strided(
+            shape,
+            strides,
+            dtype=self_tensor.dtype,
+            device=self_tensor.device,
+        )
+        _C._nrt_copy_strided_neuron_to_neuron(src, output)
         return ExecutionResult(success=True, output=output)
+
+    def _channels_last_strides(self, shape, memory_format):
+        """Compute strides for channels_last or channels_last_3d format."""
+        if memory_format == torch.channels_last and len(shape) == 4:
+            # NCHW -> NHWC: strides (H*W*C, 1, W*C, C)
+            n, c, h, w = shape
+            return (h * w * c, 1, w * c, c)
+        elif memory_format == torch.channels_last_3d and len(shape) == 5:
+            # NCDHW -> NDHWC: strides (D*H*W*C, 1, H*W*C, W*C, C)
+            n, c, d, h, w = shape
+            return (d * h * w * c, 1, h * w * c, w * c, c)
+        else:
+            raise ValueError(f"Unsupported memory_format {memory_format} for shape {shape}")
 
 
 def contiguous_internal(self_tensor, memory_format=None):

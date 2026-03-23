@@ -142,7 +142,7 @@ class ContiguousTransposeImpl(OperationImplementation):
         This implementation can handle:
         1. Tensors that are already on the Neuron device
         2. Non-contiguous tensors that are permutations of contiguous tensors
-        3. Contiguous, preserve, channels_last, and channels_last_3d memory formats
+        3. Contiguous and preserve memory formats only
         """
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
@@ -150,12 +150,10 @@ class ContiguousTransposeImpl(OperationImplementation):
         if self_tensor.is_complex():
             return False
 
-        # Only handle contiguous or preserve formats (validation happens at entry)
+        # Only handle contiguous_format - channels_last needs special stride handling
         if memory_format is not None and memory_format not in (
             torch.contiguous_format,
             torch.preserve_format,
-            torch.channels_last,
-            torch.channels_last_3d,
         ):
             return False
 

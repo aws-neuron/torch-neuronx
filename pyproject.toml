@@ -1,6 +1,6 @@
 [project]
 name = "torch-neuronx"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Neuron Backend for PyTorch"
 authors = [{name = "AWS Neuron Team"}]
 requires-python = ">=3.10,<3.14"
@@ -22,7 +22,7 @@ neuron = "torch_neuronx.neuron_dynamo_backend.backend:neuron_backend"
 requires = ["setuptools", "wheel", "torch", "grpcio-tools"]
 build-backend = "setuptools.build_meta"
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "expecttest>=0.3.0",
     "hypothesis",
