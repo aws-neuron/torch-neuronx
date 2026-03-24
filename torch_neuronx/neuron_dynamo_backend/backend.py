@@ -261,7 +261,7 @@ def neuron_backend_fx_compiler(
             ) from e
 
 
-def make_fw_compiler(
+def make_compiler(
     analysis_info: dict,
     options=None,
 ) -> Callable[[torch.fx.GraphModule, list[torch.Tensor]], any]:
@@ -294,7 +294,9 @@ def create_neuron_backend():
     # TODO (NF-24): add explicit bw_compiler
     decomposition_table = get_compile_decomposition_table()
 
-    def neuron_backend_wrapper(gm, example_inputs, *, options=None, mode="default"):
+    def neuron_backend_wrapper(
+        gm: torch.fx.GraphModule, example_inputs, *, options=None, mode="default"
+    ):
         # There are 4 torch.compile mode: "default", "reduce-overhead",
         #   "max-autotune" or "max-autotune-no-cudagraphs"
         # Currently, we only support mode "default".
@@ -310,7 +312,10 @@ def create_neuron_backend():
         options.setdefault("dynamic", False)
         gm, analysis_results = preprocess_graph(gm)
         aot_backend = aot_autograd(
-            fw_compiler=make_fw_compiler(analysis_results, options=options),
+            # pass pre-AOT aliasing info to functionalized post-AOT FWD FX graph
+            fw_compiler=make_compiler(analysis_results, options=options),
+            # functionalized post-AOT BWD FX graph does not contain aliasing hints
+            bw_compiler=make_compiler({}, options=options),
             keep_inference_input_mutations=True,  # Prevent Copy-back.
             decompositions=decomposition_table,
         )
