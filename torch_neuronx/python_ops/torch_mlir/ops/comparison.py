@@ -82,6 +82,26 @@ def torch_clamp_min(x, min, out=None):
     return torch.clamp_min(x, min)
 
 
+@register_aten(["aten::minimum", "aten::minimum.out"])
+def torch_minimum(x, y, out=None):
+    """Element-wise minimum of two tensors.
+
+    Both aten::minimum (no output) and aten::minimum.out (pre-allocated output
+    tensor) are dispatched here.  The `out` parameter is not passed through to
+    torch.minimum because the kernel infrastructure handles writing the result
+    into the provided output tensor automatically — consistent with every other
+    .out variant registered in this file (see binary.py: add.out, mul.out, …).
+
+    When both inputs have different dtypes, we promote to the common type that
+    PyTorch's result_type would select so that torch.minimum does not raise.
+    """
+    if isinstance(y, torch.Tensor) and y.dtype != x.dtype:
+        promoted = torch.result_type(x, y)
+        x = x.to(promoted)
+        y = y.to(promoted)
+    return torch.minimum(x, y)
+
+
 @register_aten(["aten::isnan"])
 def torch_isnan(x):
     return torch.isnan(x)

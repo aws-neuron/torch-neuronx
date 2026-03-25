@@ -631,6 +631,9 @@ def benchmark_block(
             device=device,
             dtype=torch.long,
         )
+    elif block_type == "grpo":
+        # GRPO block is self-contained; all data is registered as buffers on the block itself
+        input_tensor = None
     elif block_type == "rope":
         # RoPE expects query and key tensors: [batch, seq_len, num_heads, head_dim]
         xq = torch.randn(
@@ -766,6 +769,7 @@ def main():
             "rms_norm",
             "rope",
             "mixtral_moe",
+            "grpo",
         ],
     )
     args_temp, _ = parser_temp.parse_known_args()
@@ -793,6 +797,7 @@ def main():
             "gpt_oss_transformer",
             "rope",
             "mixtral_moe",
+            "grpo",
         ],
         help="Block type to benchmark (default: llama)",
     )
