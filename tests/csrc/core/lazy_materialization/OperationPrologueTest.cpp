@@ -30,6 +30,11 @@ bool Contains(const std::string& str, const std::string& substr) {
   return str.find(substr) != std::string::npos;
 }
 
+// Helper function to check if a string starts with a prefix
+bool StartsWith(const std::string& str, const std::string& prefix) {
+  return str.rfind(prefix, 0) == 0;
+}
+
 // Helper function to extract input pointers and contexts from tensors
 void ExtractInputPtrsAndContexts(const std::vector<at::Tensor>& inputs,
                                  std::vector<void*>& input_ptrs,
@@ -355,7 +360,9 @@ TEST_F(OperationPrologueTest, TwoInputsOneTransformationEach) {
       << "MLIR should contain transpose operations";
 
   // Cache key should reflect both transformations
-  EXPECT_TRUE(Contains(result.prologue_cache_key, "0_"))
+  EXPECT_TRUE(StartsWith(result.prologue_cache_key, "prologue--"))
+      << "Cache key should start with prologue prefix";
+  EXPECT_TRUE(Contains(result.prologue_cache_key, "i0_"))
       << "Cache key should reference first input";
 }
 

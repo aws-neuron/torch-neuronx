@@ -5,6 +5,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -79,8 +80,15 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
           *seq = seq_counter.fetch_add(1);
           return NRT_SUCCESS;
         });
-    EXPECT_CALL(*mock_nrt_, nrta_is_completed(_, _))
-        .WillRepeatedly(DoAll(SetArgPointee<1>(true), Return(NRT_SUCCESS)));
+    EXPECT_CALL(*mock_nrt_, nrta_event_register_seq_id_completion(_, _))
+        .WillRepeatedly(::testing::Invoke([](nrta_seq_t, int fd) -> NRT_STATUS {
+          // Simulate NRT signaling completion immediately so the worker wakes from read(efd)
+          uint64_t val = 1;
+          ::write(fd, &val, sizeof(val));
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*mock_nrt_, nrta_get_sequence(_, _, _, _))
+        .WillRepeatedly(DoAll(SetArgPointee<3>(UINT64_MAX), Return(NRT_SUCCESS)));
 
     // Register neuron device to ensure proper initialization
     torch_neuronx::register_neuron_device();

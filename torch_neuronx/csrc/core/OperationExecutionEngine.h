@@ -51,7 +51,7 @@ class OperationExecutionEngine {
   // Submit operation to concatenation queue (if enabled) or directly to compilation
   void SubmitOperation(OperationContext* operation);
   // Notify the execution worker that an operation is ready
-  void NotifyExecutionReady();
+  void NotifyExecutionReady() { WriteEventfd(); }
 
   // Execution queue depth management
   int64_t GetExecutionQueueDepth() const { return execution_queue_depth_.load(); }
@@ -79,8 +79,8 @@ class OperationExecutionEngine {
   std::deque<OperationContext*> compilation_queue_;
 
   mutable std::mutex runtime_mutex_;
-  std::condition_variable runtime_cv_;
-  bool runtime_pending_{false};
+
+  int completion_efd_{-1};
 
   // Shutdown coordination
   std::atomic<bool> shutdown_requested_{false};
@@ -103,6 +103,13 @@ class OperationExecutionEngine {
   // Check and process completions for all devices
   void CheckCompletions() noexcept;
 
+  // Register eventfd on front-of-queue sequences
+  void RegisterCompletionEvents();
+  void RegisterSeqCompletion(StreamImpl* stream, nrt::SequenceId seq);
+
+  // Write to completion_efd_ with EINTR retry
+  void WriteEventfd();
+
   // Process a single async execution task (schedule without waiting)
   void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
 
@@ -123,7 +130,7 @@ class OperationExecutionEngine {
  protected:
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
-  void ProcessCompletions(StreamImpl* stream);
+  void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
   std::atomic<int64_t> execution_queue_depth_{0};
 
   // Track pending async operations count to avoid expensive iteration

@@ -152,15 +152,16 @@ class ContiguousNKIImpl(OperationImplementation):
 
 def contiguous_internal(self_tensor, memory_format=None):
     """Internal contiguous implementation that can be called from C++ without dispatcher"""
+    from .cast_policy import validate_neuron_memory_format
+
+    validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
+
     implementations = [
         ContiguousTransposeMLIRImpl(),
         ContiguousBroadcastMLIRImpl(),
         ContiguousSliceMLIRImpl(),
         ContiguousNKIImpl(),
     ]
-    from .cast_policy import validate_neuron_memory_format
-
-    validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
 
     for impl in implementations:
         if impl.can_handle(self_tensor, memory_format):

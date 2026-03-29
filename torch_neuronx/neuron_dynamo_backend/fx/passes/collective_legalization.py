@@ -2,7 +2,10 @@
 Converts PyTorch's _c10d_functional collective operations
 (all_reduce, all_gather, reduce_scatter, all_to_all) to a format compatible with StableHLO.
 By re-writing "group name" argument from the process group identifier (e.g '1') to
-explicit list of participating ranks (e.g '[[0, 2, 4, 6]]').
+explicit list of participating ranks (e.g '[[0, 1], [2, 3]]').
+
+For SPMD compilation, all ranks must produce identical replica groups. This module
+uses the mesh registry to derive full groups from DeviceMesh topology.
 """
 
 import logging
@@ -10,6 +13,8 @@ import logging
 import torch
 import torch.distributed as dist
 from torch.fx.passes.infra.pass_base import PassBase, PassResult
+
+from torch_neuronx.distributed.mesh_registry import get_all_replica_groups
 
 logger = logging.getLogger(__name__)
 
@@ -25,40 +30,35 @@ _COLLECTIVE_OPS_GROUP_INDEX = {
 }
 
 
-def _get_process_group_ranks(group_name: str) -> list[int]:
+def _get_process_group_ranks(group_name: str) -> list[list[int]]:
     """
-    Get the list of participating ranks for a process group.
+    Get all replica groups for a process group (SPMD-compatible).
+
+    For mesh-based PGs, returns full replica groups derived from mesh topology.
+    For non-mesh PGs, returns the current rank's group wrapped in a list.
 
     Args:
         group_name: Process group identifier (e.g., "0", "3", etc.)
 
     Returns:
-        List of rank IDs participating in the process group
+        List of replica groups, each a list of rank IDs.
 
     Example:
-        >>> get_process_group_ranks("3")
-        [0, 1]
-        >>> get_process_group_ranks("0")
-        [0, 1, 2, 3]
+        # 2D mesh (4, 2) with FSDP outer, TP inner
+        >>> _get_process_group_ranks("tp_pg")
+        [[0, 1], [2, 3], [4, 5], [6, 7]]
+        >>> _get_process_group_ranks("fsdp_pg")
+        [[0, 2, 4, 6], [1, 3, 5, 7]]
     """
     try:
-        # Resolve the process group from its name/identifier
-        # e.g: torch_neuronx.distributed.backend.ProcessGroupNeuron
-        pg = dist.distributed_c10d._resolve_process_group(group_name)
-
-        # Get the ranks participating in this process group
-        # e.g: [0, 1, ...]
-        ranks = dist.get_process_group_ranks(pg)
-
-        logger.debug(f"Process group '{group_name}' has ranks: {ranks}")
-        return ranks
-
+        groups = get_all_replica_groups(group_name)
+        logger.debug(f"Process group '{group_name}' has replica groups: {groups}")
+        return groups
     except Exception as e:
-        logger.warning(f"Failed to resolve process group '{group_name}': {e}")
+        logger.warning(f"Failed to get replica groups for '{group_name}': {e}")
         logger.warning("Falling back to default world group")
-        # Fallback: return all ranks in the default world group
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        return list(range(world_size))
+        return [list(range(world_size))]
 
 
 class CollectiveLegalization(PassBase):
@@ -89,9 +89,9 @@ class CollectiveLegalization(PassBase):
                 args = list(node.args)
                 group_index = _COLLECTIVE_OPS_GROUP_INDEX[str(node.target)]
                 group_arg = args[group_index]
-                ranks = _get_process_group_ranks(group_arg)
-                logger.debug(f"Collective {node.target}: group ({group_arg}) -> ({ranks})")
-                args[group_index] = "[" + str(ranks) + "]"
+                replica_groups = _get_process_group_ranks(group_arg)
+                logger.debug(f"Collective {node.target}: group ({group_arg}) -> ({replica_groups})")
+                args[group_index] = str(replica_groups)
                 node.args = tuple(args)
                 modified = True
 

@@ -36,13 +36,17 @@ class NeuronCompilationService {
 
   CompilationConfig compilation_config_;
 
-  // Bounded worker pool
+  struct CompileResult {
+    std::string neff_path{};
+    std::string error_message{};
+  };
+
   struct CompileJob {
     std::string hlo_file_path;
     std::string ir_type;
     std::string optimization_level;
     std::string additional_args;
-    std::promise<std::string> result;
+    std::promise<CompileResult> result;
   };
 
   std::vector<std::thread> workers_;

@@ -11,6 +11,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import is_native_int64_enabled
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -59,7 +60,28 @@ class TestPermute:
     def test_permute_data_correctness(self):
         """Test that permute correctly rearranges data."""
         # Create and permute tensor on CPU first
-        x_cpu = torch.arange(24).reshape(2, 3, 4)
+        x_cpu = torch.arange(24, dtype=torch.int32).reshape(2, 3, 4)
+        p_cpu = torch.permute(x_cpu, (2, 0, 1))
+
+        # Now test on neuron and compare with CPU result
+        with track_neuron_ops():
+            x = x_cpu.to("neuron")
+            p = torch.permute(x, (2, 0, 1))
+            assert torch.all(p.cpu() == p_cpu)
+            assert_op_runs_on_neuron("aten::empty_strided")
+
+    @pytest.mark.xfail(
+        condition=is_native_int64_enabled(),
+        reason=(
+            "Compiler transpose bug for int64 tensors "
+            "(CR-253439025 fix not yet in 2.23 compiler)"
+        ),
+        strict=False,
+    )
+    def test_permute_data_correctness_int64(self):
+        """Test that permute correctly rearranges int64 data (xfail when native int64 enabled)."""
+        # Create and permute tensor on CPU first
+        x_cpu = torch.arange(24, dtype=torch.int64).reshape(2, 3, 4)
         p_cpu = torch.permute(x_cpu, (2, 0, 1))
 
         # Now test on neuron and compare with CPU result

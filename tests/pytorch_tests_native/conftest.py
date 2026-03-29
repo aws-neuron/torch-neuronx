@@ -1,6 +1,7 @@
 """Pytest configuration for running upstream PyTorch tests natively on Neuron."""
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,19 +9,27 @@ import pytest
 os.environ["DISTRIBUTED_TESTS_DEFAULT_TIMEOUT"] = "1800"  # 30 minutes
 os.environ.setdefault("PYTORCH_TESTING_DEVICE_ONLY_FOR", "neuron")
 
-# Setup overlay for torch.testing._internal
-try:
-    import torch
 
-    root = Path(__file__).parent
-    testing_internal = root / "torch" / "testing" / "_internal"
-    if testing_internal.exists():
-        os.environ["TORCH_TESTING_INTERNAL_PATH"] = str(testing_internal)
-        import torch.testing._internal as _internal
+def pytest_configure(config):
+    """Override installed torch.testing._internal with our forked version.
 
-        _internal.__path__.insert(0, str(testing_internal))
-except ModuleNotFoundError:
-    pass
+    Runs only in the master process (before xdist workers spawn), ensuring
+    all processes see the same replaced files without race conditions.
+    """
+    # Skip in xdist workers — they have workerinput, master doesn't
+    if hasattr(config, "workerinput"):
+        return
+
+    import torch.testing._internal as _internal
+
+    installed = Path(os.path.dirname(_internal.__file__))
+    overlay = Path(__file__).parent / "torch" / "testing" / "_internal"
+    if overlay.exists():
+        shutil.rmtree(installed)
+        shutil.copytree(str(overlay), str(installed))
+
+
+import torch_neuronx  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

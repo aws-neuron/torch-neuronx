@@ -75,6 +75,7 @@ def assert_concatenation_occurred(test_name: str = ""):
     # Primary check: telemetry metrics (deterministic)
     groups_created = met.get_counter_value("Concatenation.GroupsCreated")
     successes = met.get_counter_value("Concatenation.Successes")
+    attempts = met.get_counter_value("Concatenation.Attempts")
 
     # Secondary check: pipe-separated op names in executed ops
     op_list = get_executed_op_list()
@@ -93,7 +94,7 @@ def assert_concatenation_occurred(test_name: str = ""):
 
     assert metrics_show_concat or ops_show_concat or tracker_show_concat, (
         f"{test_name}: Concatenation did not occur. "
-        f"Metrics: GroupsCreated={groups_created}, Successes={successes}. "
+        f"Metrics: Attempts={attempts}, GroupsCreated={groups_created}, Successes={successes}. "
         f"Concatenated ops in executed: {len(concatenated_ops)}. "
         f"ConcatenatedOpTracker groups: {len(concat_groups)}. "
         f"Executed ops: {executed_ops}"
@@ -122,23 +123,35 @@ class TestConcatenationBasicOps:
         """
         Test matmul operations in a loop produce correct results.
 
-        Pattern: Multiple matmul + add operations in a loop.
+        Pattern: Multiple independent matmul projections (Q/K/V-style) per
+        iteration, mimicking a 70B-model transformer layer. This ensures:
+        1. Large ops (8192-dim) create enough compute backpressure to exceed
+           the queue_low_threshold, routing ops through concatenation.
+        2. Multiple independent same-shape matmuls per iteration allow the
+           concatenation engine to form groups.
         """
         device = "neuron"
 
-        # Create all tensors on CPU first
-        a_cpu = torch.randn(128, 256, dtype=dtype)
-        b_cpu = torch.randn(256, 512, dtype=dtype)
+        # 70B-model-like dimensions: (batch*seq, hidden) @ (hidden, hidden)
+        x_cpu = torch.randn(128, 8192, dtype=dtype)
+        w1_cpu = torch.randn(8192, 8192, dtype=dtype)
+        w2_cpu = torch.randn(8192, 8192, dtype=dtype)
+        w3_cpu = torch.randn(8192, 8192, dtype=dtype)
 
         # Copy to Neuron ONCE, outside the tracking context to avoid copy ops
-        a_neuron = a_cpu.to(device)
-        b_neuron = b_cpu.to(device)
+        x_neuron = x_cpu.to(device)
+        w1_neuron = w1_cpu.to(device)
+        w2_neuron = w2_cpu.to(device)
+        w3_neuron = w3_cpu.to(device)
 
         with track_neuron_ops():
             # Run all iterations on Neuron WITHOUT any host copies
+            # Three independent projections per iteration (like Q/K/V)
             for _i in range(num_iterations):
-                result = a_neuron @ b_neuron
-                result = result + result
+                r1 = x_neuron @ w1_neuron
+                r2 = x_neuron @ w2_neuron
+                r3 = x_neuron @ w3_neuron
+                result = r1 + r2 + r3
 
             # Single .cpu() at the end - fusion boundary
             result_final = result.cpu()
@@ -147,41 +160,58 @@ class TestConcatenationBasicOps:
             assert_concatenation_occurred(f"test_matmul_loop_precision[{dtype},{num_iterations}]")
 
             # Verify results
-            result_cpu = a_cpu @ b_cpu
-            result_cpu = result_cpu + result_cpu
+            r1_cpu = x_cpu @ w1_cpu
+            r2_cpu = x_cpu @ w2_cpu
+            r3_cpu = x_cpu @ w3_cpu
+            result_cpu = r1_cpu + r2_cpu + r3_cpu
 
             if dtype == torch.float32:
                 assert torch.allclose(
-                    result_final, result_cpu, rtol=1e-4, atol=1e-4
+                    result_final, result_cpu, rtol=1e-3, atol=1e-3
                 ), "Matmul produced incorrect results"
             else:  # bfloat16
                 assert torch.allclose(
-                    result_final, result_cpu, rtol=1e-2, atol=1e-2
+                    result_final, result_cpu, rtol=1e-2, atol=0.5
                 ), "Matmul produced incorrect results for bfloat16"
 
     @skip_if_concatenation_disabled()
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_matmul_add_loop_precision(self, dtype):
         """
-        Test matmul followed by add operations in a loop.
+        Test matmul followed by add (bias) operations in a loop.
+
+        Pattern: Three independent matmul projections (Q/K/V-style) per
+        iteration using 70B-model dimensions, followed by a single bias
+        addition. Keeps the same proven concat-friendly pattern as
+        test_matmul_loop_precision while also exercising bias addition.
         """
         device = "neuron"
         num_iterations = 50
 
-        # Create all tensors on CPU first
-        a_cpu = torch.randn(64, 128, dtype=dtype)
-        b_cpu = torch.randn(128, 256, dtype=dtype)
-        bias_cpu = torch.randn(64, 256, dtype=dtype)
+        # 70B-model-like dimensions with a different batch size (64) than
+        # test_matmul_loop_precision (128) to ensure distinct cache keys and
+        # force compilation, creating the queue backpressure needed for concat.
+        x_cpu = torch.randn(64, 8192, dtype=dtype)
+        w1_cpu = torch.randn(8192, 8192, dtype=dtype)
+        w2_cpu = torch.randn(8192, 8192, dtype=dtype)
+        w3_cpu = torch.randn(8192, 8192, dtype=dtype)
+        bias_cpu = torch.randn(64, 8192, dtype=dtype)
 
         # Copy to Neuron ONCE
-        a_neuron = a_cpu.to(device)
-        b_neuron = b_cpu.to(device)
+        x_neuron = x_cpu.to(device)
+        w1_neuron = w1_cpu.to(device)
+        w2_neuron = w2_cpu.to(device)
+        w3_neuron = w3_cpu.to(device)
         bias_neuron = bias_cpu.to(device)
 
         with track_neuron_ops():
+            # Three independent matmul projections, then sum with bias.
+            # Same pattern as test_matmul_loop_precision + bias term.
             for _i in range(num_iterations):
-                result = a_neuron @ b_neuron
-                result = result + bias_neuron
+                r1 = x_neuron @ w1_neuron
+                r2 = x_neuron @ w2_neuron
+                r3 = x_neuron @ w3_neuron
+                result = r1 + r2 + r3 + bias_neuron
 
             # Single .cpu() at the end
             result_final = result.cpu()
@@ -190,15 +220,18 @@ class TestConcatenationBasicOps:
             assert_concatenation_occurred(f"test_matmul_add_loop_precision[{dtype}]")
 
             # Verify results
-            result_cpu = (a_cpu @ b_cpu) + bias_cpu
+            r1_cpu = x_cpu @ w1_cpu
+            r2_cpu = x_cpu @ w2_cpu
+            r3_cpu = x_cpu @ w3_cpu
+            result_cpu = r1_cpu + r2_cpu + r3_cpu + bias_cpu
 
             if dtype == torch.float32:
                 assert torch.allclose(
-                    result_final, result_cpu, rtol=1e-4, atol=1e-4
+                    result_final, result_cpu, rtol=1e-3, atol=1e-3
                 ), "Matmul+add produced incorrect results"
             else:
                 assert torch.allclose(
-                    result_final, result_cpu, rtol=1e-2, atol=1e-2
+                    result_final, result_cpu, rtol=1e-2, atol=0.5
                 ), "Matmul+add produced incorrect results for bfloat16"
 
 

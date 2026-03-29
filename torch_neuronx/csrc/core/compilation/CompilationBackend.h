@@ -26,13 +26,11 @@ class CompilationBackend {
   //
   // Args:
   //   hlo_bytes: Serialized HLO IR
-  //   persistent_cache_key: Key for persistent cache (used by service to write NEFF)
   //   ir_type: "XLA" or "StableHLO"
   //   compile_fn: Local compilation function (used by local backend, ignored by service)
   //
   // Returns: compiled NEFF bytes (empty on failure)
   virtual std::vector<uint8_t> Compile(const std::vector<uint8_t>& hlo_bytes,
-                                       const std::string& persistent_cache_key,
                                        const std::string& ir_type,
                                        const std::string& optimization_level,
                                        const std::string& additional_args,

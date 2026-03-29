@@ -2116,7 +2116,7 @@ TEST_F(CompilationCacheTest, AsyncPathWorksWithLocalBackend) {
   std::atomic<bool> done{false};
   bool success = false;
 
-  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool s) {
+  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool s, const std::string&) {
     success = s;
     done = true;
   });
@@ -2143,7 +2143,7 @@ TEST_F(CompilationCacheTest, AsyncCacheHit) {
   std::atomic<bool> callback_invoked{false};
   bool callback_success = false;
 
-  cache_->GetOrCompileNeffAsync(kernel2, 1, [&](bool success) {
+  cache_->GetOrCompileNeffAsync(kernel2, 1, [&](bool success, const std::string&) {
     callback_success = success;
     callback_invoked = true;
   });
@@ -2163,7 +2163,7 @@ TEST_F(CompilationCacheTest, AsyncCacheMiss) {
   std::atomic<bool> callback_invoked{false};
   bool callback_success = false;
 
-  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool success) {
+  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool success, const std::string&) {
     callback_success = success;
     callback_invoked = true;
   });
@@ -2188,7 +2188,7 @@ TEST_F(CompilationCacheTest, AsyncPendingCompilation) {
     kernels.push_back(std::make_unique<MockNeuronKernelExecution>("async_pending_test"));
 
   for (auto& kernel : kernels) {
-    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success) {
+    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success, const std::string&) {
       if (success) callbacks_success++;
       callbacks_invoked++;
     });
@@ -2216,7 +2216,8 @@ TEST_F(CompilationCacheTest, AsyncMultipleDifferentKeys) {
         std::make_unique<MockNeuronKernelExecution>("async_multi_" + std::to_string(i)));
 
   for (auto& kernel : kernels)
-    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool) { callbacks_invoked++; });
+    cache_->GetOrCompileNeffAsync(*kernel, 1,
+                                  [&](bool, const std::string&) { callbacks_invoked++; });
 
   for (int i = 0; i < 100 && callbacks_invoked.load() < num_keys; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2236,7 +2237,7 @@ TEST_F(CompilationCacheTest, AsyncFutureCaptureRace) {
     kernels.push_back(std::make_unique<MockNeuronKernelExecution>("async_race_test"));
 
   for (auto& kernel : kernels) {
-    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success) {
+    cache_->GetOrCompileNeffAsync(*kernel, 1, [&](bool success, const std::string&) {
       if (success) callbacks_success++;
       callbacks_invoked++;
     });
@@ -2250,6 +2251,34 @@ TEST_F(CompilationCacheTest, AsyncFutureCaptureRace) {
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
 }
 
+TEST_F(CompilationCacheTest, AsyncErrorStashedOnKernel) {
+  class ThrowingKernel : public MockNeuronKernelExecution {
+   public:
+    ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
+    std::vector<uint8_t> CompileToNeff() const override {
+      throw std::runtime_error("neuronx-cc: unsupported op xyz");
+    }
+  };
+
+  ThrowingKernel kernel("async_error_stash_key");
+  EXPECT_FALSE(kernel.IsFailedCompilation());
+
+  std::atomic<bool> done{false};
+  cache_->GetOrCompileNeffAsync(kernel, 1, [&](bool success, const std::string& error) {
+    // Simulate what OperationExecutionEngine does on failure:
+    if (!success && !error.empty()) {
+      kernel.SetCompilationError(error);
+    }
+    done = true;
+  });
+
+  while (!done.load()) std::this_thread::yield();
+
+  // Verify the new APIs work end-to-end
+  EXPECT_FALSE(kernel.HasCachedNeff());
+  EXPECT_TRUE(kernel.IsFailedCompilation());
+  EXPECT_THAT(kernel.GetCompilationError(), ::testing::HasSubstr("neuronx-cc: unsupported op xyz"));
+}
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

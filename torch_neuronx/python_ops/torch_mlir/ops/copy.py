@@ -49,14 +49,21 @@ class CopyMLIRImpl(TorchMlirOpImpl):
 
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
+        # - int64/uint64: Not natively supported on device, handled by NRT-based implementation
         # - bool: Requires special handling, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.bool, torch.int64)
-        return (
+        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64, torch.bool)
+        if not (
             dest.device.type == "neuron"
             and src.device.type == "neuron"
             and dest.dtype not in unsupported_dtypes
             and src.dtype not in unsupported_dtypes
-        )
+        ):
+            return False
+
+        from torch_neuronx.neuron import current_stream, default_stream
+        from torch_neuronx.utils import is_host_cc_enabled
+
+        return not (is_host_cc_enabled() and current_stream() != default_stream())
 
     def execute(self, *args, **kwargs):
         """Execute copy operation using MLIR backend.

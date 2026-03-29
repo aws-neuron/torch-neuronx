@@ -394,5 +394,83 @@ class TestContextManagerSemantics:
             assert new_args1[0].dtype == torch.float32
 
 
+class TestValidateOutputDtypes:
+    """Tests for validate_output_dtypes behavior."""
+
+    def test_int64_out_allowed_when_cast_int64_false(self):
+        """Test that int64 output tensors are allowed when cast_int64=False (S64 HLO)."""
+        with autocast_neuron(cast_int64=False) as context:
+            # Process some inputs first (no int64 inputs)
+            args = (torch.tensor([1.0, 2.0], dtype=torch.float32),)
+            context.process_args(args, {})
+
+            # Validate with int64 out tensor
+            out_tensor = torch.empty(2, dtype=torch.int64)
+            original_kwargs = {"out": out_tensor}
+
+            # This should not raise TypeError when cast_int64=False
+            context.validate_output_dtypes(original_kwargs)
+
+    def test_int64_out_sets_had_int64_when_cast_int64_true(self):
+        """Test that int64 out tensor sets had_int64 flag when cast_int64=True."""
+        with autocast_neuron(cast_int64=True) as context:
+            # Process inputs without int64
+            args = (torch.tensor([1, 2], dtype=torch.int32),)
+            context.process_args(args, {})
+            assert context.had_int64 is False
+
+            # Validate with int64 out tensor
+            out_tensor = torch.empty(2, dtype=torch.int64)
+            original_kwargs = {"out": out_tensor}
+
+            context.validate_output_dtypes(original_kwargs)
+
+            # had_int64 should be set for dtype restoration
+            assert context.had_int64 is True
+
+    def test_float64_out_raises_when_cast_float64_false(self):
+        """Test that float64 out tensor raises error when cast_float64=False."""
+        with autocast_neuron(cast_float64=False) as context:
+            args = (torch.tensor([1.0, 2.0], dtype=torch.float32),)
+            context.process_args(args, {})
+
+            out_tensor = torch.empty(2, dtype=torch.float64)
+            original_kwargs = {"out": out_tensor}
+
+            with pytest.raises(TypeError, match="float64 which is not supported"):
+                context.validate_output_dtypes(original_kwargs)
+
+    def test_int64_out_with_int64_input_no_change(self):
+        """Test int64 out with int64 input doesn't modify had_int64."""
+        with autocast_neuron(cast_int64=True) as context:
+            # Process with int64 input
+            args = (torch.tensor([1, 2], dtype=torch.int64),)
+            context.process_args(args, {})
+            assert context.had_int64 is True
+
+            # Validate with int64 out - should not change had_int64
+            out_tensor = torch.empty(2, dtype=torch.int64)
+            original_kwargs = {"out": out_tensor}
+
+            context.validate_output_dtypes(original_kwargs)
+            assert context.had_int64 is True
+
+    def test_validate_with_tuple_out(self):
+        """Test validate_output_dtypes with tuple of output tensors."""
+        with autocast_neuron(cast_int64=False) as context:
+            args = (torch.tensor([1.0], dtype=torch.float32),)
+            context.process_args(args, {})
+
+            # Tuple of outputs with mixed dtypes
+            out_tensors = (
+                torch.empty(2, dtype=torch.float32),
+                torch.empty(2, dtype=torch.int64),  # Should be allowed
+            )
+            original_kwargs = {"out": out_tensors}
+
+            # Should not raise - int64 allowed when cast_int64=False
+            context.validate_output_dtypes(original_kwargs)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

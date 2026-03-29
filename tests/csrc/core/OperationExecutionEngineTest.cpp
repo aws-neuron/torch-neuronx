@@ -1,5 +1,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <climits>
@@ -31,6 +32,17 @@ class OperationExecutionEngineTest : public ::testing::Test {
   void SetUp() override {
     // Initialize mock NRT session first
     mock_nrt_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
+
+    // Default expectations for async NRT operations used by eventfd-based worker
+    EXPECT_CALL(*torch_neuronx::testing::MockNRT::GetInstance(),
+                nrta_event_register_seq_id_completion(_, _))
+        .WillRepeatedly(::testing::Invoke([](nrta_seq_t, int fd) -> NRT_STATUS {
+          uint64_t val = 1;
+          ::write(fd, &val, sizeof(val));
+          return NRT_SUCCESS;
+        }));
+    EXPECT_CALL(*torch_neuronx::testing::MockNRT::GetInstance(), nrta_get_sequence(_, _, _, _))
+        .WillRepeatedly(DoAll(SetArgPointee<3>(UINT64_MAX), Return(NRT_SUCCESS)));
 
     // Initialize stream pools before creating any engines
     InitializeStreamPools();
@@ -633,6 +645,174 @@ TEST_F(OperationExecutionEngineTest, DecrementQueueDepthSkipsConcatenatedOps) {
 
   engine.Shutdown();
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// Test that ProcessCompletions correctly uses seq watermark comparison:
+// ops with NRTA_SEQ_GET_SEQ_NUM(seq) <= NRTA_SEQ_GET_SEQ_NUM(watermark) are completed,
+// ops above the watermark are not.
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsUsesSeqWatermark) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create 3 operations with increasing sequence IDs
+  std::vector<std::shared_ptr<OperationContext>> ops;
+  for (int i = 0; i < 3; ++i) {
+    auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+    auto op = std::make_shared<OperationContext>(std::move(kernel));
+    op->stream = stream.get();
+    op->nrt_async_state_.is_scheduled = true;
+    op->nrt_async_state_.sequence_id = static_cast<nrta_seq_t>(i + 1);  // seq 1, 2, 3
+    op->nrt_status_ = NRT_SUCCESS;
+    ops.push_back(op);
+  }
+
+  // Add all ops to active_operations_
+  for (auto& op : ops) {
+    stream->active_operations_.push_back(op);
+  }
+
+  // Set pending count
+  engine.pending_async_ops_count_.store(3);
+
+  // Create watermark: only seq 1 and 2 are completed
+  XUCompletionState completed_seqs;
+  size_t xu_idx = GetXUIndex(KernelTypeEnum::kHLO);
+  int queue = nrt::GetHardwareQueue(static_cast<nrta_xu_t>(xu_idx), stream->stream_id);
+  completed_seqs.Set(static_cast<nrta_xu_t>(xu_idx), queue, 2);  // watermark at seq 2
+
+  // Process completions
+  engine.ProcessCompletions(stream.get(), completed_seqs);
+
+  // Ops with seq 1 and 2 should be completed (removed from active_operations_)
+  // Op with seq 3 should still be pending
+  EXPECT_EQ(stream->active_operations_.size(), 1);
+  EXPECT_EQ(stream->active_operations_.front()->nrt_async_state_.sequence_id, 3u);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+
+  // Clean up
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+// Test that ProcessCompletions stops at the first incomplete op (preserves ordering).
+// Even if a later op's seq is below the watermark, it won't be completed if a prior op isn't.
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Op 1: seq 5 (above watermark — incomplete)
+  auto kernel1 = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel1, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op1 = std::make_shared<OperationContext>(std::move(kernel1));
+  op1->stream = stream.get();
+  op1->nrt_async_state_.is_scheduled = true;
+  op1->nrt_async_state_.sequence_id = 5;
+  op1->nrt_status_ = NRT_SUCCESS;
+
+  // Op 2: seq 1 (below watermark — but blocked by op1)
+  auto kernel2 = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel2, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op2 = std::make_shared<OperationContext>(std::move(kernel2));
+  op2->stream = stream.get();
+  op2->nrt_async_state_.is_scheduled = true;
+  op2->nrt_async_state_.sequence_id = 1;
+  op2->nrt_status_ = NRT_SUCCESS;
+
+  stream->active_operations_.push_back(op1);
+  stream->active_operations_.push_back(op2);
+  engine.pending_async_ops_count_.store(2);
+
+  // Watermark at seq 3 — op2 (seq 1) would pass, but op1 (seq 5) blocks it
+  XUCompletionState completed_seqs;
+  size_t xu_idx = GetXUIndex(KernelTypeEnum::kHLO);
+  int queue = nrt::GetHardwareQueue(static_cast<nrta_xu_t>(xu_idx), stream->stream_id);
+  completed_seqs.Set(static_cast<nrta_xu_t>(xu_idx), queue, 3);
+
+  engine.ProcessCompletions(stream.get(), completed_seqs);
+
+  // Neither op should be completed — op1 blocks op2
+  EXPECT_EQ(stream->active_operations_.size(), 2);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 2);
+
+  // Clean up
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+// Test that pending_signal ops (events/hints) are completed without seq comparison.
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Create a pending_signal op (event/hint — no NRT scheduling)
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kEvent));
+  ON_CALL(*kernel, Schedule(_, _, _)).WillByDefault(Return(true));
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  op->nrt_async_state_.is_pending_signal = true;
+  op->nrt_async_state_.is_scheduled = false;
+
+  stream->active_operations_.push_back(op);
+  engine.pending_async_ops_count_.store(1);
+
+  // Empty watermark — doesn't matter for pending_signal ops
+  XUCompletionState completed_seqs;
+
+  engine.ProcessCompletions(stream.get(), completed_seqs);
+
+  // Pending signal op should be completed regardless of watermark
+  EXPECT_EQ(stream->active_operations_.size(), 0);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
+
+  engine.Shutdown();
+}
+
+// Test that when watermark is 0 (no completions yet), no ops are completed.
+TEST_F(OperationExecutionEngineTest, ProcessCompletionsZeroWatermarkCompletesNothing) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->nrt_async_state_.is_scheduled = true;
+  op->nrt_async_state_.sequence_id = 1;
+  op->nrt_status_ = NRT_SUCCESS;
+
+  stream->active_operations_.push_back(op);
+  engine.pending_async_ops_count_.store(1);
+
+  // Zero watermark — nothing completed
+  XUCompletionState completed_seqs;  // all zeros from value-init
+
+  engine.ProcessCompletions(stream.get(), completed_seqs);
+
+  // Op should NOT be completed (seq 1 > watermark 0)
+  EXPECT_EQ(stream->active_operations_.size(), 1);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+
+  // Clean up
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
 }
 
 int main(int argc, char** argv) {

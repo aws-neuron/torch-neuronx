@@ -144,11 +144,14 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
         auto transform_result = registry.TryCreateAnyTransformation(input, op_name, i);
 
         if (transform_result.has_value()) {
-          // SUPPORTED pattern - use the transformation
+          // SUPPORTED pattern - use the transformation(s)
           TORCH_NEURONX_DEBUG("Using supported pattern transformation", "op=", op_name,
-                              "input_index=", i, "pattern=", transform_result->pattern_name);
+                              "input_index=", i, "pattern=", transform_result->pattern_name,
+                              "num_transforms=", transform_result->transformations.size());
 
-          result.kernel_transforms[i].push_back(transform_result->transformation);
+          for (const auto& t : transform_result->transformations) {
+            result.kernel_transforms[i].push_back(t);
+          }
           result.has_input_transforms = true;
           result.final_inputs.push_back(transform_result->processed_input);
         } else {
@@ -164,6 +167,51 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
     } else {
       // Already contiguous - use as-is
       result.final_inputs.push_back(input);
+    }
+  }
+
+  // Post-processing: detect conflicting base shapes for shared storage (FSDP).
+  // When two inputs share the same data_ptr() but have different shapes (from
+  // different compound decompositions), the prologue merge will fail. Force both
+  // to use contiguous_internal to avoid the conflict.
+  if (result.has_input_transforms) {
+    std::unordered_map<void*, std::pair<std::vector<int64_t>, size_t>> base_shapes;
+    std::vector<size_t> conflicting_indices;
+
+    for (size_t i = 0; i < result.final_inputs.size(); ++i) {
+      if (result.kernel_transforms[i].empty()) continue;
+      void* ptr = result.final_inputs[i].data_ptr();
+      auto shape_vec = result.final_inputs[i].sizes().vec();
+      auto it = base_shapes.find(ptr);
+      if (it != base_shapes.end()) {
+        if (it->second.first != shape_vec) {
+          conflicting_indices.push_back(i);
+          conflicting_indices.push_back(it->second.second);
+          TORCH_NEURONX_INFO(
+              "Detected conflicting base shapes for shared storage, "
+              "falling back to contiguous_internal",
+              " op=", op_name, " input_indices=", i, " and ", it->second.second);
+        }
+      } else {
+        base_shapes[ptr] = {shape_vec, i};
+      }
+    }
+
+    for (size_t idx : conflicting_indices) {
+      if (!result.kernel_transforms[idx].empty()) {
+        result.kernel_transforms[idx].clear();
+        result.final_inputs[idx] = torch_neuronx::ops::contiguous_internal(inputs[idx]);
+      }
+    }
+
+    if (!conflicting_indices.empty()) {
+      result.has_input_transforms = false;
+      for (const auto& kt : result.kernel_transforms) {
+        if (!kt.empty()) {
+          result.has_input_transforms = true;
+          break;
+        }
+      }
     }
   }
 

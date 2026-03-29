@@ -22,7 +22,7 @@ class TestNonzeroStatic:
         """Get the neuron device."""
         return torch.device("neuron")
 
-    @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
+    @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4), (1, 260, 2048), (260, 2048)])
     def test_nonzero_static_basic_shapes(self, device, shape):
         """Test nonzero_static with various tensor shapes."""
         with track_neuron_ops():
@@ -91,6 +91,19 @@ class TestNonzeroStatic:
             assert neuron_result.device.type == "neuron"
             assert neuron_result.shape[0] == size
             cpu_result = torch.nonzero_static(x.cpu(), size=size)
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::nonzero_static")
+
+    def test_nonzero_static_undersized(self, device):
+        """Test nonzero_static with size smaller than actual nonzeros."""
+        with track_neuron_ops():
+            x = torch.tensor([True, False, True, False], device=device)
+            size = 1  # Smaller than actual nonzeros (2)
+            neuron_result = torch.nonzero_static(x, size=size)
+            cpu_result = torch.nonzero_static(x.cpu(), size=size)
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.shape[0] == size
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::nonzero_static")
 

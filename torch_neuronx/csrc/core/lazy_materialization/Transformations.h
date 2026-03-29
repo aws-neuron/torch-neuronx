@@ -67,6 +67,23 @@ std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor&
                                                                const std::string& op_name,
                                                                size_t input_index);
 
+/**
+ * @brief Try to create a COMPOUND transformation (general stride decomposition)
+ *
+ * Decomposes arbitrary non-contiguous stride patterns into a sequence of
+ * slice and transpose transformations. Handles compound patterns like
+ * transpose+slice (common in attention/RoPE) that individual TryCreateTranspose
+ * and TryCreateSlice cannot detect.
+ *
+ * @param input Input tensor to analyze
+ * @param op_name Name of the operation for logging
+ * @param input_index Index of this input in the operation
+ * @return TransformationCreationResult with multiple transformations if pattern detected
+ */
+std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& input,
+                                                              const std::string& op_name,
+                                                              size_t input_index);
+
 }  // namespace Creators
 
 // ============================================================================

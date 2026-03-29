@@ -8,8 +8,8 @@ from pathlib import Path
 from torch.utils._filelock import FileLock
 
 from .cache_utils import (
-    CompilationJob,
     atomic_write_bytes,
+    compilation_job,
     get_local_cache_dir,
     get_lock_timeout,
     get_nfs_cache_dir,
@@ -120,7 +120,6 @@ class CompilerSubprocess:
         self,
         hlo_protobuf: bytes,
         config: CompilerConfig,
-        job: CompilationJob,
         lnc_override: str | None = None,
         ir_type: str = "XLA",
         output_file: str | None = None,
@@ -131,7 +130,6 @@ class CompilerSubprocess:
         Args:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
             config: Compiler configuration
-            job: Compilation job that provides the neuronx-cc working directory
             lnc_override: Optional override for logical neuron cores
             ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
             output_file: Path to write output NEFF file (optional, for callers
@@ -147,7 +145,6 @@ class CompilerSubprocess:
             neff_bytes = CompilerSubprocess.compile_hlo_protobuf_to_neff(
                 hlo_protobuf,
                 config,
-                job,
                 lnc_override,
                 ir_type,
             )
@@ -188,27 +185,25 @@ class CompilerSubprocess:
         # reuse.
         with lock:
             # Double-check NFS cache after acquiring lock
-            if nfs_path.exists():
-                try:
-                    neff_bytes = nfs_path.read_bytes()
-                    if output_file:
-                        Path(output_file).write_bytes(neff_bytes)
-                    return neff_bytes
-                except OSError:
-                    pass
+            if not nfs_path.exists():
+                # Compile and cache
+                neff_bytes = CompilerSubprocess.compile_hlo_protobuf_to_neff(
+                    hlo_protobuf, config, lnc_override, ir_type
+                )
 
-            # Compile and cache
-            neff_bytes = CompilerSubprocess.compile_hlo_protobuf_to_neff(
-                hlo_protobuf, config, job, lnc_override, ir_type
-            )
+                if output_file is not None:
+                    Path(output_file).write_bytes(neff_bytes)
 
-            if output_file is not None:
-                Path(output_file).write_bytes(neff_bytes)
+                # Write to NFS cache atomically (this is basically writing to user provided disk)
+                # At this line, we can plug any cache of our choice - could be NFS, FSX, S3
+                atomic_write_bytes(nfs_path, neff_bytes)
 
-            # Write to NFS cache atomically (this is basically writing to user provided disk)
-            # At this line, we can plug any cache of our choice - could be NFS, FSX, S3
-            atomic_write_bytes(nfs_path, neff_bytes)
+                return neff_bytes
 
+        # Read outside lock — all waiting processes can read in parallel
+        neff_bytes = nfs_path.read_bytes()
+        if output_file is not None:
+            Path(output_file).write_bytes(neff_bytes)
         return neff_bytes
 
     @staticmethod
@@ -264,21 +259,14 @@ class CompilerSubprocess:
     def compile_hlo_protobuf_to_neff(
         hlo_protobuf: bytes,
         config: CompilerConfig,
-        job: CompilationJob,
         lnc_override: str | None = None,
         ir_type: str = "XLA",
     ) -> bytes:
         """Compile HLO protobuf or MLIR directly to NEFF.
 
-        Writes the HLO bytes to the working directory provided by the
-        CompilationJob, invokes the neuronx-cc compiler, and returns
-        the resulting NEFF bytes. Each CompilationJob provides a unique
-        working directory, avoiding race conditions in multi-worker scenarios.
-
         Args:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
             config: Compiler configuration
-            job: Compilation job that provides the neuronx-cc working directory
             lnc_override: Optional override for logical neuron cores
             ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
 
@@ -288,19 +276,20 @@ class CompilerSubprocess:
         Raises:
             NEFFCompilationError: If NEFF compilation fails
         """
-        workdir = job.get_neuronx_cc_workdir()
-        workdir.mkdir(parents=True, exist_ok=True)
+        with compilation_job("eager") as job:
+            workdir = job.get_neuronx_cc_workdir()
+            workdir.mkdir(parents=True, exist_ok=True)
 
-        # Determine file format based on ir_type
-        # "StableHLO" uses MLIR format, "XLA" uses HLO protobuf
-        input_file_name = "module.mlir" if ir_type == "StableHLO" else "module.hlo.pb"
-        output_file_name = "module.neff"
-        hlo_file = workdir / input_file_name
-        hlo_file.write_bytes(hlo_protobuf)
-        output_file = workdir / output_file_name
+            # Determine file format based on ir_type
+            # "StableHLO" uses MLIR format, "XLA" uses HLO protobuf
+            input_file_name = "module.mlir" if ir_type == "StableHLO" else "module.hlo.pb"
+            output_file_name = "module.neff"
+            hlo_file = workdir / input_file_name
+            hlo_file.write_bytes(hlo_protobuf)
+            output_file = workdir / output_file_name
 
-        CompilerSubprocess.run_neuronx_cc(
-            config, str(input_file_name), str(output_file_name), lnc_override, str(workdir)
-        )
+            CompilerSubprocess.run_neuronx_cc(
+                config, str(input_file_name), str(output_file_name), lnc_override, str(workdir)
+            )
 
-        return output_file.read_bytes()
+            return output_file.read_bytes()

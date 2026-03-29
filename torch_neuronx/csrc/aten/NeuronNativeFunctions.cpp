@@ -6,6 +6,7 @@
 #include <ATen/native/Resize.h>
 #include <c10/core/DeviceType.h>
 #include <c10/util/Exception.h>
+#include <c10/util/strides.h>
 #include <nrt/nrt.h>
 
 #include <algorithm>
@@ -21,20 +22,23 @@
 
 namespace {
 
-// Helper to get strides for a given memory format and size
+// Helper to get strides for a given memory format and size.
+// Uses max(dim, 1) so zero-sized dims don't collapse strides to 0,
+// matching PyTorch CPU semantics (see c10::contiguous_strides).
 std::vector<int64_t> get_strides_for_memory_format(c10::IntArrayRef size,
                                                    c10::MemoryFormat format) {
+  auto safe = [](int64_t x) { return std::max(x, int64_t{1}); };
+
   if (format == c10::MemoryFormat::ChannelsLast && size.size() == 4) {
-    // NHWC: stride order is (HWC, 1, WC, C) for dims (N, C, H, W)
-    auto c = size[1], h = size[2], w = size[3];
+    auto c = safe(size[1]), h = safe(size[2]), w = safe(size[3]);
     return {h * w * c, 1, w * c, c};
-  } else if (format == c10::MemoryFormat::ChannelsLast3d && size.size() == 5) {
-    // NDHWC: stride order for dims (N, C, D, H, W)
-    auto c = size[1], d = size[2], h = size[3], w = size[4];
+  }
+  if (format == c10::MemoryFormat::ChannelsLast3d && size.size() == 5) {
+    auto c = safe(size[1]), d = safe(size[2]), h = safe(size[3]), w = safe(size[4]);
     return {d * h * w * c, 1, h * w * c, w * c, c};
   }
-  // Default: contiguous strides
-  return c10::TensorType::contiguousStridesOf(size);
+  auto strides = c10::contiguous_strides(size);
+  return {strides.begin(), strides.end()};
 }
 
 // Helper to create Neuron storage
@@ -227,8 +231,8 @@ at::Tensor new_empty_neuron(const at::Tensor& self, at::IntArrayRef size,
   }
 
   // Inherit dtype and device from original tensor if not set
-  return empty_strided_neuron(size, c10::TensorType::contiguousStridesOf(size),
-                              dtype_opt.value_or(self.scalar_type()), layout_opt,
+  auto strides = c10::contiguous_strides(size);
+  return empty_strided_neuron(size, strides, dtype_opt.value_or(self.scalar_type()), layout_opt,
                               device_opt.value_or(self.device()), pin_memory_opt);
 }
 
@@ -243,10 +247,16 @@ at::Tensor empty_strided_neuron(at::IntArrayRef size, at::IntArrayRef stride,
     torch_neuronx::markExecutedLogged(op_name);
   }
 
-  // Validate device
+  // Resolve target device. Delegate to CPU when explicitly requested (e.g.
+  // Tensor.new_empty(device="cpu") dispatches here because the source tensor
+  // lives on the PrivateUse1 dispatch key). Any other non-Neuron accelerator
+  // is a genuine error.
   auto device = c10::device_or_default(device_opt);
+  if (device.type() == c10::DeviceType::CPU) {
+    return at::detail::empty_strided_cpu(size, stride, dtype_or_default(dtype_opt));
+  }
   TORCH_CHECK(device.type() == c10::DeviceType::PrivateUse1,
-              "Expected neuron device but got: ", device);
+              "Expected neuron or cpu device but got: ", device);
 
   // Initialize Neuron runtime if needed (lazy initialization)
   torch_neuronx::maybe_lazy_init();

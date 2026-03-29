@@ -14,6 +14,9 @@ _base_version = "0.1.0"
 
 
 def _get_git_sha():
+    sha = os.environ.get("GIT_SHA")
+    if sha:
+        return sha
     try:
         return (
             subprocess.check_output(

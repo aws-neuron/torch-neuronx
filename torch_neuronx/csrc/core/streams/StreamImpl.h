@@ -110,6 +110,9 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Per-stream completion tracking state for async NRT operations
   XUCompletionState xu_completed_seqs_;
 
+  // Last seq registered for eventfd notification
+  nrt::SequenceId last_registered_efd_seq_{0};
+
   // Cleanup timeout configuration
   std::chrono::milliseconds operation_timeout_;
 

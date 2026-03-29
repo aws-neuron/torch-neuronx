@@ -10,8 +10,6 @@ try:
 except ImportError:
     raise ImportError("gather requires neuronxcc >= 2.23. Please upgrade your compiler.") from None
 
-wrapped_gather_nki = wrap_nki(gather)
-
 
 @nki_op("nki_kernels::gather", mutates_args={})
 def gather_kernel(input: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
@@ -30,5 +28,5 @@ def gather_kernel(input: torch.Tensor, dim: int, index: torch.Tensor) -> torch.T
     logical_neuron_cores = int(get_logical_neuron_cores())
     grid = (logical_neuron_cores,)
 
-    result = wrapped_gather_nki[grid](input=input, dim=dim, index=index)
+    result = wrap_nki(gather)[grid](input=input, dim=dim, index=index)
     return result

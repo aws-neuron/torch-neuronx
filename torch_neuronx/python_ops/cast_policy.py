@@ -21,9 +21,10 @@ from __future__ import annotations
 import torch
 
 from torch_neuronx.python_ops import io_tensor
+from torch_neuronx.utils import is_native_int64_enabled
 
 
-def is_64bit(dtype: torch.dtype | None) -> bool:
+def bounce_64bit(dtype: torch.dtype | None) -> bool:
     """Return True if dtype is a 64-bit type needing CPU bounce on Neuron.
 
     Args:
@@ -32,6 +33,8 @@ def is_64bit(dtype: torch.dtype | None) -> bool:
     Returns:
         bool: True for torch.float64 or torch.int64
     """
+    if is_native_int64_enabled():
+        return dtype == torch.float64
     return dtype in (torch.float64, torch.int64)
 
 
@@ -151,7 +154,7 @@ def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor) -> None:
         src_prepared = ensure_contiguous_on_device(src)
         if dst.dtype != src_prepared.dtype:
             # Need dtype conversion first
-            if is_64bit(dst.dtype) or is_64bit(src_prepared.dtype):
+            if bounce_64bit(dst.dtype) or bounce_64bit(src_prepared.dtype):
                 cpu_tmp = copy_neuron_to_cpu(
                     src_prepared, target_dtype=dst.dtype, non_blocking=False
                 )
@@ -173,7 +176,7 @@ def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor) -> None:
         _C._nrt_copy_neuron_to_neuron_tensor(src_prepared, dst)
         return
 
-    if is_64bit(dst.dtype) or is_64bit(src.dtype):
+    if bounce_64bit(dst.dtype) or bounce_64bit(src.dtype):
         # Implicit synchronization
         cpu_tmp = copy_neuron_to_cpu(src, target_dtype=dst.dtype, non_blocking=False)
         _C._nrt_copy_cpu_to_neuron_tensor(cpu_tmp, dst, non_blocking=False)

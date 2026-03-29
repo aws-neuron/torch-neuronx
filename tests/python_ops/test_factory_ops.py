@@ -79,3 +79,18 @@ def test_ones_zero_size_runs_on_neuron():
         assert tuple(x.shape) == (0,)
         assert x.dtype == torch.get_default_dtype()
         assert_op_runs_on_neuron("aten::ones")
+
+
+def test_new_empty_explicit_cpu_device():
+    """Verify new_empty with device='cpu' on a neuron tensor returns a CPU tensor."""
+    x = torch.randn(4, device="neuron:0")
+    y = x.new_empty((2, 3), device="cpu")
+    assert y.device.type == "cpu"
+    assert y.shape == (2, 3)
+
+
+def test_empty_explicit_cpu_device():
+    """Verify torch.empty with device='cpu' doesn't break when neuron is loaded."""
+    y = torch.empty((2, 3), device="cpu")
+    assert y.device.type == "cpu"
+    assert y.shape == (2, 3)

@@ -57,6 +57,88 @@ std::optional<TransformationCreationResult> CreateBroadcastTransformation(
 }  // anonymous namespace
 
 // ============================================================================
+// RESHAPE Registration
+// ============================================================================
+
+namespace {
+
+// Reshape creator — RESHAPE transformations are emitted internally by TryCreateCompound
+// (to insert size-1 dims before BROADCAST). There is no standalone tensor pattern that
+// maps to RESHAPE, so this creator always returns nullopt.
+std::optional<TransformationCreationResult> CreateReshapeTransformation(
+    const at::Tensor& /*input*/, const std::string& /*op_name*/, size_t /*input_index*/) {
+  return std::nullopt;  // RESHAPE is only emitted internally, never detected from tensor strides
+}
+
+// Reshape handler: passes the RESHAPE transformation through to GenerateMlir.
+// No grouping needed — each RESHAPE is processed individually.
+class ReshapeHandler : public TransformationHandler {
+ public:
+  size_t FindGroupEnd(const std::vector<TensorTransformation>& /*transformations*/,
+                      size_t start_index, const TransformationState& /*state*/) const override {
+    return start_index + 1;
+  }
+
+  TransformationTask ProcessGroup(size_t input_index, TransformationState& state,
+                                  const std::vector<TensorTransformation>& group,
+                                  const std::string& op_name) const override {
+    TORCH_NEURONX_DEBUG("Processing RESHAPE", "op=", op_name, "input_index=", input_index);
+    const auto& transform = group[0];
+    state.current_shape = transform.output_shape;
+
+    return TransformationTask{.input_index = input_index,
+                              .type = TransformationType::RESHAPE,
+                              .input_shape = transform.input_shape,
+                              .output_shape = transform.output_shape,
+                              .element_type = transform.element_type,
+                              .current_perm = state.current_perm,
+                              .params = std::monostate{}};
+  }
+};
+
+}  // anonymous namespace
+
+// ============================================================================
+// COMPOUND Registration
+// ============================================================================
+
+namespace {
+
+// Compound creator wrapper - general stride decomposition
+std::optional<TransformationCreationResult> CreateCompoundTransformation(const at::Tensor& input,
+                                                                         const std::string& op_name,
+                                                                         size_t input_index) {
+  return Creators::TryCreateCompound(input, op_name, input_index);
+}
+
+// Compound handler: the compound creator emits SLICE and TRANSPOSE transformations,
+// so the existing SliceHandler and TransposeHandler process them in CollectTransformationTasks.
+// This handler is a safety placeholder required by the registry but should not be reached
+// because compound never emits TensorTransformation with type=COMPOUND.
+class CompoundHandler : public TransformationHandler {
+ public:
+  size_t FindGroupEnd(const std::vector<TensorTransformation>& transformations, size_t start_index,
+                      const TransformationState& /*state*/) const override {
+    return start_index + 1;
+  }
+
+  TransformationTask ProcessGroup(size_t input_index, TransformationState& state,
+                                  const std::vector<TensorTransformation>& group,
+                                  const std::string& op_name) const override {
+    // This should never be called — compound produces SLICE/TRANSPOSE types, not COMPOUND.
+    TORCH_CHECK(false,
+                "CompoundHandler::ProcessGroup should never be called. "
+                "Compound creator emits SLICE and TRANSPOSE transformations, "
+                "not COMPOUND type. op=",
+                op_name, " input_index=", input_index);
+    // Unreachable, but silence compiler warnings
+    return TransformationTask{};
+  }
+};
+
+}  // anonymous namespace
+
+// ============================================================================
 // Registration Function
 // ============================================================================
 
@@ -74,6 +156,10 @@ void RegisterTransformations() {
   TORCH_NEURONX_DEBUG("RegisterTransformations: Starting registration");
 
   // Register TRANSPOSE
+  // TODO(mengchiy): Remove TryCreateTranspose and let TryCreateCompound handle all cases.
+  // Then fix the base tensor shape inconsistency in compound by always computing the base
+  // shape as the full storage extent from offset 0, ensuring all views of the same storage
+  // get the same base shape.
   {
     TransformationDescriptor transpose_desc;
     transpose_desc.creator = CreateTransposeTransformation;
@@ -107,6 +193,35 @@ void RegisterTransformations() {
 
     registry.Register(TransformationType::BROADCAST, std::move(broadcast_desc));
     TORCH_NEURONX_DEBUG("RegisterTransformations: Registered BROADCAST");
+  }
+
+  // Register RESHAPE
+  // RESHAPE is emitted internally by TryCreateCompound (to insert size-1 dims before BROADCAST).
+  // The creator always returns nullopt (no standalone detection from tensor strides).
+  {
+    TransformationDescriptor reshape_desc;
+    reshape_desc.creator = CreateReshapeTransformation;
+    reshape_desc.handler = std::make_unique<ReshapeHandler>();
+    reshape_desc.priority = 80;  // Between BROADCAST and COMPOUND
+    reshape_desc.name = "RESHAPE";
+
+    registry.Register(TransformationType::RESHAPE, std::move(reshape_desc));
+    TORCH_NEURONX_DEBUG("RegisterTransformations: Registered RESHAPE");
+  }
+
+  // Register COMPOUND (general stride decomposition)
+  // Runs after TRANSPOSE and SLICE — handles compound patterns they cannot.
+  // The creator emits SLICE and TRANSPOSE TensorTransformations which are
+  // processed by the existing handlers in CollectTransformationTasks.
+  {
+    TransformationDescriptor compound_desc;
+    compound_desc.creator = CreateCompoundTransformation;
+    compound_desc.handler = std::make_unique<CompoundHandler>();
+    compound_desc.priority = 50;  // Lower priority - only for compound patterns
+    compound_desc.name = "COMPOUND";
+
+    registry.Register(TransformationType::COMPOUND, std::move(compound_desc));
+    TORCH_NEURONX_DEBUG("RegisterTransformations: Registered COMPOUND");
   }
 
   TORCH_NEURONX_DEBUG("RegisterTransformations: Complete",

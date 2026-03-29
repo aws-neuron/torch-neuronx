@@ -303,6 +303,14 @@ NRT_STATUS nrta_is_completed(nrta_seq_t seq, bool* is_completed) {
   return NRT_FAILURE;
 }
 
+NRT_STATUS nrta_event_register_seq_id_completion(nrta_seq_t seq, int fd) {
+  if (g_mocks_initialized) {
+    return torch_neuronx::testing::MockNRT::GetInstance()->nrta_event_register_seq_id_completion(
+        seq, fd);
+  }
+  return NRT_FAILURE;
+}
+
 NRT_STATUS nrta_execute_schedule(nrt_model_t* model, const nrt_tensor_set_t* input_set,
                                  nrt_tensor_set_t* output_set, int queue, NRT_STATUS* ret,
                                  nrta_seq_t* req_seq) {

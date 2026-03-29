@@ -5,7 +5,7 @@ import pytest
 import torch
 from neuronxcc import nki
 
-from torch_neuronx import nki_op, wrap_nki
+from torch_neuronx import nki_op
 
 # Use the test name as a namespace to avoid conflicts
 my_namespace = "TestNKIDevicePrint"
@@ -31,7 +31,7 @@ def nki_tensor_add_print(a_input, b_input):
 @nki_op(f"{my_namespace}::add_print", mutates_args={})
 def nki_add_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """NKI add operation wrapper"""
-    return wrap_nki(nki_tensor_add_print)(a, b)
+    return nki_tensor_add_print(a, b)
 
 
 def nki_func(a, b):

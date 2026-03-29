@@ -271,6 +271,12 @@ class CompilableKernelExecution {
   void UpdateCacheKey(const std::string& new_key) { cache_key_.SetKey(new_key); }
   bool HasCachedNeff() const { return cached_neff_ptr_ != nullptr; }
   bool HasCollectives() const { return has_collectives_; }
+
+  // Compilation error tracking — set by CompilationCache on failure,
+  // read by execution worker to report the real neuronx-cc error.
+  void SetCompilationError(std::string error) const { compilation_error_ = std::move(error); }
+  bool IsFailedCompilation() const { return !compilation_error_.empty(); }
+  const std::string& GetCompilationError() const { return compilation_error_; }
   const std::string& GetAdditionalArgs() const { return additional_args_; }
   const std::string& GetOptimizationLevel() const { return optimization_level_; }
 
@@ -311,6 +317,7 @@ class CompilableKernelExecution {
   std::string additional_args_;
   std::string optimization_level_;
   mutable NeffBytesPtr cached_neff_ptr_;
+  mutable std::string compilation_error_;
   bool has_collectives_;
   // Per-input transformation metadata (optional, for in-place transformations)
   std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> per_input_transformations_;

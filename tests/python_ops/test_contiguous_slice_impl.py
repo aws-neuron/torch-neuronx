@@ -160,6 +160,28 @@ class TestContiguousSlice:
                     generic_called["count"] >= 1
                 ), "Should fall back to generic for multiple slices"
 
+    def test_multiaxis_slice_zero_(self):
+        """Regression test: zero_() on a multi-axis narrow view must not corrupt data.
+
+        Before the fix, DetectSlicePattern would accept a tensor sliced on two axes
+        (e.g. narrow(0,2,1).narrow(2,3,1)) and compute a wrong start_offset, causing
+        zero_() to zero out the wrong elements.
+        """
+        s = 5
+        t = torch.ones(s, s, s, dtype=torch.int16, device="neuron")
+        view = t.narrow(0, 2, 1).narrow(2, 3, 1)
+        # shape (1,5,1), strides (25,5,1), offset=53 — multi-axis slice
+        assert view.storage_offset() == 53
+        assert not view.is_contiguous()
+
+        view.zero_()
+
+        assert (view == 0).all(), "Zeroed view should be all zeros"
+        # Only the sliced region should be zeroed; the rest must remain 1
+        expected = torch.ones(s, s, s, dtype=torch.int16)
+        expected[2, :, 3] = 0
+        assert torch.equal(t.cpu(), expected), "Only narrow(0,2).narrow(2,3) region should be zero"
+
     def test_contiguous_slice_compilation_caching(self, monkeypatch):
         """Test that different slice patterns compile separate kernels."""
         from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceMLIRImpl

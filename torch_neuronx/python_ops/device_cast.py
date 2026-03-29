@@ -1,11 +1,14 @@
 """Device-side dtype casting helper for Neuron tensors.
 
 This module provides a simple function to cast from one Neuron tensor dtype to
-another without bouncing through CPU for <=32-bit dtypes. It uses the MLIR
-kernel path to perform an on-device astype.
+another without bouncing through CPU. It uses the MLIR kernel path to perform
+an on-device astype.
 
-Note: Casting to or from 64-bit dtypes (float64/int64) is not supported on
-Neuron and should be handled via CPU bounce by the caller.
+Supports <=32-bit dtypes and int64/uint64 (the compiler handles S64 HLO
+natively, and the C++ NRT layer reinterprets int64 as 2xint32 for transfers).
+
+Note: Casting to or from float64 is not supported on device and should be
+handled via CPU bounce by the caller.
 """
 
 from __future__ import annotations

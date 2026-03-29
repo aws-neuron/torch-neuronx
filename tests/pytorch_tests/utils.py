@@ -75,30 +75,50 @@ def _apply_opinfo_patches():
 
 
 def _apply_gradcheck_patches():
-    """Patch gradcheck/gradgradcheck with float32-appropriate eps for Neuron.
+    """Patch gradcheck/gradgradcheck for Neuron's float32 precision.
 
-    Neuron doesn't natively support float64 — it downcasts to float32, computes,
-    then upcasts back to float64, so we use torch.finfo(torch.float32).eps as the
-    finite-difference step size.
+    Neuron autocasts float64 to float32, so PyTorch's float64 defaults
+    don't apply. We override:
+
+      eps=1e-3   — For central-difference gradcheck the optimal step
+                   is eps_opt = (3*u)^(1/3) where u is machine epsilon.
+                   float32 u ≈ 1.19e-7 → eps_opt ≈ 5.6e-3. We use
+                   1e-3, within an order of magnitude, which is also
+                   the historical value chosen for Neuron hardware.
+                   (For float64: u ≈ 1e-16 → eps_opt ≈ 1e-5; PyTorch
+                   defaults to 1e-6.)
+
+      atol=1e-3  — With float32 the truncation error floor is
+                   O(eps^2) ≈ 1e-6, but practical effects (condition-
+                   number amplification, non-associative summation,
+                   catastrophic cancellation) push noise to ~1e-3 in
+                   the near-zero regime where rtol can't help. (For
+                   float64, PyTorch defaults to 1e-5.)
+
+      fast_mode=False — Fast mode accumulates float32 rounding errors
+                        across the Jacobian sum; PyTorch recommends
+                        disabling it when fast fails but slow passes.
     """
     import torch
     from torch.testing._internal import common_utils
 
-    _f32_eps = torch.finfo(torch.float32).eps
+    _f32_eps = 1e-3
+    _f32_atol = 1e-3
 
     orig_gradcheck = common_utils.gradcheck
     orig_gradgradcheck = common_utils.gradgradcheck
 
-    def patched_gradcheck(*args, **kwargs):
-        kwargs.setdefault("eps", _f32_eps)
-        return orig_gradcheck(*args, **kwargs)
+    def _make_patched(orig_fn):
+        def patched(*args, **kwargs):
+            kwargs.setdefault("eps", _f32_eps)
+            kwargs.setdefault("atol", _f32_atol)
+            kwargs["fast_mode"] = False
+            return orig_fn(*args, **kwargs)
 
-    def patched_gradgradcheck(*args, **kwargs):
-        kwargs.setdefault("eps", _f32_eps)
-        return orig_gradgradcheck(*args, **kwargs)
+        return patched
 
-    common_utils.gradcheck = patched_gradcheck
-    common_utils.gradgradcheck = patched_gradgradcheck
+    common_utils.gradcheck = _make_patched(orig_gradcheck)
+    common_utils.gradgradcheck = _make_patched(orig_gradgradcheck)
 
 
 @dataclass
@@ -523,7 +543,21 @@ def _parse_test_configurations(
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in config file {json_file_path}: {e}") from e
 
-        return json_data.get("test_configurations", [])
+        configs = json_data.get("test_configurations", [])
+
+        # Merge global skip patterns into each config
+        global_patterns = json_data.get("global_skip_test_patterns", [])
+        global_reason = json_data.get(
+            "global_skip_test_patterns_reason", "Matched global skip pattern"
+        )
+        if global_patterns:
+            for cfg in configs:
+                existing = cfg.get("skip_test_patterns", [])
+                cfg["skip_test_patterns"] = sorted(set(existing + global_patterns))
+                if "skip_test_patterns_reason" not in cfg:
+                    cfg["skip_test_patterns_reason"] = global_reason
+
+        return configs
 
     else:
         test_method_list = args.test_method_name.split(",") if args.test_method_name else None

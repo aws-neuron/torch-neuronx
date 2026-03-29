@@ -12,8 +12,6 @@ except ImportError:
         "scatter_add requires neuronxcc >= 2.23. Please upgrade your compiler."
     ) from None
 
-wrapped_scatter_add_nki = wrap_nki(scatter_add)
-
 
 @nki_op("nki_kernels::scatter_add_kernel", mutates_args={})
 def scatter_add_kernel(
@@ -34,5 +32,5 @@ def scatter_add_kernel(
 
     logical_neuron_cores = int(get_logical_neuron_cores())
     grid = (logical_neuron_cores,)
-    result = wrapped_scatter_add_nki[grid](input, dim, index, src)
+    result = wrap_nki(scatter_add)[grid](input, dim, index, src)
     return result

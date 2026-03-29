@@ -67,7 +67,10 @@ class XLABuilderOpImpl(CompilableOpImpl):
             ExecutionResult: Contains success status and output tensor(s) or error message
         """
         # Use dtype autocast context
-        with autocast_neuron() as context:
+        from torch_neuronx.utils import is_native_int64_enabled
+
+        # When native int64 enabled: compiler handles S64 HLO natively, no bounce through int32
+        with autocast_neuron(cast_int64=not is_native_int64_enabled()) as context:
             # Process arguments, excluding output parameters from casting
             original_kwargs = kwargs
             args, kwargs, _ = context.process_args(args, kwargs, output_params=self.output_params)

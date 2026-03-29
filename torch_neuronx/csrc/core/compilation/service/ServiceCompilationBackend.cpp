@@ -11,15 +11,16 @@ ServiceCompilationBackend::ServiceCompilationBackend(const std::string& socket_p
 }
 
 std::vector<uint8_t> ServiceCompilationBackend::Compile(const std::vector<uint8_t>& hlo_bytes,
-                                                        const std::string& persistent_cache_key,
                                                         const std::string& ir_type,
                                                         const std::string& optimization_level,
                                                         const std::string& additional_args,
                                                         CompileFn /*compile_fn*/) {
-  auto neff_bytes = client_.CompileSync(hlo_bytes, persistent_cache_key, ir_type,
-                                        optimization_level, additional_args);
+  std::string error;
+  auto neff_bytes =
+      client_.CompileSync(hlo_bytes, ir_type, optimization_level, additional_args, &error);
   if (neff_bytes.empty()) {
-    throw std::runtime_error("Compilation failed: service returned empty NEFF");
+    throw std::runtime_error(error.empty() ? "Compilation failed: service returned empty NEFF"
+                                           : error);
   }
   return neff_bytes;
 }

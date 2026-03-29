@@ -20,7 +20,6 @@ enum class ServiceMsgType : uint8_t {
 struct CompileRequest {
   uint64_t req_id;
   std::string hlo_file_path;
-  std::string persistent_cache_key;
   std::string ir_type;             // "XLA" or "StableHLO" — per-HLO, depends on HasCollectives()
   std::string optimization_level;  // per-op from kernel_execution.GetOptimizationLevel()
   std::string additional_args;  // per-op compiler flags from kernel_execution.GetAdditionalArgs()
@@ -32,7 +31,8 @@ struct CompileRequest {
 struct CompileResponse {
   uint64_t req_id;
   bool success;
-  std::string neff_cache_path;  // path to NEFF in persistent cache (or error msg)
+  std::string neff_cache_path;  // path to compiled NEFF temp file
+  std::string error_message;    // compiler error message on failure
 
   std::vector<uint8_t> Serialize() const;
   static CompileResponse Deserialize(const uint8_t* data, size_t len);

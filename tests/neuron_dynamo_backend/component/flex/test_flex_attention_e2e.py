@@ -126,6 +126,7 @@ class TestFlexAttentionE2E:
 
         flex_attn_module._validate_device = _patched_validate_device
         """Test flex attention with causal mask end-to-end."""
+        torch.manual_seed(42)
         query = torch.randn(b, h, seq_len, e, device="cpu", dtype=dtype)
         key = torch.randn(b, h, s, e, device="cpu", dtype=dtype)
         value = torch.randn(b, h, s, e, device="cpu", dtype=dtype)
@@ -280,6 +281,7 @@ class TestFlexAttentionE2E:
 
         flex_attn_module._validate_device = _patched_validate_device
 
+        torch.manual_seed(42)
         query_cpu = torch.rand(b, h, seq_len, e, device="cpu", dtype=dtype, requires_grad=True)
         key_cpu = torch.rand(b, h, s, e, device="cpu", dtype=dtype, requires_grad=True)
         value_cpu = torch.rand(b, h, s, e, device="cpu", dtype=dtype, requires_grad=True)

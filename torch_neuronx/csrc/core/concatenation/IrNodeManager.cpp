@@ -40,6 +40,14 @@ IrNodeManager::IrNodeManager() : context(std::make_unique<mlir::MLIRContext>()) 
     check_overlap_enabled_ = false;
     TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR=0 (disabled)");
   }
+
+  // Load aliasing flag from environment variable
+  // Default: disabled. Set TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 to enable
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    aliasing_enabled_ = true;
+    TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 (enabled)");
+  }
 }
 
 std::unique_ptr<IrNode> IrNodeManager::CreateConcatNode(IrNode* node1, IrNode* node2) {
@@ -223,6 +231,14 @@ std::string IrNodeManager::GenerateConcatenationCacheKey(const IrNode* node1, co
 
   // Base key: concatenate individual node cache keys
   std::string cache_key = node1->cache_key + "|" + node2->cache_key;
+
+  // Include aliasing flag in cache key to prevent reuse across flag changes
+  cache_key += "|alias_enabled:" + std::string(aliasing_enabled_ ? "1" : "0");
+
+  if (!aliasing_enabled_) {
+    TORCH_NEURONX_DEBUG("Generated cache key (aliasing disabled):", cache_key);
+    return cache_key;
+  }
 
   // Append aliasing information to distinguish different memory sharing patterns
   std::string alias_suffix = "|alias:";
@@ -892,7 +908,9 @@ IrConcatResult IrNodeManager::ConcatAll(const std::list<IrNode*>& input_ir_list)
                           "compilable_irs:", res.compilable_irs.size(),
                           "original_hlo_count:", state.original_hlo_nodes.size());
 
-      validateAliasingAttributes(state.merged);
+      if (aliasing_enabled_) {
+        validateAliasingAttributes(state.merged);
+      }
     }
 
   } else if (state.merged) {

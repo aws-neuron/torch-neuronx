@@ -495,6 +495,11 @@ class IrNodeManager {
   /// Controlled by TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR environment variable
   /// Default: enabled. Set TORCH_NEURONX_DISABLE_CONCAT_FOR_OVERLAP_IO_TENSOR=0 to disable
   bool check_overlap_enabled_ = true;
+
+  /// Feature flag for input-output aliasing in concatenated modules
+  /// Controlled by TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING environment variable
+  /// Default: disabled. Set TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 to enable
+  bool aliasing_enabled_ = false;
 };
 
 }  // namespace torch_neuronx

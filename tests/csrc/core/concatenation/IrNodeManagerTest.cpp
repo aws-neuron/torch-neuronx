@@ -22,6 +22,7 @@ class IrNodeManagerTest : public ::testing::Test {
   void TearDown() override {
     // Clean up environment
     unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
+    unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
   }
 
   std::unique_ptr<IrNodeManager> manager;
@@ -152,7 +153,7 @@ TEST_F(IrNodeManagerTest, GenerateConcatenationCacheKey) {
 
   std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
 
-  EXPECT_EQ(cache_key, "key1|key2|alias:");
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:0");
 }
 
 TEST_F(IrNodeManagerTest, GenerateConcatenationCacheKeyNullNodes) {
@@ -339,30 +340,13 @@ TEST_F(IrNodeManagerTest, ConcatAllWithInvalidNode) {
 // Aliasing Tests
 // ============================================================================
 
-TEST_F(IrNodeManagerTest, CacheKeyNoAliasing) {
-  auto ir = createDummyIr();
-  void* in1 = createPtr();
-  void* in2 = createPtr();
-  void* out1 = createPtr();
-  void* out2 = createPtr();
-
-  auto node1 = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
-                                               std::vector<void*>{in1}, std::vector<void*>{out1},
-                                               false, manager->GetContext());
-  auto node2 = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
-                                               std::vector<void*>{in2}, std::vector<void*>{out2},
-                                               false, manager->GetContext());
-
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:");
-}
-
-TEST_F(IrNodeManagerTest, CacheKeyNode1SelfAliasing) {
+TEST_F(IrNodeManagerTest, CacheKeyNoAliasingByDefault) {
   auto ir = createDummyIr();
   void* shared = createPtr();
   void* in2 = createPtr();
   void* out2 = createPtr();
 
+  // Even with overlapping addresses, cache key should NOT include alias suffix by default
   auto node1 = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared},
       std::vector<void*>{shared}, false, manager->GetContext());
@@ -371,10 +355,58 @@ TEST_F(IrNodeManagerTest, CacheKeyNode1SelfAliasing) {
                                                false, manager->GetContext());
 
   std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:1i0->1o0,");
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:0");
+}
+
+TEST_F(IrNodeManagerTest, CacheKeyNoAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
+  auto ir = createDummyIr();
+  void* in1 = createPtr();
+  void* in2 = createPtr();
+  void* out1 = createPtr();
+  void* out2 = createPtr();
+
+  auto node1 = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
+                                               std::vector<void*>{in1}, std::vector<void*>{out1},
+                                               false, aliasing_manager->GetContext());
+  auto node2 = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
+                                               std::vector<void*>{in2}, std::vector<void*>{out2},
+                                               false, aliasing_manager->GetContext());
+
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+}
+
+TEST_F(IrNodeManagerTest, CacheKeyNode1SelfAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
+  auto ir = createDummyIr();
+  void* shared = createPtr();
+  void* in2 = createPtr();
+  void* out2 = createPtr();
+
+  auto node1 = std::make_unique<StableHloNode>(
+      "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared},
+      std::vector<void*>{shared}, false, aliasing_manager->GetContext());
+  auto node2 = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
+                                               std::vector<void*>{in2}, std::vector<void*>{out2},
+                                               false, aliasing_manager->GetContext());
+
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:1i0->1o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyNode2SelfAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* in1 = createPtr();
   void* out1 = createPtr();
@@ -382,16 +414,21 @@ TEST_F(IrNodeManagerTest, CacheKeyNode2SelfAliasing) {
 
   auto node1 = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
                                                std::vector<void*>{in1}, std::vector<void*>{out1},
-                                               false, manager->GetContext());
+                                               false, aliasing_manager->GetContext());
   auto node2 = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{shared},
-      std::vector<void*>{shared}, false, manager->GetContext());
+      std::vector<void*>{shared}, false, aliasing_manager->GetContext());
 
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:2i0->2o0,");
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:2i0->2o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyCrossNodeAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared = createPtr();
   void* out1 = createPtr();
@@ -399,16 +436,21 @@ TEST_F(IrNodeManagerTest, CacheKeyCrossNodeAliasing) {
 
   auto node1 = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
                                                std::vector<void*>{shared}, std::vector<void*>{out1},
-                                               false, manager->GetContext());
+                                               false, aliasing_manager->GetContext());
   auto node2 = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
                                                std::vector<void*>{in2}, std::vector<void*>{shared},
-                                               false, manager->GetContext());
+                                               false, aliasing_manager->GetContext());
 
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:1i0->2o0,");
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:1i0->2o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyMultipleAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared1 = createPtr();
   void* shared2 = createPtr();
@@ -416,31 +458,41 @@ TEST_F(IrNodeManagerTest, CacheKeyMultipleAliasing) {
 
   auto node1 = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared1, shared2},
-      std::vector<void*>{shared1, shared3}, false, manager->GetContext());
+      std::vector<void*>{shared1, shared3}, false, aliasing_manager->GetContext());
   auto node2 = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{shared2, shared3},
-      std::vector<void*>{shared2, shared3}, false, manager->GetContext());
+      std::vector<void*>{shared2, shared3}, false, aliasing_manager->GetContext());
 
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:1i0->1o0,2i0->2o0,2i1->2o1,1i1->2o0,");
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:1i0->1o0,2i0->2o0,2i1->2o1,1i1->2o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyNullPointers) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared = createPtr();
 
   auto node1 = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared, nullptr},
-      std::vector<void*>{shared, nullptr}, false, manager->GetContext());
+      std::vector<void*>{shared, nullptr}, false, aliasing_manager->GetContext());
   auto node2 = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{nullptr},
-      std::vector<void*>{nullptr}, false, manager->GetContext());
+      std::vector<void*>{nullptr}, false, aliasing_manager->GetContext());
 
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:1i0->1o0,");
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:1i0->1o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyDifferentAliasingPatterns) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared = createPtr();
   void* in1 = createPtr();
@@ -451,28 +503,33 @@ TEST_F(IrNodeManagerTest, CacheKeyDifferentAliasingPatterns) {
   // Pattern 1: node1 self-aliasing
   auto node1a = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared},
-      std::vector<void*>{shared}, false, manager->GetContext());
+      std::vector<void*>{shared}, false, aliasing_manager->GetContext());
   auto node2a = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
                                                 std::vector<void*>{in2}, std::vector<void*>{out2},
-                                                false, manager->GetContext());
+                                                false, aliasing_manager->GetContext());
 
   // Pattern 2: node2 self-aliasing
   auto node1b = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
                                                 std::vector<void*>{in1}, std::vector<void*>{out1},
-                                                false, manager->GetContext());
+                                                false, aliasing_manager->GetContext());
   auto node2b = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{shared},
-      std::vector<void*>{shared}, false, manager->GetContext());
+      std::vector<void*>{shared}, false, aliasing_manager->GetContext());
 
-  std::string key1 = manager->GenerateConcatenationCacheKey(node1a.get(), node2a.get());
-  std::string key2 = manager->GenerateConcatenationCacheKey(node1b.get(), node2b.get());
+  std::string key1 = aliasing_manager->GenerateConcatenationCacheKey(node1a.get(), node2a.get());
+  std::string key2 = aliasing_manager->GenerateConcatenationCacheKey(node1b.get(), node2b.get());
 
   EXPECT_NE(key1, key2);
-  EXPECT_EQ(key1, "key1|key2|alias:1i0->1o0,");
-  EXPECT_EQ(key2, "key1|key2|alias:2i0->2o0,");
+  EXPECT_EQ(key1, "key1|key2|alias_enabled:1|alias:1i0->1o0,");
+  EXPECT_EQ(key2, "key1|key2|alias_enabled:1|alias:2i0->2o0,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheMissDifferentAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared = createPtr();
   void* in = createPtr();
@@ -481,29 +538,34 @@ TEST_F(IrNodeManagerTest, CacheMissDifferentAliasing) {
   // First pair: node1 self-aliasing
   auto node1a = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared},
-      std::vector<void*>{shared}, false, manager->GetContext());
+      std::vector<void*>{shared}, false, aliasing_manager->GetContext());
   auto node2a = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
                                                 std::vector<void*>{in}, std::vector<void*>{out},
-                                                false, manager->GetContext());
+                                                false, aliasing_manager->GetContext());
 
   // Second pair: no aliasing
   auto node1b = std::make_unique<StableHloNode>("op1", "key1", std::vector<uint8_t>(ir),
                                                 std::vector<void*>{in}, std::vector<void*>{out},
-                                                false, manager->GetContext());
+                                                false, aliasing_manager->GetContext());
   auto node2b = std::make_unique<StableHloNode>("op2", "key2", std::vector<uint8_t>(ir),
                                                 std::vector<void*>{in}, std::vector<void*>{out},
-                                                false, manager->GetContext());
+                                                false, aliasing_manager->GetContext());
 
-  auto result1 = manager->CreateConcatNode(node1a.get(), node2a.get());
-  auto result2 = manager->CreateConcatNode(node1b.get(), node2b.get());
+  auto result1 = aliasing_manager->CreateConcatNode(node1a.get(), node2a.get());
+  auto result2 = aliasing_manager->CreateConcatNode(node1b.get(), node2b.get());
 
   ASSERT_NE(result1, nullptr);
   ASSERT_NE(result2, nullptr);
   EXPECT_NE(result1->cache_key, result2->cache_key);
   EXPECT_NE(result1->module.get(), result2->module.get());
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheHitSameAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* shared1 = createPtr();
   void* shared2 = createPtr();
@@ -511,29 +573,34 @@ TEST_F(IrNodeManagerTest, CacheHitSameAliasing) {
   // First pair
   auto node1a = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared1},
-      std::vector<void*>{shared1}, false, manager->GetContext());
+      std::vector<void*>{shared1}, false, aliasing_manager->GetContext());
   auto node2a = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{shared2},
-      std::vector<void*>{shared2}, false, manager->GetContext());
+      std::vector<void*>{shared2}, false, aliasing_manager->GetContext());
 
   // Second pair with same aliasing pattern
   auto node1b = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{shared1},
-      std::vector<void*>{shared1}, false, manager->GetContext());
+      std::vector<void*>{shared1}, false, aliasing_manager->GetContext());
   auto node2b = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{shared2},
-      std::vector<void*>{shared2}, false, manager->GetContext());
+      std::vector<void*>{shared2}, false, aliasing_manager->GetContext());
 
-  auto result1 = manager->CreateConcatNode(node1a.get(), node2a.get());
-  auto result2 = manager->CreateConcatNode(node1b.get(), node2b.get());
+  auto result1 = aliasing_manager->CreateConcatNode(node1a.get(), node2a.get());
+  auto result2 = aliasing_manager->CreateConcatNode(node1b.get(), node2b.get());
 
   if (result1 && result2) {
     EXPECT_EQ(result1->cache_key, result2->cache_key);
     EXPECT_EQ(result1->module.get(), result2->module.get());
   }
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(IrNodeManagerTest, CacheKeyMultiInputOutput) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+  auto aliasing_manager = std::make_unique<IrNodeManager>();
+
   auto ir = createDummyIr();
   void* p1 = createPtr();
   void* p2 = createPtr();
@@ -542,13 +609,15 @@ TEST_F(IrNodeManagerTest, CacheKeyMultiInputOutput) {
 
   auto node1 = std::make_unique<StableHloNode>(
       "op1", "key1", std::vector<uint8_t>(ir), std::vector<void*>{p1, p2},
-      std::vector<void*>{p2, p3}, false, manager->GetContext());
+      std::vector<void*>{p2, p3}, false, aliasing_manager->GetContext());
   auto node2 = std::make_unique<StableHloNode>(
       "op2", "key2", std::vector<uint8_t>(ir), std::vector<void*>{p3, p4},
-      std::vector<void*>{p3, p4}, false, manager->GetContext());
+      std::vector<void*>{p3, p4}, false, aliasing_manager->GetContext());
 
-  std::string cache_key = manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
-  EXPECT_EQ(cache_key, "key1|key2|alias:1i1->1o0,2i0->2o0,2i1->2o1,");
+  std::string cache_key = aliasing_manager->GenerateConcatenationCacheKey(node1.get(), node2.get());
+  EXPECT_EQ(cache_key, "key1|key2|alias_enabled:1|alias:1i1->1o0,2i0->2o0,2i1->2o1,");
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 // ============================================================================
@@ -569,7 +638,7 @@ TEST_F(IrNodeManagerTest, DiscardConcatEnabledByDefault) {
   std::list<IrNode*> nodes = {node1.get(), node2.get()};
   auto result = manager->ConcatAll(nodes);
 
-  // By default, concatenation should be discarded due to aliasing
+  // By default, concatenation should be discarded due to input-output overlap
   EXPECT_EQ(result.compilable_irs.size(), 2);
   EXPECT_EQ(result.concat_ir_list.size(), 0);
 }
@@ -593,7 +662,7 @@ TEST_F(IrNodeManagerTest, DiscardConcatDisabled) {
   std::list<IrNode*> nodes = {node1.get(), node2.get()};
   auto result = test_manager->ConcatAll(nodes);
 
-  // With flag=0, concatenation should succeed despite aliasing
+  // With flag=0, concatenation should succeed despite overlap
   EXPECT_EQ(result.compilable_irs.size(), 1);
   EXPECT_EQ(result.concat_ir_list.size(), 1);
 

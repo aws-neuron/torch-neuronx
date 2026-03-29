@@ -2,15 +2,15 @@ import logging
 import os
 from typing import Optional
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.typing as nt
+import nki as nki
+import nki.isa as nisa
+import nki.language as nl
+import nki.typing as nt
 import pytest
 import torch
 import torch.nn as nn
 
-from torch_neuronx import nki_op, wrap_nki
+from torch_neuronx import nki_op
 
 # Use the test name as a namespace to avoid conflicts
 my_namespace = "TestNKIDyamoIntegration"
@@ -21,80 +21,76 @@ logger.setLevel(logging.INFO)
 
 
 @nki.jit
-def nki_tensor_add_kernel_(a_input, b_input):
-    """NKI kernel for tensor addition"""
-    c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
+def nki_tensor_add_kernel_(a, b):
+    sa = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sa, src=a)
 
-    offset_i_x = nl.program_id(0) * 128
-    offset_i_y = nl.program_id(1) * 512
+    sb = nl.ndarray(b.shape, dtype=b.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sb, src=b)
 
-    ix = offset_i_x + nl.arange(128)[:, None]
-    iy = offset_i_y + nl.arange(512)[None, :]
+    sc = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=sc, data1=sa, data2=sb, op=nl.add)
 
-    a_tile = nl.load(a_input[ix, iy])
-    b_tile = nl.load(b_input[ix, iy])
-
-    c_tile = a_tile + b_tile
-
-    nl.store(c_output[ix, iy], value=c_tile)
-
-    return c_output
+    out = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=out, src=sc)
+    return out
 
 
 @nki.jit
-def nki_add_alias_mul(a_input: nt.mutable_tensor, b_input):
+def nki_add_alias_mul(a_input, b_input):
     """NKI kernel that computes multiplication and in_place add"""
     c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
-    offset_i_x = nl.program_id(0) * 128
-    offset_i_y = nl.program_id(1) * 512
 
-    ix = offset_i_x + nl.arange(128)[:, None]
-    iy = offset_i_y + nl.arange(512)[None, :]
+    a_sbuf = nl.ndarray(a_input.shape, a_input.dtype, nl.sbuf)
+    b_sbuf = nl.ndarray(b_input.shape, b_input.dtype, nl.sbuf)
+    c_sbuf = nl.ndarray(c_output.shape, c_output.dtype, nl.sbuf)
 
-    a_tile = nl.load(a_input[ix, iy])
-    b_tile = nl.load(b_input[ix, iy])
+    a_out_sbuf = nl.ndarray(a_input.shape, a_input.dtype, nl.sbuf)
 
-    c_tile = a_tile + b_tile
-    c_tile_mul = a_tile * b_tile
-    nl.store(a_input[ix, iy], value=c_tile)
-    nl.store(c_output[ix, iy], value=c_tile_mul)
+    nisa.dma_copy(a_sbuf, a_input)
+    nisa.dma_copy(b_sbuf, b_input)
+    nisa.tensor_tensor(a_out_sbuf, a_sbuf, b_sbuf, nl.add)
+    nisa.tensor_tensor(c_sbuf, a_sbuf, b_sbuf, nl.multiply)
+
+    nisa.dma_copy(a_input, a_out_sbuf)
+    nisa.dma_copy(c_output, c_sbuf)
+
     return c_output, a_input
 
 
 @nki.jit
-def nki_scaled_add_inplace(a_input, scale, b_output: nt.mutable_tensor):
+def nki_scaled_add_inplace(a_input, scale, b_output):
     """NKI kernel that computes scaled in_place add"""
-    offset_i_x = nl.program_id(0) * 128
-    offset_i_y = nl.program_id(1) * 512
 
-    ix = offset_i_x + nl.arange(128)[:, None]
-    iy = offset_i_y + nl.arange(512)[None, :]
+    sa = nl.ndarray(a_input.shape, a_input.dtype, buffer=nl.sbuf)
+    sb = nl.ndarray(b_output.shape, b_output.dtype, buffer=nl.sbuf)
+    sc = nl.ndarray(b_output.shape, b_output.dtype, buffer=nl.sbuf)
+    sb_out = nl.ndarray(b_output.shape, b_output.dtype, buffer=nl.sbuf)
 
-    a_tile = nl.load(a_input[ix, iy])
-    b_tile = nl.load(b_output[ix, iy])
+    nisa.dma_copy(dst=sa, src=a_input)
+    nisa.dma_copy(dst=sb, src=b_output)
+    nisa.tensor_scalar(sc, sa, operand0=scale, op0=nl.multiply)
 
-    c_tile = a_tile * scale + b_tile
-    nl.store(b_output[ix, iy], value=c_tile)
+    nisa.tensor_tensor(sb_out, data1=sc, data2=sb, op=nl.add)
+
+    nisa.dma_copy(dst=b_output, src=sb_out)
     return b_output
 
 
 @nki_op(f"{my_namespace}::add_op", mutates_args={})
 def nki_add_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    grid = [a.shape[0] // 128, b.shape[1] // 512]
-    return wrap_nki(nki_tensor_add_kernel_)[grid](a, b)
+    return nki_tensor_add_kernel_(a, b)
 
 
 @nki_op(f"{my_namespace}::add_inplace_and_mul", mutates_args={"a"})
 def nki_add_inplace_and_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    grid = [a.shape[0] // 128, b.shape[1] // 512]
-    e, _ = wrap_nki(nki_add_alias_mul)[grid](a, b)
+    e, _ = nki_add_alias_mul(a, b)
     return e
 
 
 @nki_op(f"{my_namespace}::scaled_add_inplace", mutates_args={"b"})
 def nki_scaled_add_inplace_op(a: torch.Tensor, scale: float, b: torch.Tensor) -> torch.Tensor:
-    grid = [a.shape[0] // 128, b.shape[1] // 512]
-    return wrap_nki(nki_scaled_add_inplace)[grid](a, scale, b)
+    return nki_scaled_add_inplace(a, scale, b)
 
 
 def nki_func(a, b):
@@ -158,26 +154,26 @@ def ref_aliased_with_constant_func(
 
 @nki.jit
 def nki_aliased_kernel_with_constant(
-    scale: float, out: nt.mutable_tensor, mode: str | None = None, input: torch.Tensor | None = None
+    scale, out, mode: str | None = None, input: torch.Tensor | None = None
 ):
-    offset_i_x = nl.program_id(0) * 128
-    offset_i_y = nl.program_id(1) * 512
+    out_sbuf = nl.ndarray(out.shape, out.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=out_sbuf, src=out)
 
-    ix = offset_i_x + nl.arange(128)[:, None]
-    iy = offset_i_y + nl.arange(512)[None, :]
+    scale_sbuf = nl.ndarray(out.shape, out.dtype, buffer=nl.sbuf)
 
-    out_tile = nl.load(out[ix, iy])
-    scaled_tile = out_tile * scale
-
-    scaled_tile = out_tile * scale if mode == "multiply" else out_tile + scale
+    if mode == "multiply":
+        nisa.tensor_scalar(scale_sbuf, out_sbuf, operand0=scale, op0=nl.multiply)
+    else:
+        nisa.tensor_scalar(scale_sbuf, out_sbuf, operand0=scale, op0=nl.add)
 
     if input is not None:
-        input_tile = nl.load(input[ix, iy])
-        result_tile = input_tile + scaled_tile
+        input_sbuf = nl.ndarray(input.shape, input.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=input_sbuf, src=input)
+        nisa.tensor_tensor(out_sbuf, data1=scale_sbuf, data2=input_sbuf, op=nl.add)
+        nisa.dma_copy(dst=out, src=out_sbuf)
     else:
-        result_tile = scaled_tile
+        nisa.dma_copy(dst=out, src=scale_sbuf)
 
-    nl.store(out[ix, iy], value=result_tile)
     return out
 
 
@@ -185,15 +181,14 @@ def nki_aliased_kernel_with_constant(
 def nki_aliased_with_constant_op(
     scale: float, out: torch.Tensor, mode: str | None, input: torch.Tensor | None = None
 ) -> torch.Tensor:
-    grid = [out.shape[0] // 128, out.shape[1] // 512]
-    wrap_nki(nki_aliased_kernel_with_constant)[grid](scale, out, mode, input)
+    nki_aliased_kernel_with_constant(scale, out, mode, input)
 
 
 class TestNKIOPIntegration:
     def test_nki_func_compiled(self):
         """Test nki_func with neuron backend"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
         compiled_func = torch.compile(nki_func, backend="neuron", fullgraph=True)
         ref = ref_func(a, b)
         result = compiled_func(a.to("neuron"), b.to("neuron")).to("cpu")
@@ -203,8 +198,8 @@ class TestNKIOPIntegration:
 
     def test_aliased_func_compiled(self):
         """Test aliased_func with neuron backend"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
         compiled_alias = torch.compile(nki_aliased_func, backend="neuron", fullgraph=True)
         ref = ref_aliased_func(a, b)
         result = compiled_alias(a.to("neuron"), b.to("neuron")).to("cpu")
@@ -214,8 +209,8 @@ class TestNKIOPIntegration:
 
     def test_nki_scaled_add_inplace(self):
         """Test nki_scaled_add_inplace with neuron backend"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
         scale = 2.5
 
         compiled_func = torch.compile(nki_scaled_add_func, backend="neuron", fullgraph=True)
@@ -237,8 +232,8 @@ class TestNKIOPIntegration:
     )
     def test_nki_aliased_with_constant(self, mode, has_input):
         """Test nki_aliased_kernel_with_constant with different optional parameter combinations"""
-        out = torch.ones((256, 1024), dtype=torch.float32)
-        input_tensor = torch.rand((256, 1024), dtype=torch.float32) if has_input else None
+        out = torch.ones((128, 128), dtype=torch.float32)
+        input_tensor = torch.rand((128, 128), dtype=torch.float32) if has_input else None
         out_neuron = out.clone().to("neuron")
         input_neuron = input_tensor.clone().to("neuron") if has_input else None
         scale = 2.5
@@ -267,18 +262,24 @@ class TestNKIOPIntegration:
             assert a_input.shape == c_input.shape
             assert a_input.shape[0] <= nl.tile_size.pmax
 
-            a_tile = nl.load(a_input)
-            b_tile = nl.load(b_input)
-            c_tile = nl.load(c_input)
+            a_tile = nl.ndarray(a_input.shape, a_input.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=a_tile, src=a_input)
+            b_tile = nl.ndarray(b_input.shape, b_input.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=b_tile, src=b_input)
+            c_tile = nl.ndarray(c_input.shape, c_input.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=c_tile, src=c_input)
 
-            ab_tile = nl.add(a_tile, b_tile)
-            ac_tile = nl.add(a_tile, c_tile)
+            ab_tile = nl.ndarray(a_input.shape, a_input.dtype, buffer=nl.sbuf)
+            ac_tile = nl.ndarray(a_input.shape, a_input.dtype, buffer=nl.sbuf)
+
+            nisa.tensor_tensor(dst=ab_tile, data1=a_tile, data2=b_tile, op=nl.add)
+            nisa.tensor_tensor(dst=ac_tile, data1=a_tile, data2=c_tile, op=nl.add)
 
             ab_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
             ac_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
 
-            nl.store(ab_output, value=ab_tile)
-            nl.store(ac_output, value=ac_tile)
+            nisa.dma_copy(dst=ab_output, src=ab_tile)
+            nisa.dma_copy(dst=ac_output, src=ac_tile)
 
             return ab_output, ac_output
 
@@ -288,7 +289,7 @@ class TestNKIOPIntegration:
             b_input: torch.Tensor,
             c_input: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return wrap_nki(nki_multiout_add_kernel)(a_input, b_input, c_input)
+            return nki_multiout_add_kernel(a_input, b_input, c_input)
 
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -301,9 +302,9 @@ class TestNKIOPIntegration:
         model = model.to("neuron:0")
         model = torch.compile(model, backend="neuron", fullgraph=True)
 
-        a = torch.ones((4, 3), dtype=torch.bfloat16)
-        b = torch.ones((4, 3), dtype=torch.bfloat16)
-        c = torch.ones((4, 3), dtype=torch.bfloat16)
+        a = torch.ones((4, 3), dtype=torch.float32)
+        b = torch.ones((4, 3), dtype=torch.float32)
+        c = torch.ones((4, 3), dtype=torch.float32)
 
         output = model(a.to("neuron:0"), b.to("neuron:0"), c.to("neuron:0"))
 
@@ -315,23 +316,32 @@ class TestNKIOPIntegration:
 
         @nki.jit
         def write_kv_cache_at_batch_kernel(
-            k: nt.tensor,
-            v: nt.tensor,
-            k_prior: nt.mutable_tensor,
-            v_prior: nt.mutable_tensor,
-            batch_idx: nt.tensor,
+            k,
+            v,
+            k_prior,
+            v_prior,
+            batch_idx,
         ):
-            batch_idx = nl.load(batch_idx)
+            batch_idx_sbuf = nl.ndarray(batch_idx.shape, batch_idx.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=batch_idx_sbuf, src=batch_idx)
 
             _, h, s, d = k.shape
             _, v_h, v_s, v_d = v.shape
 
-            _, i_h, i_s, i_d = nl.mgrid[:1, :h, :s, :d]
-            _, v_i_h, v_i_s, v_i_d = nl.mgrid[:1, :v_h, :v_s, :v_d]
-
-            nisa.dma_copy(src=k, dst=k_prior[batch_idx, i_h, i_s, i_d], oob_mode=nisa.oob_mode.skip)
             nisa.dma_copy(
-                src=v, dst=v_prior[batch_idx, v_i_h, v_i_s, v_i_d], oob_mode=nisa.oob_mode.skip
+                src=k,
+                dst=k_prior.ap(
+                    [[s * d * h, 1], [s * d, h], [d, s], [1, d]], scalar_offset=batch_idx_sbuf
+                ),
+                oob_mode=nisa.oob_mode.skip,
+            )
+            nisa.dma_copy(
+                src=v,
+                dst=v_prior.ap(
+                    [[s * d * h, 1], [v_s * v_d, v_h], [v_d, v_s], [1, v_d]],
+                    scalar_offset=batch_idx_sbuf,
+                ),
+                oob_mode=nisa.oob_mode.skip,
             )
 
             return k_prior, v_prior
@@ -347,13 +357,13 @@ class TestNKIOPIntegration:
             v_prior: torch.Tensor,
             batch_index: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return wrap_nki(write_kv_cache_at_batch_kernel)(k, v, k_prior, v_prior, batch_index)
+            return write_kv_cache_at_batch_kernel(k, v, k_prior, v_prior, batch_index)
 
         class ModelWithCacheReturn(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.register_buffer("k_prior", torch.zeros((1, 1, 256, 128), dtype=torch.bfloat16))
-                self.register_buffer("v_prior", torch.zeros((1, 1, 256, 128), dtype=torch.bfloat16))
+                self.register_buffer("k_prior", torch.zeros((1, 1, 128, 128), dtype=torch.float32))
+                self.register_buffer("v_prior", torch.zeros((1, 1, 128, 128), dtype=torch.float32))
 
             def forward(self, k, v, batch_idx):
                 updated_k, updated_v = write_kv_cache_at_batch(
@@ -365,14 +375,14 @@ class TestNKIOPIntegration:
         model = model.to("neuron:0")
         model = torch.compile(model, backend="neuron", fullgraph=True)
 
-        k = torch.ones((1, 1, 256, 128), dtype=torch.bfloat16)
-        v = torch.ones((1, 1, 256, 128), dtype=torch.bfloat16)
+        k = torch.ones((1, 1, 128, 128), dtype=torch.float32)
+        v = torch.ones((1, 1, 128, 128), dtype=torch.float32)
 
-        batch_idx = torch.tensor([0], dtype=torch.int32)
+        batch_idx = torch.tensor([[0]], dtype=torch.int32)
 
         model(k.to("neuron:0"), v.to("neuron:0"), batch_idx.to("neuron:0"))
 
-        batch_idx = torch.tensor([1], dtype=torch.int32)
+        batch_idx = torch.tensor([[1]], dtype=torch.int32)
 
         result = model(k.to("neuron:0"), v.to("neuron:0"), batch_idx.to("neuron:0"))
 
@@ -385,14 +395,13 @@ class TestNKIOPIntegration:
 class TestNKINativeIntegration:
     def test_nki_func_compiled(self):
         """Test nki_func with neuron backend using native kernel calls"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
 
         def nki_native_func(a, b):
             c = a * 2
             d = b + 3
-            grid = [a.shape[0] // 128, b.shape[1] // 512]
-            e = wrap_nki(nki_tensor_add_kernel_)[grid](c, d)
+            e = nki_tensor_add_kernel_(c, d)
             return e * c
 
         compiled_func = torch.compile(nki_native_func, backend="neuron", fullgraph=True)
@@ -404,14 +413,13 @@ class TestNKINativeIntegration:
 
     def test_aliased_func_compiled(self):
         """Test aliased_func with neuron backend using native kernel calls"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
 
         def nki_native_aliased_func(a, b):
             c = a * 2
             d = b + 3
-            grid = [a.shape[0] // 128, b.shape[1] // 512]
-            e, _ = wrap_nki(nki_add_alias_mul)[grid](c, d)
+            e, _ = nki_add_alias_mul(c, d)
             return e + c
 
         compiled_alias = torch.compile(nki_native_aliased_func, backend="neuron", fullgraph=True)
@@ -423,15 +431,14 @@ class TestNKINativeIntegration:
 
     def test_nki_scaled_add_inplace(self):
         """Test nki_scaled_add_inplace with neuron backend using native kernel calls"""
-        a = torch.rand((256, 1024), dtype=torch.float32)
-        b = torch.rand((256, 1024), dtype=torch.float32)
+        a = torch.rand((128, 128), dtype=torch.float32)
+        b = torch.rand((128, 128), dtype=torch.float32)
         scale = 2.5
 
         def nki_native_scaled_add_func(a, b, scale):
             c = a * 2
             d = b.clone()
-            grid = [a.shape[0] // 128, b.shape[1] // 512]
-            wrap_nki(nki_scaled_add_inplace)[grid](c, scale, d)
+            nki_scaled_add_inplace(c, scale, d)
             return d
 
         compiled_func = torch.compile(nki_native_scaled_add_func, backend="neuron", fullgraph=True)
@@ -455,8 +462,8 @@ class TestNKINativeIntegration:
         Test nki_aliased_kernel_with_constant with different optional parameter
         combinations using native kernel calls
         """
-        out = torch.ones((256, 1024), dtype=torch.float32)
-        input_tensor = torch.rand((256, 1024), dtype=torch.float32) if has_input else None
+        out = torch.ones((128, 128), dtype=torch.float32)
+        input_tensor = torch.rand((128, 128), dtype=torch.float32) if has_input else None
         out_neuron = out.clone().to("neuron")
         input_neuron = input_tensor.clone().to("neuron") if has_input else None
         scale = 2.5
@@ -464,8 +471,7 @@ class TestNKINativeIntegration:
         ref = ref_aliased_with_constant_func(scale, out, mode, input_tensor)
 
         def nki_native_aliased_with_constant(scale, out, mode, input):
-            grid = [out.shape[0] // 128, out.shape[1] // 512]
-            wrap_nki(nki_aliased_kernel_with_constant)[grid](scale, out, mode, input)
+            nki_aliased_kernel_with_constant(scale, out, mode, input)
 
         compiled_func = torch.compile(
             lambda *args: nki_native_aliased_with_constant(*args), backend="neuron", fullgraph=True

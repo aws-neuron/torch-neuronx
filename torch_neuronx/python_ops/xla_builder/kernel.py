@@ -10,7 +10,6 @@ from torch._C._distributed_c10d import OpType, ReduceOp
 
 from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
-from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron import current_stream, default_stream
 from torch_neuronx.utils import convert_for_neuron, is_host_cc_enabled, is_sync_mode_enabled
@@ -171,9 +170,8 @@ class XLABuilderKernel(BaseNeuronKernel):
         hlo = self.xla_builder_compiler.compile_to_hlo(self.hlo_fn, inputs, kwargs)
         # Collectives always use XLA (HLO protobuf), never StableHLO
         ir_type = "XLA"  # xla_builder only support XLA IR
-        job = CompilationJob(self.op_name)
         neff_bytes = self.hlo_compiler.compile_to_neff(
-            hlo.module_proto.SerializeToString(), ir_type=ir_type, job=job
+            hlo.module_proto.SerializeToString(), ir_type=ir_type
         )
 
         # Store in cache

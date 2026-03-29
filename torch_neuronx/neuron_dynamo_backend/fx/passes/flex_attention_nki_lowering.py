@@ -26,7 +26,7 @@ from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import 
     jinja_env,
     save_and_import_kernel,
 )
-from torch_neuronx.nki_hop import kernel_registry, nki_kernel_wrapper
+from torch_neuronx.nki_hop import kernel_registry, nki_kernel_wrapper, wrap_nki
 from torch_neuronx.utils import map_external_dtype_to_torch
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,16 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale):
     k_meta = torch.empty(k.meta["val"].shape, dtype=k.meta["val"].dtype, device="meta")
     v_meta = torch.empty(v.meta["val"].shape, dtype=v.meta["val"].dtype, device="meta")
 
-    dconfig = kernel.dump_config(q_meta, k_meta, v_meta, scale)
+    # Get arg names from the kernel function signature
+    import inspect
+
+    sig = inspect.signature(kernel.func)
+    arg_names = list(sig.parameters.keys())
+    # Build args dict matching the kernel's parameter order
+    positional_values = [q_meta, k_meta, v_meta, scale]
+    meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
+
+    dconfig = kernel[kernel.lnc].dump_config(**meta_args)
     logger.debug(f"FWD Kernel return types: {dconfig.return_types}")
     return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types
 
@@ -68,9 +77,19 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale):
     dy_meta = torch.empty(dy.meta["val"].shape, dtype=dy.meta["val"].dtype, device="meta")
     lse_meta = torch.empty(lse.meta["val"].shape, dtype=lse.meta["val"].dtype, device="meta")
 
-    dconfig = kernel.dump_config(
-        q_meta, k_meta, v_meta, o_meta, dy_meta, lse_meta, softmax_scale=scale
-    )
+    # Get arg names from the kernel function signature
+    import inspect
+
+    sig = inspect.signature(kernel.func)
+    arg_names = list(sig.parameters.keys())
+    # Build args dict: positional args first, then softmax_scale as keyword
+    positional_values = [q_meta, k_meta, v_meta, o_meta, dy_meta, lse_meta]
+    meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
+    # Add softmax_scale if it's a recognized parameter
+    if "softmax_scale" in arg_names:
+        meta_args["softmax_scale"] = scale
+
+    dconfig = kernel[kernel.lnc].dump_config(**meta_args)
     logger.debug(f"BWD Kernel return types: {dconfig.return_types}")
     return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types
 
@@ -278,7 +297,7 @@ class FlexAttentionNKILowering(PassBase):
             temp_module = save_and_import_kernel(
                 rendered_kernel, "temp_fwd_kernel", dir_name="flex_attention"
             )
-            fwd_kernel = nki.jit(mode="torch")(temp_module.attention_cte)
+            fwd_kernel = wrap_nki(nki.jit(temp_module.attention_cte))
             """
             IO Shapes:
             - q: (batch_size, seqlen_q, d) when tp_q is True
@@ -467,7 +486,7 @@ class FlexAttentionNKILowering(PassBase):
             temp_module = save_and_import_kernel(
                 rendered_kernel, "temp_bwd_kernel", dir_name="flex_attention"
             )
-            bwd_kernel = nki.jit(mode="torch")(temp_module.attention_bwd)
+            bwd_kernel = wrap_nki(nki.jit(temp_module.attention_bwd))
 
             with graph.inserting_before(node):
                 # Transpose to [bs, nheads, d_head, seqlen]

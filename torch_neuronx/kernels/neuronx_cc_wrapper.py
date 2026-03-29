@@ -19,7 +19,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .cache_utils import CompilationJob
 from .compiler_config import CompilerConfig
 from .compiler_subprocess import CompilerSubprocess, NEFFCompilationError
 
@@ -78,11 +77,9 @@ class NeuronxCCWrapper:
             ir_type = "StableHLO" if Path(parsed.input_file).suffix == ".mlir" else "XLA"
 
             # Get cached neff or compile
-            job = CompilationJob("neuronx_cc_compile")
             self.compiler.get_or_compile(
                 hlo_protobuf=hlo_protobuf,
                 config=parsed.config,
-                job=job,
                 lnc_override=parsed.lnc_override,
                 ir_type=ir_type,
                 output_file=parsed.output_file,

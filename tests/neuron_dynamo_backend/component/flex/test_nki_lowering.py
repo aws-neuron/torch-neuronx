@@ -8,7 +8,6 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.attention.flex_attention import and_masks, create_block_mask
 
 import torch_neuronx
-from torch_neuronx import wrap_nki
 from torch_neuronx.neuron_dynamo_backend._nki.ast import NKIArray
 from torch_neuronx.neuron_dynamo_backend._nki.subgraph_lowering import NISAPointwiseSubgraphLowering
 from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import (
@@ -120,7 +119,7 @@ class TestNKILowering:
 
         @torch.compile(backend="neuron")
         def mask_nki(b, h, q_idx, kv_idx):
-            return wrap_nki(mask_kernel)(b, h, q_idx, kv_idx)
+            return mask_kernel(b, h, q_idx, kv_idx)
 
         nki_result = mask_nki(
             b.to("neuron"), h.to("neuron"), q_idx.to("neuron"), kv_idx.to("neuron")

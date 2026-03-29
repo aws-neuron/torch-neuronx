@@ -117,6 +117,24 @@ std::string GenerateSlice(const std::vector<int64_t>& input_shape,
                           const std::vector<int64_t>& end_indices, const std::string& element_type);
 
 /**
+ * @brief Generate StableHLO MLIR for strided slice operation
+ *
+ * Creates a slice operation with non-unit strides (e.g., x[::2]).
+ * Uses stablehlo.slice with the strides parameter.
+ *
+ * @param input_shape Shape of the input tensor
+ * @param start_indices Starting indices for each dimension
+ * @param end_indices Ending indices (exclusive) for each dimension
+ * @param strides Stride for each dimension (1 = contiguous, >1 = step slice)
+ * @param element_type Element type as string (e.g., "f32", "bf16")
+ * @return MLIR string for strided slice operation
+ */
+std::string GenerateSlice(const std::vector<int64_t>& input_shape,
+                          const std::vector<int64_t>& start_indices,
+                          const std::vector<int64_t>& end_indices,
+                          const std::vector<int64_t>& strides, const std::string& element_type);
+
+/**
  * @brief Generate StableHLO MLIR for slice operation (MLIR type)
  *
  * Same as above but accepts mlir::Type directly instead of string.

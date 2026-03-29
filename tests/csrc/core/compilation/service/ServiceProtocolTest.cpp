@@ -11,7 +11,6 @@ TEST(ServiceProtocolTest, CompileRequestRoundTrip) {
   CompileRequest req;
   req.req_id = 42;
   req.hlo_file_path = "/tmp/hlo_test.pb";
-  req.persistent_cache_key = "persist_key_xyz";
   req.ir_type = "StableHLO";
   req.optimization_level = "-O2";
   req.additional_args = "--model-type transformer --auto-cast=none";
@@ -21,7 +20,6 @@ TEST(ServiceProtocolTest, CompileRequestRoundTrip) {
 
   EXPECT_EQ(decoded.req_id, 42);
   EXPECT_EQ(decoded.hlo_file_path, "/tmp/hlo_test.pb");
-  EXPECT_EQ(decoded.persistent_cache_key, "persist_key_xyz");
   EXPECT_EQ(decoded.ir_type, "StableHLO");
   EXPECT_EQ(decoded.optimization_level, "-O2");
   EXPECT_EQ(decoded.additional_args, "--model-type transformer --auto-cast=none");
@@ -31,7 +29,6 @@ TEST(ServiceProtocolTest, CompileRequestIrTypeXLA) {
   CompileRequest req;
   req.req_id = 1;
   req.hlo_file_path = "/tmp/hlo_collective.pb";
-  req.persistent_cache_key = "pkey";
   req.ir_type = "XLA";
   req.optimization_level = "-O1";
   req.additional_args = "";
@@ -61,7 +58,6 @@ TEST(ServiceProtocolTest, EmptyStringsRoundTrip) {
   CompileRequest req;
   req.req_id = 0;
   req.hlo_file_path = "";
-  req.persistent_cache_key = "";
   req.ir_type = "";
   req.optimization_level = "";
   req.additional_args = "";
@@ -82,7 +78,6 @@ TEST(ServiceProtocolTest, SocketSendRecvPair) {
   CompileRequest req;
   req.req_id = 123;
   req.hlo_file_path = "/tmp/test.pb";
-  req.persistent_cache_key = "pkey";
   req.ir_type = "XLA";
   req.optimization_level = "-O1";
   req.additional_args = "--model-type transformer";

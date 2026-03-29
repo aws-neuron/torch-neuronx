@@ -57,7 +57,6 @@ class ProcessExecutor {
   [[noreturn]] static void ExecCommand(const std::vector<char*>& argv);
   static void WaitAndCheckResult(pid_t pid, PipeManager& stdout_pipe, PipeManager& stderr_pipe,
                                  const std::string& context);
-  static std::string ReadPipeOutput(int fd);
 };
 
 }  // namespace at::neuron

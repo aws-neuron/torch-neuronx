@@ -309,9 +309,9 @@ void CompilationCache::GetOrCompileNeff(const CompilableKernelExecution& kernel_
   Compile(key, kernel_execution, stream_id);
 }
 
-void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& kernel_execution,
-                                             uint32_t stream_id,
-                                             std::function<void(bool success)> callback) {
+void CompilationCache::GetOrCompileNeffAsync(
+    const CompilableKernelExecution& kernel_execution, uint32_t stream_id,
+    std::function<void(bool success, const std::string& error)> callback) {
   const auto& key = kernel_execution.GetCompilationCacheKey();
   const std::string& cache_key = key.GetKey();
 
@@ -319,7 +319,7 @@ void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& ke
   if (CheckCacheAndCoordinateWork(key, kernel_execution, stream_id)) {
     if (kernel_execution.HasCachedNeff()) {
       // Cache hit — invoke callback synchronously.
-      callback(true);
+      callback(true, "");
       return;
     }
     // Another thread is compiling — get the future before it's cleaned up.
@@ -338,10 +338,10 @@ void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& ke
       if (it != cache_.end() && it->second) {
         auto neff_ptr = CreateNeffBytesPtr(it->second->neff_bytes, cache_key);
         kernel_execution.SetCachedNeff(std::move(neff_ptr));
-        callback(true);
+        callback(true, "");
         return;
       }
-      callback(false);
+      callback(false, "");
       return;
     }
 
@@ -354,9 +354,11 @@ void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& ke
         auto cache_entry = compilation_future.get();
         auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key_copy);
         kernel_execution.SetCachedNeff(std::move(neff_ptr));
-        callback(true);
+        callback(true, "");
+      } catch (const std::exception& e) {
+        callback(false, e.what());
       } catch (...) {
-        callback(false);
+        callback(false, "Unknown error while waiting for pending compilation");
       }
     });
     return;
@@ -368,9 +370,11 @@ void CompilationCache::GetOrCompileNeffAsync(const CompilableKernelExecution& ke
       [this, key_copy, &kernel_execution, stream_id, callback = std::move(callback)]() {
         try {
           Compile(key_copy, kernel_execution, stream_id);
-          callback(true);
+          callback(true, "");
+        } catch (const std::exception& e) {
+          callback(false, e.what());
         } catch (...) {
-          callback(false);
+          callback(false, "Unknown internal compilation error");
         }
       });
 }
@@ -685,8 +689,8 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
 
   // Compile via backend: local (in-process neuronx-cc) or service (remote RPC).
   auto neff_bytes = backend_->Compile(
-      kernel_execution.GetHloBytes(), *persistent_cache_key, ir_type,
-      kernel_execution.GetOptimizationLevel(), kernel_execution.GetAdditionalArgs(),
+      kernel_execution.GetHloBytes(), ir_type, kernel_execution.GetOptimizationLevel(),
+      kernel_execution.GetAdditionalArgs(),
       [&kernel_execution]() -> std::vector<uint8_t> { return kernel_execution.CompileToNeff(); });
 
   auto end_time = std::chrono::steady_clock::now();

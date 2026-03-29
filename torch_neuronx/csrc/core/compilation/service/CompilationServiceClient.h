@@ -25,11 +25,12 @@ class CompilationServiceClient {
 
   // Synchronous compile: connects, sends HLO, blocks until NEFF returned, disconnects.
   // Thread-safe — each call uses its own connection.
+  // On failure: returns empty vector, error message in out_error (if non-null).
   std::vector<uint8_t> CompileSync(const std::vector<uint8_t>& hlo_bytes,
-                                   const std::string& persistent_cache_key,
                                    const std::string& ir_type,
                                    const std::string& optimization_level,
-                                   const std::string& additional_args);
+                                   const std::string& additional_args,
+                                   std::string* out_error = nullptr);
 
  private:
   std::string socket_path_;

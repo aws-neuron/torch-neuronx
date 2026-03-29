@@ -18,7 +18,7 @@ TEST(LocalCompilationBackendTest, CompileFnInvoked) {
   LocalCompilationBackend backend;
   std::vector<uint8_t> expected_neff = {0xCA, 0xFE};
 
-  auto result = backend.Compile({0x01}, "pkey", "XLA", "-O1", "--model-type transformer",
+  auto result = backend.Compile({0x01}, "XLA", "-O1", "--model-type transformer",
                                 [&]() { return expected_neff; });
 
   EXPECT_EQ(result, expected_neff);
@@ -27,8 +27,8 @@ TEST(LocalCompilationBackendTest, CompileFnInvoked) {
 TEST(LocalCompilationBackendTest, CompileFailureReturnsEmpty) {
   LocalCompilationBackend backend;
 
-  auto result = backend.Compile({0x01}, "pkey", "XLA", "-O1", "",
-                                []() -> std::vector<uint8_t> { return {}; });
+  auto result =
+      backend.Compile({0x01}, "XLA", "-O1", "", []() -> std::vector<uint8_t> { return {}; });
 
   EXPECT_TRUE(result.empty());
 }
@@ -36,7 +36,7 @@ TEST(LocalCompilationBackendTest, CompileFailureReturnsEmpty) {
 TEST(LocalCompilationBackendTest, CompileFnExceptionPropagates) {
   LocalCompilationBackend backend;
 
-  EXPECT_THROW(backend.Compile({0x01}, "pkey", "XLA", "-O1", "",
+  EXPECT_THROW(backend.Compile({0x01}, "XLA", "-O1", "",
                                []() -> std::vector<uint8_t> { throw std::runtime_error("fail"); }),
                std::runtime_error);
 }

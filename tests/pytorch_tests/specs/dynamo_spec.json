@@ -1768,7 +1768,7 @@
         {
           "reason": "E RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: E Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: loc(\"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/einops/layers/torch.py\":63:0): error: matmul: input datatypes mismatched E loc(\"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/einops/layers/torch.py\":63:0): error: failed to perform matmul operation",
           "tests": [
-            "test_layers_version_0_8_2"
+            "test_layers_version_0_8_1"
           ]
         },
         {

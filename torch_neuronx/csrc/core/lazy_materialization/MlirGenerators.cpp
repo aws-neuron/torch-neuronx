@@ -322,6 +322,34 @@ std::string GenerateSlice(const std::vector<int64_t>& input_shape,
   }
 }
 
+// Strided slice overload — passes strides through to SliceOpBuilder
+std::string GenerateSlice(const std::vector<int64_t>& input_shape,
+                          const std::vector<int64_t>& start_indices,
+                          const std::vector<int64_t>& end_indices,
+                          const std::vector<int64_t>& strides, const std::string& element_type) {
+  // Check if all strides are 1 — delegate to the simpler overload
+  bool all_unit = std::all_of(strides.begin(), strides.end(), [](int64_t s) { return s == 1; });
+  if (all_unit) {
+    return GenerateSlice(input_shape, start_indices, end_indices, element_type);
+  }
+
+  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateSlice (strided)",
+                      "input_shape_size=", input_shape.size(), "element_type=", element_type);
+
+  try {
+    torch_neuronx::SliceOpBuilder builder(input_shape, start_indices, end_indices, strides,
+                                          element_type, true /* enable_verification */);
+    auto mlir_module = builder.build();
+    std::string result = torch_neuronx::stablehlo_utils::moduleToString(mlir_module.get());
+
+    TORCH_NEURONX_DEBUG("MlirGenerators::GenerateSlice (strided): Successfully generated MLIR");
+    return result;
+  } catch (const std::exception& e) {
+    TORCH_NEURONX_DEBUG("Failed to generate strided slice MLIR", "error=", e.what());
+    throw;
+  }
+}
+
 // ============================================================================
 // BROADCAST Implementation
 // ============================================================================

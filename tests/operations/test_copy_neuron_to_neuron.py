@@ -205,3 +205,81 @@ def test_copy_neuron_to_neuron_fp64_empty():
     dst.copy_(src)
     assert dst.numel() == 0
     assert dst.dtype == torch.float64
+
+
+def test_copy_non_default_stream_uses_direct_primitive():
+    """Test that copy on non-default stream with host_cc routes to direct
+    primitive (CopyNeuronImpl)."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+    from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
+
+    @requires_nrt_streams
+    def _run():
+        src = torch.randn(4, 4, device="neuron")
+        dst = torch.empty(4, 4, device="neuron")
+
+        impl = CopyMLIRImpl()
+
+        # Default
+        assert impl.can_handle(dst, src)
+
+        # Non-default
+        stream = torch.neuron.Stream()
+        with torch.neuron.stream(stream):
+            assert not impl.can_handle(dst, src)
+            dst.copy_(src)
+
+        stream.synchronize()
+        torch.testing.assert_close(src.cpu(), dst.cpu())
+
+    _run()
+
+
+def test_copy_non_default_stream_without_host_cc_uses_mlir():
+    """Test that copy on non-default stream WITHOUT host_cc still uses MLIR."""
+
+    from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
+    from torch_neuronx.utils import is_host_cc_enabled
+
+    old_value = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
+    os.environ.pop("TORCH_NEURONX_ENABLE_HOST_CC", None)
+    is_host_cc_enabled.cache_clear()
+    try:
+        src = torch.randn(4, 4, device="neuron")
+        dst = torch.empty(4, 4, device="neuron")
+
+        impl = CopyMLIRImpl()
+
+        stream = torch.neuron.Stream()
+        with torch.neuron.stream(stream):
+            assert impl.can_handle(dst, src)
+    finally:
+        if old_value is not None:
+            os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_value
+        is_host_cc_enabled.cache_clear()
+
+
+def test_to_copy_non_default_stream_uses_direct_primitive():
+    """Test that _to_copy on non-default stream with host_cc routes to direct primitive."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+    from torch_neuronx.python_ops.torch_mlir.ops.to_copy import ToCopyMLIRImpl
+
+    @requires_nrt_streams
+    def _run():
+        src = torch.randn(4, 4, device="neuron")
+
+        impl = ToCopyMLIRImpl()
+
+        # Default
+        assert impl.can_handle(src, device=torch.device("neuron"))
+
+        # Non-default
+        stream = torch.neuron.Stream()
+        with torch.neuron.stream(stream):
+            assert not impl.can_handle(src, device=torch.device("neuron"))
+            result = src.to(device="neuron", dtype=torch.float16)
+
+        stream.synchronize()
+        torch.testing.assert_close(src.cpu().to(torch.float16), result.cpu())
+
+    _run()

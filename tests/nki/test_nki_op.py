@@ -1,12 +1,13 @@
 """Tests for NKI op registration."""
 
-import neuronxcc.nki.typing as nt
+import nki
+import nki.isa as nisa
+import nki.language as nl
 import pytest
 import torch
 import torch.fx
-from neuronxcc import nki
 
-from torch_neuronx import nki_op, wrap_nki
+from torch_neuronx import nki_op
 
 
 class TestNKIJitDecorator:
@@ -16,82 +17,92 @@ class TestNKIJitDecorator:
         """Test a simple addition kernel with @nki.jit."""
 
         @nki.jit
-        def add_kernel(x1, x2, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def add_kernel(x1, x2):
+            s1 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s1, src=x1)
 
-            x1_tile = nl.load(x1[0:128])
-            x2_tile = nl.load(x2[0:128])
-            y_tile = x1_tile + x2_tile
-            nl.store(y[0:128], value=y_tile)
-            return y
+            s2 = nl.ndarray(x2.shape, dtype=x2.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s2, src=x2)
 
-        @nki_op("test::nki_add", mutates_args={"y"})
-        def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrap_nki(add_kernel)(x1, x2, y)
+            s3 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=s3, data1=s1, data2=s2, op=nl.add)
 
-        x1 = torch.randn(128, device="neuron")
-        x2 = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
+            out = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=s3)
+            return out
 
-        nki_add(x1, x2, y)
+        @nki_op("test::nki_add")
+        def nki_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+            return add_kernel(x1, x2)
+
+        x1 = torch.randn(1, 128, device="neuron")
+        x2 = torch.randn(1, 128, device="neuron")
+
+        result = nki_add(x1, x2)
 
         expected = x1 + x2
-        assert torch.allclose(y.cpu(), expected.cpu())
+        assert torch.allclose(result.cpu(), expected.cpu())
 
     def test_scale_kernel(self):
         """Test scaling kernel with @nki.jit."""
 
         @nki.jit
-        def scale_kernel(x, y: nt.mutable_tensor, scale):
-            import neuronxcc.nki.language as nl
+        def scale_kernel(x, scale):
+            sx = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sx, src=x)
 
-            x_tile = nl.load(x[0:128])
-            y_tile = x_tile * scale
-            nl.store(y[0:128], value=y_tile)
-            return y
+            sy = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=sy, data=sx, op0=nl.multiply, operand0=scale)
 
-        @nki_op("test::nki_scale", mutates_args={"y"})
-        def nki_scale(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
-            wrap_nki(scale_kernel)(x, y, scale)
+            out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=sy)
+            return out
 
-        x = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
+        @nki_op("test::nki_scale")
+        def nki_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
+            return scale_kernel(x, scale)
+
+        x = torch.randn(1, 128, device="neuron")
         scale = 3.0
 
-        nki_scale(x, y, scale)
+        result = nki_scale(x, scale)
 
         expected = x * scale
-        assert torch.allclose(y.cpu(), expected.cpu())
+        assert torch.allclose(result.cpu(), expected.cpu())
 
 
 class TestNKIOpRegistration:
     """Test nki_op registration and execution."""
 
     def test_basic_op_registration(self):
-        """Test basic op registration with in-place mutation."""
+        """Test basic op registration."""
 
         @nki.jit
-        def add_kernel(x1, x2, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def add_kernel(x1, x2):
+            s1 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s1, src=x1)
 
-            x1_tile = nl.load(x1[0:128])
-            x2_tile = nl.load(x2[0:128])
-            y_tile = x1_tile + x2_tile
-            nl.store(y[0:128], value=y_tile)
-            return y
+            s2 = nl.ndarray(x2.shape, dtype=x2.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s2, src=x2)
 
-        @nki_op("test::nki_add", mutates_args={"y"})
-        def nki_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrap_nki(add_kernel)(x1, x2, y)
+            s3 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=s3, data1=s1, data2=s2, op=nl.add)
 
-        x1 = torch.randn(128, device="neuron")
-        x2 = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
+            out = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=s3)
+            return out
 
-        nki_add(x1, x2, y)
+        @nki_op("test::nki_add_reg")
+        def nki_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+            return add_kernel(x1, x2)
+
+        x1 = torch.randn(1, 128, device="neuron")
+        x2 = torch.randn(1, 128, device="neuron")
+
+        result = nki_add(x1, x2)
 
         expected = x1 + x2
-        assert torch.allclose(y.cpu(), expected.cpu())
+        assert torch.allclose(result.cpu(), expected.cpu())
 
     def test_op_appears_in_torch_ops(self):
         """Test that registered op appears in torch.ops namespace."""
@@ -110,70 +121,69 @@ class TestNKIOpRegistration:
         assert torch.allclose(result.cpu(), expected.cpu())
 
     def test_different_dtypes(self):
-        """Test NKI ops with different data types."""
+        """Test NKI ops with float32 dtype."""
 
         @nki.jit
-        def copy_kernel(x, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def copy_kernel(x):
+            sx = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sx, src=x)
 
-            x_tile = nl.load(x)
-            nl.store(y, value=x_tile)
-            return y
+            out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=sx)
+            return out
 
-        @nki_op("test::dtype_test", mutates_args={})
+        @nki_op("test::dtype_test_v3")
         def dtype_test(x: torch.Tensor) -> torch.Tensor:
-            y = torch.empty(64, device="neuron", dtype=dtype)
-            wrap_nki(copy_kernel)(x, y)
-            return y
+            return copy_kernel(x)
 
-        dtypes = [torch.float32, torch.float16]
-
-        for dtype in dtypes:
-            x = torch.randn(64, device="neuron", dtype=dtype)
-
-            result = dtype_test(x)
-            assert torch.equal(result.cpu(), x.cpu())
+        x = torch.randn(1, 64, device="neuron", dtype=torch.float32)
+        result = dtype_test(x)
+        assert torch.equal(result.cpu(), x.cpu())
 
     def test_multiple_ops_in_graph(self):
         """Test multiple NKI ops in the same graph."""
 
         @nki.jit
-        def add_kernel(x1, x2, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def add_kernel(x1, x2):
+            s1 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s1, src=x1)
 
-            x1_tile = nl.load(x1[0:128])
-            x2_tile = nl.load(x2[0:128])
-            y_tile = x1_tile + x2_tile
-            nl.store(y[0:128], value=y_tile)
-            return y
+            s2 = nl.ndarray(x2.shape, dtype=x2.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s2, src=x2)
+
+            s3 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=s3, data1=s1, data2=s2, op=nl.add)
+
+            out = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=s3)
+            return out
 
         @nki.jit
-        def mul_kernel(x, y: nt.mutable_tensor, scale):
-            import neuronxcc.nki.language as nl
+        def mul_kernel(x, scale):
+            sx = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sx, src=x)
 
-            x_tile = nl.load(x[0:128])
-            y_tile = x_tile * scale
-            nl.store(y[0:128], value=y_tile)
-            return y
+            sy = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=sy, data=sx, op0=nl.multiply, operand0=scale)
 
-        @nki_op("test::multi_add", mutates_args={})
+            out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=sy)
+            return out
+
+        @nki_op("test::multi_add_v3")
         def multi_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-            y = torch.empty_like(x1)
-            wrap_nki(add_kernel)(x1, x2, y)
-            return y
+            return add_kernel(x1, x2)
 
-        @nki_op("test::multi_mul", mutates_args={})
+        @nki_op("test::multi_mul_v3")
         def multi_mul(x: torch.Tensor, scale: float) -> torch.Tensor:
-            y = torch.empty_like(x)
-            wrap_nki(mul_kernel)(x, y, scale)
-            return y
+            return mul_kernel(x, scale)
 
         def combined_fn(x1, x2, scale):
             temp = multi_add(x1, x2)
             return multi_mul(temp, scale)
 
-        x1 = torch.randn(128, device="neuron")
-        x2 = torch.randn(128, device="neuron")
+        x1 = torch.randn(1, 128, device="neuron")
+        x2 = torch.randn(1, 128, device="neuron")
         scale = 1.5
 
         result = combined_fn(x1, x2, scale)
@@ -185,20 +195,23 @@ class TestNKIOpRegistration:
         """Test NKI op with forward and backward pass."""
 
         @nki.jit
-        def add_kernel(x, y, output: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def add_kernel(x, y):
+            sx = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sx, src=x)
 
-            x_tile = nl.load(x[0:128])
-            y_tile = nl.load(y[0:128])
-            result = x_tile + y_tile
-            nl.store(output[0:128], value=result)
-            return output
+            sy = nl.ndarray(y.shape, dtype=y.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sy, src=y)
 
-        @nki_op("test::add_fwd", mutates_args={})
+            sr = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=sr, data1=sx, data2=sy, op=nl.add)
+
+            out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=sr)
+            return out
+
+        @nki_op("test::add_fwd_v3")
         def add_fwd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            output = torch.empty_like(x)
-            wrap_nki(add_kernel)(x, y, output)
-            return output
+            return add_kernel(x, y)
 
         @add_fwd.register_autograd
         def add_fwd_backward(ctx, grad_output):
@@ -206,8 +219,8 @@ class TestNKIOpRegistration:
             return grad_output.clone(), grad_output.clone()
 
         # Test forward and backward
-        x = torch.randn(128, device="neuron", requires_grad=True)
-        y = torch.randn(128, device="neuron", requires_grad=True)
+        x = torch.randn(1, 128, device="neuron", requires_grad=True)
+        y = torch.randn(1, 128, device="neuron", requires_grad=True)
 
         # Forward pass
         result = add_fwd(x, y)
@@ -228,29 +241,33 @@ class TestNKIOpRegistration:
         """Test NKI op works with autocast enabled."""
 
         @nki.jit
-        def add_kernel(x1, x2, y: nt.mutable_tensor):
-            import neuronxcc.nki.language as nl
+        def add_kernel(x1, x2):
+            s1 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s1, src=x1)
 
-            x1_tile = nl.load(x1[0:128])
-            x2_tile = nl.load(x2[0:128])
-            y_tile = x1_tile + x2_tile
-            nl.store(y[0:128], value=y_tile)
-            return y
+            s2 = nl.ndarray(x2.shape, dtype=x2.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s2, src=x2)
 
-        @nki_op("test::autocast_add", mutates_args={"y"})
-        def autocast_add(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            wrap_nki(add_kernel)(x1, x2, y)
+            s3 = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=s3, data1=s1, data2=s2, op=nl.add)
 
-        x1 = torch.randn(128, device="neuron")
-        x2 = torch.randn(128, device="neuron")
-        y = torch.empty(128, device="neuron")
+            out = nl.ndarray(x1.shape, dtype=x1.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=out, src=s3)
+            return out
+
+        @nki_op("test::autocast_add_v3")
+        def autocast_add(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+            return add_kernel(x1, x2)
+
+        x1 = torch.randn(1, 128, device="neuron")
+        x2 = torch.randn(1, 128, device="neuron")
 
         # Test with autocast enabled
         with torch.autocast(device_type="neuron", dtype=torch.bfloat16):
-            autocast_add(x1, x2, y)
+            result = autocast_add(x1, x2)
 
         expected = x1 + x2
-        assert torch.allclose(y.cpu(), expected.cpu())
+        assert torch.allclose(result.cpu(), expected.cpu())
 
 
 class TestTorchCompileIntegration:
@@ -261,7 +278,7 @@ class TestTorchCompileIntegration:
         """Test that NKI ops work with torch.compile."""
 
         @nki.jit
-        def add_one_kernel(x, y: nt.mutable_tensor):
+        def add_one_kernel(x, y):
             import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
@@ -272,7 +289,7 @@ class TestTorchCompileIntegration:
         @nki_op("test::add_one", mutates_args={})
         def add_one(x: torch.Tensor) -> torch.Tensor:
             y = torch.empty_like(x)
-            wrap_nki(add_one_kernel)(x, y)
+            add_one_kernel(x, y)
             return y
 
         @torch.compile

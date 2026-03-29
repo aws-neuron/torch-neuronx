@@ -75,15 +75,15 @@ class CompilationCache {
   // Async compilation with callback. Delegates to the active CompilationBackend.
   //
   // Callback contract:
-  //   - callback(true) on success, kernel.HasCachedNeff() == true
-  //   - callback(false) on failure
+  //   - callback(true, "") on success, kernel.HasCachedNeff() == true
+  //   - callback(false, error_msg) on failure
   //   - Invoked exactly once, synchronously (cache hit) or from another thread
   //
   // The backend is selected at construction time:
   //   - NEURON_COMPILE_SERVICE=0 → LocalCompilationBackend
   //   - Otherwise → ServiceCompilationBackend (with fallback to local)
   void GetOrCompileNeffAsync(const CompilableKernelExecution& kernel_execution, uint32_t stream_id,
-                             std::function<void(bool success)> callback);
+                             std::function<void(bool success, const std::string& error)> callback);
 
   // Returns the name of the active compilation backend ("local" or "service").
   std::string GetBackendName() const;

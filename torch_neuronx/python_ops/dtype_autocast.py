@@ -202,15 +202,10 @@ class DtypeAutocastContext:
                                 "Output tensor has dtype float64 which is not supported on Neuron. "
                                 "Please use float32 for the output tensor."
                             )
-                    elif tensor.dtype == torch.int64 and not self.had_int64:
-                        if self.cast_int64:
-                            # Similarly allow int64 outs by recording the requirement
-                            self.had_int64 = True
-                        else:
-                            raise TypeError(
-                                "Output tensor has dtype int64 which is not supported on Neuron. "
-                                "Please use int32 for the output tensor."
-                            )
+                    # Similarly allow int64 outs by recording the requirement
+                    # cast_int64=False means int64 is natively supported (S64 MLIR HLO)
+                    elif tensor.dtype == torch.int64 and not self.had_int64 and self.cast_int64:
+                        self.had_int64 = True
 
 
 @contextmanager
