@@ -35,6 +35,18 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Neuron does not support point-to-point send/recv operations. "
+            "The test calls transport.send_checkpoint which relies on these "
+            "unsupported operations."
+        ),
+        tests=[
+            "test_pg_transport.py::PgTransportGPU::test_pg_transport",
+            "test_pg_transport.py::PgTransportGPU::test_pg_transport_with_mixed_content",
+            "test_pg_transport.py::PgTransportGPU::test_pg_transport_with_sharded_tensor",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Functionality Gap: We do not support setting"
             " torch_neuronx.set_device(device) before"
             " dist.init_process_group."

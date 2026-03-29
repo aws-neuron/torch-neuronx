@@ -855,6 +855,29 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerWithEmptyBytes) {
   EXPECT_FALSE(kernel.IsValid());
 }
 
+// =============================================================================
+// Compilation Error Tracking Tests
+// =============================================================================
+
+TEST_F(KernelExecutionTest, CompilationErrorDefaultState) {
+  XLACompilableKernelExecution kernel("error_test", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "error_key",
+                                      {0x01}, false, 0);
+  EXPECT_FALSE(kernel.IsFailedCompilation());
+  EXPECT_TRUE(kernel.GetCompilationError().empty());
+}
+
+TEST_F(KernelExecutionTest, SetAndGetCompilationError) {
+  XLACompilableKernelExecution kernel("error_test", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "error_key",
+                                      {0x01}, false, 0);
+  kernel.SetCompilationError("neuronx-cc: invalid HLO format");
+
+  EXPECT_TRUE(kernel.IsFailedCompilation());
+  EXPECT_EQ(kernel.GetCompilationError(), "neuronx-cc: invalid HLO format");
+  EXPECT_FALSE(kernel.HasCachedNeff());
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

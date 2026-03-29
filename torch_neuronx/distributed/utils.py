@@ -72,6 +72,9 @@ def parse_and_update_inputs(inputs, options):
     reduce_type = get_reduce_type(options.reduceOp)
     if reduce_type == "PREMUL_SUM":
         _, premul_factor = options.reduceOp.__getstate__()
+        if premul_factor == 1.0:
+            options.reduceOp = dist.ReduceOp.SUM
+            return inputs, "SUM"
         if isinstance(inputs, list):
             if isinstance(inputs[0], list):
                 scaled_inputs = [

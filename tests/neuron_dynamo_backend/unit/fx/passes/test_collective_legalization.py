@@ -2,6 +2,7 @@
 Unit tests for collective_legalization fx pass.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,34 +19,85 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization impor
 class TestGetProcessGroupRanks:
     """Test get_process_group_ranks function"""
 
-    @patch("torch.distributed.distributed_c10d._resolve_process_group")
+    @patch(
+        "torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization.get_all_replica_groups"
+    )
+    def test_get_process_group_ranks_uses_registry(self, mock_get_all):
+        """Test that _get_process_group_ranks delegates to get_all_replica_groups"""
+        mock_get_all.return_value = [[0, 1], [2, 3]]
+
+        result = collective_legalization._get_process_group_ranks("test_group")
+
+        mock_get_all.assert_called_once_with("test_group")
+        assert result == [[0, 1], [2, 3]]
+
+    @patch(
+        "torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization.get_all_replica_groups"
+    )
     @patch("torch.distributed.get_world_size")
     @patch("torch.distributed.is_initialized")
     def test_get_process_group_ranks_fallback_initialized(
-        self, mock_is_init, mock_world_size, mock_resolve_pg
+        self, mock_is_init, mock_world_size, mock_get_all
     ):
-        """Test fallback behavior when process group
-        resolution fails but distributed is initialized"""
-        # Mock resolution failure
-        mock_resolve_pg.side_effect = Exception("Failed to resolve process group")
+        """Test fallback when get_all_replica_groups fails but distributed is initialized."""
+        mock_get_all.side_effect = Exception("Failed to get replica groups")
         mock_is_init.return_value = True
         mock_world_size.return_value = 4
 
         result = collective_legalization._get_process_group_ranks("invalid_group")
 
-        assert result == [0, 1, 2, 3]  # Should fallback to world group
+        assert result == [[0, 1, 2, 3]]  # Should fallback to world group wrapped in list
 
-    @patch("torch.distributed.distributed_c10d._resolve_process_group")
+    @patch(
+        "torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization.get_all_replica_groups"
+    )
     @patch("torch.distributed.is_initialized")
-    def test_get_process_group_ranks_fallback_not_initialized(self, mock_is_init, mock_resolve_pg):
+    def test_get_process_group_ranks_fallback_not_initialized(self, mock_is_init, mock_get_all):
         """Test fallback behavior when distributed is not initialized"""
-        # Mock resolution failure and no distributed initialization
-        mock_resolve_pg.side_effect = Exception("Failed to resolve process group")
+        mock_get_all.side_effect = Exception("Failed to get replica groups")
         mock_is_init.return_value = False
 
         result = collective_legalization._get_process_group_ranks("invalid_group")
 
-        assert result == [0]  # Should return single rank for non-distributed case
+        assert result == [[0]]  # Should return single rank wrapped in list
+
+
+class TestNeuronSpmdDisable:
+    """Test TORCH_NEURONX_SPMD_DISABLE env var bypasses the mesh registry."""
+
+    @patch("torch.distributed.get_process_group_ranks", return_value=[0, 1])
+    @patch("torch.distributed.distributed_c10d._resolve_process_group")
+    def test_disable_bypasses_registry(self, mock_resolve, mock_ranks):
+        """When TORCH_NEURONX_SPMD_DISABLE is set, get_all_replica_groups falls back to per-rank."""
+        from torch_neuronx.distributed.mesh_registry import (
+            _MESH_REGISTRY,
+            get_all_replica_groups,
+        )
+
+        _MESH_REGISTRY["test_pg"] = [[0, 1], [2, 3]]
+        try:
+            os.environ["TORCH_NEURONX_SPMD_DISABLE"] = "1"
+            result = get_all_replica_groups("test_pg")
+            assert result == [[0, 1]], f"Expected fallback, got {result}"
+            mock_resolve.assert_called_once_with("test_pg")
+        finally:
+            os.environ.pop("TORCH_NEURONX_SPMD_DISABLE", None)
+            _MESH_REGISTRY.pop("test_pg", None)
+
+    def test_registry_used_when_not_disabled(self):
+        """When TORCH_NEURONX_SPMD_DISABLE is unset, registry is used."""
+        from torch_neuronx.distributed.mesh_registry import (
+            _MESH_REGISTRY,
+            get_all_replica_groups,
+        )
+
+        _MESH_REGISTRY["test_pg2"] = [[0, 1], [2, 3]]
+        os.environ.pop("TORCH_NEURONX_SPMD_DISABLE", None)
+        try:
+            result = get_all_replica_groups("test_pg2")
+            assert result == [[0, 1], [2, 3]]
+        finally:
+            _MESH_REGISTRY.pop("test_pg2", None)
 
 
 class TestCollectiveLegalization:
@@ -70,7 +122,7 @@ class TestCollectiveLegalization:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_all_reduce_legalization(self, mock_get_ranks):
         """Test all_reduce operation legalization"""
-        mock_get_ranks.return_value = [0, 1, 2, 3]
+        mock_get_ranks.return_value = [[0, 1, 2, 3]]
 
         # Create mock node for all_reduce operation
         node = self.create_mock_fx_node(
@@ -91,7 +143,7 @@ class TestCollectiveLegalization:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_all_gather_legalization(self, mock_get_ranks):
         """Test all_gather_into_tensor operation legalization"""
-        mock_get_ranks.return_value = [0, 2, 4, 6]
+        mock_get_ranks.return_value = [[0, 2, 4, 6]]
 
         # Create mock node for all_gather_into_tensor operation
         node = self.create_mock_fx_node(
@@ -111,7 +163,7 @@ class TestCollectiveLegalization:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_reduce_scatter_legalization(self, mock_get_ranks):
         """Test reduce_scatter_tensor operation legalization"""
-        mock_get_ranks.return_value = [1, 3, 5, 7]
+        mock_get_ranks.return_value = [[1, 3, 5, 7]]
 
         # Create mock node for reduce_scatter_tensor operation
         node = self.create_mock_fx_node(
@@ -131,7 +183,7 @@ class TestCollectiveLegalization:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_all_to_all_legalization(self, mock_get_ranks):
         """Test all_to_all_single operation legalization"""
-        mock_get_ranks.return_value = [0, 1]
+        mock_get_ranks.return_value = [[0, 1]]
 
         # Create mock node for all_to_all_single operation
         node = self.create_mock_fx_node(
@@ -152,7 +204,7 @@ class TestCollectiveLegalization:
     def test_multiple_collective_ops_legalization(self, mock_get_ranks):
         """Test legalization of multiple collective operations"""
         # Mock different return values for different calls
-        mock_get_ranks.side_effect = [[0, 1, 2, 3], [0, 1], [2, 3]]
+        mock_get_ranks.side_effect = [[[0, 1, 2, 3]], [[0, 1]], [[2, 3]]]
 
         # Create multiple collective operation nodes
         all_reduce_node = self.create_mock_fx_node(
@@ -222,7 +274,7 @@ class TestCollectiveLegalization:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_args_modification_preserves_other_args(self, mock_get_ranks):
         """Test that only the group argument is modified, others preserved"""
-        mock_get_ranks.return_value = [0, 1]
+        mock_get_ranks.return_value = [[0, 1]]
 
         # Create node with multiple arguments
         original_args = ("input_tensor", "'sum'", "original_group", "extra_arg")
@@ -267,11 +319,11 @@ class TestCollectiveTransformsIntegration:
         # Set up mock to return different ranks for different groups
         def mock_ranks_side_effect(group_name):
             group_mapping = {
-                "group_0": [0, 1, 2, 3],
-                "group_1": [0, 1],
-                "group_2": [2, 3],
+                "group_0": [[0, 1, 2, 3]],
+                "group_1": [[0, 1]],
+                "group_2": [[2, 3]],
             }
-            return group_mapping.get(group_name, [0])
+            return group_mapping.get(group_name, [[0]])
 
         mock_get_ranks.side_effect = mock_ranks_side_effect
 
@@ -320,7 +372,7 @@ class TestCollectiveOpsMapping:
     @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_all_supported_ops_are_legalized(self, mock_get_ranks):
         """Test that all expected collective operations are handled"""
-        mock_get_ranks.return_value = [0, 1]
+        mock_get_ranks.return_value = [[0, 1]]
 
         # Test each supported op
         supported_ops = [

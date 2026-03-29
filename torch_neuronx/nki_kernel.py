@@ -1,155 +1,187 @@
-"""TorchNeuronNKIKernel - NKI kernel execution for torch-neuronx."""
+"""NKI kernel support for torch-neuronx (CompileKernel-based)."""
 
-from collections.abc import Hashable, Sequence
+import base64
+import json
+from dataclasses import dataclass, replace
+from typing import Any
 
-import numpy as np
 import torch
-from neuronxcc.nki.compiler.backends.neuron.FrameworkKernel import UnifiedKernel as UnifiedKernelV1
-
-try:
-    from nki.compiler.backends.neuron.FrameworkKernel import UnifiedKernel as UnifiedKernelV2
-
-    IS_NKI_V2_AVAILABLE = True
-except ImportError:
-    IS_NKI_V2_AVAILABLE = False
-
-    class UnifiedKernelV2:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError("Placeholder class - cannot instantiate")
-
-
-from neuronxcc.starfish.support import dtype as neuron_dtype
+from nki.compiler.ncc_driver import CompilationMode, CompileOptions
+from nki.framework.compiled import CompileKernel
+from nki.language.buffers import shared_hbm
+from nki.language.tensor import NkiTensor
 
 from .utils import get_platform_target
 
+# Torch dtype → NKI language dtype string.
+# NKI language dtypes are plain strings (e.g. "float32", "bfloat16").
+_TORCH_TO_NKI_DTYPE: dict[torch.dtype, str] = {
+    torch.float32: "float32",
+    torch.float64: "float32",  # NKI has no float64; downcast
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.int64: "int32",  # NKI has no int64; downcast
+    torch.int32: "int32",
+    torch.int16: "int16",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
+    torch.uint16: "uint16",
+    torch.uint32: "uint32",
+    torch.bool: "uint8",
+}
 
-class TorchNeuronNKIKernel:
-    """NKI kernel with torch-neuronx execution.
+# Conditionally add float8 mappings when the torch build supports them.
+if hasattr(torch, "float8_e5m2"):
+    _TORCH_TO_NKI_DTYPE[torch.float8_e5m2] = "float8_e5m2"
+if hasattr(torch, "float8_e4m3fn"):
+    _TORCH_TO_NKI_DTYPE[torch.float8_e4m3fn] = "float8_e4m3fn"
+if hasattr(torch, "float8_e4m3fnuz"):
+    _TORCH_TO_NKI_DTYPE[torch.float8_e4m3fnuz] = "float8_e4m3fn"
+if hasattr(torch, "float8_e5m2fnuz"):
+    _TORCH_TO_NKI_DTYPE[torch.float8_e5m2fnuz] = "float8_e5m2"
 
-    This class extends FrameworkKernel to execute NKI kernels.
+
+def _torch_to_nki_dtype(dtype: torch.dtype) -> str:
+    """Convert a PyTorch dtype to an NKI language dtype string."""
+    nki_dtype = _TORCH_TO_NKI_DTYPE.get(dtype)
+    if nki_dtype is None:
+        raise TypeError(
+            f"Unsupported torch dtype for NKI: {dtype}. "
+            f"Supported: {list(_TORCH_TO_NKI_DTYPE.keys())}"
+        )
+    return nki_dtype
+
+
+def _convert_torch_input(x: Any, name: str) -> Any:
+    """Convert a torch.Tensor to an NkiTensor for CompileKernel tracing.
+
+    Non-tensor arguments are passed through unchanged.
+    """
+    if isinstance(x, torch.Tensor):
+        return NkiTensor(
+            name=name,
+            shape=x.shape,
+            dtype=_torch_to_nki_dtype(x.dtype),
+            storage=None,
+            buffer=shared_hbm,
+        )
+    return x
+
+
+@dataclass
+class DumpedConfig:
+    """Result of ``TorchNeuronNKIKernelV3.dump_config``.
+
+    Attributes:
+        return_types: list of (dtype_str, shape) tuples for each output.
+        dumped_config: base64-encoded JSON backend configuration.
+        operand_output_aliases: mapping of input_idx → output_idx for aliased tensors.
     """
 
-    def translate_to_neuron_dtype(self, _dtype):
-        """Convert PyTorch dtype to Neuron dtype."""
-
-        torch_to_neuron_dtype = {
-            torch.float32: np.float32,
-            torch.float64: np.float64,
-            torch.float16: np.float16,
-            torch.int64: np.int64,
-            torch.int32: np.int32,
-            torch.int16: np.int16,
-            torch.int8: np.int8,
-            torch.uint8: np.uint8,
-            torch.uint16: np.uint16,
-            torch.uint32: np.uint32,
-            torch.uint64: np.uint64,
-            torch.bool: np.uint8,
-            torch.complex64: np.complex64,
-            torch.complex128: np.complex128,
-            torch.bfloat16: neuron_dtype.bfloat16,
-        }
-
-        if _dtype == getattr(torch, "float8_e4m3fn", None):
-            raise RuntimeError("float8_e4m3fn is not supported in neuronxcc. ")
-
-        if hasattr(torch, "float8_e5m2"):
-            torch_to_neuron_dtype[torch.float8_e5m2] = neuron_dtype.float8_e5m2
-
-        if hasattr(torch, "float8_e4m3fn"):
-            torch_to_neuron_dtype[torch.float8_e4m3fn] = neuron_dtype.float8_e4m3fn
-
-        if hasattr(torch, "float8_e4m3fnuz"):
-            torch_to_neuron_dtype[torch.float8_e4m3fnuz] = neuron_dtype.float8_e4m3fn
-
-        if hasattr(torch, "float8_e5m2fnuz"):
-            torch_to_neuron_dtype[torch.float8_e5m2fnuz] = neuron_dtype.float8_e5m2
-
-        if _dtype in torch_to_neuron_dtype:
-            return torch_to_neuron_dtype[_dtype]
-
-        # For other dtype that is common with numpy, use builtin pytorch to do the translation
-        return torch.empty(1, dtype=_dtype, device="cpu").numpy().dtype
-
-    def is_framework_tensor(self, t):
-        """Check if this is a PyTorch tensor."""
-        return torch.is_tensor(t)
-
-    def map_framework_tensor(self, t):
-        """Extract shape and dtype from PyTorch tensor."""
-        return t.shape, t.dtype
-
-    def _translate_param(self, ctx, o, name, annotation=None):
-        """Override parameter translation to handle PyTorch tensors properly.
-
-        This prevents the base TraceKernel from catching PyTorch tensors
-        with data_ptr/dtype attributes and allows them to flow through
-        to the baremetal execution path.
-        """
-        # Check if this is a PyTorch tensor BEFORE calling super()
-        # This ensures we handle it before TraceKernel's data_ptr check
-        if torch.is_tensor(o):
-            # PyTorch tensors should be treated like numpy arrays:
-            # create a parameter during trace phase
-            numpy_dtype = self.translate_to_neuron_dtype(o.dtype)
-            return self.create_parameter(
-                ctx=ctx, name=name, shape=tuple(o.shape), dtype=numpy_dtype, annotation=annotation
-            )
-
-        # For non-tensors, use the default translation
-        return super()._translate_param(ctx, o, name, annotation)
-
-    def dump_config_with_boundargs(self, boundargs):
-        hash_key = self._generate_hash_key(boundargs.arguments)
-        cache = getattr(self.func, "__neuron_kernel_interface_kernel_cache__", {})
-        existing_config = cache.get(hash_key, None)
-        if existing_config is not None:
-            return existing_config
-        self._map_args(boundargs)
-        result = super().dump_config_with_boundargs(boundargs)
-        cache[hash_key] = result
-        return result
+    return_types: list[tuple[Any, tuple[int, ...]]]
+    dumped_config: str
+    operand_output_aliases: dict[int, int]
 
 
-class TorchNeuronNKIKernelV1(TorchNeuronNKIKernel, UnifiedKernelV1):
-    pass
+@dataclass(frozen=True)
+class TorchNeuronNKIKernelV3(CompileKernel):
+    """CompileKernel subclass for torch-neuronx eager / torch.compile execution.
 
+    Overrides input conversion so that the compile pipeline can accept
+    ``torch.Tensor`` arguments directly, converting them to ``NkiTensor``
+    descriptors before handing off to the NKI compiler frontend.
+    """
 
-class TorchNeuronNKIKernelV2(TorchNeuronNKIKernel, UnifiedKernelV2):
-    def _map_to_decltensor_or_passthrough(self, t):
-        if isinstance(t, (tuple | list)):
-            res = [self._map_to_decltensor_or_passthrough(e) for e in t]
-            if isinstance(t, tuple):
-                res = tuple(res)
-            return res
-        if isinstance(t, dict):
-            return {k: self._map_to_decltensor_or_passthrough(v) for k, v in t.items()}
-        if not self.is_framework_tensor(t):
-            return t
-
-        return torch.empty_like(t, device="meta")
-
-    def _return_shape_dtype_or_hashable(self, t, name):
-        if isinstance(t, torch.Tensor):
-            return (t.shape, t.dtype)
-
-        if isinstance(t, str):
-            return t
-
-        if isinstance(t, Sequence):
-            return tuple(
-                self._return_shape_dtype_or_hashable(e, name=f"{name}[{i}]")
-                for i, e in enumerate(t)
-            )
-        elif isinstance(t, dict):
-            return tuple(
-                (k, self._return_shape_dtype_or_hashable(v, name=f"{name}[{k}]"))
-                for k, v in sorted(t.items())
-            )
-
-        if not isinstance(t, Hashable):
-            raise RuntimeError("sema.err_nki_param_not_hashable(name=name, ty=type(t))")
-        return t
+    def _convert_input(self, x: Any, name: str) -> Any:
+        """Convert torch.Tensor → NkiTensor; pass through everything else."""
+        return _convert_torch_input(x, name)
 
     def _platform_target(self, opts):
+        """Return the Neuron hardware target (e.g. 'trn1', 'trn2')."""
         return get_platform_target()
+
+    def _get_dump_config_cache(self) -> dict | None:
+        """Return (or create) the dump_config cache on self.func"""
+        if self._get_compile_cache() is None:
+            return None
+        if not hasattr(self.func, "_dump_config_cache"):
+            self.func._dump_config_cache = {}
+        return self.func._dump_config_cache
+
+    def dump_config(self, **kwargs: Any) -> DumpedConfig:
+        """Compile the kernel and return a DumpedConfig.
+
+        This is the single entry-point used by the HOP dispatch layer
+        and by flex-attention lowering.  Usage::
+
+            dconfig = kernel[grid].dump_config(**meta_args)
+
+        where ``grid`` sets the LNC via ``__getitem__`` and
+        ``meta_args`` is a ``{name: value}`` dict of kernel arguments
+        (torch.Tensor values are converted to NkiTensor automatically).
+        """
+        converted = {name: _convert_torch_input(v, name) for name, v in kwargs.items()}
+
+        # Lightweight opts for cache key generation
+        cache_opts = CompileOptions(
+            lnc=self.lnc,
+            enable_simulation=self._enable_simulation,
+            enable_device_dump=self._enable_device_dump,
+        )
+
+        # Check dump_config cache
+        dc_cache = self._get_dump_config_cache()
+        cache_key = None
+        if dc_cache is not None:
+            cache_key = self._generate_cache_key(converted, cache_opts)
+
+            if cache_key is not None and cache_key in dc_cache:
+                return dc_cache[cache_key]
+
+        frontend = self._frontend_cls(
+            enable_backend_opt=self._enable_backend_opt,
+        )
+        compile_opts = replace(self._compile_opts(), mode=CompilationMode.INTEGRATION)
+
+        # TODO[NKI-1279]: deterministic artifacts directory
+        """
+        if not compile_opts.artifacts_dir:
+            artifacts_dir = str(get_artifacts_directory().resolve()) + '/nki'
+            compile_opts = replace(
+                compile_opts,
+                artifacts_dir=artifacts_dir,
+                output_path=os.path.join(artifacts_dir, "kernel.neff"),
+            )
+        """
+
+        bir, result = self._cached_compile_to_bir(
+            frontend=frontend,
+            inputs=converted,
+            compile_opts=compile_opts,
+        )
+
+        backend_config = self._build_backend_config(bir, result)
+
+        # (dtype_str, shape) per output
+        return_types = [(spec.dtype, spec.shape) for spec in result.output_specs]
+
+        # input_idx → output_idx  (inverted from CompileKernel's
+        # output_idx → input_name mapping)
+        aliases = result.input_output_aliases or {}
+        input_name_to_idx = {spec.name: idx for idx, spec in enumerate(result.input_specs)}
+        operand_output_aliases: dict[int, int] = {}
+        for output_idx, input_name in aliases.items():
+            input_idx = input_name_to_idx.get(input_name)
+            if input_idx is not None:
+                operand_output_aliases[input_idx] = output_idx
+
+        dumped = base64.b64encode(json.dumps(backend_config).encode()).decode("ascii")
+
+        result = DumpedConfig(
+            return_types=return_types,
+            dumped_config=dumped,
+            operand_output_aliases=operand_output_aliases,
+        )
+        if dc_cache is not None and cache_key is not None:
+            dc_cache[cache_key] = result
+        return result

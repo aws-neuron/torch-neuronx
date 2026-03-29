@@ -7,8 +7,10 @@ import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_did_not_run_on_neuron,
     assert_op_runs_on_neuron,
+    count_cpu_bounce_calls,
     track_neuron_ops,
 )
+from torch_neuronx.utils import is_native_int64_enabled
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -208,14 +210,10 @@ def test_to_copy_neuron_to_neuron_dtype_combinations(src_dtype, dst_dtype):
     else:
         src = torch.randint(0, 10, (4, 4), dtype=src_dtype, device="neuron")
 
-    # Verify MLIR rejects bool, float64, and int32
+    # Verify MLIR rejects unsupported dtypes
     impl = ToCopyMLIRImpl()
-    if src_dtype in [torch.bool, torch.float64, torch.int32, torch.int64] or dst_dtype in [
-        torch.bool,
-        torch.float64,
-        torch.int32,
-        torch.int64,
-    ]:
+    mlir_unsupported = {torch.bool, torch.float64, torch.int32, torch.int64, torch.uint64}
+    if src_dtype in mlir_unsupported or dst_dtype in mlir_unsupported:
         assert not impl.can_handle(src, dtype=dst_dtype, device="neuron")
 
     dst = src.to(dtype=dst_dtype, device="neuron")
@@ -236,3 +234,51 @@ def test_to_copy_neuron_to_neuron_dtype_combinations(src_dtype, dst_dtype):
             assert torch.equal(expected, actual)
         else:
             torch.testing.assert_close(expected, actual)
+
+
+@pytest.mark.skipif(
+    not is_native_int64_enabled(),
+    reason="Test requires native int64 passthrough (TORCH_NEURONX_DISABLE_NATIVE_INT64=1)",
+)
+def test_to_copy_int64_small_values_to_float32():
+    """Test int64 to float32 conversion with small values (no CPU bounce, compiler handles S64)."""
+    src = torch.tensor([0, 1, -1, 42, -42], dtype=torch.int64, device="neuron")
+    dst = None
+
+    def do_copy():
+        nonlocal dst
+        dst = src.to(dtype=torch.float32, device="neuron")
+
+    bounces = count_cpu_bounce_calls(do_copy)
+    torch_neuronx.synchronize()
+    assert dst.dtype == torch.float32
+    assert dst.device.type == "neuron"
+    expected = src.cpu().to(torch.float32)
+    torch.testing.assert_close(dst.cpu(), expected)
+    # int64 passes through to compiler natively (S64 HLO), no CPU bounce needed
+    assert bounces["reads"] == 0, f"Expected 0 CPU reads, got {bounces['reads']}"
+    assert bounces["writes"] == 0, f"Expected 0 CPU writes, got {bounces['writes']}"
+
+
+@pytest.mark.skipif(
+    not is_native_int64_enabled(),
+    reason="Test requires native int64 passthrough (TORCH_NEURONX_DISABLE_NATIVE_INT64=1)",
+)
+def test_to_copy_int64_2d_small_values_to_float32():
+    """Test int64 to float32 with 2D tensor (no CPU bounce, compiler handles S64)."""
+    src = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64, device="neuron")
+    dst = None
+
+    def do_copy():
+        nonlocal dst
+        dst = src.to(dtype=torch.float32, device="neuron")
+
+    bounces = count_cpu_bounce_calls(do_copy)
+    torch_neuronx.synchronize()
+    assert dst.dtype == torch.float32
+    assert dst.shape == (2, 3)
+    expected = src.cpu().to(torch.float32)
+    torch.testing.assert_close(dst.cpu(), expected)
+    # int64 passes through to compiler natively (S64 HLO), no CPU bounce needed
+    assert bounces["reads"] == 0, f"Expected 0 CPU reads, got {bounces['reads']}"
+    assert bounces["writes"] == 0, f"Expected 0 CPU writes, got {bounces['writes']}"

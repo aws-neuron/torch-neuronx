@@ -38,7 +38,14 @@ class TestErrorHandler:
 
     @assert_raises(
         (IndexError, RuntimeError),
-        match=re.compile(r"COMPILATION FAILED.*NEFF creation failed", flags=re.DOTALL),
+        match=(
+            re.compile(
+                r"compilation failed"
+                r".*neuronxcc\.logging\.Assert\.NeuronAssertionError:"
+                r".*Unknown verbosity level",
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+        ),
     )
     def test_compilation_error_handling(self):
         """

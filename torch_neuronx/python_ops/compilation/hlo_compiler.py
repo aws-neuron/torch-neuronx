@@ -2,7 +2,6 @@
 
 import logging
 
-from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.kernels.compiler_subprocess import CompilerSubprocess
 
@@ -26,8 +25,6 @@ class HloCompiler:
         hlo_protobuf: bytes,
         ir_type: str = "XLA",
         neff_cache_key: str | None = None,
-        *,
-        job: CompilationJob,
     ) -> bytes:
         """Compile HLO protobuf or MLIR to NEFF.
 
@@ -35,7 +32,6 @@ class HloCompiler:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
             ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
             neff_cache_key: Optional override for NFS cache key
-            job: Compilation job that provides the neuronx-cc working directory
 
         Returns:
             Compiled NEFF bytes
@@ -48,7 +44,6 @@ class HloCompiler:
         neff_bytes = self.compiler_subprocess.get_or_compile(
             hlo_protobuf,
             self.compiler_config,
-            job,
             lnc,
             ir_type=ir_type,
             neff_cache_key=neff_cache_key,

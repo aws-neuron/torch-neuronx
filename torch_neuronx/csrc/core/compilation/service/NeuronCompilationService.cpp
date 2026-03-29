@@ -127,7 +127,7 @@ void NeuronCompilationService::HandleClient(int client_fd) {
   job->optimization_level = req.optimization_level;
   job->additional_args = req.additional_args;
 
-  std::future<std::string> result_future = job->result.get_future();
+  std::future<CompileResult> result_future = job->result.get_future();
 
   {
     std::lock_guard lock(queue_mutex_);
@@ -135,12 +135,13 @@ void NeuronCompilationService::HandleClient(int client_fd) {
   }
   queue_cv_.notify_one();
 
-  std::string neff_path = result_future.get();
+  auto result = result_future.get();
 
   CompileResponse resp;
   resp.req_id = req.req_id;
-  resp.success = !neff_path.empty();
-  resp.neff_cache_path = neff_path;
+  resp.success = !result.neff_path.empty();
+  resp.neff_cache_path = result.neff_path;
+  resp.error_message = result.error_message;
   auto resp_payload = resp.Serialize();
   SendMessage(client_fd, ServiceMsgType::kCompileResponse, resp_payload);
 
@@ -159,6 +160,7 @@ void NeuronCompilationService::WorkerLoop() {
     }
 
     std::string neff_path;
+    std::string error_msg;
     try {
       std::ifstream ifs(job->hlo_file_path, std::ios::binary);
       if (ifs) {
@@ -181,14 +183,17 @@ void NeuronCompilationService::WorkerLoop() {
                       static_cast<std::streamsize>(neff_bytes.size()));
           } else {
             neff_path.clear();
+            error_msg = "Failed to write NEFF to temp file";
           }
         }
+      } else {
+        error_msg = "Failed to read HLO file: " + job->hlo_file_path;
       }
     } catch (const std::exception& e) {
-      TORCH_NEURONX_ERROR("Service compilation failed", "error=", e.what());
+      error_msg = e.what();
     }
 
-    job->result.set_value(neff_path);
+    job->result.set_value({neff_path, error_msg});
   }
 }
 

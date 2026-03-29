@@ -146,7 +146,7 @@ def convert_fx_to_stablehlo(
     example_inputs,
     aliasing_info: AliasingInfo = None,
     *,
-    job: CompilationJob,
+    job: CompilationJob | None = None,
     random_input_info: RandomInputInfo | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
     """
@@ -162,7 +162,7 @@ def convert_fx_to_stablehlo(
     Args:
         gm: FX GraphModule with Aten operations (from AOTAutograd)
         example_inputs: Example input tensors
-        job: CompilationJob for artifact management (always saves artifacts)
+        job: CompilationJob for artifact management. If None, artifact dumping is skipped.
         random_input_info: Optional metadata about random inputs added to the graph
 
     Returns:
@@ -174,7 +174,8 @@ def convert_fx_to_stablehlo(
     model_name = get_model_name()
 
     # Save transformed fx graph for debugging
-    job.save_transformed_fx(model_name, gm)
+    if job is not None:
+        job.save_transformed_fx(model_name, gm)
 
     # Torch-MLIR lowering: FX → RAW → Torch Backend → StableHLO
     with dynamo_timed("torch_neuronx_lower"):
@@ -188,12 +189,14 @@ def convert_fx_to_stablehlo(
         )
 
         # Save RAW module for debugging
-        job.save_raw_torch(model_name, raw_module)
+        if job is not None:
+            job.save_raw_torch(model_name, raw_module)
 
-        err_mlir_path = job.get_err_mlir_path(model_name)
-        raw_module.operation.attributes["torch.debug_dump_path"] = mlir_ir.StringAttr.get(
-            str(err_mlir_path), raw_module.context
-        )
+        if job is not None:
+            err_mlir_path = job.get_err_mlir_path(model_name)
+            raw_module.operation.attributes["torch.debug_dump_path"] = mlir_ir.StringAttr.get(
+                str(err_mlir_path), raw_module.context
+            )
 
         # Custom Neuron RAW lowerings/transformations
         logger.debug("Applying Neuron lowerings/transformations")

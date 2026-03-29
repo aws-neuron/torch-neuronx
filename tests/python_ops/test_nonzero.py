@@ -16,7 +16,7 @@ class TestNonzero:
         """Get the neuron device."""
         return torch.device("neuron")
 
-    @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
+    @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4), (1, 260, 2048), (260, 2048)])
     def test_nonzero_basic_shapes(self, device, shape):
         """Test nonzero with various tensor shapes."""
         with track_neuron_ops():

@@ -80,10 +80,10 @@ bool CompilationServiceClient::EnsureServiceRunning(const std::string& socket_pa
 }
 
 std::vector<uint8_t> CompilationServiceClient::CompileSync(const std::vector<uint8_t>& hlo_bytes,
-                                                           const std::string& persistent_cache_key,
                                                            const std::string& ir_type,
                                                            const std::string& optimization_level,
-                                                           const std::string& additional_args) {
+                                                           const std::string& additional_args,
+                                                           std::string* out_error) {
   if (!service_ready_.load()) return {};
 
   // Each call gets its own connection — no sharing between pool threads
@@ -100,7 +100,6 @@ std::vector<uint8_t> CompilationServiceClient::CompileSync(const std::vector<uin
   CompileRequest req;
   req.req_id = req_id;
   req.hlo_file_path = hlo_path;
-  req.persistent_cache_key = persistent_cache_key;
   req.ir_type = ir_type;
   req.optimization_level = optimization_level;
   req.additional_args = additional_args;
@@ -119,7 +118,9 @@ std::vector<uint8_t> CompilationServiceClient::CompileSync(const std::vector<uin
         if (ifs) {
           neff_bytes.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
         }
-        std::remove(resp.neff_cache_path.c_str());  // cleanup temp NEFF file
+        std::remove(resp.neff_cache_path.c_str());
+      } else if (out_error) {
+        *out_error = resp.error_message;
       }
     }
   }

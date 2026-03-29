@@ -62,6 +62,9 @@ os.environ.setdefault("NEURON_RT_ALLOW_LEGACY_NEFF", "1")
 # Set default for async nrt execution
 os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
 
+# Set default for HBM mapping
+os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
+
 # Set default for host-cc
 os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
 os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
@@ -195,6 +198,13 @@ python_ops.register_python_operations()
 
 # Tell C++ that Python ops are now registered
 _C._set_python_ops_registered(True)
+
+# Apply mesh registry patch for SPMD collective legalization
+# TODO: Remove this patch once PyTorch's compile_on_one_rank lands upstream
+# (see https://github.com/pytorch/pytorch/pull/178116)
+from .distributed.mesh_registry import _apply_mesh_registry_patch
+
+_apply_mesh_registry_patch()
 
 
 def is_neuron_runtime_initialized():

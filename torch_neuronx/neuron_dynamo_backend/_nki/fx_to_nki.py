@@ -66,7 +66,7 @@ def register_all_overload(lowering_dict, aten_fn, lowering_fn):
 
 
 def make_binary_op(aten_op, nl_op, ctx, *args, **kwargs):
-    nl_op_name = "nl." + nl_op.__name__
+    nl_op_name = "nl." + nl_op._name
     if is_scalar(args[1]):
         meta_tensor = aten_op(args[0].dst_arr.meta_tensor, args[1])
         binary_op = NISAOpValue(ctx, "nisa.tensor_scalar", meta_tensor)
@@ -129,7 +129,7 @@ activation_op_map = {
 
 
 def make_activation(aten_op, nl_op, ctx, *args, **kwargs):
-    nl_op_name = "nl." + nl_op.__name__
+    nl_op_name = "nl." + nl_op._name
     meta_tensor = aten_op(args[0].dst_arr.meta_tensor)
     activation_op = NISAOpValue(ctx, "nisa.activation", meta_tensor)
     nisa_args = [activation_op.dst_arr, nl_op_name, args[0]]

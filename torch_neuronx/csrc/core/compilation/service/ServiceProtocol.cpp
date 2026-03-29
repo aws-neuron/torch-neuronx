@@ -58,7 +58,6 @@ std::vector<uint8_t> CompileRequest::Serialize() const {
   buf.resize(sizeof(uint64_t));
   std::memcpy(buf.data(), &req_id, sizeof(uint64_t));
   AppendString(buf, hlo_file_path);
-  AppendString(buf, persistent_cache_key);
   AppendString(buf, ir_type);
   AppendString(buf, optimization_level);
   AppendString(buf, additional_args);
@@ -73,7 +72,6 @@ CompileRequest CompileRequest::Deserialize(const uint8_t* data, size_t len) {
   std::memcpy(&req.req_id, p, sizeof(uint64_t));
   p += sizeof(uint64_t);
   req.hlo_file_path = ReadString(p, end);
-  req.persistent_cache_key = ReadString(p, end);
   req.ir_type = ReadString(p, end);
   req.optimization_level = ReadString(p, end);
   req.additional_args = ReadString(p, end);
@@ -86,6 +84,7 @@ std::vector<uint8_t> CompileResponse::Serialize() const {
   std::memcpy(buf.data(), &req_id, sizeof(uint64_t));
   buf[sizeof(uint64_t)] = success ? 0 : 1;
   AppendString(buf, neff_cache_path);
+  AppendString(buf, error_message);
   return buf;
 }
 
@@ -99,6 +98,7 @@ CompileResponse CompileResponse::Deserialize(const uint8_t* data, size_t len) {
   resp.success = (*p == 0);
   ++p;
   resp.neff_cache_path = ReadString(p, end);
+  resp.error_message = ReadString(p, end);
   return resp;
 }
 

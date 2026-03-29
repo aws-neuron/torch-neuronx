@@ -24,6 +24,26 @@ namespace {
 static std::unordered_map<std::string, std::string> g_prologue_cache;
 static std::mutex g_prologue_cache_mutex;
 
+/**
+ * @brief Convert TransformationType enum to human-readable string for cache keys
+ */
+std::string TransformationTypeToString(TransformationType type) {
+  switch (type) {
+    case TransformationType::TRANSPOSE:
+      return "TRANSPOSE";
+    case TransformationType::RESHAPE:
+      return "RESHAPE";
+    case TransformationType::BROADCAST:
+      return "BROADCAST";
+    case TransformationType::SLICE:
+      return "SLICE";
+    case TransformationType::NONE:
+      return "NONE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -47,18 +67,25 @@ std::string GenerateMlir(const TransformationTask& task) {
 
     case TransformationType::SLICE:
       if (auto* params = std::get_if<SliceParams>(&task.params)) {
+        // Use strided overload if any stride > 1, otherwise use simple overload
+        bool has_non_unit_stride = std::any_of(params->strides.begin(), params->strides.end(),
+                                               [](int64_t s) { return s > 1; });
+        if (has_non_unit_stride) {
+          return mlir_generators::GenerateSlice(task.input_shape, params->start_indices,
+                                                params->end_indices, params->strides,
+                                                task.element_type);
+        }
         return mlir_generators::GenerateSlice(task.input_shape, params->start_indices,
                                               params->end_indices, task.element_type);
       }
       throw std::runtime_error("Invalid SliceParams in TransformationTask");
 
-    case TransformationType::BROADCAST: {
+    case TransformationType::BROADCAST:
       if (auto* params = std::get_if<BroadcastParams>(&task.params)) {
         return mlir_generators::GenerateBroadcast(task.input_shape, task.output_shape,
                                                   params->broadcast_dims, task.element_type);
       }
       throw std::runtime_error("Invalid BroadcastParams in TransformationTask");
-    }
 
     case TransformationType::NONE:
       // Generate empty/identity MLIR for inputs with no transformations
@@ -116,6 +143,7 @@ std::string OperationPrologue::ComputePrologueCacheKey(
   // IMPORTANT: Must include shape/dtype for NONE transformations (inputs without kernel transforms)
   // to avoid cache collisions between different tensor configurations
   std::stringstream cache_key_ss;
+  cache_key_ss << "prologue--";
 
   // Process each input
   for (size_t input_idx = 0; input_idx < input_ptrs.size(); ++input_idx) {
@@ -127,20 +155,20 @@ std::string OperationPrologue::ComputePrologueCacheKey(
       std::vector<int64_t> shape = input_ctx.get_shape();
       std::string element_type = ScalarTypeToElementTypeString(input_ctx.get_dtype());
 
-      cache_key_ss << input_idx << "_NONE_";
+      cache_key_ss << "i" << input_idx << "_";
       for (auto dim : shape) {
         cache_key_ss << dim << "x";
       }
-      cache_key_ss << "_dtype_" << element_type << "_";
+      cache_key_ss << "_" << element_type << "_";
       continue;
     }
 
     // Process transformations for this input
     const auto& transforms = kernel_transforms[input_idx];
     for (const auto& transform : transforms) {
-      cache_key_ss << input_idx << "_";
-      // Add transformation type
-      cache_key_ss << static_cast<int>(transform.type) << "_";
+      cache_key_ss << "i" << input_idx << "_";
+      // Add transformation type as human-readable string
+      cache_key_ss << TransformationTypeToString(transform.type) << "_";
 
       // Add input shape
       for (auto dim : transform.input_shape) {
@@ -297,19 +325,20 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
   // STEP 3: Cache miss - perform merging
   TORCH_NEURONX_DEBUG("Prologue cache MISS", "cache_key=", merged_cache_key);
 
-  // Assert: Every input has at least one transformation (including NONE)
-  // This invariant is critical for order conservation
-  TORCH_CHECK(tasks.size() == num_inputs,
-              "Expected one transformation per input (including NONE) for operation '", op_name,
-              "'. Got ", tasks.size(), " tasks for ", num_inputs, " inputs. ",
-              "This violates the invariant that every input must have a transformation task.");
-
-  // Group tasks by input_index for verification
+  // Assert: Every input has at least one transformation (including NONE).
+  // Compound decompositions may produce multiple tasks per input (e.g., SLICE + TRANSPOSE),
+  // so we check unique input indices rather than total task count.
   std::map<size_t, std::vector<TransformationTask>> tasks_by_input;
   for (const auto& task : tasks) {
     tasks_by_input[task.input_index].push_back(task);
     result.input_was_transformed[task.input_index] = true;
   }
+
+  TORCH_CHECK(tasks_by_input.size() == num_inputs,
+              "Expected one transformation chain per input (including NONE) for operation '",
+              op_name, "'. Got chains for ", tasks_by_input.size(), " unique inputs but expected ",
+              num_inputs, " inputs. ",
+              "This violates the invariant that every input must have a transformation task.");
 
   // STEP 4: For each input, chain its transformations using slot-based addresses
   std::vector<std::string> per_input_transform_mlirs;

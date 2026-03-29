@@ -14,7 +14,7 @@ namespace c10_neuron {
 namespace lazy {
 
 // Transformation type enum
-enum class TransformationType { TRANSPOSE, RESHAPE, BROADCAST, SLICE, NONE };
+enum class TransformationType { TRANSPOSE, RESHAPE, BROADCAST, SLICE, COMPOUND, NONE };
 
 // Enhanced structure with complete transformation metadata and validation
 struct TensorTransformation {
@@ -225,10 +225,10 @@ struct TransformationState {
 
 // Result of attempting to create a transformation from a tensor
 struct TransformationCreationResult {
-  bool is_supported;                    // Whether pattern was detected
-  TensorTransformation transformation;  // The transformation metadata
-  at::Tensor processed_input;           // Modified input tensor (e.g., base tensor for slice)
-  std::string pattern_name;             // Name of detected pattern for logging
+  bool is_supported;                                  // Whether pattern was detected
+  std::vector<TensorTransformation> transformations;  // Ordered transformation sequence
+  at::Tensor processed_input;                         // Modified input tensor (e.g., base tensor)
+  std::string pattern_name;                           // Name of detected pattern for logging
 };
 
 // ============================================================================

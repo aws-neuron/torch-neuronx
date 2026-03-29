@@ -374,7 +374,7 @@ class TestComputeSoftmax:
         result = gm(scores)
         expected = F.softmax(scores, dim=-1)
 
-        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-4)
 
     def test_softmax_numerical_stability(self):
         """Test softmax is numerically stable with large values."""

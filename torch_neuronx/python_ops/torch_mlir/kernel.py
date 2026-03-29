@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import logging
 import os
 import traceback
@@ -16,10 +17,10 @@ from torch._functorch._aot_autograd.functional_utils import (
 from torch._functorch._aot_autograd.utils import create_tree_flattened_fn
 from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils._filelock import FileLock
 
 from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
-from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
@@ -28,6 +29,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_re
 )
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
+from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
 from torch_neuronx.python_ops.shared import (
     CompilationConfig,
     ExecutionContext,
@@ -250,8 +252,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         inputs: tuple,
         kwargs: dict,
         context: ExecutionContext | None = None,
-        *,
-        job: CompilationJob,
     ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple, dict]:
         """Generate HLO from PyTorch function.
 
@@ -259,7 +259,6 @@ class TorchMlirKernel(BaseNeuronKernel):
             inputs: Preprocessed inputs (potentially downcasted)
             kwargs: Keyword arguments
             context: Execution context with original inputs
-            job: Compilation job for artifact saving and workdir management.
 
         Returns:
             Tuple of (HLO bytes, io_spec, cast_spec, kept_input_indices, kept_output_indices,
@@ -292,7 +291,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         )
 
         # Save FX graph artifact
-        job.save_fx_graph(self.op_name, decomposed_gm)
 
         captured_gm = decomposed_gm
         kept_input_indices = []
@@ -387,10 +385,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             gm = captured_gm
 
         # Convert to StableHLO
-        stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs, job=job)
-
-        # Save stablehlo artifact
-        job.save_stablehlo(self.op_name, stablehlo_module)
+        stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(gm, inputs)
 
         # Remove torch.debug_dump_path to avoid non-deterministicmlir path cause recompilation
         if "torch.debug_dump_path" in stablehlo_module.operation.attributes:
@@ -780,8 +775,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         inputs: tuple,
         kwargs: dict,
         context: ExecutionContext | None = None,
-        *,
-        job: CompilationJob,
     ) -> tuple[bytes, list[int], list[int], tuple, tuple, str]:
         """Get HLO from cache or compile if needed.
 
@@ -789,7 +782,6 @@ class TorchMlirKernel(BaseNeuronKernel):
             inputs: Preprocessed inputs
             kwargs: Keyword arguments
             context: Execution context with original inputs
-            job: Compilation job for artifact saving and workdir management.
 
         Returns:
             Tuple of (hlo_bytes, kept_input_indices, kept_output_indices, downcasted_outputs,
@@ -812,43 +804,38 @@ class TorchMlirKernel(BaseNeuronKernel):
             ) = self.hlo_cache[cache_key]
         else:
             # Check persistent disk cache
+            from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
             from torch_neuronx.python_ops.compilation.hlo_cache import get as _hlo_cache_get
             from torch_neuronx.python_ops.compilation.hlo_cache import put as _hlo_cache_put
 
             disk_entry = _hlo_cache_get(cache_key)
-            if disk_entry is not None:
-                (
-                    hlo_bytes,
-                    io_spec,
-                    kept_input_indices,
-                    kept_output_indices,
-                    downcasted_outputs,
-                    original_outputs,
-                    passthrough_mappings,
-                ) = disk_entry
-            else:
-                # Generate HLO
-                (
-                    hlo_bytes,
-                    io_spec,
-                    cast_spec,
-                    kept_input_indices,
-                    kept_output_indices,
-                    downcasted_outputs,
-                    original_outputs,
-                    passthrough_mappings,
-                ) = self._generate_hlo(inputs, kwargs, context, job=job)
-                _hlo_cache_put(
-                    cache_key,
-                    hlo_bytes,
-                    io_spec,
-                    kept_input_indices,
-                    kept_output_indices,
-                    downcasted_outputs,
-                    original_outputs,
-                    passthrough_mappings,
-                )
-            self.hlo_cache[cache_key] = (
+            if disk_entry is None:
+                if _hlo_cache_mod._enabled:
+                    # Use file lock so only one process traces/lowers for a given cache key.
+                    # Other processes wait on the lock, then read from disk.
+
+                    lock_path = os.path.join(
+                        CACHE_DIR, hashlib.sha256(cache_key.encode()).hexdigest() + ".lock"
+                    )
+
+                    with FileLock(lock_path, timeout=1800):
+                        # Check existence (cheap) — another process may have written while we waited
+                        backend = _C
+                        if not backend._exists_hlo_cache(cache_key + "_meta"):
+                            result = self._generate_hlo(inputs, kwargs, context)
+                            # Drop cast_spec (index 2) for cache storage
+                            disk_entry = result[:2] + result[3:]
+                            _hlo_cache_put(cache_key, *disk_entry)
+
+                    # Losers read from disk after lock is released (parallel)
+                    if disk_entry is None:
+                        disk_entry = _hlo_cache_get(cache_key)
+                else:
+                    # Cache disabled — generate directly without coordination
+                    result = self._generate_hlo(inputs, kwargs, context)
+                    disk_entry = result[:2] + result[3:]
+
+            (
                 hlo_bytes,
                 io_spec,
                 kept_input_indices,
@@ -856,7 +843,8 @@ class TorchMlirKernel(BaseNeuronKernel):
                 downcasted_outputs,
                 original_outputs,
                 passthrough_mappings,
-            )
+            ) = disk_entry
+            self.hlo_cache[cache_key] = disk_entry
 
         return (
             hlo_bytes,
@@ -869,15 +857,12 @@ class TorchMlirKernel(BaseNeuronKernel):
             cache_key,
         )
 
-    def _get_or_compile_neff(
-        self, hlo_bytes: bytes, cache_key: str, *, job: CompilationJob
-    ) -> bytes:
+    def _get_or_compile_neff(self, hlo_bytes: bytes, cache_key: str) -> bytes:
         """Get NEFF from cache or compile if needed.
 
         Args:
             hlo_bytes: Compiled HLO bytes
             cache_key: Cache key for lookup
-            job: Compilation job that provides the neuronx-cc working directory
 
         Returns:
             NEFF bytes
@@ -889,7 +874,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         # Compile HLO to NEFF
         neff_bytes = self.hlo_compiler.compile_to_neff(
-            hlo_bytes, ir_type="StableHLO", neff_cache_key=cache_key, job=job
+            hlo_bytes, ir_type="StableHLO", neff_cache_key=cache_key
         )
 
         # Store in cache
@@ -905,16 +890,14 @@ class TorchMlirKernel(BaseNeuronKernel):
         if not args and not kwargs:
             return None
 
-        with compilation_job(self.op_name) as job:
-            return self._execute_kernel(args, context, kwargs, job=job)
-
-    def _execute_kernel(
-        self, args, context: ExecutionContext | None, kwargs, *, job: CompilationJob
-    ):
         self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
 
-        # Preprocess inputs
-        processed_inputs = self.arg_processor.preprocess_inputs(args, scalar_to_tensor=True)
+        from torch_neuronx.utils import is_native_int64_enabled
+
+        # Preprocess inputs (skip int64 conversion when native int64 is enabled)
+        processed_inputs = self.arg_processor.preprocess_inputs(
+            args, scalar_to_tensor=True, convert_int64=not is_native_int64_enabled()
+        )
         processed_kwargs = self.arg_processor.preprocess_kwargs(kwargs)
         device = self.arg_processor.extract_device(processed_inputs, processed_kwargs)
 
@@ -956,7 +939,7 @@ class TorchMlirKernel(BaseNeuronKernel):
             original_outputs,
             passthrough_mappings,
             cache_key,
-        ) = self._get_or_compile_hlo(processed_inputs, processed_kwargs, context, job=job)
+        ) = self._get_or_compile_hlo(processed_inputs, processed_kwargs, context)
 
         # Early return if no valid outputs
         if original_outputs is None or (
@@ -1031,7 +1014,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 cpu_fallback_context,
             )
         else:
-            neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key, job=job)
+            neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key)
             self._execute_sync(
                 filtered_inputs,
                 exec_tensors,

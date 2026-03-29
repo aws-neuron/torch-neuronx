@@ -1,6 +1,11 @@
 #include "OperationExecutionEngine.h"
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -73,7 +78,23 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
     }
   }
 
-  runtime_thread_ = std::thread(&OperationExecutionEngine::RuntimeWorker, this);
+  // Start runtime worker thread
+  try {
+    completion_efd_ = eventfd(0, EFD_CLOEXEC);
+    TORCH_CHECK(completion_efd_ >= 0, "Failed to create eventfd for runtime worker");
+    runtime_thread_ = std::thread(&OperationExecutionEngine::RuntimeWorker, this);
+  } catch (...) {
+    shutdown_requested_.store(true, std::memory_order_release);
+    if (completion_efd_ >= 0) {
+      ::close(completion_efd_);
+      completion_efd_ = -1;
+    }
+    if (concatenation_enabled_) {
+      concatenation_cv_.notify_all();
+      if (concatenation_thread_.joinable()) concatenation_thread_.join();
+    }
+    throw;
+  }
 
   TORCH_NEURONX_DEBUG("OperationExecutionEngine worker threads started",
                       "concatenation_enabled=", concatenation_enabled_,
@@ -93,7 +114,7 @@ void OperationExecutionEngine::Shutdown() {
   if (concatenation_enabled_) {
     concatenation_cv_.notify_all();
   }
-  runtime_cv_.notify_all();
+  WriteEventfd();
 
   if (concatenation_enabled_ && concatenation_thread_.joinable()) {
     concatenation_thread_.join();
@@ -101,57 +122,11 @@ void OperationExecutionEngine::Shutdown() {
   if (runtime_thread_.joinable()) {
     runtime_thread_.join();
   }
-  TORCH_NEURONX_DEBUG("OperationExecutionEngine shutdown complete");
-}
-
-void OperationExecutionEngine::RuntimeWorker() {
-  TORCH_NEURONX_DEBUG("Runtime worker thread started");
-  auto devices = c10_neuron::get_visible_device_indices();
-
-  while (true) {
-    bool work_done = false;
-
-    CheckCompletions();
-
-    for (auto device : devices) {
-      ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
-        OperationContext* operation = stream_impl->GetNextOperationToSchedule();
-        if (operation != nullptr) {
-          DispatchAsyncExecutionTask(operation);
-          work_done = true;
-        }
-        return false;
-      });
-    }
-
-    if (CompileNextPending()) {
-      work_done = true;
-    }
-
-    if (work_done) {
-      continue;
-    }
-
-    if (HasPendingAsyncOperations()) {
-      if (shutdown_requested_.load(std::memory_order_acquire)) {
-        break;
-      }
-      continue;
-    }
-
-    if (shutdown_requested_.load(std::memory_order_acquire)) {
-      break;
-    }
-
-    {
-      std::unique_lock<std::mutex> lock(runtime_mutex_);
-      runtime_cv_.wait(lock, [this] {
-        return runtime_pending_ || shutdown_requested_.load(std::memory_order_acquire);
-      });
-      runtime_pending_ = false;
-    }
+  if (completion_efd_ >= 0) {
+    ::close(completion_efd_);
+    completion_efd_ = -1;
   }
-  TORCH_NEURONX_DEBUG("Runtime worker thread terminated");
+  TORCH_NEURONX_DEBUG("OperationExecutionEngine shutdown complete");
 }
 
 bool OperationExecutionEngine::CompileNextPending() {
@@ -244,14 +219,19 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
 
   if (compilation_cache_->IsServiceBackend()) {
     // Service active: async path with thread pool
-    compilation_cache_->GetOrCompileNeffAsync(kernel, stream_id, [this, operation](bool success) {
-      if (success) {
-        HandleCompilationComplete(operation);
-      } else {
-        operation->MarkExecutionReady();
-      }
-      NotifyExecutionReady();
-    });
+    compilation_cache_->GetOrCompileNeffAsync(
+        kernel, stream_id, [this, operation](bool success, const std::string& error) {
+          if (success) {
+            HandleCompilationComplete(operation);
+          } else {
+            // Stash error on kernel for the execution worker to report.
+            if (!error.empty()) {
+              operation->GetCompilableKernel().SetCompilationError(error);
+            }
+            operation->MarkExecutionReady();
+          }
+          NotifyExecutionReady();
+        });
     return;
   }
 
@@ -260,12 +240,106 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
   HandleCompilationComplete(operation);
 }
 
-void OperationExecutionEngine::NotifyExecutionReady() {
-  {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    runtime_pending_ = true;
+void OperationExecutionEngine::RuntimeWorker() {
+  TORCH_NEURONX_DEBUG("Runtime worker thread started");
+  auto devices = c10_neuron::get_visible_device_indices();
+
+  while (true) {
+    // Check shutdown at top of loop
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+      break;
+    }
+
+    bool work_found;
+    do {
+      work_found = false;
+
+      CheckCompletions();
+
+      for (auto device : devices) {
+        ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
+          OperationContext* operation = stream_impl->GetNextOperationToSchedule();
+          if (operation != nullptr) {
+            DispatchAsyncExecutionTask(operation);
+            work_found = true;
+          }
+          return false;
+        });
+      }
+
+      if (CompileNextPending()) {
+        work_found = true;
+      }
+    } while (work_found && !shutdown_requested_.load(std::memory_order_acquire));
+
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+      break;
+    }
+
+    if (HasPendingAsyncOperations()) {
+      RegisterCompletionEvents();
+    }
+
+    // Block until NRT signals completion or new work arrives
+    uint64_t count;
+    while (::read(completion_efd_, &count, sizeof(count)) == -1) {
+      if (errno == EINTR) continue;
+      if (shutdown_requested_.load(std::memory_order_acquire)) break;
+      TORCH_NEURONX_ERROR("read from completion_efd_ failed: ", strerror(errno));
+      break;
+    }
   }
-  runtime_cv_.notify_one();
+  TORCH_NEURONX_DEBUG("Runtime worker thread terminated");
+}
+
+void OperationExecutionEngine::RegisterCompletionEvents() {
+  // Register eventfd on the front-of-queue scheduled operation per stream.
+  auto devices = c10_neuron::get_visible_device_indices();
+  for (auto device : devices) {
+    ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
+      if (!stream_impl->HasPendingAsyncOperations()) {
+        return false;
+      }
+      std::lock_guard<std::mutex> lock(stream_impl->active_operations_mutex_);
+      for (auto& op_ptr : stream_impl->active_operations_) {
+        if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
+          auto* concat_op = op_ptr->GetConcatenatedOperation();
+          if (concat_op->nrt_async_state_.is_scheduled) {
+            RegisterSeqCompletion(stream_impl, concat_op->nrt_async_state_.sequence_id);
+            break;
+          }
+        }
+        if (op_ptr->nrt_async_state_.is_scheduled) {
+          RegisterSeqCompletion(stream_impl, op_ptr->nrt_async_state_.sequence_id);
+          break;
+        }
+        if (op_ptr->nrt_async_state_.is_pending_signal) {
+          continue;
+        }
+        break;
+      }
+      return false;
+    });
+  }
+}
+
+void OperationExecutionEngine::RegisterSeqCompletion(StreamImpl* stream, nrt::SequenceId seq) {
+  if (seq == stream->last_registered_efd_seq_) return;
+  stream->last_registered_efd_seq_ = seq;
+  NRT_STATUS status = nrt::RegisterSeqIdCompletion(seq, completion_efd_);
+  if (status != NRT_SUCCESS) {
+    TORCH_NEURONX_WARN("RegisterSeqIdCompletion failed, status=", status, " seq=", seq);
+    WriteEventfd();
+  }
+}
+
+void OperationExecutionEngine::WriteEventfd() {
+  uint64_t val = 1;
+  while (::write(completion_efd_, &val, sizeof(val)) == -1) {
+    if (errno == EINTR) continue;
+    TORCH_NEURONX_ERROR("write to completion_efd_ failed: ", strerror(errno));
+    break;
+  }
 }
 
 void OperationExecutionEngine::SubmitOperation(OperationContext* operation) {
@@ -298,9 +372,8 @@ void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation
   {
     std::lock_guard<std::mutex> lock(runtime_mutex_);
     compilation_queue_.push_back(operation);
-    runtime_pending_ = true;
   }
-  runtime_cv_.notify_one();
+  WriteEventfd();
 }
 
 void OperationExecutionEngine::ConcatenationWorker() {
@@ -516,9 +589,12 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
     // recovery (e.g. CPU fallback). Ensure that prior ops complete first.
     if (operation->RequiresCompilation() && !operation->GetCompilableKernel().HasCachedNeff()) {
       if (!stream->HasPendingAsyncOperations()) {
-        stream->HandleErrorWithCleanup(
-            operation, torch_neuronx::CompilationRuntimeException(
-                           "NEFF creation failed for operation: " + operation_name));
+        auto& kernel = operation->GetCompilableKernel();
+        std::string error_msg = kernel.IsFailedCompilation()
+                                    ? kernel.GetCompilationError()
+                                    : "NEFF creation failed for operation: " + operation_name;
+        stream->HandleErrorWithCleanup(operation,
+                                       torch_neuronx::CompilationRuntimeException(error_msg));
       }
       return;
     }
@@ -543,22 +619,17 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
   }
 }
 
-namespace {
-// Helper to check if an operation is complete using explicit nrta_is_completed API.
-bool IsOperationComplete(nrt::SequenceId seq_id) {
-  bool is_completed = false;
-  NRT_STATUS status = nrt::IsNRTAsyncRequestCompleted(seq_id, &is_completed);
-  if (status != NRT_SUCCESS) {
-    std::string error_msg = "Operation completion check failed. Status: " + std::to_string(status);
-    throw torch_neuronx::ExecutionRuntimeException(error_msg, status);
-  }
-  return is_completed;
-}
-}  // namespace
-
-void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
+void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
+                                                  const XUCompletionState& completed_seqs) {
   // Queue is determined per-operation based on its XU type
   std::vector<OperationContext*> ops_to_complete;
+
+  auto IsSeqCompleted = [&](nrt::SequenceId seq_id, KernelTypeEnum kernel_type) {
+    size_t xu_idx = GetXUIndex(kernel_type);
+    int queue = nrt::GetHardwareQueue(static_cast<nrta_xu_t>(xu_idx), stream->stream_id);
+    nrt::SequenceId completed_seq = completed_seqs.Get(static_cast<nrta_xu_t>(xu_idx), queue);
+    return NRTA_SEQ_GET_SEQ_NUM(seq_id) <= NRTA_SEQ_GET_SEQ_NUM(completed_seq);
+  };
 
   {
     std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
@@ -568,8 +639,7 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
       if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
         auto* concat_op = op_ptr->GetConcatenatedOperation();
         if (concat_op->nrt_async_state_.is_scheduled) {
-          nrt::SequenceId concat_seq_id = concat_op->nrt_async_state_.sequence_id;
-          if (IsOperationComplete(concat_seq_id)) {
+          if (IsSeqCompleted(concat_op->nrt_async_state_.sequence_id, concat_op->GetKernelType())) {
             ops_to_complete.push_back(op_ptr.get());
             continue;
           }
@@ -579,8 +649,7 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream) {
 
       // Regular operation
       if (op_ptr->nrt_async_state_.is_scheduled) {
-        nrt::SequenceId op_seq_id = op_ptr->nrt_async_state_.sequence_id;
-        if (IsOperationComplete(op_seq_id)) {
+        if (IsSeqCompleted(op_ptr->nrt_async_state_.sequence_id, op_ptr->GetKernelType())) {
           ops_to_complete.push_back(op_ptr.get());
         } else {
           break;
@@ -662,7 +731,7 @@ void OperationExecutionEngine::CheckCompletions() noexcept {
     ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
       if (stream_impl->HasPendingAsyncOperations()) {
         stream_impl->UpdateCompletionState();
-        ProcessCompletions(stream_impl);
+        ProcessCompletions(stream_impl, stream_impl->xu_completed_seqs_);
       }
       return false;
     });

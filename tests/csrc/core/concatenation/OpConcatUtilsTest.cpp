@@ -2516,7 +2516,32 @@ module @jit_module2 {
 // Aliasing Tests
 // ============================================================================
 
+TEST_F(OpConcatUtilsTest, AliasingDisabledByDefault) {
+  auto mod1_inputs = createMockAddresses({100});
+  auto mod1_outputs = createMockAddresses({100});  // Same address — would alias if enabled
+  auto mod2_inputs = createMockAddresses({300});
+  auto mod2_outputs = createMockAddresses({400});
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+  auto mod1 = mlir::parseSourceString<mlir::ModuleOp>(mlir1_independent, &context);
+  auto mod2 = mlir::parseSourceString<mlir::ModuleOp>(mlir2_independent, &context);
+  ASSERT_TRUE(mod1 && mod2);
+
+  torch_neuronx::MergeMapping mapping;
+  auto merged =
+      torch_neuronx::mergeModulesInOrder(*mod1, *mod2, &context, mod1_inputs, mod1_outputs,
+                                         mod2_inputs, mod2_outputs, &mapping, true, {}, {});
+  ASSERT_TRUE(merged);
+
+  auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
+  EXPECT_FALSE(aliasAttr) << "Aliasing should be disabled by default";
+}
+
 TEST_F(OpConcatUtilsTest, AliasingNoAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({200});
   auto mod2_inputs = createMockAddresses({300});
@@ -2537,9 +2562,13 @@ TEST_F(OpConcatUtilsTest, AliasingNoAliasing) {
 
   auto aliasAttr = (*merged)->getAttr("mhlo.input_output_alias");
   EXPECT_FALSE(aliasAttr) << "No aliasing expected";
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(OpConcatUtilsTest, AliasingModule1SelfAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({100});  // Same address
   auto mod2_inputs = createMockAddresses({300});
@@ -2564,9 +2593,13 @@ TEST_F(OpConcatUtilsTest, AliasingModule1SelfAliasing) {
   auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
   ASSERT_TRUE(arrayAttr);
   EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 alias";
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(OpConcatUtilsTest, AliasingModule2SelfAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({200});
   auto mod2_inputs = createMockAddresses({300});
@@ -2591,9 +2624,13 @@ TEST_F(OpConcatUtilsTest, AliasingModule2SelfAliasing) {
   auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
   ASSERT_TRUE(arrayAttr);
   EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 alias";
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(OpConcatUtilsTest, AliasingCrossNodeAliasing) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({200});
   auto mod2_inputs = createMockAddresses({300});
@@ -2618,9 +2655,13 @@ TEST_F(OpConcatUtilsTest, AliasingCrossNodeAliasing) {
   auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
   ASSERT_TRUE(arrayAttr);
   EXPECT_EQ(arrayAttr.size(), 1) << "Should have 1 cross-node alias";
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(OpConcatUtilsTest, AliasingMultipleAliases) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100, 200});
   auto mod1_outputs = createMockAddresses({100});      // First input aliases
   auto mod2_inputs = createMockAddresses({200, 400});  // First input aliases with mod1 second input
@@ -2645,9 +2686,13 @@ TEST_F(OpConcatUtilsTest, AliasingMultipleAliases) {
   auto arrayAttr = mlir::dyn_cast<mlir::ArrayAttr>(aliasAttr);
   ASSERT_TRUE(arrayAttr);
   EXPECT_GE(arrayAttr.size(), 2) << "Should have at least 2 aliases";
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 TEST_F(OpConcatUtilsTest, AliasingAttributeStructure) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING", "1", 1);
+
   auto mod1_inputs = createMockAddresses({100});
   auto mod1_outputs = createMockAddresses({100});
   auto mod2_inputs = createMockAddresses({300});
@@ -2693,6 +2738,8 @@ TEST_F(OpConcatUtilsTest, AliasingAttributeStructure) {
     ASSERT_TRUE(kindStr);
     EXPECT_EQ(kindStr.getValue().str(), "must_alias");
   }
+
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
 }
 
 int main(int argc, char** argv) {

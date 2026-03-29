@@ -349,6 +349,72 @@ class TestLazyMaterializationOps:
                 result_neuron.cpu(), result_cpu, rtol=1e-2, atol=1e-2
             ), "Matmul with transpose and slice produced incorrect results for bfloat16"
 
+    def test_cat_int64_with_transpose(self):
+        """
+        Test int64 cat with transposed input.
+
+        Verifies that torch.cat correctly handles int64 tensors where one
+        input is transposed (non-contiguous). The prologue must generate
+        MLIR in i64 space for the transpose chain and the identity chain,
+        both matching the kernel's expected i64 types after ViewInt64AsInt32.
+        """
+        device = "neuron"
+
+        # Create int64 test inputs directly on Neuron
+        a_neuron = torch.randint(-100, 100, (64, 128), dtype=torch.int64, device=device)
+        b_neuron = torch.randint(-100, 100, (128, 64), dtype=torch.int64, device=device)
+
+        # Compute expected result on CPU
+        result_cpu = torch.cat([a_neuron.cpu().T, b_neuron.cpu()], dim=0)
+
+        # Execute on Neuron
+        with track_neuron_ops():
+            result_neuron = torch.cat([a_neuron.T, b_neuron], dim=0)
+
+        # Verify results match exactly (integer arithmetic is exact)
+        assert (
+            result_neuron.shape == result_cpu.shape
+        ), f"Shape mismatch: got {result_neuron.shape}, expected {result_cpu.shape}"
+
+        assert result_neuron.shape == (256, 64), f"Unexpected shape: {result_neuron.shape}"
+
+        assert torch.equal(
+            result_neuron.cpu(), result_cpu
+        ), "Int64 cat with transpose produced incorrect results"
+
+    def test_fused_ops_int64_with_transpose(self):
+        """
+        Test int64 fused operations (add then mul) with transposed inputs.
+
+        Verifies that chained operations on int64 tensors with transposed
+        inputs work correctly through the prologue system. Each operation
+        independently generates a prologue with original_dtype awareness.
+
+        Pattern: (A.T + B) * C where all are int64
+        """
+        device = "neuron"
+
+        # Create int64 test inputs directly on Neuron
+        a_neuron = torch.randint(-10, 10, (64, 128), dtype=torch.int64, device=device)
+        b_neuron = torch.randint(-10, 10, (128, 64), dtype=torch.int64, device=device)
+        c_neuron = torch.randint(-10, 10, (128, 64), dtype=torch.int64, device=device)
+
+        # Compute expected result on CPU
+        result_cpu = (a_neuron.cpu().T + b_neuron.cpu()) * c_neuron.cpu()
+
+        # Execute on Neuron
+        with track_neuron_ops():
+            result_neuron = (a_neuron.T + b_neuron) * c_neuron
+
+        # Verify results match exactly (integer arithmetic is exact)
+        assert (
+            result_neuron.shape == result_cpu.shape
+        ), f"Shape mismatch: got {result_neuron.shape}, expected {result_cpu.shape}"
+
+        assert torch.equal(
+            result_neuron.cpu(), result_cpu
+        ), "Int64 fused ops (add+mul) with transpose produced incorrect results"
+
 
 # Additional edge case tests
 class TestLazyMaterializationEdgeCases:

@@ -110,3 +110,86 @@ def test_out_dtype_mismatch_noncontiguous():
     torch.add(x, y, out=out)
     expected = torch.add(x.to("cpu"), y.to("cpu")).to(torch.float64)
     torch.testing.assert_close(out.to("cpu"), expected)
+
+
+def _make_broadcast(shape, broadcast_dims, device="neuron:0", dtype=torch.float32):
+    """Create a broadcast tensor with stride=0 in specified dimensions.
+
+    Args:
+        shape: desired broadcast shape, e.g. (3, 4, 5)
+        broadcast_dims: dims to broadcast, e.g. [0] means dim 0 has stride=0
+    """
+    base_shape = list(shape)
+    for d in broadcast_dims:
+        base_shape[d] = 1
+    if dtype.is_floating_point:
+        base = torch.randn(base_shape, device=device, dtype=dtype)
+    else:
+        base = torch.randint(0, 100, base_shape, device=device, dtype=dtype)
+    return base.expand(shape)
+
+
+def test_broadcast_add_stride0():
+    """Test binary op with broadcast tensor (stride=0 in dim 0)."""
+    a = _make_broadcast((4, 4), [0])
+    b = torch.randn(4, 4, device="neuron:0")
+    assert not a.is_contiguous()
+    result = torch.add(a, b)
+    expected = torch.add(a.to("cpu"), b.to("cpu"))
+    torch.testing.assert_close(result.to("cpu"), expected)
+
+
+def test_broadcast_multi_dim_stride0():
+    """Test with multiple broadcast dimensions (3D, dims 0 and 2)."""
+    a = _make_broadcast((3, 4, 5), [0, 2])
+    b = torch.randn(3, 4, 5, device="neuron:0")
+    assert not a.is_contiguous()
+    result = torch.add(a, b)
+    expected = torch.add(a.to("cpu"), b.to("cpu"))
+    torch.testing.assert_close(result.to("cpu"), expected)
+
+
+def test_broadcast_bitwise_and():
+    """Test integer op with broadcast tensor."""
+    a = _make_broadcast((5, 5), [0], dtype=torch.int32)
+    b = torch.randint(0, 100, (5, 5), device="neuron:0", dtype=torch.int32)
+    assert not a.is_contiguous()
+    result = torch.bitwise_and(a, b)
+    expected = torch.bitwise_and(a.to("cpu"), b.to("cpu"))
+    torch.testing.assert_close(result.to("cpu"), expected)
+
+
+def test_broadcast_unary_signbit():
+    """Test unary op with broadcast tensor."""
+    a = _make_broadcast((5, 6, 2), [0], dtype=torch.float32)
+    assert not a.is_contiguous()
+    result = torch.signbit(a)
+    expected = torch.signbit(a.to("cpu"))
+    torch.testing.assert_close(result.to("cpu"), expected)
+
+
+def test_cat_with_broadcast_input():
+    """Test torch.cat with a broadcast (stride=0) tensor."""
+    a = torch.randn(1, 32, 1, 42, device="neuron:0")
+    b = a.expand(8, 32, 32, 42)
+    c = torch.randn(8, 32, 32, 44, device="neuron:0")
+    assert not b.is_contiguous()
+    result = torch.cat([c, b], dim=-1)
+    expected = torch.cat([c.to("cpu"), b.to("cpu")], dim=-1)
+    torch.testing.assert_close(result.to("cpu"), expected)
+
+
+def test_broadcast_from_slice():
+    """Test broadcast tensor derived from slice (non-contiguous storage).
+
+    This pattern was failing: slice → unsqueeze → broadcast → op
+    The slice creates stride [2], then broadcast creates strides [2, 0].
+    The non-contiguous base stride caused MLIR kernel rejection.
+    """
+    original = torch.randn(4, device="neuron:0")
+    sliced = original[::2]  # stride [2], not contiguous
+    broadcast = sliced.unsqueeze(1).expand(2, 5)  # strides [2, 0]
+    assert not broadcast.is_contiguous()
+    result = broadcast + 1.0
+    expected = broadcast.to("cpu") + 1.0
+    torch.testing.assert_close(result.to("cpu"), expected)

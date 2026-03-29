@@ -30,9 +30,9 @@ class GatherNKIImpl(OperationImplementation):
         """Execute NKI gather"""
         try:
             from torch_neuronx.python_ops.cast_policy import (
+                bounce_64bit,
                 copy_cpu_to_neuron,
                 copy_neuron_to_cpu,
-                is_64bit,
             )
             from torch_neuronx.utils import convert_for_neuron
 
@@ -44,7 +44,7 @@ class GatherNKIImpl(OperationImplementation):
             index_1d = index[:, 0]
             result = gather_kernel(input, dim, index_1d)
             # Cast back to 64-bit if needed
-            if is_64bit(original_input_dtype):
+            if bounce_64bit(original_input_dtype):
                 cpu_cast = copy_neuron_to_cpu(result, target_dtype=original_input_dtype)
                 result = copy_cpu_to_neuron(cpu_cast, result.device, original_input_dtype)
 

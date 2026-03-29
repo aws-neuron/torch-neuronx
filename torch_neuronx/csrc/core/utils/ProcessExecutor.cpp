@@ -1,5 +1,12 @@
 #include "torch_neuronx/csrc/core/utils/ProcessExecutor.h"
 
+#include <poll.h>
+#include <unistd.h>
+
+#include <cerrno>
+
+#include "torch_neuronx/csrc/core/NeuronLogging.h"
+
 namespace at::neuron {
 
 // PipeManager implementation
@@ -95,8 +102,45 @@ void ProcessExecutor::WaitAndCheckResult(pid_t pid, PipeManager& stdout_pipe,
   stdout_pipe.CloseWrite();
   stderr_pipe.CloseWrite();
 
-  std::string stdout_output = ReadPipeOutput(stdout_pipe.read_fd());
-  std::string stderr_output = ReadPipeOutput(stderr_pipe.read_fd());
+  // Read both pipes concurrently using poll() to avoid deadlock when
+  // the child fills one pipe buffer while we're blocked reading the other.
+  std::string stdout_output, stderr_output;
+  struct pollfd fds[2];
+  fds[0] = {stdout_pipe.read_fd(), POLLIN, 0};
+  fds[1] = {stderr_pipe.read_fd(), POLLIN, 0};
+  int open_fds = 2;
+
+  while (open_fds > 0) {
+    int ret = poll(fds, 2, -1);
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      TORCH_NEURONX_WARN("poll() failed during subprocess pipe read", "errno=", errno,
+                         "context=", context);
+      break;
+    }
+    for (int i = 0; i < 2; i++) {
+      if (fds[i].fd < 0) continue;
+      if (fds[i].revents & (POLLIN | POLLHUP)) {
+        char buf[kPipeBufferSize] = {};
+        ssize_t n = read(fds[i].fd, buf, sizeof(buf));
+        if (n > 0) {
+          (i == 0 ? stdout_output : stderr_output).append(buf, n);
+        } else if (n == 0) {
+          // EOF — child closed this pipe
+          fds[i].fd = -1;
+          open_fds--;
+        } else {
+          // read error
+          if (errno == EINTR || errno == EAGAIN) continue;
+          TORCH_NEURONX_WARN("read() failed during subprocess pipe read",
+                             "fd=", (i == 0 ? "stdout" : "stderr"), "errno=", errno,
+                             "context=", context);
+          fds[i].fd = -1;
+          open_fds--;
+        }
+      }
+    }
+  }
 
   int status;
   if (waitpid(pid, &status, 0) == -1) {
@@ -116,19 +160,6 @@ void ProcessExecutor::WaitAndCheckResult(pid_t pid, PipeManager& stdout_pipe,
     }
     throw std::runtime_error(error_msg);
   }
-}
-
-std::string ProcessExecutor::ReadPipeOutput(int fd) {
-  std::string output;
-  char buffer[kPipeBufferSize];
-  ssize_t bytes_read;
-
-  while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
-    buffer[bytes_read] = '\0';
-    output += buffer;
-  }
-
-  return output;
 }
 
 }  // namespace at::neuron

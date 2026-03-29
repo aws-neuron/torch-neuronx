@@ -10,6 +10,83 @@ from torch_neuronx.distributed.utils import (
 )
 
 
+class TestParseAndUpdateInputs:
+    """Test cases for parse_and_update_inputs function."""
+
+    def test_premul_sum_factor_one_returns_original_inputs(self):
+        """Test that PREMUL_SUM with factor=1.0 returns original inputs without copy."""
+        import torch.distributed as dist
+
+        from torch_neuronx.distributed.utils import parse_and_update_inputs
+
+        inputs = torch.randn(4, 8)
+        premul_op = dist._make_nccl_premul_sum(1.0)
+
+        class Options:
+            reduceOp = premul_op  # noqa: N815
+
+        opts = Options()
+        result_inputs, reduce_type = parse_and_update_inputs(inputs, opts)
+
+        assert reduce_type == "SUM"
+        assert opts.reduceOp == dist.ReduceOp.SUM
+        assert result_inputs is inputs  # same object, no copy
+
+    def test_premul_sum_factor_scales_inputs(self):
+        """Test that PREMUL_SUM with factor!=1.0 scales inputs."""
+        import torch.distributed as dist
+
+        from torch_neuronx.distributed.utils import parse_and_update_inputs
+
+        inputs = torch.ones(4, 8)
+        premul_op = dist._make_nccl_premul_sum(0.5)
+
+        class Options:
+            reduceOp = premul_op  # noqa: N815
+
+        opts = Options()
+        result_inputs, reduce_type = parse_and_update_inputs(inputs, opts)
+
+        assert reduce_type == "SUM"
+        assert result_inputs is not inputs  # new tensor
+        assert torch.allclose(result_inputs, inputs * 0.5)
+
+    def test_premul_sum_factor_one_list_inputs(self):
+        """Test PREMUL_SUM factor=1.0 with list inputs returns originals."""
+        import torch.distributed as dist
+
+        from torch_neuronx.distributed.utils import parse_and_update_inputs
+
+        inputs = [torch.randn(4, 8), torch.randn(4, 8)]
+        premul_op = dist._make_nccl_premul_sum(1.0)
+
+        class Options:
+            reduceOp = premul_op  # noqa: N815
+
+        opts = Options()
+        result_inputs, reduce_type = parse_and_update_inputs(inputs, opts)
+
+        assert reduce_type == "SUM"
+        assert result_inputs is inputs
+
+    def test_non_premul_sum_passthrough(self):
+        """Test that non-PREMUL_SUM ops pass through unchanged."""
+        import torch.distributed as dist
+
+        from torch_neuronx.distributed.utils import parse_and_update_inputs
+
+        inputs = torch.randn(4, 8)
+
+        class Options:
+            reduceOp = dist.ReduceOp.AVG  # noqa: N815
+
+        opts = Options()
+        result_inputs, reduce_type = parse_and_update_inputs(inputs, opts)
+
+        assert reduce_type == "AVG"
+        assert result_inputs is inputs
+
+
 class TestGetReduceType:
     """Test cases for get_reduce_type function."""
 

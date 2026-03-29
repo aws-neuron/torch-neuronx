@@ -1,17 +1,21 @@
-"""Argument processing utilities for JAX operations."""
+"""Argument processing utilities for Neuron operations."""
 
 import logging
 import os
 
 import torch
 
-from torch_neuronx.utils import convert_for_neuron, is_stablehlo_enabled, is_sync_mode_enabled
+from torch_neuronx.utils import (
+    convert_for_neuron,
+    is_stablehlo_enabled,
+    is_sync_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ArgumentProcessor:
-    """Processes and prepares arguments for JAX operations."""
+    """Processes and prepares arguments for Neuron operations."""
 
     def __init__(
         self,
@@ -55,7 +59,9 @@ class ArgumentProcessor:
                 processed_kwargs[key] = value
         return processed_kwargs
 
-    def preprocess_inputs(self, inputs: tuple, scalar_to_tensor: bool = False) -> tuple:
+    def preprocess_inputs(
+        self, inputs: tuple, scalar_to_tensor: bool = False, convert_int64: bool = True
+    ) -> tuple:
         """Preprocess inputs for Neuron compatibility.
 
         Converts tensors, handles nested structures, maps torch.dtype to scalar type
@@ -65,6 +71,9 @@ class ArgumentProcessor:
             inputs: Original input tensors, scalars, and nested structures
             scalar_to_tensor: If True, convert int/float scalars to tensors
                 Defaults to False.
+            convert_int64: If True, convert int64 to int32 via convert_for_neuron.
+                If False, skip int64 conversion (MLIR handles S64 natively).
+                Defaults to True.
 
         Returns:
             Tuple of preprocessed inputs
@@ -96,7 +105,7 @@ class ArgumentProcessor:
                 # Make tensor contiguous if prologue is disabled and tensor is not contiguous
                 if prologue_disabled and not inp.is_contiguous():
                     inp = inp.contiguous()
-                return convert_for_neuron(inp)
+                return convert_for_neuron(inp, convert_int64=convert_int64)
             elif isinstance(inp, (list | tuple)):
                 return tuple(preprocess_value(item) for item in inp)
             elif isinstance(inp, torch.dtype):

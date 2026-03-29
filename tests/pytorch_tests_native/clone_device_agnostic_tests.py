@@ -93,37 +93,6 @@ def _clone_from_remote(dest_dir: Path, repo: str, branch: str):
         logger.info(f"Cloned torch/testing/_internal/ to {dest}")
 
 
-def _apply_neuron_patch(dest_dir: Path):
-    """Inject Neuron setup code at top of all test files."""
-    test_dir = dest_dir / "test"
-    if not test_dir.exists():
-        return
-
-    patch = """\
-# Neuron test setup - apply overlay and register backend
-import os as _os
-_overlay = _os.environ.get("TORCH_TESTING_INTERNAL_PATH")
-if _overlay:
-    import torch.testing._internal as _internal
-    if _overlay not in _internal.__path__:
-        _internal.__path__.insert(0, _overlay)
-    import torch_neuronx  # noqa: F401
-
-"""
-    count = 0
-    for py_file in test_dir.rglob("*.py"):
-        content = py_file.read_text()
-        if "torch.testing._internal" not in content:
-            continue
-        # Insert after first line (comment/shebang)
-        lines = content.split("\n", 1)
-        new_content = lines[0] + "\n\n" + patch + (lines[1] if len(lines) > 1 else "")
-        py_file.write_text(new_content)
-        count += 1
-
-    logger.info(f"Patched {count} test files with Neuron setup")
-
-
 def clone(source_repo: str | None = None):
     """Clone PyTorch tests with device-agnostic changes.
 
@@ -140,7 +109,6 @@ def clone(source_repo: str | None = None):
     else:
         _clone_from_remote(dest_dir, PYTORCH_FORK_REPO, PYTORCH_FORK_BRANCH)
 
-    _apply_neuron_patch(dest_dir)
     logger.info("Done")
 
 

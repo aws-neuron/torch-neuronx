@@ -484,6 +484,16 @@ inline NRT_STATUS IsNRTAsyncRequestCompleted(SequenceId sequence_id, bool* is_co
 }
 
 /**
+ * Register an eventfd to be signaled when a specific async sequence completes.
+ * @param sequence_id The sequence to monitor
+ * @param fd eventfd file descriptor to signal on completion
+ * @return NRT_SUCCESS on success
+ */
+inline NRT_STATUS RegisterSeqIdCompletion(SequenceId sequence_id, int fd) {
+  return nrta_event_register_seq_id_completion(sequence_id, fd);
+}
+
+/**
  * Get sequence number of the last completed request for an execution unit queue
  * @param lnc LNC id
  * @param xu XU type

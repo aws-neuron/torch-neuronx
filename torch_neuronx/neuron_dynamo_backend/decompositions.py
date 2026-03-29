@@ -15,7 +15,6 @@ import math
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
-import nki
 import torch
 import torch._decomp as decomp
 import torch.nn.functional as F  # noqa: N812
@@ -29,12 +28,13 @@ _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
 aten = torch.ops.aten
+from torch_neuronx.nki_hop import wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
 
 logger = logging.getLogger(__name__)
 
-wrapped_flash_fwd = nki.jit(mode="torch")(attention_cte)
-wrapped_flash_bwd = nki.jit(mode="torch")(attention_bwd)
+wrapped_flash_fwd = wrap_nki(attention_cte)
+wrapped_flash_bwd = wrap_nki(attention_bwd)
 
 # Build the base decomposition table from standard PyTorch decompositions
 # for ops that are not supported by the backend (yet)
@@ -894,6 +894,10 @@ def nonzero_with_count(
 ) -> tuple[torch.Tensor, int]:
     """Find nonzero elements with fixed output size.
 
+    Uses per-last-dim cumsum/scatter_add to keep reduce_window sizes small.
+    For shape (..., C), reduce_window sizes are C and prod(shape[:-1]), not numel.
+    No reshape needed — works directly on the original tensor shape.
+
     Args:
         tensor (torch.Tensor): Input tensor to find nonzero elements.
         size (int): Fixed output size. Pads with fill_value if fewer nonzeros.
@@ -903,7 +907,6 @@ def nonzero_with_count(
     Returns:
         tuple[torch.Tensor, int]: (indices, count) if with_count, else just indices.
     """
-    # Match safe_nonzero JAX implementation exactly
     mask = tensor != 0
     num_nonzero = mask.sum()
 
@@ -920,50 +923,73 @@ def nonzero_with_count(
         else:
             return result
 
-    # Cumsum counts - this gives position in nonzero sequence
-    cumsum_counts = torch.cumsum(mask.flatten().float(), dim=0)
-
-    # Ignore OOB values and create weights
-    in_range = cumsum_counts < size
-    cumsum_counts = torch.clamp(cumsum_counts, 0, size - 1).to(torch.long)
-    weights = torch.where(in_range, 1.0, 0.0)
-
-    # Use scatter_add (functional) instead of scatter_add_ (in-place)
-    bin_counts = torch.zeros(size, dtype=weights.dtype, device=tensor.device)
-    bin_counts = torch.scatter_add(bin_counts, 0, cumsum_counts, weights)
-
-    # Cumsum to get flat indices
-    flat_indices = torch.cumsum(bin_counts, dim=0).to(torch.long)
-
-    # Create strides dynamically without hardcoded constants
     shape = tensor.shape
-    strides = []
-    for i in range(len(shape)):
-        if i + 1 < len(shape):
-            stride = 1
-            for dim in shape[i + 1 :]:
-                stride *= dim
-        else:
-            stride = 1
-        strides.append(stride)
+    ndim = len(shape)
+    C = shape[-1]
+    device = tensor.device
+    mask_f = mask.float()
 
-    # Convert flat indices to coordinates
-    coords = []
-    for stride in strides:
-        coord = (flat_indices // stride) % shape[len(coords)]
-        coords.append(coord)
+    # --- Per-slice (along last dim): cumsum → scatter_add ---
+    # reduce_window size = C
 
-    # Apply fill_value if provided
+    # Within-slice rank of each element (1-based)
+    rank = torch.cumsum(mask_f, dim=-1)
+
+    # Scatter column index into per-slice output at rank position
+    positions = torch.clamp(rank - 1, 0, C - 1).to(torch.long)
+    col_src = torch.arange(C, device=device).float()
+    col_values = torch.where(mask, col_src, 0.0)
+
+    col_per_slice = torch.zeros_like(mask_f)
+    col_per_slice = col_per_slice.scatter_add(-1, positions, col_values)
+    # col_per_slice[..., k] = column of k-th nonzero in that slice
+
+    # --- Global assembly ---
+    # reduce_window size = prod(shape[:-1])
+
+    slice_counts = mask_f.sum(dim=-1)  # shape[:-1]
+    slice_offsets = torch.cumsum(slice_counts.flatten(), dim=0)  # [prod(shape[:-1])]
+    offset_before = slice_offsets - slice_counts.flatten()
+
+    # k-th slot in each slice → global position = offset_before + k
+    k = torch.arange(C, device=device).float()
+    global_pos = k + offset_before.reshape(shape[:-1] + (1,))
+    valid = (k < slice_counts.unsqueeze(-1)) & (global_pos < size)
+    global_pos = torch.clamp(global_pos, 0, size - 1).to(torch.long)
+
+    # Scatter col coordinates into [size] output
+    col_vals = torch.where(valid, col_per_slice, 0.0)
+    out_col = torch.zeros(size, dtype=torch.float, device=device)
+    out_col = out_col.scatter_add(0, global_pos.flatten(), col_vals.flatten())
+
+    # Scatter leading-dim indices into [size] output
+    # For N-d, the "row" is the flat index into shape[:-1]
+    row_src = torch.arange(slice_counts.numel(), device=device).float()
+    row_src = row_src.reshape(shape[:-1] + (1,)).expand_as(mask_f)
+    row_vals = torch.where(valid, row_src, 0.0)
+    out_row = torch.zeros(size, dtype=torch.float, device=device)
+    out_row = out_row.scatter_add(0, global_pos.flatten(), row_vals.flatten())
+
+    # Build coordinates
+    if ndim == 1:
+        coords = [out_col.to(torch.long)]
+    else:
+        # Unravel row index into leading dimensions
+        row_flat = out_row.to(torch.long)
+        leading = shape[:-1]
+        coords = []
+        for i, dim_size in enumerate(leading):
+            stride = 1
+            for d in leading[i + 1 :]:
+                stride *= d
+            coords.append((row_flat // stride) % dim_size)
+        coords.append(out_col.to(torch.long))
+
+    # Apply fill_value
     if fill_value is not None:
-        fill_mask = torch.arange(size, device=tensor.device) >= num_nonzero
-        if isinstance(fill_value, (list, tuple)):  # noqa: UP038
-            # Multiple fill values for each dimension
-            for i, (coord, fval) in enumerate(zip(coords, fill_value, strict=False)):
-                coords[i] = torch.where(fill_mask, fval, coord)
-        else:
-            # Single fill value for all dimensions
-            for i, coord in enumerate(coords):
-                coords[i] = torch.where(fill_mask, fill_value, coord)
+        fill_mask = torch.arange(size, device=device) >= num_nonzero
+        for i, coord in enumerate(coords):
+            coords[i] = torch.where(fill_mask, fill_value, coord)
 
     result = torch.stack(coords, dim=1)
     if with_count:

@@ -91,6 +91,8 @@ def run_bitwise_shift_op(op_name, x, y):
 
     result_dtype = x.dtype
     x = x.to(torch.int32)
+    if isinstance(y, torch.Tensor):
+        y = y.to(torch.int32)
     result = op(x, y)
     return result.to(result_dtype)
 

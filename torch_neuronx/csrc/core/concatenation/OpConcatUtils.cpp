@@ -192,7 +192,7 @@ DependencyAnalysis analyzeDependencies(const std::vector<void*>& module1_input_a
  * @throws std::runtime_error if type or shape mismatches are detected in dependencies or common
  * inputs
  */
-static void validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncOp main2,
+static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncOp main2,
                                      const DependencyAnalysis& analysis) {
   TORCH_NEURONX_DEBUG("validateDepCompatibility: Starting dependency compatibility validation");
 
@@ -336,10 +336,17 @@ static void validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
     auto type2 = main2.getArgumentTypes()[module2_idx];
 
     if (type1 != type2) {
-      throw std::runtime_error("Type mismatch in common input: module1 input " +
-                               std::to_string(module1_idx) + " (" + typeToString(type1) +
-                               ") does not match module2 input " + std::to_string(module2_idx) +
-                               " (" + typeToString(type2) + ")");
+      // Type mismatch in common inputs — skip concatenation instead of failing.
+      // This happens when different prologue transformations (e.g., TryCreateTranspose vs
+      // TryCreateCompound) produce different base tensor shapes for views of the same
+      // shared storage (e.g., FSDP flat parameter buffers). The operations will execute
+      // correctly individually without concatenation.
+      TORCH_NEURONX_INFO(
+          "validateDepCompatibility: Type mismatch in common input, "
+          "skipping concatenation. module1[",
+          module1_idx, "] (", typeToString(type1), ") != module2[", module2_idx, "] (",
+          typeToString(type2), ")");
+      return false;
     }
 
     // Validate shape compatibility
@@ -352,6 +359,7 @@ static void validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
   }
 
   TORCH_NEURONX_DEBUG("validateDepCompatibility: All dependency compatibility checks passed");
+  return true;
 }
 
 /**
@@ -1102,8 +1110,15 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
 
   TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Tensor address validation passed");
 
-  // Validate type and shape compatibility for dependencies and common inputs
-  validateDepCompatibility(main1, main2, analysis);
+  // Validate type and shape compatibility for dependencies and common inputs.
+  // Returns false if common inputs have type mismatches (e.g., FSDP shared storage
+  // where different prologue transformations produce different base tensor shapes).
+  // In this case, skip concatenation and let operations execute individually.
+  if (!validateDepCompatibility(main1, main2, analysis)) {
+    TORCH_NEURONX_DEBUG(
+        "mergeModulesWithAnalysis: Skipping merge due to incompatible common inputs");
+    return nullptr;
+  }
 
   // Unified merge logic that handles all scenarios
   TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Processing scenario ", analysis.scenario);
@@ -1217,9 +1232,13 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
   builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), results);
 
   // Add aliasing for input-output tensors with same address
-  mlir::ModuleOp moduleOp = *mergedModule;
-  addAliasingForConcatenatedModule(moduleOp, module1_input_addrs, module1_output_addrs,
-                                   module2_input_addrs, module2_output_addrs, analysis, mapping);
+  // Gated behind TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 (disabled by default)
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    mlir::ModuleOp moduleOp = *mergedModule;
+    addAliasingForConcatenatedModule(moduleOp, module1_input_addrs, module1_output_addrs,
+                                     module2_input_addrs, module2_output_addrs, analysis, mapping);
+  }
 
   TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Successfully merged modules");
 

@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _enabled = os.environ.get("TORCH_NEURONX_HLO_CACHE", "1") == "1"
 _SCHEMA_VERSION = 1
+CACHE_DIR = os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def _serialize_meta_tensor(t):

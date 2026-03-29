@@ -168,10 +168,12 @@ def is_sync_mode_enabled():
     return os.environ.get("NEURON_LAUNCH_BLOCKING", "0") == "1"
 
 
+@functools.lru_cache(maxsize=1)
 def is_host_cc_enabled():
     """Check if host-side collective communication is enabled.
 
     Host-cc enables collective operations on non-default streams using NRT host collectives API.
+    Result is cached after first call since the env var is set once at process start.
 
     Returns:
         bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1"
@@ -195,6 +197,19 @@ def skip_op_preconditions() -> bool:
         bool: True if TORCH_NEURONX_SKIP_OP_PRECONDITIONS is set to "1"
     """
     return os.environ.get("TORCH_NEURONX_SKIP_OP_PRECONDITIONS", "0") == "1"
+
+
+def is_native_int64_enabled() -> bool:
+    """Check if native int64 passthrough to compiler is enabled.
+
+    When enabled, int64 tensors pass through to the compiler natively
+    via S64 HLO instead of being casted to int32. Disable with
+    TORCH_NEURONX_NATIVE_INT64=0 to fall back to int32 conversion.
+
+    Returns:
+        bool: False by default (TORCH_NEURONX_NATIVE_INT64 is "0")
+    """
+    return os.environ.get("TORCH_NEURONX_NATIVE_INT64", "0") == "1"
 
 
 def get_logical_neuron_cores():
@@ -429,6 +444,20 @@ _NUMPY_TO_TORCH_MAP: dict[object, torch.dtype] = {
     getattr(np, "bool_", object()): torch.bool,
 }
 
+_STR_TO_TORCH_MAP: dict[str, torch.dtype] = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "int16": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+    "bool_": torch.bool,
+}
+
 
 def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
     """Map external dtype objects to torch.dtype.
@@ -495,8 +524,10 @@ def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
         if nki_or_numpy_dtype in _NUMPY_TO_TORCH_MAP:
             return _NUMPY_TO_TORCH_MAP[nki_or_numpy_dtype]
 
-    # Default fallback
-    return torch.float32
+    if nki_or_numpy_dtype in _STR_TO_TORCH_MAP:
+        return _STR_TO_TORCH_MAP[nki_or_numpy_dtype]
+
+    raise RuntimeError(f"Unrecognized dtype {nki_or_numpy_dtype}")
 
 
 def map_torch_dtype_to_external(_dtype):
@@ -543,23 +574,27 @@ def map_torch_dtype_to_external(_dtype):
     return torch.empty(1, dtype=_dtype, device="cpu").numpy().dtype
 
 
-def convert_for_neuron(tensor: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+def convert_for_neuron(
+    tensor: torch.Tensor, non_blocking: bool = False, convert_int64: bool = True
+) -> torch.Tensor:
     """Convert tensor to Neuron-compatible dtype if needed.
 
     Args:
         tensor: Input tensor
         non_blocking: Whether to use non-blocking transfers
+        convert_int64: If True, convert int64 to int32. If False, keep int64 as-is
+            (MLIR path handles S64 HLO natively). Defaults to True.
 
     Returns:
-        Tensor with compatible dtype (int64->int32, float64->float32)
+        Tensor with compatible dtype (float64->float32, and int64->int32 if convert_int64=True)
     """
-    # Only handle dtype compatibility here (int64/float64 -> int32/float32)
-    if tensor.dtype == torch.int64:
+    # Determine if conversion is needed
+    if tensor.dtype == torch.int64 and convert_int64:
         target_dtype = torch.int32
     elif tensor.dtype == torch.float64:
         target_dtype = torch.float32
     else:
-        # <=32-bit: already compatible
+        # <=32-bit or convert_int64=False (MLIR S64 HLO): already compatible
         return tensor
 
     # CPU tensors: safe to use .to(...) without involving Neuron redispatch

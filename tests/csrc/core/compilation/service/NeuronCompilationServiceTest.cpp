@@ -42,7 +42,7 @@ TEST_F(NeuronCompilationServiceTest, ClientEnsureServiceRunning) {
   EXPECT_TRUE(client.EnsureServiceRunning(socket_path_));
 }
 
-TEST_F(NeuronCompilationServiceTest, CompileSyncReturnsEmptyOnGarbageHLO) {
+TEST_F(NeuronCompilationServiceTest, PropagatesCompilerError) {
   NeuronCompilationService service;
   service.Start(socket_path_, 2);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -50,14 +50,18 @@ TEST_F(NeuronCompilationServiceTest, CompileSyncReturnsEmptyOnGarbageHLO) {
   CompilationServiceClient client;
   ASSERT_TRUE(client.EnsureServiceRunning(socket_path_));
 
-  auto result = client.CompileSync({0x01, 0x02, 0x03}, "pkey", "XLA", "-O1", "");
+  // Send garbage HLO — neuronx-cc will fail with a real error message
+  std::string error;
+  auto result = client.CompileSync({0x01, 0x02, 0x03}, "XLA", "-O1", "", &error);
   EXPECT_TRUE(result.empty());
+  EXPECT_FALSE(error.empty()) << "Service should propagate the neuronx-cc error message";
+  EXPECT_NE(error.find("Command failed"), std::string::npos) << "Got: " << error;
 }
 
 TEST_F(NeuronCompilationServiceTest, CompileSyncBeforeServiceReturnsEmpty) {
   CompilationServiceClient client;
   // service_ready_ is false
-  auto result = client.CompileSync({0x01}, "pkey", "XLA", "-O1", "");
+  auto result = client.CompileSync({0x01}, "XLA", "-O1", "");
   EXPECT_TRUE(result.empty());
 }
 
@@ -76,7 +80,7 @@ TEST_F(NeuronCompilationServiceTest, ConcurrentCompileSync) {
   std::vector<std::thread> threads;
   for (int i = 0; i < kNumThreads; ++i) {
     threads.emplace_back([&]() {
-      auto result = client.CompileSync({0xDE, 0xAD}, "pkey", "XLA", "-O1", "");
+      auto result = client.CompileSync({0xDE, 0xAD}, "XLA", "-O1", "");
       // Compilation fails (garbage HLO) but no crash or hang
       completed++;
     });
