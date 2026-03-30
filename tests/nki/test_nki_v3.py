@@ -136,6 +136,7 @@ class TestNKIV3:
             torch.float32,
             torch.float16,
             torch.bfloat16,
+            torch.float8_e5m2,
         ],
     )
     def test_nki_v3_different_dtypes(self, device, dtype):
@@ -158,8 +159,9 @@ class TestNKIV3:
         x = torch.tensor([[1.0, 2.0]], device=device, dtype=dtype)
 
         result = copy_op(x)
-
-        assert torch.allclose(result.cpu(), x.cpu(), atol=1e-5)
+        result_cpu = result.cpu().to(torch.float32)
+        x_cpu = x.cpu().to(torch.float32)
+        assert torch.allclose(result_cpu, x_cpu, atol=1e-5)
         assert result.dtype == dtype
 
     # ── eager (direct kernel call) ──────────────────────────────────────────

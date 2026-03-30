@@ -454,9 +454,21 @@ _STR_TO_TORCH_MAP: dict[str, torch.dtype] = {
     "int16": torch.int16,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    "uint16": torch.uint16,
+    "uint32": torch.uint32,
     "bool": torch.bool,
     "bool_": torch.bool,
 }
+
+# Conditionally add float8 mappings when the torch build supports them.
+if hasattr(torch, "float8_e5m2"):
+    _STR_TO_TORCH_MAP["float8_e5m2"] = torch.float8_e5m2
+if hasattr(torch, "float8_e4m3fn"):
+    _STR_TO_TORCH_MAP["float8_e4m3fn"] = torch.float8_e4m3fn
+if hasattr(torch, "float8_e4m3fnuz"):
+    _STR_TO_TORCH_MAP["float8_e4m3fnuz"] = torch.float8_e4m3fnuz
+if hasattr(torch, "float8_e5m2fnuz"):
+    _STR_TO_TORCH_MAP["float8_e5m2fnuz"] = torch.float8_e5m2fnuz
 
 
 def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
