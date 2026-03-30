@@ -430,6 +430,8 @@ class NKIHOPCaller:
         self.kernel_default_args = kernel_default_args
 
     def __getitem__(self, grid: "NKIGridType") -> "NKIHOPCaller":
+        if isinstance(grid, int):
+            grid = (grid,)
         grid = tuple(map(int, grid))
         return NKIHOPCaller(self.kernel_idx, grid, self.kernel_arg_names, self.kernel_default_args)
 
