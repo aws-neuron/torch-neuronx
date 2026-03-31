@@ -115,8 +115,8 @@ def torch_isfinite(x):
     torch.isfinite is getting decomposed before MLIR in fx graph,
     therefore we wont be able to get stablehlo.isfinite in the HLO
     """
-    if x.dtype in INT_DTYPES:
-        # Integers are always finite
+    if x.dtype in (*INT_DTYPES, torch.bool):
+        # Integers and bools are always finite
         return torch.ones_like(x, dtype=torch.bool)
     else:
         # For floating point: finite = not (nan or inf)

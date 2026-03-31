@@ -149,3 +149,7 @@ There are two ways to find what ops to implement:
    ```
 
 Once you pick the op to implement, follow [docs/new_op.md](docs/new_op.md) to implement it.
+
+## How to enable, use and contribute to torch_neuronx statistics
+
+Statistics/metrics are great to get tools to get information about the execution and helps the users debug difficult problems like OOMs, long compilation time, etc. To know more follow the [TorchNeuronX Statistics README](docs/torch_neuronx_stats_readme.md)

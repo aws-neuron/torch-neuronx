@@ -52,7 +52,7 @@ def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
 
 class NKIRegistry:
     id_to_kernel: ClassVar[dict[int, TorchNeuronNKIKernelV3]] = {}
-    kernel_func_to_id: ClassVar[dict[Callable, int]] = {}
+    kernel_to_id: ClassVar[dict[TorchNeuronNKIKernelV3, int]] = {}
     kernel_arg_names: ClassVar[dict[int, list[str]]] = {}
     kernel_default_args: ClassVar[dict[int, dict[str, Any]]] = {}
     """
@@ -73,13 +73,13 @@ class NKIRegistry:
         # Returns index on the table
         if kernel_default_args is None:
             kernel_default_args = {}
-        func = kernel.func
-        if kernel in self.kernel_func_to_id:
-            return self.kernel_func_to_id[kernel]
+
+        if kernel in self.kernel_to_id:
+            return self.kernel_to_id[kernel]
 
         idx = len(self.id_to_kernel)
         self.id_to_kernel[idx] = kernel
-        self.kernel_func_to_id[func] = idx
+        self.kernel_to_id[kernel] = idx
         self.kernel_arg_names[idx] = kernel_arg_names
         self.kernel_default_args[idx] = kernel_default_args
         return idx
@@ -109,7 +109,7 @@ class NKIRegistry:
     def reset_table(self) -> None:
         # Resets the table
         self.id_to_kernel = {}
-        self.kernel_func_to_id = {}
+        self.kernel_to_id = {}
         self.kernel_arg_names = {}
         self.kernel_default_args = {}
         self.constant_args = {}
