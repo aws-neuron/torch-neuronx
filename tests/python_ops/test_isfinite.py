@@ -170,6 +170,16 @@ class TestIsFinite:
             # Verify the operation ran on Neuron
             assert_op_runs_on_neuron("aten::isfinite")
 
+    def test_isfinite_bool_dtype(self):
+        """Test isfinite with bool dtype - bools are always finite."""
+        with track_neuron_ops():
+            input_cpu = torch.tensor([True, False, True, False])
+            input_neuron = input_cpu.to("neuron")
+            expected = torch.isfinite(input_cpu)
+            result = torch.isfinite(input_neuron)
+            assert torch.equal(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::isfinite")
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int64, torch.int32])
     def test_isfinite_dtypes(self, dtype):
         """Test isfinite with different dtypes including both floating point and integers."""

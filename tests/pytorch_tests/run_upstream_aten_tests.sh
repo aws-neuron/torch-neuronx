@@ -40,8 +40,10 @@ OUTPUT_DIR="/tmp/upstream_aten_artifacts"
 SPEC_FILE="aten_full_suite_spec.json"
 CLASS_LIST=""
 TOTAL_TIMEOUT=""
-CLASS_TIMEOUT=${CLASS_TIMEOUT:-14400}  # 4 hours default
-TEST_TIMEOUT=${TEST_TIMEOUT:-3600}      # 1 hour
+CLASS_TIMEOUT=${CLASS_TIMEOUT:-10800}  # 3 hours default
+TEST_TIMEOUT=${TEST_TIMEOUT:-600}      # 10 minutes
+SHARD_ID=""
+NUM_SHARDS=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -60,6 +62,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --total-timeout)
             TOTAL_TIMEOUT="$2"
+            shift 2
+            ;;
+        --shard-id)
+            SHARD_ID="$2"
+            shift 2
+            ;;
+        --num-shards)
+            NUM_SHARDS="$2"
             shift 2
             ;;
         *)
@@ -130,12 +140,26 @@ for CLASS_NAME in "${CLASS_NAMES[@]}"; do
     REPORT_FILE="$OUTPUT_DIR/test_results_${CLASS_NAME}.json"
     LOG_FILE="$OUTPUT_DIR/${CLASS_NAME}.log"
 
+    # Add shard suffix to report file if sharding
+    if [[ -n "$SHARD_ID" && -n "$NUM_SHARDS" ]]; then
+        REPORT_FILE="$OUTPUT_DIR/test_results_${CLASS_NAME}_shard${SHARD_ID}.json"
+        LOG_FILE="$OUTPUT_DIR/${CLASS_NAME}_shard${SHARD_ID}.log"
+    fi
+
     # Set class name filter
     export ATEN_CLASS_NAME="$CLASS_NAME"
+
+    # Build shard args if provided
+    SHARD_ARGS=""
+    if [[ -n "$SHARD_ID" && -n "$NUM_SHARDS" ]]; then
+        SHARD_ARGS="--shard-id=$SHARD_ID --num-shards=$NUM_SHARDS"
+        echo "Sharding: shard $SHARD_ID of $NUM_SHARDS"
+    fi
 
     # Run pytest with per-test timeout and class-level safety timeout
     set +e
     timeout --signal=SIGINT --kill-after=30 $CLASS_TIMEOUT pytest -n "$NUM_WORKERS" \
+        $SHARD_ARGS \
         --json-report \
         --json-report-file="$REPORT_FILE" \
         --timeout=$TEST_TIMEOUT \

@@ -33,6 +33,7 @@ dev = [
     "pytest-cov",
     "pytest-json-report",
     "pytest-timeout",
+    "pytest-shard",
     "ruff>=0.8.0",
     "pyzstd",
     "pytest-forked",
