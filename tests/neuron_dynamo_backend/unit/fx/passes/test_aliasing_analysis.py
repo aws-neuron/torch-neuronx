@@ -521,3 +521,37 @@ class TestCustomOpAliasing:
 
         # Should handle gracefully - no crash, no alias detected for missing arg
         assert_alias_count(aliasing_info.aliases, 0)
+
+
+def cross_entropy_loss(pred, labels):
+    """Torchtitan loss function (torchtitan/components/loss.py)."""
+    return torch.nn.functional.cross_entropy(
+        pred.flatten(0, 1).float(),
+        labels.flatten(0, 1),
+        reduction="sum",
+    )
+
+
+class SimpleModel(nn.Module):
+    def __init__(self, vocab_size=32, hidden_size=64):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.head = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input_ids):
+        return self.head(self.embed(input_ids))
+
+
+def test_compiled_loss_backward_aliasing_oob():
+    device = torch.neuron.current_device()
+    model = torch.compile(SimpleModel().to(device), backend="neuron")
+    loss_fn = torch.compile(cross_entropy_loss, backend="neuron")
+
+    input_ids = torch.randint(0, 32, (2, 4), device=device)
+    labels = torch.randint(0, 32, (2, 4), dtype=torch.int32, device=device)
+
+    # Production runs under torch.autocast (single-device AMP path)
+    with torch.autocast("privateuseone", dtype=torch.bfloat16):
+        pred = model(input_ids)
+        loss = loss_fn(pred, labels)
+    loss.backward()
