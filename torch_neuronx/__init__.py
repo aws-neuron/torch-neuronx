@@ -206,6 +206,11 @@ from .distributed.mesh_registry import _apply_mesh_registry_patch
 
 _apply_mesh_registry_patch()
 
+# Auto-cast fp32 conv inputs to match bf16 weights (common in diffusion training)
+from .python_ops.conv_dtype_cast import apply_conv_dtype_cast_hook
+
+apply_conv_dtype_cast_hook()
+
 
 def is_neuron_runtime_initialized():
     return _C._is_neuron_runtime_initialized()
