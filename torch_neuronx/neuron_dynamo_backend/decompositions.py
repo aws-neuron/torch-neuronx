@@ -57,7 +57,6 @@ neuron_decompositions = get_decompositions(
         aten.reflection_pad1d,
         aten.reflection_pad2d,
         aten.reflection_pad3d,
-        aten.embedding,
         aten.native_layer_norm_backward,
         aten.nll_loss_backward,
         aten.clamp_min,
@@ -109,6 +108,24 @@ def register_decomposition(
         if op in neuron_decompositions:
             raise ValueError(f"Duplicate decomposition registration for: {op}")
     return decomp.register_decomposition(ops, neuron_decompositions)
+
+
+@register_decomposition([aten.embedding.default])
+def embedding_decomposition(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    padding_idx: int = -1,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+):
+    del padding_idx, scale_grad_by_freq, sparse
+
+    if indices.is_floating_point():
+        indices = indices.to(torch.int64)
+
+    flat_indices = indices.reshape(-1)
+    output = torch.index_select(weight, 0, flat_indices)
+    return output.reshape(*indices.shape, weight.shape[1])
 
 
 @register_decomposition([aten.as_strided.default])
