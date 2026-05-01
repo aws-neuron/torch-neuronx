@@ -1,5 +1,20 @@
 # Contributing guidelines
 
+## Response Times
+
+| Category | Target Response Time |
+|----------|---------------------|
+| Issues | 1 week |
+| External pull requests | 2 weeks |
+| Security vulnerabilities | 48 hours |
+
+If you haven't received a response within these timeframes, feel free to ping the thread.
+
+## AI Contribution Policy
+
+- All pull requests must reference an actionable issue.
+- AI-generated code is welcome, but the contributor is fully responsible for its correctness, testing, and compliance with project guidelines.
+
 ## Setup Development Environment
 
 ```sh
@@ -22,14 +37,7 @@ chmod +x ./tools/*
 
 ## Install neuron compiler from neuron repo
 uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
-
-## Install Mlir
-
-# Download the wheel matching your python version
-# from https://prod.artifactbrowser.brazil.aws.dev/packages/Torch-mlir/versions/
-
-#install the wheel.
-uv pip install <torch_mlir-latest-version>-linux_x86_64.whl --no-deps
+uv pip install 'nki==0.3.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
 # Install development dependencies including Ruff
 uv pip install ruff
