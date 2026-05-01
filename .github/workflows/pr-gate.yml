@@ -1,0 +1,39 @@
+name: PR Gate
+
+# Runs automatically on every PR to create a pending status check.
+# This check blocks merge until an internal developer triggers the
+# ATen tests via PR Test Dispatcher and they pass.
+on:
+  pull_request:
+    branches:
+      - develop
+
+permissions:
+  statuses: write
+  contents: read
+
+jobs:
+  gate:
+    name: ATen Tests Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set pending status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            const prNumber = context.payload.pull_request.number;
+
+            console.log(`Setting pending status on PR #${prNumber}, SHA: ${sha}`);
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: sha,
+              state: 'pending',
+              context: 'ATen Unit Tests (trn2)',
+              description: 'Waiting — an internal developer must trigger tests via PR Test Dispatcher',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/pr-test-dispatcher.yml`,
+            });
+
+            console.log('✓ Pending status set');
