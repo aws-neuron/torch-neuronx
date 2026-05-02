@@ -1,0 +1,51 @@
+name: 🐛 Bug Report
+description: Report a bug in torch-neuronx
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        #### Before submitting a bug, please make sure the issue hasn't been already
+        addressed by searching through
+        [the existing and past issues](https://github.com/aws-neuron/torch-neuronx/issues?q=is%3Aissue+sort%3Acreated-desc+).
+  - type: textarea
+    attributes:
+      label: 🐛 Describe the bug
+      description: |
+        A clear description of the bug. Include a minimal code snippet to reproduce the issue and the error message or stack trace you observe.
+      placeholder: |
+        A clear and concise description of what the bug is.
+
+        ```python
+        # Sample code to reproduce the problem
+        ```
+
+        ```
+        The error message you got, with the full traceback.
+        ```
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: |
+        Please provide the following version information:
+      value: |
+        - torch-neuronx version:
+        - PyTorch version:
+        - neuronx-cc version:
+        - OS:
+        - Instance type (e.g., trn1.2xlarge):
+        - Python version:
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for contributing 🎉!
