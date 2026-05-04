@@ -12,9 +12,13 @@ permissions:
   statuses: write
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
-    name: ATen Tests Gate
+    name: Smoke Test Gate
     runs-on: ubuntu-latest
     steps:
       - name: Set pending status
