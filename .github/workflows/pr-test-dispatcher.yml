@@ -43,13 +43,10 @@ jobs:
               return;
             }
 
-            const headRef = pr.head.ref;
             const headSha = pr.head.sha;
             console.log(`PR #${prNumber}: "${pr.title}"`);
-            console.log(`  head ref : ${headRef}`);
             console.log(`  head sha : ${headSha}`);
 
-            core.setOutput('head_ref', headRef);
             core.setOutput('head_sha', headSha);
 
       - name: Dispatch pull.yml
@@ -57,16 +54,21 @@ jobs:
         with:
           script: |
             const prNumber = '${{ github.event.inputs.pr_number }}';
-            const headRef  = '${{ steps.pr-info.outputs.head_ref }}';
             const headSha  = '${{ steps.pr-info.outputs.head_sha }}';
 
-            console.log(`Dispatching pull.yml for PR #${prNumber} on ref ${headRef} (${headSha})`);
+            // Use the repo's default branch as the ref for workflow_dispatch.
+            // The PR branch may live in a fork and not exist in this repo,
+            // which would cause createWorkflowDispatch to fail.
+            // pull.yml checks out the correct code via head_sha anyway.
+            const dispatchRef = '${{ github.event.repository.default_branch }}';
+
+            console.log(`Dispatching pull.yml on ref "${dispatchRef}" for PR #${prNumber} (sha: ${headSha})`);
 
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'pull.yml',
-              ref: headRef,
+              ref: dispatchRef,
               inputs: {
                 pr_number: prNumber,
                 head_sha: headSha,

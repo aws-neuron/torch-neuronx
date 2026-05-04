@@ -25,20 +25,20 @@ concurrency:
 
 env:
   AWS_DEFAULT_REGION: us-west-2
+  # ── Dry-run toggle ──────────────────────────────────────────
+  # Set to "true" to run a dummy test on ubuntu-latest instead of
+  # real ATen tests on neuron hardware. Remove (or set to "false")
+  # once the self-hosted runner image is ready.
+  DRY_RUN: "true"
 
 jobs:
   aten-unit-tests:
     name: "ATen Unit Tests (trn2) — PR #${{ github.event.inputs.pr_number }}"
-    runs-on: [
-      self-hosted,
-      linux,
-      neuron,
-      neuron.internal_compute,
-      "neuron.internal_compute:trn2.48xlarge",
-      neuron.build-image,
-      "neuron.run-${{ github.run_id }}-aten-unit-tests",
-      "neuron.pr:${{ github.event.inputs.pr_number }}"
-    ]
+    runs-on: ${{ fromJSON(
+      env.DRY_RUN == 'true'
+        && '["ubuntu-latest"]'
+        || '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-' + github.run_id + '-aten-unit-tests","neuron.pr:' + github.event.inputs.pr_number + '"]'
+      ) }}
     timeout-minutes: 240
     steps:
       - name: Set status to in-progress
@@ -60,7 +60,24 @@ jobs:
         with:
           ref: ${{ github.event.inputs.head_sha }}
 
-      - uses: ./.github/actions/run-test-suite
+      # ── Dry-run: dummy test ──────────────────────────────────
+      - name: Dummy test (dry-run)
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "============================================="
+          echo "  DRY RUN — skipping real ATen tests"
+          echo "  PR: #${{ github.event.inputs.pr_number }}"
+          echo "  SHA: ${{ github.event.inputs.head_sha }}"
+          echo "============================================="
+          echo "Listing checked-out files:"
+          ls -la
+          echo ""
+          echo "Dummy test passed ✓"
+
+      # ── Real test: neuron hardware ───────────────────────────
+      - name: Run ATen tests
+        if: env.DRY_RUN != 'true'
+        uses: ./.github/actions/run-test-suite
         with:
           test-command: ./tools/run-test-parallel --skip-distributed --skip_pt_test_distributed --coverage --json-report --report-dir=outputs/test-reports
           artifact-name: aten-test-results-pr-${{ github.event.inputs.pr_number }}
