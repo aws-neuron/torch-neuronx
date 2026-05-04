@@ -32,13 +32,26 @@ env:
   DRY_RUN: "true"
 
 jobs:
+  # ── Resolve runner labels ────────────────────────────────────
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - name: Pick runner
+        id: pick
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo 'runner=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'runner=["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-${{ github.run_id }}-aten-unit-tests","neuron.pr:${{ github.event.inputs.pr_number }}"]' >> "$GITHUB_OUTPUT"
+          fi
+
   aten-unit-tests:
     name: "ATen Unit Tests (trn2) — PR #${{ github.event.inputs.pr_number }}"
-    runs-on: ${{ fromJSON(
-      env.DRY_RUN == 'true'
-        && '["ubuntu-latest"]'
-        || '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-' + github.run_id + '-aten-unit-tests","neuron.pr:' + github.event.inputs.pr_number + '"]'
-      ) }}
+    needs: setup
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner) }}
     timeout-minutes: 240
     steps:
       - name: Set status to in-progress
