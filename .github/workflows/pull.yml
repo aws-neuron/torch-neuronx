@@ -29,6 +29,10 @@ jobs:
       - self-hosted
       - linux
       - neuron
+      - neuron.internal_compute
+      - "neuron.internal_compute:trn2.48xlarge"
+      - "neuron.run-${{ github.run_id }}-smoke-test"
+      - "neuron.pr:${{ github.event.inputs.pr_number }}"
     timeout-minutes: 30
     steps:
       - name: Set status to in-progress
