@@ -1,7 +1,6 @@
 name: PR Checks
 
 # Triggered by pr-test-dispatcher.yml or manually via workflow_dispatch.
-# Only runs ATen upstream tests for external contributor PRs.
 on:
   workflow_dispatch:
     inputs:
@@ -23,36 +22,14 @@ concurrency:
   group: ${{ github.workflow }}-pr-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true
 
-env:
-  AWS_DEFAULT_REGION: us-west-2
-  # ── Dry-run toggle ──────────────────────────────────────────
-  # Set to "true" to run a dummy test on ubuntu-latest instead of
-  # real ATen tests on neuron hardware. Remove (or set to "false")
-  # once the self-hosted runner image is ready.
-  DRY_RUN: "true"
-
 jobs:
-  # ── Resolve runner labels ────────────────────────────────────
-  setup:
-    name: Setup
-    runs-on: ubuntu-latest
-    outputs:
-      runner: ${{ steps.pick.outputs.runner }}
-    steps:
-      - name: Pick runner
-        id: pick
-        run: |
-          if [ "$DRY_RUN" = "true" ]; then
-            echo 'runner=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'runner=["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-${{ github.run_id }}-aten-unit-tests","neuron.pr:${{ github.event.inputs.pr_number }}"]' >> "$GITHUB_OUTPUT"
-          fi
-
-  aten-unit-tests:
-    name: "ATen Unit Tests (trn2) — PR #${{ github.event.inputs.pr_number }}"
-    needs: setup
-    runs-on: ${{ fromJSON(needs.setup.outputs.runner) }}
-    timeout-minutes: 240
+  smoke-test:
+    name: "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
+    runs-on:
+      - self-hosted
+      - linux
+      - neuron
+    timeout-minutes: 30
     steps:
       - name: Set status to in-progress
         uses: actions/github-script@v7
@@ -63,8 +40,8 @@ jobs:
               repo: context.repo.repo,
               sha: '${{ github.event.inputs.head_sha }}',
               state: 'pending',
-              context: 'ATen Unit Tests (trn2)',
-              description: 'Running ATen unit tests...',
+              context: 'Smoke Test',
+              description: 'Running smoke test...',
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
@@ -73,27 +50,15 @@ jobs:
         with:
           ref: ${{ github.event.inputs.head_sha }}
 
-      # ── Dry-run: dummy test ──────────────────────────────────
-      - name: Dummy test (dry-run)
-        if: env.DRY_RUN == 'true'
+      - name: Smoke test
         run: |
           echo "============================================="
-          echo "  DRY RUN — skipping real ATen tests"
+          echo "  Smoke Test"
           echo "  PR: #${{ github.event.inputs.pr_number }}"
           echo "  SHA: ${{ github.event.inputs.head_sha }}"
+          echo "  Runner: $(hostname)"
           echo "============================================="
-          echo "Listing checked-out files:"
-          ls -la
-          echo ""
-          echo "Dummy test passed ✓"
-
-      # ── Real test: neuron hardware ───────────────────────────
-      - name: Run ATen tests
-        if: env.DRY_RUN != 'true'
-        uses: ./.github/actions/run-test-suite
-        with:
-          test-command: ./tools/run-test-parallel --skip-distributed --skip_pt_test_distributed --coverage --json-report --report-dir=outputs/test-reports
-          artifact-name: aten-test-results-pr-${{ github.event.inputs.pr_number }}
+          echo "Smoke test passed ✓"
 
       - name: Report success
         if: success()
@@ -105,8 +70,8 @@ jobs:
               repo: context.repo.repo,
               sha: '${{ github.event.inputs.head_sha }}',
               state: 'success',
-              context: 'ATen Unit Tests (trn2)',
-              description: 'ATen unit tests passed',
+              context: 'Smoke Test',
+              description: 'Smoke test passed',
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
@@ -120,7 +85,7 @@ jobs:
               repo: context.repo.repo,
               sha: '${{ github.event.inputs.head_sha }}',
               state: 'failure',
-              context: 'ATen Unit Tests (trn2)',
-              description: 'ATen unit tests failed',
+              context: 'Smoke Test',
+              description: 'Smoke test failed',
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });

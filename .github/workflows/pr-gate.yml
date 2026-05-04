@@ -31,7 +31,7 @@ jobs:
               repo: context.repo.repo,
               sha: sha,
               state: 'pending',
-              context: 'ATen Unit Tests (trn2)',
+              context: 'Smoke Test',
               description: 'Waiting — an internal developer must trigger tests via PR Test Dispatcher',
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/pr-test-dispatcher.yml`,
             });
