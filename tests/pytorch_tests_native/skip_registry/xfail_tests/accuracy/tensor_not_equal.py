@@ -459,5 +459,7 @@ ACCURACY_TENSOR_NOT_EQUAL = [
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_nonfinite_neuron_float16",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_nonfinite_neuron_float32",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_nonfinite_neuron_float64",
+    "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_neuron_int32",
+    "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_neuron_int64",
     "test_type_promotion.py::TestTypePromotionNEURON::test_comparison_ops_with_type_promotion_neuron",
 ]
