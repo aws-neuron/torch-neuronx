@@ -40,12 +40,14 @@ jobs:
     steps:
       - name: Set status to in-progress
         uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: '${{ github.event.inputs.head_sha }}',
+              sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'Smoke Test',
               description: 'Running smoke test...',
@@ -60,12 +62,14 @@ jobs:
       - name: Report success
         if: success()
         uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: '${{ github.event.inputs.head_sha }}',
+              sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'Smoke Test',
               description: 'Smoke test passed',
@@ -75,12 +79,14 @@ jobs:
       - name: Report failure
         if: failure()
         uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: '${{ github.event.inputs.head_sha }}',
+              sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'Smoke Test',
               description: 'Smoke test failed',
