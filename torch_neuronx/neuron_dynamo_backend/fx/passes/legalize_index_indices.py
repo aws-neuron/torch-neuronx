@@ -119,6 +119,7 @@ class LegalizeIndexIndices(PassBase):
                     zero = graph.call_function(
                         torch.ops.aten.scalar_tensor.default,
                         args=(0,),
+                        kwargs={"dtype": idx_meta.dtype},
                     )
                     _add_metadata_to_node(zero, shape=(), dtype=idx_meta.dtype)
                     lt = graph.call_function(torch.ops.aten.lt.Tensor, args=(idx, zero))
@@ -126,6 +127,7 @@ class LegalizeIndexIndices(PassBase):
                     offset = graph.call_function(
                         torch.ops.aten.scalar_tensor.default,
                         args=(dim_size,),
+                        kwargs={"dtype": idx_meta.dtype},
                     )
                     _add_metadata_to_node(offset, shape=(), dtype=idx_meta.dtype)
                     shifted = graph.call_function(torch.ops.aten.add.Tensor, args=(idx, offset))
