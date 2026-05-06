@@ -20,6 +20,8 @@
 #   CLASS_TIMEOUT          Total timeout in seconds (default: 10800, or auto-calculated)
 #   TEST_TIMEOUT           Per-test timeout in seconds (default: 600)
 #   NUM_WORKERS            Number of pytest-xdist workers (default: 64)
+#   NUM_WORKERS_RETRY      Workers for the retry pass (default: 4)
+#   RETRY_TIMEOUT          Wall-clock budget for retry in seconds (default: 1800)
 #
 # Timeout Behavior:
 #   - Per-test timeout via pytest-timeout marks tests as failed (non-distributed)
@@ -43,6 +45,11 @@ OUTPUT_DIR="/tmp/upstream_pytorch_artifacts"
 TOTAL_TIMEOUT=""
 CLASS_TIMEOUT=${CLASS_TIMEOUT:-7200}  # 2 hours default
 TEST_TIMEOUT=${TEST_TIMEOUT:-800}     # 15 minutes (temp reduce test flakiness with 10 minutes)
+# Retry pass (fires only if main pytest exits with code 1 — see retry block below).
+# Reduced concurrency avoids recreating cascading NRT conditions; separate
+# timeout keeps retry from consuming a large share of the wall-clock budget.
+NUM_WORKERS_RETRY=${NUM_WORKERS_RETRY:-4}
+RETRY_TIMEOUT=${RETRY_TIMEOUT:-1800}  # 30 minutes
 SHARD_ID=""
 NUM_SHARDS=""
 CLONE_SCRIPT="tests/pytorch_tests_native/clone_device_agnostic_tests.py"
@@ -158,7 +165,11 @@ fi
 
 echo "=== Running: ${ITEMS[*]} ==="
 
-# Use --forked for distributed tests, --timeout for others
+# Use --forked for distributed tests, --timeout for others.
+#
+# NOTE on --forked + --last-failed: pytest's last-failed cache is written
+# by the main pytest process (not the forked children), so --last-failed
+# correctly replays the prior run's failures even under --forked.
 TIMEOUT_ARGS="--timeout=$TEST_TIMEOUT --timeout-method=signal"
 for ITEM in "${ITEMS[@]}"; do
     if [[ "$ITEM" == distributed || "$ITEM" == distributed/* ]]; then
@@ -167,7 +178,20 @@ for ITEM in "${ITEMS[@]}"; do
     fi
 done
 
+# Pytest flags shared by both the main and retry invocations. Keeping these
+# in a single array avoids subtle drift between the two runs.
+# Note: $SHARD_ARGS / $IGNORE_ARGS / $TIMEOUT_ARGS are intentionally passed
+# separately (unquoted) so the shell handles word-splitting — pytest must
+# see e.g. '--shard-id=0' '--num-shards=4' as two tokens.
+PYTEST_COMMON_ARGS=(
+    --tb=short
+    --maxfail=0
+    --continue-on-collection-errors
+    -v
+)
+
 set +e
+# shellcheck disable=SC2086  # intentional word-splitting for $SHARD_ARGS/$IGNORE_ARGS/$TIMEOUT_ARGS/$PYTEST_TARGETS
 timeout --signal=SIGINT --kill-after=300 $CLASS_TIMEOUT pytest -n "$NUM_WORKERS" \
     $SHARD_ARGS \
     $IGNORE_ARGS \
@@ -175,10 +199,7 @@ timeout --signal=SIGINT --kill-after=300 $CLASS_TIMEOUT pytest -n "$NUM_WORKERS"
     --json-report-file="$REPORT_FILE" \
     --html="$HTML_FILE" --self-contained-html \
     $TIMEOUT_ARGS \
-    --tb=short \
-    --maxfail=0 \
-    --continue-on-collection-errors \
-    -v \
+    "${PYTEST_COMMON_ARGS[@]}" \
     $PYTEST_TARGETS > >(tee "$LOG_FILE") 2>&1
 EXIT_CODE=$?
 set -e
@@ -188,6 +209,76 @@ if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 137 ]; t
 fi
 if [ $EXIT_CODE -ne 0 ]; then
     FAILED_ITEMS=1
+fi
+
+# =============================================================================
+# Single retry pass for failed tests
+# =============================================================================
+#
+# pytest's --last-failed flag reuses the .pytest_cache populated by the
+# main run to rerun only the tests that failed. This catches flaky
+# failures caused by cascading NRT/worker crashes: when a worker
+# segfaults, pytest-xdist marks the tests assigned to that worker as
+# FAILED with 0.0s duration even though they never actually ran. Those
+# victims typically pass on a second attempt.
+#
+# Only retry if:
+#   - main pytest finished normally with failures (exit code 1)
+#   - not on wall-clock timeout (124/130/137) — the cache is incomplete
+#   - not on internal / usage / collection errors (>1) — retry won't help
+#
+# Retry results are written with a _retry suffix next to the main
+# reports so the aggregator can identify which previously-failing
+# tests passed on retry and count them as passes.
+#
+# Concurrency and timeout are controlled by NUM_WORKERS_RETRY and
+# RETRY_TIMEOUT env vars (defaults set near the top of this script).
+RETRY_EXIT_CODE=0
+if [ $EXIT_CODE -eq 1 ]; then
+    RETRY_REPORT_FILE="${REPORT_FILE%.json}_retry.json"
+    RETRY_HTML_FILE="${HTML_FILE%.html}_retry.html"
+    RETRY_LOG_FILE="${LOG_FILE%.log}_retry.log"
+
+    echo ""
+    echo "=== Retrying failed tests (single pass, ${NUM_WORKERS_RETRY} workers, timeout ${RETRY_TIMEOUT}s) ==="
+    echo "Retry reports:"
+    echo "  json: $RETRY_REPORT_FILE"
+    echo "  html: $RETRY_HTML_FILE"
+    echo "  log:  $RETRY_LOG_FILE"
+
+    # --last-failed-no-failures=none: exit 5 if the pytest cache has no
+    # recorded failures (defensive; shouldn't normally happen since
+    # EXIT_CODE=1 implies failures occurred). Treat exit 5 as success.
+    set +e
+    # shellcheck disable=SC2086  # intentional word-splitting (see main invocation)
+    timeout --signal=SIGINT --kill-after=300 $RETRY_TIMEOUT pytest -n "$NUM_WORKERS_RETRY" \
+        --last-failed \
+        --last-failed-no-failures=none \
+        $SHARD_ARGS \
+        $IGNORE_ARGS \
+        --json-report \
+        --json-report-file="$RETRY_REPORT_FILE" \
+        --html="$RETRY_HTML_FILE" --self-contained-html \
+        $TIMEOUT_ARGS \
+        "${PYTEST_COMMON_ARGS[@]}" \
+        $PYTEST_TARGETS > >(tee "$RETRY_LOG_FILE") 2>&1
+    RETRY_EXIT_CODE=$?
+    set -e
+
+    # Exit 0: all previously-failing tests now pass.
+    # Exit 5: no tests collected (cache empty — shouldn't happen here, treat as success).
+    if [ $RETRY_EXIT_CODE -eq 0 ] || [ $RETRY_EXIT_CODE -eq 5 ]; then
+        # Flakiness recovered. Override the final exit code so the pipeline
+        # reports success; the aggregator will surface the passed_on_retry
+        # count as a flakiness signal.
+        echo ""
+        echo "=== Retry SUCCESS: all previously-failing tests passed on retry ==="
+        EXIT_CODE=0
+        FAILED_ITEMS=0
+    else
+        echo ""
+        echo "=== Retry incomplete: some tests still failing (retry exit: $RETRY_EXIT_CODE) ==="
+    fi
 fi
 
 # Summary

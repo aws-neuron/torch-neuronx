@@ -26,22 +26,41 @@ from pathlib import Path
 # Shared helper lives in convert_reports so per-node and aggregation flows stay
 # in sync. Supports being imported as a sibling module regardless of cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from convert_reports import extract_test_data_from_json
+from convert_reports import (
+    apply_retry_outcomes,
+    extract_test_data_from_json,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+# Statuses considered "failing" for the failures-only CSV. ``error`` covers
+# pytest collection / fixture errors. ``passed_on_retry`` is intentionally
+# EXCLUDED — those tests ultimately passed and are tracked separately as a
+# flakiness signal, not as failures that need investigation.
+FAILURE_STATUSES = ("failed", "error")
 
 
 def _calc_pass_rate(status_counts: dict) -> str:
     """Calculate pass rate excluding skipped tests.
 
-    pass_rate = (passed + xpassed) / (passed + xpassed + failed + xfailed + error)
+    Each ``*_on_retry`` status counts the same as its base status:
+    - ``passed_on_retry`` / ``xpassed_on_retry`` → pass (numerator)
+    - ``xfailed_on_retry`` → denom only (same as xfailed)
+    - ``skipped_on_retry`` → excluded (same as skipped)
+    - ``failed`` / ``error`` → denom only
     """
-    passed = status_counts.get("passed", 0) + status_counts.get("xpassed", 0)
+    passed = (
+        status_counts.get("passed", 0)
+        + status_counts.get("xpassed", 0)
+        + status_counts.get("passed_on_retry", 0)
+        + status_counts.get("xpassed_on_retry", 0)
+    )
     denom = (
         passed
         + status_counts.get("failed", 0)
         + status_counts.get("xfailed", 0)
+        + status_counts.get("xfailed_on_retry", 0)
         + status_counts.get("error", 0)
     )
     if denom == 0:
@@ -82,7 +101,17 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         logger.warning(f"No JSON files found under {results_dir}")
         return {"test_rows": [], "stats": {}, "durations": {}, "total_stats": {}}
 
-    logger.info(f"Found {len(json_files)} JSON report files to process")
+    # Split main vs retry reports. Retry files end in ``_retry.json``
+    # and are merged into their paired main report via
+    # :func:`apply_retry_outcomes` (see convert_reports). Retry
+    # reports are NOT tallied on their own to prevent double-counting:
+    # the retry JSON only contains the previously-failing subset.
+    main_json_files = [p for p in json_files if not p.endswith("_retry.json")]
+    retry_json_files = {p for p in json_files if p.endswith("_retry.json")}
+    logger.info(
+        f"Found {len(main_json_files)} main + {len(retry_json_files)} retry "
+        f"JSON report files to process"
+    )
 
     # Aggregate counts per class — dynamically track all statuses
     stats = defaultdict(lambda: defaultdict(int))  # {class: {status: count}}
@@ -90,8 +119,17 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
     all_statuses = set()
     all_test_rows = []
 
-    for json_file in json_files:
-        for row in extract_test_data_from_json(json_file):
+    for json_file in main_json_files:
+        main_rows = extract_test_data_from_json(json_file)
+
+        # Merge companion retry report, if present. Sibling lookup by
+        # filename so we stay within the same per-node artifact dir.
+        retry_path = json_file.replace(".json", "_retry.json")
+        if retry_path in retry_json_files:
+            retry_rows = extract_test_data_from_json(retry_path)
+            main_rows = apply_retry_outcomes(main_rows, retry_rows)
+
+        for row in main_rows:
             cls = row.get("test_class") or "unknown"
             status = row.get("status") or "unknown"
             stats[cls][status] += 1
@@ -172,17 +210,44 @@ def write_github_summary(result: dict) -> None:
         )
 
 
-def write_all_tests_csv(test_rows: list, output_csv: Path) -> None:
-    """Write all individual test results to a single aggregated CSV.
+SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
 
-    Columns: test_class, test_method, status, duration(sec), failure_reason, timestamp
-    Matches the ``upstream_aten_all_tests_aggregated_*.csv`` format.
+
+def write_all_tests_csv(test_rows: list, output_csv: Path) -> None:
+    """Write test results excluding skipped tests.
+
+    Skipped tests typically dominate (90%+) and cloud analysis. They
+    are written to a separate ``*_skipped_*.csv`` instead.
     """
     if not test_rows:
         return
     fieldnames = [
-        "test_class",
-        "test_method",
+        "test_id",
+        "status",
+        "duration(sec)",
+        "failure_reason",
+        "timestamp",
+    ]
+    rows = [r for r in test_rows if r.get("status") not in SKIPPED_STATUSES]
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info(f"All-tests CSV (excl. skipped): {output_csv} ({len(rows)} rows)")
+
+
+def write_skipped_csv(test_rows: list, output_csv: Path) -> int:
+    """Write skipped tests to a separate CSV.
+
+    Returns:
+        Number of rows written.
+    """
+    skipped = [r for r in test_rows if r.get("status") in SKIPPED_STATUSES]
+    skipped.sort(key=lambda r: (r.get("test_class") or "", r.get("test_method") or ""))
+
+    fieldnames = [
+        "test_id",
         "status",
         "duration(sec)",
         "failure_reason",
@@ -192,8 +257,83 @@ def write_all_tests_csv(test_rows: list, output_csv: Path) -> None:
     with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(test_rows)
-    logger.info(f"All-tests CSV: {output_csv} ({len(test_rows)} rows)")
+        writer.writerows(skipped)
+
+    logger.info(f"Skipped CSV: {output_csv} ({len(skipped)} rows)")
+    return len(skipped)
+
+
+def write_failures_only_csv(test_rows: list, output_csv: Path) -> int:
+    """Write a failures-only slice of the aggregated test results.
+
+    Companion to :func:`write_all_tests_csv` that filters to rows whose
+    status is in :data:`FAILURE_STATUSES` (currently ``failed`` and
+    ``error``). ``passed_on_retry`` is **not** considered a failure
+    since the test ultimately passed — those tests are tracked as a
+    flakiness signal elsewhere, not as outstanding bugs.
+
+    Sorted by (test_class, test_method) so diffs between runs are
+    stable. Writes the same columns as the all-tests CSV for easy
+    side-by-side consumption.
+
+    Returns:
+        Number of rows written (0 if no failures).
+    """
+    failures = [row for row in test_rows if row.get("status") in FAILURE_STATUSES]
+
+    # Stable ordering so the file is diffable run-to-run.
+    failures.sort(key=lambda r: (r.get("test_class") or "", r.get("test_method") or ""))
+
+    fieldnames = [
+        "test_id",
+        "status",
+        "duration(sec)",
+        "failure_reason",
+        "timestamp",
+    ]
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    # Always write the file (even when empty) so downstream consumers
+    # can trust the path exists after a successful aggregation pass.
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(failures)
+
+    logger.info(f"Failures-only CSV: {output_csv} ({len(failures)} rows)")
+    return len(failures)
+
+
+def write_flaky_csv(test_rows: list, output_csv: Path) -> int:
+    """Write a flaky-tests report: tests that failed in main but recovered on retry.
+
+    Captures every row whose status ends with ``_on_retry`` — these are
+    tests that the main run reported as failed/error but the retry pass
+    revealed a different (non-failing) outcome. This is the worker-crash
+    flakiness signal.
+
+    Sorted by (test_class, test_method) for stable diffs.
+
+    Returns:
+        Number of rows written (0 if no flaky tests).
+    """
+    flaky = [row for row in test_rows if row.get("status", "").endswith("_on_retry")]
+    flaky.sort(key=lambda r: (r.get("test_class") or "", r.get("test_method") or ""))
+
+    fieldnames = [
+        "test_id",
+        "status",
+        "duration(sec)",
+        "failure_reason",
+        "timestamp",
+    ]
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(flaky)
+
+    logger.info(f"Flaky CSV: {output_csv} ({len(flaky)} rows)")
+    return len(flaky)
 
 
 def merge_benchmark_jsonl(results_dir: Path, output_jsonl: Path) -> None:
@@ -226,6 +366,9 @@ def main() -> int:
     run_timestamp = os.environ.get("TEST_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_csv = results_dir / f"upstream_pytorch_summary_{run_timestamp}.csv"
     all_tests_csv = results_dir / f"upstream_pytorch_all_tests_aggregated_{run_timestamp}.csv"
+    failures_csv = results_dir / f"upstream_pytorch_failures_{run_timestamp}.csv"
+    flaky_csv = results_dir / f"upstream_pytorch_flaky_{run_timestamp}.csv"
+    skipped_csv = results_dir / f"upstream_pytorch_skipped_{run_timestamp}.csv"
     benchmark_jsonl = results_dir / "benchmark_results.jsonl"
 
     if not results_dir.exists():
@@ -239,6 +382,9 @@ def main() -> int:
         return 0
 
     write_all_tests_csv(result["test_rows"], all_tests_csv)
+    write_failures_only_csv(result["test_rows"], failures_csv)
+    write_flaky_csv(result["test_rows"], flaky_csv)
+    write_skipped_csv(result["test_rows"], skipped_csv)
     merge_benchmark_jsonl(results_dir, benchmark_jsonl)
 
     # Print the summary CSV to stdout for log visibility
