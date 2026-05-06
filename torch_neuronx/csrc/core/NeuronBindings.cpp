@@ -2073,6 +2073,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Get the instance-specific output directory path used by NRT profiling",
       py::arg("output_dir"));
 
+  m.def(
+      "_nrt_inspect_precache_enable", []() { at::neuron::nrt::PrecacheEnable(); },
+      "Enable pre-caching of profile node info during wait iterations");
+
   // Create a capsule that will call cleanup_streams_func when the module is destroyed
   auto cleanup_capsule = py::capsule(cleanup_streams_func);
   m.add_object("_stream_cleanup_capsule", cleanup_capsule);
