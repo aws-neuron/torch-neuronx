@@ -1,0 +1,39 @@
+{
+  "test_configurations": [
+    {
+      "class": "ReplicateStateDictTest",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": []
+    },
+    {
+      "class": "ReplicateTest",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": [
+        {
+          "reason": "ValueError: Expected neuron device, got cpu",
+          "tests": [
+            "test_replicate_device_id",
+            "test_replicate_single_module",
+            "test_replicate_multi_module",
+            "test_replicate_with_kwargs"
+          ]
+        }
+      ]
+    },
+    {
+      "class": "ReplicateFullyShardInit",
+      "file": "distributed/_composable/test_replicate.py",
+      "xfail": [
+        {
+          "reason": "ValueError: Expected neuron device, got cpu",
+          "tests": [
+            "test_replicate_device_id",
+            "test_replicate_single_module",
+            "test_replicate_multi_module",
+            "test_replicate_with_kwargs"
+          ]
+        }
+      ]
+    }
+  ]
+}

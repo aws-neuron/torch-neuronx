@@ -1,0 +1,53 @@
+#!/bin/bash
+# Run tests for torch-neuronx using pytest (with or without uv)
+
+set -e
+
+# Get the script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Change to project root
+cd "$PROJECT_ROOT"
+
+# Default pytest args
+PYTEST_ARGS=""
+
+# If no arguments provided, run all tests except huggingface
+if [ $# -eq 0 ]; then
+    PYTEST_ARGS="tests/ --ignore=tests/huggingface"
+else
+    # Process arguments
+    for arg in "$@"; do
+        # If argument doesn't start with -, it's a path - prepend tests/ if needed
+        if [[ ! "$arg" =~ ^- ]]; then
+            # If the path doesn't start with tests/, prepend it
+            if [[ ! "$arg" =~ ^tests/ ]]; then
+                PYTEST_ARGS="$PYTEST_ARGS tests/$arg"
+            else
+                PYTEST_ARGS="$PYTEST_ARGS $arg"
+            fi
+        else
+            # Pass through pytest options as-is
+            PYTEST_ARGS="$PYTEST_ARGS $arg"
+        fi
+    done
+fi
+
+# Decide how to run python (prefer uv if available)
+if command -v uv >/dev/null 2>&1; then
+    PY_CMD_PREFIX=(uv run python -m pytest)
+    ECHO_PREFIX="uv run python -m pytest"
+else
+    PY_CMD_PREFIX=(python -m pytest)
+    ECHO_PREFIX="python -m pytest"
+fi
+
+# Exclude HF tests by default (they take ~1h) and tmp folder
+if [[ "$PYTEST_ARGS" == *"tests/huggingface"* ]]; then
+    echo "Running: $ECHO_PREFIX $PYTEST_ARGS --ignore=tests/tmp"
+    exec "${PY_CMD_PREFIX[@]}" $PYTEST_ARGS --ignore=tests/tmp
+else
+    echo "Running: $ECHO_PREFIX $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface --ignore=tests/vertical"
+    exec "${PY_CMD_PREFIX[@]}" $PYTEST_ARGS --ignore=tests/tmp --ignore=tests/huggingface --ignore=tests/vertical
+fi

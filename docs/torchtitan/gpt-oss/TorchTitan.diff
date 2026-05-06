@@ -1,0 +1,337 @@
+diff --git a/torchtitan/models/gpt_oss/__init__.py b/torchtitan/models/gpt_oss/__init__.py
+index 0ebc2064..daf85959 100644
+--- a/torchtitan/models/gpt_oss/__init__.py
++++ b/torchtitan/models/gpt_oss/__init__.py
+@@ -28,10 +28,9 @@ __all__ = [
+ 
+ gptoss_configs = {
+     "debugmodel": GptOssModelArgs(
+-        dim=256,
+-        n_layers=4,
++        n_layers=1,
+         moe_args=MoEArgs(
+-            num_experts=8,
++            num_experts=32,
+             num_shared_experts=0,
+             score_func="softmax",
+             route_norm=False,
+@@ -42,6 +41,7 @@ gptoss_configs = {
+             load_balance_coeff=1e-3,
+         ),
+         attn_mask_type="causal",
++        vocab_size=8192,
+     ),
+     "20b": GptOssModelArgs(
+         n_layers=24,
+diff --git a/torchtitan/models/gpt_oss/infra/parallelize.py b/torchtitan/models/gpt_oss/infra/parallelize.py
+index 338092fb..e97bd86b 100644
+--- a/torchtitan/models/gpt_oss/infra/parallelize.py
++++ b/torchtitan/models/gpt_oss/infra/parallelize.py
+@@ -217,8 +217,8 @@ def apply_non_moe_tp(
+                 input_layouts=(Shard(1), Shard(1), Shard(1)),
+                 desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
+                 use_local_input=True,
+-                output_layouts=(Shard(1), Shard(1)),
+-                desired_output_layouts=(Shard(1), Shard(1)),
++                output_layouts=Shard(1),
++                desired_output_layouts=Shard(1),
+                 use_local_output=False,
+             ),
+             "attention.wo": RowwiseParallel(output_layouts=Shard(1)),
+diff --git a/torchtitan/models/gpt_oss/model/args.py b/torchtitan/models/gpt_oss/model/args.py
+index 2a9aa970..77d39c68 100644
+--- a/torchtitan/models/gpt_oss/model/args.py
++++ b/torchtitan/models/gpt_oss/model/args.py
+@@ -15,7 +15,7 @@ from torchtitan.models.moe import MoEArgs
+ from torchtitan.models.utils import get_moe_model_nparams_and_flops
+ from torchtitan.protocols.train_spec import BaseModelArgs
+ from torchtitan.tools.logging import logger
+-from torchtitan.tools.utils import has_cuda_capability
++from torchtitan.tools.utils import has_cuda_capability, device_type
+ 
+ 
+ @dataclass
+@@ -80,7 +80,7 @@ class GptOssModelArgs(BaseModelArgs):
+             )
+         self.max_seq_len = seq_len
+ 
+-        if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0):
++        if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0) and "neuron" not in device_type:
+             logger.warning(
+                 "Failed to use grouped mm, which is only supported on SM90 or later",
+             )
+diff --git a/torchtitan/models/gpt_oss/model/model.py b/torchtitan/models/gpt_oss/model/model.py
+index 44e91f6f..ec223c20 100644
+--- a/torchtitan/models/gpt_oss/model/model.py
++++ b/torchtitan/models/gpt_oss/model/model.py
+@@ -14,6 +14,7 @@ from torchtitan.models.attention import (
+     get_causal_mask_mod,
+     get_document_mask_mod,
+     get_sliding_window_mask_mod,
++    ScaledDotProductAttentionWrapper,
+ )
+ from torchtitan.protocols.model import AttentionMasksType
+ from torchtitan.protocols.train_spec import ModelProtocol
+@@ -141,7 +142,7 @@ class Attention(nn.Module):
+             bias=True,
+         )
+         self.sinks = nn.Parameter(torch.empty(model_args.n_heads))
+-        self.inner_attention = FlexAttentionWrapper()
++        self.inner_attention = ScaledDotProductAttentionWrapper()
+ 
+     def init_weights(self, init_std: float):
+         linear_list = [
+@@ -190,15 +191,15 @@ class Attention(nn.Module):
+         xk = keys.transpose(1, 2).contiguous()
+         xv = values.transpose(1, 2).contiguous()
+ 
+-        assert isinstance(attention_masks, BlockMask), attention_masks
+-        output, lse = self.inner_attention(
+-            xq, xk, xv, block_mask=attention_masks, scale=None, return_lse=True
++        # assert isinstance(attention_masks, BlockMask), attention_masks
++        output = self.inner_attention(
++            xq, xk, xv
+         )
+ 
+         # Apply attention sink rescaling: rescale by σ(lse - w[h])
+         # This is mathematically equivalent to concatenating learnable sink weights
+-        sink_scale = torch.sigmoid(lse - self.sinks.view(1, -1, 1)).unsqueeze(-1)
+-        output = output * sink_scale.to(output.dtype)
++        # sink_scale = torch.sigmoid(lse - self.sinks.view(1, -1, 1)).unsqueeze(-1)
++        # output = output * sink_scale.to(output.dtype)
+ 
+         output = output.transpose(1, 2).contiguous()  # (B, H, T, D) -> (B, T, H, D)
+ 
+@@ -249,15 +250,15 @@ class TransformerBlock(nn.Module):
+             torch.Tensor: Output tensor with the same shape as the input.
+         """
+         # Extract the appropriate mask for this layer
+-        if self.use_sliding_attention:
+-            # pyrefly: ignore [missing-attribute]
+-            layer_mask = attention_masks.get("sliding_window_mask", None)
+-        else:
+-            # pyrefly: ignore [missing-attribute]
+-            layer_mask = attention_masks.get("basic_mask", None)
+-        assert layer_mask is not None
+-
+-        x = x + self.attention(self.attention_norm(x), rope_cache, layer_mask)
++        # if self.use_sliding_attention:
++        #     # pyrefly: ignore [missing-attribute]
++        #     layer_mask = attention_masks.get("sliding_window_mask", None)
++        # else:
++        #     # pyrefly: ignore [missing-attribute]
++        #     layer_mask = attention_masks.get("basic_mask", None)
++        # assert layer_mask is not None
++
++        x = x + self.attention(self.attention_norm(x), rope_cache, None)
+         x = x + self.moe(self.ffn_norm(x))
+         return x
+ 
+diff --git a/torchtitan/models/gpt_oss/model/moe.py b/torchtitan/models/gpt_oss/model/moe.py
+index f9f5b085..b3bb860c 100644
+--- a/torchtitan/models/gpt_oss/model/moe.py
++++ b/torchtitan/models/gpt_oss/model/moe.py
+@@ -83,7 +83,7 @@ def indices_padding_wrapper(func: Callable) -> Callable:
+ 
+ 
+ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
+-    x_glu, x_linear = x[..., ::2], x[..., 1::2]
++    x_glu, x_linear = x.split(x.shape[-1] // 2, -1)
+     # Clamp the input values
+     x_glu = x_glu.clamp(min=None, max=limit)
+     x_linear = x_linear.clamp(min=-limit, max=limit)
+diff --git a/torchtitan/models/gpt_oss/train_configs/20b_tp4_fac.toml b/torchtitan/models/gpt_oss/train_configs/20b_tp4_fac.toml
+new file mode 100644
+index 00000000..554aefbc
+--- /dev/null
++++ b/torchtitan/models/gpt_oss/train_configs/20b_tp4_fac.toml
+@@ -0,0 +1,82 @@
++[job]
++dump_folder = "./outputs"
++description = "Gpt-oss debug training"
++print_config = false
++
++[profiling]
++enable_profiling = true
++save_traces_folder = "profile_trace"
++profile_freq = 10
++enable_memory_snapshot = false
++save_memory_snapshot_folder = "memory_snapshot"
++
++[metrics]
++log_freq = 1
++disable_color_printing = false
++enable_tensorboard = false
++save_tb_folder = "tb"
++enable_wandb = false
++
++[model]
++name = "gpt_oss"
++flavor = "20b"
++# test folder with tokenizer.json, for debug purpose only
++hf_assets_path = "./tests/assets/tokenizer"
++# converters = ["float8"]
++
++[optimizer]
++name = "AdamW"
++lr = 8e-4
++eps = 1e-8
++
++[lr_scheduler]
++warmup_steps = 2  # lr scheduler warm up, normally 20% of the train steps
++decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
++decay_type = "linear"
++min_lr_factor = 0.0
++
++[training]
++local_batch_size = 1
++seq_len = 2048
++max_norm = 1.0  # grad norm clipping
++steps = 10
++dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
++
++[parallelism]
++data_parallel_replicate_degree = 1
++data_parallel_shard_degree = -1
++fsdp_reshard_after_forward = "default" # default / never / always
++tensor_parallel_degree = 4
++enable_async_tensor_parallel = false
++expert_parallel_degree = 1
++expert_tensor_parallel_degree = 1
++
++[checkpoint]
++enable = false
++folder = "checkpoint"
++interval = 10
++last_save_model_only = false
++export_dtype = "float32"
++async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
++
++[activation_checkpoint]
++mode = "full"  # ["none", "selective", "full"]
++selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
++
++[compile]
++enable = false
++components = ["model", "loss"]
++
++[quantize.linear.float8]
++enable_fsdp_float8_all_gather = false
++precompute_float8_dynamic_scale_for_fsdp = false
++filter_fqns = ["output", "router.gate"]
++
++[quantize.grouped_mm.float8]
++fqns = ["experts"]
++
++[validation]
++enable = false
++dataset = "c4_validation"
++freq = 5
++steps = 10
+diff --git a/torchtitan/models/gpt_oss/train_configs/debug_model.toml b/torchtitan/models/gpt_oss/train_configs/debug_model.toml
+index 82b9d0e2..9a5cc864 100644
+--- a/torchtitan/models/gpt_oss/train_configs/debug_model.toml
++++ b/torchtitan/models/gpt_oss/train_configs/debug_model.toml
+@@ -4,7 +4,7 @@ description = "Gpt-oss debug training"
+ print_config = false
+ 
+ [profiling]
+-enable_profiling = false
++enable_profiling = true
+ save_traces_folder = "profile_trace"
+ profile_freq = 10
+ enable_memory_snapshot = false
+@@ -36,7 +36,7 @@ decay_type = "linear"
+ min_lr_factor = 0.0
+ 
+ [training]
+-local_batch_size = 8
++local_batch_size = 1
+ seq_len = 2048
+ max_norm = 1.0  # grad norm clipping
+ steps = 10
+diff --git a/torchtitan/models/moe/utils.py b/torchtitan/models/moe/utils.py
+index fd9df3bb..c0c80230 100644
+--- a/torchtitan/models/moe/utils.py
++++ b/torchtitan/models/moe/utils.py
+@@ -12,8 +12,8 @@ from torchtitan.tools.utils import _round_up
+ 
+ from .kernels import generate_permute_indices
+ 
+-TOKEN_GROUP_ALIGN_SIZE_M = 8
+-ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
++TOKEN_GROUP_ALIGN_SIZE_M = 128
++ValidTokenGroupAlignmentSize = Literal[8, 16, 32, 128]
+ 
+ 
+ def set_token_group_alignment_size_m(
+@@ -45,12 +45,15 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+     padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
+     with torch.no_grad():
+         (permuted_indices, num_tokens_per_expert, _offsets,) = generate_permute_indices(
+-            num_tokens_per_expert,
++            num_tokens_per_expert.cpu(),
+             num_local_experts,
+             ep_degree,
+             padded_max_len,
+             TOKEN_GROUP_ALIGN_SIZE_M,
++            use_cpu=True,
+         )
++        permuted_indices = permuted_indices.neuron()
++        num_tokens_per_expert = num_tokens_per_expert.neuron()
+ 
+     x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+     input_shape = x.shape
+@@ -62,7 +65,7 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+ def _unpermute(out, input_shape, permuted_indices):
+     out_unpermuted = out.new_empty(input_shape)
+     out_unpermuted[permuted_indices, :] = out
+-    out = out_unpermuted[:-1]
++    out = out_unpermuted.split(out_unpermuted.shape[0] - 1)[0]
+     return out
+ 
+ 
+diff --git a/torchtitan/tools/utils.py b/torchtitan/tools/utils.py
+index 6af30cd1..af22f598 100644
+--- a/torchtitan/tools/utils.py
++++ b/torchtitan/tools/utils.py
+@@ -129,6 +129,9 @@ def get_peak_flops(device_name: str) -> float:
+     elif "l40s" in device_name:
+         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
+         return 362e12
++    elif "neuron" in device_name:
++        # Trainium2 LNC2: 128x128 systolic array, 2.4GHz, BF16
++        return 157e12
+ 
+     else:  # for other GPU types, assume A100
+         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
+diff --git a/torchtitan/train.py b/torchtitan/train.py
+index fc7514ca..562c8167 100644
+--- a/torchtitan/train.py
++++ b/torchtitan/train.py
+@@ -4,6 +4,12 @@
+ # This source code is licensed under the BSD-style license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++# Workaround for PyTorch bugs:
++# https://github.com/pytorch/pytorch/issues/145498
++# https://github.com/pytorch/pytorch/issues/155588
++import torch.nn as nn
++nn.init.trunc_normal_ = lambda tensor, mean=0.0, std=1.0, a=-2.0, b=2.0, generator=None: nn.init.normal_(tensor, mean, std, generator)
++
+ import dataclasses
+ import importlib
+ import json
+@@ -464,11 +470,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
+         attn_type = getattr(self.model_args, "attn_type", "sdpa")
+         if attn_type in ["flex", "varlen"]:
+             # pyrefly: ignore [not-callable]
+-            extra_kwargs["attention_masks"] = self.model_parts[0].get_attention_masks(
+-                input_batch=inputs,
+-                tokenizer=self.tokenizer,
+-                extra_inputs=extra_inputs,
+-            )
++            extra_kwargs["attention_masks"] = None
+ 
+         if self.parallel_dims.cp_enabled:
+             inputs, labels, extra_kwargs = prepare_context_parallel_input(

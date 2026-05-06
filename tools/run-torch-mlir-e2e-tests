@@ -1,0 +1,27 @@
+#!/bin/bash
+# Run torch-mlir E2E tests using the fx_importer_stablehlo backend.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_ROOT"
+
+# Find built torch-mlir artifacts: prefer local build, fall back to Docker image path
+TORCH_MLIR_ROOT="${PROJECT_ROOT}/third_party/torch-mlir"
+if [ ! -f "${TORCH_MLIR_ROOT}/python/torch_mlir/_mlir_libs/_mlir.so" ]; then
+    # In CI, the Docker image builds artifacts at /opt/torch-neuronx-pr/
+    TORCH_MLIR_ROOT="/opt/torch-neuronx-pr/third_party/torch-mlir"
+fi
+if [ ! -f "${TORCH_MLIR_ROOT}/python/torch_mlir/_mlir_libs/_mlir.so" ]; then
+    echo "ERROR: _mlir.so not found. Run ./tools/build first."
+    exit 1
+fi
+
+export PYTHONPATH="${TORCH_MLIR_ROOT}/python:${TORCH_MLIR_ROOT}/projects/pt1/python:${TORCH_MLIR_ROOT}/projects/pt1:${PYTHONPATH:-}"
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
+echo "Running torch-mlir E2E tests (fx_importer_stablehlo)..."
+uv pip install multiprocess torchvision 2>/dev/null || pip install multiprocess torchvision 2>/dev/null || true
+python3 -m e2e_testing.main -c fx_importer_stablehlo -v "$@"
