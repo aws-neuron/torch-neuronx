@@ -1,0 +1,187 @@
+#!/bin/bash
+
+# Script to compile and run NeuronDevice C++ unit tests
+#
+# Usage:
+#   ./run_cpp_tests.sh [options] [test_name]
+#
+# Options:
+#   -v, --verbose     Show verbose test output
+#   -r, --rebuild     Clean and rebuild before testing
+#   -h, --help        Show this help message
+#
+# Examples:
+#   ./run_cpp_tests.sh                         # Run all C++ tests
+#   ./run_cpp_tests.sh NeuronDeviceTest        # Run specific test
+#   ./run_cpp_tests.sh -v                      # Run all tests with verbose output
+#   ./run_cpp_tests.sh -r NeuronDeviceTest     # Rebuild and run specific test
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+BUILD_DIR="${BUILD_DIR:-build}"
+
+echo -e "${BOLD}${YELLOW}Building and running torch_neuronx C++ unit tests...${NC}"
+
+# Function to print a header
+print_header() {
+    local message="$1"
+    echo ""
+    echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}  $message${NC}"
+    echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Function to print test results summary
+print_test_summary() {
+    local exit_code=$1
+    echo ""
+    echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${BOLD}${GREEN}  ALL TESTS PASSED!${NC}"
+        echo -e "${GREEN}  Test execution completed successfully!${NC}"
+    else
+        echo -e "${BOLD}${RED}  SOME TESTS FAILED!${NC}"
+        echo -e "${RED}  Please check the output above for details.${NC}"
+    fi
+    echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Check if GTest and GMock are available
+GTEST_FOUND=false
+GMOCK_FOUND=false
+
+if pkg-config --exists gtest 2>/dev/null || find /usr -name "libgtest*" 2>/dev/null | grep -q libgtest; then
+    GTEST_FOUND=true
+fi
+
+if pkg-config --exists gmock 2>/dev/null || find /usr -name "libgmock*" 2>/dev/null | grep -q libgmock; then
+    GMOCK_FOUND=true
+fi
+
+if ! $GTEST_FOUND || ! $GMOCK_FOUND; then
+    echo -e "${YELLOW}GTest or GMock not found. Installing dependencies...${NC}"
+    "$SCRIPT_DIR/install-cpp-test-dependencies"
+fi
+
+# Parse arguments
+VERBOSE=false
+REBUILD=false
+TEST_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -r|--rebuild)
+            REBUILD=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS] [TEST_NAME]"
+            echo ""
+            echo "Options:"
+            echo "  -v, --verbose    Show verbose test output"
+            echo "  -r, --rebuild    Clean and rebuild before testing"
+            echo "  -h, --help       Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0                           # Run all C++ tests"
+            echo "  $0 NeuronDeviceTest          # Run specific test"
+            echo "  $0 -v                        # Run all tests with verbose output"
+            echo "  $0 -r NeuronDeviceTest       # Rebuild and run specific test"
+            exit 0
+            ;;
+        *)
+            TEST_FILTER="$1"
+            shift
+            ;;
+    esac
+done
+
+# Rebuild if requested
+if [ "$REBUILD" = true ]; then
+    echo "Cleaning and rebuilding..."
+    rm -rf "$BUILD_DIR"
+fi
+
+# Configure if build directory doesn't exist
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "Configuring CMake..."
+    cmake -S . -B "$BUILD_DIR" -DBUILD_TESTS=ON
+fi
+
+# Build tests
+echo "Building C++ tests..."
+if [ -n "$TEST_FILTER" ]; then
+    cmake --build "$BUILD_DIR" --target "$TEST_FILTER" -j$(nproc)
+else
+    cmake --build "$BUILD_DIR" -j$(nproc)
+fi
+
+
+if [ -n "$TEST_FILTER" ]; then
+    # Run specific test executable
+    print_header "Configuring CMake"
+    cmake -S . -B "$BUILD_DIR" -DBUILD_TESTS=ON
+fi
+
+print_header "Building Tests"
+if [ -n "$TEST_FILTER" ]; then
+    echo -e "${YELLOW}Building specific test: ${BOLD}$TEST_FILTER${NC}"
+    cmake --build "$BUILD_DIR" --target "$TEST_FILTER" -j$(nproc)
+else
+    echo -e "${YELLOW}Building all C++ tests...${NC}"
+    cmake --build "$BUILD_DIR" -j$(nproc)
+fi
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Build successful!${NC}"
+else
+    echo -e "${RED}Build failed!${NC}"
+    exit 1
+fi
+
+print_header "Running Tests"
+
+# Store test result for summary
+TEST_EXIT_CODE=0
+
+if [ -n "$TEST_FILTER" ]; then
+    # Run specific test executable
+    echo -e "${YELLOW}Running test: ${BOLD}$TEST_FILTER${NC}"
+    if [ "$VERBOSE" = true ]; then
+        "./$BUILD_DIR/$TEST_FILTER" --gtest_color=yes
+    else
+        "./$BUILD_DIR/$TEST_FILTER" --gtest_color=yes --gtest_brief=1
+    fi
+    TEST_EXIT_CODE=$?
+else
+    # Run all tests via CTest
+    echo -e "${YELLOW}Running all tests via CTest...${NC}"
+    if [ "$VERBOSE" = true ]; then
+        CTEST_OUTPUT_ON_FAILURE=1 ctest --test-dir "$BUILD_DIR" --output-on-failure --verbose --progress --color=always
+    else
+        CTEST_OUTPUT_ON_FAILURE=1 ctest --test-dir "$BUILD_DIR" --output-on-failure --progress --color=always
+    fi
+    TEST_EXIT_CODE=$?
+fi
+
+# Print test summary
+print_test_summary $TEST_EXIT_CODE
+
+# Exit with the test result code
+exit $TEST_EXIT_CODE

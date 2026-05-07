@@ -1,0 +1,26 @@
+diff --git a/torchtitan/models/qwen3/infra/parallelize.py b/torchtitan/models/qwen3/infra/parallelize.py
+index be963bee..0f1b29f9 100644
+--- a/torchtitan/models/qwen3/infra/parallelize.py
++++ b/torchtitan/models/qwen3/infra/parallelize.py
+@@ -37,6 +37,7 @@ from torchtitan.tools.logging import logger
+
+ # for selective op activation checkpointing
+ _op_sac_save_list = {
++    torch.ops.aten.linear.default,
+     torch.ops.aten.mm.default,
+     torch.ops.aten._scaled_dot_product_efficient_attention.default,
+     torch.ops.aten._scaled_dot_product_flash_attention.default,
+diff --git a/torchtitan/tools/utils.py b/torchtitan/tools/utils.py
+index 6af30cd1..caa88056 100644
+--- a/torchtitan/tools/utils.py
++++ b/torchtitan/tools/utils.py
+@@ -129,6 +129,9 @@ def get_peak_flops(device_name: str) -> float:
+     elif "l40s" in device_name:
+         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
+         return 362e12
++    elif "neuron" in device_name:
++        # we assume lnc2 here
++        return 157e12
+
+     else:  # for other GPU types, assume A100
+         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")

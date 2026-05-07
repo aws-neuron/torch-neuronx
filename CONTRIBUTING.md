@@ -1,59 +1,163 @@
-# Contributing Guidelines
+# Contributing guidelines
 
-Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
-documentation, we greatly value feedback and contributions from our community.
+## Response Times
 
-Please read through this document before submitting any issues or pull requests to ensure we have all the necessary
-information to effectively respond to your bug report or contribution.
+| Category | Target Response Time |
+|----------|---------------------|
+| Issues | 1 week |
+| External pull requests | 2 weeks |
+| Security vulnerabilities | 48 hours |
 
+If you haven't received a response within these timeframes, feel free to ping the thread.
 
-## Reporting Bugs/Feature Requests
+## AI Contribution Policy
 
-We welcome you to use the GitHub issue tracker to report bugs or suggest features.
+- All pull requests must reference an actionable issue.
+- AI-generated code is welcome, but the contributor is fully responsible for its correctness, testing, and compliance with project guidelines.
 
-When filing an issue, please check existing open, or recently closed, issues to make sure somebody else hasn't already
-reported the issue. Please try to include as much information as you can. Details like these are incredibly useful:
+## Setup Development Environment
 
-* A reproducible test case or series of steps
-* The version of our code being used
-* Any modifications you've made relevant to the bug
-* Anything unusual about your environment or deployment
+```sh
+# Clone the repository
+git clone <repository-url>
 
+# Install prerequisites
+# Installs necessary drivers and bazel (See BAZEL_BUILD.md)
+./prerequisites.sh
 
-## Contributing via Pull Requests
-Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
+# Create and activate virtual environment
+uv venv
+source .venv/bin/activate
 
-1. You are working against the latest source on the *main* branch.
-2. You check existing open, and recently merged, pull requests to make sure someone else hasn't addressed the problem already.
-3. You open an issue to discuss any significant work - we would hate for your time to be wasted.
+#If permission are needed, execute below command
+chmod +x ./tools/*
 
-To send us a pull request, please:
+#Perform the build
+./tools/build
 
-1. Fork the repository.
-2. Modify the source; please focus on the specific change you are contributing. If you also reformat all the code, it will be hard for us to focus on your change.
-3. Ensure local tests pass.
-4. Commit to your fork using clear commit messages.
-5. Send us a pull request, answering any default questions in the pull request interface.
-6. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
+## Install neuron compiler from neuron repo
+uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
+uv pip install 'nki==0.3.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
-GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
-[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
+# Install development dependencies including Ruff
+uv pip install ruff
 
+# Install pre-commit hooks
+uv pip install pre-commit
+pre-commit install
+```
 
-## Finding contributions to work on
-Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
+> [!NOTE]
+> **Why `uv pip` instead of `pip`?** Virtual environments created by `uv` don't include `pip` by default. When your venv is activated, running `pip` will use the system pip (`/usr/bin/pip`) instead of the venv's. Always use `uv pip` for installing packages, or install pip into the venv with `uv pip install pip`.
 
+> [!NOTE]
+> **When to use `uv run`?** Use `uv run <command>` when your venv is **not activated** — it automatically finds the venv in current dir and runs the command inside it. If your venv is already activated (check with `echo $VIRTUAL_ENV`), you can run commands directly without `uv run`. Keep in mind that `uv run` looks for `.venv` in the current or parent directories, so it may fail if your venv is located elsewhere.
 
-## Code of Conduct
-This project has adopted the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct).
-For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq) or contact
-opensource-codeofconduct@amazon.com with any additional questions or comments.
+### Building and Testing
 
+**Build only:**
+```sh
+./tools/build
+```
 
-## Security issue notifications
-If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
+**Build and generate wheel:**
+```sh
+./tools/build --wheel
+```
 
+**Build documentation:**
+```sh
+uv sync --group docs
+./tools/build --docs
+```
+Documentation will be generated in `build/docs/html/`.
 
-## Licensing
+**Generate wheel only (after build):**
+```sh
+USE_BAZEL=1 python setup.py bdist_wheel release
+```
 
-See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+**Python tests:**
+```sh
+# Run all tests in parallel
+./tools/build-and-test-parallel
+
+# Run all tests sequentially
+./tools/build-and-test
+
+# Run specific test
+./tools/run-test device/test_device.py
+
+# Pass pytest options
+./tools/run-test device/test_device.py -v
+```
+
+**C++ tests:**
+```sh
+# Run all C++ unit tests
+./tools/run-cpp-test
+
+# Run specific test
+./tools/run-cpp-test  //tests/csrc:KernelExecutionTest
+
+# Verbose output
+./tools/run-cpp-test -v
+
+# Rebuild and test
+./tools/run-cpp-test -r
+
+# To run the profiler test suite.
+./tools/run-cpp-test //:ProfilerTests
+```
+
+### Test Reports and Coverage
+
+> [!NOTE]
+> Currently all sync tests are running with the flag `NEURON_LAUNCH_BLOCKING=1`
+
+```sh
+./tools/run-test-parallel                              # HTML reports (default)
+./tools/run-test-parallel --coverage                   # With coverage analysis
+./tools/run-test-parallel --skip-distributed           # Skip distributed tests
+./tools/run-test-parallel --coverage --skip-distributed
+```
+
+**Reports:** `test-reports/report.html`, `test-reports/coverage/index.html`
+
+### Huggingface Tests
+
+Tests top 50 Causal-LM models. Excluded by default (must specify path explicitly):
+
+```sh
+./tools/run-test tests/huggingface                    # All HF tests
+./tools/run-test tests/huggingface/test_hf_models.py  # Specific test
+./tools/run-test-parallel tests/huggingface           # Parallel
+```
+
+### Linting and Formatting
+
+```sh
+uv run ruff check .                            # Check linting
+uv run ruff check . --fix                       # Auto-fix
+uv run ruff format .                           # Format Python
+clang-format -i torch_neuronx/csrc/**/*.cpp     # Format C++
+uv run pre-commit run --all-files               # Run all checks
+```
+
+## Expand op coverage
+
+There are two ways to find what ops to implement:
+
+1. **Generate a HTML table of categorized aten ops**: This shows all aten ops with core ops highlighted and already implemented ops struck out.
+   ```sh
+   uv run python ./tools/aten-functions.py \
+       --yaml-path ~/pytorch/aten/src/ATen/native/native_functions.yaml \
+       --html-table \
+       > ops.html
+   ```
+
+Once you pick the op to implement, follow [docs/new_op.md](docs/new_op.md) to implement it.
+
+## How to enable, use and contribute to torch_neuronx statistics
+
+Statistics/metrics are great to get tools to get information about the execution and helps the users debug difficult problems like OOMs, long compilation time, etc. To know more follow the [TorchNeuronX Statistics README](docs/torch_neuronx_stats_readme.md)

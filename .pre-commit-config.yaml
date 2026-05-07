@@ -1,0 +1,28 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+        exclude: ^(torch_neuronx/protos/|third_party/)
+      - id: ruff-format
+        exclude: ^(tests/pytorch_tests/clone_tests\.py$|third_party/)
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.0
+    hooks:
+      - id: clang-format
+        files: \.(cpp|h|hpp|cc|cxx)$
+        exclude: ^third_party/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(torch_neuronx/protos/|third_party/)|\.diff$
+      - id: end-of-file-fixer
+        exclude: ^(torch_neuronx/protos/|third_party/)
+      - id: check-yaml
+      - id: check-added-large-files
+        exclude: ^third_party/
+      - id: pretty-format-json
+        args: [--autofix]
