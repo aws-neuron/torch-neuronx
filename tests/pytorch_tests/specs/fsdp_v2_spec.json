@@ -1,0 +1,229 @@
+{
+  "test_configurations": [
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_training.py",
+      "sanity_methods": [
+        "test_train_parity_single_group_shard_dim0",
+        "test_explicit_prefetching",
+        "test_2d_mlp_with_nd_mesh"
+      ],
+      "xfail": [
+        {
+          "reason": "Multiple failures - CUDA driver missing, tensor comparison mismatches, device assignment errors, unsupported operations",
+          "tests": [
+            "test_train_parity_with_activation_checkpointing",
+            "test_3d_mlp_with_nd_mesh",
+            "test_gradient_accumulation",
+            "test_param_registration_after_backward",
+            "test_param_registration_after_forward",
+            "test_root_move_forward_input_to_device"
+          ]
+        },
+        {
+          "reason": "Timeout/hang during multi-group CPU offload",
+          "tests": [
+            "test_train_parity_multi_group_cpu_offload_eager"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_frozen.py"
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_state.py",
+      "sanity_methods": [
+        "test_fully_shard_deepcopy",
+        "test_fully_shard_state",
+        "test_fully_shard_reapply"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_state_dict.py",
+      "sanity_methods": [
+        "test_dp_state_dict_save_load",
+        "test_rank0_offload_full_state_dict"
+      ],
+      "xfail": [
+        {
+          "reason": "State dict correctness failures and tensor comparison mismatches",
+          "tests": [
+            "test_hsdp_tp_state_dict_save_load"
+          ]
+        },
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: Torch not compiled with CUDA enabled",
+          "tests": [
+            "test_cached_state_dict"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_overlap.py",
+      "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: timing assertion failures",
+          "tests": [
+            "test_fully_shard_post_optim_event_overlap"
+          ]
+        },
+        {
+          "reason": "Flaky performance test - assertLessEqual timing comparison fails intermittently on Neuron",
+          "tests": [
+            "test_fully_shard_training_overlap"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_mixed_precision.py",
+      "xfail": [
+        {
+          "reason": "Mixed precision and dtype handling failures",
+          "tests": [
+            "test_norm_modules_bf16",
+            "test_norm_modules_fp16"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_memory.py",
+      "xfail": [
+        {
+          "reason": "Memory management failures",
+          "tests": [
+            "test_fully_shard_del_memory",
+            "test_fully_shard_training_memory"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_logging.py",
+      "xfail": [
+        {
+          "reason": "Logging functionality failure",
+          "tests": [
+            "test_fsdp_logging"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_init.py",
+      "skip_tests": [
+        {
+          "reason": "Running tests separately in test_fully_shard_meta_device_init.py",
+          "tests": [
+            "test_1d_process_group_init",
+            "test_2d_process_group_init"
+          ]
+        },
+        {
+          "reason": "Test only checks PyTorch error message, does not run any workload on Neuron",
+          "tests": [
+            "test_move_states_to_device_dtensor_invalid"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Initialization failures with various sharding configurations",
+          "tests": [
+            "test_rank0_broadcast_meta_device_init",
+            "test_mixed_dtypes_no_grad_param",
+            "test_raise_noncontiguous_parameter"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_ignore_params.py",
+      "sanity_methods": [
+        "test_ddp_A_fsdp_B_ddp_C"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_grad_scaler.py",
+      "sanity_methods": [
+        "test_1f1b_microbatching"
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_extensions.py",
+      "skip_tests": [
+        {
+          "reason": "NRT stream cleanup heap corruption on error path - process hangs during shutdown",
+          "tests": [
+            "test_all_gather_extension_outer_size_stride"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Extension functionality failures",
+          "tests": [
+            "test_all_gather_extensions_monkey_patch",
+            "test_all_gather_extensions_train_parity"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_comm.py",
+      "skip_tests": [
+        {
+          "reason": "NCCL log comparison does not apply to Neuron",
+          "tests": [
+            "test_fully_shard_force_sum_both_reductions",
+            "test_fully_shard_force_sum_reduce_scatter",
+            "test_fully_shard_alloc_from_pg"
+          ]
+        },
+        {
+          "reason": "Replaced by neuron specific test in fsdp_v2/test_fully_shard_comm.py",
+          "tests": [
+            "test_unshard_without_lazy_init"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "Communication and reduction operation failures",
+          "tests": [
+            "test_fully_shard_communication_count",
+            "test_all_gather_fp32",
+            "test_manual_reshard_with_reshard_after_forward_false",
+            "test_set_reshard_after_forward"
+          ]
+        },
+        {
+          "reason": "PyTorch 2.9.1 breaking change: init_device_mesh requires mesh_dim_names for world_size=1. Test imports init_device_mesh at module level before patches can be applied.",
+          "tests": [
+            "test_size1_reduceop"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_clip_grad_norm_.py",
+      "xfail": [
+        {
+          "reason": "[TODO-FIX post Beta] AssertionError: Scalars are not equal!",
+          "tests": [
+            "test_clip_grad_norm_2d"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "distributed/_composable/fsdp/test_fully_shard_autograd.py",
+      "sanity_methods": [
+        "test_nontensor_activations",
+        "test_unused_forward_module"
+      ]
+    }
+  ]
+}

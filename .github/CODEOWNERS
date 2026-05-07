@@ -1,0 +1,62 @@
+# torch-neuronx Code Owners
+# Converted from CODE_APPROVERS.yaml
+#
+# GitHub CODEOWNERS uses last-match-wins, so the catch-all goes FIRST
+# and more specific rules override it below.
+#
+# Owners: @aws-singhada, @galaind
+# Override approvers: @aws-rhsoln, @indhub
+#
+# Teams must exist as GitHub teams under the org. Adjust @org/ prefix
+# to match your actual GitHub organization name.
+
+# -- Catch-all --
+*                                                   @aws-neuron/torch-neuronx-approvers
+
+# -- CODEOWNERS itself --
+CODEOWNERS                                          @aws-singhada @galaind
+
+# -- C++ Runtime (default for csrc; SMEs override below) --
+torch_neuronx/csrc/                                 @aws-neuron/torch-runtime-approvers
+
+# -- Profiler --
+torch_neuronx/csrc/profiler/                        @aws-neuron/torch-profiler-approvers
+
+# -- Ops (aten, csrc/ops, python_ops, NKI kernels) --
+torch_neuronx/csrc/aten/                            @aws-neuron/torch-ops-approvers
+torch_neuronx/csrc/ops/                             @aws-neuron/torch-ops-approvers
+torch_neuronx/python_ops/                           @aws-neuron/torch-ops-approvers
+torch_neuronx/kernels/                              @aws-neuron/torch-ops-approvers
+
+# -- Eager (amp) --
+torch_neuronx/csrc/amp/                             @aws-neuron/torch-neuronx-approvers
+
+# -- c10 (distributed) --
+torch_neuronx/csrc/c10/                             @aws-neuron/torch-distributed-approvers
+
+# -- Distributed (catches torch_neuronx/distributed/ and torch_neuronx/csrc/distributed/) --
+/torch_neuronx/**/distributed/                      @aws-neuron/torch-distributed-approvers
+
+# -- Dynamo / Compile --
+torch_neuronx/neuron_dynamo_backend/                @aws-neuron/torch-compile-approvers
+
+# -- Tests (catch-all for unowned test dirs) --
+tests/**                                            @aws-neuron/torch-tests-approvers
+
+# -- Tests: SME-specific test directories --
+tests/csrc/                                         @aws-neuron/torch-runtime-approvers
+tests/profiler/                                     @aws-neuron/torch-profiler-approvers
+tests/operations/                                   @aws-neuron/torch-ops-approvers
+tests/python_ops/                                   @aws-neuron/torch-ops-approvers
+tests/kernels/                                      @aws-neuron/torch-ops-approvers
+tests/nki/                                          @aws-neuron/torch-ops-approvers
+tests/distributed/                                  @aws-neuron/torch-distributed-approvers
+tests/neuron_dynamo_backend/                        @aws-neuron/torch-compile-approvers
+
+# -- Build Infra --
+bazel/                                              @aws-neuron/torch-infra-approvers
+build-tools/                                        @aws-neuron/torch-infra-approvers
+CMakeLists.txt                                      @aws-neuron/torch-infra-approvers
+setup.py                                            @aws-neuron/torch-infra-approvers
+pyproject.toml                                      @aws-neuron/torch-infra-approvers
+*.sh                                                @aws-neuron/torch-infra-approvers

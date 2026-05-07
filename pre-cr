@@ -1,0 +1,8 @@
+#!/bin/bash
+
+pre-commit run --all-files || {
+    echo "Pre-commit checks failed! Run 'pre-commit run --all-files' to see details. Fix errors and try again"
+    exit 1
+}
+
+echo "Pre-commit checks passed!"

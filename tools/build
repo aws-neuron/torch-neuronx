@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# Build torch-neuronx extension
+# Usage: ./tools/build [--wheel] [--python VERSION] [--docs] [release]
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Supported Python versions
+SUPPORTED_VERSIONS="3.10 3.11 3.12 3.13"
+
+# Parse arguments
+BUILD_WHEEL=0
+BUILD_DOCS=0
+RELEASE_FLAG=""
+PYTHON_VERSION="${PYTHON_VERSION:-$(cat .python-version)}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --python)
+            PYTHON_VERSION="$2"
+            shift 2
+            ;;
+        --wheel)
+            BUILD_WHEEL=1
+            shift
+            ;;
+        --docs)
+            BUILD_DOCS=1
+            shift
+            ;;
+        release)
+            RELEASE_FLAG="release"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: ./tools/build [--wheel] [--python VERSION] [--docs] [release]"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate Python version
+if [[ ! " $SUPPORTED_VERSIONS " =~ " $PYTHON_VERSION " ]]; then
+    echo "Error: Unsupported Python version: $PYTHON_VERSION"
+    echo "Supported versions: $SUPPORTED_VERSIONS"
+    exit 1
+fi
+
+# Export for setup.py
+export PYTHON_VERSION
+
+echo "Building torch-neuronx for Python $PYTHON_VERSION..."
+
+# Decide how to run python (prefer uv if available)
+if [ -n "$VIRTUAL_ENV" ]; then
+    RUNNER=(python)
+elif command -v uv >/dev/null 2>&1; then
+    RUNNER=(uv run python)
+else
+    RUNNER=(python)
+fi
+
+# Build extension
+if ! USE_BAZEL=1 "${RUNNER[@]}" setup.py build_ext --quiet > /dev/null; then
+    echo "Build failed! Running verbose build to show errors..."
+    USE_BAZEL=1 "${RUNNER[@]}" setup.py build_ext
+    exit 1
+fi
+
+# Generate wheel (optional)
+if [[ "$BUILD_WHEEL" == "1" ]]; then
+    echo "Generating wheel for Python $PYTHON_VERSION..."
+    if ! USE_BAZEL=1 "${RUNNER[@]}" setup.py bdist_wheel $RELEASE_FLAG --quiet; then
+        echo "Wheel generation failed! Running verbose wheel build to show errors..."
+        USE_BAZEL=1 "${RUNNER[@]}" setup.py bdist_wheel $RELEASE_FLAG
+        exit 1
+    fi
+    echo "Wheel generation completed successfully!"
+    echo "Wheel available in: dist/"
+fi
+
+# Build documentation (optional)
+if [[ "$BUILD_DOCS" == "1" ]]; then
+    echo "Building documentation..."
+    if ! command -v sphinx-build >/dev/null 2>&1; then
+        echo "Error: sphinx-build not found."
+        echo "Activate the virtual environment and re-run"
+        exit 1
+    fi
+    if ! sphinx-build -M html docs/src build/docs -q; then
+        echo "Documentation build failed!"
+        exit 1
+    fi
+    echo "Documentation built successfully!"
+    echo "HTML available in: build/docs/html/"
+fi
+
+if [[ "$BUILD_WHEEL" == "0" && "$BUILD_DOCS" == "0" ]]; then
+    echo "To generate a wheel: ./tools/build --wheel [--python VERSION]"
+    echo "To build documentation: ./tools/build --docs"
+fi

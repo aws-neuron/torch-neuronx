@@ -1,0 +1,143 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Also available under a BSD-style license. See LICENSE.
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
+#include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
+#include "torch-mlir/Dialect/Torch/Utils/Utils.h"
+
+using namespace mlir;
+using namespace mlir::torch;
+using namespace mlir::torch::Torch;
+namespace mlir::torch::Torch {
+
+#define GEN_PASS_DEF_MATCHQUANTIZEDCUSTOMOPS
+#include "torch-mlir/Dialect/Torch/Transforms/Passes.h.inc"
+
+namespace {
+
+Type getQuantizedType(MLIRContext *context, Type t) {
+  if (t.isSignlessInteger(8) || t.isUnsignedInteger(8))
+    return Torch::QUInt8Type::get(context);
+  if (t.isInteger(8) || t.isSignedInteger(8))
+    return Torch::QInt8Type::get(context);
+  if (t.isInteger(16))
+    return Torch::QInt16Type::get(context);
+  if (t.isInteger(32))
+    return Torch::QInt32Type::get(context);
+  return {};
+}
+
+class MatchQuantizeOperator : public OpRewritePattern<OperatorOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(OperatorOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getName() == "torch.quantized_decomposed.quantize_per_tensor") {
+      auto resultTy = cast<ValueTensorType>(op.getType(0));
+      auto qeTy = getQuantizedType(rewriter.getContext(), resultTy.getDtype());
+      if (!qeTy)
+        qeTy = resultTy.getDtype();
+
+      auto qTy =
+          rewriter.getType<ValueTensorType>(resultTy.getOptionalSizes(), qeTy);
+      Value quant = AtenQuantizePerTensorOp::create(
+          rewriter, op.getLoc(), qTy,
+          /*self=*/op.getOperand(0), /*scale=*/op.getOperand(1),
+          /*zero_point=*/op.getOperand(2), /*dtype=*/op.getOperand(5));
+
+      if (qTy != resultTy) {
+        quant = AtenIntReprOp::create(rewriter, op.getLoc(), resultTy, quant);
+      }
+
+      rewriter.replaceOpWithNewOp<AtenClampOp>(
+          op, resultTy, quant, op.getOperand(3), op.getOperand(4));
+      return success();
+    }
+
+    auto prepareDequantize = [&](Value quantMin, Value quantMax, Value &clamp,
+                                 Type &qTy) {
+      clamp =
+          AtenClampOp::create(rewriter, op.getLoc(), op.getOperand(0).getType(),
+                              op.getOperand(0), quantMin, quantMax);
+
+      auto clampTy = cast<Torch::ValueTensorType>(clamp.getType());
+      if (!clampTy.hasDtype())
+        return rewriter.notifyMatchFailure(op,
+                                           "dequantization has unknown dtype");
+
+      Type dtype = clampTy.getDtype();
+      Type qetype = getQuantizedType(op.getContext(), dtype);
+      if (!qetype)
+        return rewriter.notifyMatchFailure(op,
+                                           "dequantization has unknown qtype");
+
+      qTy = Torch::ValueTensorType::get(op.getContext(),
+                                        clampTy.getOptionalSizes(), qetype);
+      return success();
+    };
+
+    if (op.getName() == "torch.quantized_decomposed.dequantize_per_tensor") {
+      Value clamp;
+      Type qTy;
+      if (failed(prepareDequantize(op.getOperand(3), op.getOperand(4), clamp,
+                                   qTy)))
+        return failure();
+
+      auto quant = Aten_MakePerTensorQuantizedTensorOp::create(
+          rewriter, op.getLoc(), qTy, clamp, op.getOperand(1),
+          op.getOperand(2));
+      rewriter.replaceOpWithNewOp<AtenDequantizeTensorOp>(
+          op, op.getResultTypes(), quant);
+      return success();
+    }
+
+    if (op.getName() == "torch.quantized_decomposed.dequantize_per_channel") {
+      Value clamp;
+      Type qTy;
+      if (failed(prepareDequantize(op.getOperand(4), op.getOperand(5), clamp,
+                                   qTy)))
+        return failure();
+      auto quant = Aten_MakePerChannelQuantizedTensorOp::create(
+          rewriter, op.getLoc(), qTy, clamp, op.getOperand(1), op.getOperand(2),
+          op.getOperand(3));
+      rewriter.replaceOpWithNewOp<AtenDequantizeSelfOp>(op, op.getResultTypes(),
+                                                        quant);
+      return success();
+    }
+
+    return failure();
+  }
+};
+
+class MatchQuantizedCustomOpsPass
+    : public impl::MatchQuantizedCustomOpsBase<MatchQuantizedCustomOpsPass> {
+public:
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.insert<MatchQuantizeOperator>(context);
+
+    GreedyRewriteConfig config;
+    if (failed(
+            applyPatternsGreedily(getOperation(), std::move(patterns), config)))
+      return signalPassFailure();
+  }
+};
+
+} // namespace
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+createMatchQuantizedCustomOpsPass() {
+  return std::make_unique<MatchQuantizedCustomOpsPass>();
+}
+
+} // namespace mlir::torch::Torch

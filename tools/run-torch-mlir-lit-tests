@@ -1,0 +1,27 @@
+#!/bin/bash
+# Run torch-mlir LIT tests via Bazel
+# These are MLIR FileCheck tests that verify pass correctness.
+#
+# Known failures are marked XFAIL in the test files themselves.
+# This script simply runs all tests and reports the results.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_ROOT"
+
+PYTHON_VERSION="${PYTHON_VERSION:-$(cat .python-version 2>/dev/null || echo 3.12)}"
+
+echo "Running torch-mlir LIT tests..."
+echo ""
+
+bazel test //third_party/torch-mlir/test/... \
+    --@rules_python//python/config_settings:python_version="$PYTHON_VERSION" \
+    --action_env=PYTHON_VERSION="$PYTHON_VERSION" \
+    --test_output=errors \
+    "$@"
+
+echo ""
+echo "torch-mlir LIT tests passed."
