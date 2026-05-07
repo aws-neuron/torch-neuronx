@@ -138,4 +138,10 @@ at::Tensor argsort_stable_neuron(const at::Tensor& self, bool stable, int64_t di
   return result_cpu.to(self.device());
 }
 
+at::Tensor view_as_real_neuron(const at::Tensor& self) { return at::native::view_as_real(self); }
+
+at::Tensor view_as_complex_neuron(const at::Tensor& self) {
+  return at::native::view_as_complex(self);
+}
+
 }  // namespace torch_neuronx

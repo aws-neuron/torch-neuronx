@@ -77,6 +77,15 @@ std::vector<TransformationType> TransformationRegistry::GetAllTypes() const {
 
 std::optional<TransformationCreationResult> TransformationRegistry::TryCreateAnyTransformation(
     const at::Tensor& input, const std::string& op_name, size_t input_index) const {
+  // Complex dtypes cannot be fused into transformation prologues — the compiler
+  // rejects complex in transpose/permute/slice ops. Return nullopt so the caller
+  // falls back to CPU contiguous in ProcessInputTransformations.
+  if (input.is_complex()) {
+    TORCH_NEURONX_DEBUG("TransformationRegistry: complex dtype → skipping transformation",
+                        " op=", op_name, " input_idx=", input_index);
+    return std::nullopt;
+  }
+
   // Ensure priority sorted list is up to date
   UpdatePrioritySortedTypes();
 

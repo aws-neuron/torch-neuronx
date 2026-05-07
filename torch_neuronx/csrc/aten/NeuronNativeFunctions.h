@@ -142,6 +142,10 @@ at::Tensor slice_backward_neuron(const at::Tensor& grad_output, c10::SymIntArray
 // argsort.stable
 at::Tensor argsort_stable_neuron(const at::Tensor& self, bool stable, int64_t dim, bool descending);
 
+// Complex/real view operations
+at::Tensor view_as_real_neuron(const at::Tensor& self);
+at::Tensor view_as_complex_neuron(const at::Tensor& self);
+
 void record_stream_neuron(at::Tensor& tensor, c10::Stream stream);
 
 }  // namespace torch_neuronx

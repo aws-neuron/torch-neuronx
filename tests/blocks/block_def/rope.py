@@ -164,3 +164,50 @@ class RoPEBlockHF(nn.Module):
 
         # Transpose back to original format
         return xq_out.transpose(1, 2), xk_out.transpose(1, 2)
+
+
+# ============================================================================
+# Complex Multiplication Implementation (Llama3/4 style)
+# ============================================================================
+
+
+def precompute_freqs_cis(dim: int, max_seq_len: int, base: float = 1_000_000.0) -> torch.Tensor:
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(max_seq_len, dtype=freqs.dtype, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+
+def apply_rotary_emb_complex(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    ndim = xq_.ndim
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(xq_.shape)]
+    freqs = freqs_cis[: xq_.shape[1]].view(*shape)
+    xq_out = torch.view_as_real(xq_ * freqs).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+class RoPEBlockComplex(nn.Module):
+    def __init__(self, head_dim, max_seq_len, rope_theta):
+        super().__init__()
+        self.register_buffer(
+            "freqs_cis", precompute_freqs_cis(head_dim, max_seq_len, rope_theta), persistent=False
+        )
+
+    def _apply(self, fn, recurse=True):
+        """Override _apply to preserve complex dtype on freqs_cis."""
+        super()._apply(fn, recurse)
+        # Restore complex64 if .to(dtype=bf16) cast it
+        if self.freqs_cis.dtype != torch.complex64:
+            self.freqs_cis = precompute_freqs_cis(
+                self.freqs_cis.shape[1] * 2,
+                self.freqs_cis.shape[0],
+            ).to(self.freqs_cis.device)
+        return self
+
+    def forward(self, xq, xk):
+        return apply_rotary_emb_complex(xq, xk, self.freqs_cis)
