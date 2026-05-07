@@ -100,7 +100,7 @@ bool IsSupportedDtype(c10::ScalarType dt) {
   if (dt == c10::ScalarType::Long) return IsNativeInt64Enabled();
   return dt == c10::ScalarType::Float || dt == c10::ScalarType::Half ||
          dt == c10::ScalarType::BFloat16 || dt == c10::ScalarType::Int ||
-         dt == c10::ScalarType::Bool;
+         dt == c10::ScalarType::Bool || dt == c10::ScalarType::ComplexFloat;
 }
 
 static c10::ScalarType CastTarget(c10::ScalarType dt) {

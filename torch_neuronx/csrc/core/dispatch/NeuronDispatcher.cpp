@@ -348,7 +348,7 @@ static torch::Tensor CastContiguousCPU(const at::Tensor& src, c10::ScalarType ta
 
 /// Dtype supported by the MLIR aten::copy_ lowering (excludes Bool).
 static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
-  return IsSupportedDtype(dt) && dt != c10::ScalarType::Bool;
+  return IsSupportedDtype(dt) && dt != c10::ScalarType::Bool && !c10::isComplexType(dt);
 }
 
 /// Dtype supported by the MLIR aten::_to_copy lowering.
@@ -726,22 +726,29 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
     return;
   }
 
-  // Complex dtypes: fall back to CPU (mirrors Python can_handle() in base.py).
+  // Complex dtype allowlist: only ops verified to lower and execute correctly
+  // with complex tensors are allowed through. All others fall back to CPU.
   // With TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1, raise only when
-  // a complex tensor is at an input position. Complex produced as an out= is
-  // handled like any unregistered op (silent fallback).
+  // a complex tensor is at an input position (not just an out= tensor).
   if (HasComplexInput(args)) {
-    if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
-      RaiseComplexFallbackDisabled(op_name);
+    static const std::unordered_set<std::string> kComplexSupportedOps = {
+        "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_",
+        "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
+    };
+    if (kComplexSupportedOps.find(lookup_name) == kComplexSupportedOps.end()) {
+      if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
+        RaiseComplexFallbackDisabled(op_name);
+      }
+      TORCH_NEURONX_DISPATCH_DEBUG(
+          "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
+          " op=", op_name);
+      torch_neuronx::markFallbackLogged(op_name);
+      for (auto& arg : args) {
+        torch::jit::push(*stack, arg);
+      }
+      at::native::cpu_fallback(op, stack);
+      return;
     }
-    TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] complex dtype → CPU fallback",
-                                 " op=", op_name);
-    torch_neuronx::markFallbackLogged(op_name);
-    for (auto& arg : args) {
-      torch::jit::push(*stack, arg);
-    }
-    at::native::cpu_fallback(op, stack);
-    return;
   }
 
   TORCH_CHECK(
