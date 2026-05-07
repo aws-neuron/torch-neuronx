@@ -37,7 +37,7 @@ chmod +x ./tools/*
 
 ## Install neuron compiler from neuron repo
 uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
-uv pip install 'nki==0.3.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
+uv pip install nki --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
 # Install development dependencies including Ruff
 uv pip install ruff
@@ -143,6 +143,32 @@ uv run ruff format .                           # Format Python
 clang-format -i torch_neuronx/csrc/**/*.cpp     # Format C++
 uv run pre-commit run --all-files               # Run all checks
 ```
+
+## CI Expectations
+
+Every pull request triggers two CI workflows that must pass before merge:
+
+1. **Lint** — runs pre-commit checks (Ruff linting/formatting, clang-format) on `ubuntu-latest`.
+2. **PR Checks** — runs the full test suite on self-hosted trn2 hardware:
+   - ATen unit tests (with coverage)
+   - Distributed unit tests
+   - Block performance tests (MFU thresholds enforced)
+   - Torch Compile PyTorch unit tests
+   - C++ unit tests
+   - Concatenation unit tests
+   - Torch-MLIR LIT tests
+
+All jobs must pass. If a failure looks unrelated to your change, comment on the PR and a maintainer will investigate.
+
+## Merging Process
+
+1. Open a PR against `main` with a linked issue.
+2. CI runs automatically. Fix any failures.
+3. A maintainer will review your PR within the timeframes listed in
+   [Response Times](#response-times). If you don't receive a response within
+   that window, leave a comment on the PR to nudge it back onto our radar.
+4. Address review feedback and push updates.
+5. Once approved and CI is green, a maintainer will merge the PR.
 
 ## Expand op coverage
 
