@@ -2,7 +2,7 @@
 
 import torch
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 def _validate_one_hot(x, num_classes=-1):
@@ -16,7 +16,7 @@ def _validate_one_hot(x, num_classes=-1):
 @register_aten(
     ["aten::one_hot"],
     static_argnums=(1,),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_one_hot,
 )
 def torch_one_hot(x, num_classes=-1):

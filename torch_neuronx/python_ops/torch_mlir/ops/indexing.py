@@ -4,7 +4,7 @@ import torch
 
 from torch_neuronx.utils import skip_op_preconditions
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 def convert_indices(indices):
@@ -49,7 +49,7 @@ def _validate_index_select(x, dim, index, out=None):
 @register_aten(
     ["aten::index_select", "aten::index_select.out"],
     static_argnums=(1,),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_index_select,
 )
 def torch_index_select(x, dim, index, out=None):
@@ -115,7 +115,7 @@ def torch_gather(x, dim, index, *, sparse_grad=False, out=None):
 @register_aten(
     ["aten::scatter", "aten::scatter.value_out"],
     static_argnums=(1,),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_scatter_value(x, dim, index, value, out=None):
     # Convert scalar to tensor with matching dtype
@@ -126,7 +126,7 @@ def torch_scatter_value(x, dim, index, value, out=None):
         if value.dim() == 0:
             # without expanding, we hit dimension mismatch issues
             value = value.expand_as(index)
-        if x.is_floating_point() and not value.is_floating_point():
+        if value.dtype != x.dtype:
             value = value.to(x.dtype)
         return torch.scatter(x, dim, index, value)
 
@@ -151,7 +151,7 @@ def torch_scatter_value(x, dim, index, value, out=None):
     ],
     static_argnums=(1,),
     static_argnames=("reduce",),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     def torch_scatter_src_fn(x, dim, index, src, out=None, reduce=None):
@@ -199,7 +199,7 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
 @register_aten(
     ["aten::masked_select", "aten::masked_select.out", "aten::masked_select.Tensor_out"],
     static_argnums=(2,),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
 )
 def torch_masked_select(x, mask, out=None):
     if mask.dtype != torch.bool:
@@ -296,7 +296,7 @@ def _translate_index_put_args(*args, **kwargs):
 @register_aten(
     ["aten::_index_put_impl_"],
     static_argnames=("accumulate", "unsafe", "use_masked_fill"),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
     translate_args_fn=_translate_index_put_args,
 )
 def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out=None):
@@ -367,7 +367,7 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
         return torch.ops.aten.index_put(x, indices, values, accumulate=accumulate)
 
     if can_dispatch:
-        processed_indices = mask
+        processed_indices = mask if mask.device == x.device else mask.to(x.device)
     else:
         processed_indices = convert_indices(indices)
 
@@ -402,7 +402,7 @@ def _validate_index_select_backward(grad, input_sizes, dim, index):
 @register_aten(
     ["aten::index_select_backward"],
     static_argnums=(1, 2),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_index_select_backward,
 )
 def torch_index_select_backward(grad, input_sizes, dim, index):
