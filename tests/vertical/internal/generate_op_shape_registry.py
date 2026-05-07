@@ -96,7 +96,7 @@ def _parse_token(token: str) -> Any:
     # Tensor: [dims]:Type:S(...)
     parsed_tensor = _parse_tensor_token(token)
     if parsed_tensor is not None:
-        return parsed_tensor.shape
+        return {"shape": parsed_tensor.shape, "dtype": parsed_tensor.dtype}
 
     if token in ("undef", "None"):
         return None
@@ -169,11 +169,13 @@ def _parse_token(token: str) -> Any:
     # TensorList / GenericList: parse tensor shapes from inner content
     if token.startswith(("TL[", "GL[")):
         inner = token[3:-1]  # Strip TL[...] or GL[...] outer brackets
-        shapes = []
+        tensors = []
         for m in _TENSOR_RE.finditer(inner):
-            raw = m.group(1).strip()
-            shapes.append([int(d) for d in raw.split(",") if d.strip().isdigit()] if raw else [])
-        return shapes if shapes else token
+            raw_dims, dtype_str = m.group(1).strip(), m.group(2)
+            shape = [int(d) for d in raw_dims.split(",") if d.strip().isdigit()] if raw_dims else []
+            dtype = _DTYPE_MAP.get(dtype_str, dtype_str.lower())
+            tensors.append({"shape": shape, "dtype": dtype})
+        return tensors if tensors else token
 
     logger.debug(f"Unknown cache key token: {token!r}")
     return token
@@ -265,7 +267,7 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
     """
     schema = _get_schema(op_name)
     if schema is None:
-        return {f"arg{i}": v for i, v in enumerate(parsed.positional) if isinstance(v, list)}
+        return {f"arg{i}": v for i, v in enumerate(parsed.positional) if isinstance(v, list | dict)}
 
     arg_shapes: dict[str, Any] = {}
     pos_idx = 0

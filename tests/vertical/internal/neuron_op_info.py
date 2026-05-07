@@ -94,6 +94,11 @@ def _build_value(type_str, raw, device, dtype):
         return raw
     if isinstance(raw, tuple):
         return list(raw)
+    # Convert dtype strings (e.g., "bfloat16") to torch.dtype objects
+    if isinstance(raw, str):
+        attr = getattr(torch, raw, None)
+        if isinstance(attr, torch.dtype):
+            return attr
     return raw
 
 
