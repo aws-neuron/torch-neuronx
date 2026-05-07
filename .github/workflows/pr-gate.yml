@@ -4,7 +4,7 @@ name: PR Gate
 # This check blocks merge until an internal developer triggers the
 # smoke test via PR Test Dispatcher and it passes.
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - main
 
