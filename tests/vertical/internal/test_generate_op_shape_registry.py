@@ -37,10 +37,13 @@ class TestParseTensorToken:
 
 class TestParseToken:
     def test_tensor_returns_shape(self):
-        assert _parse_token("[1,2048,4096]:BFloat16:S(C)") == [1, 2048, 4096]
+        assert _parse_token("[1,2048,4096]:BFloat16:S(C)") == {
+            "shape": [1, 2048, 4096],
+            "dtype": "bfloat16",
+        }
 
     def test_scalar_tensor(self):
-        assert _parse_token("[]:BFloat16:S(C)") == []
+        assert _parse_token("[]:BFloat16:S(C)") == {"shape": [], "dtype": "bfloat16"}
 
     def test_none(self):
         assert _parse_token("None") is None
@@ -89,7 +92,10 @@ class TestParseToken:
 
     def test_tensor_list(self):
         result = _parse_token("TL[[64,2]:BFloat16:S(C),[64,4096]:BFloat16:S(C)]")
-        assert result == [[64, 2], [64, 4096]]
+        assert result == [
+            {"shape": [64, 2], "dtype": "bfloat16"},
+            {"shape": [64, 4096], "dtype": "bfloat16"},
+        ]
 
 
 class TestTokenizeSignature:
@@ -130,7 +136,7 @@ class TestParseCacheKey:
         )
         result = parse_cache_key(key)
         assert result is not None
-        assert result.positional[0] == [2]
+        assert result.positional[0] == {"shape": [2], "dtype": "bfloat16"}
 
     def test_with_kwargs(self):
         key = "_fused_rms_norm--_[1,2048,4096]:BFloat16:S(C)_IL[i4096]_[4096]:BFloat16:S(C)_d1e-06"
