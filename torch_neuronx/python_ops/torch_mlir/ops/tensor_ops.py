@@ -2,7 +2,7 @@
 
 import torch
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 @register_aten(["aten::cat", "aten::cat.out"], static_argnums=(1,))
@@ -160,7 +160,7 @@ def compute_repeat_interleave(input, repeats, dim=None, output_size=None):
         "aten::repeat_interleave.Tensor",
     ],
     static_argnames=("output_size",),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
 )
 def torch_repeat_interleave_tensor(repeats, output_size=None):
     """releat_interleave.Tensor variant is not supported in MLIR.

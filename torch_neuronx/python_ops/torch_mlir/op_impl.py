@@ -42,7 +42,7 @@ class TorchMlirOpImpl(CompilableOpImpl):
         self.output_handler = BaseOutputHandler()
 
         # Check for preprocessing
-        self._uses_preprocessing = getattr(self.torch_fn, "uses_preprocessing", False)
+        self._uses_preprocessing = getattr(self.torch_fn, "preprocessing", None) is not None
         self._postprocess_fn = None
         if not self._uses_preprocessing:
             self.kernel = TorchMlirKernel(

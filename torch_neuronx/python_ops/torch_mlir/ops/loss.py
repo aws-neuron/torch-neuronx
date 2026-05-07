@@ -18,7 +18,7 @@ from torch_neuronx.python_ops.auto_registration import neuron_op
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
 from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 try:
     from torch.distributed._tensor import DTensor
@@ -160,7 +160,7 @@ def _flatten_spatial(input, target, n_classes, is_prob_target):
         "orig_shape",
         "is_prob_target",
     ),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
     skip_dispatch_registration=True,
 )
 def cross_entropy_loss(
@@ -427,7 +427,7 @@ def _ce_chunked_fwd_inner(
         "no_batch",
         "is_prob_target",
     ),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def cross_entropy_loss_backward(
     input: TensorLikeType,
