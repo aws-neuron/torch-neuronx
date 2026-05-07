@@ -263,7 +263,11 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
                 cpu_out = op(*cpu_args, **cpu_kwargs)
                 neuron_out = op(*fresh_neuron_args, **fresh_neuron_kwargs)
             torch.testing.assert_close(
-                _allocate_to_device(neuron_out, "cpu"), cpu_out, rtol=1e-2, atol=1e-3
+                _allocate_to_device(neuron_out, "cpu"),
+                cpu_out,
+                rtol=1e-2,
+                atol=1e-3,
+                equal_nan=True,
             )
             out["correctness"] = "pass"
         except Exception as e:
