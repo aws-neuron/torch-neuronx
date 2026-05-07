@@ -229,7 +229,7 @@ def foreach_list_nki(tensors1, tensors2, op="mul", alpha=1):
     for t1, t2 in zip(tensors1, tensors2, strict=False):
         if t1.numel() == 0:
             result.append(t1)
-        elif t1.numel() == 1 or not _has_nki_elementwise_kernels:
+        elif t1.numel() == 1 or not _has_nki_elementwise_kernels or t1.shape != t2.shape:
             out_dtype = torch.promote_types(t1.dtype, t2.dtype)
             result.append(mlir_ops[op](t1.to(out_dtype), t2.to(out_dtype), alpha))
         else:
@@ -326,7 +326,12 @@ def _foreach_addcop_scalar_nki(self, tensor1, tensor2, value, nki_fn, torch_comb
     for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
         if s.numel() == 0:
             result.append(s)
-        elif s.numel() == 1 or not _has_nki_elementwise_kernels:
+        elif (
+            s.numel() == 1
+            or not _has_nki_elementwise_kernels
+            or s.shape != t1.shape
+            or s.shape != t2.shape
+        ):
             result.append(
                 _cast_to_dtype(
                     s.to(compute_dtype)
@@ -358,7 +363,12 @@ def _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, nki_fn, torc
 
         if s.numel() == 0:
             result.append(s)
-        elif s.numel() == 1 or not _has_nki_elementwise_kernels:
+        elif (
+            s.numel() == 1
+            or not _has_nki_elementwise_kernels
+            or s.shape != t1.shape
+            or s.shape != t2.shape
+        ):
             result.append(
                 _cast_to_dtype(
                     s.to(compute_dtype)
