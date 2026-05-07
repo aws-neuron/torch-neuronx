@@ -74,7 +74,7 @@ class TestParseToken:
         assert _parse_token("dtype:Float") == "float32"
 
     def test_device(self):
-        assert _parse_token("dev:neuron:0") == "neuron:0"
+        assert _parse_token("dev:neuron:0") is None
 
     def test_int_list(self):
         assert _parse_token("IL[i4096]") == [4096]

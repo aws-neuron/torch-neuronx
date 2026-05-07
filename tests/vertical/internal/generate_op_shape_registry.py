@@ -137,9 +137,9 @@ def _parse_token(token: str) -> Any:
     if token.startswith("dtype:"):
         dtype_str = token[6:]
         return _DTYPE_MAP.get(dtype_str, dtype_str.lower())
-    # Device: dev:neuron:0 → "neuron:0"
+    # Device: dev:neuron:0 → None (device indices are runtime-specific, not shape info)
     if token.startswith("dev:"):
-        return token[4:]
+        return None
     # Scalar dynamic types
     if token.startswith("scalar:"):
         return None
