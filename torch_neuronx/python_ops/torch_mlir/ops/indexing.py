@@ -392,11 +392,37 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
 
 
 def _validate_index_select_backward(grad, input_sizes, dim, index):
-    """Validate index_select_backward dtypes on raw args."""
+    """Validate index_select_backward dtypes and bounds on raw args."""
     if index.dtype not in [torch.int32, torch.int64]:
         raise TypeError(
             f"index_select_backward(): Expected dtype int32/int64 for index but got: {index.dtype}"
         )
+
+    if skip_op_preconditions():
+        return
+
+    # For 0-d (input_sizes empty), dim_size is effectively 1 — the scalar
+    # grad holds a single element addressable only at index 0. CPU rejects
+    # negatives here (unlike the forward path) and rejects multiple indices.
+    # Match those semantics. For 1-d+, keep the existing `0 <= index < dim_size`
+    # check; negative-index support for 1-d+ backward is a pre-existing gap
+    # tracked separately.
+    if len(input_sizes) == 0:
+        if index.numel() > 1:
+            raise IndexError(
+                f"index_select_backward(): Index to scalar can have only 1 value, "
+                f"got {index.numel()} value(s)"
+            )
+        if torch.any(index != 0):
+            oob_idx = index.flatten()[0].item()
+            raise IndexError(f"index {oob_idx} is out of bounds for dimension {dim} with size 1")
+    else:
+        dim_size = input_sizes[dim]
+        if torch.any(index < 0) or torch.any(index >= dim_size):
+            oob_idx = index.min().item() if torch.any(index < 0) else index.max().item()
+            raise IndexError(
+                f"index {oob_idx} is out of bounds for dimension {dim} with size {dim_size}"
+            )
 
 
 @register_aten(
@@ -406,32 +432,6 @@ def _validate_index_select_backward(grad, input_sizes, dim, index):
     validate_static_inputs=_validate_index_select_backward,
 )
 def torch_index_select_backward(grad, input_sizes, dim, index):
-    if not skip_op_preconditions():
-        # For 0-d (input_sizes empty), dim_size is effectively 1 — the scalar
-        # grad holds a single element addressable only at index 0. CPU rejects
-        # negatives here (unlike the forward path) and rejects multiple indices.
-        # Match those semantics. For 1-d+, keep the existing `0 <= index < dim_size`
-        # check; negative-index support for 1-d+ backward is a pre-existing gap
-        # tracked separately.
-        if len(input_sizes) == 0:
-            if index.numel() > 1:
-                raise RuntimeError(
-                    f"index_select_backward(): Index to scalar can have only 1 value, "
-                    f"got {index.numel()} value(s)"
-                )
-            if torch.any(index != 0):
-                oob_idx = index.flatten()[0].item()
-                raise IndexError(
-                    f"index {oob_idx} is out of bounds for dimension {dim} with size 1"
-                )
-        else:
-            dim_size = input_sizes[dim]
-            if torch.any(index < 0) or torch.any(index >= dim_size):
-                oob_idx = index.min().item() if torch.any(index < 0) else index.max().item()
-                raise IndexError(
-                    f"index {oob_idx} is out of bounds for dimension {dim} with size {dim_size}"
-                )
-
     def index_select_backward_fn(grad, input_sizes, dim, index):
         # 0-d self (input_sizes empty): CPU identity-returns the scalar grad.
         if len(input_sizes) == 0:

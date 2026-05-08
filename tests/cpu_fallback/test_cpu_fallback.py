@@ -146,6 +146,11 @@ class TestCpuFallback:
         row_idx = torch.tensor([1, 2], dtype=dtype, device="neuron")  # 15 is out of bounds
         x[row_idx, :]
 
+    @pytest.mark.skipif(
+        os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") == "1",
+        reason="Complex dtype CPU fallback is disabled under "
+        "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1;",
+    )
     @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
     def test_complex_dtype_fallback(self, dtype):
         """Test that complex dtypes fall back to CPU"""
@@ -197,6 +202,12 @@ class TestCpuFallback:
 @pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
     reason="Async CPU fallback is only relevant with aysnc execution mode",
+)
+@pytest.mark.skipif(
+    os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") == "1",
+    reason="Runtime CPU fallback executor is disabled under "
+    "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 (CPUFallbackExecutor "
+    "sets enabled_=false), so compilation-failure recovery cannot run.",
 )
 class TestCpuFallbackAsync:
     """Test CPU fallback for operations with static arguments.

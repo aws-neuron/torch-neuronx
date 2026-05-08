@@ -229,7 +229,7 @@ class TestIndexSelectBackward:
         )
 
     @assert_raises(
-        RuntimeError,
+        IndexError,
         match=r"Index to scalar can have only 1 value, got 2 value\(s\)",
     )
     def test_index_select_backward_0d_input_multiple_indices(self):
