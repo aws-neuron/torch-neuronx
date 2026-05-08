@@ -163,6 +163,11 @@ class CopyNeuronImpl(OperationImplementation):
                     _C._nrt_copy_neuron_to_cpu_tensor(
                         src_prepared, self_tensor, non_blocking=non_blocking
                     )
+                    # Materialize conj/neg bits that raw byte copy does not handle.
+                    if src.is_conj():
+                        self_tensor.conj_physical_()
+                    if src.is_neg():
+                        self_tensor.neg_()
                 else:
                     # Copy to contiguous CPU buffer first
                     tmp_cpu = torch.empty(
@@ -171,6 +176,11 @@ class CopyNeuronImpl(OperationImplementation):
                     _C._nrt_copy_neuron_to_cpu_tensor(
                         src_prepared, tmp_cpu, non_blocking=non_blocking
                     )
+                    # Materialize conj/neg bits that raw byte copy does not handle.
+                    if src.is_conj():
+                        tmp_cpu.conj_physical_()
+                    if src.is_neg():
+                        tmp_cpu.neg_()
 
                     # Handle dtype conversion on CPU
                     if tmp_cpu.dtype != self_tensor.dtype:
