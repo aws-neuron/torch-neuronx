@@ -1,0 +1,252 @@
+"""Helpers shared by test_target_ops_coverage.py and
+test_target_ops_compile_coverage.py.
+
+Kept in the ``internal`` package (name not matching ``test_*``) so pytest
+doesn't try to collect it as a test module. Extracting shared bits here lets
+each test file build its own op_db without importing the other test module's
+side effects at top level.
+
+The op_db build is cached via ``functools.cache`` so the two test files
+share a single build when both are collected in the same session.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+from functools import cache
+
+import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+logger = logging.getLogger(__name__)
+
+
+# ── Worst-case ranking when aggregating per-shape statuses into one CSV row ──
+
+STATUS_RANK = {
+    "supported": 0,
+    "pending_registry": 1,
+    "missing": 2,
+    "failed_lowering": 3,
+}
+
+
+# ── Data movement ────────────────────────────────────────────────────────────
+
+
+def allocate_to_device(data, device):
+    """Deep-clone tensors/lists/dicts to ``device``. Non-tensors pass through."""
+    if isinstance(data, torch.Tensor):
+        return data.detach().clone().to(device)
+    if isinstance(data, list | tuple):
+        return type(data)(allocate_to_device(item, device) for item in data)
+    if isinstance(data, dict):
+        return {k: allocate_to_device(v, device) for k, v in data.items()}
+    return data
+
+
+# ── Dispatch-key classification (drives `supported_by` column) ───────────────
+
+
+def _dispatch_has(op_name: str, key) -> bool:
+    clean = op_name.replace("aten::", "")
+    base, _, overload = clean.partition(".")
+    overload = overload or "default"
+    try:
+        pkt = getattr(torch.ops.aten, base, None)
+        if pkt is None:
+            return False
+        op = getattr(pkt, overload, None)
+        if op is None:
+            return False
+        schema = op._schema
+        q = f"{schema.name}.{schema.overload_name}" if schema.overload_name else str(schema.name)
+        return torch._C._dispatch_has_kernel_for_dispatch_key(q, key)
+    except Exception:
+        return False
+
+
+def has_pu1(op_name: str) -> bool:
+    """True if Neuron (PrivateUse1) has a registered kernel for this op."""
+    return _dispatch_has(op_name, torch._C.DispatchKey.PrivateUse1)
+
+
+def is_composite(op_name: str) -> bool:
+    """True if the op has any Composite*Autograd kernel — meaning it doesn't
+    have a direct backend kernel but decomposes into primitives at dispatch
+    time. Covers the three distinct composite keys PyTorch uses in practice:
+
+      - CompositeImplicitAutograd: implicit decomposition (e.g. ``aten::linear``).
+      - CompositeExplicitAutograd: explicit decomposition for ops that keep
+        gradient math.
+      - CompositeExplicitAutogradNonFunctional: decomposition for in-place
+        and out-variant ops (e.g. ``aten::add_.Tensor`` → ``aten::add.out``,
+        ``aten::as_strided_scatter``). Ops registered *only* under this key
+        were previously mis-classified as ``unknown``.
+    """
+    return (
+        _dispatch_has(op_name, torch._C.DispatchKey.CompositeImplicitAutograd)
+        or _dispatch_has(op_name, torch._C.DispatchKey.CompositeExplicitAutograd)
+        or _dispatch_has(op_name, torch._C.DispatchKey.CompositeExplicitAutogradNonFunctional)
+    )
+
+
+def classify_op(op_name: str) -> str:
+    if has_pu1(op_name):
+        return "registered"
+    if is_composite(op_name):
+        return "composite"
+    return "unknown"
+
+
+# ── Exception classification for the eager path ─────────────────────────────
+
+
+def classify_error(exc_str: str) -> str:
+    """Map a dispatcher/runtime error string to one of:
+    ``missing``, ``failed_lowering``, or ``pending_registry``.
+    """
+    if "Could not run" in exc_str and "backend" in exc_str:
+        return "missing"
+    if "NYI" in exc_str or "not yet implemented" in exc_str.lower():
+        return "missing"
+    if "op not found" in exc_str:
+        return "missing"
+    if "CPU fallback disabled" in exc_str:
+        return "failed_lowering"
+    if "_copy_from_and_resize" in exc_str:
+        return "failed_lowering"
+    if "got an unexpected keyword argument" in exc_str:
+        return "failed_lowering"
+    if "Expected PythonKernelHolder" in exc_str:
+        return "failed_lowering"
+    if "Compilation error occurred on Neuron" in exc_str:
+        return "failed_lowering"
+    if "only supports CPU" in exc_str:
+        return "missing"
+    # Type mismatches from wrong sample inputs — not a real failure
+    if "Expected a value of type" in exc_str and "but instead found type" in exc_str:
+        return "pending_registry"
+    if "is missing value for argument" in exc_str:
+        return "pending_registry"
+    if "expected at most" in exc_str and "argument(s) but received" in exc_str:
+        return "pending_registry"
+    if "scalar tensor expected to be 0 dim" in exc_str:
+        return "pending_registry"
+    if "Unknown keyword argument" in exc_str:
+        return "pending_registry"
+    if "takes" in exc_str and "positional argument(s) but" in exc_str:
+        return "pending_registry"
+    if "specified both as positional and keyword" in exc_str:
+        return "pending_registry"
+    if "Expected out tensor to have dtype" in exc_str:
+        return "pending_registry"
+    if "Expected result to be of dtype" in exc_str:
+        return "pending_registry"
+    if "Dimension specified as" in exc_str and "tensor has no dimensions" in exc_str:
+        return "pending_registry"
+    if "list assignment index out of range" in exc_str:
+        return "pending_registry"
+    return "failed_lowering"
+
+
+# ── Output-shape probe (feeds compute_roofline) ─────────────────────────────
+
+
+def flatten_tensors(obj):
+    """Return the tensors inside ``obj``, dropping non-tensors and any tensors
+    with symbolic (non-int) dimensions that FakeTensorMode can emit for
+    data-dependent outputs such as ``nonzero``."""
+    tensors = (
+        [obj]
+        if isinstance(obj, torch.Tensor)
+        else list(obj)
+        if isinstance(obj, list | tuple)
+        else []
+    )
+    out = []
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            continue
+        try:
+            [int(d) for d in t.shape]
+        except Exception:
+            return []
+        out.append(t)
+    return out
+
+
+def probe_output_meta(op, sample):
+    """Infer output metadata (shape/dtype) via FakeTensorMode — no real kernel
+    run, no storage allocated, no mutation. Empty list on failure; callers
+    treat that as 'fall back to input-size estimate' in ``compute_roofline``.
+    """
+    try:
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = op(sample.input, *sample.args, **sample.kwargs)
+        return flatten_tensors(out)
+    except Exception as e:
+        logger.debug("fake probe failed for %s: %s", op, e)
+        return []
+
+
+# ── Op database (cached; shared across test modules) ────────────────────────
+
+
+@cache
+def get_neuron_op_db():
+    """Build the full target-ops database. Cached so that
+    test_target_ops_coverage.py and test_target_ops_compile_coverage.py share
+    a single ~1360-op DB build when collected in the same pytest session."""
+    from .neuron_op_db import build_neuron_op_db
+    from .target_ops import TARGET_ATEN_OP_GROUP, TARGET_ATEN_OPS
+
+    return build_neuron_op_db(
+        target_ops=TARGET_ATEN_OPS,
+        target_op_groups=TARGET_ATEN_OP_GROUP,
+    )
+
+
+def build_params(op_db):
+    """Return the pytest.param list for a given op_db."""
+    return [pytest.param(op_info, id=f"{op_info.op_name}[{op_info.op_group}]") for op_info in op_db]
+
+
+def reset_cache_dirs(*paths) -> None:
+    """Empty the given cache dirs in place so the next compile is cold.
+
+    Clears contents (rather than rmtree-ing the dir itself) to avoid the
+    classic ``[Errno 17] File exists`` race when the path appears as a file
+    or when recreation collides with concurrent state. Missing dirs are
+    created. A stray file at a dir path is replaced. All OSErrors are
+    swallowed to debug-log — a failed cache reset means this op's TTF may
+    be warm, not that the test should crash.
+
+    Call between ops (or between shapes) to ensure each ``time_to_first_ms``
+    measurement really is a cold compile, not a reuse of a previously-cached
+    primitive NEFF from the same worker.
+    """
+    import shutil
+    from pathlib import Path
+
+    for p in paths:
+        p = Path(p)
+        try:
+            if p.is_dir():
+                for child in p.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        with contextlib.suppress(OSError):
+                            child.unlink()
+            elif p.exists():
+                # A stray file where we expect a dir — replace it.
+                with contextlib.suppress(OSError):
+                    p.unlink()
+                p.mkdir(parents=True, exist_ok=True)
+            else:
+                p.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.debug("cache reset failed for %s: %s", p, e)
