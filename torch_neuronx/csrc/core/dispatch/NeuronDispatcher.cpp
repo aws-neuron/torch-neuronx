@@ -1735,9 +1735,17 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
 
     return entry;
   } catch (const py::error_already_set& e) {
+    // IndexError/ValueError/TypeError are user/input contract errors and
+    // must surface to match Pytorch behavior.
+    if (e.matches(PyExc_IndexError) || e.matches(PyExc_ValueError) || e.matches(PyExc_TypeError) ||
+        kFallbackOnlyForUnimplemented) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] propagating Python exception",
+                                   " cache_key=", cache_key, " error=", e.what());
+      throw;
+    }
     TORCH_NEURONX_WARN("[GetOrLowerOperation] Python lower_func failed: ", e.what(),
-                       " cache_key=", cache_key);
-    throw;
+                       " cache_key=", cache_key, " — falling back to CPU");
+    return nullptr;
   }
 }
 

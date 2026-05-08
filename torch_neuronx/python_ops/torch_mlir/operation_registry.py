@@ -127,20 +127,43 @@ def finalize_registrations(aten_lib=None, verbose: bool = False):
 
             # Create a wrapper class
             ta_fn = reg_info.get("translate_args_fn")
+            # Wire validate_static_inputs through into the impl so it fires
+            # before kernel execution on the Python dispatch path. Mirrors
+            # what finalize_registrations_cpp does for the C++ path
+            validate_fn = reg_info.get("validate_static_inputs")
 
             def make_wrapper(
-                name, fn, params, static_argnums, static_argnames, translate_args_fn=None
+                name,
+                fn,
+                params,
+                static_argnums,
+                static_argnames,
+                translate_args_fn=None,
+                validate_fn=None,
             ):
                 class ImplementationWrapper(TorchMlirOpImpl):
                     def __init__(self):
-                        super().__init__(name, fn, params, static_argnums, static_argnames)
+                        super().__init__(
+                            name,
+                            fn,
+                            params,
+                            static_argnums,
+                            static_argnames,
+                            validate_static_inputs_func=validate_fn,
+                        )
                         if translate_args_fn is not None:
                             self.translate_args = translate_args_fn
 
                 return ImplementationWrapper
 
             implementation_wrapper = make_wrapper(
-                aten_name, torch_fn, output_params, static_argnums, static_argnames, ta_fn
+                aten_name,
+                torch_fn,
+                output_params,
+                static_argnums,
+                static_argnames,
+                ta_fn,
+                validate_fn,
             )
 
             # Create the operation wrapper

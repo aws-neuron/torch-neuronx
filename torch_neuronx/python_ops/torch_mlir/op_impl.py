@@ -2,6 +2,7 @@
 
 import logging
 import traceback
+from collections.abc import Callable
 
 import torch
 
@@ -29,6 +30,7 @@ class TorchMlirOpImpl(CompilableOpImpl):
         output_params: tuple[str, ...] | None = None,
         static_argnums: tuple[int, ...] | None = None,
         static_argnames: tuple[str, ...] | None = None,
+        validate_static_inputs_func: Callable | None = None,
     ):
         super().__init__()
 
@@ -37,6 +39,9 @@ class TorchMlirOpImpl(CompilableOpImpl):
         self.output_params = output_params
         self.static_argnums = static_argnums or ()
         self.static_argnames = static_argnames or ()
+        # Stored on the impl (not the kernel) because for preprocessing ops
+        # the kernel is lazily created in execute(), after registration.
+        self.validate_static_inputs_func = validate_static_inputs_func
 
         # Initialize handlers
         self.output_handler = BaseOutputHandler()
@@ -65,6 +70,11 @@ class TorchMlirOpImpl(CompilableOpImpl):
         Returns:
             ExecutionResult with output tensor(s)
         """
+        # Run validator on raw args before preprocessing. Mirrors what the C++
+        # dispatch path does in kernel.lower
+        if self.validate_static_inputs_func is not None:
+            self.validate_static_inputs_func(*args, **kwargs)
+
         if self._uses_preprocessing:
             preprocess_result = self.torch_fn(*args, **kwargs)
 
