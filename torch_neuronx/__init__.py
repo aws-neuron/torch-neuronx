@@ -22,19 +22,6 @@ _embedded_torch_mlir = os.path.join(
 if os.path.isdir(_embedded_torch_mlir):
     sys.path.insert(0, _embedded_torch_mlir)
 
-try:
-    from importlib.metadata import version as _standalone_version
-
-    _standalone_version("neuron-torch-mlir")
-    warnings.warn(
-        "A standalone 'neuron-torch-mlir' package is installed. "
-        "torch-neuronx now bundles torch-mlir and the standalone package "
-        "may cause conflicts. Consider running: "
-        "pip uninstall -y neuron-torch-mlir",
-        stacklevel=2,
-    )
-except Exception:
-    pass
 import threading
 
 # Global variable to track if module has been loaded
