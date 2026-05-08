@@ -33,6 +33,7 @@ jobs:
       - neuron
       - neuron.internal_compute
       - "neuron.internal_compute:trn2.48xlarge"
+      - neuron.build-image
       - "neuron.run-${{ github.run_id }}-smoke-test"
       - "neuron.pr:${{ github.event.inputs.pr_number }}"
     timeout-minutes: 30
