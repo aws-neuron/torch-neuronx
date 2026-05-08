@@ -107,3 +107,70 @@ class TestToCpuNonBlocking:
         expected = src.to("cpu").to(torch.float16)
         torch.neuron.synchronize()
         torch.testing.assert_close(dst, expected)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Conjugate / negation bit materialization (Neuron → CPU)
+#
+#  CopyNeuronToCPU must apply conj/neg metadata after the raw byte copy.
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestConjBitNeuronToCpu:
+    """Neuron→CPU copy must materialize the conjugate bit."""
+
+    @pytest.mark.parametrize("cpp_dispatch", [False, True], ids=["python_dispatch", "cpp_dispatch"])
+    def test_copy_conj_to_cpu(self, cpp_dispatch):
+        os.environ["TORCH_NEURONX_CPP_DISPATCH"] = "1" if cpp_dispatch else "0"
+        try:
+            t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+            dst = torch.empty(2, dtype=torch.complex64)
+            dst.copy_(t.conj())
+            expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+            torch.testing.assert_close(dst, expected)
+        finally:
+            os.environ.pop("TORCH_NEURONX_CPP_DISPATCH", None)
+
+    def test_to_cpu_conj(self):
+        t = torch.randn(16, dtype=torch.complex64)
+        result = t.to("neuron").conj().cpu()
+        torch.testing.assert_close(result, t.conj().resolve_conj())
+
+    def test_to_cpu_neg(self):
+        t = torch.randn(16, dtype=torch.complex64)
+        result = t.to("neuron")._neg_view().cpu()
+        torch.testing.assert_close(result, -t)
+
+    def test_copy_conj_broadcast_to_cpu(self):
+        """Conj'd Neuron tensor with broadcast into CPU destination."""
+        src = torch.randn(1, 4, dtype=torch.complex64)
+        src_neuron = src.to("neuron").conj()
+        dst = torch.empty(3, 4, dtype=torch.complex64)
+        dst.copy_(src_neuron)
+        expected = src.conj().resolve_conj().expand(3, 4)
+        torch.testing.assert_close(dst, expected)
+
+    def test_copy_conj_and_neg_to_cpu(self):
+        """Tensor with both conj and neg bits copied to CPU."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()._neg_view()
+        result = t_neuron.clone().cpu()
+        expected = -(t.conj().resolve_conj())
+        torch.testing.assert_close(result, expected)
+
+    def test_copy_conj_to_cpu_non_blocking(self):
+        """Non-blocking Neuron→CPU copy with conj bit."""
+        t = torch.randn(16, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()
+        dst = torch.empty(16, dtype=torch.complex64).pin_memory("neuron")
+        dst.copy_(t_neuron, non_blocking=True)
+        torch.neuron.synchronize()
+        torch.testing.assert_close(dst, t.conj().resolve_conj())
+
+    def test_to_copy_conj_with_dtype_cast(self):
+        """_to_copy path: conj'd Neuron tensor cast to different dtype on CPU."""
+        t = torch.randn(8, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()
+        result = t_neuron.to(dtype=torch.complex128, device="cpu")
+        expected = t.conj().resolve_conj().to(torch.complex128)
+        torch.testing.assert_close(result, expected)
