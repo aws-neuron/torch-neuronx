@@ -37,7 +37,7 @@ void TensorShelf::clear() {
 
 NeuronWork::NeuronWork(const std::string& pg_uid, const std::string& pg_desc, at::Device device,
                        int rank, const std::string& op_type, uint64_t seq_num,
-                       std::vector<at::Tensor> outputs, bool enable_timing, float timeout_ms,
+                       std::vector<at::Tensor> outputs, bool enable_timing, int64_t timeout_ms,
                        at::neuron::NeuronStream* stream, bool blocking_wait)
     : c10d::Work(rank, c10d::OpType::UNKNOWN),
       pg_uid_(pg_uid),
@@ -147,8 +147,7 @@ bool NeuronWork::checkTimeout(std::optional<std::chrono::milliseconds> timeout) 
   auto current_time = std::chrono::steady_clock::now();
   auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(current_time - work_start_time_);
-  auto work_timeout =
-      timeout.value_or(std::chrono::milliseconds(static_cast<int64_t>(timeout_ms_)));
+  auto work_timeout = timeout.value_or(std::chrono::milliseconds(timeout_ms_));
 
   if (elapsed < work_timeout) {
     return false;
@@ -330,5 +329,6 @@ bool NeuronWork::wait(std::chrono::milliseconds timeout) {
 
   return true;
 }
+
 }  // namespace distributed
 }  // namespace torch_neuronx

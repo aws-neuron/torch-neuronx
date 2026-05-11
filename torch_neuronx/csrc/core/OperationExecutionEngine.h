@@ -133,6 +133,7 @@ class OperationExecutionEngine {
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
   void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
+
   std::atomic<int64_t> execution_queue_depth_{0};
 
   // Track pending async operations count to avoid expensive iteration
