@@ -31,3 +31,31 @@ func.func @torch.aten.prod.intdim_negative_dim(%arg0: !torch.vtensor<[?,?,?,?],f
   // CHECK: return %[[VAL_3]] : !torch.vtensor<[?,?,?],f32>
   return %0 : !torch.vtensor<[?,?,?],f32>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.max.dim$rank0(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],si32>) -> (!torch.vtensor<[],si32>, !torch.vtensor<[],si64>) {
+// CHECK:         %[[IDX:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         %[[IDX_TORCH:.*]] = torch_c.from_builtin_tensor %[[IDX]] : tensor<i64> -> !torch.vtensor<[],si64>
+// CHECK:         return %[[ARG0]], %[[IDX_TORCH]] : !torch.vtensor<[],si32>, !torch.vtensor<[],si64>
+func.func @torch.aten.max.dim$rank0(%arg0: !torch.vtensor<[],si32>) -> (!torch.vtensor<[],si32>, !torch.vtensor<[],si64>) {
+  %int0 = torch.constant.int 0
+  %false = torch.constant.bool false
+  %values, %indices = torch.aten.max.dim %arg0, %int0, %false : !torch.vtensor<[],si32>, !torch.int, !torch.bool -> !torch.vtensor<[],si32>, !torch.vtensor<[],si64>
+  return %values, %indices : !torch.vtensor<[],si32>, !torch.vtensor<[],si64>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.min.dim$rank0(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+// CHECK:         %[[IDX:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         %[[IDX_TORCH:.*]] = torch_c.from_builtin_tensor %[[IDX]] : tensor<i64> -> !torch.vtensor<[],si64>
+// CHECK:         return %[[ARG0]], %[[IDX_TORCH]] : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+func.func @torch.aten.min.dim$rank0(%arg0: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+  %int0 = torch.constant.int 0
+  %false = torch.constant.bool false
+  %values, %indices = torch.aten.min.dim %arg0, %int0, %false : !torch.vtensor<[],f32>, !torch.int, !torch.bool -> !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+  return %values, %indices : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+}
