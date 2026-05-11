@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <iostream>
 
 #include "NeuronEvent.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
@@ -277,6 +278,20 @@ void synchronize(c10::DeviceIndex device_index) {
     auto* stream = stream_pools[device_index][i];
     if (stream == nullptr) continue;
     stream->Synchronize();
+  }
+}
+
+void drain_visible_device_streams(const char* phase) noexcept {
+  try {
+    for (auto device : c10_neuron::get_visible_device_indices()) {
+      synchronize(device);
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Warning: stream drain failed (" << (phase ? phase : "unknown")
+              << "): " << e.what() << std::endl;
+  } catch (...) {
+    std::cerr << "Warning: stream drain failed (" << (phase ? phase : "unknown") << ")"
+              << std::endl;
   }
 }
 

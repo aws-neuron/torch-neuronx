@@ -129,6 +129,22 @@ inline bool IsLazyAllocEnabled() {
   return enabled;
 }
 
+// Shutdown barrier.
+//
+// During normal operation the lazy-alloc path submits a kDealloc op per
+// recorded stream so the physical free is ordered after any in-flight
+// kernel that touched the memory. At process exit, streams have been
+// drained and NRT teardown reclaims memory wholesale, so the ordering is
+// meaningless — but the submission itself races the engine's worker
+// shutdown.
+//
+// BeginShutdown() is a one-way fence: after it returns, every subsequent
+// free() on the allocator short-circuits instead of submitting an op.
+// Called from ~NeuronResourceManager before the engine Shutdown(), so
+// producer submissions stop strictly before consumers are joined.
+void BeginShutdown();
+bool IsShuttingDown();
+
 c10::Allocator* get();
 void emptyCache();
 void emptyNrtBufferCache();
