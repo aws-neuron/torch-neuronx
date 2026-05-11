@@ -178,6 +178,21 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
   }
 }
 
+bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
+  bool any_changed = false;
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    auto& t = tensors[i];
+    if (!t.defined()) continue;
+    auto dt = t.scalar_type();
+    if (IsSupportedDtype(dt)) continue;
+    auto target = CastTarget(dt);
+    tensors[i] = NeuronSafeCast(t, target);
+    any_changed = true;
+    TORCH_NEURONX_DISPATCH_DEBUG("[DowncastTensorList] idx=", i, " ", dt, " → ", target);
+  }
+  return any_changed;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Dispatch snapshot helpers
 // ═══════════════════════════════════════════════════════════════

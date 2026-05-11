@@ -1751,6 +1751,30 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
   }
 }
 
+std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerCollectiveOperation(
+    const std::string& cache_key, py::object& lower_callback, c10d::OpType op_type,
+    const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& outputs,
+    const std::vector<std::vector<int>>& replica_groups, int reduce_op, bool slice_output) {
+  if (auto entry = CacheLookup(cache_key)) return entry;
+
+  py::gil_scoped_acquire gil;
+
+  TORCH_CHECK(lower_callback, "Collective lowering callback not set");
+
+  py::dict kwargs;
+  if (!outputs.empty()) {
+    py::tuple out_tuple(outputs.size());
+    for (size_t i = 0; i < outputs.size(); ++i) out_tuple[i] = outputs[i];
+    kwargs["out"] = out_tuple;
+  }
+  if (slice_output) kwargs["slice_output"] = py::bool_(true);
+
+  auto result = lower_callback(op_type, inputs, replica_groups, reduce_op, kwargs);
+  auto entry = ParseLoweringResult(result);
+  CacheInsert(cache_key, entry);
+  return entry;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Cache operations
 // ═══════════════════════════════════════════════════════════════

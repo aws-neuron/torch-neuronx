@@ -101,6 +101,9 @@ os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
 os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
+# Default to C++ NeuronBackend process group
+os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
+
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
 

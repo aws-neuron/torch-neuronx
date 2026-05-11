@@ -7,6 +7,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -178,6 +179,16 @@ class NeuronDispatcher {
    * in NeuronBindings.cpp.
    */
   void Cleanup();
+
+  /**
+   * Collective lowering — cache lookup, GIL acquire on miss, call Python
+   * lowering callback, parse result, cache and return.
+   */
+  std::shared_ptr<DispatchCacheEntry> GetOrLowerCollectiveOperation(
+      const std::string& cache_key, pybind11::object& lower_callback, c10d::OpType op_type,
+      const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& outputs,
+      const std::vector<std::vector<int>>& replica_groups, int reduce_op,
+      bool slice_output = false);
 
  private:
   friend class NeuronDispatcherTestAccess;

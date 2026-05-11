@@ -5,6 +5,7 @@ import os
 
 import torch
 
+from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type
 from torch_neuronx.utils import (
     convert_for_neuron,
     is_stablehlo_enabled,
@@ -288,23 +289,5 @@ class ArgumentProcessor:
         Returns:
             Integer value corresponding to the ScalarType enum
         """
-        dtype_to_scalar_type = {
-            torch.uint8: 0,  # Byte
-            torch.int8: 1,  # Char
-            torch.int16: 2,  # Short
-            torch.int32: 3,  # Int
-            torch.int64: 4,  # Long
-            torch.float16: 5,  # Half
-            torch.float32: 6,  # Float
-            torch.float64: 7,  # Double
-            # torch.complex32: 8,   # ComplexHalf (not commonly used)
-            torch.complex64: 9,  # ComplexFloat
-            torch.complex128: 10,  # ComplexDouble
-            torch.bool: 11,  # Bool
-            # Quantized types: 12-14, 16-17
-            torch.bfloat16: 15,  # BFloat16
-            # Float8 types: 23-26
-            # Additional types: 27-45
-        }
-
-        return dtype_to_scalar_type.get(dtype, 6)  # Default to Float (6)
+        val = torch_dtype_to_scalar_type(dtype)
+        return val if val is not None else 6  # Default to Float (6)

@@ -261,6 +261,8 @@ namespace NeuronCachingAllocator {
 
 namespace {
 
+std::atomic<bool> g_shutting_down{false};
+
 using Block = c10_neuron::Block;
 
 void* ReserveVirtualAddress(size_t size) {
@@ -387,6 +389,16 @@ void neuron_deleter(void* ctx) {
   void* ptr = info->ptr;
   int device = info->device;
   size_t size = info->size;
+
+  if (IsShuttingDown()) {
+    try {
+      AllocatorRegistry::getInstance().remove(ptr);
+    } catch (...) {
+      // Process is exiting; registry entry leaks on exception, which
+      // is strictly better than terminating.
+    }
+    return;
+  }
 
   if (IsLazyAllocEnabled()) {
     // Always include the allocation stream in recorded_streams for handling cross
@@ -551,6 +563,10 @@ NeuronAllocator* getAllocator() {
 }
 
 }  // anonymous namespace
+
+void BeginShutdown() { g_shutting_down.store(true, std::memory_order_relaxed); }
+
+bool IsShuttingDown() { return g_shutting_down.load(std::memory_order_relaxed); }
 
 c10::Allocator* get() { return getAllocator(); }
 
