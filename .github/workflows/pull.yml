@@ -1,9 +1,19 @@
 name: PR Checks
 
+# Triggered by pr-test-dispatcher.yml or manually via workflow_dispatch.
+# The self-hosted runner builds a Docker image and runs the job
+# inside the resulting container.
 on:
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number being tested'
+        required: true
+        type: string
+      head_sha:
+        description: 'HEAD SHA of the PR branch'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,15 +21,12 @@ permissions:
   statuses: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-pr-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true
-
-env:
-  AWS_DEFAULT_REGION: us-west-2
 
 jobs:
   smoke-test:
-    name: "Smoke Test — PR #${{ github.event.pull_request.number }}"
+    name: "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
     runs-on:
       - self-hosted
       - linux
@@ -28,13 +35,13 @@ jobs:
       - "neuron.internal_compute:trn2.48xlarge"
       - neuron.build-image
       - "neuron.run-${{ github.run_id }}-smoke-test"
-      - "neuron.pr:${{ github.event.pull_request.number }}"
+      - "neuron.pr:${{ github.event.inputs.pr_number }}"
     timeout-minutes: 30
     steps:
       - name: Set status to in-progress
         uses: actions/github-script@v7
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -50,12 +57,12 @@ jobs:
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.inputs.head_sha }}
 
       - name: Smoke test
         run: |
           echo "========================================="
-          echo "Smoke Test — PR #${{ github.event.pull_request.number }}"
+          echo "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
           echo "========================================="
           echo "Running on internal compute (Neuron hardware)"
           python3 -c "import sys; print(f'Python {sys.version}')"
@@ -67,7 +74,7 @@ jobs:
         if: success()
         uses: actions/github-script@v7
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -84,7 +91,7 @@ jobs:
         if: failure()
         uses: actions/github-script@v7
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.inputs.head_sha }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
