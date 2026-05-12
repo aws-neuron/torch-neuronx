@@ -24,7 +24,7 @@ from torch.testing._internal.opinfo.core import OpInfo, SampleInput, _dispatch_d
 # reference it without a circular import.
 TENSOR_LIST_DEFAULT_COUNT = 15
 
-from .neuron_shape_registry import SHAPE_REGISTRY  # noqa: E402
+from .neuron_shape_registry import SHAPE_REGISTRY, max_tensor_elems  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -289,10 +289,29 @@ class NeuronOpInfo(OpInfo):
         """Registry entries for this op. Propagation at registry-load time
         (see NeuronShapeRegistry.propagate_to_compatible_overloads) already
         covered schema-compatible ``.out`` / ``.default`` overloads, so no
-        name-based runtime fallbacks are needed here."""
+        name-based runtime fallbacks are needed here.
+
+        Caps the vended list to the top-N entries by max tensor element
+        count, where N comes from the ``NEURON_MAX_SHAPES_PER_OP`` env var
+        (default ``10``). Set by conftest from the ``--max-shapes-per-op``
+        CLI option. Model-traced registries generated from compile-cache
+        keys can carry 500-1000 entries per op with tensors up to multiple
+        GB, which turns a single op's coverage run into a multi-hour
+        cold-compile sweep and can OOM HBM on the largest shapes. Keeping
+        the top-N by size preserves the strongest roofline signal per
+        compile. A non-positive value disables the cap.
+        """
         entries = SHAPE_REGISTRY.get(self.op_name)
         if entries and os.environ.get("NEURON_MODEL_SHAPES_ONLY"):
             entries = [e for e in entries if any(s != "builtin" for s in e.sources)]
+
+        max_per_op = int(os.environ.get("NEURON_MAX_SHAPES_PER_OP", "10"))
+        if max_per_op > 0 and len(entries) > max_per_op:
+            entries = sorted(
+                entries,
+                key=lambda e: max_tensor_elems(e.arg_shapes, self.op_name),
+                reverse=True,
+            )[:max_per_op]
         return entries
 
     def _registry_samples(self, device, dtype) -> Iterable[SampleInput]:

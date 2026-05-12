@@ -97,6 +97,14 @@ class TestParseToken:
             {"shape": [64, 4096], "dtype": "bfloat16"},
         ]
 
+    def test_empty_tensor_list(self):
+        # Empty TL[]/GL[] must parse to [] (legitimate empty list), not the
+        # literal token string — otherwise downstream _build_value fails when
+        # the schema expects Tensor[] (e.g. aten::_fused_adamw_.max_exp_avg_sqs
+        # when AMSGrad is disabled).
+        assert _parse_token("TL[]") == []
+        assert _parse_token("GL[]") == []
+
 
 class TestTokenizeSignature:
     def test_simple_args(self):
@@ -172,3 +180,106 @@ class TestCollectFromCacheKeysFile:
         assert "aten::linear" in op_names
         assert "aten::add.Tensor" in op_names
         assert len(results) == 2
+
+
+class TestScalarDefaultFilling:
+    """Tests for the default-filling pass in ``_build_arg_shapes``.
+
+    Cache keys encode dynamic (SymFloat/SymInt) scalars as None; this pass
+    replaces None with a concrete value for required non-Tensor args so the
+    registered entry can actually execute at test time.
+    """
+
+    def _build(self, op_name, positional=None, kwargs=None):
+        """Run _build_arg_shapes for a given op with parsed positional + kwargs."""
+        from .generate_op_shape_registry import ParsedCacheKey, _build_arg_shapes
+
+        parsed = ParsedCacheKey(
+            op_name=op_name,
+            positional=positional or [],
+            kwargs=kwargs or {},
+        )
+        return _build_arg_shapes(op_name, parsed)
+
+    def test_op_specific_fused_adamw(self):
+        """_fused_adamw_'s lr/beta1/beta2/weight_decay/eps get filled with
+        canonical AdamW hyperparameters when the cache key captured them as
+        dynamic."""
+        args = self._build(
+            "aten::_fused_adamw_",
+            positional=[
+                [[256, 4096]],  # self
+                [[256, 4096]],  # grads
+                [[256, 4096]],  # exp_avgs
+                [[256, 4096]],  # exp_avg_sqs
+                [],  # max_exp_avg_sqs
+                [[]],  # state_steps
+            ],
+            kwargs={
+                "lr": None,
+                "beta1": None,
+                "beta2": None,
+                "weight_decay": None,
+                "eps": None,
+                "amsgrad": None,
+                "maximize": None,
+            },
+        )
+        # Required scalars must be concrete.
+        assert args["lr"] == 0.001
+        assert args["beta1"] == 0.9
+        assert args["beta2"] == 0.999
+        assert args["weight_decay"] == 0.01
+        assert args["eps"] == 1e-8
+        assert args["amsgrad"] is False
+        assert args["maximize"] is False
+        # Optional Tensor kwargs stay None.
+        assert args["grad_scale"] is None
+        assert args["found_inf"] is None
+
+    def test_name_scoped_eps_on_norm_op(self):
+        """A norm op's `eps` gets the norm-canonical value 1e-5, not 1e-8."""
+        args = self._build(
+            "aten::layer_norm",
+            positional=[
+                [1, 4, 16],  # input
+                [16],  # normalized_shape
+                [16],  # weight
+                [16],  # bias
+                None,  # eps captured as dynamic
+            ],
+        )
+        assert args["eps"] == 1e-5
+
+    def test_type_based_fallback(self):
+        """For an op/arg combo not in any table, the type-based fallback kicks
+        in and fills ``float`` → 0.0, ``int`` → 0, ``bool`` → False."""
+        # Use a simple op with scalar args not in our tables.
+        args = self._build(
+            "aten::clamp",
+            positional=[
+                [4, 4],  # self
+                None,  # min (Optional[Scalar])
+                None,  # max (Optional[Scalar])
+            ],
+        )
+        # min/max are Optional → stay None (not filled).
+        assert args["min"] is None
+        assert args["max"] is None
+
+    def test_optional_tensor_stays_none(self):
+        """Optional[Tensor] args don't get a filled default — None is valid."""
+        args = self._build(
+            "aten::linear",
+            positional=[[2, 16], [32, 16], None],  # input, weight, bias=None
+        )
+        assert args["bias"] is None
+
+    def test_tensor_null_stays_null(self):
+        """Required Tensor args captured as None stay None — the consumer
+        (sample build) decides what to do. We don't invent shapes."""
+        args = self._build(
+            "aten::add.Tensor",
+            positional=[None, [4, 4]],  # self=None, other=shape
+        )
+        assert args["self"] is None
