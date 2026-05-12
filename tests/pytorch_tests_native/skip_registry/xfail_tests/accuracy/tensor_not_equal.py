@@ -313,7 +313,6 @@ ACCURACY_TENSOR_NOT_EQUAL = [
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_rot90_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_rsqrt_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_scatter_add_neuron_bool",
-    "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_scatter_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_scatter_reduce_amax_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_scatter_reduce_amin_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_scatter_reduce_prod_neuron_bool",

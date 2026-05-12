@@ -163,12 +163,26 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
 
         # Fallback/workaround for unsupported reduce operations
         if reduce == "add":
-            # scatter_add requires tensor src, convert scalar if needed
+            # scatter_add requires a tensor src whose dtype matches x.dtype.
+            # Upstream scatter(..., reduce='add') tolerates dtype mismatches
+            # (e.g. scalar float src with integer self, or a 0-dim src tensor
+            # of a different dtype), so replicate that behavior here by
+            # casting src to x.dtype before dispatching to scatter_add.
             if not isinstance(src, torch.Tensor):
                 src = torch.full_like(index, src, dtype=x.dtype)
+            if src.dtype != x.dtype:
+                src = src.to(x.dtype)
             return torch.scatter_add(x, dim, index, src)
         elif reduce == "multiply":
-            # Use scatter with multiplication: input * (1 + (src-1) at indices)
+            # Use scatter with multiplication: multiplier = ones at positions
+            # that aren't scattered, src at positions that are. Upstream
+            # scatter(..., reduce='multiply') tolerates dtype mismatches, so
+            # normalize src to x.dtype here so the inner scatter doesn't fail
+            # the meta-level self.dtype == src.dtype check.
+            if not isinstance(src, torch.Tensor):
+                src = torch.full_like(index, src, dtype=x.dtype)
+            if src.dtype != x.dtype:
+                src = src.to(x.dtype)
             ones = torch.ones_like(x)
             multiplier = torch.scatter(ones, dim, index, src)
             return x * multiplier
