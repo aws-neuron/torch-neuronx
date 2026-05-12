@@ -95,13 +95,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.COMPILER_ERROR_NEURON,
     ),
     SkipGroup(
-        reason=(
-            "[compiler_error.prologue_merge] Lazy materialization prologue generation"
-            " failed: 'Failed to merge transformation chain 1' on aten::bmm"
-        ),
-        tests=x.COMPILER_ERROR_PROLOGUE_MERGE,
-    ),
-    SkipGroup(
         reason="[compiler_error.torch_mlir] TorchMLIR op lowering or MLIR conversion error",
         tests=x.COMPILER_ERROR_TORCH_MLIR,
     ),
@@ -260,9 +253,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_huber_loss_neuron_float32",
             "test_decomp.py::TestDecompNEURON::test_quick_logit_neuron_bfloat16",
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_binary_cross_entropy_neuron_float16",
-            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_softplus_neuron_float16",
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_hardsigmoid_neuron_float32",
-            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_mse_loss_neuron_float16",
         ],
     ),
     SkipGroup(
@@ -274,22 +265,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_reductions.py::TestReductionsNEURON::test_noncontiguous_transposed_nansum_neuron_int16",
-            "test_reductions.py::TestReductionsNEURON::test_noncontiguous_transposed_masked_mean_neuron_float16",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_linalg_ldl_solve_neuron_float32",
-            "test_torch.py::TestTorchDeviceTypeNEURON::test_expected_failure_xla_neuron",
             "test_torch.py::TestTorchDeviceTypeNEURON::test_cdist_large_batch_neuron",
-            "test_torch.py::TestTorchDeviceTypeNEURON::test_copy__neuron_float16",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_poisson_nll_loss_neuron_bfloat16",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Upstream test bug: test_comprehensive_std_mean calls std_mean with"
-            " 4 positional args but the function only takes 1-2. Not"
-            " Neuron-specific — needs to be fixed upstream."
-        ),
-        tests=[
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_std_mean_neuron_bfloat16",
         ],
     ),
     SkipGroup(

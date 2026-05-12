@@ -1,5 +1,4 @@
 UNSUPPORTED_OP_NOT_IMPLEMENTED = [
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_pow_neuron_float16",
     "test_linalg.py::TestLinalgNEURON::test__int4_mm_m_32_k_32_n_48_neuron",
     "test_linalg.py::TestLinalgNEURON::test__int4_mm_m_32_k_32_n_64_neuron",
     "test_linalg.py::TestLinalgNEURON::test__int4_mm_m_32_k_64_n_48_neuron",

@@ -3,11 +3,9 @@ COMPILER_ERROR_NEURON = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_cumprod_neuron_float16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_cumprod_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_cumprod_neuron_float64",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_diagonal_copy_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_diff_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_vander_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_bfloat16",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_max_reduction_with_dim_neuron_bool",
@@ -46,7 +44,6 @@ COMPILER_ERROR_NEURON = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose1d_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose2d_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose3d_neuron_float32",
-    "test_ops.py::TestFakeTensorNEURON::test_fake_norm_fro_neuron_float32",
     "test_foreach.py::TestForeachNEURON::test_binary_op_scalar_with_overlapping_tensors__foreach_pow_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_float32",
@@ -169,7 +166,6 @@ COMPILER_ERROR_NEURON = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_masked_select_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_masked_scatter_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_masked_scatter_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_dropout3d_neuron_float32",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_2d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_grid_sample_neuron_float64",
@@ -177,41 +173,23 @@ COMPILER_ERROR_NEURON = [
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_bfloat16",
     "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_div_floor_rounding_neuron_bfloat16",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_bool",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_diag_embed_neuron_float16",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_diag_embed_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_diag_embed_neuron_int32",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_diag_embed_neuron_int8",
-    "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_float_power_neuron_bool",
-    "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_float_power_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_float_power_neuron_uint8",
-    "test_decomp.py::TestDecompNEURON::test_quick__unsafe_masked_index_put_accumulate_neuron_bfloat16",
-    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_tanhshrink_neuron_float16",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_float16",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int8",
     "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_t_copy_neuron_float32",
     "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fn",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_neuron",
     "test_transformers.py::TestSDPAFailureModesNEURON::test_sdpa_unbacked_no_dde_neuron",
-    "test_ops.py::TestFakeTensorNEURON::test_strided_layout_full_neuron_bfloat16",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_atan2_neuron_bfloat16",
-    "test_ops.py::TestFakeTensorNEURON::test_fake_gradient_neuron_float32",
     # --- Persistent compile failures across three consistent runs ---
     # aten::convolution compile failure; shows up in cosine_embedding_loss,
     # ctc_loss, hinge_embedding_loss, and hardshrink (all internally invoke a
     # convolution path).
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_cosine_embedding_loss_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_hinge_embedding_loss_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_ctc_loss_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_pointwise_ops_nn_functional_hardshrink_neuron_float32",
     # aten::bitwise_xor.Tensor_out compile failure on int8
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_bitwise_xor_neuron_int8",
     # aten::maximum compile failure on uint8
-    "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_maximum_neuron_uint8",
     # aten::ne.Tensor_out compile failure (invoked via bucketize)
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_bucketize_neuron_float64",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_bucketize_neuron_int32",
     # aten::sum.IntList_out compile failure (masked_sum meta dispatch)
-    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_masked_sum_neuron_float16",
     # aten::_foreach_addcmul.Scalar / _foreach_addcdiv.Scalar compile failure
     # (foreach_abs / foreach_neg / foreach_cos / foreach_sinh / foreach_erf /
     # foreach_atan on different devices hit these paths across int8/int16/int32/

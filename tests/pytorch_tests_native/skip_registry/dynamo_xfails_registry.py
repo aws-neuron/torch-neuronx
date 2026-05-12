@@ -24,26 +24,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[PT2.11] Graph retracibility / output mismatch on Neuron:"
-            " torch.allclose() returns False between original and retraced graph."
-        ),
-        tests=[
-            "test_retracibility_inline_and_install",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT2.11] Model/module not freed after compile on Neuron: Dynamo's"
-            " weakref-based cleanup tracking fails (cleared=False). Likely a"
-            " backend reference leak via compiled graph cache."
-        ),
-        tests=[
-            "test_parameter_free",
-            "test_outside_linear_module_free",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "[PT2.11] Test expects RuntimeError under FakeTensorMode that the"
             " Neuron backend does not raise (compilation succeeds instead)."
         ),
@@ -81,8 +61,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "LoggingTests::test_output_code",
             "StructuredTraceTest::test_dump_file",
             "TestBackendOverrideIntegrationNEURON::test_multiple_rules_neuron",
-            "RegionalInductorInvokeSubgraphTests::test_invoke_subgraph_inner_serialize_False",
-            "RegionalInductorInvokeSubgraphTests::test_custom_decomposition",
         ],
     ),
     SkipGroup(
@@ -467,7 +445,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="_copy_from_and_resize size mismatch on Neuron",
         tests=[
             "DynamicShapesReproTests::test_sort_out_dynamic_shapes",
-            "ReproTests::test_sort_out",
         ],
     ),
     SkipGroup(
@@ -475,7 +452,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesReproTests::test_tokenization_dynamic_shapes",
             "MiscTests::test_sourceless_namedtuple",
-            "ReproTests::test_tokenization",
         ],
     ),
     SkipGroup(
@@ -584,16 +560,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="InternalTorchDynamoError: KeyError or AttributeError in guard/getattr",
         tests=[
             "GuardManagerTests::test_dimension_marking_guard_dependent_attrs",
-            "GuardManagerTests::test_dynamic_indices_guard",
-            "MiscTests::test_sys_modules",
-            "MiscTests::test_user_getattr1",
             "OptimizedModuleTest::test_dict_insertion_guard_method_func",
-        ],
-    ),
-    SkipGroup(
-        reason="Assertion failure: test_user_defined_setattr1 on Neuron",
-        tests=[
-            "MiscTests::test_user_defined_setattr1",
         ],
     ),
     SkipGroup(
@@ -650,7 +617,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "NbIntTests::test_tensor_dunder_int",
             "NbIntTests::test_tensor_float_dtype",
             "NbIntTests::test_tensor_int_dtype",
-            "UnspecTests::test_symfloat_no_replacement",
         ],
     ),
     SkipGroup(
@@ -663,7 +629,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Unsupported: Failed to convert args/kwargs to proxy",
         tests=[
             "ReproTests::test_issue164247_backend_eager",
-            "ReproTests::test_issue134451",
         ],
     ),
     SkipGroup(
