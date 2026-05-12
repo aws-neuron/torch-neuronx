@@ -20,7 +20,6 @@ ASSERTION_MISC_FALSE_NOT_TRUE = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_cross_entropy_neuron_float32",
     "test_linalg.py::TestLinalgNEURON::test_cholesky_solve_batched_many_batches_neuron_float32",
     "test_linalg.py::TestLinalgNEURON::test_cholesky_solve_batched_many_batches_neuron_float64",
-    "test_linalg.py::TestLinalgNEURON::test_cholesky_solve_batched_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_ormqr_neuron_float32",
     "test_modules.py::TestModuleNEURON::test_memory_format_nn_AdaptiveMaxPool2d_neuron_float32",
     "test_modules.py::TestModuleNEURON::test_memory_format_nn_AdaptiveMaxPool2d_neuron_float64",
