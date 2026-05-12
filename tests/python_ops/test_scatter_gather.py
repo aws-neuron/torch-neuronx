@@ -393,3 +393,52 @@ class TestGatherPriorityImpl:
             assert_op_runs_on_neuron("aten::gather")
 
         torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=1e-4, atol=1e-4)
+
+
+class TestScatterReduceDtypeMismatch:
+    """Regression tests for scatter(..., reduce='add'|'multiply') when src
+    does not match self.dtype.
+
+    Upstream scatter-with-reduce silently casts src to self.dtype, but the
+    Neuron fallback decomposes to scatter_add / scatter+multiply, which both
+    enforce self.dtype == src.dtype at the meta level. The fix in
+    torch_scatter_src_fn casts src to x.dtype before dispatching. These cases
+    reproduce the 7 previously-xfailing tests (integer/bool self with a
+    Python-float scalar src, and float16 self with reduce='multiply').
+    """
+
+    @pytest.mark.parametrize(
+        "reduce,self_dtype",
+        [
+            ("add", torch.int8),  # reproduces test_comprehensive_scatter_neuron_int8 and friends
+            ("add", torch.bool),  # reproduces test_non_standard_bool_values_scatter_neuron_bool
+            ("multiply", torch.float16),  # reproduces test_scatter__reductions_neuron_float16
+        ],
+    )
+    def test_scatter_reduce_scalar_src_mismatched_dtype(self, reduce, self_dtype):
+        """Python-float scalar src whose implicit dtype does not match self.dtype."""
+        base = torch.ones((3, 4), dtype=self_dtype, device="neuron")
+        idx = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=torch.int64, device="neuron")
+        scalar_src = 2.5  # Python float, deliberately not matching self_dtype
+
+        actual = base.clone().scatter_(0, idx, scalar_src, reduce=reduce)
+        expected = base.cpu().clone().scatter_(0, idx.cpu(), scalar_src, reduce=reduce)
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("reduce", ["add", "multiply"])
+    def test_scatter_reduce_tensor_src_matching_dtype(self, reduce):
+        """Tensor src whose dtype matches self.dtype.
+
+        This is the only tensor-src reduce path reachable from the Python API;
+        upstream PyTorch rejects mismatched-dtype tensor src at dispatch time.
+        Kept as a guardrail alongside the scalar-src cases above.
+        """
+        base = torch.ones((3, 4), dtype=torch.float16, device="neuron")
+        idx = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=torch.int64, device="neuron")
+        src = torch.full(idx.shape, 2.0, dtype=torch.float16, device="neuron")
+
+        actual = base.clone().scatter_(0, idx, src, reduce=reduce)
+        expected = base.cpu().clone().scatter_(0, idx.cpu(), src.cpu(), reduce=reduce)
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-3, atol=1e-3)
