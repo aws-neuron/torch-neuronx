@@ -192,6 +192,37 @@ std::string GenerateBroadcast(const std::vector<int64_t>& input_shape,
                               const std::vector<int64_t>& broadcast_dims, mlir::Type element_type);
 
 // ============================================================================
+// SCATTER_IOTA - StableHLO scatter with iota-computed flat indices
+// (Epilogue slice writeback — no base shape ambiguity)
+// ============================================================================
+
+/**
+ * @brief Generate StableHLO MLIR for scatter with iota-computed indices
+ *
+ * Creates a scatter operation that writes an update tensor into specific
+ * positions of a FLAT 1D base tensor, with indices computed from the
+ * view's stride/offset metadata using iota + arithmetic.
+ *
+ * Unlike GenerateDynamicUpdateSlice, this operates on flat storage and
+ * doesn't need to know the base tensor's shape — only the flat storage span.
+ * This eliminates the base shape ambiguity problem.
+ *
+ * Produces a 2-input function:
+ *   func @main(%update: tensor<view_shape>, %base_flat: tensor<storage_span>) ->
+ * tensor<storage_span>
+ *
+ * @param view_shape Shape of the update tensor (operation result)
+ * @param view_strides Strides of the destination view
+ * @param storage_offset Storage offset of the view
+ * @param storage_span Total flat storage size (elements)
+ * @param element_type Element type as string (e.g., "f32", "bf16")
+ * @return MLIR string for scatter_iota operation
+ */
+std::string GenerateScatterIota(const std::vector<int64_t>& view_shape,
+                                const std::vector<int64_t>& view_strides, int64_t storage_offset,
+                                int64_t storage_span, const std::string& element_type);
+
+// ============================================================================
 // EMPTY - StableHLO empty/identity operation generation
 // ============================================================================
 

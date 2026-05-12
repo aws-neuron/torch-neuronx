@@ -3,6 +3,7 @@
 #include <torch/csrc/Dtype.h>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/LoweringResult.h"
 
 namespace torch_neuronx {
@@ -32,6 +33,19 @@ static std::vector<DispatchCacheEntry::OutputSpec> ParseOutputSpecs(const py::li
         spec.shape.push_back(dim.cast<int64_t>());
       }
       spec.dtype = ParseDtype(tup[1]);
+    }
+    // Parse optional target_strides (3rd element of tuple).
+    // Format: ((shape...), dtype_int, (stride0, stride1, ...))
+    // When present, the dispatch allocates a physical-shape buffer and fuses
+    // a TRANSPOSE epilogue so the NEFF writes in the target stride layout.
+    if (torch_neuronx::IsEpilogueEnabled() && tup.size() >= 3 && !tup[2].is_none()) {
+      auto strides_tuple = tup[2].cast<py::tuple>();
+      std::vector<int64_t> strides;
+      strides.reserve(strides_tuple.size());
+      for (auto s : strides_tuple) {
+        strides.push_back(s.cast<int64_t>());
+      }
+      spec.target_strides = std::move(strides);
     }
     result.push_back(std::move(spec));
   }

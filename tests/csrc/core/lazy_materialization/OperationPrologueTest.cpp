@@ -12,7 +12,7 @@
 #include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
-#include "torch_neuronx/csrc/core/lazy_materialization/OperationPrologue.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
 using namespace torch_neuronx::testing;

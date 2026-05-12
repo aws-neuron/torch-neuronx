@@ -431,4 +431,42 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_fastpath_inplace_neuron_bool",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "[compiler] nn.functional.pad(mode='circular') triggers neuronxcc"
+            " internal error (NCC_IDRV014 Unknown verbosity level). The op is"
+            " lowerable but the compiler rejects it. xfail until compiler fix."
+        ),
+        tests=[
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_int32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_float16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_float32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_int32",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_float16",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_float32",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_int32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_float16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_float32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_pad_circular_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_pad_circular_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_pad_circular_neuron_float32",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_nn_functional_pad_circular_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[prologue] Data-dependent NaN in standalone transpose NEFF for"
+            " non-contiguous fp16 tensors. The _refs.div decomposition"
+            " (promote->div->demote) triggers CopyToNonContiguous which uses"
+            " an on-device transpose that produces spurious NaN at row 128"
+            " for specific data patterns. Native torch.div with epilogue"
+            " works correctly. See .internal_docs/NaN_Bug_Investigation.md."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_div_no_rounding_mode_neuron_float16",
+        ],
+    ),
 ]

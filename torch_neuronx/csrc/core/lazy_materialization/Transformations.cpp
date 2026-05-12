@@ -275,6 +275,249 @@ std::optional<BroadcastInfo> DetectBroadcastPattern(const at::Tensor& tensor) {
 }  // anonymous namespace
 
 // ============================================================================
+// STRIDE DECOMPOSITION IMPLEMENTATION
+// ============================================================================
+
+std::optional<StrideDecompositionResult> DecomposeStrides(const at::Tensor& tensor,
+                                                          const std::string& op_name,
+                                                          size_t index) {
+  auto shape = tensor.sizes();
+  auto strides = tensor.strides();
+  int64_t offset = tensor.storage_offset();
+  int64_t ndims = shape.size();
+
+  if (ndims == 0 || tensor.is_contiguous()) {
+    TORCH_NEURONX_DEBUG("DecomposeStrides rejected: tensor is empty or contiguous", "op=", op_name,
+                        "index=", index, "ndims=", ndims, "is_contiguous=", tensor.is_contiguous());
+    return std::nullopt;
+  }
+
+  // Step 1: Identify broadcast dims (stride=0 or size=1) vs non-broadcast dims.
+  std::vector<int64_t> non_bc_dims;
+  std::vector<bool> is_bc(ndims, false);
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (strides[i] == 0 || shape[i] == 1) {
+      is_bc[i] = true;
+    } else {
+      non_bc_dims.push_back(i);
+    }
+  }
+
+  // Handle all-broadcast: return a scalar base tensor with broadcast metadata
+  if (non_bc_dims.empty()) {
+    std::string element_type = ScalarTypeToElementTypeString(tensor.scalar_type());
+    at::Tensor base_tensor = tensor.as_strided({1}, {1}, offset);
+
+    StrideDecompositionResult result;
+    result.base_tensor = base_tensor;
+    result.phys_base_shape = {1};
+    result.phys_starts = {0};
+    result.phys_target_shape = {1};
+    result.phys_steps = {1};
+    result.phys_to_logical = {};  // empty signals all-broadcast
+    result.logical_to_phys = {};
+    result.is_broadcast = is_bc;
+    result.element_type = element_type;
+    result.total_dims = ndims;
+    return result;
+  }
+
+  // Step 2: Sort non-broadcast dims by stride descending.
+  int64_t num_non_broadcast = non_bc_dims.size();
+  std::vector<int64_t> sorted_nb_order(num_non_broadcast);
+  std::iota(sorted_nb_order.begin(), sorted_nb_order.end(), 0);
+  std::sort(sorted_nb_order.begin(), sorted_nb_order.end(), [&](int64_t a, int64_t b) {
+    int64_t stride_a = strides[non_bc_dims[a]];
+    int64_t stride_b = strides[non_bc_dims[b]];
+    if (stride_a != stride_b) return stride_a > stride_b;
+    return non_bc_dims[a] < non_bc_dims[b];
+  });
+
+  int64_t total_dims = ndims;
+
+  // Step 3: Extract sorted shapes/strides and factorize stride gaps.
+  std::vector<int64_t> sorted_shape;
+  std::vector<int64_t> sorted_strides;
+  for (int64_t idx : sorted_nb_order) {
+    sorted_shape.push_back(shape[non_bc_dims[idx]]);
+    sorted_strides.push_back(strides[non_bc_dims[idx]]);
+  }
+
+  std::vector<int64_t> sorted_base_shape = sorted_shape;
+  std::vector<int64_t> step_factors(num_non_broadcast, 1);
+  std::vector<int64_t> sorted_base_strides(num_non_broadcast, 1);
+
+  if (num_non_broadcast > 0) {
+    std::vector<int64_t> outer_stride_gcd(num_non_broadcast);
+    outer_stride_gcd[0] = sorted_strides[0];
+    for (int i = 1; i < num_non_broadcast; ++i) {
+      outer_stride_gcd[i] = std::gcd(outer_stride_gcd[i - 1], sorted_strides[i]);
+    }
+
+    sorted_base_strides[num_non_broadcast - 1] = 1;
+    step_factors[num_non_broadcast - 1] = sorted_strides[num_non_broadcast - 1];
+
+    for (int64_t i = num_non_broadcast - 2; i >= 0; --i) {
+      if (outer_stride_gcd[i] % sorted_base_strides[i + 1] != 0) {
+        TORCH_NEURONX_DEBUG("DecomposeStrides rejected: non-admissible layout (GCD check)",
+                            "op=", op_name, "index=", index, "sorted_dim=", i);
+        return std::nullopt;
+      }
+
+      int64_t max_base_extent = outer_stride_gcd[i] / sorted_base_strides[i + 1];
+      int64_t min_required_extent = (sorted_shape[i + 1] - 1) * step_factors[i + 1] + 1;
+
+      int64_t best_extent = -1;
+      for (int64_t d = 1; d * d <= max_base_extent; ++d) {
+        if (max_base_extent % d != 0) continue;
+        for (int64_t candidate : {d, max_base_extent / d}) {
+          if (candidate < min_required_extent) continue;
+          int64_t start_idx = (offset / sorted_base_strides[i + 1]) % candidate;
+          int64_t physical_span = start_idx + (sorted_shape[i + 1] - 1) * step_factors[i + 1] + 1;
+          if (physical_span <= candidate) {
+            if (best_extent == -1 || candidate < best_extent) {
+              best_extent = candidate;
+            }
+          }
+        }
+      }
+      if (best_extent == -1) {
+        TORCH_NEURONX_DEBUG("DecomposeStrides rejected: no valid base factor found", "op=", op_name,
+                            "index=", index, "sorted_dim=", i);
+        return std::nullopt;
+      }
+
+      sorted_base_shape[i + 1] = best_extent;
+      sorted_base_strides[i] = sorted_base_strides[i + 1] * best_extent;
+      step_factors[i] = sorted_strides[i] / sorted_base_strides[i];
+    }
+  }
+
+  // Step 4: Offset decomposition
+  int64_t remaining_offset = offset;
+  std::vector<int64_t> sorted_starts(num_non_broadcast, 0);
+  for (int64_t i = 0; i < num_non_broadcast; ++i) {
+    if (sorted_base_strides[i] > 0 && remaining_offset >= sorted_base_strides[i]) {
+      sorted_starts[i] = remaining_offset / sorted_base_strides[i];
+      remaining_offset %= sorted_base_strides[i];
+    }
+  }
+
+  if (remaining_offset != 0) {
+    TORCH_NEURONX_DEBUG("DecomposeStrides rejected: offset decomposition failed", "op=", op_name,
+                        "index=", index, "remaining_offset=", remaining_offset);
+    return std::nullopt;
+  }
+
+  // Enlarge outermost base shape to prevent out-of-bounds slicing
+  if (num_non_broadcast > 0) {
+    int64_t outermost_span = sorted_starts[0] + (sorted_shape[0] - 1) * step_factors[0] + 1;
+    sorted_base_shape[0] = std::max(sorted_base_shape[0], outermost_span);
+  }
+
+  // Step 5: Build physical-to-logical dimension mapping.
+  std::vector<int64_t> phys_to_logical;
+  int sorted_dim_ptr = 0;
+  for (int i = 0; i < ndims; ++i) {
+    if (is_bc[i])
+      phys_to_logical.push_back(i);
+    else
+      phys_to_logical.push_back(non_bc_dims[sorted_nb_order[sorted_dim_ptr++]]);
+  }
+  std::vector<int64_t> logical_to_phys(total_dims);
+  for (int p = 0; p < total_dims; ++p) {
+    logical_to_phys[phys_to_logical[p]] = p;
+  }
+
+  // Step 6: Construct the contiguous base tensor.
+  std::vector<int64_t> phys_base_shape(total_dims);
+  std::vector<int64_t> phys_starts(total_dims, 0);
+  std::vector<int64_t> phys_target_shape(total_dims);
+
+  int sorted_ptr = 0;
+  for (int p = 0; p < total_dims; ++p) {
+    int orig = phys_to_logical[p];
+    if (orig < ndims && is_bc[orig]) {
+      phys_base_shape[p] = 1;
+      phys_starts[p] = 0;
+      phys_target_shape[p] = 1;
+    } else {
+      int64_t logical_size = shape[orig];
+      int64_t start_idx = sorted_starts[sorted_ptr];
+      int64_t step = step_factors[sorted_ptr];
+      int64_t physical_span = start_idx + (logical_size - 1) * step + 1;
+      int64_t stride_gap_extent = sorted_base_shape[sorted_ptr];
+
+      phys_base_shape[p] = std::max(stride_gap_extent, physical_span);
+      phys_starts[p] = start_idx;
+      phys_target_shape[p] = logical_size;
+      sorted_ptr++;
+    }
+  }
+
+  auto base_strides = ComputeRowMajorStrides(phys_base_shape);
+
+  int64_t base_offset = offset;
+  for (int i = 0; i < total_dims; ++i) {
+    base_offset -= phys_starts[i] * base_strides[i];
+  }
+
+  int64_t base_elements = 1;
+  for (auto s : phys_base_shape) base_elements *= s;
+  int64_t storage_elements =
+      static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size());
+  if (base_offset < 0 || base_offset + base_elements > storage_elements) {
+    TORCH_NEURONX_DEBUG("DecomposeStrides rejected: base tensor out of storage bounds",
+                        "op=", op_name, "index=", index, "base_offset=", base_offset,
+                        "base_elements=", base_elements, "storage_elements=", storage_elements);
+    return std::nullopt;
+  }
+
+  // Reject if base tensor would exceed 4GB
+  {
+    int64_t base_bytes = base_elements * tensor.element_size();
+    constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
+    if (base_bytes >= kMaxBytes) {
+      TORCH_NEURONX_DEBUG("DecomposeStrides rejected: base tensor exceeds 4GB", "op=", op_name,
+                          "index=", index, "base_bytes=", base_bytes);
+      return std::nullopt;
+    }
+  }
+
+  at::Tensor base_tensor = tensor.as_strided(c10::IntArrayRef(phys_base_shape),
+                                             c10::IntArrayRef(base_strides), base_offset);
+
+  // Compute phys_steps for all dims
+  std::vector<int64_t> phys_steps(total_dims, 1);
+  {
+    int step_ptr = 0;
+    for (int p = 0; p < total_dims; ++p) {
+      int orig = phys_to_logical[p];
+      if (orig < ndims && is_bc[orig]) {
+        phys_steps[p] = 1;
+      } else {
+        phys_steps[p] = step_factors[step_ptr++];
+      }
+    }
+  }
+
+  std::string element_type = ScalarTypeToElementTypeString(tensor.scalar_type());
+
+  StrideDecompositionResult result;
+  result.base_tensor = base_tensor;
+  result.phys_base_shape = phys_base_shape;
+  result.phys_starts = phys_starts;
+  result.phys_target_shape = phys_target_shape;
+  result.phys_steps = phys_steps;
+  result.phys_to_logical = phys_to_logical;
+  result.logical_to_phys = logical_to_phys;
+  result.is_broadcast = is_bc;
+  result.element_type = element_type;
+  result.total_dims = total_dims;
+  return result;
+}
+
+// ============================================================================
 // CREATORS IMPLEMENTATION
 // ============================================================================
 
@@ -643,339 +886,66 @@ std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor&
 std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& input,
                                                               const std::string& op_name,
                                                               size_t input_index) {
-  auto shape = input.sizes();
-  auto strides = input.strides();
-  int64_t offset = input.storage_offset();
-  int64_t ndims = shape.size();
-
-  if (ndims == 0 || input.is_contiguous()) {
-    TORCH_NEURONX_DEBUG("TryCreateCompound rejected: tensor is empty or contiguous", "op=", op_name,
-                        "input_index=", input_index, "ndims=", ndims,
-                        "is_contiguous=", input.is_contiguous());
+  // Use shared stride decomposition (Steps 1-6)
+  auto decomp = DecomposeStrides(input, op_name, input_index);
+  if (!decomp.has_value()) {
     return std::nullopt;
   }
 
-  // Step 1: Identify broadcast dims (stride=0 or size=1) vs non-broadcast dims.
-  // Size-1 dims are treated as broadcast because their stride value is mathematically
-  // irrelevant (the dimension contributes zero span regardless of stride value).
-  // Including them in the non-broadcast set would pollute the GCD computation with
-  // meaningless "junk" strides that cause false rejections.
-  std::vector<int64_t> non_bc_dims;
-  std::vector<bool> is_bc(ndims, false);
-  for (int64_t i = 0; i < ndims; ++i) {
-    if (strides[i] == 0 || shape[i] == 1) {
-      is_bc[i] = true;
-    } else {
-      non_bc_dims.push_back(i);
-    }
-  }
+  auto shape = input.sizes();
+  int64_t ndims = shape.size();
+  const auto& d = decomp.value();
 
-  // Handle all-broadcast early return
-  if (non_bc_dims.empty()) {
-    std::string element_type = ScalarTypeToElementTypeString(input.scalar_type());
-    at::Tensor base_tensor = input.as_strided({1}, {1}, offset);
+  // Handle all-broadcast early return (DecomposeStrides signals this with empty phys_to_logical)
+  if (d.phys_to_logical.empty()) {
     std::vector<TensorTransformation> transforms;
     std::vector<int64_t> all_ones_shape(ndims, 1);
     transforms.emplace_back(TransformationType::RESHAPE, std::vector<int64_t>{1}, all_ones_shape,
-                            element_type);
+                            d.element_type);
 
     std::vector<int64_t> bc_params(ndims);
     std::iota(bc_params.begin(), bc_params.end(), 0);
     std::vector<int64_t> id_perm(ndims);
     std::iota(id_perm.begin(), id_perm.end(), 0);
     transforms.emplace_back(TransformationType::BROADCAST, all_ones_shape,
-                            std::vector<int64_t>(shape.begin(), shape.end()), element_type,
+                            std::vector<int64_t>(shape.begin(), shape.end()), d.element_type,
                             bc_params, id_perm, id_perm);
 
-    return TransformationCreationResult{true, std::move(transforms), base_tensor,
+    return TransformationCreationResult{true, std::move(transforms), d.base_tensor,
                                         "COMPOUND_ALL_BC"};
   }
 
-  // Step 2: Sort non-broadcast dims by stride descending to get physical memory order.
-  // The outermost dimension (largest stride) comes first.
-  int64_t num_non_broadcast = non_bc_dims.size();
-  std::vector<int64_t> sorted_nb_order(num_non_broadcast);
-  std::iota(sorted_nb_order.begin(), sorted_nb_order.end(), 0);
-  std::sort(sorted_nb_order.begin(), sorted_nb_order.end(), [&](int64_t a, int64_t b) {
-    int64_t stride_a = strides[non_bc_dims[a]];
-    int64_t stride_b = strides[non_bc_dims[b]];
-
-    // Primary sort: stride magnitude descending
-    if (stride_a != stride_b) return stride_a > stride_b;
-
-    // Tie-breaker: maintain original relative axis order
-    return non_bc_dims[a] < non_bc_dims[b];
-  });
-
-  int64_t total_dims = ndims;
-
-  // Step 3: Extract sorted shapes/strides and factorize stride gaps.
-  // For each consecutive pair of sorted strides, compute the base dimension size
-  // using GCD. This determines how many contiguous elements each dimension spans
-  // in the base tensor.
-  std::vector<int64_t> sorted_shape;
-  std::vector<int64_t> sorted_strides;
-  for (int64_t idx : sorted_nb_order) {
-    sorted_shape.push_back(shape[non_bc_dims[idx]]);
-    sorted_strides.push_back(strides[non_bc_dims[idx]]);
-  }
-
-  std::vector<int64_t> sorted_base_shape = sorted_shape;
-  std::vector<int64_t> step_factors(num_non_broadcast, 1);
-  std::vector<int64_t> sorted_base_strides(num_non_broadcast, 1);
-
-  if (num_non_broadcast > 0) {
-    // Precompute running GCD of all strides from outermost to current position.
-    // outer_stride_gcd[i] = GCD(sorted_strides[0], ..., sorted_strides[i]).
-    // This bounds the maximum base dimension size at each level.
-    //
-    // Example: [B,S,H,D]=[1,8,4,8] transposed(1,2) then sliced [..., 4:]
-    //   sorted_strides = [32, 8, 1] (S=8→stride 32, H=4→stride 8, D_half=4→stride 1)
-    //   outer_stride_gcd = [32, GCD(32,8)=8, GCD(8,1)=1]
-    std::vector<int64_t> outer_stride_gcd(num_non_broadcast);
-    outer_stride_gcd[0] = sorted_strides[0];
-    for (int i = 1; i < num_non_broadcast; ++i) {
-      outer_stride_gcd[i] = std::gcd(outer_stride_gcd[i - 1], sorted_strides[i]);
-    }
-
-    // Innermost dimension: base stride is always 1, step is the actual stride.
-    // Example: sorted_strides[-1]=1 → base_stride=1, step=1 (contiguous access)
-    sorted_base_strides[num_non_broadcast - 1] = 1;
-    step_factors[num_non_broadcast - 1] = sorted_strides[num_non_broadcast - 1];
-
-    // Work from inner to outer: for each dimension, determine the base extent
-    // and step factor by factorizing the stride gap using GCD.
-    for (int64_t i = num_non_broadcast - 2; i >= 0; --i) {
-      // GCD check: outer_stride_gcd[i] must be divisible by base_strides_sorted[i+1].
-      // If not, the strides are coprime at this level — the layout can't be represented
-      // as a rectangular grid (e.g., view-split after narrow creates this).
-      if (outer_stride_gcd[i] % sorted_base_strides[i + 1] != 0) {
-        TORCH_NEURONX_DEBUG("TryCreateCompound rejected: non-admissible layout (GCD check)",
-                            "op=", op_name, "input_index=", input_index, "sorted_dim=", i,
-                            "sorted_base_strides[i+1]=", sorted_base_strides[i + 1],
-                            "outer_stride_gcd[i]=", outer_stride_gcd[i], "shape=", shape,
-                            "strides=", strides, "sorted_shape=", sorted_shape,
-                            "sorted_strides=", sorted_strides);
-        return std::nullopt;
-      }
-
-      // max_base_extent: the maximum valid base dimension size, derived from GCD.
-      // It represents how many contiguous elements the inner dimension could span
-      // while still being compatible with all outer strides.
-      // Example (i=0): outer_stride_gcd[0]=8, base_strides_sorted[1]=1
-      //   → max_base_extent = 8/1 = 8 (dim 1 can have at most 8 elements in base)
-      int64_t max_base_extent = outer_stride_gcd[i] / sorted_base_strides[i + 1];
-
-      // min_required_extent: the minimum physical memory footprint needed by the
-      // inner dimension's slice (accounting for step). Formula: (size-1)*step + 1.
-      // Example: sorted_shape[1]=4, step_factors[1]=1
-      //   → min_required_extent = (4-1)*1 + 1 = 4 (need 4 contiguous slots)
-      //   Since 4 ≤ 8 (max_base_extent), this dimension fits.
-      int64_t min_required_extent = (sorted_shape[i + 1] - 1) * step_factors[i + 1] + 1;
-
-      // Find the smallest divisor of max_base_extent that is >= min_required_extent
-      // and can physically accommodate the slice (including offset).
-      // Uses O(√n) divisor enumeration instead of linear search.
-      int64_t best_extent = -1;
-      for (int64_t d = 1; d * d <= max_base_extent; ++d) {
-        if (max_base_extent % d != 0) continue;
-        // Check both d and max_base_extent/d
-        for (int64_t candidate : {d, max_base_extent / d}) {
-          if (candidate < min_required_extent) continue;
-          int64_t start_idx = (offset / sorted_base_strides[i + 1]) % candidate;
-          int64_t physical_span = start_idx + (sorted_shape[i + 1] - 1) * step_factors[i + 1] + 1;
-          if (physical_span <= candidate) {
-            if (best_extent == -1 || candidate < best_extent) {
-              best_extent = candidate;
-            }
-          }
-        }
-      }
-      if (best_extent == -1) {
-        TORCH_NEURONX_DEBUG("TryCreateCompound rejected: no valid base factor found",
-                            "op=", op_name, "input_index=", input_index, "sorted_dim=", i,
-                            "max_base_extent=", max_base_extent,
-                            "min_required_extent=", min_required_extent, "shape=", shape,
-                            "strides=", strides, "offset=", offset);
-        return std::nullopt;
-      }
-
-      // Update base shape and compute the base stride for the outer dimension.
-      // base_strides_sorted[i] = product of all inner base extents.
-      // Example (i=0): base_strides_sorted[0] = 1 * 4 = 4
-      //   (dim 0 strides over rows of 4 elements each)
-      sorted_base_shape[i + 1] = best_extent;
-      sorted_base_strides[i] = sorted_base_strides[i + 1] * best_extent;
-
-      // The remaining stride factor becomes the step (strided slice).
-      // sorted_strides[i] = sorted_base_strides[i] * step_factors[i]
-      // Example: sorted_strides[0]=32, sorted_base_strides[0]=4
-      //   → step_factors[0] = 32/4 = 8 (take every 8th row → strided slice)
-      step_factors[i] = sorted_strides[i] / sorted_base_strides[i];
-    }
-  }
-
-  // Step 4: Offset decomposition — convert the flat storage offset into
-  // per-dimension start indices using sorted_base_strides (NOT sorted_strides).
-  // Example: offset=12, sorted_base_strides=[4,1] → starts=[3,0] (start at row 3)
-  // TODO(mengchiy): Simplify by handling offset in flat space as an initial slice on the
-  // base tensor (e.g., base[offset : offset + numel]), which would eliminate the
-  // per-dimension decomposition and simplify the earlier min/max extent logic.
-  int64_t remaining_offset = offset;
-  std::vector<int64_t> sorted_starts(num_non_broadcast, 0);
-  for (int64_t i = 0; i < num_non_broadcast; ++i) {
-    if (sorted_base_strides[i] > 0 && remaining_offset >= sorted_base_strides[i]) {
-      sorted_starts[i] = remaining_offset / sorted_base_strides[i];
-      remaining_offset %= sorted_base_strides[i];
-    }
-  }
-
-  if (remaining_offset != 0) {
-    TORCH_NEURONX_DEBUG("TryCreateCompound rejected: offset decomposition failed", "op=", op_name,
-                        "input_index=", input_index, "remaining_offset=", remaining_offset,
-                        "original_offset=", offset, "shape=", shape, "strides=", strides);
-    return std::nullopt;
-  }
-
-  // Enlarge outermost base shape to prevent out-of-bounds slicing
-  if (num_non_broadcast > 0) {
-    int64_t outermost_span = sorted_starts[0] + (sorted_shape[0] - 1) * step_factors[0] + 1;
-    sorted_base_shape[0] = std::max(sorted_base_shape[0], outermost_span);
-  }
-
-  // Step 5: Build physical-to-logical dimension mapping.
-  // Physical order = broadcast dims in original position + non-broadcast dims in stride-sorted
-  // order. This mapping tells us how to transpose from physical layout back to logical layout.
-  std::vector<int64_t> phys_to_logical;
-  int sorted_dim_ptr = 0;
-  for (int i = 0; i < ndims; ++i) {
-    if (is_bc[i])
-      phys_to_logical.push_back(i);
-    else
-      phys_to_logical.push_back(non_bc_dims[sorted_nb_order[sorted_dim_ptr++]]);
-  }
-  std::vector<int64_t> logical_to_phys(total_dims);
-  for (int p = 0; p < total_dims; ++p) {
-    logical_to_phys[phys_to_logical[p]] = p;
-  }
-
-  // Step 6: Construct the contiguous base tensor (physical bounding box).
-  // Each non-broadcast dim gets the computed base extent; broadcast dims get size 1.
-  std::vector<int64_t> phys_base_shape(total_dims);
-  std::vector<int64_t> phys_starts(total_dims, 0);
-  std::vector<int64_t> phys_target_shape(total_dims);
-
-  int sorted_ptr = 0;
-  for (int p = 0; p < total_dims; ++p) {
-    int orig = phys_to_logical[p];
-    if (orig < ndims && is_bc[orig]) {
-      phys_base_shape[p] = 1;
-      phys_starts[p] = 0;
-      phys_target_shape[p] = 1;
-    } else {
-      int64_t logical_size = shape[orig];
-      int64_t start_idx = sorted_starts[sorted_ptr];  // Native base coordinates
-      int64_t step = step_factors[sorted_ptr];
-
-      // Physical span accounts for the step
-      int64_t physical_span = start_idx + (logical_size - 1) * step + 1;
-      int64_t stride_gap_extent = sorted_base_shape[sorted_ptr];
-
-      phys_base_shape[p] = std::max(stride_gap_extent, physical_span);
-      phys_starts[p] = start_idx;
-      phys_target_shape[p] = logical_size;
-      sorted_ptr++;
-    }
-  }
-
-  auto base_strides = ComputeRowMajorStrides(phys_base_shape);
-
-  // Compute the base tensor's storage offset by subtracting the slice starts.
-  // The base tensor starts earlier in storage; the SLICE ops will re-add the starts.
-  // Example: offset=4 (from [..., D//2:]), phys_starts=[0,0,0,4], base_strides=[...,1]
-  //   → base_offset = 4 - 4*1 = 0 (base tensor starts at storage position 0)
-  int64_t base_offset = offset;
-  for (int i = 0; i < total_dims; ++i) {
-    base_offset -= phys_starts[i] * base_strides[i];
-  }
-
-  int64_t base_elements = 1;
-  for (auto s : phys_base_shape) base_elements *= s;
-  int64_t storage_elements = static_cast<int64_t>(input.storage().nbytes() / input.element_size());
-  if (base_offset < 0 || base_offset + base_elements > storage_elements) {
-    TORCH_NEURONX_DEBUG("TryCreateCompound rejected: base tensor out of storage bounds",
-                        "op=", op_name, "input_index=", input_index, "base_offset=", base_offset,
-                        "base_elements=", base_elements, "storage_elements=", storage_elements,
-                        "shape=", shape, "strides=", strides, "offset=", offset);
-    return std::nullopt;
-  }
-
-  // Note: The base tensor may not cover the full storage (e.g., FSDP shared buffers).
-  // Type mismatches from different base shapes are handled gracefully by:
-  // 1. ProcessInputTransformations (NeuronBindings.cpp): detects conflicting base shapes
-  //    for inputs sharing the same data_ptr() and falls back to contiguous_internal.
-  // 2. validateDepCompatibility (OpConcatUtils.cpp): returns false for common input type
-  //    mismatches during operation concatenation, skipping concatenation gracefully.
-
-  // Reject if base tensor would exceed 4GB — compiler limitation.
-  // Matches Python ContiguousSliceMLIRImpl.can_handle() 4GB check.
-  {
-    int64_t base_numel = 1;
-    for (auto s : phys_base_shape) base_numel *= s;
-    int64_t base_bytes = base_numel * input.element_size();
-    constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
-    if (base_bytes >= kMaxBytes) {
-      TORCH_NEURONX_DEBUG("TryCreateCompound rejected: base tensor exceeds 4GB", "op=", op_name,
-                          "input_index=", input_index, "base_bytes=", base_bytes);
-      return std::nullopt;
-    }
-  }
-
-  at::Tensor base_tensor = input.as_strided(c10::IntArrayRef(phys_base_shape),
-                                            c10::IntArrayRef(base_strides), base_offset);
-
-  // Step 7: Generate the transformation chain.
+  // Step 7: Generate the forward transformation chain from decomposition result.
   // Emit one SLICE per dimension that needs slicing/stepping, then TRANSPOSE
   // (if physical order ≠ logical order), then BROADCAST (if any dims were broadcast).
-  std::string element_type = ScalarTypeToElementTypeString(input.scalar_type());
+  int64_t total_dims = d.total_dims;
   std::vector<TensorTransformation> transforms;
-  std::vector<int64_t> cur_shape = phys_base_shape;
+  std::vector<int64_t> cur_shape = d.phys_base_shape;
   std::vector<int64_t> id_perm_total(total_dims);
   std::iota(id_perm_total.begin(), id_perm_total.end(), 0);
 
-  std::vector<int64_t> phys_steps(total_dims, 1);
-  {
-    int step_ptr = 0;
-    for (int p = 0; p < total_dims; ++p) {
-      int orig = phys_to_logical[p];
-      if (orig < ndims && is_bc[orig]) {
-        phys_steps[p] = 1;
-      } else {
-        phys_steps[p] = step_factors[step_ptr++];
-      }
-    }
-  }
-
+  // SLICE ops
   for (int p = 0; p < total_dims; ++p) {
-    if (phys_starts[p] > 0 || phys_base_shape[p] != phys_target_shape[p] || phys_steps[p] > 1) {
+    if (d.phys_starts[p] > 0 || d.phys_base_shape[p] != d.phys_target_shape[p] ||
+        d.phys_steps[p] > 1) {
       std::vector<int64_t> next_shape = cur_shape;
-      next_shape[p] = phys_target_shape[p];
+      next_shape[p] = d.phys_target_shape[p];
 
       std::vector<int64_t> slice_params;
       for (int i = 0; i < total_dims; ++i) {
         if (i == p) {
-          int64_t start = phys_starts[p];  // Already in base coordinates
-          int64_t end = start + (phys_target_shape[p] - 1) * phys_steps[p] + 1;
+          int64_t start = d.phys_starts[p];
+          int64_t end = start + (d.phys_target_shape[p] - 1) * d.phys_steps[p] + 1;
           slice_params.push_back(start);
           slice_params.push_back(end);
-          slice_params.push_back(phys_steps[p]);
+          slice_params.push_back(d.phys_steps[p]);
         } else {
           slice_params.push_back(0);
           slice_params.push_back(cur_shape[i]);
           slice_params.push_back(1);
         }
       }
-      transforms.emplace_back(TransformationType::SLICE, cur_shape, next_shape, element_type,
+      transforms.emplace_back(TransformationType::SLICE, cur_shape, next_shape, d.element_type,
                               slice_params, id_perm_total, id_perm_total);
       cur_shape = next_shape;
     }
@@ -984,7 +954,7 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
   // TRANSPOSE (Move physical layout to logical layout)
   bool is_identity_perm = true;
   for (int i = 0; i < total_dims; ++i) {
-    if (logical_to_phys[i] != i) {
+    if (d.logical_to_phys[i] != i) {
       is_identity_perm = false;
       break;
     }
@@ -992,9 +962,9 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
 
   if (!is_identity_perm) {
     std::vector<int64_t> final_phys_shape(total_dims);
-    for (int i = 0; i < total_dims; ++i) final_phys_shape[i] = cur_shape[logical_to_phys[i]];
+    for (int i = 0; i < total_dims; ++i) final_phys_shape[i] = cur_shape[d.logical_to_phys[i]];
     transforms.emplace_back(TransformationType::TRANSPOSE, cur_shape, final_phys_shape,
-                            element_type, logical_to_phys, id_perm_total, logical_to_phys);
+                            d.element_type, d.logical_to_phys, id_perm_total, d.logical_to_phys);
     cur_shape = final_phys_shape;
   }
 
@@ -1005,11 +975,294 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
     std::iota(broadcast_params.begin(), broadcast_params.end(), 0);
     std::vector<int64_t> identity_perm_n(ndims);
     std::iota(identity_perm_n.begin(), identity_perm_n.end(), 0);
-    transforms.emplace_back(TransformationType::BROADCAST, cur_shape, final_shape, element_type,
+    transforms.emplace_back(TransformationType::BROADCAST, cur_shape, final_shape, d.element_type,
                             broadcast_params, identity_perm_n, identity_perm_n);
   }
 
-  return TransformationCreationResult{true, std::move(transforms), base_tensor, "COMPOUND"};
+  return TransformationCreationResult{true, std::move(transforms), d.base_tensor, "COMPOUND"};
+}
+
+// ============================================================================
+// TryCreateEpilogue: Build INVERSE transformation chain for non-contiguous outputs
+// ============================================================================
+
+// Result of physical layout analysis for epilogue detection.
+struct EpilogueLayoutInfo {
+  std::vector<int64_t> active_dims;      // logical dims with size > 1
+  std::vector<int64_t> phys_order;       // active dims sorted by stride descending
+  std::vector<int64_t> phys_base;        // base shape per active dim (physical order)
+  std::vector<int64_t> phys_view;        // view shape per active dim (physical order)
+  std::vector<int64_t> phys_starts;      // per-dim slice starts (physical order)
+  std::vector<int64_t> logical_to_phys;  // active-dim logical→physical mapping
+  int64_t storage_elements;
+  bool has_slice;
+  bool is_transposed;
+};
+
+// Analyze physical layout: compute base shape from stride ratios, decompose offset.
+// Returns nullopt if the tensor layout is unsupported (strided slice, broadcast, etc).
+std::optional<EpilogueLayoutInfo> AnalyzeEpilogueLayout(c10::IntArrayRef shape,
+                                                        c10::IntArrayRef strides, int64_t offset,
+                                                        int64_t storage_elements,
+                                                        const std::string& op_name,
+                                                        size_t output_index) {
+  int64_t ndims = shape.size();
+
+  // Collect active dims and sort by stride descending (physical order)
+  std::vector<int64_t> active_dims;
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (shape[i] > 1) active_dims.push_back(i);
+  }
+  if (active_dims.empty()) return std::nullopt;
+
+  std::vector<int64_t> phys_order = active_dims;
+  std::sort(phys_order.begin(), phys_order.end(),
+            [&](int64_t a, int64_t b) { return strides[a] > strides[b]; });
+  int64_t num_active = static_cast<int64_t>(phys_order.size());
+
+  // Compute base shape from stride ratios
+  std::vector<int64_t> phys_base(num_active);
+  std::vector<int64_t> phys_view(num_active);
+  bool has_slice = false;
+
+  for (int64_t pi = 0; pi < num_active; ++pi) {
+    int64_t dim = phys_order[pi];
+    phys_view[pi] = shape[dim];
+
+    if (pi == 0) {
+      phys_base[pi] = storage_elements / strides[dim];
+    } else {
+      int64_t outer_dim = phys_order[pi - 1];
+      if (strides[dim] <= 0) return std::nullopt;
+      phys_base[pi] = strides[outer_dim] / strides[dim];
+      if (strides[outer_dim] != phys_base[pi] * strides[dim]) {
+        TORCH_NEURONX_DEBUG("TryCreateEpilogue: non-contiguous stride gap", "op=", op_name,
+                            "output_index=", output_index);
+        return std::nullopt;
+      }
+    }
+
+    if (pi == num_active - 1 && strides[dim] != 1) {
+      TORCH_NEURONX_DEBUG("TryCreateEpilogue: innermost stride != 1", "op=", op_name,
+                          "output_index=", output_index);
+      return std::nullopt;
+    }
+
+    if (phys_base[pi] < phys_view[pi]) return std::nullopt;
+    if (phys_base[pi] > phys_view[pi]) has_slice = true;
+  }
+
+  // Decompose offset into per-dim starts
+  std::vector<int64_t> phys_starts(num_active, 0);
+  {
+    auto base_strides_phys = ComputeRowMajorStrides(phys_base);
+    int64_t remaining = offset;
+    for (int64_t pi = 0; pi < num_active; ++pi) {
+      if (base_strides_phys[pi] > 0 && remaining >= base_strides_phys[pi]) {
+        phys_starts[pi] = remaining / base_strides_phys[pi];
+        remaining %= base_strides_phys[pi];
+      }
+    }
+    if (remaining != 0) {
+      TORCH_NEURONX_DEBUG("TryCreateEpilogue: offset decomposition failed", "op=", op_name,
+                          "output_index=", output_index);
+      return std::nullopt;
+    }
+    for (int64_t pi = 0; pi < num_active; ++pi) {
+      if (phys_starts[pi] + phys_view[pi] > phys_base[pi]) return std::nullopt;
+    }
+  }
+
+  // Build logical→physical mapping for active dims
+  std::vector<int64_t> logical_to_phys_active(num_active);
+  {
+    std::unordered_map<int64_t, int64_t> dim_to_pi;
+    for (int64_t pi = 0; pi < num_active; ++pi) dim_to_pi[phys_order[pi]] = pi;
+    for (int64_t li = 0; li < num_active; ++li)
+      logical_to_phys_active[li] = dim_to_pi[active_dims[li]];
+  }
+
+  bool is_transposed = false;
+  for (int64_t i = 0; i < num_active; ++i) {
+    if (logical_to_phys_active[i] != i) {
+      is_transposed = true;
+      break;
+    }
+  }
+
+  if (!has_slice && !is_transposed) return std::nullopt;  // contiguous
+
+  return EpilogueLayoutInfo{std::move(active_dims), std::move(phys_order),
+                            std::move(phys_base),   std::move(phys_view),
+                            std::move(phys_starts), std::move(logical_to_phys_active),
+                            storage_elements,       has_slice,
+                            is_transposed};
+}
+
+// Build full-ndims permutation vectors from active-dim layout analysis.
+struct EpiloguePermutation {
+  std::vector<int64_t> full_log_to_phys;  // logical_dim → physical_position
+  std::vector<int64_t> full_phys_to_log;  // physical_position → logical_dim
+  std::vector<int64_t> full_base_phys;    // base shape in physical order
+  std::vector<int64_t> full_starts_phys;  // starts in physical order
+  bool full_is_identity;
+};
+
+EpiloguePermutation BuildEpiloguePermutation(c10::IntArrayRef shape, c10::IntArrayRef strides,
+                                             const EpilogueLayoutInfo& layout) {
+  int64_t ndims = shape.size();
+  int64_t num_active = static_cast<int64_t>(layout.active_dims.size());
+
+  // Positions in full ndims occupied by active dims
+  std::vector<int64_t> slots_for_active;
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (shape[i] > 1) slots_for_active.push_back(i);
+  }
+
+  // Build full permutation: logical_dim → physical_position
+  std::vector<int64_t> full_log_to_phys(ndims);
+  for (int64_t i = 0; i < ndims; ++i) full_log_to_phys[i] = i;
+  for (int64_t li = 0; li < num_active; ++li) {
+    full_log_to_phys[slots_for_active[li]] = slots_for_active[layout.logical_to_phys[li]];
+  }
+
+  // Inverse: phys_position → logical_dim
+  std::vector<int64_t> full_phys_to_log(ndims);
+  for (int64_t i = 0; i < ndims; ++i) full_phys_to_log[full_log_to_phys[i]] = i;
+
+  // Build full base shape and starts in physical order
+  std::vector<int64_t> full_base_phys(ndims, 1);
+  std::vector<int64_t> full_starts_phys(ndims, 0);
+  for (int64_t p = 0; p < ndims; ++p) {
+    int64_t log_dim = full_phys_to_log[p];
+    if (shape[log_dim] <= 1) continue;
+    for (int64_t li = 0; li < num_active; ++li) {
+      if (layout.active_dims[li] == log_dim) {
+        int64_t pi = layout.logical_to_phys[li];
+        full_base_phys[p] = layout.phys_base[pi];
+        full_starts_phys[p] = layout.phys_starts[pi];
+        break;
+      }
+    }
+  }
+
+  bool full_is_identity = true;
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (full_log_to_phys[i] != i) {
+      full_is_identity = false;
+      break;
+    }
+  }
+
+  return EpiloguePermutation{std::move(full_log_to_phys), std::move(full_phys_to_log),
+                             std::move(full_base_phys), std::move(full_starts_phys),
+                             full_is_identity};
+}
+
+std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& output,
+                                                              const std::string& op_name,
+                                                              size_t output_index) {
+  auto shape = output.sizes();
+  auto strides = output.strides();
+  int64_t offset = output.storage_offset();
+  int64_t ndims = shape.size();
+
+  if (ndims == 0 || output.is_contiguous()) return std::nullopt;
+
+  // Reject broadcast and negative strides
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (strides[i] < 0) return std::nullopt;
+    if (strides[i] == 0 && shape[i] > 1) {
+      TORCH_NEURONX_DEBUG("TryCreateEpilogue: broadcast view", "op=", op_name,
+                          "output_index=", output_index);
+      return std::nullopt;
+    }
+  }
+
+  int64_t storage_elements =
+      static_cast<int64_t>(output.storage().nbytes() / output.element_size());
+
+  // Phase 1: Analyze physical layout
+  auto layout_opt =
+      AnalyzeEpilogueLayout(shape, strides, offset, storage_elements, op_name, output_index);
+  if (!layout_opt) return std::nullopt;
+  const auto& layout = *layout_opt;
+
+  // Phase 2: Build full-ndims permutation and base shape
+  auto perm = BuildEpiloguePermutation(shape, strides, layout);
+
+  // Verify storage bounds
+  int64_t base_elements = 1;
+  for (auto s : perm.full_base_phys) base_elements *= s;
+  if (base_elements > storage_elements) return std::nullopt;
+  {
+    int64_t base_bytes = base_elements * output.element_size();
+    constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
+    if (base_bytes >= kMaxBytes) return std::nullopt;
+  }
+
+  // Create base tensor
+  auto base_cont_strides = ComputeRowMajorStrides(perm.full_base_phys);
+  int64_t base_offset = offset;
+  for (int64_t i = 0; i < ndims; ++i)
+    base_offset -= perm.full_starts_phys[i] * base_cont_strides[i];
+  if (base_offset < 0 || base_offset + base_elements > storage_elements) return std::nullopt;
+
+  at::Tensor base_tensor = output.as_strided(c10::IntArrayRef(perm.full_base_phys),
+                                             c10::IntArrayRef(base_cont_strides), base_offset);
+
+  // Phase 3: Build transformation chain
+  std::string element_type = ScalarTypeToElementTypeString(output.scalar_type());
+  std::vector<int64_t> id_perm(ndims);
+  std::iota(id_perm.begin(), id_perm.end(), 0);
+  std::vector<int64_t> logical_shape(shape.begin(), shape.end());
+  std::vector<TensorTransformation> transforms;
+  std::vector<int64_t> cur_shape = logical_shape;
+
+  // INVERSE TRANSPOSE
+  if (!perm.full_is_identity) {
+    std::vector<int64_t> physical_shape(ndims);
+    for (int64_t p = 0; p < ndims; ++p) physical_shape[p] = logical_shape[perm.full_phys_to_log[p]];
+    transforms.emplace_back(TransformationType::TRANSPOSE, cur_shape, physical_shape, element_type,
+                            perm.full_phys_to_log, id_perm, perm.full_phys_to_log);
+    cur_shape = physical_shape;
+  }
+
+  // SCATTER_IOTA for slice patterns.
+  // Controlled by TORCH_NEURONX_ENABLE_SCATTER_IOTA (default OFF until compiler fix).
+  // When OFF, patterns requiring SCATTER_IOTA fall back to contiguous temp + CopyBackToOriginal.
+  //
+  // TODO(mengchiy): Change default to ON once compiler fix comes in.
+  static const bool scatter_iota_enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_ENABLE_SCATTER_IOTA");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  if (layout.has_slice && !scatter_iota_enabled) {
+    TORCH_NEURONX_DEBUG("TryCreateEpilogue: SCATTER_IOTA disabled via env var", "op=", op_name);
+    return std::nullopt;
+  }
+  if (layout.has_slice) {
+    std::vector<int64_t> phys_strides(ndims);
+    for (int64_t p = 0; p < ndims; ++p) phys_strides[p] = strides[perm.full_phys_to_log[p]];
+
+    int64_t scatter_storage_span = storage_elements;
+    std::vector<int64_t> scatter_output_shape = {scatter_storage_span};
+
+    std::vector<int64_t> scatter_params;
+    scatter_params.insert(scatter_params.end(), phys_strides.begin(), phys_strides.end());
+    scatter_params.push_back(offset);
+    scatter_params.push_back(scatter_storage_span);
+
+    transforms.emplace_back(TransformationType::SCATTER_IOTA, cur_shape, scatter_output_shape,
+                            element_type, scatter_params, id_perm, id_perm);
+
+    base_tensor = output.as_strided({scatter_storage_span}, {1}, 0);
+  }
+
+  std::string pattern_name = layout.has_slice
+                                 ? (perm.full_is_identity ? "EPILOGUE_SLICE" : "EPILOGUE_COMPOUND")
+                                 : "EPILOGUE_TRANSPOSE";
+  return TransformationCreationResult{true, std::move(transforms), base_tensor, pattern_name};
 }
 
 }  // namespace Creators
@@ -1181,6 +1434,48 @@ TransformationTask BroadcastHandler::ProcessGroup(size_t input_index, Transforma
   // Return TransformationTask
   return TransformationTask{.input_index = input_index,
                             .type = TransformationType::BROADCAST,
+                            .input_shape = transform.input_shape,
+                            .output_shape = transform.output_shape,
+                            .element_type = transform.element_type,
+                            .current_perm = state.current_perm,
+                            .params = params};
+}
+
+// ScatterIotaHandler
+size_t ScatterIotaHandler::FindGroupEnd(const std::vector<TensorTransformation>& transformations,
+                                        size_t start_index,
+                                        const TransformationState& state) const {
+  return start_index + 1;  // Process individually
+}
+
+TransformationTask ScatterIotaHandler::ProcessGroup(size_t input_index, TransformationState& state,
+                                                    const std::vector<TensorTransformation>& group,
+                                                    const std::string& op_name) const {
+  TORCH_NEURONX_DEBUG("Processing SCATTER_IOTA group", "op=", op_name, "input_index=", input_index);
+
+  const auto& transform = group[0];
+
+  // Extract strides, offset, storage_span from params
+  // params layout: [stride_0, ..., stride_{n-1}, storage_offset, storage_span]
+  size_t ndims = transform.input_shape.size();
+  TORCH_CHECK(transform.params.size() == ndims + 2, "SCATTER_IOTA params size mismatch: expected ",
+              ndims + 2, " got ", transform.params.size());
+
+  std::vector<int64_t> view_strides(transform.params.begin(), transform.params.begin() + ndims);
+  int64_t storage_offset = transform.params[ndims];
+  int64_t storage_span = transform.params[ndims + 1];
+
+  // Update state — output is 1D flat storage
+  state.current_shape = transform.output_shape;
+
+  // Build ScatterIotaParams
+  ScatterIotaParams params;
+  params.view_strides = view_strides;
+  params.storage_offset = storage_offset;
+  params.storage_span = storage_span;
+
+  return TransformationTask{.input_index = input_index,
+                            .type = TransformationType::SCATTER_IOTA,
                             .input_shape = transform.input_shape,
                             .output_shape = transform.output_shape,
                             .element_type = transform.element_type,
