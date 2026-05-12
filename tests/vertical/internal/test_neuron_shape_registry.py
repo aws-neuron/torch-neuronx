@@ -399,6 +399,102 @@ class TestPropagation:
         assert reg.has("aten::linear.default")
 
 
+# ── max_tensor_elems ─────────────────────────────────────────────────────────
+
+
+class TestMaxTensorElems:
+    def test_nested_dict_shape(self):
+        # Model-traced format: {"self": {"dtype": "...", "shape": [...]}}
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert (
+            max_tensor_elems({"self": {"dtype": "bfloat16", "shape": [16, 5120]}}, "aten::log")
+            == 16 * 5120
+        )
+
+    def test_bare_tuple_under_tensor_key(self):
+        # Most common form in hand-registered entries. Schema says ``self``
+        # is a tensor, so the bare tuple must be treated as its shape.
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert max_tensor_elems({"self": (256, 4096)}, "aten::log") == 256 * 4096
+
+    def test_bare_tuple_multi_tensor_args(self):
+        # linear has tensor args ``input``, ``weight``, ``bias`` per schema.
+        # Result is the max over the three — not the sum, not just one.
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert (
+            max_tensor_elems(
+                {"input": (32, 64), "weight": (10, 64), "bias": (10,)},
+                "aten::linear",
+            )
+            == 32 * 64
+        )  # input has 2048 elems, weight has 640, bias has 10
+
+    def test_factory_size_arg(self):
+        # For ops like aten::zeros(int[] size, ...), ``size`` is a non-tensor
+        # IntList arg per schema — so max_tensor_elems returns 0 for it.
+        # (The tool is shape-input ranker, not output-size ranker.)
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert max_tensor_elems({"size": (8192, 2880)}, "aten::zeros") == 0
+
+    def test_ignores_parameter_lists(self):
+        # layer_norm: ``input`` / ``weight`` are tensors; ``normalized_shape``
+        # is int[] — MUST NOT inflate the ranking.
+        from .neuron_shape_registry import max_tensor_elems
+
+        args = {
+            "input": {"dtype": "bfloat16", "shape": [1, 2048, 4096]},
+            "normalized_shape": [4096],
+            "weight": (4096,),
+            "bias": (4096,),
+            "eps": 1e-6,
+        }
+        assert max_tensor_elems(args, "aten::layer_norm") == 1 * 2048 * 4096
+
+    def test_ignores_split_sizes(self):
+        # split_with_sizes.out has ``split_sizes`` as int[] — must not be
+        # counted despite its large values.
+        from .neuron_shape_registry import max_tensor_elems
+
+        args = {
+            "self": (1024,),
+            "split_sizes": [262144, 262144, 262144, 64],
+            "dim": -1,
+        }
+        assert max_tensor_elems(args, "aten::split_with_sizes") == 1024
+
+    def test_foreach_list_of_specs(self):
+        # _foreach_* ops take Tensor[] — value is list of per-tensor specs.
+        from .neuron_shape_registry import max_tensor_elems
+
+        args = {"self": [{"shape": (4, 4)}, {"shape": (8, 8)}, {"shape": (2,)}]}
+        assert max_tensor_elems(args, "aten::_foreach_neg") == 64  # max over the three
+
+    def test_foreach_list_of_bare_tuples(self):
+        # Alternate list-of-tuples form accepted by _tensor_list_from_spec.
+        from .neuron_shape_registry import max_tensor_elems
+
+        args = {"tensors": [(4, 4), (8, 8), (2,)]}
+        assert max_tensor_elems(args, "aten::cat") == 64
+
+    def test_unresolvable_op_returns_zero(self):
+        # Unknown op name → schema missing → degrades to 0 (sort falls back
+        # to registration-order, safer than over-counting).
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert max_tensor_elems({"self": (256, 4096)}, "aten::not_a_real_op") == 0
+
+    def test_empty_and_none(self):
+        from .neuron_shape_registry import max_tensor_elems
+
+        assert max_tensor_elems({}, "aten::log") == 0
+        assert max_tensor_elems({"self": None}, "aten::log") == 0
+        assert max_tensor_elems(None, "aten::log") == 0
+
+
 # ── NeuronOpInfo ─────────────────────────────────────────────────────────────
 
 
@@ -484,3 +580,56 @@ class TestNeuronOpInfo:
         assert info.op_resolved
         samples = list(info.sample_inputs("cpu", torch.float32, requires_grad=False))
         assert len(samples) > 0
+
+    def test_registry_entries_capped_to_top_n_by_size(self, monkeypatch):
+        """_registry_entries caps at ``NEURON_MAX_SHAPES_PER_OP`` env var
+        (default 10), keeping the largest tensors first."""
+        from .neuron_shape_registry import SHAPE_REGISTRY, max_tensor_elems
+
+        # Use a real aten op (valid schema) that has no pre-registered
+        # entries in the defaults file so the test controls the full set.
+        op_name = "aten::i0"
+        assert not SHAPE_REGISTRY.get(op_name), "precondition: op has no prior entries"
+
+        # Register shapes of strictly increasing numel.
+        registered_sides = (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+        for side in registered_sides:
+            SHAPE_REGISTRY.register(
+                op_name,
+                arg_shapes={"self": (side, side)},
+                source=f"trace_{side}",
+                count=1,
+            )
+
+        info = self.NeuronOpInfo.from_schema(op_name)
+
+        def _sizes(entries):
+            return [max_tensor_elems(e.arg_shapes, op_name) for e in entries]
+
+        # Default cap = 10: keep the 10 largest.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "10")
+        entries = info._registry_entries()
+        assert len(entries) == 10
+        sizes = _sizes(entries)
+        assert sizes == sorted(sizes, reverse=True), f"not descending: {sizes}"
+        assert sizes[0] == 4096 * 4096
+        # Two smallest sides (2, 4) must have been dropped.
+        dropped_sides = {2, 4}
+        kept_shapes = {e.arg_shapes["self"] for e in entries}
+        assert all((s, s) not in kept_shapes for s in dropped_sides)
+
+        # Custom cap = 3: top 3 by numel.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "3")
+        entries = info._registry_entries()
+        sizes = _sizes(entries)
+        assert sizes == [4096 * 4096, 2048 * 2048, 1024 * 1024]
+
+        # Cap = 0 disables the cap.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "0")
+        entries = info._registry_entries()
+        assert len(entries) == len(registered_sides)
+
+        # Negative cap also disables.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "-1")
+        entries = info._registry_entries()
+        assert len(entries) == len(registered_sides)

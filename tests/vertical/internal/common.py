@@ -26,9 +26,15 @@ logger = logging.getLogger(__name__)
 # ── Worst-case ranking when aggregating per-shape statuses into one CSV row ──
 
 STATUS_RANK = {
+    # Eager-path statuses
+    "runs_on_neuron": 0,
+    "cpu_fallback": 2,
+    # Compile-path statuses
     "supported": 0,
-    "pending_registry": 1,
-    "missing": 2,
+    "graph_break": 2,
+    # Shared (both paths)
+    "no_input_sample": 1,
+    "unresolved": 2,
     "failed_lowering": 3,
 }
 
@@ -101,19 +107,32 @@ def classify_op(op_name: str) -> str:
     return "unknown"
 
 
-# ── Exception classification for the eager path ─────────────────────────────
+# ── Exception classification ────────────────────────────────────────────────
 
 
 def classify_error(exc_str: str) -> str:
-    """Map a dispatcher/runtime error string to one of:
-    ``missing``, ``failed_lowering``, or ``pending_registry``.
+    """Classify a dispatcher/runtime error string into an error **cause**:
+
+      - ``"unsupported"``      — no kernel on the target backend (dispatcher
+                                 "Could not run ... backend", NYI, "only
+                                 supports CPU", op-lookup failure).
+      - ``"failed_lowering"``  — a real compile/lowering/runtime failure
+                                 (CPU fallback disabled, Neuron compile error,
+                                 registration bug).
+      - ``"pending_registry"`` — the test supplied inputs incompatible with
+                                 the op's schema (type mismatch, wrong arg
+                                 count, etc.); the op itself may still work.
+
+    The returned label is an error *cause*, not a test-path status. Callers
+    map cause → status in their own vocabulary (e.g. eager path maps
+    ``unsupported`` → ``cpu_fallback``; compile path maps it → ``missing``).
     """
     if "Could not run" in exc_str and "backend" in exc_str:
-        return "missing"
+        return "unsupported"
     if "NYI" in exc_str or "not yet implemented" in exc_str.lower():
-        return "missing"
+        return "unsupported"
     if "op not found" in exc_str:
-        return "missing"
+        return "unsupported"
     if "CPU fallback disabled" in exc_str:
         return "failed_lowering"
     if "_copy_from_and_resize" in exc_str:
@@ -125,7 +144,7 @@ def classify_error(exc_str: str) -> str:
     if "Compilation error occurred on Neuron" in exc_str:
         return "failed_lowering"
     if "only supports CPU" in exc_str:
-        return "missing"
+        return "unsupported"
     # Type mismatches from wrong sample inputs — not a real failure
     if "Expected a value of type" in exc_str and "but instead found type" in exc_str:
         return "pending_registry"
@@ -176,6 +195,37 @@ def flatten_tensors(obj):
             return []
         out.append(t)
     return out
+
+
+def count_input_elems(sample) -> int:
+    """Sum of ``numel()`` across every tensor input of a ``SampleInput``.
+
+    Returns the total element count over ``sample.input`` and each positional
+    arg (unwrapping ``List[Tensor]`` / ``Tuple[Tensor]`` inputs used by
+    ``_foreach_*`` and ``cat``/``stack``). Non-tensor args are ignored.
+    Kwarg tensors are not counted because most Neuron ops keep large-data
+    args positional; kwargs are typically scalars, axes, modes, or
+    write-alias ``out=`` slots already accounted for via the positional
+    inputs.
+
+    Returns ``0`` on any failure. The caller (test aggregator) treats 0
+    as "unable to identify" and emits an empty CSV cell. This keeps the
+    column empty for scalar-only samples and for ops whose sample builder
+    produced no real tensors (e.g. pending_registry skips).
+    """
+    try:
+        total = 0
+        for t in (sample.input, *sample.args):
+            if isinstance(t, torch.Tensor):
+                total += int(t.numel())
+            elif isinstance(t, list | tuple):
+                for x in t:
+                    if isinstance(x, torch.Tensor):
+                        total += int(x.numel())
+        return total
+    except Exception as e:
+        logger.debug("count_input_elems failed: %s", e)
+        return 0
 
 
 def probe_output_meta(op, sample):

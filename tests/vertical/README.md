@@ -57,7 +57,8 @@ Results are aggregated into:
 | `op_group` | Category: elementwise, linalg, nn, reduction, indexing, etc. |
 | `status` | `supported`, `missing`, `failed_lowering`, `pending_registry` |
 | `supported_by` | `registered`, `composite`, `variant_covered`, `unknown` |
-| `input_source` | `shape_registry`, `pytorch_db`, `pending_registry` |
+| `input_source` | `shape_registry_model`, `shape_registry_default`, `pytorch_db`, `pending_registry` |
+| `input_element_count` | Total input element count of the slowest-executing shape (empty when no shape ran) |
 | `neuron_primitive_ops` | ATen ops executed on Neuron |
 | `fallback_primitive_ops` | ATen ops that fell back to CPU |
 | `time_to_first_ms` | Time to first result (ms) |
