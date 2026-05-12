@@ -15,7 +15,7 @@
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
-#include "torch_neuronx/csrc/core/lazy_materialization/OperationPrologue.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
 using namespace torch_neuronx::testing;

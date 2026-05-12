@@ -1,4 +1,4 @@
-#include "OperationPrologue.h"
+#include "OperationTransformations.h"
 
 #include <chrono>
 #include <mutex>
@@ -37,6 +37,8 @@ std::string TransformationTypeToString(TransformationType type) {
       return "BROADCAST";
     case TransformationType::SLICE:
       return "SLICE";
+    case TransformationType::SCATTER_IOTA:
+      return "SCATTER_IOTA";
     case TransformationType::NONE:
       return "NONE";
     default:
@@ -86,6 +88,17 @@ std::string GenerateMlir(const TransformationTask& task) {
                                                   params->broadcast_dims, task.element_type);
       }
       throw std::runtime_error("Invalid BroadcastParams in TransformationTask");
+
+    case TransformationType::SCATTER_IOTA:
+      if (auto* params = std::get_if<ScatterIotaParams>(&task.params)) {
+        return mlir_generators::GenerateScatterIota(
+            task.input_shape,        // view shape (update)
+            params->view_strides,    // strides of destination view
+            params->storage_offset,  // storage offset
+            params->storage_span,    // total flat storage size
+            task.element_type);
+      }
+      throw std::runtime_error("Invalid ScatterIotaParams in TransformationTask");
 
     case TransformationType::NONE:
       // Generate empty/identity MLIR for inputs with no transformations
@@ -496,6 +509,214 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
     g_prologue_cache[merged_cache_key] = result.prologue_mlir_str;
 
     TORCH_NEURONX_DEBUG("Cached merged prologue", "cache_key=", merged_cache_key);
+  }
+
+  return result;
+}
+
+// ============================================================================
+// OperationEpilogue Implementation
+//
+// Reuses OperationPrologue's CollectTransformationTasks and
+// transformation_utils::GenerateMlir. The epilogue is structurally identical
+// to the prologue — the only difference is the transformations themselves
+// (inverse permutations) and the cache prefix.
+// ============================================================================
+
+namespace {
+
+// Separate cache for epilogue MLIR strings
+// Cache stores {epilogue_mlir_str, has_scatter_iota} — both are needed on cache hit
+// because has_scatter_iota determines whether ProcessEpilogueWithMlirMerge adds an
+// extra input address for the SCATTER_IOTA base tensor.
+static std::unordered_map<std::string, std::pair<std::string, bool>> g_epilogue_cache;
+static std::mutex g_epilogue_cache_mutex;
+
+}  // anonymous namespace
+
+std::string OperationEpilogue::ComputeEpilogueCacheKey(
+    const std::vector<void*>& output_ptrs,
+    const std::vector<at::neuron::TensorContext>& output_contexts, const std::string& op_name,
+    const std::vector<std::vector<TensorTransformation>>& kernel_transforms) {
+  // Reuse the same cache key format as prologue, just with "epilogue--" prefix
+  std::stringstream cache_key_ss;
+  cache_key_ss << "epilogue--";
+
+  for (size_t idx = 0; idx < output_ptrs.size(); ++idx) {
+    if (idx >= kernel_transforms.size() || kernel_transforms[idx].empty()) {
+      const auto& ctx = output_contexts[idx];
+      std::vector<int64_t> shape = ctx.get_shape();
+      std::string element_type = ScalarTypeToElementTypeString(ctx.get_dtype());
+      cache_key_ss << "o" << idx << "_";
+      for (auto dim : shape) cache_key_ss << dim << "x";
+      cache_key_ss << "_" << element_type << "_";
+      continue;
+    }
+
+    for (const auto& transform : kernel_transforms[idx]) {
+      cache_key_ss << "o" << idx << "_";
+      cache_key_ss << TransformationTypeToString(transform.type) << "_";
+      for (auto dim : transform.input_shape) cache_key_ss << dim << "x";
+      cache_key_ss << "_to_";
+      for (auto dim : transform.output_shape) cache_key_ss << dim << "x";
+      if (!transform.params.empty()) {
+        cache_key_ss << "_params_";
+        for (auto p : transform.params) cache_key_ss << p << ",";
+      }
+      cache_key_ss << "_dtype_" << transform.element_type << "_";
+    }
+  }
+
+  cache_key_ss << "op_" << op_name;
+  return cache_key_ss.str();
+}
+
+EpilogueResult OperationEpilogue::GenerateEpilogue(
+    const std::vector<void*>& output_ptrs,
+    const std::vector<at::neuron::TensorContext>& output_contexts, const std::string& op_name,
+    const std::vector<std::vector<TensorTransformation>>& kernel_transforms,
+    const std::string& epilogue_cache_key) {
+  // Reuse prologue's CollectTransformationTasks — it works identically for
+  // both directions since it just converts TensorTransformation → TransformationTask
+  // using the handler registry.
+  auto tasks = OperationPrologue::CollectTransformationTasks(output_ptrs, output_contexts, op_name,
+                                                             kernel_transforms);
+
+  if (tasks.empty()) {
+    EpilogueResult result;
+    result.success = true;
+    result.has_transformations = false;
+    result.epilogue_cache_key = "";
+    return result;
+  }
+
+  TORCH_NEURONX_DEBUG("OperationEpilogue: Collected transformation tasks", "op=", op_name,
+                      "num_tasks=", tasks.size());
+
+  // Build the epilogue result using the same merge logic as prologue
+  // but with a separate cache and no deduplication (outputs don't share storage)
+  EpilogueResult result;
+  result.success = true;
+  result.has_transformations = true;
+  result.tasks = tasks;
+  result.output_was_transformed.resize(output_ptrs.size(), false);
+  result.epilogue_cache_key = epilogue_cache_key;
+
+  // Check epilogue cache
+  {
+    std::lock_guard<std::mutex> lock(g_epilogue_cache_mutex);
+    auto it = g_epilogue_cache.find(epilogue_cache_key);
+    if (it != g_epilogue_cache.end()) {
+      result.epilogue_mlir_str = it->second.first;
+      result.has_scatter_iota = it->second.second;
+      // Restore output_was_transformed from tasks (tasks are available before cache check)
+      for (const auto& task : tasks) {
+        if (task.input_index < result.output_was_transformed.size()) {
+          result.output_was_transformed[task.input_index] = true;
+        }
+      }
+      TORCH_NEURONX_DEBUG("Epilogue cache HIT", "cache_key=", epilogue_cache_key,
+                          "has_scatter_iota=", result.has_scatter_iota);
+      return result;
+    }
+  }
+
+  TORCH_NEURONX_DEBUG("Epilogue cache MISS", "cache_key=", epilogue_cache_key);
+
+  // Group tasks by output index
+  std::map<size_t, std::vector<TransformationTask>> tasks_by_output;
+  for (const auto& task : tasks) {
+    tasks_by_output[task.input_index].push_back(task);
+    result.output_was_transformed[task.input_index] = true;
+  }
+
+  size_t num_outputs = output_ptrs.size();
+  TORCH_CHECK(tasks_by_output.size() == num_outputs,
+              "Expected one transformation chain per output for '", op_name, "'.");
+
+  // Chain transformations per output
+  // NOTE: SCATTER_IOTA has 2 inputs (update + base), so chaining must
+  // handle the extra base input. The merge function automatically creates a new
+  // input for unmatched slots.
+  std::vector<std::string> per_output_mlirs;
+  size_t slot_input = 0, slot_intermediate = 1, slot_output = 2;
+  size_t slot_base = 3;  // Extra slot for SCATTER_IOTA base tensor input
+
+  for (const auto& [output_idx, output_tasks] : tasks_by_output) {
+    std::string accumulated_mlir;
+    bool first = true;
+
+    for (size_t ti = 0; ti < output_tasks.size(); ++ti) {
+      std::string task_mlir = transformation_utils::GenerateMlir(output_tasks[ti]);
+      bool is_scatter = (output_tasks[ti].type == TransformationType::SCATTER_IOTA);
+      bool has_extra_input = is_scatter;
+
+      if (first) {
+        accumulated_mlir = task_mlir;
+        first = false;
+        if (is_scatter) result.has_scatter_iota = true;
+      } else {
+        // For SCATTER_IOTA: the task MLIR has 2 inputs.
+        // Connect update to the previous chain's output (slot_intermediate),
+        // and add base as a new unique input (slot_base).
+        std::vector<void*> task_in_addrs;
+        if (has_extra_input) {
+          task_in_addrs = {&slot_intermediate, &slot_base};
+          if (is_scatter) result.has_scatter_iota = true;
+        } else {
+          task_in_addrs = {&slot_intermediate};
+        }
+
+        std::string merged = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
+            accumulated_mlir, task_mlir, {&slot_input}, {&slot_intermediate}, task_in_addrs,
+            {&slot_output});
+        if (merged.empty()) {
+          result.success = false;
+          result.error_message =
+              "Failed to chain epilogue transformation for output " + std::to_string(output_idx);
+          return result;
+        }
+        accumulated_mlir = merged;
+      }
+    }
+    per_output_mlirs.push_back(accumulated_mlir);
+  }
+
+  // Merge all per-output chains (same as prologue, no dedup needed for outputs)
+  std::vector<size_t> input_slots(num_outputs);
+  std::vector<size_t> output_slots(num_outputs);
+
+  std::string accumulated_mlir = per_output_mlirs[0];
+  std::vector<void*> acc_in = {&input_slots[0]};
+  std::vector<void*> acc_out = {&output_slots[0]};
+
+  for (size_t i = 1; i < per_output_mlirs.size(); ++i) {
+    std::vector<void*> chain_in = {&input_slots[i]};
+    std::vector<void*> chain_out = {&output_slots[i]};
+
+    torch_neuronx::MergeMapping mm;
+    std::string merged = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
+        accumulated_mlir, per_output_mlirs[i], acc_in, acc_out, chain_in, chain_out, &mm);
+
+    if (merged.empty()) {
+      result.success = false;
+      result.error_message = "Failed to merge epilogue chain " + std::to_string(i);
+      return result;
+    }
+
+    accumulated_mlir = merged;
+    acc_in.push_back(&input_slots[i]);
+    acc_out.push_back(&output_slots[i]);
+  }
+
+  result.epilogue_mlir_str = accumulated_mlir;
+
+  // Cache the result (MLIR + has_scatter_iota flag)
+  {
+    std::lock_guard<std::mutex> lock(g_epilogue_cache_mutex);
+    g_epilogue_cache[epilogue_cache_key] = {result.epilogue_mlir_str, result.has_scatter_iota};
+    TORCH_NEURONX_DEBUG("Cached merged epilogue", "cache_key=", epilogue_cache_key,
+                        "has_scatter_iota=", result.has_scatter_iota);
   }
 
   return result;

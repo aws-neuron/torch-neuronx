@@ -10,6 +10,7 @@ import math
 import torch
 from torch._meta_registrations import alloc_with_matching_layout
 
+from torch_neuronx._C import _is_epilogue_enabled
 from torch_neuronx.neuron_dynamo_backend.decompositions import (
     _can_use_nki_flash_attention,
     _can_use_nki_flash_attention_backward,
@@ -25,6 +26,43 @@ from .base import AttentionOpImpl, ExecutionResult, Operation
 from .lowering_result import LoweringResult
 from .tensor_layout_utils import match_layout
 from .torch_mlir.kernel import TorchMlirKernel
+
+
+def _compute_output_strides_from_ref(ref_tensor, output_shape):
+    """Compute dense output strides matching ref_tensor's dimension ordering.
+
+    Returns a tuple of strides for output_shape that preserves the memory layout
+    (dimension ordering) of ref_tensor, or None if:
+    - ref_tensor has zero strides (from expand)
+    - ref_tensor has duplicate strides (ambiguous ordering)
+    - The resulting strides would be contiguous (no epilogue needed)
+    """
+    strides = ref_tensor.stride()
+    ndim = len(strides)
+    if ndim != len(output_shape):
+        return None
+    # Reject zero strides (expand) and duplicate strides (ambiguous)
+    if 0 in strides or len(set(strides)) != ndim:
+        return None
+    # Dimension ordering: sort by stride descending (outermost first)
+    perm = sorted(range(ndim), key=lambda d: strides[d], reverse=True)
+    # Compute dense strides for output_shape in this order
+    out_strides = [0] * ndim
+    s = 1
+    for d in reversed(perm):
+        out_strides[d] = s
+        s *= output_shape[d]
+    out_strides = tuple(out_strides)
+    # Skip if already contiguous
+    contiguous = []
+    s = 1
+    for d in reversed(range(ndim)):
+        contiguous.append(s)
+        s *= output_shape[d]
+    contiguous.reverse()
+    if out_strides == tuple(contiguous):
+        return None
+    return out_strides
 
 
 def _sdpa_fwd_traceable(
@@ -306,7 +344,16 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
                     is_empty_tensor=True,
                     stablehlo_bytes=b"",
                 )
-            return kernel.lower(*args, **kwargs)
+            result = kernel.lower(*args, **kwargs)
+            # Inject target_strides for output[0] (attention) so the epilogue
+            # fuses the stride relayout into the NEFF instead of a post-hoc copy.
+            # Only valid when query strides represent a simple permutation (no gaps/zeros).
+            if _is_epilogue_enabled() and result.output_specs and len(result.output_specs) > 0:
+                target = _compute_output_strides_from_ref(query, result.output_specs[0][0])
+                if target is not None:
+                    spec = result.output_specs[0]
+                    result.output_specs[0] = (spec[0], spec[1], target)
+            return result
 
         return sdpa_fwd_lower
 
@@ -497,7 +544,18 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
                     is_empty_tensor=True,
                     stablehlo_bytes=b"",
                 )
-            return kernel.lower(*args, **kwargs)
+            result = kernel.lower(*args, **kwargs)
+            # Inject target_strides for grad outputs [0,1,2] matching query/key/value strides
+            # so the epilogue fuses the stride relayout into the NEFF.
+            if _is_epilogue_enabled() and result.output_specs and len(result.output_specs) >= 3:
+                refs = [args[1], args[2], args[3]]  # query, key, value
+                for i in range(3):
+                    spec = result.output_specs[i]
+                    if isinstance(spec, tuple) and len(spec) >= 2:
+                        target = _compute_output_strides_from_ref(refs[i], spec[0])
+                        if target is not None:
+                            result.output_specs[i] = (spec[0], spec[1], target)
+            return result
 
         return sdpa_bwd_lower
 

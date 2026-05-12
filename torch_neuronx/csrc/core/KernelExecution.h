@@ -318,6 +318,19 @@ class CompilableKernelExecution {
 
   bool HasInputTransformations() const { return !per_input_transformations_.empty(); }
 
+  // Output transformation metadata accessors (for epilogue)
+  void SetOutputTransformations(
+      std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> transforms) {
+    per_output_transformations_ = std::move(transforms);
+  }
+
+  const std::vector<std::vector<c10_neuron::lazy::TensorTransformation>>& GetOutputTransformations()
+      const {
+    return per_output_transformations_;
+  }
+
+  bool HasOutputTransformations() const { return !per_output_transformations_.empty(); }
+
  protected:
   virtual bool ValidateImpl() const;
 
@@ -346,6 +359,8 @@ class CompilableKernelExecution {
   bool has_collectives_;
   // Per-input transformation metadata (optional, for in-place transformations)
   std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> per_input_transformations_;
+  // Per-output transformation metadata (optional, for epilogue — inverse transformations)
+  std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> per_output_transformations_;
 };
 
 // XLA-based kernels (StableHLO compilation path).
@@ -383,7 +398,16 @@ class XLACompilableKernelExecution
                      const std::vector<TensorContext>& new_src_ctxs) {
     src_data_refs_ = std::move(new_src_refs);
     src_tensor_ctxs_ = new_src_ctxs;
+    // Rebuild base class src_ptrs_ to match (used by GetSrcPtrs())
+    src_ptrs_.clear();
+    src_ptrs_.reserve(src_data_refs_.size());
+    for (const auto& ref : src_data_refs_) {
+      src_ptrs_.push_back(ref.ptr);
+    }
   }
+
+  const std::vector<TensorDataRef>& GetSrcRefs() const { return src_data_refs_; }
+  const std::vector<TensorDataRef>& GetDstRefs() const { return dst_data_refs_; }
 
   const std::vector<TensorContext>& GetInputContexts() const { return GetSrcTensorContexts(); }
   const std::vector<TensorContext>& GetOutputContexts() const { return GetDstTensorContexts(); }

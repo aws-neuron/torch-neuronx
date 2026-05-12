@@ -117,6 +117,75 @@ TEST(AllocateExecutionOutputsTest, AliasDtypeMismatchAllocatesFresh) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  AllocateExecutionOutputs — target_strides (SDPA pattern)
+// ═══════════════════════════════════════════════════════════════
+
+TEST(AllocateExecutionOutputsTest, TargetStrides_TransposedLayout) {
+  // SDPA pattern: logical shape [2, 4, 8, 16] with strides from transpose(1,2)
+  // target_strides = strides of [2, 4, 8, 16] viewed as [2, 8, 4, 16].transpose(1,2)
+  // i.e. physical is [2, 8, 4, 16], logical is [2, 4, 8, 16]
+  DispatchCacheEntry entry;
+  // target strides for [2, 4, 8, 16] with physical layout [2, 8, 4, 16]:
+  //   dim 0: stride = 8*4*16 = 512
+  //   dim 1: stride = 16      (was dim 2 in physical)
+  //   dim 2: stride = 4*16 = 64  (was dim 1 in physical)
+  //   dim 3: stride = 1
+  entry.output_specs = {{{2, 4, 8, 16}, c10::ScalarType::Float, {{512, 16, 64, 1}}}};
+
+  std::vector<c10::IValue> args = {torch::zeros({2, 4, 8, 16}), torch::ones({2, 4, 8, 16}), 1};
+  std::vector<torch::Tensor> filtered = {torch::zeros({2, 4, 8, 16})};
+
+  auto outputs = AllocateExecutionOutputs(entry, args, filtered, kCPU, AddSchema());
+  ASSERT_EQ(outputs.size(), 1u);
+
+  // Logical shape must match spec
+  EXPECT_EQ(outputs[0].sizes(), (std::vector<int64_t>{2, 4, 8, 16}));
+
+  // Strides must match target_strides
+  EXPECT_EQ(outputs[0].strides(), (std::vector<int64_t>{512, 16, 64, 1}));
+
+  // Output should NOT be contiguous (it's a transposed view)
+  EXPECT_FALSE(outputs[0].is_contiguous());
+
+  // Total elements must be correct
+  EXPECT_EQ(outputs[0].numel(), 2 * 4 * 8 * 16);
+
+  // Underlying storage must be large enough
+  EXPECT_GE(static_cast<int64_t>(outputs[0].storage().nbytes() / outputs[0].element_size()),
+            outputs[0].numel());
+}
+
+TEST(AllocateExecutionOutputsTest, TargetStrides_2DTranspose) {
+  // Simple 2D transpose: logical [3, 4], physical [4, 3]
+  // target_strides = {1, 3} (column-major)
+  DispatchCacheEntry entry;
+  entry.output_specs = {{{3, 4}, c10::ScalarType::Float, {{1, 3}}}};
+
+  std::vector<c10::IValue> args = {torch::zeros({3, 4}), torch::ones({3, 4}), 1};
+  std::vector<torch::Tensor> filtered = {torch::zeros({3, 4})};
+
+  auto outputs = AllocateExecutionOutputs(entry, args, filtered, kCPU, AddSchema());
+  ASSERT_EQ(outputs.size(), 1u);
+  EXPECT_EQ(outputs[0].sizes(), (std::vector<int64_t>{3, 4}));
+  EXPECT_EQ(outputs[0].strides(), (std::vector<int64_t>{1, 3}));
+  EXPECT_FALSE(outputs[0].is_contiguous());
+}
+
+TEST(AllocateExecutionOutputsTest, TargetStrides_NulloptUsesContiguous) {
+  // When target_strides is nullopt, should allocate contiguous as usual
+  DispatchCacheEntry entry;
+  entry.output_specs = {{{2, 3}, c10::ScalarType::Float, std::nullopt}};
+
+  std::vector<c10::IValue> args = {torch::zeros({2, 3}), torch::ones({2, 3}), 1};
+  std::vector<torch::Tensor> filtered = {torch::zeros({2, 3})};
+
+  auto outputs = AllocateExecutionOutputs(entry, args, filtered, kCPU, AddSchema());
+  ASSERT_EQ(outputs.size(), 1u);
+  EXPECT_TRUE(outputs[0].is_contiguous());
+  EXPECT_EQ(outputs[0].strides(), (std::vector<int64_t>{3, 1}));
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  ReconstructOutputs
 // ═══════════════════════════════════════════════════════════════
 
