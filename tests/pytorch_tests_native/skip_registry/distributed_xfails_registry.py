@@ -482,4 +482,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_hsdp_checkpoint.py::TestHSDPCheckpoint::test_hsdp_fsdp_checkpoint_conversion_is_even_sharded_model_False",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "C++ PG: BackendType.CUSTOM lacks device awareness. "
+            "PyTorch hardcodes BackendType.CUSTOM for all extended_api backends "
+            "(distributed_c10d.py:372). ProcessGroup::getBackendName() returns "
+            "'custom' instead of delegating to NeuronBackend::getBackendName(). "
+            "ProcessGroup::barrier() falls into the else branch (CPU tensor) "
+            "because only NCCL->CUDA and XCCL->XPU are handled. "
+            "Requires upstream fix: either allow CUSTOM backends to specify "
+            "their device type, or make ProcessGroup delegate to the registered "
+            "Backend for CUSTOM type."
+        ),
+        tests=[
+            "test_backends.py::TestMiscCollectiveUtilsNEURON::test_create_pg_neuron",
+            "test_c10d_ops_privateuse1.py::ProcessGroupPrivateUse1OpTest::test_barrier",
+        ],
+    ),
 ]
