@@ -60,6 +60,18 @@ class TestDecompositionTable:
         assert torch.ops.aten.as_strided.default in decompositions.neuron_decompositions
         assert torch.ops.aten.scalar_tensor.default in decompositions.neuron_decompositions
         assert torch.ops.aten.index_copy.default in decompositions.neuron_decompositions
+        assert torch.ops.aten.native_batch_norm.default in decompositions.neuron_decompositions
+        assert (
+            torch.ops.aten._native_batch_norm_legit.default in decompositions.neuron_decompositions
+        )
+        assert (
+            torch.ops.aten._native_batch_norm_legit_functional.default
+            in decompositions.neuron_decompositions
+        )
+        assert (
+            torch.ops.aten._native_batch_norm_legit_no_training.default
+            in decompositions.neuron_decompositions
+        )
 
         # Verify the functions are callable
         assert callable(decompositions.neuron_decompositions[torch.ops.aten.as_strided.default])
@@ -2659,3 +2671,48 @@ class TestSiluBackwardDecompositionE2E:
             return m, x_base.to(dt).to(device)
 
         self._assert_parity(model_fn)
+
+
+class TestNativeBatchNormDecomposition:
+    """Tests for native_batch_norm decomposition numerical correctness.
+
+    Verifies that the PyTorch-provided decomposition produces outputs matching
+    the monolithic aten.native_batch_norm op.
+    """
+
+    def test_native_batch_norm_accuracy_bf16(self):
+        """native_batch_norm decomposition handles bf16 inputs in training mode."""
+        torch.manual_seed(0)
+        shape = (2, 8, 16, 16)
+        num_features = 8
+        x = torch.randn(shape, dtype=torch.bfloat16)
+        weight = torch.randn(num_features)
+        bias = torch.randn(num_features)
+        running_mean = torch.zeros(num_features)
+        running_var = torch.ones(num_features)
+
+        ref_out, _, _ = torch.ops.aten.native_batch_norm(
+            x.float(),
+            weight,
+            bias,
+            running_mean.clone(),
+            running_var.clone(),
+            True,
+            0.1,
+            1e-5,
+        )
+
+        decomp = decompositions.neuron_decompositions[torch.ops.aten.native_batch_norm.default]
+        decomp_out, _, _ = decomp(
+            x,
+            weight,
+            bias,
+            running_mean.clone(),
+            running_var.clone(),
+            True,
+            0.1,
+            1e-5,
+        )
+
+        assert decomp_out.dtype == torch.bfloat16
+        torch.testing.assert_close(decomp_out.float(), ref_out, rtol=1e-2, atol=1e-2)
