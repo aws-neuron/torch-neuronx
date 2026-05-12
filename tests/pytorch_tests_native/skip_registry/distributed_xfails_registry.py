@@ -55,11 +55,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "[Not a test setup issue]"
         ),
         tests=[
-            "TensorParallelAPITests::test_parallelize_module_multi_wildcard",
-            "TensorParallelAPITests::test_parallelize_module_with_no_match",
-            "TensorParallelAPITests::test_parallelize_module_with_root_module",
             "TensorParallelAPITestsWithLocalTensor::test_parallelize_module_multi_wildcard",
-            "TensorParallelAPITests::test_linear_row_wise_parallel",
             "TensorParallelAPITestsWithLocalTensor::test_linear_row_wise_parallel",
             "TensorParallelAPITestsWithLocalTensor::test_parallelize_module_with_no_match",
             "TensorParallelAPITestsWithLocalTensor::test_parallelize_module_with_root_module",
@@ -89,12 +85,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Fake backend test fails; needs handling for LocalTensor philox offset",
         tests=[
             "TensorParallelStyleTestWithLocalTensor::test_sequence_parallel_style",
-        ],
-    ),
-    SkipGroup(
-        reason="Neuron RNG tracker doesn't differentiate per-rank",
-        tests=[
-            "TensorParallelRandomStateTests::test_model_init",
         ],
     ),
     SkipGroup(
@@ -284,40 +274,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Neuron compilation error for zero_ op with mixed dtype parameters",
-        tests=[
-            "TestFullyShardMixedDtypeParam::test_mixed_dtypes_no_grad_param",
-        ],
-    ),
-    SkipGroup(
-        reason="Neuron tensors are always contiguous — "
-        "channels_last and stride-based views unsupported",
-        tests=[
-            "TestFullyShardShardedParameterTensor::test_raise_noncontiguous_parameter",
-            "TestFullyShard2DTraining::test_train_parity_2d_transformer",
-            "TestFullyShard2DTraining::test_train_parity_2d_transformer_checkpoint_resume",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Test hangs in multiprocess mode (PREFER_MULTIPROCESS) but passed"
-            " multithreaded in old patching — TwoTensor all_gather extension"
-            " may deadlock with process isolation"
-        ),
-        tests=[
-            "TestFullyShardAllGatherExtensionsMultiThread::test_all_gather_extensions_end_to_end",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Test hangs with unshard_async_op=True"
-            " - async unshard operation causes deadlock on Neuron"
-        ),
-        tests=[
-            "TestFullyShard1DTrainingCore::test_train_parity_multi_group_unshard_async_op",
-        ],
-    ),
-    SkipGroup(
         reason="Neuron does not support fp16 linear — CPU fallback disabled",
         tests=[
             "TestFSDPMixedPrecisionIgnoredModules::test_mixed_precision_with_ignored_module",
@@ -336,12 +292,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="GradScaler found_inf assertion mismatch on Neuron",
         tests=[
             "TestShardedGradScalerParityWithDDP::test_sharded_grad_scaler_found_inf",
-        ],
-    ),
-    SkipGroup(
-        reason="Convolution_backward compilation error on Neuron",
-        tests=[
-            "TestFSDPMixedPrecisionSharded::test_buffer_dtype_no_root_handle",
         ],
     ),
     SkipGroup(
@@ -402,7 +352,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Unwaited collective stress test exceeds default 600s timeout on Neuron",
         tests=[
-            "TestWithNCCL::test_unwaited",
             "CommTest::test_unwaited",
         ],
     ),
