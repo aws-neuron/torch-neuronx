@@ -40,6 +40,24 @@ def index_checking(tensor, indices):
                 )
 
 
+def _assert_no_internal_overlap(tensor, op_name=""):
+    """Raise RuntimeError if tensor has internal memory overlap.
+
+    Matches CPU PyTorch's ``assert_no_internal_overlap`` semantics: a tensor
+    whose strides cause multiple elements to alias the same memory location
+    cannot be used as an output.
+    """
+    if tensor is None:
+        return
+    for stride, size in zip(tensor.stride(), tensor.shape, strict=False):
+        if stride == 0 and size > 1:
+            raise RuntimeError(
+                "unsupported operation: more than one element of the written-to "
+                "tensor refers to a single memory location. Please clone() the "
+                "tensor before performing the operation."
+            )
+
+
 def _validate_index_select(x, dim, index, out=None):
     """Validate index_select dtypes on raw args."""
     if index.dtype not in [torch.int32, torch.int64]:
@@ -53,6 +71,7 @@ def _validate_index_select(x, dim, index, out=None):
     validate_static_inputs=_validate_index_select,
 )
 def torch_index_select(x, dim, index, out=None):
+    _assert_no_internal_overlap(out)
     if index.dim() == 0:
         index = index.reshape(1)
     elif index.dim() != 1:
