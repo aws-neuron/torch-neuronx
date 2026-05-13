@@ -7,6 +7,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 
@@ -93,6 +94,8 @@ OperationContextResult ErrorRecovery::AttemptOOMRecovery(OperationContext* op) {
   } catch (const torch_neuronx::ExecutionRuntimeException& retry_e) {
     TORCH_NEURONX_WARN("OOM recovery failed after cache drain", "op=", op->GetOpName(),
                        "error=", retry_e.what());
+    int device_id = op->kernel_execution ? op->kernel_execution->GetDeviceId() : 0;
+    at::neuron::metrics::RecordOOMFailure(device_id, 0, op->stream_id, nullptr);
     return OperationContextResult::CreateError(std::string("OOM recovery failed: ") +
                                                retry_e.what());
   }

@@ -311,3 +311,139 @@ class TestMemoryStats:
 
         mem_final = torch_neuronx.memory_allocated()
         assert mem_final <= baseline
+
+    def test_peak_memory_stats_valid_after_allocation(self):
+        """Test that peak stats is captured after an allocation."""
+        x = torch.randn(1024, device="neuron")
+        torch_neuronx.synchronize()
+        peak = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert peak["valid"], "Peak stats should be valid after allocation"
+        assert peak["allocated_bytes"]["current"] > 0
+        assert peak["allocated_bytes"]["peak"] > 0
+        assert peak["active_bytes"]["current"] > 0
+        assert peak["allocated_bytes"]["current"] >= peak["active_bytes"]["current"]
+        del x
+        torch_neuronx.synchronize()
+
+    def test_peak_memory_stats_not_cleared_by_reset_peak(self):
+        """Test that reset_peak_memory_stats does NOT clear peak stats."""
+        x = torch.randn(1024, 1024, device="neuron")
+        torch_neuronx.synchronize()
+        stats_before = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert stats_before["valid"]
+
+        torch_neuronx.reset_peak_memory_stats()
+
+        stats_after = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert stats_after["valid"], "Peak stats should survive reset_peak_memory_stats"
+        assert stats_after["allocated_bytes"]["peak"] == stats_before["allocated_bytes"]["peak"]
+        del x
+        torch_neuronx.synchronize()
+
+    def test_peak_memory_stats_tracks_increasing_peak(self):
+        """Test that peak stats updates when a new peak is reached."""
+        x = torch.randn(512, device="neuron")
+        torch_neuronx.synchronize()
+        t1 = torch_neuronx.memory.get_peak_memory_stats(0)
+
+        y = torch.randn(1024, 1024, device="neuron")
+        torch_neuronx.synchronize()
+        t2 = torch_neuronx.memory.get_peak_memory_stats(0)
+
+        assert t2["allocated_bytes"]["peak"] >= t1["allocated_bytes"]["peak"]
+        del x, y
+        torch_neuronx.synchronize()
+
+    def test_peak_memory_stats_internal_fragmentation(self):
+        """Test that internal fragmentation is non-negative."""
+        x = torch.randn(1024, 1024, device="neuron")
+        torch_neuronx.synchronize()
+        peak = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert peak["internal_fragmentation"] >= 0
+        del x
+        torch_neuronx.synchronize()
+
+    def test_segment_pool_analysis_returns_valid_stats(self):
+        """Test that segment_pool_analysis returns expected keys with valid values."""
+        x = torch.randn(1024, 1024, device="neuron")
+        torch_neuronx.synchronize()
+        analysis = torch_neuronx.memory.segment_pool_analysis(0)
+
+        assert analysis["allocated_bytes"] > 0
+        assert analysis["reserved_bytes"] >= analysis["allocated_bytes"]
+        assert analysis["active_bytes"] > 0
+        assert analysis["total_hbm"] > 0
+        assert analysis["free_chunks"] >= 0
+        assert analysis["largest_free"] >= 0
+        assert analysis["num_segments"] >= 1
+        assert 0 <= analysis["fragmentation_index"] <= 1
+        assert analysis["memory_efficiency"] >= 0
+        assert analysis["internal_fragmentation"] >= 0
+        assert analysis["cached_free"] >= 0
+        del x
+        torch_neuronx.synchronize()
+
+    def test_segment_pool_analysis_summary_returns_string(self):
+        """Test that segment_pool_analysis_summary returns a formatted string."""
+        x = torch.randn(1024, device="neuron")
+        torch_neuronx.synchronize()
+        summary = torch_neuronx.memory.segment_pool_analysis_summary(0)
+        assert isinstance(summary, str)
+        assert "Segment Pool Analysis" in summary
+        assert "Frag index" in summary
+        del x
+        torch_neuronx.synchronize()
+
+    def test_peak_memory_stats_invalid_before_allocation(self):
+        """Test that peak stats returns a dict with expected keys even if no new peak."""
+        # Note: valid may be True from prior tests since peak stats is
+        # intentionally not cleared by reset_peak_memory_stats.
+        peak = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert "valid" in peak
+        assert "allocated_bytes" in peak
+        assert "reserved_bytes" in peak
+        assert "active_bytes" in peak
+        assert "internal_fragmentation" in peak
+
+    def test_segment_pool_analysis_empty_state(self):
+        """Test that segment_pool_analysis handles no-allocation state without crashing."""
+        analysis = torch_neuronx.memory.segment_pool_analysis(0)
+        assert analysis["allocated_bytes"] == 0
+        assert analysis["active_bytes"] == 0
+        assert analysis["free_chunks"] >= 0
+        assert analysis["fragmentation_index"] == 0.0
+        assert analysis["memory_efficiency"] == 0.0
+        assert analysis["num_segments"] == 0
+
+    def test_segment_pool_analysis_summary_empty_state(self):
+        """Test that segment_pool_analysis_summary handles no-allocation state."""
+        summary = torch_neuronx.memory.segment_pool_analysis_summary(0)
+        assert isinstance(summary, str)
+        assert "Segment Pool Analysis" in summary
+
+    def test_peak_stats_alloc_dealloc_stress(self):
+        """Test peak stats across repeated alloc/matmul/dealloc cycles."""
+        peak_before = torch_neuronx.memory.get_peak_memory_stats(0)
+
+        for _ in range(50):
+            x = torch.randn(256, 256, device="neuron")
+            torch_neuronx.synchronize()
+            for _ in range(20):
+                y = x @ x.T
+            torch_neuronx.synchronize()
+            del x, y
+            torch_neuronx.synchronize()
+
+        peak_after = torch_neuronx.memory.get_peak_memory_stats(0)
+        assert peak_after["valid"], "Peak stats should be valid after stress test"
+        assert peak_after["allocated_bytes"]["peak"] > 0
+
+        # Peak should be at least as large as before (monotonically increasing)
+        if peak_before["valid"]:
+            assert peak_after["allocated_bytes"]["peak"] >= peak_before["allocated_bytes"]["peak"]
+
+        # Verify analysis still works after stress
+        torch_neuronx.synchronize()
+        analysis = torch_neuronx.memory.segment_pool_analysis(0)
+        assert analysis["num_segments"] >= 1
+        assert analysis["reserved_bytes"] >= analysis["allocated_bytes"]

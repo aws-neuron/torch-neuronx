@@ -1576,25 +1576,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Memory Statistics Bindings
   // ============================================================================
 
+  // Shared helper for converting MemoryStatInfo to Python dict
+  auto memoryStatToDict = [](const at::neuron::metrics::MemoryStatInfo& stat) {
+    py::dict d;
+    d["current"] = stat.current;
+    d["peak"] = stat.peak;
+    d["allocated"] = stat.allocated;
+    d["freed"] = stat.freed;
+    return d;
+  };
+
   m.def(
       "_get_memory_stats",
-      [](int device_index) -> py::dict {
+      [memoryStatToDict](int device_index) -> py::dict {
         auto stats =
             at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetMemoryStats(device_index);
 
-        auto statToDict = [](const at::neuron::metrics::MemoryStatInfo& stat) {
-          py::dict d;
-          d["current"] = stat.current;
-          d["peak"] = stat.peak;
-          d["allocated"] = stat.allocated;
-          d["freed"] = stat.freed;
-          return d;
-        };
-
         py::dict result;
-        result["allocated_bytes"] = statToDict(stats.allocated_bytes);
-        result["reserved_bytes"] = statToDict(stats.reserved_bytes);
-        result["active_bytes"] = statToDict(stats.active_bytes);
+        result["allocated_bytes"] = memoryStatToDict(stats.allocated_bytes);
+        result["reserved_bytes"] = memoryStatToDict(stats.reserved_bytes);
+        result["active_bytes"] = memoryStatToDict(stats.active_bytes);
         result["num_alloc_retries"] = stats.num_alloc_retries;
         result["num_ooms"] = stats.num_ooms;
         result["num_tensor_frees"] = stats.num_tensor_frees;
@@ -1617,6 +1618,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             device_index);
       },
       "Reset accumulated memory statistics", py::arg("device_index"));
+
+  m.def(
+      "_get_peak_memory_stats",
+      [memoryStatToDict](int device_index) -> py::dict {
+        auto peak =
+            at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetPeakStats(device_index);
+
+        py::dict result;
+        result["valid"] = peak.valid;
+        result["timestamp_ns"] = peak.timestamp_ns;
+        result["allocated_bytes"] = memoryStatToDict(peak.stats.allocated_bytes);
+        result["reserved_bytes"] = memoryStatToDict(peak.stats.reserved_bytes);
+        result["active_bytes"] = memoryStatToDict(peak.stats.active_bytes);
+        result["internal_fragmentation"] =
+            peak.stats.allocated_bytes.current - peak.stats.active_bytes.current;
+        result["num_alloc_retries"] = peak.stats.num_alloc_retries;
+        result["num_ooms"] = peak.stats.num_ooms;
+        result["num_tensor_frees"] = peak.stats.num_tensor_frees;
+        result["allocation_requests"] = peak.stats.allocation_requests;
+        return result;
+      },
+      "Get peak memory stats snapshot for a device", py::arg("device_index"));
 
   // ============================================================================
   // Memory Snapshot Bindings
