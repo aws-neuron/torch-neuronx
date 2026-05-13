@@ -85,8 +85,10 @@ _NORM_OPS = frozenset(
     }
 )
 
-_COPY_OPS = re.compile(
-    r"aten::(reshape|view|expand|contiguous|clone|copy|(?:t|transpose|permute|"
+_COPY_OPS = re.compile(r"aten::(contiguous|clone|copy)(?!.*backward)")
+
+_VIEW_OPS = re.compile(
+    r"aten::(reshape|view|expand|(?:t|transpose|permute|"
     r"flatten|unflatten|squeeze|unsqueeze|narrow|slice|select|as_strided)(?!.*backward))"
 )
 
@@ -163,6 +165,10 @@ def _classify(op_name: str) -> str:
         return "norm"
     if _REDUCTION_PATTERNS.search(op_name):
         return "reduction"
+    if "embedding" in base:
+        return "embedding"
+    if _VIEW_OPS.search(op_name):
+        return "view"
     if _COPY_OPS.search(op_name):
         return "copy"
     # Default: elementwise (covers unary and binary)
@@ -213,7 +219,27 @@ def compute_roofline(
         return _roofline_sdpa_backward(input_tensors, eb)
     if category == "reduction":
         n_elem = sum(t.numel() for t in input_tensors)
-        t_compute = (2 * n_elem) / ve
+        base = _base(op_name)
+        if "norm" in base:
+            # square + sum = 2 ops/elem (sqrt is on the scalar result)
+            ops_per_elem = 2
+        elif "var" in base or "std" in base:
+            # Two passes: sum for mean (1 op/elem), then (x-mean)²+accum (3 ops/elem)
+            ops_per_elem = 4
+        elif "argmax" in base or "argmin" in base:
+            # compare + conditional index update
+            ops_per_elem = 2
+        elif "logsumexp" in base:
+            # max (1) + sub (1) + exp (1) + sum (1) per elem; log+add is scalar, negligible
+            ops_per_elem = 4
+        elif "cumsum" in base or "cumprod" in base:
+            ops_per_elem = 1
+        else:
+            # sum, mean, prod, max, min, amax, amin, any, all, nansum, count_nonzero
+            ops_per_elem = 1
+        t_compute = (ops_per_elem * n_elem) / ve
+        # Only counts input reads; output is negligible for full reductions (scalar).
+        # Slightly underestimates partial reductions where output is non-trivial.
         t_memory = (n_elem * eb) / HBM_BW
         return _result(t_compute, t_memory)
     if category == "softmax":
@@ -222,15 +248,26 @@ def compute_roofline(
         t_memory = (2 * n_elem * eb) / HBM_BW
         return _result(t_compute, t_memory)
     if category == "norm":
+        # Compute: mean+var (sub+square+accum = 3 ops/elem) + normalize (sub+mul = 2) = 5 ops/elem
+        # Memory: normalization dim fits in SBUF so no HBM re-read needed; 1 read + 1 write = 2x
         n_elem = input_tensors[0].numel() if input_tensors else 0
         t_compute = (5 * n_elem) / ve
-        t_memory = (3 * n_elem * eb) / HBM_BW
+        t_memory = (2 * n_elem * eb) / HBM_BW
         return _result(t_compute, t_memory)
+    if category == "embedding":
+        if output_tensors:
+            out_elems = sum(t.numel() for t in output_tensors)
+        else:
+            return None
+        t_memory = (2 * out_elems * eb) / HBM_BW
+        return _result(0.0, t_memory)
+    if category == "view":
+        return None
     if category == "copy":
         n_elem = input_tensors[0].numel() if input_tensors else 0
         return _result(0.0, (2 * n_elem * eb) / HBM_BW)
     if category == "elementwise":
-        return _roofline_elementwise(input_tensors, output_tensors, eb, ve)
+        return _roofline_elementwise(input_tensors, output_tensors, eb, ve, op_name)
     return None
 
 
@@ -386,9 +423,20 @@ def _roofline_sdpa_backward(inputs: list[torch.Tensor], eb: int) -> dict | None:
     """Fused SDPA backward.
 
     Schema has Q at inputs[1], K at [2], V at [3] (grad_out at [0]). The
-    backward recomputes P and does 4 matmuls total (grad_V, grad_P via dO,
-    grad_Q, grad_K), so FLOPs ≈ 2.5x forward ≈ 10·B·H·S_q·S_kv·D.
-    Memory: read grad_out + Q + K + V + out (5 tensors) + write 3 grad tensors.
+    backward recomputes P and does 5 matmuls total:
+      1. Q·K^T (recompute P)        — B·H·S_q·S_kv·D
+      2. P^T · grad_out (grad_V)    — B·H·S_kv·S_q·D
+      3. grad_out · V^T (grad_P)    — B·H·S_q·D·S_kv
+      4. dS · K (grad_Q)            — B·H·S_q·S_kv·D
+      5. dS^T · Q (grad_K)          — B·H·S_kv·S_q·D
+    Total FLOPs = 5 x 2·B·H·S_q·S_kv·D = 10·B·H·S_q·S_kv·D.
+
+    Memory (flash-attention style, attention matrix stays in SRAM):
+      Reads:  grad_out(S_q,D) + Q(S_q,D) + K(S_kv,D) + V(S_kv,D) + out(S_q,D)
+              = 3·B·H·S_q·D + 2·B·H·S_kv·D
+      Writes: grad_Q(S_q,D) + grad_K(S_kv,D) + grad_V(S_kv,D)
+              = 1·B·H·S_q·D + 2·B·H·S_kv·D
+      Total = 4·B·H·S_q·D + 4·B·H·S_kv·D
     """
     if len(inputs) < 4:
         return None
@@ -398,11 +446,31 @@ def _roofline_sdpa_backward(inputs: list[torch.Tensor], eb: int) -> dict | None:
     b, h, s_q, d = int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3])
     s_kv = int(k.shape[2])
     flops = 10 * b * h * s_q * s_kv * d
-    bytes_xfer = (5 * b * h * s_q * d + 3 * b * h * s_kv * d) * eb
+    bytes_xfer = (4 * b * h * s_q * d + 4 * b * h * s_kv * d) * eb
     return _result(flops / TE_FLOPS, bytes_xfer / HBM_BW)
 
 
 # ── Elementwise fallback ───────────────────────────────────────────────────
+
+
+def _elementwise_ops_per_elem(op_name: str) -> int:
+    base = _base(op_name)
+    if "addcmul" in base:
+        # self + value * tensor1 * tensor2 = 3 ops
+        return 3
+    if "addcdiv" in base:
+        # self + value * tensor1 / tensor2 = 3 ops
+        return 3
+    if "_fused_adamw" in base:
+        # With scalar_tensor_tensor fusing s1*t1+s2*t2:
+        # m update (2) + v update: g²+fused (3) + denom (3) + corrected (3)
+        # + p: fused wd*p-update (1) = 12 ops
+        return 12
+    if "_fused_adam" in base:
+        # With scalar_tensor_tensor fusing s1*t1+s2*t2:
+        # m update (2) + v update: g²+fused (3) + denom (3) + corrected (3) + p-update (1) = 12 ops
+        return 12
+    return 1
 
 
 def _roofline_elementwise(
@@ -410,13 +478,15 @@ def _roofline_elementwise(
     outputs: list[torch.Tensor] | None,
     eb: int,
     ve: float,
+    op_name: str = "",
 ) -> dict | None:
     if not inputs:
         return None
     total_input_elements = sum(t.numel() for t in inputs)
     total_output_elements = sum(t.numel() for t in outputs) if outputs else total_input_elements
     n_elem = max(total_input_elements, total_output_elements)
-    t_compute = n_elem / ve
+    ops_per_elem = _elementwise_ops_per_elem(op_name)
+    t_compute = (ops_per_elem * n_elem) / ve
     t_memory = (total_input_elements * eb + total_output_elements * eb) / HBM_BW
     return _result(t_compute, t_memory)
 
