@@ -137,6 +137,7 @@ from .memory import (
     _dump_snapshot,
     _record_memory_history,
     _snapshot,
+    get_peak_memory_stats,
     max_memory_allocated,
     max_memory_reserved,
     memory_allocated,
@@ -145,6 +146,8 @@ from .memory import (
     memory_summary,
     reset_accumulated_memory_stats,
     reset_peak_memory_stats,
+    segment_pool_analysis,
+    segment_pool_analysis_summary,
 )
 
 # Import torch.compile metrics APIs
