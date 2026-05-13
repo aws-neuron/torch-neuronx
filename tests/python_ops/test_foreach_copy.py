@@ -1,4 +1,4 @@
-"""Tests for optimized aten::_foreach_copy_ implementation."""
+"""Tests for MLIR-based aten::_foreach_copy_ implementation."""
 
 import pytest
 import torch
@@ -204,3 +204,32 @@ def test_fsdp_all_gather_copy_in_pattern():
         assert_op_runs_on_neuron("_foreach_copy_")
 
     torch.testing.assert_close(ag_input.cpu(), flat_bf16.cpu())
+
+
+# --- Fallback path: unsupported dtypes ---
+
+
+def test_unsupported_dtype_float64():
+    """Unsupported dtype (float64) falls back to dst.copy_(src)."""
+    srcs = [torch.randn(128, dtype=torch.float64, device="neuron") for _ in range(3)]
+    dsts = [torch.zeros(128, dtype=torch.float64, device="neuron") for _ in range(3)]
+
+    with track_neuron_ops():
+        torch._foreach_copy_(dsts, srcs)
+        assert_op_runs_on_neuron("_foreach_copy_")
+
+    for dst, src in zip(dsts, srcs, strict=False):
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+
+def test_unsupported_dtype_bool():
+    """Unsupported dtype (bool) falls back to dst.copy_(src)."""
+    srcs = [torch.randint(0, 2, (64,), dtype=torch.bool, device="neuron") for _ in range(2)]
+    dsts = [torch.zeros(64, dtype=torch.bool, device="neuron") for _ in range(2)]
+
+    with track_neuron_ops():
+        torch._foreach_copy_(dsts, srcs)
+        assert_op_runs_on_neuron("_foreach_copy_")
+
+    for dst, src in zip(dsts, srcs, strict=False):
+        torch.testing.assert_close(dst.cpu(), src.cpu())
