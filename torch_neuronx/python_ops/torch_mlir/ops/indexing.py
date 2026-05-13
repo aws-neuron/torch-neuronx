@@ -86,15 +86,27 @@ def _validate_index_copy(x, dim, indexes, source, out=None):
     validate_static_inputs=_validate_index_copy,
 )
 def torch_index_copy(x, dim, indexes, source, out=None):
-    # Validate source shape matches expected slice shape
-    actual_dim = dim if dim >= 0 else x.dim() + dim
-    expected_shape = list(x.shape)
-    expected_shape[actual_dim] = indexes.numel()
-    if list(source.shape) != expected_shape:
-        raise ValueError(
-            f"Incompatible shapes for broadcasting: {tuple(source.shape)}"
-            f" and requested shape {tuple(expected_shape)}"
-        )
+    # 0-d tensor: index_copy on a scalar is valid when dim=0, index has
+    # exactly one element (value 0), and source is also 0-d.  CPU PyTorch
+    # handles this by treating the scalar as a 1-element container.
+    # Skip the shape validation that assumes at least 1 dimension, but
+    # still reject the cases CPU rejects (e.g. multiple indices into a
+    # single-element scalar destination when source is also a scalar).
+    if x.dim() == 0:
+        if source.dim() == 0 and indexes.numel() > 1:
+            raise IndexError(
+                f"index_copy_(): When source is scalar, index should "
+                f"have one element (got {indexes.numel()})"
+            )
+    else:
+        actual_dim = dim if dim >= 0 else x.dim() + dim
+        expected_shape = list(x.shape)
+        expected_shape[actual_dim] = indexes.numel()
+        if list(source.shape) != expected_shape:
+            raise ValueError(
+                f"Incompatible shapes for broadcasting: {tuple(source.shape)}"
+                f" and requested shape {tuple(expected_shape)}"
+            )
     return torch.index_copy(x, dim, indexes, source)
 
 
