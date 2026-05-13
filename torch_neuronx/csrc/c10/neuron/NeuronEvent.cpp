@@ -8,7 +8,7 @@ namespace at::neuron {
 
 void NeuronEvent::record(const NeuronStream& stream) {
   impl_->device_index = stream.device_index();
-  impl_->recorded_stream_id = stream.id();
+  impl_->recorded_stream_id.store(stream.id(), std::memory_order_relaxed);
   mark_recorded();
   impl_->is_completed.store(false, std::memory_order_release);
 
