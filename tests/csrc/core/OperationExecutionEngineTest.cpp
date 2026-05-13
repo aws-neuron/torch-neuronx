@@ -13,7 +13,9 @@
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "tests/csrc/utils/TestUtils.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
+#include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
@@ -1022,6 +1024,84 @@ TEST_F(OperationExecutionEngineTest, RecordHintDoesNotAccumulateOwnership) {
 
   engine.Shutdown();
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+// --- Same-stream kWait bypass ---
+
+namespace {
+
+std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, int64_t recorded_sid) {
+  NeuronEvent event(/*device_id=*/0);
+  event.get_impl()->recorded_stream_id.store(recorded_sid, std::memory_order_relaxed);
+  event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
+  auto kernel = std::make_unique<EventDirectKernelExecution>(
+      "test_event_wait", event, EventDirectKernelExecution::EventAction::kWait,
+      /*device_id=*/0);
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream;
+  op->stream_id = stream->stream_id;
+  op->MarkExecutionReady();
+  return op;
+}
+
+std::shared_ptr<OperationContext> PushPendingDeviceOp(StreamImpl* stream) {
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream;
+  op->nrt_async_state_.is_scheduled = true;
+  op->nrt_async_state_.sequence_id = 1;
+  stream->active_operations_.push_back(op);
+  return op;
+}
+
+}  // namespace
+
+TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitSameStreamBypassesGuard) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+  PushPendingDeviceOp(stream.get());
+  ASSERT_TRUE(stream->HasPendingAsyncOperations());
+
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/stream->stream_id);
+  stream->active_operations_.push_back(kwait);
+  stream->next_to_schedule_ = std::prev(stream->active_operations_.end());
+  ASSERT_FALSE(kwait->IsSchedulable());
+
+  EXPECT_TRUE(engine.ScheduleOperation(kwait.get(), stream.get()));
+  EXPECT_TRUE(kwait->nrt_async_state_.is_pending_signal);
+  EXPECT_EQ(stream->next_to_schedule_, stream->active_operations_.end());
+
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+  PushPendingDeviceOp(stream.get());
+  ASSERT_TRUE(stream->HasPendingAsyncOperations());
+
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/99);
+  stream->active_operations_.push_back(kwait);
+  auto kwait_iter = std::prev(stream->active_operations_.end());
+  stream->next_to_schedule_ = kwait_iter;
+  ASSERT_FALSE(kwait->IsSchedulable());
+
+  EXPECT_FALSE(engine.ScheduleOperation(kwait.get(), stream.get()));
+  EXPECT_FALSE(kwait->nrt_async_state_.is_pending_signal);
+  EXPECT_EQ(stream->next_to_schedule_, kwait_iter);
+
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
 }
 
 int main(int argc, char** argv) {
