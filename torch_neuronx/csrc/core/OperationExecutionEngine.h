@@ -115,9 +115,6 @@ class OperationExecutionEngine {
   // Process a single async execution task (schedule without waiting)
   void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
 
-  // Async scheduling helper
-  bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
-
   // Preprocessing helpers prologue attached with operations if needed
   void ProcessPreprocessingTask(OperationContext* operation);
 
@@ -133,6 +130,9 @@ class OperationExecutionEngine {
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
   void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
+
+  // Async scheduling helper.
+  bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
 
   std::atomic<int64_t> execution_queue_depth_{0};
 
