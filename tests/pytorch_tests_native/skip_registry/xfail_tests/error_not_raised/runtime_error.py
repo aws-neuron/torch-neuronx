@@ -134,7 +134,6 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_nonsupported_dtypes_antialias_True_num_channels_5_mode_bilinear_uint8_neuron_uint8",
     "test_ops.py::TestCommonNEURON::test_errors_cat_neuron",
     "test_ops.py::TestCommonNEURON::test_errors_gather_neuron",
-    "test_ops.py::TestCommonNEURON::test_errors_index_select_neuron",
     "test_ops.py::TestCommonNEURON::test_errors_kthvalue_neuron",
     "test_ops.py::TestCommonNEURON::test_errors_masked_select_neuron",
     "test_ops.py::TestCommonNEURON::test_errors_nn_functional_rms_norm_neuron",
