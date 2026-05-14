@@ -343,10 +343,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason=("AoTAutogradCache not supported: expected OutputCode, got function"),
-        tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE,
-    ),
-    SkipGroup(
         reason=("AoTAutogradCache not supported: cache hit/miss count mismatch"),
         tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
     ),

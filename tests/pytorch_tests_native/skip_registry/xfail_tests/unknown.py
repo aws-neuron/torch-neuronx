@@ -2,7 +2,6 @@ UNKNOWN = [
     "test_foreach.py::TestForeachNEURON::test_big_num_tensors__foreach_max_use_cuda_graph_True_w_empty_True_neuron_float64",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_true_divide_neuron_bool",
     "test_meta.py::TestMetaNEURON::test_meta_outplace_uniform_neuron_float32",
-    "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_tan_neuron_float64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_add_neuron_uint8",
     "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_acos_inplace_neuron_float64",
     "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_cos_inplace_neuron_float64",

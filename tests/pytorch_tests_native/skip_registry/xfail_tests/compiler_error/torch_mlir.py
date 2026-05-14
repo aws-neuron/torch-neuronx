@@ -59,8 +59,6 @@ COMPILER_ERROR_TORCH_MLIR = [
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_index___rdiv___neuron_int64",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_index___rdiv___neuron_int8",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_index___rdiv___neuron_uint8",
-    "test_modules.py::TestModuleNEURON::test_errors_nn_Embedding_neuron_float32",
-    "test_modules.py::TestModuleNEURON::test_errors_nn_Embedding_neuron_float64",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_dim_function_empty_neuron",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_reciprocal_neuron_bool",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_reciprocal_neuron_int16",

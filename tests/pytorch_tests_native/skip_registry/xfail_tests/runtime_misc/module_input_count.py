@@ -8,7 +8,6 @@ RUNTIME_MISC_MODULE_INPUT_COUNT = [
     "test_ops.py::TestCommonNEURON::test_out_linalg_matrix_power_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_ones_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_zeros_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_linalg_svdvals_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_False_with_lrsched_False_Muon_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_False_with_lrsched_True_Muon_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_True_with_lrsched_False_Muon_neuron_float32",
@@ -20,6 +19,4 @@ RUNTIME_MISC_MODULE_INPUT_COUNT = [
     "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_2_Muon_neuron_float32",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_diff_noncontig_neuron_bool",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_swap_data_ptr_device_mismatch_neuron",
-    "test_ops.py::TestFakeTensorNEURON::test_pointwise_ops_linalg_svd_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_logaddexp_neuron_float32",
 ]

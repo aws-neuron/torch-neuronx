@@ -173,10 +173,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.UNSUPPORTED_OP_CPU_FALLBACK_DISABLED,
     ),
     SkipGroup(
-        reason="[unsupported_op.fused_rnn] Fused RNN ops not available for Neuron backend",
-        tests=x.UNSUPPORTED_OP_FUSED_RNN,
-    ),
-    SkipGroup(
         reason="[unsupported_op.not_implemented] Op not implemented for Neuron backend",
         tests=x.UNSUPPORTED_OP_NOT_IMPLEMENTED,
     ),
@@ -286,15 +282,11 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         patterns=[
             "test_scaled_dot_product_attention_batch_size_0_*",
-            "test_Transformer_empty_neuron",
-            "test_TransformerEncoder_empty_neuron",
-            "test_TransformerDecoder_empty_neuron",
-            "test_TransformerDecoderLayer_empty_neuron",
         ],
     ),
     SkipGroup(
         reason=(
-            "PT 2.11 accuracy regression: 27 bfloat16/float16"
+            "PT 2.11 accuracy regression: 33 bfloat16/float16"
             " reciprocal-family tests (div, reciprocal, rsqrt, fmod,"
             " true_divide, lgamma, floor_divide, remainder,"
             " pairwise_distance) pass on nightly but fail on PT 2.11"

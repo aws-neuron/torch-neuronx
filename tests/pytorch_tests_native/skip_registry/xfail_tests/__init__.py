@@ -31,9 +31,6 @@ from .dynamo_xfails import (
     DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS as DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
 )
 from .dynamo_xfails import (
-    DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE as DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE,
-)
-from .dynamo_xfails import (
     DYNAMO_DEVICE_MISMATCH_MIXED as DYNAMO_DEVICE_MISMATCH_MIXED,
 )
 from .dynamo_xfails import (
@@ -132,7 +129,6 @@ from .unknown import UNKNOWN as UNKNOWN
 from .unsupported_op.cpu_fallback_disabled import (
     UNSUPPORTED_OP_CPU_FALLBACK_DISABLED as UNSUPPORTED_OP_CPU_FALLBACK_DISABLED,
 )
-from .unsupported_op.fused_rnn import UNSUPPORTED_OP_FUSED_RNN as UNSUPPORTED_OP_FUSED_RNN
 from .unsupported_op.not_implemented import (
     UNSUPPORTED_OP_NOT_IMPLEMENTED as UNSUPPORTED_OP_NOT_IMPLEMENTED,
 )
