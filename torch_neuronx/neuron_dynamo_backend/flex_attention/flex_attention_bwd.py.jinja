@@ -1078,7 +1078,7 @@ def recompute_qk_softmax(
 
         if tile_type == _TILE_FULL:
             # No masking needed — all elements are valid
-            nisa.tensor_copy(qk_res_buf[i_q_tile_group_size], post_mod_scores)
+            nisa.tensor_copy(qk_res_buf[i_q_tile_group_size], post_mod_scores, engine=nisa.scalar_engine)
         elif tile_type == _TILE_PARTIAL:
             mask_idx = QK_MASK_INDEX[q_grp][k_tile_global]
             mask_sb = nl.ndarray((q_seq_tile_size, k_seq_tile_size), dtype=nl.float32, buffer=nl.sbuf)
@@ -1098,7 +1098,7 @@ def recompute_qk_softmax(
         mask = nl.ndarray(
             qk_res_buf[i_q_tile_group_size].shape, dtype=qk_res_buf[i_q_tile_group_size].dtype, buffer=nl.sbuf
         )
-        nisa.tensor_copy(mask, boolean_mask)
+        nisa.tensor_copy(mask, boolean_mask, engine=nisa.scalar_engine)
 
         # Apply mask: score * mask + (1 - mask) * (-inf)
         nisa.tensor_tensor(qk_res_buf[i_q_tile_group_size], post_mod_scores, mask, nl.multiply)
@@ -1217,7 +1217,7 @@ def compute_softmax_backward_dx(
             kv_idx,
             softmax_dx_local[i_q_tile_group_size],
         )
-        nisa.dma_copy(softmax_dx_local[i_q_tile_group_size], d_attn)
+        nisa.tensor_copy(softmax_dx_local[i_q_tile_group_size], d_attn, engine=nisa.scalar_engine)
 
 
 def flash_attn_bwd(
@@ -1723,7 +1723,7 @@ def _flash_attn_bwd_core(
                 ],
             )
 
-        nisa.tensor_copy(transposed_softmax_dx_local[i_k_seq_tile_backward], transposed_softmax_dx_local_psum)
+        nisa.tensor_copy(transposed_softmax_dx_local[i_k_seq_tile_backward], transposed_softmax_dx_local_psum, engine=nisa.scalar_engine)
 
     for i_d_head_tile in range(d_head_n_tiles):
         dq_psum = nl.ndarray((d_head_tile_size, q_seq_tile_size * q_tile_group_size), dtype=nl.float32, buffer=nl.psum)
