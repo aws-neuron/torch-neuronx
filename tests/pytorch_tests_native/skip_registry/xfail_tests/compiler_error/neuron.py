@@ -6,6 +6,7 @@ COMPILER_ERROR_NEURON = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_diff_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_vander_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_max_reduction_with_dim_neuron_bool",
@@ -129,6 +130,7 @@ COMPILER_ERROR_NEURON = [
     "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_div_floor_rounding_neuron_int32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_cumprod_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_conv_transpose2d_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_cosine_embedding_loss_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_cosine_similarity_neuron_float32",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_conv_transpose3d_neuron_float64",
@@ -166,13 +168,10 @@ COMPILER_ERROR_NEURON = [
     "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fn",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_neuron",
     "test_transformers.py::TestSDPAFailureModesNEURON::test_sdpa_unbacked_no_dde_neuron",
-    "test_ops.py::TestCommonNEURON::test_python_ref__refs_atan2_neuron_bfloat16",
     # --- Persistent compile failures across three consistent runs ---
     # aten::convolution compile failure; shows up in cosine_embedding_loss,
     # ctc_loss, hinge_embedding_loss, and hardshrink (all internally invoke a
     # convolution path).
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_hinge_embedding_loss_neuron_float32",
-    "test_ops.py::TestFakeTensorNEURON::test_pointwise_ops_nn_functional_hardshrink_neuron_float32",
     # aten::bitwise_xor.Tensor_out compile failure on int8
     # aten::maximum compile failure on uint8
     # aten::ne.Tensor_out compile failure (invoked via bucketize)
@@ -185,9 +184,7 @@ COMPILER_ERROR_NEURON = [
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int64",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_neg_neuron_int8",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_cos_neuron_float64",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_sinh_neuron_float16",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_erf_neuron_int64",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_atan_neuron_int32",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int16",
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_ceil_neuron_uint8",
 ]

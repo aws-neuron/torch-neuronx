@@ -5,16 +5,6 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "[torch.special] Compiler miscompilation on non-contiguous inputs:"
-            " special_{i0e, i1, i1e, log_ndtr, erfcx, modified_bessel_i0} ops"
-            " produce incorrect values when the input is transposed/non-contiguous."
-            " The contiguous path works; the transposed path returns garbage values."
-            " torch.special is beta on Neuron — these are tracked as unsupported."
-        ),
-        tests=s.ATEN_SPECIAL_NON_CONTIGUOUS_MISCOMPILATION,
-    ),
-    SkipGroup(
-        reason=(
             "FFT ops and complex dtypes (cfloat, cdouble, chalf)"
             " are not supported on Neuron hardware. Includes tests that"
             " primarily exercise complex output ops (polar, linalg_eigvals,"
@@ -367,5 +357,20 @@ SKIP_GROUPS: list[SkipGroup] = [
             " segfault in isolated runs. TODO: investigate."
         ),
         tests=s.ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT,
+    ),
+    SkipGroup(
+        reason=(
+            "Neuron's native_multi_head_attention does not support arbitrary"
+            " mask tensors — only mask=None or mask_type=1 (causal masking)."
+            " Parametrized variants exercise padding masks and raise"
+            " NotImplementedError from"
+            " torch_neuronx/python_ops/native_multi_head_attention.py:79."
+            " Skipped because the failure is consistent (real implementation"
+            " gap, not a flake) and subtest failures don't retry cleanly."
+            " Remove this skip when arbitrary mask support is added."
+        ),
+        patterns=[
+            "test_native_multihead_self_attention_*",
+        ],
     ),
 ]

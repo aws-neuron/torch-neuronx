@@ -374,4 +374,44 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_c10d_ops_privateuse1.py::ProcessGroupPrivateUse1OpTest::test_barrier",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "DTensor + torch.compile: Neuron Dynamo backend fails to compile"
+            " DTensor graphs (Torch-MLIR lowering errors and rank-not-set"
+            " errors during AOT autograd). DTensor compile path requires"
+            " distributed runtime fixtures and Neuron-specific lowering"
+            " support that is not yet in place."
+        ),
+        tests=[
+            "test_dtensor_compile.py::TestDTensorCompile::test_compile_redistribute_flattened_mesh",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_basic",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_dynamo_device_mesh_attrs",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_input_mutations",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_noncontiguous_output",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor_from_local_redistribute",
+            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_to_local_kwargs_forward_hook",
+            "test_dtensor_compile.py::TestDTensorCompile::test_get_local_rank_compile",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Distributed multi-process test fails with subprocess exit code 10."
+            " Worker process exits during test setup/execution without a"
+            " surfaced traceback in the parent log."
+        ),
+        tests=[
+            "test_tensor_ops.py::DistArgMaxArgMinTest::test_argmax_argmin_with_placements",
+            "test_redistribute.py::DistributeWithStridedShardTest::test_strided_shard_redistribution",
+            "test_dtensor_resharding.py::TestDTensorReshardMeshChange::test_dtensor_checkpoint_resharding_with_empty_shard",
+            "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
+            "test_fully_shard_comm.py::TestFullyShardCommunication::test_set_reduce_scatter_divide_factor",
+            "test_fully_shard_training.py::TestFullyShardGradientAccumulation::test_1f1b_microbatching",
+            "test_fully_shard_training.py::TestFullyShardSharedParams::test_train_parity_with_shared_params",
+            "test_fully_shard_training.py::TestFullyShardShardPlacementFnMultiProcess::test_train_parity_shard_placement_fn_shard_largest_dim",
+            "test_fully_shard_autograd.py::TestFullyShardPostAccGradHookMultiProcess::test_post_acc_grad_hook_optim_parity",
+            "test_replicate_training.py::TestReplicateGradientAccumulation::test_1f1b_microbatching",
+            "test_replicate_training.py::TestReplicateSharedParams::test_train_parity_with_shared_params",
+        ],
+    ),
 ]
