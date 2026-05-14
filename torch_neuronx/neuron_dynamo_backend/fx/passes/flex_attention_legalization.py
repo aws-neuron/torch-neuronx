@@ -376,9 +376,19 @@ class FlexAttentionLegalization(PassBase):
             lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype
         )
 
+        # Cast to float32 before squeeze for backward compatibility
+        lse_keepdim = graph.call_function(
+            torch.ops.aten._to_copy.default, args=(lse_keepdim,), kwargs={"dtype": torch.float32}
+        )
+        self._add_metadata_to_node(
+            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=torch.float32
+        )
+
         # Squeeze to [B, H, L]
         logsumexp = graph.call_function(torch.ops.aten.squeeze.dim, args=(lse_keepdim, -1))
-        self._add_metadata_to_node(logsumexp, shape=[shapes.B, shapes.H_q, shapes.L], dtype=dtype)
+        self._add_metadata_to_node(
+            logsumexp, shape=[shapes.B, shapes.H_q, shapes.L], dtype=torch.float32
+        )
 
         return attn_weights, logsumexp
 
@@ -1170,6 +1180,12 @@ class FlexAttentionLegalization(PassBase):
         graph = gm.graph
 
         self._replace_sort_stable_with_identity(graph)
+
+        # Remove aten.detach nodes (identity ops from autograd)
+        for node in list(graph.nodes):
+            if node.op == "call_function" and node.target == torch.ops.aten.detach.default:
+                node.replace_all_uses_with(node.args[0])
+                graph.erase_node(node)
 
         graph.eliminate_dead_code()
         gm.recompile()

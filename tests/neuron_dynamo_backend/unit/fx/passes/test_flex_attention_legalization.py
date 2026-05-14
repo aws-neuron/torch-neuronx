@@ -1896,3 +1896,50 @@ class TestScoreModBroadcasting:
             legalized_output = legalized_output[0]
 
         torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+
+class TestFinalizeDetachRemoval:
+    """Tests for aten.detach node removal in _finalize_legalization."""
+
+    def test_detach_removal_preserves_data_flow(self):
+        """Test that aten.detach nodes are removed and computation is preserved.
+
+        When mask_mod/score_mod submodules with captured buffers are inlined,
+        aten.detach nodes from autograd tracing are carried over.
+        torch-mlir cannot lower aten.detach to StableHLO, so the legalization
+        pass must remove them without changing outputs.
+        """
+
+        class ModuleWithDetach(torch.nn.Module):
+            def forward(self, x, y):
+                a = torch.ops.aten.detach.default(x)
+                b = torch.ops.aten.detach.default(y)
+                return a + b
+
+        gm = fx.symbolic_trace(ModuleWithDetach())
+
+        # Verify detach nodes exist before finalization
+        detach_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.detach.default
+        ]
+        assert len(detach_nodes) == 2
+
+        # Run finalization
+        flex_pass = FlexAttentionLegalization()
+        flex_pass._finalize_legalization(gm)
+
+        # Verify all detach nodes removed
+        detach_nodes_after = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.detach.default
+        ]
+        assert len(detach_nodes_after) == 0
+
+        # Verify output is still correct
+        x = torch.randn(4, 4)
+        y = torch.randn(4, 4)
+        result = gm(x, y)
+        torch.testing.assert_close(result, x + y)
