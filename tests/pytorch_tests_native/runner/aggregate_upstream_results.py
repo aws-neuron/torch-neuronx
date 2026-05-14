@@ -18,6 +18,7 @@ import csv
 import glob
 import logging
 import os
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -39,6 +40,89 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 # EXCLUDED — those tests ultimately passed and are tracked separately as a
 # flakiness signal, not as failures that need investigation.
 FAILURE_STATUSES = ("failed", "error")
+
+# Statuses that count as "this test didn't actually run" — used to filter
+# all-skipped classes out of the rendered GH summary panel and to split
+# skipped rows into their own CSV in the aggregator.
+SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
+
+
+def _get_run_metadata() -> dict:
+    """Pull commit/branch/run-id from GH Actions env vars.
+
+    Defaults to ``"unknown"`` outside CI so dashboards can still distinguish
+    "no metadata available" from "missing column."
+    """
+    return {
+        "commit_sha": os.environ.get("GITHUB_SHA", "unknown"),
+        "branch": (os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "unknown")),
+        "run_id": os.environ.get("GITHUB_RUN_ID", "unknown"),
+    }
+
+
+def write_run_metadata_csv(result: dict, output_csv: Path) -> None:
+    """Write a single-row sidecar CSV with run metadata + roll-up stats.
+
+    Lets dashboards attribute pass rate / failure counts to a specific
+    commit without denormalizing the metadata onto every per-test row.
+    The full per-test CSVs stay lean; this is the join key for time-series
+    plots ("pass rate over time on main, with each point = one run").
+    """
+    metadata = _get_run_metadata()
+    total_stats = result["total_stats"]
+    total_count = sum(total_stats.values())
+    pass_rate = _calc_pass_rate(total_stats)
+    total_duration = round(sum(result["durations"].values()), 3)
+
+    fieldnames = [
+        "commit_sha",
+        "branch",
+        "run_id",
+        "run_timestamp",
+        "total",
+        "passed",
+        "passed_on_retry",
+        "failed",
+        "skipped",
+        "skipped_on_retry",
+        "xfailed",
+        "xfailed_on_retry",
+        "xpassed",
+        "xpassed_on_retry",
+        "error",
+        "pass_rate(%)",
+        "duration(sec)",
+    ]
+    row = {
+        **metadata,
+        "run_timestamp": os.environ.get(
+            "TEST_RUN_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S")
+        ),
+        "total": total_count,
+        "pass_rate(%)": pass_rate,
+        "duration(sec)": total_duration,
+        # Per-status counts; default 0 for absent statuses.
+        **{
+            k: total_stats.get(k, 0)
+            for k in fieldnames
+            if k
+            not in {
+                "commit_sha",
+                "branch",
+                "run_id",
+                "run_timestamp",
+                "total",
+                "pass_rate(%)",
+                "duration(sec)",
+            }
+        },
+    }
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow(row)
+    logger.info(f"Run metadata CSV: {output_csv}")
 
 
 def _calc_pass_rate(status_counts: dict) -> str:
@@ -68,38 +152,64 @@ def _calc_pass_rate(status_counts: dict) -> str:
     return f"{passed / denom * 100:.1f}"
 
 
+def _file_from_row(row: dict) -> str:
+    """Extract the test file from a row's test_id (or nodeid as fallback).
+
+    ``test_id`` is shaped like ``test_ops.py::TestClass::test_method`` or
+    ``dynamo/test_x.py::TestY::test_z`` — the leading segment before the
+    first ``::`` is the file. Sharded files collapse together because
+    pytest-shard doesn't tag tests with the shard id.
+    """
+    test_id = row.get("test_id") or row.get("nodeid") or ""
+    if "::" in test_id:
+        return test_id.split("::", 1)[0]
+    return test_id or "unknown"
+
+
 def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
     """Aggregate test stats from all node artifacts and write summary CSV.
 
     Args:
         results_dir: Directory containing per-node artifact subdirectories,
-            each with ``json_reports/test_results_*.json`` files (the structure
-            produced by ``run_upstream_tests.sh`` and preserved by
-            ``upload-artifact``/``download-artifact``).
+            each with ``test_results_*.json`` files directly inside (no
+            nested ``json_reports/`` layer — the runner writes them flat).
         output_csv: Path where the summary CSV is written.
 
     Returns:
         Dict with ``test_rows`` (list of per-test dicts), ``stats`` (nested
         dict: class → status → count), ``durations`` (dict: class → total sec),
-        and ``total_stats`` (dict: status → count across all classes).
+        ``total_stats`` (dict: status → count across all classes), plus
+        parallel ``file_stats`` and ``file_durations`` keyed by test file
+        for the GH panel render (file-level instead of class-level).
     """
-    # Find all pytest JSON report files across all node artifacts.
-    #
-    # Each per-node artifact contains the same report at two subpaths
-    # (outputs/… and test-results/…) because run_test.sh copies outputs to
-    # shared storage for the GH Actions runner to upload. Use the outputs/
-    # path consistently to avoid double-counting.
-    json_files = glob.glob(
-        str(
-            results_dir
-            / "upstream-pytorch-*/outputs/upstream_pytorch_artifacts"
-            / "json_reports/test_results_*.json"
-        )
-    )
+    # Per-node artifacts may contain two copies of each report (one under
+    # `outputs/upstream_pytorch_artifacts/` and a `test-results/` mirror).
+    # Dedupe by (per-node-dir, filename); prefer the `outputs/` copy.
+    candidates = list(results_dir.glob("upstream-pytorch-*/**/test_results_*.json"))
+
+    by_node_and_name: dict[tuple[str, str], str] = {}
+    for p in candidates:
+        # Per-node dir is the immediate child of results_dir.
+        try:
+            node_dir = p.relative_to(results_dir).parts[0]
+        except ValueError:
+            continue
+        key = (node_dir, p.name)
+        existing = by_node_and_name.get(key)
+        if existing is None or "/outputs/" in str(p):
+            by_node_and_name[key] = str(p)
+    json_files = list(by_node_and_name.values())
 
     if not json_files:
         logger.warning(f"No JSON files found under {results_dir}")
-        return {"test_rows": [], "stats": {}, "durations": {}, "total_stats": {}}
+        return {
+            "test_rows": [],
+            "stats": {},
+            "durations": {},
+            "file_stats": {},
+            "file_durations": {},
+            "total_stats": {},
+        }
 
     # Split main vs retry reports. Retry files end in ``_retry.json``
     # and are merged into their paired main report via
@@ -113,9 +223,11 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         f"JSON report files to process"
     )
 
-    # Aggregate counts per class — dynamically track all statuses
+    # Aggregate counts per class (canonical / CSV) and per file (panel).
     stats = defaultdict(lambda: defaultdict(int))  # {class: {status: count}}
     durations = defaultdict(float)  # {class: total_duration}
+    file_stats = defaultdict(lambda: defaultdict(int))  # {file: {status: count}}
+    file_durations = defaultdict(float)  # {file: total_duration}
     all_statuses = set()
     all_test_rows = []
 
@@ -131,11 +243,15 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
 
         for row in main_rows:
             cls = row.get("test_class") or "unknown"
+            test_file = _file_from_row(row)
             status = row.get("status") or "unknown"
             stats[cls][status] += 1
+            file_stats[test_file][status] += 1
             all_statuses.add(status)
             with contextlib.suppress(ValueError):
-                durations[cls] += float(row.get("duration(sec)", 0))
+                duration = float(row.get("duration(sec)", 0))
+                durations[cls] += duration
+                file_durations[test_file] += duration
             all_test_rows.append(row)
 
     # Create summary CSV with dynamic columns
@@ -166,26 +282,66 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         "test_rows": all_test_rows,
         "stats": dict(stats),
         "durations": dict(durations),
+        "file_stats": {f: dict(s) for f, s in file_stats.items()},
+        "file_durations": dict(file_durations),
         "total_stats": dict(total_stats),
         "sorted_statuses": sorted_statuses,
     }
 
 
+def _is_all_skipped(unit_stats: dict) -> bool:
+    """A grouping (class or file) with no executed tests — only skips.
+
+    These rows are pure noise in the GH summary panel: pass_rate is N/A and
+    they outnumber the rows that actually ran. We hide them in the
+    rendered markdown but keep them in the canonical summary CSV so
+    dashboards and historical comparisons aren't affected.
+    """
+    return all(status in SKIPPED_STATUSES for status in unit_stats)
+
+
+# Back-compat alias for tests that imported the old class-specific name.
+_is_all_skipped_class = _is_all_skipped
+
+
 def write_github_summary(result: dict) -> None:
-    """Write a GitHub Actions job summary (markdown table)."""
+    """Write a GitHub Actions job summary (markdown table).
+
+    Renders one row per **test file** rather than per class — the full
+    suite has hundreds of classes, which is unreadable in the panel. The
+    canonical summary CSV stays class-keyed for finer-grained dashboards.
+
+    Hides files where every test was skipped (pass_rate would be N/A);
+    the hidden count is surfaced in a footer so readers can tell
+    missing-from-table from missing-entirely.
+    """
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_file:
         return
 
-    stats = result["stats"]
-    durations = result["durations"]
+    # Use file-level stats for the panel; fall back to class-level if
+    # an older caller didn't populate file_stats.
+    panel_stats = result.get("file_stats") or result.get("stats", {})
+    panel_durations = result.get("file_durations") or result.get("durations", {})
     sorted_statuses = result["sorted_statuses"]
     total_stats = result["total_stats"]
 
+    visible_units = [u for u in sorted(panel_stats) if not _is_all_skipped(panel_stats[u])]
+    hidden_count = len(panel_stats) - len(visible_units)
+
+    metadata = _get_run_metadata()
+
     with open(summary_file, "a") as f:
         f.write("## PT Upstream Test Results\n\n")
+        # Commit/branch/run line lets a reader bisect by comparing two
+        # panels side by side without leaving the run page.
+        f.write(
+            f"**Commit:** `{metadata['commit_sha']}`  •  "
+            f"**Branch:** `{metadata['branch']}`  •  "
+            f"**Run:** `{metadata['run_id']}`\n\n"
+        )
         header = (
-            f"| test_class | {' | '.join(sorted_statuses)} "
+            f"| test_file | {' | '.join(sorted_statuses)} "
             "| total | pass_rate(%) | duration(sec) |\n"
         )
         f.write(header)
@@ -193,24 +349,44 @@ def write_github_summary(result: dict) -> None:
 
         totals = [0] * len(sorted_statuses)
         total_duration = 0.0
-        for cls in sorted(stats.keys()):
-            counts = [stats[cls][s] for s in sorted_statuses]
-            pass_rate = _calc_pass_rate(stats[cls])
+        for unit in visible_units:
+            counts = [panel_stats[unit].get(s, 0) for s in sorted_statuses]
+            pass_rate = _calc_pass_rate(panel_stats[unit])
             f.write(
-                f"| {cls} | {' | '.join(str(c) for c in counts)} | "
-                f"{sum(counts)} | {pass_rate} | {round(durations[cls], 3)} |\n"
+                f"| {unit} | {' | '.join(str(c) for c in counts)} | "
+                f"{sum(counts)} | {pass_rate} | {round(panel_durations.get(unit, 0), 3)} |\n"
             )
             totals = [t + c for t, c in zip(totals, counts, strict=False)]
-            total_duration += durations[cls]
+            total_duration += panel_durations.get(unit, 0)
 
-        total_pass_rate = _calc_pass_rate(total_stats)
+        # Visible-only totals so the column sums match the displayed rows.
+        total_pass_rate = _calc_pass_rate(_sum_stats(panel_stats[u] for u in visible_units))
         f.write(
-            f"| **TOTAL** | {' | '.join(str(t) for t in totals)} | "
+            f"| **TOTAL (visible)** | {' | '.join(str(t) for t in totals)} | "
             f"**{sum(totals)}** | **{total_pass_rate}** | **{round(total_duration, 3)}** |\n"
         )
 
+        if hidden_count:
+            # Surface the hidden count so readers can tell missing-from-table
+            # from missing-entirely. Show the full TOTAL too so the panel
+            # still summarizes the suite as a whole.
+            full_pass_rate = _calc_pass_rate(total_stats)
+            full_total = sum(total_stats.values())
+            full_duration = sum(panel_durations.values())
+            f.write(
+                f"\n_Hiding {hidden_count} all-skipped file(s) "
+                f"(pass_rate N/A). Full suite TOTAL: {full_total} tests, "
+                f"pass rate {full_pass_rate}%, duration {round(full_duration, 3)}s._\n"
+            )
 
-SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
+
+def _sum_stats(per_class_stats):
+    """Sum a sequence of per-class stat dicts into a single status→count dict."""
+    out: dict[str, int] = defaultdict(int)
+    for cls_stats in per_class_stats:
+        for status, count in cls_stats.items():
+            out[status] += count
+    return out
 
 
 def write_all_tests_csv(test_rows: list, output_csv: Path) -> None:
@@ -337,14 +513,14 @@ def write_flaky_csv(test_rows: list, output_csv: Path) -> int:
 
 
 def merge_benchmark_jsonl(results_dir: Path, output_jsonl: Path) -> None:
-    """Concatenate per-node benchmark_results.jsonl files into one."""
-    jsonl_files = glob.glob(
-        str(
-            results_dir
-            / "upstream-pytorch-*/outputs/upstream_pytorch_artifacts"
-            / "benchmark_results.jsonl"
-        )
-    )
+    """Concatenate per-node benchmark_results.jsonl files into one.
+
+    Recursive glob handles both flat per-node artifact layouts and the
+    nested ``test-results/...`` layout from internal compute.
+    """
+    jsonl_files = [
+        str(p) for p in results_dir.glob("upstream-pytorch-*/**/benchmark_results.jsonl")
+    ]
     if not jsonl_files:
         logger.info("No benchmark_results.jsonl files found")
         return
@@ -361,6 +537,78 @@ def merge_benchmark_jsonl(results_dir: Path, output_jsonl: Path) -> None:
     logger.info(f"Merged {len(jsonl_files)} JSONL files → {output_jsonl} ({total_lines} records)")
 
 
+# File type → (glob, destination subdirectory for flattening).
+# Reports live flat inside each per-node artifact; flatten_reports
+# copies them into central ``<type>/`` directories for easier review.
+# Logs are included so post-mortem evidence survives the per-node-dir
+# cleanup that runs at the end of flatten_reports.
+_FLATTEN_GROUPS = (
+    ("json_reports", "test_results_*.json"),
+    ("html_reports", "*.html"),
+    ("csv_reports", "test_results_*.csv"),
+    ("log_reports", "*.log"),
+)
+
+
+def flatten_reports(results_dir: Path) -> dict[str, int]:
+    """Collect per-node reports into central ``<type>_reports/`` dirs.
+
+    Output layout:
+
+        results_dir/
+        ├── json_reports/   # every node's test_results_*.json
+        ├── html_reports/   # every node's *.html
+        ├── csv_reports/    # every node's test_results_*.csv
+        └── log_reports/    # every node's *.log (post-mortem evidence)
+
+    Recursive glob handles both flat and nested ``test-results/...``
+    per-node layouts. Per-node dirs are removed only when files were
+    successfully flattened, so a glob miss doesn't destroy the originals.
+    Returns per-type counts.
+    """
+    counts: dict[str, int] = {}
+    total_copied = 0
+    for dst_name, glob_pattern in _FLATTEN_GROUPS:
+        dst_dir = results_dir / dst_name
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        src_files = list(results_dir.glob(f"upstream-pytorch-*/**/{glob_pattern}"))
+        copied = 0
+        for src in src_files:
+            dst = dst_dir / src.name
+            if dst.exists():
+                logger.warning(f"Skipping duplicate {dst_name}/{dst.name} from {src}")
+                continue
+            shutil.copy2(src, dst)
+            copied += 1
+
+        counts[dst_name] = copied
+        total_copied += copied
+        logger.info(f"Flattened {copied} files → {dst_dir}/")
+
+    # Per-node dirs are duplicated under the central <type>/ subdirs only
+    # if we actually flattened files out of them. If the flatten globs
+    # didn't match anything (layout regression, empty artifacts, etc.),
+    # leave the per-node dirs alone so we don't accidentally throw away
+    # the only copy of the data.
+    if total_copied > 0:
+        removed = 0
+        for node_dir in glob.glob(str(results_dir / "upstream-pytorch-*")):
+            if os.path.isdir(node_dir):
+                shutil.rmtree(node_dir)
+                removed += 1
+        if removed:
+            logger.info(f"Removed {removed} per-node upstream-pytorch-*/ dirs (deduped)")
+    else:
+        logger.warning(
+            "flatten_reports found no files to flatten; leaving per-node "
+            "upstream-pytorch-*/ dirs in place. Investigate the artifact "
+            "layout if the central <type>/ dirs are empty."
+        )
+
+    return counts
+
+
 def main() -> int:
     results_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/upstream-results")
     run_timestamp = os.environ.get("TEST_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -369,6 +617,7 @@ def main() -> int:
     failures_csv = results_dir / f"upstream_pytorch_failures_{run_timestamp}.csv"
     flaky_csv = results_dir / f"upstream_pytorch_flaky_{run_timestamp}.csv"
     skipped_csv = results_dir / f"upstream_pytorch_skipped_{run_timestamp}.csv"
+    metadata_csv = results_dir / f"upstream_pytorch_run_metadata_{run_timestamp}.csv"
     benchmark_jsonl = results_dir / "benchmark_results.jsonl"
 
     if not results_dir.exists():
@@ -385,7 +634,12 @@ def main() -> int:
     write_failures_only_csv(result["test_rows"], failures_csv)
     write_flaky_csv(result["test_rows"], flaky_csv)
     write_skipped_csv(result["test_rows"], skipped_csv)
+    write_run_metadata_csv(result, metadata_csv)
     merge_benchmark_jsonl(results_dir, benchmark_jsonl)
+
+    write_github_summary(result)
+
+    flatten_reports(results_dir)
 
     # Print the summary CSV to stdout for log visibility
     print("=" * 60)
@@ -394,8 +648,6 @@ def main() -> int:
     with open(summary_csv) as f:
         sys.stdout.write(f.read())
     print("=" * 60)
-
-    write_github_summary(result)
     return 0
 
 

@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_n
 from aggregate_upstream_results import (
     FAILURE_STATUSES,
     _calc_pass_rate,
+    flatten_reports,
     write_failures_only_csv,
     write_flaky_csv,
 )
@@ -150,49 +151,48 @@ def test_apply_retry_outcomes_last_retry_observation_wins() -> None:
 # convert_output_dir — retry pairing and no double-counting
 # -----------------------------------------------------------------------------
 def test_convert_output_dir_merges_retry_sibling(tmp_path: Path) -> None:
-    json_dir = tmp_path / "json_reports"
     _write_pytest_json(
-        json_dir / "test_results_Foo.json",
+        tmp_path / "test_results_Foo.json",
         [("test_example.py::Foo::ok", "passed"), ("test_example.py::Foo::flake", "failed")],
     )
     _write_pytest_json(
-        json_dir / "test_results_Foo_retry.json",
+        tmp_path / "test_results_Foo_retry.json",
         [("test_example.py::Foo::flake", "passed")],
     )
 
     assert convert_output_dir(str(tmp_path)) == 0
 
-    csv_dir = tmp_path / "csv_reports"
-    assert (csv_dir / "test_results_Foo.csv").exists()
+    # Reports land flat next to their source JSONs — no subdirectories.
+    assert (tmp_path / "test_results_Foo.csv").exists()
     # Retry JSON must NOT produce its own CSV (would double-count).
-    assert not (csv_dir / "test_results_Foo_retry.csv").exists()
+    assert not (tmp_path / "test_results_Foo_retry.csv").exists()
 
-    rows = list(csv.DictReader((csv_dir / "test_results_Foo.csv").open()))
+    rows = list(csv.DictReader((tmp_path / "test_results_Foo.csv").open()))
     by = {r["test_id"]: r["status"] for r in rows}
     assert by == {
         "test_example.py::Foo::ok": "passed",
         "test_example.py::Foo::flake": "passed_on_retry",
     }
-    # nodeid and test_class/test_method are internal — not emitted to CSV.
+    # nodeid is internal — not emitted to CSV. test_class and test_method
+    # ARE emitted (the aggregator groups by test_class).
     assert "nodeid" not in rows[0]
-    assert "test_class" not in rows[0]
-    assert "test_method" not in rows[0]
+    assert "test_class" in rows[0]
+    assert "test_method" in rows[0]
 
 
 def test_convert_output_dir_handles_sharded_names(tmp_path: Path) -> None:
-    json_dir = tmp_path / "json_reports"
     for shard in (0, 1):
         _write_pytest_json(
-            json_dir / f"test_results_TestMeta_shard{shard}.json",
+            tmp_path / f"test_results_TestMeta_shard{shard}.json",
             [(f"test_example.py::TestMeta::s{shard}", "failed")],
         )
         _write_pytest_json(
-            json_dir / f"test_results_TestMeta_shard{shard}_retry.json",
+            tmp_path / f"test_results_TestMeta_shard{shard}_retry.json",
             [(f"test_example.py::TestMeta::s{shard}", "passed")],
         )
 
     convert_output_dir(str(tmp_path))
-    csvs = sorted(p.name for p in (tmp_path / "csv_reports").iterdir())
+    csvs = sorted(p.name for p in tmp_path.glob("test_results_*.csv"))
     assert csvs == [
         "test_results_TestMeta_shard0.csv",
         "test_results_TestMeta_shard1.csv",
@@ -201,10 +201,9 @@ def test_convert_output_dir_handles_sharded_names(tmp_path: Path) -> None:
 
 def test_convert_output_dir_without_retry_is_unchanged(tmp_path: Path) -> None:
     """Backwards-compat: artifacts missing _retry.json must still aggregate."""
-    json_dir = tmp_path / "json_reports"
-    _write_pytest_json(json_dir / "test_results_X.json", [("test_example.py::X::a", "passed")])
+    _write_pytest_json(tmp_path / "test_results_X.json", [("test_example.py::X::a", "passed")])
     assert convert_output_dir(str(tmp_path)) == 0
-    rows = list(csv.DictReader((tmp_path / "csv_reports" / "test_results_X.csv").open()))
+    rows = list(csv.DictReader((tmp_path / "test_results_X.csv").open()))
     assert len(rows) == 1 and rows[0]["status"] == "passed"
 
 
@@ -293,6 +292,60 @@ def test_write_flaky_csv_empty_when_no_retries(tmp_path: Path) -> None:
     assert out.exists()
 
 
+# -----------------------------------------------------------------------------
+# flatten_reports
+# -----------------------------------------------------------------------------
+def test_flatten_reports_copies_all_types(tmp_path: Path) -> None:
+    """Per-node artifacts (flat layout) are collected into central dirs per type."""
+    # Two "nodes". Each per-node dir is flat — test_results_*.json /
+    # <name>.html / test_results_*.csv / <name>.log live directly inside it.
+    for node in ("test_autograd", "test_ops-shard0"):
+        base = tmp_path / f"upstream-pytorch-{node}"
+        base.mkdir()
+        (base / f"test_results_{node}.json").write_text("{}")
+        (base / f"{node}.html").write_text("<html/>")
+        (base / f"test_results_{node}.csv").write_text("test_id,status\n")
+        (base / f"{node}.log").write_text("log line")
+
+    counts = flatten_reports(tmp_path)
+    assert counts == {
+        "json_reports": 2,
+        "html_reports": 2,
+        "csv_reports": 2,
+        "log_reports": 2,
+    }
+
+    for sub in ("json_reports", "html_reports", "csv_reports", "log_reports"):
+        files = sorted(p.name for p in (tmp_path / sub).iterdir())
+        assert len(files) == 2, f"{sub}: {files}"
+
+
+def test_flatten_reports_skips_duplicate_names(tmp_path: Path) -> None:
+    """Duplicate filenames (shouldn't happen but...) are skipped, not overwritten."""
+    for node in ("node_a", "node_b"):
+        base = tmp_path / f"upstream-pytorch-{node}"
+        base.mkdir()
+        (base / "test_results_shared.json").write_text(f"from {node}")
+
+    counts = flatten_reports(tmp_path)
+    assert counts["json_reports"] == 1  # one copied, one skipped
+    files = list((tmp_path / "json_reports").iterdir())
+    assert len(files) == 1
+
+
+def test_flatten_reports_empty_when_no_nodes(tmp_path: Path) -> None:
+    counts = flatten_reports(tmp_path)
+    assert counts == {
+        "json_reports": 0,
+        "html_reports": 0,
+        "csv_reports": 0,
+        "log_reports": 0,
+    }
+    # Central dirs still created (downstream consumers may check for them).
+    for sub in ("json_reports", "html_reports", "csv_reports", "log_reports"):
+        assert (tmp_path / sub).is_dir()
+
+
 @pytest.mark.parametrize(
     ("counts", "expected"),
     [
@@ -320,10 +373,9 @@ def test_calc_pass_rate(counts: dict, expected: str) -> None:
 
 def test_pass_rate_end_to_end_with_partial_retry_recovery(tmp_path: Path) -> None:
     """8/10 pass in main, retry recovers 1 of 2 failures → 90% pass rate."""
-    json_dir = tmp_path / "json_reports"
     # Main: 8 passed + 2 failed
     _write_pytest_json(
-        json_dir / "test_results_Foo.json",
+        tmp_path / "test_results_Foo.json",
         [
             *[(f"test_x.py::Foo::pass_{i}", "passed") for i in range(8)],
             ("test_x.py::Foo::flake", "failed"),
@@ -332,7 +384,7 @@ def test_pass_rate_end_to_end_with_partial_retry_recovery(tmp_path: Path) -> Non
     )
     # Retry: flake passes, real_bug still fails
     _write_pytest_json(
-        json_dir / "test_results_Foo_retry.json",
+        tmp_path / "test_results_Foo_retry.json",
         [
             ("test_x.py::Foo::flake", "passed"),
             ("test_x.py::Foo::real_bug", "failed"),
@@ -341,7 +393,7 @@ def test_pass_rate_end_to_end_with_partial_retry_recovery(tmp_path: Path) -> Non
 
     convert_output_dir(str(tmp_path))
 
-    rows = list(csv.DictReader((tmp_path / "csv_reports" / "test_results_Foo.csv").open()))
+    rows = list(csv.DictReader((tmp_path / "test_results_Foo.csv").open()))
     from collections import Counter
 
     status_counts = Counter(r["status"] for r in rows)

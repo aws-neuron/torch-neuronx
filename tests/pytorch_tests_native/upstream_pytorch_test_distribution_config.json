@@ -4,8 +4,8 @@
     {
       "ignore": [
         "distributed/fsdp",
-        "distributed/checkpoint",
-        "distributed/tensor"
+        "distributed/tensor",
+        "distributed/_composable"
       ],
       "items": [
         "distributed"
@@ -22,11 +22,12 @@
       "items": [
         "distributed/tensor"
       ],
+      "num_shards": 2,
       "num_workers": 8
     },
     {
       "items": [
-        "distributed/checkpoint"
+        "distributed/_composable"
       ],
       "num_workers": 8
     },
