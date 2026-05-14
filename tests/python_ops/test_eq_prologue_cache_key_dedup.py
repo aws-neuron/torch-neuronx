@@ -63,18 +63,26 @@ See:
       #637's narrower guard does not cover.
 """
 
-import os
-
-# Force synchronous execution so exceptions surface on the call that
-# caused them, not on the next sync. Without this the alternating
-# sig(1)/sig(2) pattern still fires but the traceback blames the
-# wrong iteration.
-os.environ["NEURON_LAUNCH_BLOCKING"] = "1"
-
 import pytest
 import torch
 
 SHAPE = (789, 357)  # Matches upstream test_contig_vs_transposed.
+
+
+@pytest.fixture(autouse=True)
+def _force_launch_blocking(monkeypatch):
+    """Force synchronous NRT execution for the duration of each test.
+
+    Without this, exceptions from the collision bug surface on the
+    *next* NRT sync rather than on the call that caused them, so the
+    alternating sig(1)/sig(2) pattern still fires but the traceback
+    blames the wrong iteration.
+
+    Scoped to each test via monkeypatch so the env var doesn't leak
+    into unrelated tests running in the same pytest process or
+    pytest-xdist worker.
+    """
+    monkeypatch.setenv("NEURON_LAUNCH_BLOCKING", "1")
 
 
 def _eq_on_neuron_via_isclose(op, c):
