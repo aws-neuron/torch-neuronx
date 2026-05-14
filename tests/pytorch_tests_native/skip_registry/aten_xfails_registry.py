@@ -40,12 +40,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="NEFF creation failed for operation: aten::contiguous on zero-sized tensors",
-        tests=[
-            "test_parallelize_api.py::TensorParallelAPITests::test_prepare_module_input_output",
-        ],
-    ),
-    SkipGroup(
         reason=(
             "[accuracy.gradcheck] Numerical vs analytical gradient"
             " mismatch due to float64→float32 precision loss"
@@ -210,16 +204,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "ASGD passes per-group etas as 0-dim scalar tensors into _foreach_addcmul_."
-            " Neuron's NKI addcmul kernel is 2D tile-based and rejects 0-dim operands"
-            " with 'invalid shape: cannot be empty'"
-        ),
-        tests=[
-            "test_optimizers.py::TestDTensorOptimizer::test_asgd_1d_sharding",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "index_put with None in the indices "
             "list generates a torch.constant.bool op in the IR, and neuron's "
             "torch-mlir → StableHLO pass has no legalization pattern for it, "
@@ -376,17 +360,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "NRT Execution error on aten::addmv_ when exercising argsort's"
-            " variant consistency path on float32. The addmv_ inplace kernel"
-            " fails inside the Neuron runtime; likely an uninitialized-output"
-            " or stride-handling bug in the Neuron addmv_ kernel."
-        ),
-        tests=[
-            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_argsort_neuron_float32",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "NRT Execution error on aten::ne.Tensor_out when prod reduction hits"
             " the high-dim-count limit (>ndim). Likely a Neuron kernel bug in"
             " the out-variant of ne for high-rank tensors."
@@ -405,31 +378,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_fastpath_inplace_neuron_bool",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[compiler] nn.functional.pad(mode='circular') triggers neuronxcc"
-            " internal error (NCC_IDRV014 Unknown verbosity level). The op is"
-            " lowerable but the compiler rejects it. xfail until compiler fix."
-        ),
-        tests=[
-            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_int32",
-            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_float16",
-            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_float32",
-            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_int32",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_float16",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_float32",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
-            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_int32",
-            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_float16",
-            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_float32",
-            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_pad_circular_neuron_bfloat16",
-            "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_pad_circular_neuron_float32",
-            "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_pad_circular_neuron_float32",
-            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_pad_circular_neuron_float32",
-            "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_nn_functional_pad_circular_neuron_float32",
         ],
     ),
     SkipGroup(
