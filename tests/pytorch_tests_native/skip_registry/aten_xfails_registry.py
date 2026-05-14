@@ -40,12 +40,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="NEFF creation failed for operation: aten::contiguous on zero-sized tensors",
-        tests=[
-            "test_parallelize_api.py::TensorParallelAPITests::test_prepare_module_input_output",
-        ],
-    ),
-    SkipGroup(
         reason=(
             "[accuracy.gradcheck] Numerical vs analytical gradient"
             " mismatch due to float64→float32 precision loss"
@@ -213,16 +207,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="RNG tracker is None - random ops initialization",
         tests=[
             "test_deterministic_uniform_2d",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "ASGD passes per-group etas as 0-dim scalar tensors into _foreach_addcmul_."
-            " Neuron's NKI addcmul kernel is 2D tile-based and rejects 0-dim operands"
-            " with 'invalid shape: cannot be empty'"
-        ),
-        tests=[
-            "test_optimizers.py::TestDTensorOptimizer::test_asgd_1d_sharding",
         ],
     ),
     SkipGroup(
@@ -400,17 +384,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "NRT Execution error on aten::addmv_ when exercising argsort's"
-            " variant consistency path on float32. The addmv_ inplace kernel"
-            " fails inside the Neuron runtime; likely an uninitialized-output"
-            " or stride-handling bug in the Neuron addmv_ kernel."
-        ),
-        tests=[
-            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_argsort_neuron_float32",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "NRT Execution error on aten::ne.Tensor_out when prod reduction hits"
             " the high-dim-count limit (>ndim). Likely a Neuron kernel bug in"
             " the out-variant of ne for high-rank tensors."
@@ -429,6 +402,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_fastpath_inplace_neuron_bool",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[prologue] Data-dependent NaN in standalone transpose NEFF for"
+            " non-contiguous fp16 tensors of shape (357, 789). The _refs"
+            " decomposition (promote->op->demote) triggers CopyToNonContiguous"
+            " which uses an on-device transpose that produces spurious NaN at"
+            " row 128 for specific data patterns. Affects any _refs op that"
+            " does promote/demote on this shape. Native ops with epilogue work"
+            " correctly."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_div_no_rounding_mode_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_pow_neuron_float16",
         ],
     ),
 ]

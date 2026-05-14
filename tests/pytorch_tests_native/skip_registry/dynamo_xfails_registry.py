@@ -17,10 +17,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " hardware. Gradient metadata propagation differs from CPU reference"
             " on bfloat16/float16 for various inplace ops (fmod, lerp, etc.)."
         ),
-        patterns=[
-            "test_inplace_ops_propagate_requires_grad_metadata_*_neuron_bfloat16",
-            "test_inplace_ops_propagate_requires_grad_metadata_*_neuron_float16",
-        ],
+        tests=x.DYNAMO_INPLACE_METADATA_PROPAGATION,
     ),
     SkipGroup(
         reason=(
@@ -681,14 +678,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " (param_num/output_idx out of bounds)."
         ),
         tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_basic",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_dynamo_device_mesh_attrs",
             "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_dce",
             "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_no_dce",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_input_mutations",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_to_local_kwargs_forward_hook",
-            "test_dtensor_compile.py::TestDTensorCompile::test_get_local_rank_compile",
             "test_dtensor_compile.py::TestDTensorCompile::test_device_mesh_input_to_dtensor_from_local",
         ],
     ),

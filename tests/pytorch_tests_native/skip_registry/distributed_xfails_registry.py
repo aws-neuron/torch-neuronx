@@ -16,26 +16,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "ProcessGroupNeuron inherits from ProcessGroup instead of C10dBackend, "
-            "preventing composite backend registration (CPU + Neuron). Async "
-            "checkpoint save requires two backends. ProcessGroupNeuron should "
-            "subclass C10dBackend."
-        ),
-        tests=[
-            "test_state_dict_stager.py::TestDTensorStateDictStager::test_dtensor",
-            "test_state_dict_stager.py::TestReplicationStager::test_replication_dtensors",
-            "test_state_dict_stager.py::TestReplicationStager::test_replication_persistence",
-            "test_state_dict_stager.py::TestReplicationStager::test_replication_sharded_tensors",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type0_zoc_False",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type2_zoc_False",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type4_zoc_True",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type5_zoc_True",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type1_zoc_False",
-            "test_e2e_save_and_load.py::TestE2ESaveAndLoad::test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type3_zoc_False",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "Distributed cross_entropy with all-reduce "
             "accumulates float32 values in a different "
             "order than local cross_entropy, causing a "
@@ -63,16 +43,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "TensorParallelAPITestsWithLocalTensor::test_linear_row_wise_parallel",
             "TensorParallelAPITestsWithLocalTensor::test_parallelize_module_with_no_match",
             "TensorParallelAPITestsWithLocalTensor::test_parallelize_module_with_root_module",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "CommDebugMode does not detect Neuron "
-            "collective ops because they bypass the "
-            "dispatch path that CommDebugMode hooks into"
-        ),
-        tests=[
-            "TensorParallelAPITests::test_parallelize_module_src_data_rank",
         ],
     ),
     SkipGroup(
@@ -121,9 +91,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_c10d_nccl.py::CommTest::test_sequence_num_set_default_pg_nccl",
             "test_c10d_nccl.py::CommTest::test_sequence_num_set_nccl_new_group",
             "test_c10d_nccl.py::LargeCommTest::test_new_group_ordered",
-            "test_device_mesh.py::DeviceMeshTest::test_2d_mesh_eager_init_subgroup",
             "test_device_mesh.py::InitDeviceMeshTest::test_backend_override_argument_dict_with_idx_and_backend_eager",
-            "test_device_mesh.py::TestDeviceMeshGetItem::test_flatten_mesh_4d",
         ],
     ),
     SkipGroup(
@@ -147,8 +115,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=("Neuron collectives do not support empty tensor handling."),
         tests=[
-            "test_dtensor_resharding.py::TestDTensorReshardMeshChange::test_dtensor_checkpoint_resharding_with_empty_shard",
-            "test_hf_safetensor_e2e.py::TestDTensorReshardMeshChange::test_dtensor_checkpoint_resharding_with_empty_shard",
             "test_c10d_ops_privateuse1.py::ProcessGroupPrivateUse1OpTest::test_empty_tensors",
         ],
     ),
@@ -173,26 +139,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_state_dict.py::TestStateDict::test_extra_state",
-            "test_state_dict.py::TestStateDict::test_flattened_osd",
             "test_state_dict.py::TestStateDict::test_non_persistent_buffers",
             "test_state_dict.py::TestStateDict::test_single_gpu",
             "test_state_dict.py::TestNoComm::test_no_dist",
             "test_state_dict_stager.py::TestDTensorStateDictStager::test_async_save_no_memory_leak",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Upstream FSDP does not limit the number of devices per process, "
-            "causing each worker to claim all 64 cores instead of a subset. "
-            "Will be enabled/fixed as part of FSDP onboarding."
-        ),
-        tests=[
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_1d_fsdp_cpu_offload_full_model_state_dict",
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_1d_fsdp_get_model_state_dict",
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_save_with_fsdp1_and_load_with_fsdp2",
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_save_with_fsdp1_and_load_with_fsdp2_tp",
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_save_with_fsdp2_tp_and_load_with_tp",
-            "test_fsdp_dsd.py::TestFullyShardWithDistributedStateDict::test_save_with_tp_and_load_with_fsdp2_tp",
         ],
     ),
     SkipGroup(
@@ -217,7 +167,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "test_fsdp_optim_state.py::FsdpOptimStateCheckpoint::test_load_sharded_optimizer_state_dict_pass_planner_False",
             "test_fsdp_optim_state.py::FsdpOptimStateCheckpoint::test_load_sharded_optimizer_state_dict_pass_planner_True",
-            "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
         ],
     ),
     SkipGroup(
@@ -232,14 +181,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " - Neuron collectives bypass CommDebugMode dispatch hooks"
         ),
         tests=[
-            "TestFullyShardCommunication::test_fully_shard_communication_count",
-            "TestFullyShardCommunication::test_manual_reshard_with_reshard_after_forward_false",
-            "TestFullyShardCommunication::test_set_reshard_after_forward",
             "TestFullyShardGradientAccumulation::test_gradient_accumulation",
             "TestFullyShardCollectiveOps::test_reduce_scatter_fp16",
             "TestFullyShardCollectiveOps::test_all_gather_fp32",
             "TestFullyShardCollectiveOps::test_reduce_scatter_fp32",
-            "TestFullyShardAllGatherExtensionsMultiThread::test_all_gather_extensions_monkey_patch",
         ],
     ),
     SkipGroup(
@@ -267,10 +212,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Timing assertion failures in overlap measurement",
         tests=[
-            "TestFullyShardOverlap::test_fully_shard_post_optim_event_overlap",
             "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_training_overlap",
             "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_no_grad_input_overlap",
-            "TestFullyShardOverlap::test_fully_shard_training_overlap",
         ],
     ),
     SkipGroup(
@@ -372,12 +315,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Needs further investigation - SIGABRT in compiler",
-        tests=[
-            "TestFullyShardAllGatherExtensionsMultiThread::test_all_gather_extension_hsdp_mesh",
-        ],
-    ),
-    SkipGroup(
         reason="torch.distributed.record_comm API not supported",
         tests=[
             "RecordCommTest::test_nesting",
@@ -440,7 +377,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_fully_shard_training.py::TestFullyShardRegisteredParams::test_modules_to_run_forward_empty_for_single_module",
-            "test_fsdp_state_dict.py::TestFSDPStateDict::test_basic_save_and_load_state_dict_state_dict_type_state_dict_cpu_offload1_fp16_False_state_dict_rank0_and_offload_False_use_orig_params_False",
         ],
     ),
     SkipGroup(
@@ -474,12 +410,19 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Gloo-based test, not a Neuron issue — MASTER_PORT collision"
-            " causes Gloo connectFullMesh 'Connection closed by peer'"
-            " during DeviceMesh sub-process-group init."
+            "C++ PG: BackendType.CUSTOM lacks device awareness. "
+            "PyTorch hardcodes BackendType.CUSTOM for all extended_api backends "
+            "(distributed_c10d.py:372). ProcessGroup::getBackendName() returns "
+            "'custom' instead of delegating to NeuronBackend::getBackendName(). "
+            "ProcessGroup::barrier() falls into the else branch (CPU tensor) "
+            "because only NCCL->CUDA and XCCL->XPU are handled. "
+            "Requires upstream fix: either allow CUSTOM backends to specify "
+            "their device type, or make ProcessGroup delegate to the registered "
+            "Backend for CUSTOM type."
         ),
         tests=[
-            "test_hsdp_checkpoint.py::TestHSDPCheckpoint::test_hsdp_fsdp_checkpoint_conversion_is_even_sharded_model_False",
+            "test_backends.py::TestMiscCollectiveUtilsNEURON::test_create_pg_neuron",
+            "test_c10d_ops_privateuse1.py::ProcessGroupPrivateUse1OpTest::test_barrier",
         ],
     ),
 ]

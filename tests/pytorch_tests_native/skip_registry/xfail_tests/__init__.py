@@ -61,6 +61,9 @@ from .dynamo_xfails import (
     DYNAMO_GRADIENT_NEURON_TO_CPU as DYNAMO_GRADIENT_NEURON_TO_CPU,
 )
 from .dynamo_xfails import (
+    DYNAMO_INPLACE_METADATA_PROPAGATION as DYNAMO_INPLACE_METADATA_PROPAGATION,
+)
+from .dynamo_xfails import (
     DYNAMO_LOWERING_FAILURE_ATEN_ADD as DYNAMO_LOWERING_FAILURE_ATEN_ADD,
 )
 from .dynamo_xfails import (

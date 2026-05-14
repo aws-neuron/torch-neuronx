@@ -100,9 +100,7 @@ ACCURACY_SCALAR_NOT_CLOSE = [
     "test_reductions.py::TestReductionsNEURON::test_reference_masked_masked_sum_neuron_bfloat16",
     "test_reductions.py::TestReductionsNEURON::test_reference_masked_masked_sum_neuron_float32",
     "test_reductions.py::TestReductionsNEURON::test_reference_masked_masked_sum_neuron_float64",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float64",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float64",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_rsqrt_neuron_bool",
 ]
