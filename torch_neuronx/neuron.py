@@ -4,7 +4,7 @@
 # Import memory module to enable torch.neuron.memory.* access
 import sys
 
-from torch_neuronx import memory  # noqa: F401
+import torch_neuronx.memory as memory  # noqa: F401
 
 
 def is_initialized() -> bool:
@@ -451,6 +451,50 @@ def empty_cache():
     import torch_neuronx
 
     torch_neuronx.empty_cache()
+
+
+def peak_memory_stats(device=None):
+    """Return peak memory stats snapshot captured at the all-time allocation peak.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        dict: Peak stats snapshot with allocated/reserved/active bytes at peak,
+              internal fragmentation, and OOM counters.
+    """
+    import torch_neuronx
+
+    return torch_neuronx.peak_memory_stats(device)
+
+
+def segment_pool_analysis(device=None):
+    """Compute segment pool fragmentation and efficiency metrics.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        dict: Analysis with fragmentation_index, memory_efficiency,
+              largest_free, free_chunks, address_span, etc.
+    """
+    import torch_neuronx
+
+    return torch_neuronx.segment_pool_analysis(device)
+
+
+def segment_pool_analysis_summary(device=None):
+    """Return a formatted string of segment pool analysis.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        str: Formatted analysis summary
+    """
+    import torch_neuronx
+
+    return torch_neuronx.segment_pool_analysis_summary(device)
 
 
 def _sleep(cycles: int) -> None:
