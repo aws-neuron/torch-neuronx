@@ -501,3 +501,49 @@ def torch_slice_backward(grad_output, input_sizes, dim, start, end, step):
     indices[dim] = slice(start, end, step)
     grad_input[tuple(indices)] = grad_output
     return grad_input
+
+
+@register_aten(
+    [
+        "aten::searchsorted.Tensor",
+        "aten::searchsorted.Tensor_out",
+    ],
+    static_argnames=("out_int32", "right", "side"),
+)
+def torch_searchsorted_tensor(
+    sorted_sequence, values, *, out_int32=False, right=False, side=None, sorter=None, out=None
+):
+    """Decompose searchsorted into comparison + sum.
+
+    O(N*M) linear scan that avoids data-dependent control flow.
+    NOTE: Creates an intermediate [..., N, M] tensor; large inputs may cause OOM.
+    """
+    if side is not None:
+        right = side == "right"
+    if sorter is not None:
+        sorted_sequence = torch.gather(sorted_sequence, -1, sorter)
+    seq = sorted_sequence.unsqueeze(-2)
+    val = values.unsqueeze(-1)
+    mask = seq <= val if right else seq < val
+    result = mask.sum(dim=-1)
+    return result.to(torch.int32) if out_int32 else result.to(torch.int64)
+
+
+@register_aten(
+    [
+        "aten::searchsorted.Scalar",
+        "aten::searchsorted.Scalar_out",
+    ],
+    static_argnames=("out_int32", "right", "side"),
+)
+def torch_searchsorted_scalar(
+    sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None, out=None
+):
+    """Scalar variant: wrap scalar as tensor and delegate to tensor version."""
+    values = (
+        torch.as_tensor(value, dtype=sorted_sequence.dtype).reshape(1).to(sorted_sequence.device)
+    )
+    result = torch_searchsorted_tensor(
+        sorted_sequence, values, out_int32=out_int32, right=right, side=side, sorter=sorter
+    )
+    return result.squeeze(-1)
