@@ -184,7 +184,7 @@ def torch_histc(
 
 
 @register_aten(["aten::threshold", "aten::threshold.out"], static_argnums=(1, 2))
-def torch_threshold(self, threshold, value):
+def torch_threshold(self, threshold, value, out=None):
     return torch.nn.functional.threshold(self, threshold, value)
 
 

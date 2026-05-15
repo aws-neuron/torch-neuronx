@@ -32,7 +32,7 @@ def torch_tanh(self, out=None):
 
 
 @register_aten(["aten::softplus", "aten::softplus.out"], static_argnums=(1, 2))
-def torch_softplus(self, beta=1, threshold=20):
+def torch_softplus(self, beta=1, threshold=20, out=None):
     return torch.nn.functional.softplus(self, beta=beta, threshold=threshold)
 
 
