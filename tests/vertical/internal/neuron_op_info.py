@@ -37,10 +37,17 @@ def _noop(*_args, **_kwargs):
 
 _DTYPE_MAP = {
     "long": torch.long,
+    "int64": torch.long,
     "int": torch.int32,
+    "int32": torch.int32,
+    "int16": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
     "bool": torch.bool,
     "double": torch.float64,
+    "float64": torch.float64,
     "float": None,  # sentinel: use caller's default dtype
+    "float32": None,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
