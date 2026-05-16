@@ -140,10 +140,17 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
 
   // For async execution worker (operation scheduling)
   OperationContext* GetNextOperationToSchedule();
-  void AdvanceToNextOperation();
+  // Advance next_to_schedule_ past the op the caller just scheduled.
+  void AdvanceToNextOperation(OperationContext* just_scheduled = nullptr);
 
   // Check if stream has pending async operations (scheduled or pending signal)
   bool HasPendingAsyncOperations() const;
+
+  // Park `alloc_kernel` as Deferred iff the stream has drainable work.
+  // Returns false when there's nothing whose completion would unblock the
+  // retry — caller must escalate. Single-mutex-acquisition closes the
+  // drain-check vs state-flip race.
+  bool TryDeferAlloc(AllocDirectKernelExecution& alloc_kernel);
 
   // Get/set last scheduled info for cross-XU synchronization
   LastScheduledInfo& GetLastScheduledInfo() { return last_scheduled_info_; }
@@ -165,12 +172,19 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // Linear search bounded by kDefaultMaxInflightPerXU and only triggered on errors
   OperationContext* FindOperationBySeq(nrt::SequenceId sequence_id);
 
+  void RemoveActiveOperation(const OperationContext* operation);
+
  private:
   // Prepare operation on the calling thread if RequiresPrepare() is true.
   void PrepareOperation(OperationContext* op);
 
-  // Operation management
-  void RemoveActiveOperation(const OperationContext* operation);
+  // True iff no scheduled / pending-signal ops remain (Deferred kAllocs are
+  // ignored). Caller must hold active_operations_mutex_.
+  bool IsStreamDrainedWithLockHeld() const;
+
+  // Flip parked kAllocs from Deferred to RetryReady when the stream is
+  // drained. Caller must hold active_operations_mutex_.
+  void ReleaseDeferredAllocGates();
 
   // Handle the respective error for the current operation
   template <typename ExceptionType>

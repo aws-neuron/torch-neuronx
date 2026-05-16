@@ -84,18 +84,38 @@ bool ErrorRecovery::ShouldAttemptOOMRecovery(const torch_neuronx::ExecutionRunti
 
 OperationContextResult ErrorRecovery::AttemptOOMRecovery(OperationContext* op) {
   TORCH_NEURONX_DEBUG("Attempting OOM recovery via cache drain", "op=", op->GetOpName());
+
+  const int device_id = op->kernel_execution->GetDeviceId();
+  metrics::RecordOOMRetry(device_id);
+
+  size_t requested_size = 0;
+  if (op->GetKernelType() == KernelTypeEnum::kAlloc) {
+    requested_size = op->GetKernel<KernelTypeEnum::kAlloc>().GetSizeBytes();
+  }
+
   c10_neuron::NeuronCachingAllocator::emptyNrtBufferCache();
   try {
-    NRT_STATUS nrt_status;
-    nrt::SequenceId seq_id;
+    NRT_STATUS nrt_status = NRT_SUCCESS;
+    nrt::SequenceId seq_id = 0;
     op->kernel_execution->Schedule(&nrt_status, &seq_id, op->stream_id);
+    if (nrt_status == NRT_RESOURCE) {
+      TORCH_NEURONX_WARN("OOM recovery failed after cache drain", "op=", op->GetOpName(),
+                         "nrt_status=NRT_RESOURCE");
+      metrics::RecordOOMFailure(device_id, requested_size, op->stream_id, nullptr);
+      return OperationContextResult::CreateError(
+          "OOM recovery failed: nrt_tensor_allocate still failed after cache drain");
+    }
     TORCH_NEURONX_DEBUG("OOM recovery succeeded", "op=", op->GetOpName());
     return OperationContextResult::CreateSuccess();
   } catch (const torch_neuronx::ExecutionRuntimeException& retry_e) {
     TORCH_NEURONX_WARN("OOM recovery failed after cache drain", "op=", op->GetOpName(),
                        "error=", retry_e.what());
-    int device_id = op->kernel_execution ? op->kernel_execution->GetDeviceId() : 0;
-    at::neuron::metrics::RecordOOMFailure(device_id, 0, op->stream_id, nullptr);
+    // Only count as an OOM if the retry's exception was actually NRT_RESOURCE.
+    // Other exceptions (e.g. a downstream op throwing on the retry path) are
+    // recovery failures but not OOMs and must not inflate num_ooms telemetry.
+    if (retry_e.HasNRTStatus() && retry_e.GetNRTStatus() == NRT_RESOURCE) {
+      metrics::RecordOOMFailure(device_id, requested_size, op->stream_id, nullptr);
+    }
     return OperationContextResult::CreateError(std::string("OOM recovery failed: ") +
                                                retry_e.what());
   }

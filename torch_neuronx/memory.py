@@ -35,6 +35,11 @@ def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
         - num_ooms: Count of final OOM failures
         - num_tensor_frees: Count of tensor deallocations
         - allocation_requests: Total allocation requests
+        - num_alloc_deferred: Count of kAllocs parked as Deferred after an OOM
+        - num_alloc_drain_retry_ok: Deferred kAllocs that succeeded on retry after
+          the stream drained
+        - num_alloc_drain_retry_fail: Deferred kAllocs whose retry also OOM'd and
+          escalated to cache-drain recovery.
 
         Each byte stat dict contains:
         - current: Current value in bytes
@@ -192,6 +197,9 @@ def memory_summary(device: int | torch.device | None = None, abbreviated: bool =
         f"  Allocations: {stats['allocation_requests']:,}  |  "
         f"Frees: {stats['num_tensor_frees']:,}",
         f"  OOMs: {stats['num_ooms']:,}  |  Alloc Retries: {stats['num_alloc_retries']:,}",
+        f"  Defer-retry: deferred={stats.get('num_alloc_deferred', 0):,}  "
+        f"drain_retry_ok={stats.get('num_alloc_drain_retry_ok', 0):,}  "
+        f"drain_retry_fail={stats.get('num_alloc_drain_retry_fail', 0):,}",
         "=" * 75,
         "  Metric              | Current    | Peak       | Allocated  | Freed",
         "-" * 75,
@@ -473,10 +481,10 @@ def segment_pool_analysis_summary(device: int | torch.device | None = None) -> s
         f"  Total free:       {_fmt(s['total_free'])}  [{s['total_free']:,} B]\n"
         f"  NRT free:         {_fmt(s['nrt_free'])}  [{s['nrt_free']:,} B]\n"
         f"  Cached free:      {_fmt(s['cached_free'])}  [{s['cached_free']:,} B]\n"
-        f"  Internal frag:    {_fmt(s['internal_fragmentation'])}"
-        f"  [{s['internal_fragmentation']:,} B]\n"
-        f"  External frag:    {_fmt(s['external_fragmentation'])}"
-        f"  [{s['external_fragmentation']:,} B]\n"
+        f"  Internal frag:    {_fmt(s['internal_fragmentation'])}  "
+        f"[{s['internal_fragmentation']:,} B]\n"
+        f"  External frag:    {_fmt(s['external_fragmentation'])}  "
+        f"[{s['external_fragmentation']:,} B]\n"
         f"  Frag index:       {s['fragmentation_index']:>14.4f}\n"
         f"  Mem efficiency:   {s['memory_efficiency']:>14.4f}\n"
         f"  Address span:     {_fmt(s['address_span'])}  [{s['address_span']:,} B]\n"

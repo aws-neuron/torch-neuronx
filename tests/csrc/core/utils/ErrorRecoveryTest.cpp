@@ -8,6 +8,7 @@
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/utils/ErrorRecovery.h"
 
 using namespace at::neuron;
@@ -378,6 +379,57 @@ TEST_F(ErrorRecoveryTest, AttemptRecovery_ExecutionError_CompilableOp_DoesNotFal
   EXPECT_FALSE(result.IsSuccess());
   EXPECT_EQ(result.status, OperationContextResult::kPending);
   EXPECT_TRUE(result.GetError().empty());
+}
+
+TEST_F(ErrorRecoveryTest, AttemptRecoveryForAllocKernelRetryStillOOM) {
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  // Simulate the post-patch contract: Schedule returns normally but surfaces
+  // NRT_RESOURCE via the out-param.
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(
+          ::testing::DoAll(::testing::SetArgPointee<0>(NRT_RESOURCE), ::testing::Return(false)));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_EQ(result.status, OperationContextResult::kFailed);
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("OOM recovery failed"));
+}
+
+TEST_F(ErrorRecoveryTest, OOMRecoveryIncrementsTelemetryCounters) {
+  constexpr int kDeviceId = 0;
+  auto& registry = at::neuron::metrics::DeviceMemoryStatsRegistry::Instance();
+  auto& stats = registry.GetDeviceStats(kDeviceId);
+  const uint64_t retries_before = stats.num_alloc_retries.load(std::memory_order_relaxed);
+  const uint64_t ooms_before = stats.num_ooms.load(std::memory_order_relaxed);
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(
+          ::testing::DoAll(::testing::SetArgPointee<0>(NRT_RESOURCE), ::testing::Return(false)));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), retries_before + 1);
+  EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), ooms_before + 1);
 }
 
 int main(int argc, char** argv) {

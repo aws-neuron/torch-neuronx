@@ -392,6 +392,14 @@ struct OperationContext {
       return IsExecutionReady() && GetKernel<KernelTypeEnum::kEvent>().IsReady();
     }
 
+    // kAlloc: if we deferred due to NRT_RESOURCE, gate re-entry until the
+    // stream fully drains and clears the pending flag from a completion hook.
+    if (GetKernelType() == KernelTypeEnum::kAlloc &&
+        GetKernel<KernelTypeEnum::kAlloc>().GetAllocState() ==
+            at::neuron::AllocDirectKernelExecution::AllocState::Deferred) {
+      return false;
+    }
+
     // If this operation has a concatenated operation, check if the concatenated operation is ready
     // instead of checking this individual operation
     if (HasConcatenatedOperation()) {
