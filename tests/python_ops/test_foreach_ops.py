@@ -1048,3 +1048,80 @@ def test_foreach_scalarlist_inplace_integer_float_scalar(op_name, dtype):
 
     with pytest.raises(RuntimeError, match="can't be cast"):
         op_(t_neuron, scalars)
+
+
+# --- Shape validation tests ---
+
+
+def test_foreach_list_mismatched_shapes_raises():
+    """_foreach_add with non-broadcastable shapes should raise RuntimeError."""
+    t1 = [torch.zeros(10, 10, device="neuron", dtype=torch.int32) for _ in range(3)]
+    t2 = [torch.ones(11, 11, device="neuron", dtype=torch.int32) for _ in range(3)]
+    with pytest.raises(RuntimeError, match="size of tensor a"):
+        torch._foreach_add(t1, t2)
+
+
+def test_foreach_list_broadcastable_shapes_succeeds():
+    """_foreach_add with broadcastable shapes should succeed via MLIR fallback."""
+    t1 = [torch.ones(3, 4, device="neuron", dtype=torch.float32)]
+    t2 = [torch.ones(1, 4, device="neuron", dtype=torch.float32) * 2]
+    result = torch._foreach_add(t1, t2)
+    assert result[0].shape == (3, 4)
+    assert torch.allclose(result[0].cpu(), torch.full((3, 4), 3.0))
+
+
+def test_foreach_addcdiv_mismatched_shapes_raises():
+    """_foreach_addcdiv with non-broadcastable shapes should raise RuntimeError."""
+    s = [torch.ones(10, 10, device="neuron", dtype=torch.float32)]
+    t1 = [torch.ones(11, 11, device="neuron", dtype=torch.float32)]
+    t2 = [torch.ones(10, 10, device="neuron", dtype=torch.float32)]
+    with pytest.raises(RuntimeError, match="size of tensor a"):
+        torch._foreach_addcdiv(s, t1, t2, value=1)
+
+
+# --- addcmul/addcdiv bool dtype tests ---
+
+
+def test_foreach_addcmul_inplace_bool_raises():
+    """_foreach_addcmul_ on bool tensors should raise, matching CPU."""
+    s = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t1 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t2 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    with pytest.raises(RuntimeError):
+        torch._foreach_addcmul_(s, t1, t2, value=1)
+
+
+def test_foreach_addcmul_outplace_bool_raises():
+    """_foreach_addcmul on bool tensors should raise, matching CPU."""
+    s = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t1 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t2 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    with pytest.raises(RuntimeError):
+        torch._foreach_addcmul(s, t1, t2, value=1)
+
+
+def test_foreach_addcdiv_bool_raises():
+    """_foreach_addcdiv on bool tensors should raise, matching CPU."""
+    s = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t1 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    t2 = [torch.ones(5, device="neuron", dtype=torch.bool)]
+    with pytest.raises(RuntimeError):
+        torch._foreach_addcdiv(s, t1, t2, value=1)
+
+
+def test_addcmul_inplace_bool_raises():
+    """Tensor.addcmul_ on bool should raise, matching CPU."""
+    t = torch.ones(5, device="neuron", dtype=torch.bool)
+    t1 = torch.ones(5, device="neuron", dtype=torch.bool)
+    t2 = torch.ones(5, device="neuron", dtype=torch.bool)
+    with pytest.raises(RuntimeError):
+        t.addcmul_(t1, t2, value=1)
+
+
+def test_addcdiv_inplace_int_raises():
+    """Tensor.addcdiv_ on int should raise, matching CPU."""
+    t = torch.ones(5, device="neuron", dtype=torch.int32)
+    t1 = torch.ones(5, device="neuron", dtype=torch.int32)
+    t2 = torch.ones(5, device="neuron", dtype=torch.int32)
+    with pytest.raises(RuntimeError):
+        t.addcdiv_(t1, t2, value=1)

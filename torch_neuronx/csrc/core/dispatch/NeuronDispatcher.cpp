@@ -22,6 +22,7 @@
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
 #include "torch_neuronx/csrc/utils/CopyUtils.h"
 
@@ -299,6 +300,9 @@ static torch::Tensor NeuronToContiguousCPU(const at::Tensor& src, bool non_block
 static torch::Tensor CopyNeuronToCPU(const at::Tensor& src, c10::ScalarType target_dtype,
                                      bool non_blocking = false) {
   auto cpu = NeuronToContiguousCPU(src, non_blocking);
+  // Materialize conj/neg bits that raw byte copy does not handle.
+  if (src.is_conj()) cpu = cpu.conj_physical_();
+  if (src.is_neg()) cpu = cpu.neg_();
   if (cpu.scalar_type() != target_dtype) {
     // Synchronize before reading data for the dtype cast — the non-blocking
     // copy may still be in flight.
@@ -348,7 +352,7 @@ static torch::Tensor CastContiguousCPU(const at::Tensor& src, c10::ScalarType ta
 
 /// Dtype supported by the MLIR aten::copy_ lowering (excludes Bool).
 static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
-  return IsSupportedDtype(dt) && dt != c10::ScalarType::Bool;
+  return IsSupportedDtype(dt) && dt != c10::ScalarType::Bool && !c10::isComplexType(dt);
 }
 
 /// Dtype supported by the MLIR aten::_to_copy lowering.
@@ -513,8 +517,27 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
         return;
       }
 
-      // Same dtype, same shape — hot path (SDPA attention).
-      // On-device transpose + flat D2D copy.
+      // Same dtype, same shape — route through MLIR pipeline with epilogue.
+      // EnqueueXlaOperation's ProcessOutputTransformations detects non-contiguous
+      // output and fuses transpose into the NEFF. No recursion risk since epilogue
+      // fallback allocates a contiguous temp, not a copy_() call.
+      if (torch_neuronx::IsEpilogueEnabled()) {
+        // Null out non_blocking arg to avoid 0-dim Bool tensor on Neuron.
+        {
+          const auto& schema_args = op.schema().arguments();
+          for (size_t ai = 0; ai < schema_args.size() && ai < args.size(); ++ai) {
+            if (schema_args[ai].name() == "non_blocking") {
+              args[ai] = c10::IValue();
+              break;
+            }
+          }
+        }
+        for (auto& arg : args) torch::jit::push(*stack, arg);
+        NeuronDispatcher::DispatchImpl(op, dispatch_keys, stack, reg);
+        return;
+      }
+
+      // Fallback (epilogue disabled): on-device transpose + flat D2D copy via CopyToNonContiguous.
       auto src_prepared = src.is_contiguous() ? src
                                               : torch_neuronx::ops::contiguous_internal(
                                                     src, c10::MemoryFormat::Contiguous);
@@ -726,22 +749,29 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
     return;
   }
 
-  // Complex dtypes: fall back to CPU (mirrors Python can_handle() in base.py).
+  // Complex dtype allowlist: only ops verified to lower and execute correctly
+  // with complex tensors are allowed through. All others fall back to CPU.
   // With TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1, raise only when
-  // a complex tensor is at an input position. Complex produced as an out= is
-  // handled like any unregistered op (silent fallback).
+  // a complex tensor is at an input position (not just an out= tensor).
   if (HasComplexInput(args)) {
-    if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
-      RaiseComplexFallbackDisabled(op_name);
+    static const std::unordered_set<std::string> kComplexSupportedOps = {
+        "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_",
+        "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
+    };
+    if (kComplexSupportedOps.find(lookup_name) == kComplexSupportedOps.end()) {
+      if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
+        RaiseComplexFallbackDisabled(op_name);
+      }
+      TORCH_NEURONX_DISPATCH_DEBUG(
+          "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
+          " op=", op_name);
+      torch_neuronx::markFallbackLogged(op_name);
+      for (auto& arg : args) {
+        torch::jit::push(*stack, arg);
+      }
+      at::native::cpu_fallback(op, stack);
+      return;
     }
-    TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] complex dtype → CPU fallback",
-                                 " op=", op_name);
-    torch_neuronx::markFallbackLogged(op_name);
-    for (auto& arg : args) {
-      torch::jit::push(*stack, arg);
-    }
-    at::native::cpu_fallback(op, stack);
-    return;
   }
 
   TORCH_CHECK(
@@ -1287,6 +1317,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
   auto device = ExtractDevice(args);
   auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name);
   auto exec_outputs = AllocateExecutionOutputs(*entry, args, filtered_inputs, device, schema);
+
   int device_id = c10_neuron::GetTargetDeviceId(filtered_inputs, exec_outputs);
   auto fallback_ctx = BuildCPUFallbackContext(original_args, schema);
 
@@ -1342,11 +1373,6 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
     TORCH_CHECK(q.size(1) % k.size(1) == 0,
                 "SDPA: Number of heads in key and value must divide the number of heads in query");
   }
-  // We need query (args[0]) and value (args[2]) for stride fixup after execution
-  const auto& query_ref = (*stack)[stack->size() - num_args].toTensor();
-  const auto& value_ref = (*stack)[stack->size() - num_args + 2].toTensor();
-  // Copy shape info before stack is popped
-  auto query_sizes = query_ref.sizes().vec();
 
   auto result = DispatchSdpaCore(op, dispatch_keys, stack, reg);
   if (result.handled) return;
@@ -1355,17 +1381,26 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
   TORCH_CHECK(final_outputs.size() == 7, "SDPA forward expected 7 outputs, got ",
               final_outputs.size());
 
-  // Stride fixup: use alloc_with_matching_layout
-  // to produce output with strides matching query's layout.
+  // Stride fixup: use alloc_with_matching_layout to produce output with strides
+  // matching query's layout (ATen contract).
+  // When epilogue is enabled AND target_strides was applied (output is already
+  // non-contiguous), the epilogue has fused the stride relayout into the NEFF —
+  // skip the fixup to avoid a redundant neuron-to-neuron copy.
+  // When the output is contiguous (target_strides was None), we still need the
+  // fixup to match the query's non-contiguous layout.
   if (!final_outputs.empty() && final_outputs[0].defined()) {
-    const auto& query = result.original_args[0].toTensor();
-    const auto& value = result.original_args[2].toTensor();
-    std::vector<int64_t> res_shape = {query.size(0), query.size(1), query.size(2), value.size(3)};
-    at::Tensor fixed;
-    at::native::alloc_with_matching_layout(query, fixed, res_shape);
-    if (fixed.strides().vec() != final_outputs[0].strides().vec()) {
-      fixed.copy_(final_outputs[0]);
-      final_outputs[0] = fixed;
+    bool epilogue_handled_strides =
+        torch_neuronx::IsEpilogueEnabled() && !final_outputs[0].is_contiguous();
+    if (!epilogue_handled_strides) {
+      const auto& query = result.original_args[0].toTensor();
+      const auto& value = result.original_args[2].toTensor();
+      std::vector<int64_t> res_shape = {query.size(0), query.size(1), query.size(2), value.size(3)};
+      at::Tensor fixed;
+      at::native::alloc_with_matching_layout(query, fixed, res_shape);
+      if (fixed.strides().vec() != final_outputs[0].strides().vec()) {
+        fixed.copy_(final_outputs[0]);
+        final_outputs[0] = fixed;
+      }
     }
   }
 
@@ -1399,22 +1434,30 @@ void NeuronDispatcher::DispatchSdpaBwdImpl(const c10::OperatorHandle& op,
 
   auto& final_outputs = result.final_outputs;
 
-  // Fix grad strides to match input strides
-  auto fixGradStrides = [](torch::Tensor& grad, const at::Tensor& ref) {
-    if (grad.defined() && grad.strides().vec() != ref.strides().vec()) {
-      auto fixed = torch::empty_strided(grad.sizes(), ref.strides(), grad.options());
-      fixed.copy_(grad);
-      grad = fixed;
-    }
-  };
-  // grad_query matches query (arg 1), grad_key matches key (arg 2), grad_value matches value (arg
-  // 3)
-  if (final_outputs.size() > 0)
-    fixGradStrides(final_outputs[0], result.original_args[1].toTensor());
-  if (final_outputs.size() > 1)
-    fixGradStrides(final_outputs[1], result.original_args[2].toTensor());
-  if (final_outputs.size() > 2)
-    fixGradStrides(final_outputs[2], result.original_args[3].toTensor());
+  // Fix grad strides to match input strides (ATen contract).
+  // When epilogue is enabled AND target_strides was applied (grad is already
+  // non-contiguous), the epilogue has fused the stride relayout — skip fixup.
+  // When grad is contiguous (target_strides was None), still need fixup.
+  {
+    auto fixGradStrides = [](torch::Tensor& grad, const at::Tensor& ref) {
+      if (!grad.defined()) return;
+      // Skip if epilogue already produced the correct non-contiguous layout
+      if (torch_neuronx::IsEpilogueEnabled() && !grad.is_contiguous()) return;
+      if (grad.strides().vec() != ref.strides().vec()) {
+        auto fixed = torch::empty_strided(grad.sizes(), ref.strides(), grad.options());
+        fixed.copy_(grad);
+        grad = fixed;
+      }
+    };
+    // grad_query matches query (arg 1), grad_key matches key (arg 2), grad_value matches value
+    // (arg 3)
+    if (final_outputs.size() > 0)
+      fixGradStrides(final_outputs[0], result.original_args[1].toTensor());
+    if (final_outputs.size() > 1)
+      fixGradStrides(final_outputs[1], result.original_args[2].toTensor());
+    if (final_outputs.size() > 2)
+      fixGradStrides(final_outputs[2], result.original_args[3].toTensor());
+  }
 
   // If attn_bias was None, set grad_attn_bias to None
   if (final_outputs.size() > 3) {
@@ -1508,17 +1551,6 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
                                " num_filtered_inputs=", filtered_inputs.size());
 
   LogTensors("[DispatchCore] filtered_inputs", filtered_inputs);
-
-  // Non-contiguous inplace tensors: AllocateExecutionOutputs will skip the
-  // alias (is_contiguous check) and allocate a contiguous temp instead.
-  // CopyBackToOriginal scatters the result back via .copy_().
-  if (entry->is_inplace && !args.empty() && args[0].isTensor()) {
-    auto first_tensor = args[0].toTensor();
-    if (first_tensor.defined() && !first_tensor.is_contiguous()) {
-      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] non-contiguous inplace tensor detected",
-                                   " op=", op_name, " — will allocate contiguous temp");
-    }
-  }
 
   auto exec_outputs = AllocateExecutionOutputs(*entry, args, filtered_inputs, device, schema);
 
@@ -1735,10 +1767,42 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
 
     return entry;
   } catch (const py::error_already_set& e) {
+    // IndexError/ValueError/TypeError are user/input contract errors and
+    // must surface to match Pytorch behavior.
+    if (e.matches(PyExc_IndexError) || e.matches(PyExc_ValueError) || e.matches(PyExc_TypeError) ||
+        kFallbackOnlyForUnimplemented) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] propagating Python exception",
+                                   " cache_key=", cache_key, " error=", e.what());
+      throw;
+    }
     TORCH_NEURONX_WARN("[GetOrLowerOperation] Python lower_func failed: ", e.what(),
-                       " cache_key=", cache_key);
-    throw;
+                       " cache_key=", cache_key, " — falling back to CPU");
+    return nullptr;
   }
+}
+
+std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerCollectiveOperation(
+    const std::string& cache_key, py::object& lower_callback, c10d::OpType op_type,
+    const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& outputs,
+    const std::vector<std::vector<int>>& replica_groups, int reduce_op, bool slice_output) {
+  if (auto entry = CacheLookup(cache_key)) return entry;
+
+  py::gil_scoped_acquire gil;
+
+  TORCH_CHECK(lower_callback, "Collective lowering callback not set");
+
+  py::dict kwargs;
+  if (!outputs.empty()) {
+    py::tuple out_tuple(outputs.size());
+    for (size_t i = 0; i < outputs.size(); ++i) out_tuple[i] = outputs[i];
+    kwargs["out"] = out_tuple;
+  }
+  if (slice_output) kwargs["slice_output"] = py::bool_(true);
+
+  auto result = lower_callback(op_type, inputs, replica_groups, reduce_op, kwargs);
+  auto entry = ParseLoweringResult(result);
+  CacheInsert(cache_key, entry);
+  return entry;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2159,7 +2223,7 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
 
 void NeuronDispatcher::EnqueueXlaOperation(
     const std::string& op_name, const std::vector<torch::Tensor>& inputs,
-    const std::vector<torch::Tensor>& outputs, const std::vector<uint8_t>& stablehlo_bytes,
+    std::vector<torch::Tensor>& outputs, const std::vector<uint8_t>& stablehlo_bytes,
     const std::string& neff_cache_key, bool has_collectives, int device_id,
     at::neuron::CPUFallbackContext fallback_ctx, const std::string& hierarchy_string) {
   TORCH_NEURONX_DISPATCH_DEBUG("[EnqueueXlaOperation] op=", op_name, " inputs=", inputs.size(),
@@ -2169,11 +2233,35 @@ void NeuronDispatcher::EnqueueXlaOperation(
   auto transform_result =
       torch_neuronx::ProcessInputTransformations(op_name, inputs, has_collectives);
 
+  // ── Output transformations (epilogue) ──
+  // Detects non-contiguous outputs and either:
+  //   - Fuses a transpose/scatter into the NEFF (epilogue supported)
+  //   - Falls back to a contiguous temp (epilogue unsupported)
+  auto output_transform_result =
+      torch_neuronx::ProcessOutputTransformations(op_name, outputs, has_collectives);
+
+  // Update caller's outputs for the epilogue-UNSUPPORTED fallback case only.
+  // When epilogue is supported (kernel_transforms[i] non-empty): the NEFF writes into the
+  //   base storage via fused epilogue, and the caller's non-contiguous tensor shares that
+  //   storage — no update needed (CopyBackToOriginal will be a no-op via data_ptr match).
+  // When epilogue is unsupported (kernel_transforms[i] empty but output was non-contiguous):
+  //   ProcessOutputTransformations allocated a contiguous temp — update outputs[i] so
+  //   CopyBackToOriginal can scatter the computed data back to the original non-contiguous tensor.
+  for (size_t i = 0; i < outputs.size() && i < output_transform_result.final_outputs.size(); ++i) {
+    bool epilogue_handled = (i < output_transform_result.kernel_transforms.size() &&
+                             !output_transform_result.kernel_transforms[i].empty());
+    if (!epilogue_handled &&
+        output_transform_result.final_outputs[i].data_ptr() != outputs[i].data_ptr()) {
+      outputs[i] = output_transform_result.final_outputs[i];
+    }
+  }
+
   auto stream = at::neuron::getCurrentNeuronStream();
 
   auto [input_refs, input_contexts] =
       torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
-  auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(outputs);
+  auto [output_refs, output_contexts] =
+      torch_neuronx::PrepareKernelTensors(output_transform_result.final_outputs);
 
   auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
       op_name, std::move(input_refs), std::move(output_refs), input_contexts, output_contexts,
@@ -2181,6 +2269,11 @@ void NeuronDispatcher::EnqueueXlaOperation(
 
   if (transform_result.has_input_transforms) {
     xla_kernel->SetInputTransformations(std::move(transform_result.kernel_transforms));
+  }
+
+  // Output transformations (epilogue): attach to kernel for MLIR merge at runtime.
+  if (output_transform_result.has_output_transforms) {
+    xla_kernel->SetOutputTransformations(std::move(output_transform_result.kernel_transforms));
   }
 
   at::neuron::CPUFallbackContext fb_ctx = std::move(fallback_ctx);

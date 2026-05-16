@@ -204,3 +204,133 @@ def torch_native_group_norm_backward(
     return torch.ops.aten.native_group_norm_backward(
         grad_out, input, mean, rstd, weight, n, c, h_x_w, group, output_mask
     )
+
+
+@register_aten(
+    ["aten::_native_batch_norm_legit_functional"],
+    static_argnums=(5, 6, 7),
+    output_params=("out0", "out1", "out2", "out3", "out4"),
+)
+def torch_native_batch_norm_legit_functional(
+    input,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    training,
+    momentum,
+    eps,
+    out0=None,
+    out1=None,
+    out2=None,
+    out3=None,
+    out4=None,
+):
+    return torch.ops.aten._native_batch_norm_legit_functional(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+
+
+@register_aten(
+    ["aten::_native_batch_norm_legit", "aten::_native_batch_norm_legit.out"],
+    static_argnums=(5, 6, 7),
+    output_params=("out", "save_mean", "save_invstd"),
+)
+def torch_native_batch_norm_legit(
+    input,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    training,
+    momentum,
+    eps,
+    out=None,
+    save_mean=None,
+    save_invstd=None,
+):
+    return torch.ops.aten._native_batch_norm_legit(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+
+
+@register_aten(
+    [
+        "aten::_native_batch_norm_legit_no_training",
+        "aten::_native_batch_norm_legit_no_training.out",
+    ],
+    static_argnums=(5, 6),
+    output_params=("out0", "out1", "out2"),
+)
+def torch_native_batch_norm_legit_no_training(
+    input,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    momentum,
+    eps,
+    out0=None,
+    out1=None,
+    out2=None,
+):
+    return torch.ops.aten._native_batch_norm_legit_no_training(
+        input, weight, bias, running_mean, running_var, momentum, eps
+    )
+
+
+@register_aten(
+    ["aten::native_batch_norm", "aten::native_batch_norm.out"],
+    static_argnums=(5, 6, 7),
+    output_params=("out", "save_mean", "save_invstd"),
+)
+def torch_native_batch_norm(
+    input,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    training,
+    momentum,
+    eps,
+    out=None,
+    save_mean=None,
+    save_invstd=None,
+):
+    return torch.ops.aten.native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+
+
+@register_aten(
+    ["aten::native_batch_norm_backward", "aten::native_batch_norm_backward.out"],
+    static_argnums=(7, 8, 9),
+    output_params=("out0", "out1", "out2"),
+)
+def torch_native_batch_norm_backward(
+    grad_out,
+    input,
+    weight,
+    running_mean,
+    running_var,
+    save_mean,
+    save_invstd,
+    training,
+    eps,
+    output_mask,
+    out0=None,
+    out1=None,
+    out2=None,
+):
+    return torch.ops.aten.native_batch_norm_backward(
+        grad_out,
+        input,
+        weight,
+        running_mean,
+        running_var,
+        save_mean,
+        save_invstd,
+        training,
+        eps,
+        output_mask,
+    )

@@ -1,4 +1,4 @@
-from block_def.rope import RoPEBlock, RoPEBlockHF
+from block_def.rope import RoPEBlock, RoPEBlockComplex, RoPEBlockHF
 
 
 def create_rope_block(config, device, dtype=None):
@@ -8,6 +8,8 @@ def create_rope_block(config, device, dtype=None):
         block = RoPEBlock(config["head_dim"], config["max_seq_len"], config["rope_theta"])
     elif implementation == "hf":
         block = RoPEBlockHF(config["head_dim"], config["max_seq_len"], config["rope_theta"])
+    elif implementation == "complex":
+        block = RoPEBlockComplex(config["head_dim"], config["max_seq_len"], config["rope_theta"])
     else:
         raise ValueError(f"Unknown implementation: {implementation}")
 
@@ -36,6 +38,8 @@ def get_presets():
         "rope-gqa-8-2-torchtitan",
         "rope-gqa-32-8-hf",
         "rope-gqa-8-2-hf",
+        "rope-gqa-32-8-complex",
+        "rope-gqa-8-2-complex",
     ]
 
 
@@ -47,6 +51,9 @@ def create_config(preset_name, batch_size, seq_len):
     elif preset_name.endswith("-hf"):
         implementation = "hf"
         base_preset = preset_name.replace("-hf", "")
+    elif preset_name.endswith("-complex"):
+        implementation = "complex"
+        base_preset = preset_name.replace("-complex", "")
     else:
         # Default to torchtitan for backward compatibility
         implementation = "torchtitan"

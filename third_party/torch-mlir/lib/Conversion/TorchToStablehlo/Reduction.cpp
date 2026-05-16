@@ -522,6 +522,14 @@ public:
           "Only floating-point or integer datatype legalization supported");
     }
 
+    // Rank-0 reduce with indices is a no-op: the value is the scalar itself
+    // and the index is 0.
+    if (inputTy.getRank() == 0) {
+      Value idx = hlo::getConstTensor<int64_t>(rewriter, op, {0}, {}).value();
+      rewriter.replaceOp(op, {input, idx});
+      return success();
+    }
+
     RankedTensorType valResultType = cast<RankedTensorType>(
         ConvertAtenReductionOp<AtenOpT>::getTypeConverter()->convertType(
             op.getResult(0).getType()));

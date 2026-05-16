@@ -17,7 +17,14 @@ from collections.abc import Callable, Iterable
 import torch
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput, _dispatch_dtypes
 
-from .neuron_shape_registry import SHAPE_REGISTRY
+# Default length for ``Tensor[]`` / ``List[Tensor]`` args when the registry
+# entry provides a single shape tuple rather than an explicit list-of-specs.
+# Defined BEFORE the shape-registry import so neuron_shape_defaults_generated
+# (imported transitively from neuron_shape_registry at module load) can
+# reference it without a circular import.
+TENSOR_LIST_DEFAULT_COUNT = 15
+
+from .neuron_shape_registry import SHAPE_REGISTRY, max_tensor_elems  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +37,19 @@ def _noop(*_args, **_kwargs):
 
 _DTYPE_MAP = {
     "long": torch.long,
+    "int64": torch.long,
     "int": torch.int32,
+    "int32": torch.int32,
+    "int16": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
     "bool": torch.bool,
     "double": torch.float64,
+    "float64": torch.float64,
     "float": None,  # sentinel: use caller's default dtype
+    "float32": None,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
 }
 
 
@@ -56,33 +72,66 @@ def _is_out_variant(schema) -> bool:
 
 
 def _tensor_from_spec(spec, device, default_dtype):
-    """Build a tensor from a shape tuple/list or a dict {shape, dtype, low, high, sigmoid}."""
+    """Build a tensor from a shape tuple/list or a dict spec.
+
+    Supported dict keys:
+      shape (required), dtype, low, high, sigmoid, names.
+
+    When ``names`` is provided (tuple of strings matching ``len(shape)``),
+    the tensor is tagged with those names via ``refine_names`` so it can be
+    passed to ``.dimname`` / ``.names_out`` schema variants that require
+    named-tensor inputs.
+    """
     if isinstance(spec, dict):
         shape = tuple(spec["shape"])
         dt = _DTYPE_MAP.get(spec.get("dtype", "float"))
         dt = dt if dt is not None else default_dtype
         if dt in (torch.long, torch.int32):
-            return torch.randint(
+            t = torch.randint(
                 spec.get("low", 0), spec.get("high", 4), shape, device=device, dtype=dt
             )
-        if dt is torch.bool:
-            return torch.randint(0, 2, shape, device=device, dtype=torch.bool)
-        t = torch.randn(shape, device=device, dtype=dt)
-        return t.sigmoid() if spec.get("sigmoid") else t
+        elif dt is torch.bool:
+            t = torch.randint(0, 2, shape, device=device, dtype=torch.bool)
+        else:
+            t = torch.randn(shape, device=device, dtype=dt)
+            if spec.get("sigmoid"):
+                t = t.sigmoid()
+        names = spec.get("names")
+        if names:
+            t = t.refine_names(*names)
+        return t
     return torch.randn(tuple(spec), device=device, dtype=default_dtype)
 
 
-def _tensor_list_from_spec(raw, device, default_dtype, count_default=2):
-    """Build a list of tensors from a shape, a list of shape-dicts, or a passthrough."""
+# Default length for `Tensor[]` / `List[Tensor]` args when the registry entry
+# provides a single shape tuple rather than an explicit list-of-specs. Foreach
+# ops and any co-varying list-typed args (e.g. ``scalars``) in the same entry
+# must have a matching element count — see neuron_shape_defaults_generated.py.
+
+
+def _tensor_list_from_spec(raw, device, default_dtype, count_default=TENSOR_LIST_DEFAULT_COUNT):
+    """Build a list of tensors from a shape, a list of shape-dicts, a list of
+    shape-tuples, or a passthrough."""
     if isinstance(raw, tuple | list) and raw and isinstance(raw[0], int):
+        # Single shape tuple → count_default identical tensors
         return [torch.randn(*raw, device=device, dtype=default_dtype) for _ in range(count_default)]
-    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+    if isinstance(raw, list | tuple) and raw and isinstance(raw[0], dict):
+        # List of shape-dicts → one tensor per dict
         return [_tensor_from_spec(d, device, default_dtype) for d in raw]
+    if isinstance(raw, list | tuple) and raw and isinstance(raw[0], tuple | list):
+        # List of shape tuples → one tensor per shape. Each element must be
+        # a tuple/list of ints (explicit shapes).
+        return [torch.randn(tuple(s), device=device, dtype=default_dtype) for s in raw]
     return raw
 
 
 def _build_value(type_str, raw, device, dtype):
-    if "Tensor[]" in type_str or "List[Tensor]" in type_str:
+    if (
+        "Tensor[]" in type_str
+        or "Tensor?[]" in type_str
+        or "List[Tensor]" in type_str
+        or "List[Optional[Tensor]]" in type_str
+    ):
         return _tensor_list_from_spec(raw, device, dtype)
     if "Tensor" in type_str:
         if raw is None:
@@ -94,6 +143,11 @@ def _build_value(type_str, raw, device, dtype):
         return raw
     if isinstance(raw, tuple):
         return list(raw)
+    # Convert dtype strings (e.g., "bfloat16") to torch.dtype objects
+    if isinstance(raw, str):
+        attr = getattr(torch, raw, None)
+        if isinstance(attr, torch.dtype):
+            return attr
     return raw
 
 
@@ -121,6 +175,18 @@ def _schema_make_sample(op, arg_shapes, device, dtype):
         if arg.name in arg_shapes:
             val = _build_value(type_str, arg_shapes[arg.name], device, dtype)
         elif arg.kwarg_only:
+            # Kwarg-only args not in the entry. If the schema has a default,
+            # skip and PyTorch uses it. Otherwise, if the type is Optional or
+            # has "?" (e.g. Generator?, str[]?) AND is not a write-alias, pass
+            # None explicitly — some ops (aten::rand.generator_out,
+            # aten::normal.out, etc.) require the kwarg even though it's
+            # Optional. Write-alias kwargs are filled later by _with_out_kwargs.
+            if arg.has_default_value():
+                continue
+            if ("?" in type_str or "Optional" in type_str) and not getattr(
+                getattr(arg, "alias_info", None), "is_write", False
+            ):
+                kwargs[arg.name] = None
             continue
         else:
             try:
@@ -138,11 +204,42 @@ def _schema_make_sample(op, arg_shapes, device, dtype):
 
 
 def _probe_out_shape_dtype(op, sample) -> tuple[torch.Size, torch.dtype] | None:
-    """Call functional overload once to learn expected out shape+dtype. None on failure."""
+    """Infer expected out-variant shape+dtype via FakeTensorMode.
+
+    Runs the op's functional overload inside FakeTensorMode so no real kernel
+    executes and no tensor storage is allocated. This prevents sample building
+    from triggering Neuron compilation as a side effect (e.g., when a
+    composite op decomposes onto device-sensitive primitives).
+
+    Returns ``None`` if FakeTensorMode can't dispatch the op (no meta kernel,
+    dynamic-shape output, etc.) — callers should then skip ``out=`` injection.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     try:
-        # Drop any out= kwargs that may have been pre-populated
         kw = {k: v for k, v in sample.kwargs.items() if k != "out"}
-        out = op(sample.input, *sample.args, **kw)
+        schema = getattr(op, "_schema", None)
+        probe_op = op
+        if schema and schema.overload_name and "out" in schema.overload_name:
+            # Use the functional variant so probe result matches what .out
+            # would write into its pre-allocated out= kwarg. Strip the _out
+            # suffix (m_out → m, Scalar_out → Scalar, start_step_out →
+            # start_step); fall back to .default for plain .out and for
+            # unusual cases like .all_out where stripped name isn't an
+            # overload on this packet.
+            base_name = schema.name.split("::")[-1]
+            pkt = getattr(torch.ops.aten, base_name, None)
+            if pkt is not None:
+                overload = schema.overload_name
+                if overload == "out":
+                    candidate = "default"
+                elif overload.endswith("_out"):
+                    candidate = overload[:-4]
+                else:
+                    candidate = overload
+                probe_op = getattr(pkt, candidate, None) or getattr(pkt, "default", None) or pkt
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = probe_op(sample.input, *sample.args, **kw)
         if isinstance(out, torch.Tensor):
             return out.shape, out.dtype
         if isinstance(out, tuple | list) and out and isinstance(out[0], torch.Tensor):
@@ -196,12 +293,32 @@ class NeuronOpInfo(OpInfo):
         return _schema_make_sample(self._resolved_op, arg_shapes, device, dtype)
 
     def _registry_entries(self) -> list:
-        """Registry entries for this op; falls back to base name for `.default`."""
+        """Registry entries for this op. Propagation at registry-load time
+        (see NeuronShapeRegistry.propagate_to_compatible_overloads) already
+        covered schema-compatible ``.out`` / ``.default`` overloads, so no
+        name-based runtime fallbacks are needed here.
+
+        Caps the vended list to the top-N entries by max tensor element
+        count, where N comes from the ``NEURON_MAX_SHAPES_PER_OP`` env var
+        (default ``10``). Set by conftest from the ``--max-shapes-per-op``
+        CLI option. Model-traced registries generated from compile-cache
+        keys can carry 500-1000 entries per op with tensors up to multiple
+        GB, which turns a single op's coverage run into a multi-hour
+        cold-compile sweep and can OOM HBM on the largest shapes. Keeping
+        the top-N by size preserves the strongest roofline signal per
+        compile. A non-positive value disables the cap.
+        """
         entries = SHAPE_REGISTRY.get(self.op_name)
-        if not entries and self.op_name.endswith(".default"):
-            entries = SHAPE_REGISTRY.get(self.op_name.rsplit(".", 1)[0])
         if entries and os.environ.get("NEURON_MODEL_SHAPES_ONLY"):
             entries = [e for e in entries if any(s != "builtin" for s in e.sources)]
+
+        max_per_op = int(os.environ.get("NEURON_MAX_SHAPES_PER_OP", "10"))
+        if max_per_op > 0 and len(entries) > max_per_op:
+            entries = sorted(
+                entries,
+                key=lambda e: max_tensor_elems(e.arg_shapes, self.op_name),
+                reverse=True,
+            )[:max_per_op]
         return entries
 
     def _registry_samples(self, device, dtype) -> Iterable[SampleInput]:
@@ -212,7 +329,7 @@ class NeuronOpInfo(OpInfo):
                 logger.debug("%s: sample build failed: %s", self.op_name, e)
                 continue
             if sample is not None:
-                yield sample
+                yield self._with_out_kwargs(sample)
 
     def _opdb_samples(self, op_info, device, dtype, requires_grad, **kwargs):
         if self._pytorch_sample_inputs_func is None or not self.op_resolved:
@@ -222,10 +339,22 @@ class NeuronOpInfo(OpInfo):
         is_base = not overload or overload == "default"
         if not (is_base or (schema is not None and _is_out_variant(schema))):
             return
+        # Schema arg names the target op will accept — used to filter kwargs
+        # coming from the functional variant's opdb sample_inputs_func. Factory
+        # `.out` overloads (aten::arange.out, aten::full.out, aten::randn.out,
+        # ...) don't accept dtype/layout/device/pin_memory/memory_format/names
+        # kwargs that opdb includes for the functional variant. Dropping those
+        # prevents spurious "expected at most N args but received M" errors
+        # that were surfacing as false-positive `status=supported` rows.
+        schema_arg_names = {a.name for a in schema.arguments} if schema is not None else None
         try:
             for sample in self._pytorch_sample_inputs_func(
                 op_info, device, dtype, requires_grad, **kwargs
             ):
+                if schema_arg_names is not None and sample.kwargs:
+                    filtered = {k: v for k, v in sample.kwargs.items() if k in schema_arg_names}
+                    if len(filtered) != len(sample.kwargs):
+                        sample = SampleInput(sample.input, args=sample.args, kwargs=filtered)
                 yield self._with_out_kwargs(sample)
         except Exception as e:
             logger.debug("%s: opdb fallback failed: %s", self.op_name, e)
@@ -272,7 +401,9 @@ class NeuronOpInfo(OpInfo):
 
         arg = write_args[0]
         type_str = str(arg.type)
-        if "Tensor[]" in type_str:
+        # Match both C++ schema style ("Tensor[]") and Python-style
+        # ("List[Tensor]") — torch returns the latter for _foreach_*_out.
+        if "Tensor[]" in type_str or "List[Tensor]" in type_str:
             # list length inferred from first tensor-list input, else 2
             n_list = 2
             for a in (sample.input, *sample.args):

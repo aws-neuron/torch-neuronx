@@ -297,3 +297,31 @@ class TestAddCompositeOp:
         assert torch.equal(out1, out2)
         # reset environment variables
         os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
+
+    def test_addcmul_bool_raises(self):
+        """addcmul on bool tensors should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.bool)
+        with pytest.raises(RuntimeError):
+            torch.addcmul(t, t, t, value=1)
+
+    def test_addcmul_inplace_bool_raises(self):
+        """Tensor.addcmul_ on bool should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.bool)
+        with pytest.raises(RuntimeError):
+            t.addcmul_(t, t, value=1)
+
+    def test_addcdiv_int_raises(self):
+        """addcdiv on integer tensors should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.int32)
+        with pytest.raises(RuntimeError):
+            torch.addcdiv(t, t, t, value=1)
+
+    def test_addcdiv_inplace_int_raises(self):
+        """Tensor.addcdiv_ on int should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.int32)
+        with pytest.raises(RuntimeError):
+            t.addcdiv_(t, t, value=1)

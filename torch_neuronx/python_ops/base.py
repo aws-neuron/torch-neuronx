@@ -66,42 +66,41 @@ class OperationImplementation(ABC):
         for the operation. Override this method when multiple implementations
         exist and need to filter based on input arguments.
 
-        Returns False for complex dtypes (not supported yet by neuron backend).
+        Complex dtypes are allowed through here; the allowlist in
+        composite_lower (auto_registration.py) controls which complex
+        ops actually run on Neuron vs fall back to CPU.
 
         Raises:
             RuntimeError: If non-scalar tensors are on wrong device
         """
         for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
-                # Complex dtype not supported yet
-                if arg.dtype.is_complex:
-                    return False
                 if arg.ndim != 0 and arg.device.type != "neuron":
                     raise RuntimeError(
                         f"Non-scalar tensor arg{i} is on {arg.device.type} device, expected neuron"
                     )
             elif isinstance(arg, list | tuple):
                 for j, value in enumerate(arg):
-                    if isinstance(value, torch.Tensor):
-                        # Complex dtype not supported yet
-                        if value.dtype.is_complex:
-                            return False
-                        if value.ndim != 0 and value.device.type != "neuron":
-                            raise RuntimeError(
-                                f"Non-scalar tensor arg{i}[{j}] is on {value.device.type} "
-                                "device, expected neuron"
-                            )
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.ndim != 0
+                        and value.device.type != "neuron"
+                    ):
+                        raise RuntimeError(
+                            f"Non-scalar tensor arg{i}[{j}] is on {value.device.type} "
+                            "device, expected neuron"
+                        )
 
         for key, kwarg in kwargs.items():
-            if isinstance(kwarg, torch.Tensor):
-                # Complex dtype not supported yet
-                if kwarg.dtype.is_complex:
-                    return False
-                if kwarg.ndim != 0 and kwarg.device.type != "neuron":
-                    raise RuntimeError(
-                        f"Non-scalar tensor kwarg '{key}' is on {kwarg.device.type}"
-                        "device, expected neuron"
-                    )
+            if (
+                isinstance(kwarg, torch.Tensor)
+                and kwarg.ndim != 0
+                and kwarg.device.type != "neuron"
+            ):
+                raise RuntimeError(
+                    f"Non-scalar tensor kwarg '{key}' is on {kwarg.device.type}"
+                    "device, expected neuron"
+                )
 
         return True
 

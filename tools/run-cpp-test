@@ -135,8 +135,11 @@ if [ -z "$TEST_TARGET" ]; then
     TEST_TARGET="//:cpp_unit_tests"
 fi
 
-# Set Python version (default from .python-version)
-PYTHON_VERSION="${PYTHON_VERSION:-$(cat .python-version)}"
+# Set Python version. Prefer the active interpreter (so the hermetic
+# toolchain matches libpython linked into embedded-Python tests on images
+# whose interpreter differs from .python-version), falling back to the
+# repo pin.
+PYTHON_VERSION="${PYTHON_VERSION:-$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || cat .python-version)}"
 
 # Resolve PYTORCH_LOCAL_PATH before generating LD_LIBRARY_PATH so nvidia/ lib
 # discovery uses the correct site-packages directory

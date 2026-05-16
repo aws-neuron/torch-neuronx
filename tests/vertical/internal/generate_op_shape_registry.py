@@ -96,7 +96,7 @@ def _parse_token(token: str) -> Any:
     # Tensor: [dims]:Type:S(...)
     parsed_tensor = _parse_tensor_token(token)
     if parsed_tensor is not None:
-        return parsed_tensor.shape
+        return {"shape": parsed_tensor.shape, "dtype": parsed_tensor.dtype}
 
     if token in ("undef", "None"):
         return None
@@ -137,10 +137,13 @@ def _parse_token(token: str) -> Any:
     if token.startswith("dtype:"):
         dtype_str = token[6:]
         return _DTYPE_MAP.get(dtype_str, dtype_str.lower())
-    # Device: dev:neuron:0 → "neuron:0"
+    # Device: dev:neuron:0 → None (device indices are runtime-specific, not shape info)
     if token.startswith("dev:"):
-        return token[4:]
-    # Scalar dynamic types
+        return None
+    # Scalar dynamic types — the exact value is data-dependent and not
+    # recoverable from the cache key. Return None so _fill_scalar_default
+    # can apply op-specific defaults (lr=0.001, eps=1e-5, etc.) or fall back
+    # to type-based defaults (Scalar→0.0) as a last resort.
     if token.startswith("scalar:"):
         return None
     # Complex, generator
@@ -169,11 +172,19 @@ def _parse_token(token: str) -> Any:
     # TensorList / GenericList: parse tensor shapes from inner content
     if token.startswith(("TL[", "GL[")):
         inner = token[3:-1]  # Strip TL[...] or GL[...] outer brackets
-        shapes = []
+        # Empty bracket (e.g. "GL[]") is a legitimate empty list — return [],
+        # not the literal string.
+        if not inner:
+            return []
+        tensors = []
         for m in _TENSOR_RE.finditer(inner):
-            raw = m.group(1).strip()
-            shapes.append([int(d) for d in raw.split(",") if d.strip().isdigit()] if raw else [])
-        return shapes if shapes else token
+            raw_dims, dtype_str = m.group(1).strip(), m.group(2)
+            shape = [int(d) for d in raw_dims.split(",") if d.strip().isdigit()] if raw_dims else []
+            dtype = _DTYPE_MAP.get(dtype_str, dtype_str.lower())
+            tensors.append({"shape": shape, "dtype": dtype})
+        # Non-empty inner with no tensor matches: fall back to the raw token
+        # so the caller can log/debug it.
+        return tensors if tensors else token
 
     logger.debug(f"Unknown cache key token: {token!r}")
     return token
@@ -191,13 +202,14 @@ def _tokenize_signature(signature: str) -> list[tuple[str | None, str]]:
     tokens: list[tuple[str | None, str]] = []
     depth = 0  # bracket + paren nesting depth
     start = 0  # start of current token
+    in_kw = False  # True when accumulating a kw:name=value token
 
     for i, ch in enumerate(signature):
         if ch in ("[", "("):
             depth += 1
         elif ch in ("]", ")"):
             depth = max(0, depth - 1)
-        elif ch == "_" and depth == 0:
+        elif ch == "_" and depth == 0 and not in_kw:
             token = signature[start:i]
             if token:
                 if token.startswith("kw:") and "=" in token:
@@ -206,6 +218,11 @@ def _tokenize_signature(signature: str) -> list[tuple[str | None, str]]:
                 else:
                     tokens.append((None, token))
             start = i + 1
+
+        # Track whether we're inside a kw: token that hasn't reached = yet
+        if depth == 0:
+            current = signature[start : i + 1]
+            in_kw = current.startswith("kw:") and "=" not in current
 
     # Last token
     token = signature[start:]
@@ -257,15 +274,88 @@ def _get_schema(op_name: str):
     return getattr(op, "_schema", None) if op else None
 
 
+# Defaults for required non-Tensor schema args that cache keys encode as
+# dynamic (null). The value is synthesized so the op can actually execute at
+# test time — real models tend to train with these canonical scalars anyway.
+# Matched first by (base_op, arg_name), then by arg_name alone, then by
+# type_str heuristic.
+_SCALAR_DEFAULT_BY_OP_ARG: dict[tuple[str, str], object] = {
+    ("aten::_fused_adam_", "lr"): 0.001,
+    ("aten::_fused_adam_", "beta1"): 0.9,
+    ("aten::_fused_adam_", "beta2"): 0.999,
+    ("aten::_fused_adam_", "weight_decay"): 0.01,
+    ("aten::_fused_adam_", "eps"): 1e-8,
+    ("aten::_fused_adam_", "amsgrad"): False,
+    ("aten::_fused_adam_", "maximize"): False,
+    ("aten::_fused_adamw_", "lr"): 0.001,
+    ("aten::_fused_adamw_", "beta1"): 0.9,
+    ("aten::_fused_adamw_", "beta2"): 0.999,
+    ("aten::_fused_adamw_", "weight_decay"): 0.01,
+    ("aten::_fused_adamw_", "eps"): 1e-8,
+    ("aten::_fused_adamw_", "amsgrad"): False,
+    ("aten::_fused_adamw_", "maximize"): False,
+    ("aten::_fused_sgd_", "lr"): 0.001,
+    ("aten::_fused_sgd_", "momentum"): 0.9,
+    ("aten::_fused_sgd_", "dampening"): 0.0,
+    ("aten::_fused_sgd_", "weight_decay"): 0.0,
+    ("aten::_fused_sgd_", "nesterov"): False,
+    ("aten::_fused_sgd_", "maximize"): False,
+    ("aten::_fused_sgd_", "is_first_step"): False,
+}
+
+# Arg-name-scoped defaults (any op). Applied after the op-specific table.
+_SCALAR_DEFAULT_BY_NAME: dict[str, object] = {
+    "eps": 1e-5,  # layer_norm / batch_norm / group_norm canonical eps
+    "momentum": 0.1,
+    "alpha": 1.0,
+    "beta": 1.0,
+    "dim": 0,
+    "keepdim": False,
+    "unbiased": True,
+    "correction": 1,
+}
+
+# Type-based fallback: coarse but safe when we can't match by name.
+_SCALAR_DEFAULT_BY_TYPE: dict[str, object] = {
+    "float": 0.0,
+    "int": 0,
+    "SymInt": 0,
+    "bool": False,
+    "number": 0.0,
+    "Scalar": 0.0,
+    "str": "",
+}
+
+
+def _fill_scalar_default(op_name: str, arg) -> object | None:
+    """Return a sensible default for a required non-Tensor arg, or None if
+    we don't know. Looked up first by (op_name, arg_name), then arg_name
+    alone, then schema type."""
+    type_str = str(arg.type)
+    hit = _SCALAR_DEFAULT_BY_OP_ARG.get((op_name, arg.name))
+    if hit is not None:
+        return hit
+    hit = _SCALAR_DEFAULT_BY_NAME.get(arg.name)
+    if hit is not None:
+        return hit
+    return _SCALAR_DEFAULT_BY_TYPE.get(type_str)
+
+
 def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
     """Map parsed cache key values to schema arg names.
 
     Walks the op schema in order, consuming positional args sequentially
     and matching kwargs by name. For missing args, uses schema defaults or None.
+
+    Cache keys encode dynamic (SymFloat/SymInt) scalars as the tokens 'float'
+    and 'int', which ``_parse_token`` translates to ``None``. For schema args
+    that require a concrete non-None value at execution time (the aten
+    dispatcher won't accept None for a ``float lr``), we fill a plausible
+    default via ``_fill_scalar_default`` as a post-processing pass.
     """
     schema = _get_schema(op_name)
     if schema is None:
-        return {f"arg{i}": v for i, v in enumerate(parsed.positional) if isinstance(v, list)}
+        return {f"arg{i}": v for i, v in enumerate(parsed.positional) if isinstance(v, list | dict)}
 
     arg_shapes: dict[str, Any] = {}
     pos_idx = 0
@@ -289,6 +379,8 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
         if pos_idx < len(parsed.positional):
             arg_shapes[name] = parsed.positional[pos_idx]
             pos_idx += 1
+        elif name in parsed.kwargs:
+            arg_shapes[name] = parsed.kwargs[name]
         else:
             has_default = getattr(arg, "has_default_value", lambda: False)
             if callable(has_default):
@@ -297,6 +389,40 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
                 arg_shapes[name] = arg.default_value
             elif "?" in type_str or "Optional" in type_str:
                 arg_shapes[name] = None
+
+    # Convert 0-d tensor specs to None for Scalar-typed args: the cache key
+    # encodes a scalar value as a 0-d tensor []:Type:S(C), but the schema
+    # expects a number. The actual value is lost, so set to None and let
+    # _fill_scalar_default apply op-specific or type-based defaults below.
+    for arg in schema.arguments:
+        type_str = str(arg.type)
+        if "Scalar" in type_str and arg.name in arg_shapes:
+            val = arg_shapes[arg.name]
+            if isinstance(val, dict) and val.get("shape") == []:
+                arg_shapes[arg.name] = None
+
+    # Fill sensible defaults for required non-Tensor args captured as dynamic.
+    for arg in schema.arguments:
+        name = arg.name
+        type_str = str(arg.type)
+        if name not in arg_shapes or arg_shapes[name] is not None:
+            continue
+        # Only fill non-Tensor required args; Optional[Tensor]=None is legitimate,
+        # and writable kwargs are populated by the test's _with_out_kwargs.
+        if "Tensor" in type_str:
+            continue
+        if "?" in type_str or "Optional" in type_str:
+            continue
+        default = _fill_scalar_default(op_name, arg)
+        if default is not None:
+            arg_shapes[name] = default
+            logger.debug(
+                "%s: filled %s=%r (was null; schema type=%s)",
+                op_name,
+                name,
+                default,
+                type_str,
+            )
 
     for arg in schema.arguments:
         if arg.name not in arg_shapes:

@@ -12,9 +12,6 @@ from .assertion_misc.false_not_true import (
 )
 from .assertion_misc.tensor_false import ASSERTION_MISC_TENSOR_FALSE as ASSERTION_MISC_TENSOR_FALSE
 from .compiler_error.neuron import COMPILER_ERROR_NEURON as COMPILER_ERROR_NEURON
-from .compiler_error.prologue_merge import (
-    COMPILER_ERROR_PROLOGUE_MERGE as COMPILER_ERROR_PROLOGUE_MERGE,
-)
 from .compiler_error.torch_mlir import COMPILER_ERROR_TORCH_MLIR as COMPILER_ERROR_TORCH_MLIR
 from .device_mismatch import DEVICE_MISMATCH_CPU_VS_NEURON as DEVICE_MISMATCH_CPU_VS_NEURON
 from .dtensor.backend_type_missing import (
@@ -32,9 +29,6 @@ from .dynamo_xfails import (
 )
 from .dynamo_xfails import (
     DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS as DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
-)
-from .dynamo_xfails import (
-    DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE as DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE,
 )
 from .dynamo_xfails import (
     DYNAMO_DEVICE_MISMATCH_MIXED as DYNAMO_DEVICE_MISMATCH_MIXED,
@@ -59,6 +53,9 @@ from .dynamo_xfails import (
 )
 from .dynamo_xfails import (
     DYNAMO_GRADIENT_NEURON_TO_CPU as DYNAMO_GRADIENT_NEURON_TO_CPU,
+)
+from .dynamo_xfails import (
+    DYNAMO_INPLACE_METADATA_PROPAGATION as DYNAMO_INPLACE_METADATA_PROPAGATION,
 )
 from .dynamo_xfails import (
     DYNAMO_LOWERING_FAILURE_ATEN_ADD as DYNAMO_LOWERING_FAILURE_ATEN_ADD,
@@ -132,7 +129,6 @@ from .unknown import UNKNOWN as UNKNOWN
 from .unsupported_op.cpu_fallback_disabled import (
     UNSUPPORTED_OP_CPU_FALLBACK_DISABLED as UNSUPPORTED_OP_CPU_FALLBACK_DISABLED,
 )
-from .unsupported_op.fused_rnn import UNSUPPORTED_OP_FUSED_RNN as UNSUPPORTED_OP_FUSED_RNN
 from .unsupported_op.not_implemented import (
     UNSUPPORTED_OP_NOT_IMPLEMENTED as UNSUPPORTED_OP_NOT_IMPLEMENTED,
 )

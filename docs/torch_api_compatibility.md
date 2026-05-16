@@ -357,7 +357,7 @@
 |350|torch.renorm|CPU_FALLBACK|aten::renorm not registered|
 |351|torch.repeat_interleave|Y|Native MLIR impl with preprocessing|
 |352|torch.roll|CPU_FALLBACK|aten::roll not registered|
-|353|torch.searchsorted|CPU_FALLBACK|aten::searchsorted not registered|
+|353|torch.searchsorted|Y|Decomposed into comparison + sum|
 |354|torch.tensordot|CPU_FALLBACK|aten::tensordot not registered|
 |355|torch.trace|CPU_FALLBACK|aten::trace not registered|
 |356|torch.tril|Y|Native MLIR impl|

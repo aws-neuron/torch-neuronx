@@ -832,22 +832,25 @@ TEST_F(SessionTest, SecondSessionRejectedWhileFirstIsActive) {
   // First session starts successfully
   expectSuccessfulStart();
   expectStop();
-  expectCleanup();
 
   NeuronActivityProfilerSession session1(activityTypes, config);
   session1.start();
   EXPECT_TRUE(session1.errors().empty());
 
-  // Second session should be rejected
+  // Second session: constructor allocates config and sets baseline activity (succeeds),
+  // but start() is rejected by the cross-session guard. Config is freed in destructor.
+  expectConfigAllocation();
+  expectActivityTypeSetup();
+
+  // Both sessions free their config in destructors
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_free(_)).Times(2).WillRepeatedly(Return(NRT_SUCCESS));
+
   NeuronActivityProfilerSession session2(activityTypes, config);
   session2.start();
   EXPECT_FALSE(session2.errors().empty());
 
   // Stop first session
   session1.stop();
-
-  // After first session stops, no cleanup is needed for session2 since
-  // it never allocated an NRT config.
 }
 
 // Verify that after a session fails to start (config allocation failure),
@@ -856,7 +859,7 @@ TEST_F(SessionTest, SessionCanStartAfterPreviousFailure) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
 
-  // First session: config allocation fails
+  // First session: config allocation fails in constructor
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_allocate(_)).WillOnce(Return(NRT_FAILURE));
 
   NeuronActivityProfilerSession session1(activityTypes, config);

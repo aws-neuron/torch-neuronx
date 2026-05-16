@@ -397,4 +397,28 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_replicate.py::ReplicateTest::test_compile_cpu",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "HSDP DTensor state-dict offload-to-cpu test intermittently hangs"
+            " for 7000+ seconds (2+ hours) before being killed. The test"
+            " sometimes passes on retry in ~22s, but the hang risk is too"
+            " expensive to leave in the suite. Skip until HSDP cpu-offload"
+            " synchronization on Neuron is investigated."
+        ),
+        tests=[
+            "test_hsdp_dtensor_state_dict.py::TestHSDPWithDeviceMeshAndDTensorNEURON::test_dtensor_sharded_tensor_state_dict_identical_offload_to_cpu_True_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "FSDP autograd test_unshard_params_as_tensors intermittently"
+            " hangs and is killed by SIGTERM at the 600s subprocess timeout"
+            " (exit code -15). The test passes in some runs but the flaky"
+            " hang costs 10 minutes each time it triggers. Skip until the"
+            " unshard tensor-handle synchronization is investigated."
+        ),
+        tests=[
+            "test_fsdp_core.py::TestAutogradNEURON::test_unshard_params_as_tensors_neuron",
+        ],
+    ),
 ]

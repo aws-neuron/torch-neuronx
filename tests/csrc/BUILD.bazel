@@ -289,6 +289,8 @@ torch_neuronx_cc_test(
 torch_neuronx_cc_test(
     name = "TransformationsTest",
     srcs = ["core/lazy_materialization/TransformationsTest.cpp"],
+    # TODO(mengchiy): Remove env override once SCATTER_IOTA is default ON after compiler fix.
+    env = {"TORCH_NEURONX_ENABLE_SCATTER_IOTA": "1"},
     deps = [
         "//:lazy_materialization",
     ],
@@ -547,6 +549,12 @@ torch_neuronx_cc_test(
 torch_neuronx_cc_test(
     name = "NeuronWorkTest",
     srcs = ["core/distributed/NeuronWorkTest.cpp"],
+    deps = ["//:distributed"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronBackendTest",
+    srcs = ["core/distributed/NeuronBackendTest.cpp"],
     deps = ["//:distributed"],
 )
 

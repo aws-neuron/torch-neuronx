@@ -10,10 +10,12 @@ Deduplicates on (op_name, arg_shapes). Merges counts across models.
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from math import prod
 from pathlib import Path
 
 
@@ -146,8 +148,222 @@ class NeuronShapeRegistry:
             )[:10],
         }
 
+    def propagate_to_compatible_overloads(self, target_ops) -> int:
+        """Pre-resolve fallback lookups: for every registered op, copy its
+        entries onto every schema-compatible write-out (or ``.default``)
+        overload of the same base name found in ``target_ops`` that is not
+        already registered.
+
+        This replaces the runtime ``.out`` / ``.default`` fallbacks in
+        NeuronOpInfo with a one-time, auditable transformation of the registry.
+
+        Source attribution is preserved so ``shape_registry_model`` vs
+        ``shape_registry_default`` classification in the test continues to work.
+
+        Runs once over the registry; cost is O(|registry| x overloads_per_base)
+        schema compatibility checks (~13 ms on ~800 ops / ~1360 targets).
+        Returns the number of (src, tgt) pairs that were propagated.
+        """
+        from collections import defaultdict
+
+        def _base(op_name: str) -> str:
+            return op_name.replace("aten::", "").split(".", 1)[0]
+
+        base_to_overloads: dict[str, list[str]] = defaultdict(list)
+        for op in target_ops:
+            base_to_overloads[_base(op)].append(op)
+
+        schema_cache: dict[str, object] = {}
+
+        def _schema(name: str):
+            if name not in schema_cache:
+                schema_cache[name] = _aten_schema(name)
+            return schema_cache[name]
+
+        propagated = 0
+        for src_name in list(self.all_ops()):
+            overloads = base_to_overloads.get(_base(src_name), ())
+            if not overloads:
+                continue
+            src_entries = self.get(src_name)
+            for tgt_name in overloads:
+                if tgt_name == src_name or self.has(tgt_name):
+                    continue  # skip already-registered targets
+                tgt_schema = _schema(tgt_name)
+                if tgt_schema is None:
+                    continue
+                # Propagate to write-out variants, and also to .default siblings
+                # for parity with the pre-existing .default fallback.
+                if not _is_write_out_schema(tgt_schema) and not tgt_name.endswith(".default"):
+                    continue
+                for entry in src_entries:
+                    if not _entry_compatible_with_schema(entry.arg_shapes, tgt_schema):
+                        continue
+                    for source, count in entry.sources.items():
+                        self.register(tgt_name, entry.arg_shapes, source, count)
+                    propagated += 1
+        return propagated
+
 
 SHAPE_REGISTRY = NeuronShapeRegistry()
+
+
+@functools.cache
+def _tensor_arg_names(op_name: str) -> frozenset[str]:
+    """Names of tensor-typed args for ``op_name`` per its aten schema.
+
+    Used by ``max_tensor_elems`` to identify which keys in an ``arg_shapes``
+    entry hold tensor shapes (as opposed to parameter lists like ``padding``
+    or ``dim``). Returns an empty frozenset when the schema can't be
+    resolved; callers degrade to registration-order sort in that case.
+    Cached because ``_aten_schema`` is hit once per op across many entries.
+    """
+    schema = _aten_schema(op_name)
+    if schema is None:
+        return frozenset()
+    return frozenset(a.name for a in schema.arguments if "Tensor" in str(a.type))
+
+
+def _shape_numel(shape) -> int:
+    """Element count of an int-tuple shape; 0 for malformed or empty."""
+    if not shape or not all(isinstance(x, int) for x in shape):
+        return 0
+    return prod(shape)
+
+
+def _value_numel(val) -> int:
+    """Element count for a single arg value of any tensor-shape encoding:
+
+    - ``None``                              → 0
+    - ``{"shape": [...], "dtype": "..."}``  → numel of shape
+    - ``(1, 2048, 4096)``                   → numel of shape
+    - ``[{"shape": (4,)}, {"shape": (8,)}]`` → max over per-tensor specs
+    - ``[(4, 4), (8, 8)]``                  → max over the shape tuples
+    """
+    if val is None:
+        return 0
+    if isinstance(val, dict):
+        sh = val.get("shape")
+        return _shape_numel(sh) if isinstance(sh, list | tuple) else 0
+    if isinstance(val, list | tuple):
+        if not val:
+            return 0
+        if all(isinstance(x, int) for x in val):
+            return _shape_numel(val)
+        return max((_value_numel(t) for t in val), default=0)
+    return 0
+
+
+def max_tensor_elems(arg_shapes: dict, op_name: str) -> int:
+    """Max ``numel()`` across every tensor-typed arg value in an entry.
+
+    Uses ``op_name``'s aten schema to pick which keys are tensors (so
+    ``padding`` / ``stride`` / ``dim`` / ``split_sizes`` and the like
+    are never mistaken for shape values) and supports every tensor-shape
+    encoding accepted elsewhere in the registry: nested
+    ``{"shape","dtype"}`` dicts, bare int tuples, lists of dicts, and
+    lists of bare tuples.
+
+    Returns 0 when the schema is unresolvable or the entry carries no
+    tensor values; callers treat that as "unrankable" and keep the
+    entry in its registered order.
+    """
+    if not arg_shapes:
+        return 0
+    tensor_names = _tensor_arg_names(op_name)
+    if not tensor_names:
+        return 0
+    best = 0
+    for key, val in arg_shapes.items():
+        if key in tensor_names:
+            best = max(best, _value_numel(val))
+    return best
+
+
+def _aten_schema(op_name: str):
+    """Resolve ``aten::<base>.<overload>`` to its JIT schema, or ``None``."""
+    import torch
+
+    clean = op_name.replace("aten::", "")
+    base, _, overload = clean.partition(".")
+    pkt = getattr(torch.ops.aten, base, None)
+    if pkt is None:
+        return None
+    op = getattr(pkt, overload or "default", None) or getattr(pkt, "default", None)
+    return getattr(op, "_schema", None) if op is not None else None
+
+
+def _is_write_out_schema(schema) -> bool:
+    """True if schema has at least one kwarg-only write alias (e.g. ``out=``)."""
+    return any(
+        a.kwarg_only and getattr(getattr(a, "alias_info", None), "is_write", False)
+        for a in schema.arguments
+    )
+
+
+def _value_compatible_with_type(value, type_str: str) -> bool:
+    """Check that a registry entry value is plausibly compatible with a
+    schema arg type. Catches cross-overload mismatches during propagation,
+    e.g. propagating ``dim: 1`` (int) to a ``str`` / ``List[str]`` dim.
+    Only rejects obvious mismatches; permissive otherwise to avoid false
+    negatives on edge cases.
+    """
+    if value is None:
+        return "?" in type_str or "Optional" in type_str
+    # bool must be checked before int because bool subclasses int in Python
+    if isinstance(value, bool):
+        return "bool" in type_str
+    if isinstance(value, int | float):
+        # Numeric literal — accept numeric / Scalar / Tensor (shape-spec)
+        # plain number can't go to a string-typed arg
+        return not ("str" in type_str and "Tensor" not in type_str)
+    if isinstance(value, str):
+        return "str" in type_str
+    if isinstance(value, list | tuple):
+        if not value:
+            return True  # empty literal; hard to classify, accept
+        first = value[0]
+        if isinstance(first, bool):
+            return "bool" in type_str
+        if isinstance(first, str):
+            return "str" in type_str
+        if isinstance(first, int | float):
+            # int-list can be a tensor shape OR a List[int] — reject if the
+            # target expects List[str] / List[Dimname].
+            return not ("str" in type_str and "Tensor" not in type_str)
+        return True
+    if isinstance(value, dict):
+        return "Tensor" in type_str  # dict spec describes a Tensor
+    return True
+
+
+def _entry_compatible_with_schema(arg_shapes: dict, tgt_schema) -> bool:
+    """An entry (arg_shapes dict) is reusable for tgt_schema iff:
+    - every key in the entry is a valid schema arg name,
+    - every value's Python type is plausibly compatible with the schema
+      arg's type (catches e.g. ``dim: 1`` (int) propagating to a
+      ``dim: str`` dimname-variant), and
+    - every arg in tgt that is not covered by the entry is either
+        (a) defaulted,
+        (b) Optional/nullable, or
+        (c) a write-alias kwarg (populated later by ``_with_out_kwargs``).
+    """
+    schema_args = {a.name: a for a in tgt_schema.arguments}
+    if any(k not in schema_args for k in arg_shapes):
+        return False
+    for k, v in arg_shapes.items():
+        if not _value_compatible_with_type(v, str(schema_args[k].type)):
+            return False
+    for a in tgt_schema.arguments:
+        if a.name in arg_shapes or a.has_default_value():
+            continue
+        type_str = str(a.type)
+        if "?" in type_str or "Optional" in type_str:
+            continue
+        if a.kwarg_only and getattr(getattr(a, "alias_info", None), "is_write", False):
+            continue  # write-alias kwargs are filled by _with_out_kwargs downstream
+        return False
+    return True
 
 
 # Load all shape defaults (hand-crafted + auto-generated)
@@ -164,3 +380,10 @@ _load_defaults()
 _shape_registry_path = os.environ.get("NEURON_SHAPE_REGISTRY")
 if _shape_registry_path and os.path.exists(_shape_registry_path):
     SHAPE_REGISTRY.load_json(_shape_registry_path, source="model_trace")
+
+# Propagate base entries onto schema-compatible write-out / .default overloads
+# that don't have explicit entries. Replaces runtime .out / .default fallbacks
+# with a single deterministic registry transformation.
+from .target_ops import TARGET_ATEN_OPS as _TARGET_ATEN_OPS  # noqa: E402
+
+SHAPE_REGISTRY.propagate_to_compatible_overloads(_TARGET_ATEN_OPS)

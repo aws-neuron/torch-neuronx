@@ -72,13 +72,25 @@ def torch_floor_divide(x, y, out=None):
     return torch.floor_divide(x, y)
 
 
-@register_aten(["aten::addcmul", "aten::addcmul.out"])
+@register_aten(["aten::addcmul", "aten::addcmul.out", "aten::addcmul_"])
 def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
+    if input.dtype == torch.bool:
+        raise RuntimeError("\"addcmul\" not implemented for 'Bool'")
     torch.broadcast_tensors(input, tensor1, tensor2)
     return input + value * tensor1 * tensor2
 
 
-@register_aten(["aten::addcdiv", "aten::addcdiv.out"])
+@register_aten(["aten::addcdiv", "aten::addcdiv.out", "aten::addcdiv_"])
 def torch_addcdiv(input, tensor1, tensor2, value=1, out=None):
+    if not input.dtype.is_floating_point:
+        raise RuntimeError(
+            "Integer division with addcdiv is no longer supported, and in a future "
+            "release addcdiv will perform a true division of tensor1 and tensor2. "
+            "The historic addcdiv behavior can be implemented as "
+            "(input + value * torch.trunc(tensor1 / tensor2)).to(input.dtype) for "
+            "integer inputs and as (input + value * tensor1 / tensor2) for float inputs. "
+            "The future addcdiv behavior is just the latter implementation: "
+            "(input + value * tensor1 / tensor2), for all dtypes."
+        )
     torch.broadcast_tensors(input, tensor1, tensor2)
     return input + value * tensor1 / tensor2

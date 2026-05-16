@@ -52,6 +52,7 @@
 // Metrics
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 // Include Distributed Work and Watchdog (for async collective completion tracking)
+#include "torch_neuronx/csrc/distributed/NeuronBackend.h"
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
 // Include memory snapshot
@@ -72,6 +73,7 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistration.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistry.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TypeUtils.h"
 // Internal operations
 #include "torch_neuronx/csrc/ops/InternalOps.h"
@@ -251,6 +253,54 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
           break;
         }
       }
+    }
+  }
+
+  return result;
+}
+
+// ProcessOutputTransformations — implementation of the function declared in NeuronOpsApi.h
+OutputTransformationResult ProcessOutputTransformations(const std::string& op_name,
+                                                        const std::vector<torch::Tensor>& outputs,
+                                                        bool has_collectives) {
+  OutputTransformationResult result;
+  result.final_outputs.reserve(outputs.size());
+  result.kernel_transforms.resize(outputs.size());
+
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    const auto& output = outputs[i];
+
+    // Check if output tensor is non-contiguous and epilogue is enabled
+    if (!output.is_contiguous() && IsEpilogueEnabled() && !has_collectives) {
+      TORCH_NEURONX_DEBUG("Detected non-contiguous output", "op=", op_name, "output_index=", i,
+                          "output_shape=", output.sizes(), "has_collectives=", has_collectives);
+
+      // Try to create epilogue (inverse) transformations
+      auto epilogue_result = c10_neuron::lazy::Creators::TryCreateEpilogue(output, op_name, i);
+
+      if (epilogue_result.has_value()) {
+        // SUPPORTED: record inverse transforms, use base tensor as output buffer
+        TORCH_NEURONX_DEBUG("Using epilogue transformation for output", "op=", op_name,
+                            "output_index=", i, "pattern=", epilogue_result->pattern_name,
+                            "num_transforms=", epilogue_result->transformations.size());
+
+        for (const auto& t : epilogue_result->transformations) {
+          result.kernel_transforms[i].push_back(t);
+        }
+        result.has_output_transforms = true;
+        result.final_outputs.push_back(epilogue_result->processed_input);  // base tensor
+      } else {
+        // UNSUPPORTED pattern — allocate contiguous temp for PrepareKernelTensors,
+        // CopyBackToOriginal will handle the scatter back to non-contiguous original.
+        TORCH_NEURONX_DEBUG("Epilogue unsupported for output, using contiguous temp fallback",
+                            "op=", op_name, "output_index=", i);
+        auto contiguous_temp = torch::empty(
+            output.sizes().vec(), output.options().memory_format(c10::MemoryFormat::Contiguous));
+        result.final_outputs.push_back(contiguous_temp);
+      }
+    } else {
+      // Contiguous output or epilogue disabled — pass through
+      result.final_outputs.push_back(output);
     }
   }
 
@@ -630,6 +680,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("unfold", &torch_neuronx::unfold_neuron);
   m.impl("as_strided", &torch_neuronx::as_strided_neuron);
   m.impl("_reshape_alias", &torch_neuronx::_reshape_alias_neuron);
+  m.impl("view_as_real", &torch_neuronx::view_as_real_neuron);
+  m.impl("view_as_complex", &torch_neuronx::view_as_complex_neuron);
   m.impl("select_backward", &torch_neuronx::select_backward_neuron);
   m.impl("argsort.stable", &torch_neuronx::argsort_stable_neuron);
   // Set Operations
@@ -865,6 +917,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Resize an out= tensor with PyTorch's resize-output UserWarning on shape mismatch",
       py::arg("out"), py::arg("target_shape"));
+
+  m.def("_is_epilogue_enabled", &torch_neuronx::IsEpilogueEnabled,
+        "Check if operation epilogue is enabled (TORCH_NEURONX_ENABLE_EPILOGUE=1)");
 
   m.def("version", []() { return "0.1.0"; });
   m.def(
@@ -1573,25 +1628,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Memory Statistics Bindings
   // ============================================================================
 
+  // Shared helper for converting MemoryStatInfo to Python dict
+  auto memoryStatToDict = [](const at::neuron::metrics::MemoryStatInfo& stat) {
+    py::dict d;
+    d["current"] = stat.current;
+    d["peak"] = stat.peak;
+    d["allocated"] = stat.allocated;
+    d["freed"] = stat.freed;
+    return d;
+  };
+
   m.def(
       "_get_memory_stats",
-      [](int device_index) -> py::dict {
+      [memoryStatToDict](int device_index) -> py::dict {
         auto stats =
             at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetMemoryStats(device_index);
 
-        auto statToDict = [](const at::neuron::metrics::MemoryStatInfo& stat) {
-          py::dict d;
-          d["current"] = stat.current;
-          d["peak"] = stat.peak;
-          d["allocated"] = stat.allocated;
-          d["freed"] = stat.freed;
-          return d;
-        };
-
         py::dict result;
-        result["allocated_bytes"] = statToDict(stats.allocated_bytes);
-        result["reserved_bytes"] = statToDict(stats.reserved_bytes);
-        result["active_bytes"] = statToDict(stats.active_bytes);
+        result["allocated_bytes"] = memoryStatToDict(stats.allocated_bytes);
+        result["reserved_bytes"] = memoryStatToDict(stats.reserved_bytes);
+        result["active_bytes"] = memoryStatToDict(stats.active_bytes);
         result["num_alloc_retries"] = stats.num_alloc_retries;
         result["num_ooms"] = stats.num_ooms;
         result["num_tensor_frees"] = stats.num_tensor_frees;
@@ -1614,6 +1670,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             device_index);
       },
       "Reset accumulated memory statistics", py::arg("device_index"));
+
+  m.def(
+      "_get_peak_memory_stats",
+      [memoryStatToDict](int device_index) -> py::dict {
+        auto peak =
+            at::neuron::metrics::DeviceMemoryStatsRegistry::Instance().GetPeakStats(device_index);
+
+        py::dict result;
+        result["valid"] = peak.valid;
+        result["timestamp_ns"] = peak.timestamp_ns;
+        result["allocated_bytes"] = memoryStatToDict(peak.stats.allocated_bytes);
+        result["reserved_bytes"] = memoryStatToDict(peak.stats.reserved_bytes);
+        result["active_bytes"] = memoryStatToDict(peak.stats.active_bytes);
+        result["internal_fragmentation"] =
+            peak.stats.allocated_bytes.current - peak.stats.active_bytes.current;
+        result["num_alloc_retries"] = peak.stats.num_alloc_retries;
+        result["num_ooms"] = peak.stats.num_ooms;
+        result["num_tensor_frees"] = peak.stats.num_tensor_frees;
+        result["allocation_requests"] = peak.stats.allocation_requests;
+        return result;
+      },
+      "Get peak memory stats snapshot for a device", py::arg("device_index"));
 
   // ============================================================================
   // Memory Snapshot Bindings
@@ -2006,20 +2084,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // Register cleanup function that runs during module destruction
   // This happens before Python's atexit handlers and before C++ destructors
-  static auto cleanup_streams_func = +[]() {
+  static auto module_cleanup_func = +[]() {
+    // Drain any in-flight device ops submitted
+    at::neuron::drain_visible_device_streams("module_cleanup:pre");
     try {
-      auto devices = c10_neuron::get_visible_device_indices();
-      // Synchronize all initialized devices to ensure pending operations complete
-      for (auto device : devices) {
-        at::neuron::synchronize(device);
-      }
+      torch_neuronx::dispatch::NeuronDispatcher::Instance().Cleanup();
+      torch_neuronx::ops::SetPythonContiguousOp(nullptr);
+      torch_neuronx::distributed::NeuronBackend::Cleanup();
     } catch (const std::exception& e) {
-      std::cerr << "Warning: Stream cleanup failed during module destruction: " << e.what()
+      std::cerr << "Warning: Dispatcher cleanup failed during module cleanup: " << e.what()
                 << std::endl;
     } catch (...) {
-      std::cerr << "Warning: Stream cleanup failed during module destruction: unknown error"
-                << std::endl;
+      std::cerr << "Warning: Dispatcher cleanup failed during module cleanup" << std::endl;
     }
+    // Drain any lingering shelved tensors
+    at::neuron::drain_visible_device_streams("module_cleanup:post");
   };
 
   // Profiler mapping collector functions
@@ -2073,28 +2152,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Get the instance-specific output directory path used by NRT profiling",
       py::arg("output_dir"));
 
-  // Create a capsule that will call cleanup_streams_func when the module is destroyed
-  auto cleanup_capsule = py::capsule(cleanup_streams_func);
-  m.add_object("_stream_cleanup_capsule", cleanup_capsule);
+  m.def(
+      "_nrt_inspect_precache_enable", []() { at::neuron::nrt::PrecacheEnable(); },
+      "Enable pre-caching of profile node info during wait iterations");
 
-  // NeuronDispatcher cleanup — release py::object members and torch::Library
-  // before Python interpreter finalization.
-  static auto cleanup_dispatcher_func = +[]() {
-    try {
-      torch_neuronx::dispatch::NeuronDispatcher::Instance().Cleanup();
-      // Release the Python contiguous op before interpreter finalization
-      torch_neuronx::ops::SetPythonContiguousOp(nullptr);
-    } catch (const std::exception& e) {
-      std::cerr << "Warning: NeuronDispatcher cleanup failed during module destruction: "
-                << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "Warning: NeuronDispatcher cleanup failed during module destruction: "
-                   "unknown error"
-                << std::endl;
-    }
-  };
-  auto dispatcher_cleanup_capsule = py::capsule(cleanup_dispatcher_func);
-  m.add_object("_dispatcher_cleanup_capsule", dispatcher_cleanup_capsule);
+  // Single cleanup capsule — explicit ordering, no dependency on attribute destruction order
+  auto cleanup_capsule = py::capsule(module_cleanup_func);
+  m.add_object("_module_cleanup_capsule", cleanup_capsule);
 
   // ============== Distributed Bindings ==============
   // NeuronWork class for tracking async collective operations
@@ -2221,4 +2285,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "Notify watchdog of new work")
       .def("enqueue_work", &torch_neuronx::distributed::NeuronWatchdog::enqueueWork,
            "Add work to monitoring queue", py::arg("work"));
+
+  py::class_<torch_neuronx::distributed::NeuronBackend, c10d::Backend,
+             c10::intrusive_ptr<torch_neuronx::distributed::NeuronBackend>>(m, "NeuronBackend")
+      .def(py::init([](const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
+                       int size, int global_world_size, py::object lower_callback) {
+             return c10::make_intrusive<torch_neuronx::distributed::NeuronBackend>(
+                 options, rank, size, global_world_size, std::move(lower_callback));
+           }),
+           py::arg("options"), py::arg("rank"), py::arg("size"), py::arg("global_world_size"),
+           py::arg("lower_callback"));
 }

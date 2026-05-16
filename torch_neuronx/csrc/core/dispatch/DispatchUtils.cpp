@@ -100,7 +100,7 @@ bool IsSupportedDtype(c10::ScalarType dt) {
   if (dt == c10::ScalarType::Long) return IsNativeInt64Enabled();
   return dt == c10::ScalarType::Float || dt == c10::ScalarType::Half ||
          dt == c10::ScalarType::BFloat16 || dt == c10::ScalarType::Int ||
-         dt == c10::ScalarType::Bool;
+         dt == c10::ScalarType::Bool || dt == c10::ScalarType::ComplexFloat;
 }
 
 static c10::ScalarType CastTarget(c10::ScalarType dt) {
@@ -176,6 +176,21 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
       if (changed) args[i] = c10::IValue(list);
     }
   }
+}
+
+bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
+  bool any_changed = false;
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    auto& t = tensors[i];
+    if (!t.defined()) continue;
+    auto dt = t.scalar_type();
+    if (IsSupportedDtype(dt)) continue;
+    auto target = CastTarget(dt);
+    tensors[i] = NeuronSafeCast(t, target);
+    any_changed = true;
+    TORCH_NEURONX_DISPATCH_DEBUG("[DowncastTensorList] idx=", i, " ", dt, " → ", target);
+  }
+  return any_changed;
 }
 
 // ═══════════════════════════════════════════════════════════════

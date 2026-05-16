@@ -142,6 +142,27 @@ def reset_accumulated_memory_stats(device: int | torch.device | None = None) -> 
     _C._reset_accumulated_memory_stats(device_index)
 
 
+def peak_memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
+    """
+    Return the memory stats snapshot captured at the moment allocated_bytes
+    last exceeded its previous peak. Automatically dumped on OOM.
+
+    Returns:
+        Dictionary containing:
+        - valid: Whether a peak snapshot has been captured
+        - timestamp_ns: When the peak was recorded
+        - allocated_bytes: Block sizes at peak (dict with current/peak/allocated/freed)
+        - reserved_bytes: Segment sizes at peak
+        - active_bytes: Requested sizes at peak
+        - internal_fragmentation: allocated_bytes.current - active_bytes.current at peak
+        - num_alloc_retries, num_ooms, num_tensor_frees, allocation_requests
+    """
+    from torch_neuronx import _C
+
+    device_index = _get_device_index(device)
+    return _C._get_peak_memory_stats(device_index)
+
+
 def memory_summary(device: int | torch.device | None = None, abbreviated: bool = False) -> str:
     """
     Return a human-readable summary of memory usage for a device.
@@ -334,6 +355,134 @@ def _snapshot(device: int | torch.device | None = None) -> dict[str, Any]:
     from torch_neuronx import _C
 
     return _C._neuron_memory_snapshot()
+
+
+def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str, Any]:
+    """Compute segment pool fragmentation and efficiency stats from the memory snapshot."""
+    from torch_neuronx import _C
+
+    device_index = _get_device_index(device)
+    stats = _C._get_memory_stats(device_index)
+    snapshot = _C._neuron_memory_snapshot()
+    total_hbm = _C._neuron_getDeviceProperties(device_index).total_memory
+
+    # Collect segments for this device, sorted by address
+    segments = []
+    for seg in snapshot.get("segments", []):
+        if seg.get("device", -1) != device_index:
+            continue
+        segments.append(seg)
+    segments.sort(key=lambda s: s.get("address", 0))
+
+    # Build free chunk lists separately:
+    # - nrt_free_chunks: inter-segment gaps + edge unreserved (real NRT free)
+    # - cached_free_chunks: inactive blocks within segments (reusable without NRT call)
+    nrt_free_chunks = []
+    cached_free_chunks = []
+    internal_frag = 0
+    num_segments = len(segments)
+
+    for seg in segments:
+        internal_frag += seg.get("allocated_size", 0) - seg.get("active_size", 0)
+        for block in seg.get("blocks", []):
+            if block.get("state") != "active_allocated":
+                cached_free_chunks.append(block.get("size", 0))
+
+    # Inter-segment gaps (NRT-level free)
+    inter_seg_gap_total = 0
+    for i in range(len(segments) - 1):
+        gap_start = segments[i].get("address", 0) + segments[i].get("total_size", 0)
+        gap_end = segments[i + 1].get("address", 0)
+        if gap_end > gap_start:
+            gap = gap_end - gap_start
+            nrt_free_chunks.append(gap)
+            inter_seg_gap_total += gap
+
+    # Address span
+    if segments:
+        min_addr = segments[0].get("address", 0)
+        last = segments[-1]
+        max_addr = last.get("address", 0) + last.get("total_size", 0)
+        address_span = max_addr - min_addr
+    else:
+        address_span = 0
+
+    # Edge unreserved HBM (outside segment span)
+    reserved = stats["reserved_bytes"]["current"]
+    nrt_free = total_hbm - reserved
+    edge_unreserved = max(0, nrt_free - inter_seg_gap_total)
+    if edge_unreserved > 0:
+        nrt_free_chunks.append(edge_unreserved)
+
+    active = stats["active_bytes"]["current"]
+    allocated = stats["allocated_bytes"]["current"]
+    total_free = max(0, total_hbm - allocated)
+    cached_free = reserved - allocated
+    all_free_chunks = nrt_free_chunks + cached_free_chunks
+    free_chunks = len(all_free_chunks)
+    # largest_free is the largest NRT free chunk (inter-segment gap or edge),
+    # not cached blocks — cached blocks are already in cached_free
+    largest_free = max(nrt_free_chunks) if nrt_free_chunks else 0
+
+    external_frag = max(total_free - largest_free - cached_free, 0)
+    # No free memory = fully fragmented (can't allocate anything)
+    frag_index = (external_frag + internal_frag) / total_free if total_free > 0 else 1.0
+    efficiency = reserved / address_span if address_span > 0 else 0.0
+
+    return {
+        "free_chunks": free_chunks,
+        "largest_free": largest_free,
+        "total_free": total_free,
+        "nrt_free": nrt_free,
+        "total_hbm": total_hbm,
+        "internal_fragmentation": internal_frag,
+        "external_fragmentation": external_frag,
+        "cached_free": cached_free,
+        "fragmentation_index": frag_index,
+        "memory_efficiency": efficiency,
+        "address_span": address_span,
+        "num_segments": num_segments,
+        "allocated_bytes": allocated,
+        "reserved_bytes": reserved,
+        "active_bytes": active,
+    }
+
+
+def segment_pool_analysis_summary(device: int | torch.device | None = None) -> str:
+    """Return a formatted string of the segment pool analysis."""
+    s = segment_pool_analysis(device)
+
+    def _fmt(b: int | float) -> str:
+        for u in ["B", "KiB", "MiB", "GiB", "TiB"]:
+            if abs(b) < 1024:
+                return f"{b:,.2f} {u}".rjust(14)
+            b /= 1024
+        return f"{b:,.2f} PiB".rjust(14)
+
+    return (
+        f"{'=' * 75}\n"
+        f"  Segment Pool Analysis (current state at exit)\n"
+        f"{'=' * 75}\n"
+        f"  Allocated:        {_fmt(s['allocated_bytes'])}  [{s['allocated_bytes']:,} B]\n"
+        f"  Reserved:         {_fmt(s['reserved_bytes'])}  [{s['reserved_bytes']:,} B]\n"
+        f"  Active:           {_fmt(s['active_bytes'])}  [{s['active_bytes']:,} B]\n"
+        f"  Total HBM:        {_fmt(s['total_hbm'])}  [{s['total_hbm']:,} B]\n"
+        f"  ---\n"
+        f"  Free chunks:      {s['free_chunks']:>14}\n"
+        f"  Largest free:     {_fmt(s['largest_free'])}  [{s['largest_free']:,} B]\n"
+        f"  Total free:       {_fmt(s['total_free'])}  [{s['total_free']:,} B]\n"
+        f"  NRT free:         {_fmt(s['nrt_free'])}  [{s['nrt_free']:,} B]\n"
+        f"  Cached free:      {_fmt(s['cached_free'])}  [{s['cached_free']:,} B]\n"
+        f"  Internal frag:    {_fmt(s['internal_fragmentation'])}"
+        f"  [{s['internal_fragmentation']:,} B]\n"
+        f"  External frag:    {_fmt(s['external_fragmentation'])}"
+        f"  [{s['external_fragmentation']:,} B]\n"
+        f"  Frag index:       {s['fragmentation_index']:>14.4f}\n"
+        f"  Mem efficiency:   {s['memory_efficiency']:>14.4f}\n"
+        f"  Address span:     {_fmt(s['address_span'])}  [{s['address_span']:,} B]\n"
+        f"  Segments:         {s['num_segments']:>14}\n"
+        f"{'=' * 75}"
+    )
 
 
 def _dump_snapshot(filename: str = "memory_snapshot.pickle") -> None:

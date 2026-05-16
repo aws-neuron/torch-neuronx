@@ -47,6 +47,10 @@ neuron_decompositions = get_decompositions(
         aten.logsumexp,
         aten.squeeze.dims,
         aten.binary_cross_entropy,
+        aten.native_batch_norm,
+        aten._native_batch_norm_legit,
+        aten._native_batch_norm_legit_functional,
+        aten._native_batch_norm_legit_no_training,
         aten.native_batch_norm_backward,
         aten.native_group_norm_backward,
         aten.mse_loss_backward,
@@ -952,6 +956,12 @@ def index_copy(
     if dim < 0:
         dim = input.dim() + dim
 
+    # 0-d (scalar) tensors: scatter requires ≥1-d, so handle directly.
+    # CPU semantics: dim must be 0, index has one element (value 0),
+    # source is 0-d → result is the source value with input's shape.
+    if input.dim() == 0:
+        return source.reshape(input.shape)
+
     # Build target shape: 1s everywhere except at dim where we keep index size
     target_shape = [1] * source.dim()
     target_shape[dim] = index.numel()
@@ -1645,6 +1655,53 @@ def value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
         grad = grad.unsqueeze(dim)
         indices = indices.unsqueeze(dim)
     return grad_input.scatter(dim, indices, grad)
+
+
+@register_decomposition([aten.searchsorted.Tensor])
+def searchsorted_tensor_decomposition(
+    sorted_sequence, values, *, out_int32=False, right=False, side=None, sorter=None
+):
+    """Decompose searchsorted into comparison + sum.
+
+    For each value, counts how many elements in sorted_sequence satisfy the
+    boundary condition. This is O(N*M) rather than O(N*log M), but maps
+    cleanly to StableHLO (no data-dependent control flow).
+
+    Warning: Creates an intermediate [..., N, M] tensor from broadcasting
+    values (N) against sorted_sequence (M). Large inputs may cause OOM.
+    """
+    if side is not None:
+        right = side == "right"
+
+    if sorter is not None:
+        sorted_sequence = torch.gather(sorted_sequence, -1, sorter)
+
+    # Broadcast: compare each value against all elements in sorted_sequence
+    # sorted_sequence: [..., M], values: [..., N] -> compare [..., N, M]
+    # NOTE: This creates an intermediate tensor of size batch * N * M.
+    # For large M or N this may exceed device memory.
+    seq_unsqueezed = sorted_sequence.unsqueeze(-2)  # [..., 1, M]
+    val_unsqueezed = values.unsqueeze(-1)  # [..., N, 1]
+
+    mask = seq_unsqueezed <= val_unsqueezed if right else seq_unsqueezed < val_unsqueezed
+
+    result = mask.sum(dim=-1)
+
+    if out_int32:
+        return result.to(torch.int32)
+    return result.to(torch.int64)
+
+
+@register_decomposition([aten.searchsorted.Scalar])
+def searchsorted_scalar_decomposition(
+    sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None
+):
+    """Decompose scalar searchsorted by wrapping the scalar as a tensor."""
+    values = torch.tensor([value], dtype=sorted_sequence.dtype).to(sorted_sequence.device)
+    result = searchsorted_tensor_decomposition(
+        sorted_sequence, values, out_int32=out_int32, right=right, side=side, sorter=sorter
+    )
+    return result.squeeze(-1)
 
 
 @register_decomposition([aten.histc.default])

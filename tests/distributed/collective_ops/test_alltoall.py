@@ -401,7 +401,11 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with dtype mismatch. Error thrown by torch directly"""
         self.distributed_tester.run_test(run_dtype_mismatch_test)
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_different_devices_error(self):
         """Test alltoall with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -438,7 +442,10 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
             partial_group=partial_group,
         )
 
-    @assert_raises(RuntimeError, match=r".*unsupported world size.*supported sizes.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*unsupported world size.*supported sizes.*",
+    )
     def test_alltoall_partial_group_unsupported_world_size(self):
         """Test alltoall with unsupported world size."""
         partial_group = [0, 1]
@@ -461,10 +468,7 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
     )
     @assert_raises(
         RuntimeError,
-        match=(
-            r".*replica group start ranks must be "
-            r"multiples of world size.*found.*group.*starts at rank.*"
-        ),
+        match=r".*replica group start ranks must be multiples of world size.*",
     )
     def test_alltoall_partial_group_supported_fail_cases(self, group_config):
         partial_group = group_config["partial_group"]

@@ -17,30 +17,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " hardware. Gradient metadata propagation differs from CPU reference"
             " on bfloat16/float16 for various inplace ops (fmod, lerp, etc.)."
         ),
-        patterns=[
-            "test_inplace_ops_propagate_requires_grad_metadata_*_neuron_bfloat16",
-            "test_inplace_ops_propagate_requires_grad_metadata_*_neuron_float16",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT2.11] Graph retracibility / output mismatch on Neuron:"
-            " torch.allclose() returns False between original and retraced graph."
-        ),
-        tests=[
-            "test_retracibility_inline_and_install",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT2.11] Model/module not freed after compile on Neuron: Dynamo's"
-            " weakref-based cleanup tracking fails (cleared=False). Likely a"
-            " backend reference leak via compiled graph cache."
-        ),
-        tests=[
-            "test_parameter_free",
-            "test_outside_linear_module_free",
-        ],
+        tests=x.DYNAMO_INPLACE_METADATA_PROPAGATION,
     ),
     SkipGroup(
         reason=(
@@ -81,8 +58,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "LoggingTests::test_output_code",
             "StructuredTraceTest::test_dump_file",
             "TestBackendOverrideIntegrationNEURON::test_multiple_rules_neuron",
-            "RegionalInductorInvokeSubgraphTests::test_invoke_subgraph_inner_serialize_False",
-            "RegionalInductorInvokeSubgraphTests::test_custom_decomposition",
         ],
     ),
     SkipGroup(
@@ -368,10 +343,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason=("AoTAutogradCache not supported: expected OutputCode, got function"),
-        tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_OUTPUT_CODE,
-    ),
-    SkipGroup(
         reason=("AoTAutogradCache not supported: cache hit/miss count mismatch"),
         tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
     ),
@@ -467,7 +438,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="_copy_from_and_resize size mismatch on Neuron",
         tests=[
             "DynamicShapesReproTests::test_sort_out_dynamic_shapes",
-            "ReproTests::test_sort_out",
         ],
     ),
     SkipGroup(
@@ -475,7 +445,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesReproTests::test_tokenization_dynamic_shapes",
             "MiscTests::test_sourceless_namedtuple",
-            "ReproTests::test_tokenization",
         ],
     ),
     SkipGroup(
@@ -584,16 +553,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="InternalTorchDynamoError: KeyError or AttributeError in guard/getattr",
         tests=[
             "GuardManagerTests::test_dimension_marking_guard_dependent_attrs",
-            "GuardManagerTests::test_dynamic_indices_guard",
-            "MiscTests::test_sys_modules",
-            "MiscTests::test_user_getattr1",
             "OptimizedModuleTest::test_dict_insertion_guard_method_func",
-        ],
-    ),
-    SkipGroup(
-        reason="Assertion failure: test_user_defined_setattr1 on Neuron",
-        tests=[
-            "MiscTests::test_user_defined_setattr1",
         ],
     ),
     SkipGroup(
@@ -650,7 +610,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "NbIntTests::test_tensor_dunder_int",
             "NbIntTests::test_tensor_float_dtype",
             "NbIntTests::test_tensor_int_dtype",
-            "UnspecTests::test_symfloat_no_replacement",
         ],
     ),
     SkipGroup(
@@ -663,7 +622,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Unsupported: Failed to convert args/kwargs to proxy",
         tests=[
             "ReproTests::test_issue164247_backend_eager",
-            "ReproTests::test_issue134451",
         ],
     ),
     SkipGroup(
@@ -681,14 +639,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " (param_num/output_idx out of bounds)."
         ),
         tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_basic",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_dynamo_device_mesh_attrs",
             "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_dce",
             "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_no_dce",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_input_mutations",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_to_local_kwargs_forward_hook",
-            "test_dtensor_compile.py::TestDTensorCompile::test_get_local_rank_compile",
             "test_dtensor_compile.py::TestDTensorCompile::test_device_mesh_input_to_dtensor_from_local",
         ],
     ),

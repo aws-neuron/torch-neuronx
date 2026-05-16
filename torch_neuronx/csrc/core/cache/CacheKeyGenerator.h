@@ -53,6 +53,13 @@ class CacheKeyGenerator {
   // Public so NkiDispatcher can reuse the same encoding format.
   static void AppendTensor(std::ostringstream& key, const at::Tensor& t);
 
+  // ── Collective path ──
+  // Called from NeuronBackend for collective operations.
+  static std::string GenerateCollective(const std::string& op_type,
+                                        const std::vector<at::Tensor>& inputs,
+                                        const std::vector<std::vector<int>>& replica_groups,
+                                        int reduce_op, bool slice_output = false);
+
  private:
   // ── Shared type formatters ──
   // Each type has exactly ONE formatting function. Both AppendIValue (C++ path)
@@ -61,6 +68,7 @@ class CacheKeyGenerator {
   static void AppendNone(std::ostringstream& key);
   static void AppendBool(std::ostringstream& key, bool val);
   static void AppendInt(std::ostringstream& key, int64_t val, bool is_static);
+  static void AppendIntList(std::ostringstream& key, const std::vector<int>& vals);
   static void AppendDouble(std::ostringstream& key, double val, bool is_static);
   static void AppendComplexDouble(std::ostringstream& key, c10::complex<double> val,
                                   bool is_static);

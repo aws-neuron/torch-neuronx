@@ -40,12 +40,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="NEFF creation failed for operation: aten::contiguous on zero-sized tensors",
-        tests=[
-            "test_parallelize_api.py::TensorParallelAPITests::test_prepare_module_input_output",
-        ],
-    ),
-    SkipGroup(
         reason=(
             "[accuracy.gradcheck] Numerical vs analytical gradient"
             " mismatch due to float64→float32 precision loss"
@@ -93,13 +87,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="[compiler_error.neuron] Neuron compiler failed to compile HLO graph",
         tests=x.COMPILER_ERROR_NEURON,
-    ),
-    SkipGroup(
-        reason=(
-            "[compiler_error.prologue_merge] Lazy materialization prologue generation"
-            " failed: 'Failed to merge transformation chain 1' on aten::bmm"
-        ),
-        tests=x.COMPILER_ERROR_PROLOGUE_MERGE,
     ),
     SkipGroup(
         reason="[compiler_error.torch_mlir] TorchMLIR op lowering or MLIR conversion error",
@@ -186,10 +173,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.UNSUPPORTED_OP_CPU_FALLBACK_DISABLED,
     ),
     SkipGroup(
-        reason="[unsupported_op.fused_rnn] Fused RNN ops not available for Neuron backend",
-        tests=x.UNSUPPORTED_OP_FUSED_RNN,
-    ),
-    SkipGroup(
         reason="[unsupported_op.not_implemented] Op not implemented for Neuron backend",
         tests=x.UNSUPPORTED_OP_NOT_IMPLEMENTED,
     ),
@@ -213,16 +196,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="RNG tracker is None - random ops initialization",
         tests=[
             "test_deterministic_uniform_2d",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "ASGD passes per-group etas as 0-dim scalar tensors into _foreach_addcmul_."
-            " Neuron's NKI addcmul kernel is 2D tile-based and rejects 0-dim operands"
-            " with 'invalid shape: cannot be empty'"
-        ),
-        tests=[
-            "test_optimizers.py::TestDTensorOptimizer::test_asgd_1d_sharding",
         ],
     ),
     SkipGroup(
@@ -260,9 +233,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_huber_loss_neuron_float32",
             "test_decomp.py::TestDecompNEURON::test_quick_logit_neuron_bfloat16",
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_binary_cross_entropy_neuron_float16",
-            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_softplus_neuron_float16",
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_hardsigmoid_neuron_float32",
-            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_mse_loss_neuron_float16",
         ],
     ),
     SkipGroup(
@@ -274,22 +245,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_reductions.py::TestReductionsNEURON::test_noncontiguous_transposed_nansum_neuron_int16",
-            "test_reductions.py::TestReductionsNEURON::test_noncontiguous_transposed_masked_mean_neuron_float16",
-            "test_meta.py::TestMetaNEURON::test_meta_outplace_linalg_ldl_solve_neuron_float32",
-            "test_torch.py::TestTorchDeviceTypeNEURON::test_expected_failure_xla_neuron",
             "test_torch.py::TestTorchDeviceTypeNEURON::test_cdist_large_batch_neuron",
-            "test_torch.py::TestTorchDeviceTypeNEURON::test_copy__neuron_float16",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_poisson_nll_loss_neuron_bfloat16",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Upstream test bug: test_comprehensive_std_mean calls std_mean with"
-            " 4 positional args but the function only takes 1-2. Not"
-            " Neuron-specific — needs to be fixed upstream."
-        ),
-        tests=[
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_std_mean_neuron_bfloat16",
         ],
     ),
     SkipGroup(
@@ -326,15 +282,11 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         patterns=[
             "test_scaled_dot_product_attention_batch_size_0_*",
-            "test_Transformer_empty_neuron",
-            "test_TransformerEncoder_empty_neuron",
-            "test_TransformerDecoder_empty_neuron",
-            "test_TransformerDecoderLayer_empty_neuron",
         ],
     ),
     SkipGroup(
         reason=(
-            "PT 2.11 accuracy regression: 27 bfloat16/float16"
+            "PT 2.11 accuracy regression: 33 bfloat16/float16"
             " reciprocal-family tests (div, reciprocal, rsqrt, fmod,"
             " true_divide, lgamma, floor_divide, remainder,"
             " pairwise_distance) pass on nightly but fail on PT 2.11"
@@ -400,17 +352,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "NRT Execution error on aten::addmv_ when exercising argsort's"
-            " variant consistency path on float32. The addmv_ inplace kernel"
-            " fails inside the Neuron runtime; likely an uninitialized-output"
-            " or stride-handling bug in the Neuron addmv_ kernel."
-        ),
-        tests=[
-            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_argsort_neuron_float32",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "NRT Execution error on aten::ne.Tensor_out when prod reduction hits"
             " the high-dim-count limit (>ndim). Likely a Neuron kernel bug in"
             " the out-variant of ne for high-rank tensors."
@@ -429,6 +370,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_fastpath_inplace_neuron_bool",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[prologue] Data-dependent NaN in standalone transpose NEFF for"
+            " non-contiguous fp16 tensors of shape (357, 789). The _refs"
+            " decomposition (promote->op->demote) triggers CopyToNonContiguous"
+            " which uses an on-device transpose that produces spurious NaN at"
+            " row 128 for specific data patterns. Affects any _refs op that"
+            " does promote/demote on this shape. Native ops with epilogue work"
+            " correctly."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_div_no_rounding_mode_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_pow_neuron_float16",
         ],
     ),
 ]

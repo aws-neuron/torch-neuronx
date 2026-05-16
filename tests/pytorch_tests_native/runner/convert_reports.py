@@ -4,19 +4,22 @@
 Used for two purposes:
 
 1. Per-node CSV generation — called at the end of ``run_upstream_tests.sh``
-   after pytest completes. Writes ``csv_reports/*.csv`` alongside
-   ``json_reports/*.json`` so each per-node artifact contains both JSON and
-   CSV forms of the test results.
+   after pytest completes. Writes one ``test_results_<name>.csv`` next to
+   each ``test_results_<name>.json`` so each per-node artifact carries both
+   JSON and CSV forms of the test results flat (no subdirectories).
 
 2. Shared helpers — imported by ``aggregate_upstream_results.py`` which
-   reuses ``extract_test_data_from_json`` for the aggregation pass.
+   reuses ``extract_test_data_from_json`` and ``apply_retry_outcomes`` for
+   the aggregation pass.
 
 Usage (standalone):
     python3 convert_reports.py <output_dir>
 
-    Walks ``<output_dir>/json_reports/test_results_*.json`` and produces one
-    CSV per JSON file in ``<output_dir>/csv_reports/``. Safe to call even if
-    no JSON files exist (returns 0).
+    Walks ``<output_dir>/test_results_*.json`` and writes a sibling CSV
+    for each main JSON. A ``test_results_<name>_retry.json`` sibling is
+    merged into the main CSV (its retry outcomes override main failures)
+    but is never written as a standalone CSV. Safe to call even if no
+    JSON files exist (returns 0).
 """
 
 import csv
@@ -239,10 +242,12 @@ def json_to_csv(json_path: str, csv_path: str, retry_json_path: str | None = Non
             "timestamp",
         ]
     else:
-        # Strip internal-only columns from the output.
-        # ``test_id`` carries the full test identifier; ``test_class``
-        # and ``test_method`` are redundant (derivable from test_id).
-        fieldnames = [k for k in rows[0] if k not in ("nodeid", "test_class", "test_method")]
+        # Keep test_class and test_method as columns so the aggregation
+        # pass in aggregate_upstream_results.py can group rows by class
+        # without re-parsing the nodeid string. Stripping these caused a
+        # silent regression where the summary CSV bucketed every row
+        # under "unknown". nodeid is the only internal-only column dropped.
+        fieldnames = [k for k in rows[0] if k != "nodeid"]
 
     try:
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -258,13 +263,22 @@ def json_to_csv(json_path: str, csv_path: str, retry_json_path: str | None = Non
 
 
 def convert_output_dir(output_dir: str) -> int:
-    """Convert all pytest JSON reports in <output_dir>/json_reports/ to CSV.
+    """Convert all pytest JSON reports in ``output_dir`` to CSV in place.
 
-    Writes one CSV per main JSON to <output_dir>/csv_reports/ with the same
-    base filename (``test_results_<name>.json`` → ``test_results_<name>.csv``).
-    If a ``test_results_<name>_retry.json`` sibling exists, its outcomes
+    Reports live flat inside ``output_dir`` (no subdirectories) so each
+    per-node artifact stays easy to browse. For every main JSON, a
+    sibling CSV with the same base name is emitted alongside it:
+
+        output_dir/
+        ├── test_results_TestFoo.json           (pytest's JSON report)
+        ├── test_results_TestFoo_retry.json     (retry JSON, if any)
+        ├── test_results_TestFoo.csv            ← written here
+        ├── TestFoo.html / TestFoo.log          (other pytest outputs)
+        └── ...
+
+    If a ``test_results_<name>_retry.json`` sibling exists its outcomes
     are merged into the main CSV via :func:`apply_retry_outcomes` — the
-    retry JSON itself is not written as a standalone CSV to avoid
+    retry JSON itself is never written as a standalone CSV to avoid
     double-counting.
 
     Args:
@@ -273,29 +287,25 @@ def convert_output_dir(output_dir: str) -> int:
     Returns:
         Exit code (0 = success, >0 = one or more failures).
     """
-    json_dir = os.path.join(output_dir, "json_reports")
-    csv_dir = os.path.join(output_dir, "csv_reports")
-
-    if not os.path.isdir(json_dir):
-        logger.warning(f"No json_reports directory at {json_dir} — nothing to convert")
+    if not os.path.isdir(output_dir):
+        logger.warning(f"Output dir not found: {output_dir}")
         return 0
 
-    all_json_files = sorted(glob.glob(os.path.join(json_dir, "test_results_*.json")))
+    all_json_files = sorted(glob.glob(os.path.join(output_dir, "test_results_*.json")))
     if not all_json_files:
-        logger.info(f"No test_results_*.json files in {json_dir}")
+        logger.info(f"No test_results_*.json files in {output_dir}")
         return 0
 
     # Separate main vs retry reports. Retry reports end in ``_retry.json``.
     main_json_files = [p for p in all_json_files if not p.endswith("_retry.json")]
     logger.info(
-        f"Converting {len(main_json_files)} main JSON report(s) to CSV in {csv_dir} "
+        f"Converting {len(main_json_files)} main JSON report(s) to CSV in {output_dir} "
         f"({len(all_json_files) - len(main_json_files)} retry report(s) will be merged)"
     )
 
     failures = 0
     for json_path in main_json_files:
-        csv_basename = os.path.basename(json_path).replace(".json", ".csv")
-        csv_path = os.path.join(csv_dir, csv_basename)
+        csv_path = json_path.replace(".json", ".csv")
         retry_json_path = json_path.replace(".json", "_retry.json")
         if not os.path.exists(retry_json_path):
             retry_json_path = None

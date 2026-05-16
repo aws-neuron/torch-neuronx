@@ -22,19 +22,6 @@ _embedded_torch_mlir = os.path.join(
 if os.path.isdir(_embedded_torch_mlir):
     sys.path.insert(0, _embedded_torch_mlir)
 
-try:
-    from importlib.metadata import version as _standalone_version
-
-    _standalone_version("neuron-torch-mlir")
-    warnings.warn(
-        "A standalone 'neuron-torch-mlir' package is installed. "
-        "torch-neuronx now bundles torch-mlir and the standalone package "
-        "may cause conflicts. Consider running: "
-        "pip uninstall -y neuron-torch-mlir",
-        stacklevel=2,
-    )
-except Exception:
-    pass
 import threading
 
 # Global variable to track if module has been loaded
@@ -101,6 +88,9 @@ os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
 os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
+# Default to C++ NeuronBackend process group
+os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
+
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
 
@@ -153,8 +143,11 @@ from .memory import (
     memory_reserved,
     memory_stats,
     memory_summary,
+    peak_memory_stats,
     reset_accumulated_memory_stats,
     reset_peak_memory_stats,
+    segment_pool_analysis,
+    segment_pool_analysis_summary,
 )
 
 # Import torch.compile metrics APIs

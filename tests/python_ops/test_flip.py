@@ -170,7 +170,8 @@ class TestFlip:
 
     @assert_raises(
         RuntimeError,
-        match=r"duplicate value in the list of dims",
+        match=r".*duplicate value in the list of dims.*",
+        match_cpu=r".*dim \d+ appears multiple times in the list of dims.*",
     )
     def test_flip_repeated_dims(self):
         """Test flipping with repeated dimensions"""

@@ -245,6 +245,29 @@ SKIP_GROUPS: list[SkipGroup] = [
         match_target="test_method",
     ),
     # ═══════════════════════════════════════════════════════════════
+    # nn.LSTM / nn.GRU module tests — internally call _thnn_fused_*_cell
+    # which has no native Neuron lowering AND CPU fallback is disabled.
+    # ═══════════════════════════════════════════════════════════════
+    # Some of these tests run for 60-150s before failing, wasting
+    # significant compute. Skip rather than xfail to avoid that cost.
+    SkipGroup(
+        reason=(
+            "nn.LSTM/nn.GRU module tests bottom out on _thnn_fused_*_cell"
+            " (no native Neuron lowering, CPU fallback disabled). Skipped"
+            " rather than xfailed because some variants run for 60-150s"
+            " before failing."
+        ),
+        patterns=[
+            "*nn_LSTM*neuron*",
+            "*nn_GRU*neuron*",
+            "*_LSTM_grad_and_gradgrad_neuron*",
+            "*_GRU_grad_and_gradgrad_neuron*",
+            "*_rnn_retain_variables_neuron*",
+            "*_variable_sequence_neuron*",
+        ],
+        match_target="test_method",
+    ),
+    # ═══════════════════════════════════════════════════════════════
     # Foreach ops not natively lowered on Neuron (30 ops).
     # ═══════════════════════════════════════════════════════════════
     # All unary _foreach_* variants of ops missing from the unary list —

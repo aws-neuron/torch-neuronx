@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "OperationPrologue.h"
+#include "OperationTransformations.h"
 #include "TransformationTypes.h"
 
 // Forward declarations
@@ -22,10 +22,15 @@ namespace lazy {
 // Provides centralized handling of all lazy transformation operations
 class LazyTransformationManager {
  public:
-  // Process pending transformations for operation inputs
+  // Process pending transformations for operation inputs (prologue)
   // This is the main preprocessing entry point called from OperationExecutionEngine
   // Throws an exception if preprocessing fails
   static void ProcessOperationInputs(at::neuron::OperationContext* operation_context);
+
+  // Process pending transformations for operation outputs (epilogue)
+  // Generates inverse transformation MLIR and merges it after the operation.
+  // Called from OperationExecutionEngine after ProcessOperationInputs.
+  static void ProcessOperationOutputs(at::neuron::OperationContext* operation_context);
 
   // Cache management functions for merged operation cache
   static void ClearMergedOperationCache();
@@ -36,6 +41,12 @@ class LazyTransformationManager {
   // Returns merged MLIR bytes, throws exception on failure
   static std::vector<uint8_t> ProcessPrologueWithMlirMerge(
       const PrologueResult& prologue_result, const std::string& op_name,
+      at::neuron::XLACompilableKernelExecution* compilable_kernel);
+
+  // Process epilogue transformations using MLIR merging with OperationEpilogue
+  // Returns merged MLIR bytes (operation + epilogue), throws exception on failure
+  static std::vector<uint8_t> ProcessEpilogueWithMlirMerge(
+      const EpilogueResult& epilogue_result, const std::string& op_name,
       at::neuron::XLACompilableKernelExecution* compilable_kernel);
 };
 

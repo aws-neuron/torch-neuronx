@@ -185,6 +185,12 @@ void OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operat
   const std::string& op_name = operation->GetOpName();
   TORCH_NEURONX_DEBUG("Processing preprocessing task", "op=", op_name);
   c10_neuron::lazy::LazyTransformationManager::ProcessOperationInputs(operation);
+  // Epilogue: merge output transformations into the operation MLIR (when enabled).
+  // Safe to call unconditionally — ProcessOperationOutputs early-exits if no
+  // output transforms are set (which is always the case when epilogue is OFF,
+  // since DetectEpilogueTransforms returns empty and SetOutputTransformations
+  // is never called).
+  c10_neuron::lazy::LazyTransformationManager::ProcessOperationOutputs(operation);
 }
 
 void OperationExecutionEngine::HandleCompilationComplete(OperationContext* operation) {
@@ -603,17 +609,20 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     return true;
   }
 
-  bool is_pending_host_op = kernel_type == KernelTypeEnum::kEvent ||
-                            kernel_type == KernelTypeEnum::kHint ||
-                            kernel_type == KernelTypeEnum::kDealloc;
+  // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
+  bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
-    // Wait events need prior async ops to drain first
+    // Same-stream kWait is redundant with FIFO ordering; only gate on
+    // cross-stream where the producer's completion is not implied here.
     if (kernel_type == KernelTypeEnum::kEvent &&
         op->GetKernel<KernelTypeEnum::kEvent>().GetEventAction() ==
             EventDirectKernelExecution::EventAction::kWait &&
         stream->HasPendingAsyncOperations()) {
-      return false;
+      auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+      if (event_kernel.GetEvent().recorded_stream_id() != stream->GetStreamId()) {
+        return false;
+      }
     }
     op->nrt_async_state_.is_pending_signal = true;
     pending_async_ops_count_.fetch_add(1);
@@ -622,6 +631,9 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   }
 
   // Device ops: XU inflight throttling and device scheduling
+  EXECUTION_RUNTIME_CHECK(IsDeviceKernelType(kernel_type),
+                          "ScheduleOperation reached device-op path with non-device kernel type: ",
+                          static_cast<int>(kernel_type));
   EXECUTION_RUNTIME_CHECK(stream->device_index >= 0 && stream->device_index < kMaxDevices,
                           "device_index out of bounds: ", stream->device_index);
   size_t xu_idx = GetXUIndex(kernel_type);
