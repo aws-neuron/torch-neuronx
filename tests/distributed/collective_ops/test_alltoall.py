@@ -298,8 +298,6 @@ def run_partial_group_alltoall_test(rank, world_size, kwargs):
         # Ranks not in partial_group don't participate
         pass
 
-    dist.barrier()
-
 
 def run_5gb_tensor_test(rank, world_size, kwargs):
     """Test alltoall with 5GB tensor (~1.25 billion float32 elements)."""
