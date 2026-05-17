@@ -3,6 +3,7 @@
 #include <nrt/nrt.h>
 #include <torch/torch.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -612,6 +613,13 @@ class AllocDirectKernelExecution
     : public NeuronKernelExecutionTyped<KernelTypeEnum::kAlloc, c10::DeviceType::PrivateUse1,
                                         c10::DeviceType::PrivateUse1> {
  public:
+  // One-shot forward state machine: Fresh -> Deferred -> RetryReady.
+  enum class AllocState {
+    Fresh,
+    Deferred,    // 1st OOM; gated until stream drains
+    RetryReady,  // Drain hook completed; next OOM throws (no re-defer)
+  };
+
   AllocDirectKernelExecution(const std::string& op_name, TensorDataRef dst_ref, size_t size_bytes,
                              int device_id);
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
@@ -619,12 +627,16 @@ class AllocDirectKernelExecution
   size_t GetSizeBytes() const { return size_bytes_; }
   const NeuronEvent& GetEvent() const { return event_op_.GetEvent(); }
 
+  AllocState GetAllocState() const { return alloc_state_.load(std::memory_order_acquire); }
+  void SetAllocState(AllocState s) { alloc_state_.store(s, std::memory_order_release); }
+
  protected:
   bool ValidateImpl() const override { return HasOutputs() && size_bytes_ > 0; }
 
  private:
   size_t size_bytes_;
   EventDirectKernelExecution event_op_;
+  std::atomic<AllocState> alloc_state_{AllocState::Fresh};
 };
 
 class DeallocDirectKernelExecution

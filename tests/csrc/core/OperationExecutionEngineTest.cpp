@@ -1104,6 +1104,417 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates
   engine.Shutdown();
 }
 
+TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  // Single inline attempt: sets NRT_SUCCESS.
+  EXPECT_CALL(*kernel, Schedule(_, _, _))
+      .Times(1)
+      .WillOnce(DoAll(SetArgPointee<0>(NRT_SUCCESS), Return(false)));
+
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  stream->active_operations_.push_back(op);
+
+  bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
+
+  EXPECT_TRUE(scheduled);
+  EXPECT_TRUE(op->nrt_async_state_.is_pending_signal);
+  EXPECT_EQ(op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Fresh);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+
+  // Cleanup: clear before stream dtor
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+TEST_F(OperationExecutionEngineTest, AllocScheduleDeferOnNrtResourceParksOp) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  // First attempt -> NRT_RESOURCE (defer), second -> NRT_SUCCESS after gate clears.
+  EXPECT_CALL(*kernel, Schedule(_, _, _))
+      .Times(2)
+      .WillOnce(DoAll(SetArgPointee<0>(NRT_RESOURCE), Return(false)))
+      .WillOnce(DoAll(SetArgPointee<0>(NRT_SUCCESS), Return(false)));
+
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  // Prior scheduled op in front so TryDeferAlloc sees drainable work and
+  // the "alone-on-stream" escalation does NOT fire.
+  auto prior_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*prior_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto prior_op = std::make_shared<OperationContext>(std::move(prior_kernel));
+  prior_op->stream = stream.get();
+  prior_op->stream_id = stream->stream_id;
+  prior_op->nrt_async_state_.is_scheduled = true;
+  prior_op->nrt_async_state_.sequence_id = 1;
+  stream->active_operations_.push_back(prior_op);
+  stream->active_operations_.push_back(op);
+
+  // First schedule -> defer.
+  bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
+  EXPECT_FALSE(scheduled);
+  EXPECT_EQ(op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Deferred);
+  EXPECT_FALSE(op->nrt_async_state_.is_pending_signal);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
+
+  // IsSchedulable must return false while the gate is set.
+  op->MarkExecutionReady();
+  EXPECT_FALSE(op->IsSchedulable());
+
+  // Simulate stream drain
+  op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
+      AllocDirectKernelExecution::AllocState::RetryReady);
+  EXPECT_TRUE(op->IsSchedulable());
+
+  // Retry -> success.
+  scheduled = engine.ScheduleOperation(op.get(), stream.get());
+  EXPECT_TRUE(scheduled);
+  EXPECT_TRUE(op->nrt_async_state_.is_pending_signal);
+  // State remains RetryReady after a successful retry — the kernel is one-shot.
+  EXPECT_EQ(op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
+
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+TEST_F(OperationExecutionEngineTest, AllocScheduleSecondNrtResourceEscalates) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  // Both attempts hit NRT_RESOURCE.
+  EXPECT_CALL(*kernel, Schedule(_, _, _))
+      .Times(2)
+      .WillRepeatedly(DoAll(SetArgPointee<0>(NRT_RESOURCE), Return(false)));
+
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  // Prior scheduled op in front so TryDeferAlloc sees drainable work on the
+  // first attempt and flips state to Deferred instead of escalating.
+  auto prior_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*prior_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto prior_op = std::make_shared<OperationContext>(std::move(prior_kernel));
+  prior_op->stream = stream.get();
+  prior_op->stream_id = stream->stream_id;
+  prior_op->nrt_async_state_.is_scheduled = true;
+  prior_op->nrt_async_state_.sequence_id = 1;
+  stream->active_operations_.push_back(prior_op);
+  stream->active_operations_.push_back(op);
+
+  // First schedule -> defer.
+  bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
+  EXPECT_FALSE(scheduled);
+  EXPECT_EQ(op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Deferred);
+
+  // Simulate drain transitioning state to RetryReady.
+  op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
+      AllocDirectKernelExecution::AllocState::RetryReady);
+
+  // Second schedule -> escalate via exception so ErrorHandler/AttemptOOMRecovery takes over.
+  try {
+    engine.ScheduleOperation(op.get(), stream.get());
+    FAIL() << "Expected ExecutionRuntimeException";
+  } catch (const torch_neuronx::ExecutionRuntimeException& e) {
+    EXPECT_TRUE(e.HasNRTStatus());
+    EXPECT_EQ(e.GetNRTStatus(), NRT_RESOURCE);
+  }
+
+  stream->active_operations_.clear();
+  engine.pending_async_ops_count_.store(0);
+  engine.Shutdown();
+}
+
+TEST_F(OperationExecutionEngineTest, AllocScheduleAloneOnStreamEscalates) {
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  // Single attempt -> NRT_RESOURCE. No retry should follow since the op is alone.
+  EXPECT_CALL(*kernel, Schedule(_, _, _))
+      .Times(1)
+      .WillOnce(DoAll(SetArgPointee<0>(NRT_RESOURCE), Return(false)));
+
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  // Only the kAlloc itself on the stream. TryDeferAlloc sees no drainable
+  // work and returns false → we escalate with the "no pending ops" reason
+  // so AttemptOOMRecovery gets a chance at the allocator cache.
+  stream->active_operations_.push_back(op);
+
+  try {
+    engine.ScheduleOperation(op.get(), stream.get());
+    FAIL() << "Expected ExecutionRuntimeException for alone-on-stream kAlloc";
+  } catch (const torch_neuronx::ExecutionRuntimeException& e) {
+    EXPECT_TRUE(e.HasNRTStatus());
+    EXPECT_EQ(e.GetNRTStatus(), NRT_RESOURCE);
+    EXPECT_THAT(std::string(e.what()), ::testing::HasSubstr("no pending ops on stream"));
+  }
+
+  // No parking: state remains Fresh since TryDeferAlloc didn't flip it.
+  EXPECT_EQ(op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Fresh);
+  EXPECT_FALSE(op->nrt_async_state_.is_pending_signal);
+  EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
+
+  stream->active_operations_.clear();
+  engine.Shutdown();
+}
+
+TEST_F(OperationExecutionEngineTest, RemoveActiveOperationClearsAllocRetryPendingOnDrain) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Parked kAlloc op with AllocState::Deferred.
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  alloc_op->stream = stream.get();
+  alloc_op->stream_id = stream->stream_id;
+  alloc_op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
+      AllocDirectKernelExecution::AllocState::Deferred);
+  alloc_op->MarkExecutionReady();
+
+  // Prior scheduled op that will drain, triggering the hook.
+  auto prior_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*prior_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto prior_op = std::make_shared<OperationContext>(std::move(prior_kernel));
+  prior_op->stream = stream.get();
+  prior_op->stream_id = stream->stream_id;
+
+  stream->active_operations_.push_back(prior_op);
+  stream->active_operations_.push_back(alloc_op);
+
+  EXPECT_FALSE(alloc_op->IsSchedulable());
+
+  // Drive the drain hook
+  stream->RemoveActiveOperation(prior_op.get());
+
+  EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+  EXPECT_TRUE(alloc_op->IsSchedulable());
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, GetNextOperationParksOnDeferredKAllocAtHead) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Deferred kAlloc at the head.
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto deferred_alloc = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  deferred_alloc->stream = stream.get();
+  deferred_alloc->stream_id = stream->stream_id;
+  deferred_alloc->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
+      AllocDirectKernelExecution::AllocState::Deferred);
+  deferred_alloc->MarkExecutionReady();
+
+  auto hlo_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*hlo_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto hlo_op = std::make_shared<OperationContext>(std::move(hlo_kernel));
+  hlo_op->stream = stream.get();
+  hlo_op->stream_id = stream->stream_id;
+  hlo_op->MarkExecutionReady();
+
+  stream->active_operations_.push_back(deferred_alloc);
+  stream->active_operations_.push_back(hlo_op);
+  stream->next_to_schedule_ = stream->active_operations_.begin();
+
+  EXPECT_EQ(stream->GetNextOperationToSchedule(), nullptr);
+  // next_to_schedule_ stays on the Deferred kAlloc — it does not advance.
+  EXPECT_EQ(stream->next_to_schedule_->get(), deferred_alloc.get());
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, GetNextOperationDoesNotSkipNonDeferredBlocker) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Non-schedulable, non-Deferred op at the head (kHLO with execution_ready=false).
+  auto head_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*head_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto head_op = std::make_shared<OperationContext>(std::move(head_kernel));
+  head_op->stream = stream.get();
+  head_op->stream_id = stream->stream_id;
+  // Deliberately NOT MarkExecutionReady() — IsSchedulable returns false.
+
+  // Schedulable op behind it.
+  auto back_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*back_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto back_op = std::make_shared<OperationContext>(std::move(back_kernel));
+  back_op->stream = stream.get();
+  back_op->stream_id = stream->stream_id;
+  back_op->MarkExecutionReady();
+
+  stream->active_operations_.push_back(head_op);
+  stream->active_operations_.push_back(back_op);
+  stream->next_to_schedule_ = stream->active_operations_.begin();
+
+  // Scheduler must return nullptr (head is a real blocker); back_op must not
+  // be hoisted past the head.
+  EXPECT_EQ(stream->GetNextOperationToSchedule(), nullptr);
+  EXPECT_EQ(stream->next_to_schedule_->get(), head_op.get());
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, AdvanceToNextOperationIsIdempotent) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Two ops; next_to_schedule_ at the first.
+  auto op1_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*op1_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op1 = std::make_shared<OperationContext>(std::move(op1_kernel));
+  op1->stream = stream.get();
+  op1->stream_id = stream->stream_id;
+
+  auto op2_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*op2_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op2 = std::make_shared<OperationContext>(std::move(op2_kernel));
+  op2->stream = stream.get();
+  op2->stream_id = stream->stream_id;
+
+  stream->active_operations_.push_back(op1);
+  stream->active_operations_.push_back(op2);
+  stream->next_to_schedule_ = stream->active_operations_.begin();
+
+  stream->RemoveActiveOperation(op1.get());
+  ASSERT_EQ(stream->next_to_schedule_->get(), op2.get());
+
+  stream->AdvanceToNextOperation(op1.get());
+  EXPECT_EQ(stream->next_to_schedule_->get(), op2.get());
+
+  // Legacy nullptr form does an unconditional advance.
+  stream->AdvanceToNextOperation(nullptr);
+  EXPECT_EQ(stream->next_to_schedule_, stream->active_operations_.end());
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsTrueWhenDrainableWorkExists) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Scheduled op that hasn't completed yet.
+  auto inflight_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*inflight_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto inflight_op = std::make_shared<OperationContext>(std::move(inflight_kernel));
+  inflight_op->stream = stream.get();
+  inflight_op->stream_id = stream->stream_id;
+  inflight_op->nrt_async_state_.is_scheduled = true;
+
+  // Fresh kAlloc behind it.
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  alloc_op->stream = stream.get();
+  alloc_op->stream_id = stream->stream_id;
+  ASSERT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Fresh);
+
+  stream->active_operations_.push_back(inflight_op);
+  stream->active_operations_.push_back(alloc_op);
+
+  EXPECT_TRUE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
+  EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Deferred);
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsFalseWhenStreamDrained) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  alloc_op->stream = stream.get();
+  alloc_op->stream_id = stream->stream_id;
+
+  stream->active_operations_.push_back(alloc_op);
+
+  EXPECT_FALSE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
+  EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::Fresh)
+      << "TryDeferAlloc must not mutate state on the no-defer path";
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarliest) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Three Deferred kAllocs in order, then a single in-flight op that keeps
+  // the stream from being considered drained until it's removed.
+  auto make_deferred = [&]() {
+    auto k = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+    auto op = std::make_shared<OperationContext>(std::move(k));
+    op->stream = stream.get();
+    op->stream_id = stream->stream_id;
+    op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
+        AllocDirectKernelExecution::AllocState::Deferred);
+    op->MarkExecutionReady();
+    return op;
+  };
+  auto a = make_deferred();
+  auto b = make_deferred();
+  auto c = make_deferred();
+
+  auto inflight_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*inflight_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto inflight = std::make_shared<OperationContext>(std::move(inflight_kernel));
+  inflight->stream = stream.get();
+  inflight->stream_id = stream->stream_id;
+  inflight->nrt_async_state_.is_scheduled = true;
+
+  stream->active_operations_.push_back(a);
+  stream->active_operations_.push_back(b);
+  stream->active_operations_.push_back(c);
+  stream->active_operations_.push_back(inflight);
+  // Simulate scheduler having scanned past all three Deferred kAllocs to
+  // reach `inflight` on a previous pass — next_to_schedule_ is now past
+  // them.
+  stream->next_to_schedule_ = std::next(stream->active_operations_.begin(), 3);
+
+  // Drain: remove the inflight op. All three Deferred kAllocs flip to
+  // RetryReady, and next_to_schedule_ rewinds to `a`.
+  stream->RemoveActiveOperation(inflight.get());
+
+  EXPECT_EQ(a->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+  EXPECT_EQ(b->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+  EXPECT_EQ(c->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+  ASSERT_NE(stream->next_to_schedule_, stream->active_operations_.end());
+  EXPECT_EQ(stream->next_to_schedule_->get(), a.get())
+      << "rewind should land on the earliest RetryReady kAlloc, not a later one";
+
+  stream->active_operations_.clear();
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -4,17 +4,22 @@ Integration tests for Neuron memory statistics API.
 Tests the memory stats functions exposed through torch_neuronx.
 """
 
-import os
-
 import pytest
 import torch
 
 import torch_neuronx
-
-_LAZY_ALLOC_ENABLED = os.environ.get("TORCH_NEURONX_ENABLE_LAZY_ALLOC") == "1"
-_requires_lazy_alloc = pytest.mark.skipif(
-    not _LAZY_ALLOC_ENABLED, reason="Requires TORCH_NEURONX_ENABLE_LAZY_ALLOC=1"
+from tests.utils.defer_retry_helpers import (
+    big_mib,
+    floats_for_mib,
+    n_chunks,
+    oversize_mib,
+    requires_lazy_alloc,
+    stage_pending_kdeallocs,
+    staged_mib,
+    vnc_hbm_mib,
 )
+
+_requires_lazy_alloc = requires_lazy_alloc
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -447,3 +452,183 @@ class TestMemoryStats:
         analysis = torch_neuronx.memory.segment_pool_analysis(0)
         assert analysis["num_segments"] >= 1
         assert analysis["reserved_bytes"] >= analysis["allocated_bytes"]
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.usefixtures("clean_device_state")
+class TestLazyAllocDeferRetry:
+    """End-to-end tests for the lazy-alloc defer-retry path: parks an OOM'd
+    kAlloc as Deferred, waits for the stream to drain so preceding kDeallocs
+    release NRT memory, then retries. Sizing + staging helpers live in
+    ``tests.utils.defer_retry_helpers``."""
+
+    @_requires_lazy_alloc
+    def test_defer_retry_silent_recovery(self):
+        """A pressure kAlloc with kDeallocs queued behind compute defers,
+        recovers silently via stage-2 drain-retry or stage-3 cache-drain,
+        and completes without raising. Timing-dependent: which stage wins
+        is not pinned."""
+        stage_pending_kdeallocs()
+
+        big = torch.empty(floats_for_mib(big_mib()), device="neuron", dtype=torch.float32)
+        big.fill_(0.0)
+        torch_neuronx.synchronize()
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert stats["num_alloc_deferred"] == 1, (
+            f"defer must engage exactly once; got {stats['num_alloc_deferred']}. "
+            f"VNC={vnc_hbm_mib()} MiB, staged={staged_mib()} MiB / {n_chunks()} "
+            f"chunks, big={big_mib()} MiB. Bump the fractions if pressure missed."
+        )
+        assert stats["num_ooms"] == 0, f"unexpected hard OOM: stats={stats}"
+        stage2_ok = stats["num_alloc_drain_retry_ok"] == 1
+        stage3_ok = stats["num_alloc_drain_retry_fail"] == 1
+        assert stage2_ok or stage3_ok, f"retry funnel missed: stats={stats}"
+        assert stage2_ok != stage3_ok, f"stages must be mutually exclusive: stats={stats}"
+        del big
+
+    @_requires_lazy_alloc
+    def test_defer_retry_counters_sync_baseline(self):
+        """Negative control: synchronizing before the pressure alloc must
+        not engage defer-retry, catching regressions that inflate counters
+        on unrelated allocations."""
+        stage_pending_kdeallocs()
+        torch_neuronx.synchronize()  # full drain before the pressure alloc
+
+        big = torch.empty(floats_for_mib(big_mib()), device="neuron", dtype=torch.float32)
+        big.fill_(0.0)
+        torch_neuronx.synchronize()
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert stats["num_alloc_deferred"] == 0, f"unexpected defer: stats={stats}"
+        assert stats["num_alloc_drain_retry_ok"] == 0, f"unexpected drain-retry: stats={stats}"
+        assert (
+            stats["num_alloc_drain_retry_fail"] == 0
+        ), f"unexpected drain-retry-fail: stats={stats}"
+        assert stats["num_ooms"] == 0, f"unexpected OOM: stats={stats}"
+        del big
+
+    @_requires_lazy_alloc
+    def test_alone_on_stream_oom_propagates_cleanly(self):
+        """An oversize kAlloc on an empty stream surfaces a RuntimeError
+        and records the terminal-failure counters."""
+        torch_neuronx.synchronize()
+
+        floats = floats_for_mib(oversize_mib())
+
+        with pytest.raises(RuntimeError) as excinfo:
+            big = torch.empty(floats, device="neuron", dtype=torch.float32)
+            big.fill_(0.0)
+            torch_neuronx.synchronize()
+
+        message = str(excinfo.value)
+        assert "NRT_RESOURCE" in message or "OOM" in message, f"not OOM-flavored: {message!r}"
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert stats["num_alloc_retries"] == 1, f"stats={stats}"
+        assert stats["num_ooms"] == 1, f"stats={stats}"
+
+    @_requires_lazy_alloc
+    def test_hard_oom_records_counters(self):
+        """Bottom of the funnel: defer → RetryReady → AttemptOOMRecovery →
+        cache-drain → final failure on a request that exceeds total HBM."""
+        stage_pending_kdeallocs()
+
+        floats = floats_for_mib(oversize_mib())  # > total HBM
+
+        with pytest.raises(RuntimeError):
+            big = torch.empty(floats, device="neuron", dtype=torch.float32)
+            big.fill_(0.0)
+            torch_neuronx.synchronize()
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert stats["num_alloc_retries"] >= 1, f"stats={stats}"
+        assert stats["num_ooms"] == 1, f"stats={stats}"
+
+    @_requires_lazy_alloc
+    def test_repeated_defer_retry_cycles(self):
+        """Per-OperationContext AllocState must not leak across allocations:
+        N pressure cycles must each defer once and recover silently."""
+        n_iters = 3
+
+        for _ in range(n_iters):
+            stage_pending_kdeallocs()
+            big = torch.empty(floats_for_mib(big_mib()), device="neuron", dtype=torch.float32)
+            big.fill_(0.0)
+            del big
+
+        torch_neuronx.synchronize()
+        stats = torch_neuronx.memory_stats(device=0)
+
+        assert (
+            stats["num_alloc_deferred"] == n_iters
+        ), f"expected {n_iters} defers, got {stats['num_alloc_deferred']}. stats={stats}"
+        assert stats["num_ooms"] == 0, f"unexpected hard OOM: stats={stats}"
+        stage2_total = stats["num_alloc_drain_retry_ok"] + stats["num_alloc_drain_retry_fail"]
+        assert stage2_total == stats["num_alloc_deferred"], (
+            f"every defer must resolve in stage 2; got ok="
+            f"{stats['num_alloc_drain_retry_ok']}, fail="
+            f"{stats['num_alloc_drain_retry_fail']}, deferred="
+            f"{stats['num_alloc_deferred']}"
+        )
+
+    @_requires_lazy_alloc
+    def test_synchronize_returns_when_deferred_alloc_completes(self):
+        """synchronize() must return once a Deferred kAlloc completes or escalates."""
+        stage_pending_kdeallocs()
+
+        big = torch.empty(floats_for_mib(big_mib()), device="neuron", dtype=torch.float32)
+        big.fill_(0.0)
+        torch_neuronx.synchronize()
+
+        assert big.shape[0] == floats_for_mib(big_mib())
+        del big
+
+    @_requires_lazy_alloc
+    def test_compute_behind_deferred_alloc_sees_bound_memory(self):
+        """FIFO invariant: a compute op submitted behind a Deferred kAlloc
+        must run against the bound buffer after retry, not before."""
+        stage_pending_kdeallocs()
+
+        floats = floats_for_mib(big_mib())
+        big = torch.empty(floats, device="neuron", dtype=torch.float32)
+        sentinel = 7.0
+        big.fill_(sentinel)
+        torch_neuronx.synchronize()
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert (
+            stats["num_alloc_deferred"] == 1
+        ), f"defer must engage to cover FIFO invariant; stats={stats}"
+        assert stats["num_ooms"] == 0, f"unexpected hard OOM: stats={stats}"
+        # Endpoints would be garbage if fill_() ran against unmapped memory.
+        cpu = big.cpu()
+        assert float(cpu[0].item()) == pytest.approx(
+            sentinel
+        ), f"FIFO violated: cpu[0]={cpu[0].item()} (expected {sentinel})"
+        assert float(cpu[-1].item()) == pytest.approx(
+            sentinel
+        ), f"FIFO violated: cpu[-1]={cpu[-1].item()} (expected {sentinel})"
+        del big
+
+    @_requires_lazy_alloc
+    def test_alone_on_stream_oom_surfaces_oom_error_first(self):
+        """First-exception ordering: when an OOM'd kAlloc has a dependent
+        compute behind it, the user-visible RuntimeError must describe the
+        OOM, not the downstream 'Tensor not bound' from the failed bind."""
+        torch_neuronx.synchronize()  # empty stream
+
+        floats = floats_for_mib(oversize_mib())  # > HBM total
+
+        with pytest.raises(RuntimeError) as excinfo:
+            big = torch.empty(floats, device="neuron", dtype=torch.float32)
+            big.fill_(1.0)  # would throw "Tensor not bound" if it ran
+            torch_neuronx.synchronize()
+
+        message = str(excinfo.value)
+        assert "NRT_RESOURCE" in message or "OOM" in message, f"not OOM-flavored: {message!r}"
+        assert "Tensor not bound" not in message, f"first-exception ordering regressed: {message!r}"
+
+        stats = torch_neuronx.memory_stats(device=0)
+        assert stats["num_alloc_retries"] == 1, f"stats={stats}"
+        assert stats["num_ooms"] == 1, f"stats={stats}"

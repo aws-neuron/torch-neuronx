@@ -442,6 +442,10 @@ struct DeviceMemoryStats {
   std::atomic<int64_t> num_tensor_frees{0};     // neuron_deleter calls
   std::atomic<int64_t> allocation_requests{0};  // Total allocation requests
 
+  std::atomic<int64_t> num_alloc_deferred{0};          // Fresh kAlloc OOM parked as Deferred
+  std::atomic<int64_t> num_alloc_drain_retry_ok{0};    // RetryReady Schedule succeeded
+  std::atomic<int64_t> num_alloc_drain_retry_fail{0};  // RetryReady Schedule OOM'd again
+
   void reset_peak() {
     allocated_bytes.reset_peak();
     reserved_bytes.reset_peak();
@@ -453,6 +457,9 @@ struct DeviceMemoryStats {
     num_ooms.store(0, std::memory_order_relaxed);
     num_tensor_frees.store(0, std::memory_order_relaxed);
     allocation_requests.store(0, std::memory_order_relaxed);
+    num_alloc_deferred.store(0, std::memory_order_relaxed);
+    num_alloc_drain_retry_ok.store(0, std::memory_order_relaxed);
+    num_alloc_drain_retry_fail.store(0, std::memory_order_relaxed);
   }
 
   void reset_accumulated() {
@@ -484,6 +491,9 @@ struct DeviceMemoryStatsInfo {
   int64_t num_ooms = 0;
   int64_t num_tensor_frees = 0;
   int64_t allocation_requests = 0;
+  int64_t num_alloc_deferred = 0;
+  int64_t num_alloc_drain_retry_ok = 0;
+  int64_t num_alloc_drain_retry_fail = 0;
 };
 
 /**
@@ -559,6 +569,15 @@ void RecordOOMRetry(int device_id);
 void RecordOOMFailure(
     int device_id, size_t requested_size, c10::StreamId stream_id,
     const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context);
+
+/**
+ * Lazy-alloc defer-retry counters. Called from the Fresh/Deferred/RetryReady
+ * state machine in ScheduleAllocOperation. Distinct from num_alloc_retries
+ * above (which is the 3rd-stage AttemptOOMRecovery cache-drain retry).
+ */
+void RecordAllocDeferred(int device_id);
+void RecordAllocDrainRetryOk(int device_id);
+void RecordAllocDrainRetryFail(int device_id);
 
 /**
  * Global registry for per-device memory statistics.

@@ -516,6 +516,21 @@ void RecordUnreserve(int device_id, size_t size_bytes) {
   stats.reserved_bytes.decrease(size_bytes);
 }
 
+void RecordAllocDeferred(int device_id) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_alloc_deferred.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordAllocDrainRetryOk(int device_id) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_alloc_drain_retry_ok.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordAllocDrainRetryFail(int device_id) {
+  auto& stats = DeviceMemoryStatsRegistry::Instance().GetDeviceStats(device_id);
+  stats.num_alloc_drain_retry_fail.fetch_add(1, std::memory_order_relaxed);
+}
+
 void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream_id,
                       const std::shared_ptr<NeuronMemorySnapshot::StackContext>& context) {
   auto& registry = DeviceMemoryStatsRegistry::Instance();
@@ -535,7 +550,10 @@ void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream
                " active_bytes.current=", p.active_bytes.current,
                " active_bytes.peak=", p.active_bytes.peak,
                " internal_fragmentation=", p.allocated_bytes.current - p.active_bytes.current,
-               " num_alloc_retries=", p.num_alloc_retries, " num_ooms=", p.num_ooms);
+               " num_alloc_retries=", p.num_alloc_retries, " num_ooms=", p.num_ooms,
+               " num_alloc_deferred=", p.num_alloc_deferred,
+               " num_alloc_drain_retry_ok=", p.num_alloc_drain_retry_ok,
+               " num_alloc_drain_retry_fail=", p.num_alloc_drain_retry_fail);
   }
 
   // Dump segment pool state for OOM diagnostics
@@ -652,7 +670,10 @@ DeviceMemoryStatsInfo DeviceMemoryStatsRegistry::GetMemoryStats(int device_index
       stats_ptr->num_alloc_retries.load(std::memory_order_relaxed),
       stats_ptr->num_ooms.load(std::memory_order_relaxed),
       stats_ptr->num_tensor_frees.load(std::memory_order_relaxed),
-      stats_ptr->allocation_requests.load(std::memory_order_relaxed)};
+      stats_ptr->allocation_requests.load(std::memory_order_relaxed),
+      stats_ptr->num_alloc_deferred.load(std::memory_order_relaxed),
+      stats_ptr->num_alloc_drain_retry_ok.load(std::memory_order_relaxed),
+      stats_ptr->num_alloc_drain_retry_fail.load(std::memory_order_relaxed)};
 }
 
 void DeviceMemoryStatsRegistry::ResetPeakStats(int device_index) {
@@ -710,7 +731,10 @@ void DeviceMemoryStatsRegistry::CachePeakStats(int device_index) {
                 device_stats->num_alloc_retries.load(std::memory_order_relaxed),
                 device_stats->num_ooms.load(std::memory_order_relaxed),
                 device_stats->num_tensor_frees.load(std::memory_order_relaxed),
-                device_stats->allocation_requests.load(std::memory_order_relaxed)};
+                device_stats->allocation_requests.load(std::memory_order_relaxed),
+                device_stats->num_alloc_deferred.load(std::memory_order_relaxed),
+                device_stats->num_alloc_drain_retry_ok.load(std::memory_order_relaxed),
+                device_stats->num_alloc_drain_retry_fail.load(std::memory_order_relaxed)};
   peak.timestamp_ns = GetCurrentTimeNs();
   peak.valid = true;
 }

@@ -346,7 +346,17 @@ AllocDirectKernelExecution::AllocDirectKernelExecution(const std::string& op_nam
 
 bool AllocDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                                           c10::StreamId stream_id) const {
-  c10_neuron::NeuronCachingAllocator::lazy::AllocBind(dst_ptrs_[0], size_bytes_, device_id_);
+  try {
+    c10_neuron::NeuronCachingAllocator::lazy::AllocBind(dst_ptrs_[0], size_bytes_, device_id_);
+  } catch (const torch_neuronx::ExecutionRuntimeException& e) {
+    // Surface NRT_RESOURCE via out-param so ScheduleOperation can defer-and-retry
+    // without unwinding through the error handler on the first hit.
+    if (e.HasNRTStatus() && e.GetNRTStatus() == NRT_RESOURCE) {
+      *nrt_status = NRT_RESOURCE;
+      return false;
+    }
+    throw;
+  }
   event_op_.Schedule(nrt_status, sequence_id, stream_id);
   return false;
 }

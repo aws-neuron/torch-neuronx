@@ -20,6 +20,7 @@
 #include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
 #include "torch_neuronx/csrc/core/concatenation/OpConcatUtils.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -595,18 +596,52 @@ bool OperationExecutionEngine::HandleConcatenatedExecutionFailure(OperationConte
   return false;  // Not a concatenated operation failure, handle normally
 }
 
+bool OperationExecutionEngine::ScheduleAllocOperation(OperationContext* op, StreamImpl* stream) {
+  auto& alloc_kernel = op->GetKernel<KernelTypeEnum::kAlloc>();
+  const bool is_retry = alloc_kernel.GetAllocState() ==
+                        at::neuron::AllocDirectKernelExecution::AllocState::RetryReady;
+
+  // Wall time captures the initial allocation, not retries.
+  if (!is_retry) {
+    op->execute_start = std::chrono::steady_clock::now();
+    op->neuron_stream_os_tid = getOsTid();
+  }
+
+  NRT_STATUS alloc_status = NRT_SUCCESS;
+  op->kernel_execution->Schedule(&alloc_status, &op->nrt_async_state_.sequence_id, op->stream_id);
+  const int device_id = op->kernel_execution->GetDeviceId();
+
+  if (alloc_status == NRT_RESOURCE) {
+    // RetryReady is sticky: a second NRT_RESOURCE escalates, never re-defers.
+    if (is_retry) {
+      metrics::RecordAllocDrainRetryFail(device_id);
+      throw torch_neuronx::ExecutionRuntimeException(
+          "lazy::AllocBind: NRT_RESOURCE on retry after drain", NRT_RESOURCE);
+    }
+    if (stream->TryDeferAlloc(alloc_kernel)) {
+      metrics::RecordAllocDeferred(device_id);
+      return false;
+    }
+    throw torch_neuronx::ExecutionRuntimeException(
+        "lazy::AllocBind: NRT_RESOURCE; no pending ops on stream to wait "
+        "for (cannot defer)",
+        NRT_RESOURCE);
+  }
+
+  if (is_retry) {
+    metrics::RecordAllocDrainRetryOk(device_id);
+  }
+  op->nrt_status_ = NRT_SUCCESS;
+  op->nrt_async_state_.is_pending_signal = true;
+  pending_async_ops_count_.fetch_add(1);
+  stream->AdvanceToNextOperation(op);
+  return true;
+}
+
 bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImpl* stream) {
   KernelTypeEnum kernel_type = op->GetKernelType();
   if (kernel_type == KernelTypeEnum::kAlloc) {
-    op->execute_start = std::chrono::steady_clock::now();
-    op->neuron_stream_os_tid = getOsTid();
-    op->kernel_execution->Schedule(&op->nrt_status_, &op->nrt_async_state_.sequence_id,
-                                   op->stream_id);
-    op->nrt_status_ = NRT_SUCCESS;
-    op->nrt_async_state_.is_pending_signal = true;
-    pending_async_ops_count_.fetch_add(1);
-    stream->AdvanceToNextOperation();
-    return true;
+    return ScheduleAllocOperation(op, stream);
   }
 
   // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
@@ -626,7 +661,7 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     }
     op->nrt_async_state_.is_pending_signal = true;
     pending_async_ops_count_.fetch_add(1);
-    stream->AdvanceToNextOperation();
+    stream->AdvanceToNextOperation(op);
     return true;
   }
 
