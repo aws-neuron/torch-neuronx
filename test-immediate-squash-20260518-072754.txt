@@ -1,0 +1,1 @@
+test: verify immediate squash merge at 20260518-072754
