@@ -258,24 +258,15 @@
             "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float64",
             "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
             "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
-            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float64"
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float64"
           ]
         },
         {
-          "reason": "PT 2.11 test_inplace_ops: Torch-MLIR partial lowering FX->StableHLO not supported",
+          "reason": "PT 2.11 test_inplace_ops: Backward pass requires dynamic shapes or unregistered ops in torch-mlir",
           "tests": [
-            "test_inplace_ops_propagate_requires_grad_metadata_addbmm_neuron_bfloat16",
-            "test_inplace_ops_propagate_requires_grad_metadata_addbmm_neuron_float16",
-            "test_inplace_ops_propagate_requires_grad_metadata_addbmm_neuron_float32",
-            "test_inplace_ops_propagate_requires_grad_metadata_addbmm_neuron_float64",
-            "test_inplace_ops_propagate_requires_grad_metadata_addmv_neuron_bfloat16",
-            "test_inplace_ops_propagate_requires_grad_metadata_addmv_neuron_float16",
-            "test_inplace_ops_propagate_requires_grad_metadata_addmv_neuron_float32",
-            "test_inplace_ops_propagate_requires_grad_metadata_addmv_neuron_float64",
-            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_bfloat16",
-            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float16",
-            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float32",
-            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float64",
             "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",
             "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float16",
             "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float32",
