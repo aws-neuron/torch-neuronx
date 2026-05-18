@@ -91,6 +91,7 @@ neuron_decompositions = get_decompositions(
         aten.silu,
         aten.log_sigmoid_forward,
         aten.log_sigmoid_backward,
+        aten.addmv,
     ]
 )
 
@@ -1842,6 +1843,30 @@ def native_dropout_decomposition(input, p: float, train: bool = True):
 
     y = input * mask.to(input.dtype) * scale
     return y, mask
+
+
+@register_decomposition([aten.addbmm.default])
+def addbmm(self, batch1, batch2, *, beta=1, alpha=1):
+    """Decompose addbmm: beta * self + alpha * (batch1 @ batch2).sum(dim=0)"""
+    bmm_result = torch.bmm(batch1, batch2).sum(dim=0)
+    if alpha != 1:
+        bmm_result = bmm_result * alpha
+    if beta == 0:
+        return bmm_result
+    if beta != 1:
+        self = self * beta
+    return self + bmm_result
+
+
+@register_decomposition([aten.hypot.default])
+def hypot(self, other):
+    """Numerically stable hypot: max(|a|,|b|) * sqrt(1 + (min/max)^2)."""
+    a = torch.abs(self)
+    b = torch.abs(other)
+    max_val = torch.maximum(a, b)
+    min_val = torch.minimum(a, b)
+    ratio = min_val / max_val
+    return torch.where(max_val == 0, max_val, max_val * torch.sqrt(1 + ratio * ratio))
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
