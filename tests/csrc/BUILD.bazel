@@ -551,6 +551,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "NeuronBackendTest",
+    srcs = ["core/distributed/NeuronBackendTest.cpp"],
+    deps = ["//:distributed"],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronWatchdogTest",
     srcs = ["core/distributed/NeuronWatchdogTest.cpp"],
     deps = ["//:distributed"],

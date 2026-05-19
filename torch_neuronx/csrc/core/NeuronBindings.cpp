@@ -52,6 +52,7 @@
 // Metrics
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 // Include Distributed Work and Watchdog (for async collective completion tracking)
+#include "torch_neuronx/csrc/distributed/NeuronBackend.h"
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
 // Include memory snapshot
@@ -2008,20 +2009,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // Register cleanup function that runs during module destruction
   // This happens before Python's atexit handlers and before C++ destructors
-  static auto cleanup_streams_func = +[]() {
+  static auto module_cleanup_func = +[]() {
+    // Drain any in-flight device ops submitted
+    at::neuron::drain_visible_device_streams("module_cleanup:pre");
     try {
-      auto devices = c10_neuron::get_visible_device_indices();
-      // Synchronize all initialized devices to ensure pending operations complete
-      for (auto device : devices) {
-        at::neuron::synchronize(device);
-      }
+      torch_neuronx::dispatch::NeuronDispatcher::Instance().Cleanup();
+      torch_neuronx::ops::SetPythonContiguousOp(nullptr);
+      torch_neuronx::distributed::NeuronBackend::Cleanup();
     } catch (const std::exception& e) {
-      std::cerr << "Warning: Stream cleanup failed during module destruction: " << e.what()
+      std::cerr << "Warning: Dispatcher cleanup failed during module cleanup: " << e.what()
                 << std::endl;
     } catch (...) {
-      std::cerr << "Warning: Stream cleanup failed during module destruction: unknown error"
-                << std::endl;
+      std::cerr << "Warning: Dispatcher cleanup failed during module cleanup" << std::endl;
     }
+    // Drain any lingering shelved tensors
+    at::neuron::drain_visible_device_streams("module_cleanup:post");
   };
 
   // Profiler mapping collector functions
@@ -2079,28 +2081,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "_nrt_inspect_precache_enable", []() { at::neuron::nrt::PrecacheEnable(); },
       "Enable pre-caching of profile node info during wait iterations");
 
-  // Create a capsule that will call cleanup_streams_func when the module is destroyed
-  auto cleanup_capsule = py::capsule(cleanup_streams_func);
-  m.add_object("_stream_cleanup_capsule", cleanup_capsule);
-
-  // NeuronDispatcher cleanup — release py::object members and torch::Library
-  // before Python interpreter finalization.
-  static auto cleanup_dispatcher_func = +[]() {
-    try {
-      torch_neuronx::dispatch::NeuronDispatcher::Instance().Cleanup();
-      // Release the Python contiguous op before interpreter finalization
-      torch_neuronx::ops::SetPythonContiguousOp(nullptr);
-    } catch (const std::exception& e) {
-      std::cerr << "Warning: NeuronDispatcher cleanup failed during module destruction: "
-                << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "Warning: NeuronDispatcher cleanup failed during module destruction: "
-                   "unknown error"
-                << std::endl;
-    }
-  };
-  auto dispatcher_cleanup_capsule = py::capsule(cleanup_dispatcher_func);
-  m.add_object("_dispatcher_cleanup_capsule", dispatcher_cleanup_capsule);
+  // Single cleanup capsule — explicit ordering, no dependency on attribute destruction order
+  auto cleanup_capsule = py::capsule(module_cleanup_func);
+  m.add_object("_module_cleanup_capsule", cleanup_capsule);
 
   // ============== Distributed Bindings ==============
   // NeuronWork class for tracking async collective operations
@@ -2227,4 +2210,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "Notify watchdog of new work")
       .def("enqueue_work", &torch_neuronx::distributed::NeuronWatchdog::enqueueWork,
            "Add work to monitoring queue", py::arg("work"));
+
+  py::class_<torch_neuronx::distributed::NeuronBackend, c10d::Backend,
+             c10::intrusive_ptr<torch_neuronx::distributed::NeuronBackend>>(m, "NeuronBackend")
+      .def(py::init([](const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
+                       int size, int global_world_size, py::object lower_callback) {
+             return c10::make_intrusive<torch_neuronx::distributed::NeuronBackend>(
+                 options, rank, size, global_world_size, std::move(lower_callback));
+           }),
+           py::arg("options"), py::arg("rank"), py::arg("size"), py::arg("global_world_size"),
+           py::arg("lower_callback"));
 }

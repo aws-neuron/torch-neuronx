@@ -603,9 +603,8 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     return true;
   }
 
-  bool is_pending_host_op = kernel_type == KernelTypeEnum::kEvent ||
-                            kernel_type == KernelTypeEnum::kHint ||
-                            kernel_type == KernelTypeEnum::kDealloc;
+  // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
+  bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
     // Wait events need prior async ops to drain first
@@ -622,6 +621,9 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   }
 
   // Device ops: XU inflight throttling and device scheduling
+  EXECUTION_RUNTIME_CHECK(IsDeviceKernelType(kernel_type),
+                          "ScheduleOperation reached device-op path with non-device kernel type: ",
+                          static_cast<int>(kernel_type));
   EXECUTION_RUNTIME_CHECK(stream->device_index >= 0 && stream->device_index < kMaxDevices,
                           "device_index out of bounds: ", stream->device_index);
   size_t xu_idx = GetXUIndex(kernel_type);

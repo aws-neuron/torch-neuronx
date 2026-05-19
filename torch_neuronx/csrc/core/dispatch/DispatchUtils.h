@@ -143,6 +143,16 @@ bool IsSupportedDtype(c10::ScalarType dt);
  */
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema);
 
+/**
+ * Downcast a vector of tensors in-place to Neuron-supported dtypes.
+ * Float64 → Float32; unsupported int types → Int32 (unless IsNativeInt64Enabled).
+ * Returns true iff any tensor was downcasted.
+ *
+ * Used by the C++ process-group collective path, which lacks a FunctionSchema
+ * to drive DowncastArgs. Leaves already-supported tensors untouched (by identity).
+ */
+bool DowncastTensorList(std::vector<at::Tensor>& tensors);
+
 // ═══════════════════════════════════════════════════════════════
 //  Debug logging helpers
 //

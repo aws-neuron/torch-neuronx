@@ -1355,7 +1355,11 @@ class TestReduceScatter(BaseCollectiveOpTest):
     # DEVICE & MEMORY TESTS
     # ========================================================================
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_non_neuron_device(self):
         """Test with tensors not on neuron device."""
         self.distributed_tester.run_test(run_non_neuron_device_test)
