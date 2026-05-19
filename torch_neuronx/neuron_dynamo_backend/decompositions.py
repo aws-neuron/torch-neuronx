@@ -956,6 +956,12 @@ def index_copy(
     if dim < 0:
         dim = input.dim() + dim
 
+    # 0-d (scalar) tensors: scatter requires ≥1-d, so handle directly.
+    # CPU semantics: dim must be 0, index has one element (value 0),
+    # source is 0-d → result is the source value with input's shape.
+    if input.dim() == 0:
+        return source.reshape(input.shape)
+
     # Build target shape: 1s everywhere except at dim where we keep index size
     target_shape = [1] * source.dim()
     target_shape[dim] = index.numel()
