@@ -142,6 +142,10 @@ class TestIndexSelect:
         # This triggers CPU fallback which fails with IndexError about vector requirement
         torch.index_select(input_neuron, dim=0, index=indices.to(device))
 
+    @pytest.mark.xfail(
+        condition=os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "0") == "0",
+        reason="CPU fallback modifies out= tensor, removing overlap",
+    )
     @assert_raises(RuntimeError, match="unsupported operation")
     def test_index_select_out_internal_overlap(self):
         """Test index_select raises RuntimeError when out= has internal memory overlap.
