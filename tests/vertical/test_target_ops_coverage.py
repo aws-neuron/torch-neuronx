@@ -22,9 +22,42 @@ import torch_neuronx
 
 # Add testing module to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from internal import NeuronOpInfo, build_neuron_op_db
+from internal import NeuronOpInfo
+from internal.common import (
+    STATUS_RANK as _STATUS_RANK,
+)
+from internal.common import (
+    allocate_to_device as _allocate_to_device,
+)
+from internal.common import (
+    build_params as _build_params_for,
+)
+from internal.common import (
+    classify_error as _classify_error,
+)
+from internal.common import (
+    classify_op as _classify_op,
+)
+from internal.common import (
+    flatten_tensors as _flatten_tensors,  # re-export for tests/vertical/test_probe.py
+)
+from internal.common import (
+    get_neuron_op_db,
+)
+from internal.common import (
+    has_pu1 as _has_pu1,
+)
+from internal.common import (
+    is_composite as _is_composite,
+)
+from internal.common import (
+    probe_output_meta as _probe_output_meta,
+)
+from internal.common import (
+    reset_cache_dirs as _reset_cache_dirs,
+)
 from internal.neuron_op_info import _resolve_op
-from internal.target_ops import TARGET_ATEN_OP_GROUP, TARGET_ATEN_OPS
+from internal.roofline import compute_roofline
 
 logger = logging.getLogger(__name__)
 
@@ -41,113 +74,8 @@ if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:
     )
 _SESSION_TIMESTAMP = os.environ["NEURON_COVERAGE_TIMESTAMP"]
 
-# Build the op database
-neuron_op_db = build_neuron_op_db(
-    target_ops=TARGET_ATEN_OPS,
-    target_op_groups=TARGET_ATEN_OP_GROUP,
-)
-
-
-def _allocate_to_device(data, device):
-    if isinstance(data, torch.Tensor):
-        return data.detach().clone().to(device)
-    elif isinstance(data, list | tuple):
-        return type(data)(_allocate_to_device(item, device) for item in data)
-    elif isinstance(data, dict):
-        return {k: _allocate_to_device(v, device) for k, v in data.items()}
-    return data
-
-
-def _has_pu1(op_name: str) -> bool:
-    clean = op_name.replace("aten::", "")
-    parts = clean.split(".", 1)
-    base, overload = parts[0], (parts[1] if len(parts) > 1 else "default")
-    try:
-        pkt = getattr(torch.ops.aten, base, None)
-        if pkt is None:
-            return False
-        op = getattr(pkt, overload, None)
-        if op is None:
-            return False
-        schema = op._schema
-        q = f"{schema.name}.{schema.overload_name}" if schema.overload_name else str(schema.name)
-        return torch._C._dispatch_has_kernel_for_dispatch_key(q, torch._C.DispatchKey.PrivateUse1)
-    except Exception:
-        return False
-
-
-def _is_composite(op_name: str) -> bool:
-    clean = op_name.replace("aten::", "")
-    parts = clean.split(".", 1)
-    base, overload = parts[0], (parts[1] if len(parts) > 1 else "default")
-    try:
-        pkt = getattr(torch.ops.aten, base, None)
-        if pkt is None:
-            return False
-        op = getattr(pkt, overload, None)
-        if op is None:
-            return False
-        schema = op._schema
-        q = f"{schema.name}.{schema.overload_name}" if schema.overload_name else str(schema.name)
-        return torch._C._dispatch_has_kernel_for_dispatch_key(
-            q, torch._C.DispatchKey.CompositeImplicitAutograd
-        ) or torch._C._dispatch_has_kernel_for_dispatch_key(
-            q, torch._C.DispatchKey.CompositeExplicitAutograd
-        )
-    except Exception:
-        return False
-
-
-def _classify_op(op_name: str) -> str:
-    if _has_pu1(op_name):
-        return "registered"
-    if _is_composite(op_name):
-        return "composite"
-    return "unknown"
-
-
-def _classify_error(exc_str: str) -> str:
-    if "Could not run" in exc_str and "backend" in exc_str:
-        return "missing"
-    if "NYI" in exc_str or "not yet implemented" in exc_str.lower():
-        return "missing"
-    if "op not found" in exc_str:
-        return "missing"
-    if "CPU fallback disabled" in exc_str:
-        return "failed_lowering"
-    if "_copy_from_and_resize" in exc_str:
-        return "failed_lowering"
-    if "got an unexpected keyword argument" in exc_str:
-        return "failed_lowering"
-    if "Expected PythonKernelHolder" in exc_str:
-        return "failed_lowering"
-    if "only supports CPU" in exc_str:
-        return "missing"
-    # Type mismatches from wrong sample inputs — not a real failure
-    if "Expected a value of type" in exc_str and "but instead found type" in exc_str:
-        return "pending_registry"
-    if "is missing value for argument" in exc_str:
-        return "pending_registry"
-    if "expected at most" in exc_str and "argument(s) but received" in exc_str:
-        return "pending_registry"
-    if "scalar tensor expected to be 0 dim" in exc_str:
-        return "pending_registry"
-    if "Unknown keyword argument" in exc_str:
-        return "pending_registry"
-    if "takes" in exc_str and "positional argument(s) but" in exc_str:
-        return "pending_registry"
-    if "specified both as positional and keyword" in exc_str:
-        return "pending_registry"
-    if "Expected out tensor to have dtype" in exc_str:
-        return "pending_registry"
-    if "Expected result to be of dtype" in exc_str:
-        return "pending_registry"
-    if "Dimension specified as" in exc_str and "tensor has no dimensions" in exc_str:
-        return "pending_registry"
-    if "list assignment index out of range" in exc_str:
-        return "pending_registry"
-
-    return "failed_lowering"
+# Build the op database (shared cached helper; see internal.common)
+neuron_op_db = get_neuron_op_db()
 
 
 def _save_result(result: dict):
@@ -162,19 +90,7 @@ def _save_result(result: dict):
 
 
 def _build_params():
-    params = []
-    for op_info in neuron_op_db:
-        params.append(pytest.param(op_info, id=f"{op_info.op_name}[{op_info.op_group}]"))
-    return params
-
-
-# Worst-case ordering when aggregating across shapes. Higher rank = worse.
-_STATUS_RANK = {
-    "supported": 0,
-    "pending_registry": 1,
-    "missing": 2,
-    "failed_lowering": 3,
-}
+    return _build_params_for(neuron_op_db)
 
 
 def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
@@ -192,9 +108,32 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
         "fallback": [],
         "error": "",
         "correctness": "",
+        "t_roofline_ms": None,
+        "t_compute_ms": None,
+        "t_memory_ms": None,
     }
 
     sample.kwargs.pop("requires_grad", None)
+
+    # Compute roofline from CPU-side inputs before device allocation
+    # Handle List[Tensor] inputs (foreach ops) by unwrapping lists
+    input_tensors = []
+    for t in (sample.input, *sample.args):
+        if isinstance(t, torch.Tensor):
+            input_tensors.append(t)
+        elif isinstance(t, list | tuple):
+            input_tensors.extend(x for x in t if isinstance(x, torch.Tensor))
+    dtype = input_tensors[0].dtype if input_tensors else torch.float32
+    # Probe output shape/dtype via FakeTensorMode / meta (no real kernel run,
+    # no memory allocation). Works for ops without a CPU kernel (most
+    # Neuron-only ops have meta kernels registered by PyTorch). On failure,
+    # compute_roofline falls back to input-size estimates.
+    output_tensors = _probe_output_meta(op, sample)
+    roofline = compute_roofline(op_name, input_tensors, output_tensors=output_tensors, dtype=dtype)
+    if roofline:
+        out["t_roofline_ms"] = roofline["t_roofline_ms"]
+        out["t_compute_ms"] = roofline["t_compute_ms"]
+        out["t_memory_ms"] = roofline["t_memory_ms"]
 
     try:
         neuron_args = tuple(_allocate_to_device(a, "neuron") for a in (sample.input, *sample.args))
@@ -208,6 +147,14 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
     torch_neuronx.clear_op_tracking()
 
     try:
+        # Ensure a cold compile for time_to_first_ms — clear the worker's
+        # HLO+NEFF cache contents so no previously-compiled primitive from a
+        # sibling op leaks into this op's first invocation.
+        _reset_cache_dirs(
+            os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache"),
+            os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
+        )
+
         start = time.perf_counter()
         with torch.no_grad():
             _ = op(*neuron_args, **neuron_kwargs)
@@ -230,7 +177,8 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
     out["executed"] = sorted(set(torch_neuronx.get_executed_ops()))
     out["fallback"] = sorted(set(torch_neuronx.get_fallback_ops()))
 
-    if not out["fallback"]:
+    has_cpu_roundtrip = "neuron::copy::neuron_to_cpu" in out["executed"]
+    if not out["fallback"] and not has_cpu_roundtrip:
         out["status"] = "supported"
         if _has_pu1(op_name):
             out["supported_by"] = "registered"
@@ -241,13 +189,16 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
     else:
         out["status"] = "missing"
 
-    for _ in range(NUM_EXEC_ITERATIONS):
+    # NUM_EXEC_ITERATIONS + 1 iterations; discard the first (warmup) so
+    # exec_{avg,min,max}_ms reflect steady-state execution.
+    for i in range(NUM_EXEC_ITERATIONS + 1):
         torch_neuronx.synchronize()
         start = time.perf_counter()
         with torch.no_grad():
             _ = op(*neuron_args, **neuron_kwargs)
         torch_neuronx.synchronize()
-        out["exec_times"].append((time.perf_counter() - start) * 1000)
+        if i > 0:  # skip warmup
+            out["exec_times"].append((time.perf_counter() - start) * 1000)
 
     if out["status"] == "supported":
         try:
@@ -272,12 +223,20 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
             out["correctness"] = "pass"
         except Exception as e:
             exc_str = str(e)
-            if "backend" in exc_str and (
-                "Could not run" in exc_str or "not implemented" in exc_str
-            ):
-                out["correctness"] = "skip_no_cpu"
-            else:
-                out["correctness"] = "fail"
+            # CPU-side limitation (not a Neuron bug) — mark skip_no_cpu so the
+            # dashboard doesn't falsely flag the op as a Neuron regression.
+            #   - "Could not run ... backend":   no CPU kernel at all
+            #   - "not implemented for":         CPU kernel exists but rejects the dtype
+            #                                    (e.g. "lshift_cpu not implemented for 'Float'")
+            #   - "does not support":            CPU kernel limitation on output shape/dtype
+            #                                    (e.g. "signbit does not support non-boolean
+            #                                    outputs")
+            is_cpu_gap = (
+                ("backend" in exc_str and "Could not run" in exc_str)
+                or "not implemented for" in exc_str
+                or "does not support" in exc_str
+            )
+            out["correctness"] = "skip_no_cpu" if is_cpu_gap else "fail"
             if not out["error"]:
                 out["error"] = (
                     f"correctness: {exc_str.replace(chr(10),' ').replace(chr(13),'')[:200]}"
@@ -304,10 +263,14 @@ def _aggregate_into(result: dict, per_shape: list[dict], classification: str) ->
         else classification
     )
 
-    # If every shape hit the pending_registry short-circuit (status promoted to
-    # supported/missing via dispatch key but each had a bad-input error with no
-    # real execution), surface that as pending_registry for the dashboard.
-    if all(r["error"] and not r["exec_times"] for r in per_shape):
+    # Bad-input short-circuit: when every shape hit the pending_registry
+    # classification in _run_one_sample, each per-shape was promoted to
+    # status="supported" via dispatch-key classification but still carries the
+    # bad-input error and no real execution timings. That (and only that) is
+    # what we want to surface as input_source=pending_registry for the
+    # dashboard. Ops that legitimately execute and then failed_lowering /
+    # missing must keep their real input_source.
+    if all(r["status"] == "supported" and r["error"] and not r["exec_times"] for r in per_shape):
         result["input_source"] = "pending_registry"
 
     result["error"] = worst["error"]
@@ -328,13 +291,42 @@ def _aggregate_into(result: dict, per_shape: list[dict], classification: str) ->
         result["exec_min_ms"] = f"{min(all_times):.3f}"
         result["exec_max_ms"] = f"{max(all_times):.3f}"
 
+    # Roofline: pick the roofline for the shape that produced the slowest execution
+    slowest_shape = max(
+        (r for r in per_shape if r["exec_times"]),
+        key=lambda r: max(r["exec_times"]),
+        default=None,
+    )
+    if slowest_shape and slowest_shape.get("t_roofline_ms"):
+        result["t_roofline_ms"] = f"{slowest_shape['t_roofline_ms']:.4f}"
+        result["t_compute_ms"] = f"{slowest_shape['t_compute_ms']:.4f}"
+        result["t_memory_ms"] = f"{slowest_shape['t_memory_ms']:.4f}"
+        result["bound"] = (
+            "compute" if slowest_shape["t_compute_ms"] > slowest_shape["t_memory_ms"] else "memory"
+        )
+        exec_max = float(result.get("exec_max_ms", 0))
+        roofline = slowest_shape["t_roofline_ms"]
+        if roofline > 0 and exec_max > 0:
+            result["roofline_ratio"] = f"{exec_max / roofline:.2f}"
+
+    # Correctness is reported only when the aggregated op status is
+    # ``supported``. If the op as a whole failed (some shape hit
+    # failed_lowering / missing), a stray "pass" from a lucky shape is
+    # misleading; the error column already conveys the failure. A "fail"
+    # from any shape still wins over "pass" so real regressions are visible.
     correctness = {r["correctness"] for r in per_shape} - {""}
     if "fail" in correctness:
         result["correctness_test"] = "fail"
-    elif "pass" in correctness:
-        result["correctness_test"] = "pass"
-    elif "skip_no_cpu" in correctness:
-        result["correctness_test"] = "skip_no_cpu"
+        if not result["error"]:
+            for r in per_shape:
+                if r["correctness"] == "fail" and r["error"]:
+                    result["error"] = r["error"]
+                    break
+    elif result["status"] == "supported":
+        if "pass" in correctness:
+            result["correctness_test"] = "pass"
+        elif "skip_no_cpu" in correctness:
+            result["correctness_test"] = "skip_no_cpu"
 
 
 class TestTargetOpsCoverage:
@@ -365,6 +357,11 @@ class TestTargetOpsCoverage:
             "error": "",
             "last_updated": "",
             "correctness_test": "",
+            "t_roofline_ms": "",
+            "t_compute_ms": "",
+            "t_memory_ms": "",
+            "bound": "",
+            "roofline_ratio": "",
         }
 
         if not op_info.op_resolved:
@@ -376,13 +373,22 @@ class TestTargetOpsCoverage:
         try:
             samples = list(op_info.sample_inputs("cpu", torch.float32, requires_grad=False))
         except Exception as e:
-            result["error"] = f"sample_inputs failed: {str(e)[:100]}"
-            result["status"] = (
-                "supported" if classification in ("registered", "composite") else "missing"
-            )
-            result["input_source"] = "pending_registry"
+            exc_str = str(e)
+            result["error"] = f"sample_inputs failed: {exc_str[:200]}"
+            err_class = _classify_error(exc_str)
+            if err_class in ("failed_lowering", "missing"):
+                # A real Neuron/dispatch failure happened while building the
+                # sample — surface it as that, not as "no input available".
+                result["status"] = err_class
+            else:
+                result["status"] = (
+                    "no_input_sample"
+                    if classification in ("registered", "composite")
+                    else "missing"
+                )
+                result["input_source"] = "pending_registry"
             _save_result(result)
-            pytest.skip(f"{op_name}: pending_registry")
+            pytest.skip(f"{op_name}: {result['status']}")
 
         # Filter out scalar/0-d inputs for topk — triggers compiler crash
         if "topk" in op_name:
@@ -396,7 +402,7 @@ class TestTargetOpsCoverage:
         if not samples:
             result["error"] = "no shapes registered"
             result["status"] = (
-                "supported" if classification in ("registered", "composite") else "missing"
+                "no_input_sample" if classification in ("registered", "composite") else "missing"
             )
             result["input_source"] = "pending_registry"
             _save_result(result)

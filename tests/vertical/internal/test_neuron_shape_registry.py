@@ -260,6 +260,145 @@ class TestNeuronShapeRegistry:
         assert s["total_shapes"] == 3
 
 
+# ── Propagation to compatible overloads ─────────────────────────────────────
+
+
+class TestPropagation:
+    """Pre-propagation of base-op entries onto schema-compatible overloads.
+
+    These tests exercise the runtime-free replacement for the legacy
+    ``.out`` / ``.default`` fallbacks in ``NeuronOpInfo._registry_entries``.
+    """
+
+    def test_propagates_to_out_variant(self):
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::amax",
+            {"self": (4, 4), "dim": [0], "keepdim": False},
+            source="builtin",
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        assert n == 1
+        assert reg.has("aten::amax.out")
+        # source attribution preserved
+        assert "builtin" in reg.get("aten::amax.out")[0].sources
+
+    def test_skips_already_registered(self):
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::amax",
+            {"self": (4, 4), "dim": [0], "keepdim": False},
+            source="builtin",
+        )
+        reg.register(
+            "aten::amax.out",
+            {"self": (256, 256), "dim": [0], "keepdim": False, "out": (1, 256)},
+            source="manual",
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        assert n == 0
+        # existing entry untouched; no extra shape appended
+        entries = reg.get("aten::amax.out")
+        assert len(entries) == 1
+        assert entries[0].arg_shapes["self"] == (256, 256)
+
+    def test_skips_schema_incompatible(self):
+        reg = NeuronShapeRegistry()
+        # scatter.src entry has `src:` positional; scatter.value_out expects
+        # `value: Scalar` (required, no default). Copying the entry would
+        # leave `value` missing in the propagated sample.
+        reg.register(
+            "aten::scatter.src",
+            {
+                "self": (8, 8),
+                "dim": 0,
+                "index": {"shape": (8, 8), "dtype": "long"},
+                "src": (8, 8),
+            },
+            source="builtin",
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::scatter.src", "aten::scatter.value_out"})
+        assert n == 0
+        assert not reg.has("aten::scatter.value_out")
+
+    def test_idempotent(self):
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::amax",
+            {"self": (4, 4), "dim": [0], "keepdim": False},
+            source="builtin",
+        )
+        reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        # Second call is a no-op because tgt is now registered (has(tgt) skip).
+        n = reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        assert n == 0
+        assert len(reg.get("aten::amax.out")) == 1
+
+    def test_does_not_propagate_from_writeout_to_non_writeout(self):
+        """Propagation is src-is-non-writeout → tgt-is-writeout (or .default)."""
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::amax.out",
+            {"self": (8, 8), "dim": [0], "keepdim": False, "out": (1, 8)},
+            source="manual",
+        )
+        reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        # aten::amax (base, non-writeout) is NOT a write-out variant, and
+        # amax.out's extra kwarg is write-only, so the schema pair is still
+        # compatible; but amax's schema lacks `out` so entries CAN in theory
+        # propagate backward. The implementation specifically gates targets on
+        # being write-out (or .default), so the non-writeout base is untouched.
+        assert not reg.has("aten::amax")
+
+    def test_skips_required_kwarg_without_default(self):
+        """A target with a required NON-write-alias kwarg (no default) is incompatible.
+
+        Regression: aten::scatter.reduce_out has ``str reduce`` as a required
+        kwarg. An entry from aten::scatter.src lacks it — propagating would
+        silently produce an invalid sample at test time.
+        """
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::scatter.src",
+            {
+                "self": (8, 8),
+                "dim": 0,
+                "index": {"shape": (8, 8), "dtype": "long"},
+                "src": (8, 8),
+            },
+            source="builtin",
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::scatter.src", "aten::scatter.reduce_out"})
+        assert n == 0
+        assert not reg.has("aten::scatter.reduce_out")
+
+    def test_skips_dimname_variant_from_int_dim_entry(self):
+        """Type-aware compat: an entry with ``dim: int`` must NOT propagate to
+        a sibling schema whose ``dim`` is ``str`` / ``List[str]`` (dimname
+        variants). Previously only arg names were checked; value-type
+        incompatibilities silently produced invalid propagated entries."""
+        reg = NeuronShapeRegistry()
+        # aten::all.dim takes `dim: int`, .dimname_out takes `dim: str`.
+        reg.register(
+            "aten::all.dim",
+            {"self": (256, 4096), "dim": 1, "keepdim": False},
+            source="builtin",
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::all.dim", "aten::all.dimname_out"})
+        assert n == 0
+        assert not reg.has("aten::all.dimname_out")
+
+    def test_propagates_to_default_sibling(self):
+        """Base dotless → .default overload coverage (replaces legacy fallback)."""
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::linear", {"input": (4, 8), "weight": (16, 8), "bias": None}, source="builtin"
+        )
+        n = reg.propagate_to_compatible_overloads({"aten::linear", "aten::linear.default"})
+        assert n == 1
+        assert reg.has("aten::linear.default")
+
+
 # ── NeuronOpInfo ─────────────────────────────────────────────────────────────
 
 
