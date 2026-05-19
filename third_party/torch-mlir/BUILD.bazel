@@ -917,6 +917,12 @@ cc_import(
     shared_library = "//:_C.so",
 )
 
+# Import _mlir.so so _stablehlo.so can link against it for MLIR Python symbols
+cc_import(
+    name = "_mlir_import",
+    shared_library = ":_mlir.so",
+)
+
 cc_binary(
     name = "_mlir.so",
     srcs = ["@llvm-project//mlir:lib/Bindings/Python/MainModule.cpp"],
@@ -929,6 +935,7 @@ cc_binary(
     linkshared = 1,
     deps = [
         ":_C_import",
+        "@stablehlo//:stablehlo_unified_capi_objects",
         ":TorchMLIRBindingsPythonCore",
         "@llvm-project//mlir:MLIRBindingsPythonNanobindHeadersAndDeps",
         "@nanobind",
@@ -970,4 +977,36 @@ cc_binary(
     name = "libmlir_runner_utils.so",
     linkshared = 1,
     deps = ["@llvm-project//mlir:mlir_runner_utils"],
+)
+
+# ===========================================================================
+# _stablehlo.so — nanobind extension for StableHLO Python bindings
+# ===========================================================================
+
+cc_binary(
+    name = "_stablehlo.so",
+    srcs = [
+        "@stablehlo//:stablehlo/integrations/python/StablehloModule.cpp",
+        "@stablehlo//:stablehlo/integrations/python/StablehloApi.cpp",
+        "@stablehlo//:stablehlo/integrations/python/StablehloApi.h",
+    ],
+    copts = [
+        "-DMLIR_PYTHON_PACKAGE_PREFIX=torch_mlir.",
+        "-fexceptions",
+        "-frtti",
+    ],
+    features = ["-use_header_modules"],
+    linkopts = [
+        "-Wl,--no-as-needed",
+        "-Wl,-soname,_stablehlo.so",
+    ],
+    linkshared = 1,
+    deps = [
+        ":_mlir_import",
+        "@stablehlo//:stablehlo_capi_headers",
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeadersAndDeps",
+        "@nanobind",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
 )
