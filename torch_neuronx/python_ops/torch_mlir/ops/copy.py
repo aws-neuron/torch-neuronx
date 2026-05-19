@@ -17,9 +17,6 @@ def _copy_fn(src, out_dtype=None, out=None):
     produce an unsupported tensor<Nxindex> constant in StableHLO).
     """
     if out_dtype is not None:
-        # Float-to-int requires explicit truncation to match PyTorch semantics
-        if out_dtype in (torch.int32, torch.int16, torch.int8) and src.is_floating_point():
-            src = src.trunc()
         return src.to(out_dtype) + 0
     return src + 0
 
@@ -104,8 +101,6 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         if not dest.is_contiguous():
             from ...cast_policy import _write_to_noncontiguous_neuron
 
-            if src_prepared.dtype != dest.dtype:
-                src_prepared = src_prepared.to(dest.dtype)
             _write_to_noncontiguous_neuron(dest, src_prepared)
             return ExecutionResult(success=True, output=dest)
 

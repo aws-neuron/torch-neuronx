@@ -206,7 +206,7 @@ def test_to_copy_neuron_to_neuron_dtype_combinations(src_dtype, dst_dtype):
 
     # Verify MLIR rejects unsupported dtypes
     impl = ToCopyMLIRImpl()
-    mlir_unsupported = {torch.bool, torch.float64, torch.int64, torch.uint64}
+    mlir_unsupported = {torch.bool, torch.float64, torch.int32, torch.int64, torch.uint64}
     if src_dtype in mlir_unsupported or dst_dtype in mlir_unsupported:
         assert not impl.can_handle(src, dtype=dst_dtype, device="neuron")
 
