@@ -23,6 +23,7 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
   using OperationExecutionEngine::hint_ownership_map_;
   using OperationExecutionEngine::pending_async_ops_count_;
   using OperationExecutionEngine::ProcessCompletions;
+  using OperationExecutionEngine::ScheduleOperation;
 };
 
 // Wrapper for backward compatibility

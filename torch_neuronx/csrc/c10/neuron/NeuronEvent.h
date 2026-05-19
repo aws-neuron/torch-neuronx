@@ -22,7 +22,8 @@ struct EventImpl {
   std::atomic<bool> is_recorded{false};
   std::atomic<bool> is_completed{false};
   c10::DeviceIndex device_index = -1;
-  int64_t recorded_stream_id = -1;
+  // Written by Python thread in record(), read by runtime worker.
+  std::atomic<int64_t> recorded_stream_id{-1};
   bool enable_timing = false;
   bool blocking = false;
 };
@@ -67,6 +68,11 @@ class NeuronEvent {
 
   /// Get the device index where this event was recorded
   c10::DeviceIndex device_index() const { return impl_->device_index; }
+
+  /// Stream ID on which this event was recorded, or -1 if never recorded.
+  int64_t recorded_stream_id() const noexcept {
+    return impl_->recorded_stream_id.load(std::memory_order_relaxed);
+  }
 
   /// Complete the event (used by stream for async completion)
   void complete_event() const {
