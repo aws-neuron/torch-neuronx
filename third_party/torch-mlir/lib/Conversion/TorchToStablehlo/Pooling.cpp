@@ -72,6 +72,83 @@ static Value createInitialValueForAtenPoolingOp(Operation *op, Type elementTy,
   return nullptr;
 }
 
+// Compute per-axis [low, high] padding for a pool op
+// Ceil-mode adds trailing padding to match PyTorch's output size; see
+// https://github.com/pytorch/pytorch/blob/c5de6ff079e3e5b453d6ff5190c90f02db458928/aten/src/ATen/native/Pool.h#L79
+static SmallVector<std::pair<int64_t, int64_t>>
+computePoolPadding(ArrayRef<int64_t> inputShape, ArrayRef<int64_t> kernelSize,
+                   ArrayRef<int64_t> stride, ArrayRef<int64_t> padding,
+                   bool ceilMode, int64_t dim) {
+  const int64_t rank = inputShape.size();
+  const int64_t spatialStart = rank - dim;
+  SmallVector<std::pair<int64_t, int64_t>> result(rank, {0, 0});
+
+  for (int64_t i = 0; i < dim; ++i) {
+    const int64_t axis = spatialStart + i;
+    int64_t low = padding[i];
+    int64_t high = padding[i];
+
+    if (ceilMode) {
+      const int64_t inputSize = inputShape[axis];
+      if (inputSize != ShapedType::kDynamic) {
+        const int64_t numerator =
+            inputSize + 2 * padding[i] - (kernelSize[i] - 1) - 1;
+        const int64_t floorOut = numerator / stride[i] + 1;
+        const int64_t adj = stride[i] - 1;
+        int64_t ceilOut = (numerator + adj) / stride[i] + 1;
+        if ((ceilOut - 1) * stride[i] >= inputSize + padding[i])
+          ceilOut--;
+        if (ceilOut > floorOut) {
+          const int64_t extra = (ceilOut - floorOut) * stride[i];
+          high += extra;
+        }
+      }
+    }
+
+    result[axis] = {low, high};
+  }
+  return result;
+}
+
+static void splitPoolPaddingForStablehloPad(
+    ArrayRef<std::pair<int64_t, int64_t>> poolPadding,
+    SmallVectorImpl<int64_t> &padLow, SmallVectorImpl<int64_t> &padHigh,
+    SmallVectorImpl<int64_t> &padInterior) {
+  const int64_t rank = poolPadding.size();
+  padLow.clear();
+  padHigh.clear();
+  padInterior.clear();
+  padLow.reserve(rank);
+  padHigh.reserve(rank);
+  padInterior.assign(rank, 0);
+  for (auto &p : poolPadding) {
+    padLow.push_back(p.first);
+    padHigh.push_back(p.second);
+  }
+}
+
+// Pad `input` with `padValue` per the given [low, high] pairs; no-op if all
+// padding is zero.
+static Value applyExplicitPad(
+    Location loc, Value input, Value padValue,
+    ArrayRef<std::pair<int64_t, int64_t>> poolPadding,
+    ConversionPatternRewriter &rewriter) {
+  SmallVector<int64_t> padLow, padHigh, padInterior;
+  splitPoolPaddingForStablehloPad(poolPadding, padLow, padHigh, padInterior);
+  bool anyNonZero = false;
+  for (auto v : padLow)
+    anyNonZero |= (v != 0);
+  for (auto v : padHigh)
+    anyNonZero |= (v != 0);
+  if (!anyNonZero)
+    return input;
+  return stablehlo::PadOp::create(
+      rewriter, loc, input, padValue,
+      rewriter.getDenseI64ArrayAttr(padLow),
+      rewriter.getDenseI64ArrayAttr(padHigh),
+      rewriter.getDenseI64ArrayAttr(padInterior));
+}
+
 // AtenMaxPool1dWithIndicesOp
 template <>
 LogicalResult ConvertAtenOp<AtenMaxPool1dWithIndicesOp>::matchAndRewrite(
@@ -250,10 +327,13 @@ LogicalResult ConvertAtenOp<AtenMaxPool1dWithIndicesOp>::matchAndRewrite(
 }
 
 // AtenMaxPool2dWithIndicesOp
+//
+// Indices are row-major flat offsets into the H*W plane per (n, c) slice.
 template <>
 LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
     AtenMaxPool2dWithIndicesOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
   Value input = adaptor.getSelf();
   auto inputTy = cast<RankedTensorType>(input.getType());
   auto inputElemTy = inputTy.getElementType();
@@ -268,87 +348,51 @@ LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
     return op.emitError(
         "max_pooling2d only supports inputs with rank higher than 2");
   }
+
   SmallVector<int64_t, 2> padding, kernelSize, stride, dilation;
   bool ceilMode = false;
-
-  if (!(matchPattern(op.getKernelSize(),
-                     m_TorchListOfConstantInts(kernelSize)))) {
-    return rewriter.notifyMatchFailure(
-        op, "non-const int kernel size unsupported!");
-  }
-  if (!(matchPattern(op.getStride(), m_TorchListOfConstantInts(stride)))) {
-    // If stride is not provided, default to kernel_size
+  if (!matchPattern(op.getKernelSize(), m_TorchListOfConstantInts(kernelSize)))
+    return rewriter.notifyMatchFailure(op, "non-const kernel_size");
+  if (!matchPattern(op.getStride(), m_TorchListOfConstantInts(stride))) {
     if (isa<Torch::NoneType>(op.getStride().getType()) || stride.empty()) {
       stride = kernelSize;
     } else {
-      return rewriter.notifyMatchFailure(op,
-                                         "non-const int stride unsupported!");
+      return rewriter.notifyMatchFailure(op, "non-const stride");
     }
   }
-  // If stride was successfully parsed but is empty, default to kernel_size
-  if (stride.empty()) {
+  if (stride.empty())
     stride = kernelSize;
-  }
-  if (!(matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding)))) {
-    return rewriter.notifyMatchFailure(op,
-                                       "non-const int padding unsupported!");
-  }
-  if (!(matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilation)))) {
-    return rewriter.notifyMatchFailure(op,
-                                       "non-const int dilation unsupported!");
-  }
-  if (!(matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode)))) {
-    return rewriter.notifyMatchFailure(op,
-                                       "non-const bool ceil_mode unsupported!");
-  }
+  if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding)))
+    return rewriter.notifyMatchFailure(op, "non-const padding");
+  if (!matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilation)))
+    return rewriter.notifyMatchFailure(op, "non-const dilation");
+  if (!matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode)))
+    return rewriter.notifyMatchFailure(op, "non-const ceil_mode");
 
-  // prepend 1 to kernelSize, stride, dilation until they are of same rank as
-  // input
-  SmallVector<int64_t> stablehloStride(inputRank, 1);
-  SmallVector<int64_t> stablehloDilation(inputRank, 1);
-  SmallVector<int64_t> stablehloKernelSize(inputRank, 1);
-  SmallVector<int64_t> stablehloPadding(inputRank * 2, 0);
-  std::copy(dilation.begin(), dilation.end(),
-            stablehloDilation.begin() + inputRank - 2);
-  std::copy(stride.begin(), stride.end(),
-            stablehloStride.begin() + inputRank - 2);
+  SmallVector<int64_t> winDims(inputRank, 1);
+  SmallVector<int64_t> winStrides(inputRank, 1);
   std::copy(kernelSize.begin(), kernelSize.end(),
-            stablehloKernelSize.begin() + inputRank - 2);
+            winDims.begin() + inputRank - 2);
+  std::copy(stride.begin(), stride.end(),
+            winStrides.begin() + inputRank - 2);
 
-  Value initVal = createInitialValueForAtenPoolingOp(op, inputElemTy, rewriter);
-
-  stablehloPadding[stablehloPadding.size() - 4] = padding[0];
-  stablehloPadding[stablehloPadding.size() - 3] = padding[0];
-  stablehloPadding[stablehloPadding.size() - 2] = padding[1];
-  stablehloPadding[stablehloPadding.size() - 1] = padding[1];
-
-  auto windowDimensions = rewriter.getDenseI64ArrayAttr(stablehloKernelSize);
-  auto windowStrides = rewriter.getDenseI64ArrayAttr(stablehloStride);
-  DenseI64ArrayAttr baseDilations;
-  auto windowDilations = rewriter.getDenseI64ArrayAttr(stablehloDilation);
-  DenseIntElementsAttr pad = DenseIntElementsAttr::get(
-      RankedTensorType::get(
-          {static_cast<int64_t>(inputRank), static_cast<int64_t>(2)},
-          rewriter.getI64Type()),
-      stablehloPadding);
-
+  // Build an iota index tensor matching input shape, with values = h*W + w.
   auto inputShapeInfo = hlo::getDimIndexOfTensor(rewriter, op, input);
-  if (failed(inputShapeInfo)) {
+  if (failed(inputShapeInfo))
     return rewriter.notifyMatchFailure(
         op, "failed to get dimension sizes of the input");
-  }
   auto inputShapeVec = *inputShapeInfo;
-  auto inputShapeTensor = mlir::tensor::FromElementsOp::create(
-      rewriter, op->getLoc(), inputShapeVec);
+  auto inputShapeTensor =
+      tensor::FromElementsOp::create(rewriter, loc, inputShapeVec);
 
   SmallVector<Value> initIndexShapeVec;
   for (int64_t i = 0; i < inputRank - 2; i++)
     initIndexShapeVec.push_back(inputShapeVec[i]);
-  initIndexShapeVec.push_back(mlir::arith::MulIOp::create(
-      rewriter, op->getLoc(), inputShapeVec[inputRank - 1],
+  initIndexShapeVec.push_back(arith::MulIOp::create(
+      rewriter, loc, inputShapeVec[inputRank - 1],
       inputShapeVec[inputRank - 2]));
-  auto initIndexShapeTensor = mlir::tensor::FromElementsOp::create(
-      rewriter, op->getLoc(), initIndexShapeVec);
+  auto initIndexShapeTensor =
+      tensor::FromElementsOp::create(rewriter, loc, initIndexShapeVec);
 
   SmallVector<int64_t> initIndexShapeForType(inputShape.begin(),
                                              inputShape.end() - 2);
@@ -360,80 +404,88 @@ LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
                                     inputShape[inputRank - 2]);
   }
 
-  auto initIndexTensor =
-      stablehlo::DynamicIotaOp::create(
-          rewriter, op->getLoc(),
-          RankedTensorType::get(initIndexShapeForType, rewriter.getI64Type()),
-          initIndexShapeTensor, static_cast<uint64_t>(inputRank - 2))
-          .getResult();
+  Value initIndexTensor = stablehlo::DynamicIotaOp::create(
+      rewriter, loc,
+      RankedTensorType::get(initIndexShapeForType, rewriter.getI64Type()),
+      initIndexShapeTensor, static_cast<uint64_t>(inputRank - 2));
 
-  auto indexTensor =
-      stablehlo::DynamicReshapeOp::create(
-          rewriter, op->getLoc(),
-          RankedTensorType::get(inputShape, rewriter.getI64Type()),
-          initIndexTensor, inputShapeTensor)
-          .getResult();
+  Value indexTensor = stablehlo::DynamicReshapeOp::create(
+      rewriter, loc,
+      RankedTensorType::get(inputShape, rewriter.getI64Type()),
+      initIndexTensor, inputShapeTensor);
 
-  Value initIdx = hlo::getConstTensor<int64_t>(rewriter, op, {0}, {}).value();
+  auto poolPadding = computePoolPadding(inputShape, kernelSize, stride,
+                                        padding, ceilMode, /*dim=*/2);
+
+  Value padValueVal =
+      createInitialValueForAtenPoolingOp(op, inputElemTy, rewriter);
+  Value paddedInput =
+      applyExplicitPad(loc, input, padValueVal, poolPadding, rewriter);
+
+  // Padded index positions use 0 as a sentinel; the matching -inf value
+  // never wins the GE compare, so these indices are never selected.
+  Value padIndexVal =
+      hlo::getConstTensor<int64_t>(rewriter, op, {0}, {}).value();
+  Value paddedIndex =
+      applyExplicitPad(loc, indexTensor, padIndexVal, poolPadding, rewriter);
+
+  SmallVector<int64_t> noPadding(inputRank * 2, 0);
+  DenseIntElementsAttr noPadAttr = DenseIntElementsAttr::get(
+      RankedTensorType::get(
+          {static_cast<int64_t>(inputRank), static_cast<int64_t>(2)},
+          rewriter.getI64Type()),
+      noPadding);
+  DenseI64ArrayAttr baseDilations;
+  DenseI64ArrayAttr windowDilations;
 
   auto reduceWindowOp = stablehlo::ReduceWindowOp::create(
-      rewriter, op->getLoc(), mlir::TypeRange{outValTy, outIdxTy},
-      mlir::ValueRange{input, indexTensor}, mlir::ValueRange{initVal, initIdx},
-      windowDimensions, windowStrides, baseDilations, windowDilations, pad);
+      rewriter, loc, TypeRange{outValTy, outIdxTy},
+      ValueRange{paddedInput, paddedIndex},
+      ValueRange{padValueVal, padIndexVal},
+      rewriter.getDenseI64ArrayAttr(winDims),
+      rewriter.getDenseI64ArrayAttr(winStrides), baseDilations, windowDilations,
+      noPadAttr);
 
   Block &block = reduceWindowOp.getBody().emplaceBlock();
-
-  // Add bb argument
-  auto blockValArgumentType = RankedTensorType::get({}, inputElemTy);
-  auto blockIdxArgumentType = RankedTensorType::get({}, rewriter.getI64Type());
-  auto compareResultType = RankedTensorType::get({}, rewriter.getI1Type());
-  block.addArgument(blockValArgumentType, op->getLoc());
-  block.addArgument(blockIdxArgumentType, op->getLoc());
-  block.addArgument(blockValArgumentType, op->getLoc());
-  block.addArgument(blockIdxArgumentType, op->getLoc());
+  auto valArgTy = RankedTensorType::get({}, inputElemTy);
+  auto idxArgTy = RankedTensorType::get({}, rewriter.getI64Type());
+  auto boolTy = RankedTensorType::get({}, rewriter.getI1Type());
+  block.addArgument(valArgTy, loc);
+  block.addArgument(idxArgTy, loc);
+  block.addArgument(valArgTy, loc);
+  block.addArgument(idxArgTy, loc);
   auto *firstValArg = block.args_begin();
   auto *firstIdxArg = std::next(firstValArg);
   auto *secondValArg = std::next(firstIdxArg);
   auto *secondIdxArg = std::next(secondValArg);
 
-  stablehlo::ComparisonTypeAttr compareTypeAttr;
-  if (isa<mlir::FloatType>(inputTy.getElementType())) {
-    compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
-        rewriter.getContext(), stablehlo::ComparisonType::FLOAT);
-  } else if (isa<mlir::IntegerType>(inputTy.getElementType())) {
-    compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
-        rewriter.getContext(), stablehlo::ComparisonType::SIGNED);
-  }
-  stablehlo::ComparisonDirectionAttr compareGeDirectionAttr =
-      stablehlo::ComparisonDirectionAttr::get(
-          rewriter.getContext(), stablehlo::ComparisonDirection::GE);
-  stablehlo::ComparisonDirectionAttr compareEqDirectionAttr =
-      stablehlo::ComparisonDirectionAttr::get(
-          rewriter.getContext(), stablehlo::ComparisonDirection::EQ);
+  auto cmpType = isa<mlir::FloatType>(inputElemTy)
+                     ? stablehlo::ComparisonType::FLOAT
+                     : stablehlo::ComparisonType::SIGNED;
+  auto cmpTypeAttr =
+      stablehlo::ComparisonTypeAttr::get(rewriter.getContext(), cmpType);
+  auto geDir = stablehlo::ComparisonDirectionAttr::get(
+      rewriter.getContext(), stablehlo::ComparisonDirection::GE);
+  auto eqDir = stablehlo::ComparisonDirectionAttr::get(
+      rewriter.getContext(), stablehlo::ComparisonDirection::EQ);
 
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(&block);
-
-    Value compareGeResult = stablehlo::CompareOp::create(
-        rewriter, op->getLoc(), compareResultType, *firstValArg, *secondValArg,
-        compareGeDirectionAttr, compareTypeAttr);
-    Value retValResult = stablehlo::SelectOp::create(
-        rewriter, op->getLoc(), compareGeResult, *firstValArg, *secondValArg);
-
+    Value ge = stablehlo::CompareOp::create(
+        rewriter, loc, boolTy, *firstValArg, *secondValArg, geDir, cmpTypeAttr);
+    Value retVal = stablehlo::SelectOp::create(rewriter, loc, ge, *firstValArg,
+                                               *secondValArg);
     // Get smaller index if compared values are equal.
-    Value compareEqResult = stablehlo::CompareOp::create(
-        rewriter, op->getLoc(), compareResultType, *firstValArg, *secondValArg,
-        compareEqDirectionAttr, compareTypeAttr);
-    Value minIdx = stablehlo::MinOp::create(rewriter, op->getLoc(),
-                                            *firstIdxArg, *secondIdxArg);
-    Value idxWithGeVal = stablehlo::SelectOp::create(
-        rewriter, op->getLoc(), compareGeResult, *firstIdxArg, *secondIdxArg);
-    Value retIdxResult = stablehlo::SelectOp::create(
-        rewriter, op->getLoc(), compareEqResult, minIdx, idxWithGeVal);
-
-    stablehlo::ReturnOp::create(rewriter, op->getLoc(),
-                                mlir::ValueRange{retValResult, retIdxResult});
+    Value eq = stablehlo::CompareOp::create(
+        rewriter, loc, boolTy, *firstValArg, *secondValArg, eqDir, cmpTypeAttr);
+    Value minIdx = stablehlo::MinOp::create(rewriter, loc, *firstIdxArg,
+                                            *secondIdxArg);
+    Value idxFromGe = stablehlo::SelectOp::create(rewriter, loc, ge,
+                                                  *firstIdxArg, *secondIdxArg);
+    Value retIdx =
+        stablehlo::SelectOp::create(rewriter, loc, eq, minIdx, idxFromGe);
+    stablehlo::ReturnOp::create(rewriter, loc, ValueRange{retVal, retIdx});
   }
 
   rewriter.replaceOp(op, reduceWindowOp.getResults());
@@ -871,6 +923,10 @@ LogicalResult ConvertAtenOp<Aten_AdaptiveAvgPool2dBackwardOp>::matchAndRewrite(
   return success();
 }
 
+// AtenMaxPool2dWithIndicesBackwardOp via stablehlo.select_and_scatter.
+//
+// The `indices` operand is unused — select_and_scatter re-derives winners
+// from `self`. Overlapping windows accumulate via add.
 template <>
 LogicalResult
 ConvertAtenOp<AtenMaxPool2dWithIndicesBackwardOp>::matchAndRewrite(
@@ -878,93 +934,102 @@ ConvertAtenOp<AtenMaxPool2dWithIndicesBackwardOp>::matchAndRewrite(
     ConversionPatternRewriter &rewriter) const {
 
   Location loc = op.getLoc();
+  Value self = adaptor.getSelf();
   Value gradOutput = adaptor.getGradOutput();
-  Value indices = adaptor.getIndices();
 
+  auto selfTy = cast<RankedTensorType>(self.getType());
   auto gradOutputTy = cast<RankedTensorType>(gradOutput.getType());
-  auto indicesTy = cast<RankedTensorType>(indices.getType());
   auto outTy =
       cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  Type elemTy = outTy.getElementType();
+  const int64_t rank = selfTy.getRank();
 
-  if (gradOutputTy.getRank() != 4 || indicesTy.getRank() != 4) {
+  if (rank != 4 || gradOutputTy.getRank() != 4) {
     return rewriter.notifyMatchFailure(op, "expected 4D tensors");
   }
 
-  // Create zero-initialized output
+  SmallVector<int64_t, 2> kernelSize, stride, padding, dilation;
+  bool ceilMode = false;
+  if (!matchPattern(op.getKernelSize(), m_TorchListOfConstantInts(kernelSize)))
+    return rewriter.notifyMatchFailure(op, "non-const kernel_size unsupported");
+  if (!matchPattern(op.getStride(), m_TorchListOfConstantInts(stride)))
+    return rewriter.notifyMatchFailure(op, "non-const stride unsupported");
+  if (stride.empty())
+    stride = kernelSize;
+  if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding)))
+    return rewriter.notifyMatchFailure(op, "non-const padding unsupported");
+  if (!matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilation)))
+    return rewriter.notifyMatchFailure(op, "non-const dilation unsupported");
+  if (!matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode)))
+    return rewriter.notifyMatchFailure(op, "non-const ceil_mode unsupported");
+
+  // select_and_scatter has no dilation knob; reject dilation > 1
+  for (int64_t d : dilation)
+    if (d != 1)
+      return rewriter.notifyMatchFailure(op, "dilation > 1 unsupported");
+
+  SmallVector<int64_t> winDims(rank, 1);
+  SmallVector<int64_t> winStrides(rank, 1);
+  winDims[rank - 2] = kernelSize[0];
+  winDims[rank - 1] = kernelSize[1];
+  winStrides[rank - 2] = stride[0];
+  winStrides[rank - 1] = stride[1];
+
+  // Share padding with the forward so we reduce over the exact same shape.
+  auto poolPadding = computePoolPadding(selfTy.getShape(), kernelSize, stride,
+                                        padding, ceilMode, /*dim=*/2);
+
+  SmallVector<int64_t> padLowHigh;
+  padLowHigh.reserve(rank * 2);
+  for (auto &p : poolPadding) {
+    padLowHigh.push_back(p.first);
+    padLowHigh.push_back(p.second);
+  }
+  auto padAttr = DenseIntElementsAttr::get(
+      RankedTensorType::get({rank, 2}, rewriter.getI64Type()), padLowHigh);
+
   Value zero = hlo::getConstTensor<float>(rewriter, op, {0.0}, {}).value();
-  zero = hlo::promoteType(rewriter, loc, zero, outTy.getElementType());
+  zero = hlo::promoteType(rewriter, loc, zero, elemTy);
 
-  auto outShapeVec = *hlo::getDimIndexOfTensor(rewriter, op, adaptor.getSelf());
-  auto outShapeTensor =
-      tensor::FromElementsOp::create(rewriter, loc, outShapeVec);
-  Value gradInput = stablehlo::DynamicBroadcastInDimOp::create(
-      rewriter, loc, outTy, zero, outShapeTensor,
-      rewriter.getDenseI64ArrayAttr({}));
+  auto scalarTy = RankedTensorType::get({}, elemTy);
+  auto boolTy = RankedTensorType::get({}, rewriter.getI1Type());
 
-  auto gradOutputShape = gradOutputTy.getShape();
-  auto outShape = outTy.getShape();
+  auto sasOp = stablehlo::SelectAndScatterOp::create(
+      rewriter, loc, outTy, self, gradOutput, zero,
+      rewriter.getDenseI64ArrayAttr(winDims),
+      rewriter.getDenseI64ArrayAttr(winStrides), padAttr);
 
-  // Check for dynamic shapes
-  for (auto dim : gradOutputShape) {
-    if (dim == ShapedType::kDynamic) {
-      return rewriter.notifyMatchFailure(op, "dynamic shapes not supported");
-    }
-  }
-  for (auto dim : outShape) {
-    if (dim == ShapedType::kDynamic) {
-      return rewriter.notifyMatchFailure(op, "dynamic shapes not supported");
-    }
-  }
-
-  int64_t N = gradOutputShape[0], C = gradOutputShape[1];
-  int64_t outH = gradOutputShape[2], outW = gradOutputShape[3];
-  int64_t H = outShape[2], W = outShape[3];
-
-  // Reshape to [N, C, outH*outW] and [N, C, H*W]
-  auto reshapedGradOutTy =
-      RankedTensorType::get({N, C, outH * outW}, gradOutputTy.getElementType());
-  auto reshapedIndicesTy =
-      RankedTensorType::get({N, C, outH * outW, 1}, indicesTy.getElementType());
-  auto reshapedOutTy =
-      RankedTensorType::get({N, C, H * W}, outTy.getElementType());
-
-  Value reshapedGradOutput = stablehlo::ReshapeOp::create(
-      rewriter, loc, reshapedGradOutTy, gradOutput);
-  Value reshapedIndices =
-      stablehlo::ReshapeOp::create(rewriter, loc, reshapedIndicesTy, indices);
-  Value reshapedGradInput =
-      stablehlo::ReshapeOp::create(rewriter, loc, reshapedOutTy, gradInput);
-
-  // Perform scatter
-  auto scatterOp = stablehlo::ScatterOp::create(
-      rewriter, loc, reshapedOutTy, reshapedGradInput, reshapedIndices,
-      reshapedGradOutput,
-      stablehlo::ScatterDimensionNumbersAttr::get(
-          rewriter.getContext(),
-          /*updateWindowDims=*/{},
-          /*insertedWindowDims=*/{2},
-          /*inputBatchingDims=*/{0, 1},
-          /*scatterIndicesBatchingDims=*/{0, 1},
-          /*scatterDimsToOperandDims=*/{2},
-          /*indexVectorDim=*/3),
-      false, false);
-
-  // aggregate gradients
-  Block &block = scatterOp.getUpdateComputation().emplaceBlock();
-  auto blockArgTy = RankedTensorType::get({}, outTy.getElementType());
-  block.addArgument(blockArgTy, loc);
-  block.addArgument(blockArgTy, loc);
+  // Select region: a >= b picks the max-pool winner.
   {
+    Block &sel = sasOp.getSelect().emplaceBlock();
+    sel.addArgument(scalarTy, loc);
+    sel.addArgument(scalarTy, loc);
     OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(&block);
-    Value sum = stablehlo::AddOp::create(rewriter, loc, block.getArgument(0),
-                                         block.getArgument(1));
+    rewriter.setInsertionPointToStart(&sel);
+    auto cmpType = isa<mlir::FloatType>(elemTy)
+                       ? stablehlo::ComparisonType::FLOAT
+                       : stablehlo::ComparisonType::SIGNED;
+    Value cmp = stablehlo::CompareOp::create(
+        rewriter, loc, boolTy, sel.getArgument(0), sel.getArgument(1),
+        stablehlo::ComparisonDirectionAttr::get(
+            rewriter.getContext(), stablehlo::ComparisonDirection::GE),
+        stablehlo::ComparisonTypeAttr::get(rewriter.getContext(), cmpType));
+    stablehlo::ReturnOp::create(rewriter, loc, cmp);
+  }
+
+  // Scatter region: sum gradients from overlapping windows.
+  {
+    Block &sc = sasOp.getScatter().emplaceBlock();
+    sc.addArgument(scalarTy, loc);
+    sc.addArgument(scalarTy, loc);
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&sc);
+    Value sum = stablehlo::AddOp::create(rewriter, loc, sc.getArgument(0),
+                                         sc.getArgument(1));
     stablehlo::ReturnOp::create(rewriter, loc, sum);
   }
 
-  // Reshape back to output shape
-  rewriter.replaceOpWithNewOp<stablehlo::ReshapeOp>(op, outTy,
-                                                    scatterOp.getResult(0));
+  rewriter.replaceOp(op, sasOp.getResult());
   return success();
 }
 
