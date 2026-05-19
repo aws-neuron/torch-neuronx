@@ -1657,6 +1657,53 @@ def value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
     return grad_input.scatter(dim, indices, grad)
 
 
+@register_decomposition([aten.searchsorted.Tensor])
+def searchsorted_tensor_decomposition(
+    sorted_sequence, values, *, out_int32=False, right=False, side=None, sorter=None
+):
+    """Decompose searchsorted into comparison + sum.
+
+    For each value, counts how many elements in sorted_sequence satisfy the
+    boundary condition. This is O(N*M) rather than O(N*log M), but maps
+    cleanly to StableHLO (no data-dependent control flow).
+
+    Warning: Creates an intermediate [..., N, M] tensor from broadcasting
+    values (N) against sorted_sequence (M). Large inputs may cause OOM.
+    """
+    if side is not None:
+        right = side == "right"
+
+    if sorter is not None:
+        sorted_sequence = torch.gather(sorted_sequence, -1, sorter)
+
+    # Broadcast: compare each value against all elements in sorted_sequence
+    # sorted_sequence: [..., M], values: [..., N] -> compare [..., N, M]
+    # NOTE: This creates an intermediate tensor of size batch * N * M.
+    # For large M or N this may exceed device memory.
+    seq_unsqueezed = sorted_sequence.unsqueeze(-2)  # [..., 1, M]
+    val_unsqueezed = values.unsqueeze(-1)  # [..., N, 1]
+
+    mask = seq_unsqueezed <= val_unsqueezed if right else seq_unsqueezed < val_unsqueezed
+
+    result = mask.sum(dim=-1)
+
+    if out_int32:
+        return result.to(torch.int32)
+    return result.to(torch.int64)
+
+
+@register_decomposition([aten.searchsorted.Scalar])
+def searchsorted_scalar_decomposition(
+    sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None
+):
+    """Decompose scalar searchsorted by wrapping the scalar as a tensor."""
+    values = torch.tensor([value], dtype=sorted_sequence.dtype).to(sorted_sequence.device)
+    result = searchsorted_tensor_decomposition(
+        sorted_sequence, values, out_int32=out_int32, right=right, side=side, sorter=sorter
+    )
+    return result.squeeze(-1)
+
+
 @register_decomposition([aten.histc.default])
 def histc_decomposition(input, bins=100, min=0, max=0):
     """Decompose histc into basic ops
