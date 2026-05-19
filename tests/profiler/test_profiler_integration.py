@@ -504,8 +504,15 @@ class TestNeuronProfilerIntegration:
         end_ids = {e["id"] for e in flow_ends}
         assert start_ids & end_ids, "No matching flow IDs between start/end"
 
-        # RUNTIME event metadata
-        for evt in runtime_evts:
+        # SUBMIT events have nrt_sequence_id; DISPATCH events have dispatch_slot.
+        # Filter to our SUBMIT events (have stream_id but not dispatch_slot).
+        submit_evts = [
+            e
+            for e in runtime_evts
+            if "stream_id" in e.get("args", {}) and "dispatch_slot" not in e.get("args", {})
+        ]
+        assert len(submit_evts) > 0, "No SUBMIT events found"
+        for evt in submit_evts:
             args = evt.get("args", {})
             assert "nrt_sequence_id" in args
             assert "stream_id" in args

@@ -302,6 +302,10 @@ void StreamImpl::CompleteOperation(OperationContext* operation) {
     snapshot.stream_id = static_cast<int32_t>(stream_id);
     snapshot.neuron_stream_os_tid = operation->neuron_stream_os_tid;
     snapshot.pytorch_os_tid = operation->os_tid;
+    snapshot.dispatch_start_ns = at::neuron::toNs(operation->dispatch_start);
+    snapshot.xu_type = operation->xu_type;
+    snapshot.dispatch_slot = operation->dispatch_slot;
+    snapshot.pytorch_sequence_nr = operation->pytorch_sequence_nr;
     snapshot.hierarchy_string = operation->hierarchy_string;
     if (operation->RequiresCompilation()) {
       auto& compilable_kernel = operation->GetCompilableKernel();

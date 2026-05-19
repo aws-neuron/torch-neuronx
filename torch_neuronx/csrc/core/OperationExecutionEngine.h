@@ -141,6 +141,10 @@ class OperationExecutionEngine {
   // Per-device per-XU count of inflight operations.
   int xu_inflight_counts_[kMaxDevices][NRTA_XU_TYPE_NUM]{};
 
+  // Per-device per-XU slot bitmask for profiler dispatch slot assignment.
+  // Each bit represents an inflight slot (0 = free, 1 = occupied).
+  uint8_t xu_slot_bitmask_[kMaxDevices][NRTA_XU_TYPE_NUM]{};
+
   // Configurable max inflight per XU
   size_t max_inflight_per_xu_{kDefaultMaxInflightPerXU};
 

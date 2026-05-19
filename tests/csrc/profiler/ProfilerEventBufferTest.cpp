@@ -130,6 +130,49 @@ TEST(ProfilerEventBufferTest, ActiveBufferRecordsCacheAndHierarchyFields) {
   EXPECT_EQ(events[0].persistent_cache_key, "00813ff53bb82d57870f6335f192ae50");
 }
 
+TEST(ProfilerEventBufferTest, ActiveBufferRecordsDispatchFields) {
+  ProfilerEventBuffer buffer;
+  buffer.activate();
+
+  ProfiledOperation op;
+  op.op_name = "dispatch_test_op";
+  op.submit_start_ns = 100;
+  op.submit_time_ns = 150;
+  op.execute_start_ns = 300;
+  op.execute_end_ns = 500;
+  op.dispatch_start_ns = 250;
+  op.xu_type = 1;  // NRTA_XU_COMPUTE
+  op.dispatch_slot = 3;
+  op.pytorch_sequence_nr = 42;
+  buffer.record(std::move(op));
+
+  auto events = buffer.drain();
+  ASSERT_EQ(events.size(), 1);
+  EXPECT_EQ(events[0].op_name, "dispatch_test_op");
+  EXPECT_EQ(events[0].dispatch_start_ns, 250);
+  EXPECT_EQ(events[0].xu_type, 1);
+  EXPECT_EQ(events[0].dispatch_slot, 3);
+  EXPECT_EQ(events[0].pytorch_sequence_nr, 42);
+  // Verify dispatch_start < execute_start (dispatch encapsulates execution)
+  EXPECT_LT(events[0].dispatch_start_ns, events[0].execute_start_ns);
+}
+
+TEST(ProfilerEventBufferTest, DefaultDispatchFieldsAreUnset) {
+  ProfilerEventBuffer buffer;
+  buffer.activate();
+
+  ProfiledOperation op;
+  op.op_name = "no_dispatch_op";
+  buffer.record(std::move(op));
+
+  auto events = buffer.drain();
+  ASSERT_EQ(events.size(), 1);
+  EXPECT_EQ(events[0].dispatch_start_ns, 0);
+  EXPECT_EQ(events[0].xu_type, -1);
+  EXPECT_EQ(events[0].dispatch_slot, -1);
+  EXPECT_EQ(events[0].pytorch_sequence_nr, -1);
+}
+
 TEST(ProfilerEventBufferTest, GlobalPointerDefaultsToNull) {
   EXPECT_EQ(getActiveProfilerBuffer(), nullptr);
 }

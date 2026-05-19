@@ -3,6 +3,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
+#include "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h"
 
 namespace at::neuron {
 
@@ -297,12 +299,19 @@ void OperationExecutionEngine::RuntimeWorker() {
     }
 
     // Block until NRT signals completion or new work arrives
+    auto sleep_start = std::chrono::steady_clock::now();
     uint64_t count;
     while (::read(completion_efd_, &count, sizeof(count)) == -1) {
       if (errno == EINTR) continue;
       if (shutdown_requested_.load(std::memory_order_acquire)) break;
       TORCH_NEURONX_ERROR("read from completion_efd_ failed: ", strerror(errno));
       break;
+    }
+    if (auto* buffer = at::neuron::getActiveProfilerBuffer()) {
+      at::neuron::RuntimeSleepEvent sleep_evt;
+      sleep_evt.start_ns = at::neuron::toNs(sleep_start);
+      sleep_evt.end_ns = at::neuron::toNs(std::chrono::steady_clock::now());
+      buffer->recordSleep(sleep_evt);
     }
   }
   TORCH_NEURONX_DEBUG("Runtime worker thread terminated");
@@ -682,10 +691,28 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   if (result == ScheduleResult::kScheduled) {
     xu_inflight_counts_[stream->device_index][xu_idx]++;
     pending_async_ops_count_.fetch_add(1);
+    op->xu_type = static_cast<int32_t>(xu_idx);
+    // Assign a profiler dispatch slot from the bitmask (max 8 slots per XU)
+    auto& bitmask = xu_slot_bitmask_[stream->device_index][xu_idx];
+    for (int s = 0; s < std::min(static_cast<int>(max_inflight_per_xu_), 8); ++s) {
+      if (!(bitmask & (1u << s))) {
+        bitmask |= (1u << s);
+        op->dispatch_slot = s;
+        // Propagate slot to concat_op so ProcessCompletions can release it
+        if (op->HasConcatenatedOperation() && !op->IsConcatenatedOperation()) {
+          op->GetConcatenatedOperation()->dispatch_slot = s;
+        }
+        break;
+      }
+    }
     return true;
   }
   // kAdvanced: cascading op advanced (concat already scheduled). kNotReady: will retry.
-  return result == ScheduleResult::kAdvanced;
+  if (result == ScheduleResult::kAdvanced) {
+    op->xu_type = static_cast<int32_t>(xu_idx);
+    return true;
+  }
+  return false;
 }
 
 void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* operation) noexcept {
@@ -708,6 +735,13 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
       return;
     }
 
+    // Capture dispatch start for profiler on first attempt only — retries (e.g., event_wait
+    // blocking on prior async ops) should not reset the start time. DISPATCH end = execute_end
+    // (set in CompleteOperation), so the DISPATCH event shows the full wait + execution time.
+    if (operation->dispatch_start.time_since_epoch().count() == 0) {
+      operation->dispatch_start = std::chrono::steady_clock::now();
+    }
+
     TORCH_NEURONX_DEBUG("Processing async execution task", "stream_id=", stream->stream_id,
                         "operation_name=", operation_name);
     bool scheduled = ScheduleOperation(operation, stream);
@@ -722,8 +756,16 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
       }
     }
   } catch (const torch_neuronx::ExecutionRuntimeException& e) {
+    if (operation->dispatch_slot >= 0 && operation->xu_type >= 0) {
+      xu_slot_bitmask_[stream->device_index][operation->xu_type] &=
+          ~(1u << operation->dispatch_slot);
+    }
     stream->HandleErrorWithCleanup(operation, e);
   } catch (...) {
+    if (operation->dispatch_slot >= 0 && operation->xu_type >= 0) {
+      xu_slot_bitmask_[stream->device_index][operation->xu_type] &=
+          ~(1u << operation->dispatch_slot);
+    }
     stream->HandleErrorWithExceptionPtr(operation, std::current_exception());
   }
 }
@@ -804,6 +846,9 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
                                 "Concatenation operation is not a device kernel");
         size_t xu_idx = GetXUIndex(concat_kernel_type);
         xu_inflight_counts_[stream->device_index][xu_idx]--;
+        if (concat_op->dispatch_slot >= 0) {
+          xu_slot_bitmask_[stream->device_index][xu_idx] &= ~(1u << concat_op->dispatch_slot);
+        }
         concat_op->execute_end = std::chrono::steady_clock::now();
         // Check per-operation NRT status
         if (concat_op->HasNRTError()) {
@@ -826,6 +871,9 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
 
       size_t xu_idx = GetXUIndex(kernel_type);
       xu_inflight_counts_[stream->device_index][xu_idx]--;
+      if (op->dispatch_slot >= 0) {
+        xu_slot_bitmask_[stream->device_index][xu_idx] &= ~(1u << op->dispatch_slot);
+      }
 
       // Check per-operation NRT status
       if (op->HasNRTError()) {
