@@ -113,7 +113,8 @@ class TestMm:
 
     @assert_raises(
         RuntimeError,
-        match="must have same reduction dim",
+        match=r".*must have same reduction dim.*",
+        match_cpu=r".*shapes cannot be multiplied.*",
     )
     def test_mm_dimension_mismatch_error(self, monkeypatch):
         """Test that dimension mismatch raises appropriate error"""
@@ -126,7 +127,8 @@ class TestMm:
 
     @assert_raises(
         RuntimeError,
-        match="must be 2D",
+        match=r".*must be 2D.*",
+        match_cpu=r".*must be a matrix.*",
     )
     def test_mm_wrong_dimensions_error(self, monkeypatch):
         """Test that non-2D tensors raise appropriate error"""
