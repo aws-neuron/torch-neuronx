@@ -179,13 +179,15 @@ def convert_fx_to_stablehlo(
     # Torch-MLIR lowering: FX → RAW → Torch Backend → StableHLO
     with dynamo_timed("torch_neuronx_lower"):
         logger.debug("Importing FX to RAW Torch dialect")
+        fx_importer = NeuronFxImporter(hooks=CustomFxImporterHooks())
         raw_module = fx.stateless_fx_import(
             gm,
             output_type=OutputType.RAW,  # RAW = no backend pipeline
-            fx_importer=NeuronFxImporter(hooks=CustomFxImporterHooks()),
+            fx_importer=fx_importer,
             verbose=IR_DEBUG_PRINT,
             enable_ir_printing=IR_DEBUG_PRINT,
         )
+        has_hierarchy = fx_importer.has_hierarchy
 
         # Save RAW module for debugging
         if job is not None:
@@ -240,6 +242,11 @@ def convert_fx_to_stablehlo(
             "modify your code to have at least one output."
         )
     logger.debug("FX Graph -> StableHLO conversion successful")
+    # Mark module as hierarchy-splitter compatible if hierarchy metadata was used
+    if has_hierarchy:
+        raw_module.operation.attributes["stablehlo.hierarchy_splitter_compatible"] = (
+            mlir_ir.StringAttr.get("true", raw_module.context)
+        )
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
     return raw_module, io_spec, cast_spec
