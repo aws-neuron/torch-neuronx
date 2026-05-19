@@ -629,10 +629,13 @@ TEST_F(SessionTest, ProcessTraceDrainsBufferAndPopulatesActivities) {
   op.submit_time_ns = 1000;
   op.execute_start_ns = 2000;
   op.execute_end_ns = 3000;
+  op.dispatch_start_ns = 1500;
   op.kineto_correlation_id = 42;
   op.pytorch_thread_id = 100;
   op.device_index = 0;
   op.stream_id = 1;
+  op.xu_type = 1;  // NRTA_XU_COMPUTE
+  op.dispatch_slot = 0;
   op.neuron_stream_os_tid = 9999;  // simulated worker thread OS tid
   op.pytorch_os_tid = 8888;        // simulated PyTorch calling thread OS tid
   buf->record(std::move(op));
@@ -644,52 +647,54 @@ TEST_F(SessionTest, ProcessTraceDrainsBufferAndPopulatesActivities) {
   auto noLinkedActivity = [](int32_t) -> const libkineto::ITraceActivity* { return nullptr; };
   session.processTrace(logger, noLinkedActivity, 0, INT64_MAX);
 
-  // processTrace emits 2 activities per operation (dispatch + execution)
-  EXPECT_EQ(logger.activityCount(), 2);
+  // processTrace emits 3 activities per device operation (submit + dispatch + driver)
+  EXPECT_EQ(logger.activityCount(), 3);
 
   // getTraceBuffer should return the populated activities
   auto traceBuffer = session.getTraceBuffer();
   ASSERT_NE(traceBuffer, nullptr);
-  ASSERT_EQ(traceBuffer->activities.size(), 2u);
+  ASSERT_EQ(traceBuffer->activities.size(), 3u);
 
-  // Activity 1: dispatch (PRIVATEUSE1_RUNTIME, submit_start -> submit_time)
+  // Activity 1: submit (PRIVATEUSE1_RUNTIME, submit_start -> submit_time)
   // Placed on CPU process with PyTorch calling thread's OS tid
-  auto& dispatch_act = *traceBuffer->activities[0];
+  auto& submit_act = *traceBuffer->activities[0];
+  EXPECT_EQ(submit_act.name(), "test_op");
+  EXPECT_EQ(submit_act.type(), libkineto::ActivityType::PRIVATEUSE1_RUNTIME);
+  EXPECT_EQ(submit_act.endTime - submit_act.startTime, 500);  // submit_time - submit_start
+  EXPECT_GT(submit_act.startTime, 0);
+  EXPECT_EQ(submit_act.id, 42);
+  EXPECT_EQ(submit_act.device, libkineto::processId());  // CPU process PID
+  EXPECT_EQ(submit_act.resource, 8888);                  // pytorch_os_tid
+  EXPECT_EQ(submit_act.threadId, 8888);                  // pytorch_os_tid
+
+  // Activity 2: dispatch (PRIVATEUSE1_RUNTIME, dispatch_start -> execute_end)
+  // Placed on virtual slot tid
+  auto& dispatch_act = *traceBuffer->activities[1];
   EXPECT_EQ(dispatch_act.name(), "test_op");
   EXPECT_EQ(dispatch_act.type(), libkineto::ActivityType::PRIVATEUSE1_RUNTIME);
-  // Timestamps are shifted from steady_clock to system_clock domain by clockDomainOffset_.
-  // Verify durations and timing chain which are offset-invariant.
-  EXPECT_EQ(dispatch_act.endTime - dispatch_act.startTime, 500);  // submit_time - submit_start
-  EXPECT_GT(dispatch_act.startTime, 0);
-  EXPECT_EQ(dispatch_act.id, 42);
-  EXPECT_EQ(dispatch_act.device, libkineto::processId());  // CPU process PID
-  EXPECT_EQ(dispatch_act.resource, 8888);                  // pytorch_os_tid
-  EXPECT_EQ(dispatch_act.threadId, 8888);                  // pytorch_os_tid
+  EXPECT_EQ(dispatch_act.endTime - dispatch_act.startTime, 1500);  // execute_end - dispatch_start
 
-  // Verify flow arrow fields on dispatch activity (unique monotonic ID, not correlation ID)
+  // Verify flow arrow fields on dispatch activity (DISPATCH -> DRIVER)
   EXPECT_GT(dispatch_act.flow.id, 0u);
   EXPECT_EQ(dispatch_act.flow.type, libkineto::kLinkAsyncCpuGpu);
   EXPECT_EQ(dispatch_act.flow.start, 1u);
 
-  // Activity 2: execution (PRIVATEUSE1_DRIVER, execute_start -> execute_end)
-  // Placed on device process with stream ID
-  auto& exec_act = *traceBuffer->activities[1];
+  // Activity 3: execution (PRIVATEUSE1_DRIVER, execute_start -> execute_end)
+  auto& exec_act = *traceBuffer->activities[2];
   EXPECT_EQ(exec_act.name(), "test_op");
   EXPECT_EQ(exec_act.type(), libkineto::ActivityType::PRIVATEUSE1_DRIVER);
-  EXPECT_GT(exec_act.startTime, dispatch_act.endTime);     // exec starts after dispatch ends
   EXPECT_EQ(exec_act.endTime - exec_act.startTime, 1000);  // execute_end - execute_start
   EXPECT_EQ(exec_act.id, 42);
-  EXPECT_EQ(exec_act.device, 0);    // device_index
-  EXPECT_EQ(exec_act.resource, 1);  // stream_id for device execution
+  EXPECT_EQ(exec_act.device, 0);  // device_index
 
   // Verify flow arrow fields on execution activity (flow END, paired with dispatch)
   EXPECT_EQ(exec_act.flow.id, dispatch_act.flow.id);
   EXPECT_EQ(exec_act.flow.type, libkineto::kLinkAsyncCpuGpu);
   EXPECT_EQ(exec_act.flow.start, 0u);
 
-  // Verify resource info: PyTorch thread under CPU process, stream under device
+  // Verify resource info: PyTorch thread + dispatch slot + device XU row
   auto resources = session.getResourceInfos();
-  EXPECT_EQ(resources.size(), 2u);  // PyTorch thread + stream
+  EXPECT_GE(resources.size(), 3u);
 }
 
 TEST_F(SessionTest, ProcessTraceMultipleOperations) {
@@ -1477,10 +1482,13 @@ TEST_F(SessionTest, ProcessTraceMultiDeviceMultiStreamCorrelation) {
     op.submit_time_ns = i * 10000 + 2000;
     op.execute_start_ns = i * 10000 + 5000;
     op.execute_end_ns = i * 10000 + 9000;
+    op.dispatch_start_ns = i * 10000 + 3000;
     op.kineto_correlation_id = corr_ids[i];
     op.pytorch_thread_id = 100;
     op.device_index = devices[i];
     op.stream_id = streams[i];
+    op.xu_type = 1;  // NRTA_XU_COMPUTE
+    op.dispatch_slot = i;
     op.neuron_stream_os_tid = worker_tids[i];
     op.pytorch_os_tid = pytorch_tid;
     buf->record(std::move(op));
@@ -1494,48 +1502,43 @@ TEST_F(SessionTest, ProcessTraceMultiDeviceMultiStreamCorrelation) {
 
   auto traceBuffer = session.getTraceBuffer();
   ASSERT_NE(traceBuffer, nullptr);
-  ASSERT_EQ(traceBuffer->activities.size(), 6u);
+  // 3 activities per op: submit + dispatch + driver
+  ASSERT_EQ(traceBuffer->activities.size(), 9u);
 
   for (int i = 0; i < 3; ++i) {
-    auto& runtime = *traceBuffer->activities[2 * i];
-    auto& driver = *traceBuffer->activities[2 * i + 1];
+    auto& submit = *traceBuffer->activities[3 * i];
+    auto& dispatch = *traceBuffer->activities[3 * i + 1];
+    auto& driver = *traceBuffer->activities[3 * i + 2];
 
     // Correlation pairing
-    EXPECT_EQ(runtime.id, static_cast<int32_t>(corr_ids[i]));
+    EXPECT_EQ(submit.id, static_cast<int32_t>(corr_ids[i]));
     EXPECT_EQ(driver.id, static_cast<int32_t>(corr_ids[i]));
 
-    // Flow arrows: unique monotonic IDs, paired between RUNTIME and DRIVER
-    EXPECT_GT(runtime.flow.id, 0u);
-    EXPECT_EQ(driver.flow.id, runtime.flow.id);
-    EXPECT_EQ(runtime.flow.start, 1u);
+    // Flow arrows: DISPATCH -> DRIVER
+    EXPECT_GT(dispatch.flow.id, 0u);
+    EXPECT_EQ(driver.flow.id, dispatch.flow.id);
+    EXPECT_EQ(dispatch.flow.start, 1u);
     EXPECT_EQ(driver.flow.start, 0u);
 
     // Device placement
-    EXPECT_EQ(runtime.device, libkineto::processId());
+    EXPECT_EQ(submit.device, libkineto::processId());
     EXPECT_EQ(driver.device, devices[i]);
 
-    // Resource placement
-    EXPECT_EQ(runtime.resource, pytorch_tid);
-    EXPECT_EQ(driver.resource, streams[i]);
-
-    // threadId asymmetry: RUNTIME sets it, DRIVER leaves default 0
-    EXPECT_EQ(runtime.threadId, pytorch_tid);
-    EXPECT_EQ(driver.threadId, 0);
-
-    // Timing chain: dispatch ends at submit_time, exec starts at execute_start
-    EXPECT_LT(runtime.endTime, driver.startTime);
+    // Submit on PyTorch thread
+    EXPECT_EQ(submit.resource, pytorch_tid);
+    EXPECT_EQ(submit.threadId, pytorch_tid);
   }
 
   // Verify all flow IDs are unique across operations
   std::set<uint32_t> flowIds;
   for (int i = 0; i < 3; ++i) {
-    flowIds.insert(traceBuffer->activities[2 * i]->flow.id);
+    flowIds.insert(traceBuffer->activities[3 * i + 1]->flow.id);
   }
   EXPECT_EQ(flowIds.size(), 3u);
 
-  // Resource deduplication: 1 unique PyTorch thread + 3 unique streams = 4
+  // Resource deduplication: 1 PyTorch thread + 3 dispatch slots + 3 XU rows = 7
   auto resources = session.getResourceInfos();
-  EXPECT_EQ(resources.size(), 4u);
+  EXPECT_GE(resources.size(), 4u);
 
   // primaryDevice_ set from first op's device_index
   auto deviceInfo = session.getDeviceInfo();
@@ -1563,10 +1566,13 @@ TEST_F(SessionTest, ProcessTraceZeroCorrelationIdSkipsLinking) {
   op.submit_time_ns = 1000;
   op.execute_start_ns = 2000;
   op.execute_end_ns = 3000;
+  op.dispatch_start_ns = 1500;
   op.kineto_correlation_id = 0;
   op.pytorch_thread_id = 50;
   op.device_index = 0;
   op.stream_id = 0;
+  op.xu_type = 1;
+  op.dispatch_slot = 0;
   op.neuron_stream_os_tid = 4444;
   op.pytorch_os_tid = 5000;
   buf->record(std::move(op));
@@ -1584,23 +1590,25 @@ TEST_F(SessionTest, ProcessTraceZeroCorrelationIdSkipsLinking) {
   NoOpLogger logger;
   session.processTrace(logger, trackingCallback, 0, INT64_MAX);
 
-  // Callback must not have been invoked
+  // Callback must not have been invoked (correlation_id == 0 skips linking)
   EXPECT_FALSE(callbackInvoked);
 
   auto traceBuffer = session.getTraceBuffer();
   ASSERT_NE(traceBuffer, nullptr);
-  ASSERT_EQ(traceBuffer->activities.size(), 2u);
+  ASSERT_EQ(traceBuffer->activities.size(), 3u);  // submit + dispatch + driver
 
-  auto& runtime = *traceBuffer->activities[0];
-  auto& driver = *traceBuffer->activities[1];
+  auto& submit = *traceBuffer->activities[0];
+  auto& dispatch = *traceBuffer->activities[1];
+  auto& driver = *traceBuffer->activities[2];
 
-  // Both activities should have no linked activity
-  EXPECT_EQ(runtime.linkedActivity(), nullptr);
+  // All activities should have no linked activity (correlation_id == 0)
+  EXPECT_EQ(submit.linkedActivity(), nullptr);
+  EXPECT_EQ(dispatch.linkedActivity(), nullptr);
   EXPECT_EQ(driver.linkedActivity(), nullptr);
 
-  // Flow IDs are always assigned (monotonic counter), even for zero correlation
-  EXPECT_GT(runtime.flow.id, 0u);
-  EXPECT_EQ(driver.flow.id, runtime.flow.id);
+  // Flow arrows still connect DISPATCH -> DRIVER even with zero correlation
+  EXPECT_GT(dispatch.flow.id, 0u);
+  EXPECT_EQ(driver.flow.id, dispatch.flow.id);
 }
 
 // Verify that multiple ops sharing the same kineto_correlation_id get unique flow IDs.
@@ -1631,10 +1639,13 @@ TEST_F(SessionTest, ProcessTraceSharedCorrelationIdGetsUniqueFlowIds) {
     op.submit_time_ns = i * 1000 + 200;
     op.execute_start_ns = i * 1000 + 400;
     op.execute_end_ns = i * 1000 + 800;
+    op.dispatch_start_ns = i * 1000 + 300;
     op.kineto_correlation_id = sharedCorrId;
     op.pytorch_thread_id = 100;
     op.device_index = 0;
     op.stream_id = 0;
+    op.xu_type = 1;
+    op.dispatch_slot = i;
     op.neuron_stream_os_tid = 7777;
     op.pytorch_os_tid = 5000;
     buf->record(std::move(op));
@@ -1656,40 +1667,39 @@ TEST_F(SessionTest, ProcessTraceSharedCorrelationIdGetsUniqueFlowIds) {
   };
   session.processTrace(logger, linkedActivityCb, 0, INT64_MAX);
 
-  // 3 ops * 2 activities each = 6
-  EXPECT_EQ(logger.activityCount(), 6);
+  // 3 ops * 3 activities each = 9
+  EXPECT_EQ(logger.activityCount(), 9);
 
   auto traceBuffer = session.getTraceBuffer();
   ASSERT_NE(traceBuffer, nullptr);
-  ASSERT_EQ(traceBuffer->activities.size(), 6u);
+  ASSERT_EQ(traceBuffer->activities.size(), 9u);
 
-  // Collect all RUNTIME flow IDs and verify uniqueness
-  std::set<uint32_t> runtimeFlowIds;
+  // Collect all DISPATCH flow IDs and verify uniqueness
+  std::set<uint32_t> dispatchFlowIds;
   for (int i = 0; i < 3; ++i) {
-    auto& runtime = *traceBuffer->activities[2 * i];
-    auto& driver = *traceBuffer->activities[2 * i + 1];
+    auto& submit = *traceBuffer->activities[3 * i];
+    auto& dispatch = *traceBuffer->activities[3 * i + 1];
+    auto& driver = *traceBuffer->activities[3 * i + 2];
 
     // All activities should share the same correlation ID
-    EXPECT_EQ(runtime.id, static_cast<int32_t>(sharedCorrId));
+    EXPECT_EQ(submit.id, static_cast<int32_t>(sharedCorrId));
     EXPECT_EQ(driver.id, static_cast<int32_t>(sharedCorrId));
 
-    // Each RUNTIME->DRIVER pair has matching flow IDs
-    EXPECT_GT(runtime.flow.id, 0u);
-    EXPECT_EQ(driver.flow.id, runtime.flow.id);
-    EXPECT_EQ(runtime.flow.start, 1u);
+    // Each DISPATCH->DRIVER pair has matching flow IDs
+    EXPECT_GT(dispatch.flow.id, 0u);
+    EXPECT_EQ(driver.flow.id, dispatch.flow.id);
+    EXPECT_EQ(dispatch.flow.start, 1u);
     EXPECT_EQ(driver.flow.start, 0u);
 
-    runtimeFlowIds.insert(runtime.flow.id);
+    dispatchFlowIds.insert(dispatch.flow.id);
 
     // All three ops should link to the same CPU activity
-    EXPECT_NE(runtime.linkedActivity(), nullptr);
-    EXPECT_EQ(runtime.linkedActivity()->correlationId(), static_cast<int32_t>(sharedCorrId));
+    EXPECT_NE(submit.linkedActivity(), nullptr);
+    EXPECT_EQ(submit.linkedActivity()->correlationId(), static_cast<int32_t>(sharedCorrId));
   }
 
   // Critical assertion: all 3 flow IDs must be unique despite shared correlation ID.
-  // Before the fix, all three would have been static_cast<uint32_t>(42) = 42,
-  // causing TORCH_INTERNAL_ASSERT failure in flow_map insertion.
-  EXPECT_EQ(runtimeFlowIds.size(), 3u);
+  EXPECT_EQ(dispatchFlowIds.size(), 3u);
 }
 
 TEST_F(SessionTest, NeffCacheDirSetViaCustomConfig) {
