@@ -179,7 +179,6 @@ UNSUPPORTED_OP_CPU_FALLBACK_DISABLED = [
     "test_indexing.py::TestIndexingNEURON::test_index_tensor_empty_indices_neuron",
     "test_indexing.py::TestIndexingNEURON::test_multi_dimensional_bool_mask_neuron",
     "test_indexing.py::TestIndexingNEURON::test_multiple_byte_mask_neuron",
-    "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_scatter__reductions_neuron_float16",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_kthvalue_neuron_float64",
     "test_tensor_creation_ops.py::TestLikeTensorCreationNEURON::test_randint_like_neuron",
     "test_tensor_creation_ops.py::TestRandomTensorCreationNEURON::test_randperm_neuron",
