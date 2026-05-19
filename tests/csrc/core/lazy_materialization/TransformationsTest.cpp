@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistry.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 
 namespace c10_neuron {
@@ -1376,6 +1377,22 @@ TEST_F(TransformationsTest, TryCreateCompound_Reject4GBBaseTensor) {
   auto result = Creators::TryCreateCompound(sliced, "test_4gb_compound_reject", 0);
   EXPECT_FALSE(result.has_value())
       << "TryCreateCompound must reject patterns where the base tensor >= 4GB";
+}
+
+TEST_F(TransformationsTest, TryCreateAnyTransformation_RejectComplexDtype) {
+  // Complex tensors cannot be fused — compiler rejects complex in prologues.
+  // TryCreateAnyTransformation must return nullopt so ProcessInputTransformations
+  // falls back to CPU contiguous.
+  auto tensor =
+      at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::ComplexFloat)).transpose(0, 1);
+
+  ASSERT_FALSE(tensor.is_contiguous()) << "Tensor should be non-contiguous";
+  ASSERT_TRUE(tensor.is_complex()) << "Tensor should be complex dtype";
+
+  auto& registry = TransformationRegistry::Get();
+  auto result = registry.TryCreateAnyTransformation(tensor, "test_op", 0);
+
+  EXPECT_FALSE(result.has_value()) << "Should reject complex dtype tensor";
 }
 
 }  // namespace

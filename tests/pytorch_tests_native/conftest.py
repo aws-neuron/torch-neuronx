@@ -141,7 +141,13 @@ def pytest_collection_modifyitems(config, items):
     from tests.pytorch_tests_native.neuron_test_registry import apply_markers
 
     for item in items:
-        apply_markers(item)
+        # Guard: only apply skip/xfail markers to pytorch_tests_native tests.
+        # pytest_collection_modifyitems receives ALL collected items, and
+        # run-test-parallel collects the entire tests/ tree in one invocation.
+        # Without this guard, patterns like *complex* in the skip registry
+        # would incorrectly skip tests in tests/operations/ and tests/views/.
+        if "pytorch_tests_native" in str(item.fspath):
+            apply_markers(item)
 
 
 @pytest.hookimpl(hookwrapper=True)
