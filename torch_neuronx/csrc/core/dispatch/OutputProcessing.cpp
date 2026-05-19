@@ -1,6 +1,7 @@
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 
@@ -29,18 +30,19 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
   std::vector<torch::Tensor> outputs(num_outputs);
 
   // ── Step 1: Apply input_output_aliases — reuse IR input buffers as outputs ──
+  // Non-contiguous tensors are passed through; EnqueueXlaOperation's
+  // ProcessOutputTransformations will detect them and handle epilogue.
   for (const auto& [ir_param_idx, output_idx] : entry.input_output_aliases) {
     if (ir_param_idx >= 0 && static_cast<size_t>(ir_param_idx) < filtered_inputs.size() &&
         output_idx >= 0 && static_cast<size_t>(output_idx) < num_outputs) {
       const auto& input_tensor = filtered_inputs[ir_param_idx];
       const auto& ospec = entry.output_specs[output_idx];
-      if (input_tensor.defined() && input_tensor.scalar_type() == ospec.dtype &&
-          input_tensor.is_contiguous()) {
+      if (input_tensor.defined() && input_tensor.scalar_type() == ospec.dtype) {
         outputs[output_idx] = input_tensor;
-        TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] aliasing IR input[", ir_param_idx,
-                                     "] → output[", output_idx, "]",
-                                     " shape=", input_tensor.sizes(),
-                                     " dtype=", input_tensor.scalar_type());
+        TORCH_NEURONX_DISPATCH_DEBUG(
+            "[AllocateExecutionOutputs] aliasing IR input[", ir_param_idx, "] → output[",
+            output_idx, "]", " shape=", input_tensor.sizes(), " dtype=", input_tensor.scalar_type(),
+            " contiguous=", input_tensor.is_contiguous());
       }
     }
   }
@@ -74,10 +76,11 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
           ResizeOutputWithWarning(out_tensor, ospec.shape);
         }
 
-        if (out_tensor.scalar_type() == ospec.dtype && out_tensor.is_contiguous()) {
+        if (out_tensor.scalar_type() == ospec.dtype) {
           outputs[ret_idx] = out_tensor;
           TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using out tensor from arg[",
-                                       arg_idx, "] for output[", ret_idx, "]");
+                                       arg_idx, "] for output[", ret_idx, "]",
+                                       " contiguous=", out_tensor.is_contiguous());
         }
         break;
       }
@@ -123,7 +126,52 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
     if (!outputs[i].defined()) {
       const auto& spec = entry.output_specs[i];
       auto opts = torch::TensorOptions().dtype(spec.dtype).device(device);
-      outputs[i] = torch::empty(spec.shape, opts);
+      if (spec.target_strides.has_value()) {
+        // SDPA / functional op with ATen stride contract.
+        // Allocate a contiguous buffer with PHYSICAL shape (the layout the NEFF writes),
+        // then return an as_strided view with the logical shape + target strides.
+        // The TRANSPOSE epilogue fused into the NEFF handles the relayout.
+        const auto& target = *spec.target_strides;
+        size_t ndims = spec.shape.size();
+
+        // Compute permutation: sort dimensions by target stride descending.
+        // This gives the physical dimension order (outermost -> innermost).
+        std::vector<int64_t> perm(ndims);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::sort(perm.begin(), perm.end(),
+                  [&](int64_t a, int64_t b) { return target[a] > target[b]; });
+
+        // Physical shape: logical dims reordered by the permutation
+        std::vector<int64_t> physical_shape(ndims);
+        for (size_t j = 0; j < ndims; ++j) {
+          physical_shape[j] = spec.shape[perm[j]];
+        }
+
+        // Allocate contiguous buffer with physical shape
+        auto phys_tensor = torch::empty(physical_shape, opts);
+
+        // Bounds check: verify the as_strided view fits within the physical buffer.
+        int64_t required_storage = 1;
+        for (size_t j = 0; j < ndims; ++j) {
+          if (spec.shape[j] > 0) {
+            required_storage += (spec.shape[j] - 1) * target[j];
+          }
+        }
+        TORCH_CHECK(required_storage <= phys_tensor.numel(),
+                    "[AllocateExecutionOutputs] target_strides out of bounds: required_storage=",
+                    required_storage, " but physical buffer has ", phys_tensor.numel(),
+                    " elements");
+
+        // Create as_strided view: logical shape + target strides over physical buffer
+        outputs[i] = phys_tensor.as_strided(spec.shape, target);
+
+        TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] target_strides allocation",
+                                     " output_idx=", i, " logical_shape=", spec.shape,
+                                     " physical_shape=", physical_shape,
+                                     " target_strides=", target);
+      } else {
+        outputs[i] = torch::empty(spec.shape, opts);
+      }
     }
   }
 
