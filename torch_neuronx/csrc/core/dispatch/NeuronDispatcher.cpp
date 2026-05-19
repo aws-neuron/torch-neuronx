@@ -356,11 +356,11 @@ static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
 }
 
 /// Dtype supported by the MLIR aten::_to_copy lowering.
+/// Only float16, bfloat16, float32 (matches Python to_copy.py unsupported_dtypes).
 static bool IsToCopyMlirDtypeSupported(c10::ScalarType dt) {
   static const bool native_int64 = IsNativeInt64Enabled();
   return dt == c10::ScalarType::Half || dt == c10::ScalarType::BFloat16 ||
-         dt == c10::ScalarType::Float || dt == c10::ScalarType::Int ||
-         (native_int64 && dt == c10::ScalarType::Long);
+         dt == c10::ScalarType::Float || (native_int64 && dt == c10::ScalarType::Long);
 }
 
 /// Returns true when on a non-default stream with host-cc enabled.
@@ -493,27 +493,28 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
 
     // ── 2. Non-contiguous dst: on-device stride matching via NRT ──
     if (!self_tensor.is_contiguous()) {
-      // Dtype mismatch: cast on-device if both dtypes supported, else CPU bounce
-      if (src.scalar_type() != self_tensor.scalar_type()) {
-        if (IsCopyMlirDtypeSupported(src.scalar_type()) &&
-            IsCopyMlirDtypeSupported(self_tensor.scalar_type())) {
-          src = src.to(self_tensor.scalar_type());
-          args[1] = c10::IValue(src);
-        } else {
-          auto tmp_cpu = CopyNeuronToCPU(src, self_tensor.scalar_type());
-          if (needs_broadcast) {
-            tmp_cpu = tmp_cpu.expand_as(self_tensor).contiguous();
-          }
-          CopyCPUIntoNeuron(tmp_cpu, self_tensor, /*non_blocking=*/false);
-          logOperationExecuted("aten::copy_");
-          torch::jit::push(*stack, self_tensor);
-          return;
+      // Dtype mismatch or unsupported dtype → CPU bounce
+      if (src.scalar_type() != self_tensor.scalar_type() ||
+          !IsCopyMlirDtypeSupported(src.scalar_type()) ||
+          !IsCopyMlirDtypeSupported(self_tensor.scalar_type())) {
+        auto tmp_cpu = CopyNeuronToCPU(src, self_tensor.scalar_type());
+        if (needs_broadcast) {
+          tmp_cpu = tmp_cpu.expand_as(self_tensor).contiguous();
         }
+        CopyCPUIntoNeuron(tmp_cpu, self_tensor, /*non_blocking=*/false);
+        logOperationExecuted("aten::copy_");
+        torch::jit::push(*stack, self_tensor);
+        return;
       }
 
-      // Broadcast + non-contiguous dst: expand on-device, then fall through to strided copy
+      // Broadcast + non-contiguous dst → CPU bounce
       if (needs_broadcast) {
-        src = src.expand_as(self_tensor).contiguous();
+        auto tmp_cpu = CopyNeuronToCPU(src, self_tensor.scalar_type());
+        tmp_cpu = tmp_cpu.expand_as(self_tensor).contiguous();
+        CopyCPUIntoNeuron(tmp_cpu, self_tensor, /*non_blocking=*/false);
+        logOperationExecuted("aten::copy_");
+        torch::jit::push(*stack, self_tensor);
+        return;
       }
 
       // Same dtype, same shape — route through MLIR pipeline with epilogue.
@@ -610,8 +611,6 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
 
   auto target_dtype = dtype_opt.value_or(self_tensor.scalar_type());
   auto target_device = device_opt.value_or(self_tensor.device());
-  bool preserve_fmt =
-      !memory_format_opt.has_value() || *memory_format_opt == c10::MemoryFormat::Preserve;
 
   TORCH_NEURONX_DISPATCH_DEBUG(
       "[DispatchToCopy] ENTER", " src_device=", self_tensor.device(),
@@ -658,9 +657,8 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
     auto src_strides = self_tensor.strides().vec();
     auto cpu_prepared = CastContiguousCPU(self_tensor, target_dtype);
     auto dst = CopyCPUToNewNeuron(cpu_prepared, target_device, non_blocking);
-    // Preserve original strides only when MemoryFormat::Preserve is requested
-    // (or unset, which defaults to Preserve) — to match PyTorch _to_copy semantics.
-    if (preserve_fmt && !self_tensor.is_contiguous() && dst.strides().vec() != src_strides) {
+    // Preserve original strides (e.g. from transpose)
+    if (!self_tensor.is_contiguous() && dst.strides().vec() != src_strides) {
       auto strided =
           torch::empty_strided(self_tensor.sizes(), src_strides,
                                torch::TensorOptions().dtype(target_dtype).device(target_device));
@@ -675,15 +673,6 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
   // ── Neuron → CPU ──
   if (src_is_neuron && target_device.is_cpu()) {
     auto cpu_result = CopyNeuronToCPU(self_tensor, target_dtype, non_blocking);
-    // Preserve strides only when MemoryFormat::Preserve is requested (or unset)
-    // — to match PyTorch _to_copy semantics.
-    if (preserve_fmt && !self_tensor.is_contiguous() &&
-        self_tensor.is_non_overlapping_and_dense()) {
-      auto strided_out =
-          torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), cpu_result.options());
-      strided_out.copy_(cpu_result);
-      cpu_result = strided_out;
-    }
     logOperationExecuted("aten::_to_copy");
     torch::jit::push(*stack, cpu_result);
     return;
@@ -708,17 +697,6 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
         torch::jit::push(*stack, arg);
       }
       NeuronDispatcher::DispatchImpl(op, dispatch_keys, stack, reg);
-
-      // Preserve strides only when MemoryFormat::Preserve is requested (or unset)
-      // — to match PyTorch _to_copy semantics.
-      if (preserve_fmt && !self_tensor.is_contiguous() &&
-          self_tensor.is_non_overlapping_and_dense()) {
-        auto result = torch::jit::pop(*stack).toTensor();
-        auto strided_out =
-            torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), result.options());
-        strided_out.copy_(result);
-        torch::jit::push(*stack, strided_out);
-      }
       return;
     }
 
