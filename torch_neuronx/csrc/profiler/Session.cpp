@@ -2,6 +2,7 @@
 
 #include <ThreadUtil.h>
 #include <libkineto.h>
+#include <nrt/nrt_async.h>
 #include <nrt/nrt_profile.h>
 #include <output_base.h>
 
@@ -23,6 +24,19 @@ namespace at::neuron {
 namespace {
 
 using namespace torch_neuronx::profiler;
+
+inline const char* GetXUTypeName(int32_t xu_type) {
+  switch (xu_type) {
+    case NRTA_XU_TENSOR_OP:
+      return "TensorOp";
+    case NRTA_XU_COMPUTE:
+      return "Compute";
+    case NRTA_XU_COLLECTIVES:
+      return "Collectives";
+    default:
+      return "Unknown";
+  }
+}
 
 // Helper to cast context to NRT config
 inline nrt_inspect_config_t* toNrtConfig(void* ctx) {
@@ -338,13 +352,15 @@ void NeuronActivityProfilerSession::processTrace(libkineto::ActivityLogger& logg
 //   values (~10^14) are far smaller than system_clock values (~1.7×10^18).
 //
 // Activity placement:
-//   Each ProfiledOperation produces two GenericTraceActivity events:
-//   1. PRIVATEUSE1_RUNTIME — submission on PyTorch thread (submit_start → submit_time),
+//   Each ProfiledOperation produces up to three GenericTraceActivity events:
+//   1. PRIVATEUSE1_RUNTIME (SUBMIT) — submission on PyTorch thread (submit_start → submit_time),
 //      placed on the CPU process track under the PyTorch calling thread's OS tid.
-//      This is the cudaLaunchKernel equivalent: the synchronous enqueue call.
-//   2. PRIVATEUSE1_DRIVER — device execution (execute_start → execute_end), placed
-//      on the NeuronDevice track under the logical stream.
-//   A flow arrow (kLinkAsyncCpuGpu) connects RUNTIME → DRIVER via kineto_correlation_id.
+//   2. PRIVATEUSE1_RUNTIME (DISPATCH) — execution engine scheduling (dispatch_start → execute_end),
+//      placed on a per-slot virtual tid for parallel row visualization (8 slots per XU type).
+//      Only emitted for device ops with dispatch_slot >= 0.
+//   3. PRIVATEUSE1_DRIVER — device execution (execute_start → execute_end), placed
+//      on the NeuronDevice track under the per-XU type resource.
+//   A flow arrow (kLinkAsyncCpuGpu) connects DISPATCH → DRIVER via unique monotonic flow ID.
 void NeuronActivityProfilerSession::processTrace(
     libkineto::ActivityLogger& logger, libkineto::getLinkedActivityCallback getLinkedActivity,
     int64_t captureWindowStartTime, int64_t captureWindowEndTime) {
@@ -373,6 +389,7 @@ void NeuronActivityProfilerSession::processTrace(
     op.submit_time_ns += clockDomainOffset_;
     op.execute_start_ns += clockDomainOffset_;
     op.execute_end_ns += clockDomainOffset_;
+    if (op.dispatch_start_ns > 0) op.dispatch_start_ns += clockDomainOffset_;
   }
 
   // Filter to capture window — skip operations entirely outside the window
@@ -444,50 +461,96 @@ void NeuronActivityProfilerSession::processTrace(
   // Flow arrow connects PyTorch thread → Neuron Device via unique monotonic flow ID.
   // pytorch_thread_id (PyTorch logical counter, NOT an OS tid) is emitted as metadata.
   // neuron_worker_tid preserves the worker thread OS tid for debugging.
+
+  // Virtual tid layout for dispatch slots (above Linux pid_max to avoid collisions):
+  //   Base + stream_id * kSlotsPerStream + xu_type * 8 + slot
+  // Sleep tid is placed after all possible stream slots.
+  constexpr int32_t kDispatchSlotTidBase = 0x500000;
+  constexpr int32_t kSlotsPerStream = NRTA_XU_TYPE_NUM * 8;  // 24 device slots per stream
+  constexpr int32_t kMaxStreams = 16;                        // Safe upper bound for stream count
+  constexpr int32_t kSleepTid = kDispatchSlotTidBase + kMaxStreams * kSlotsPerStream;
+
   for (auto& op : profiled_ops) {
     // Activity 1: PRIVATEUSE1_RUNTIME — submission on PyTorch thread (submit_start → submit_time)
     traceBuffer_->emplace_activity(traceBuffer_->span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
                                    op.op_name);
-    auto& dispatch_act = *traceBuffer_->activities.back();
+    auto& submit_act = *traceBuffer_->activities.back();
 
-    dispatch_act.startTime = op.submit_start_ns;
-    dispatch_act.endTime = op.submit_time_ns;
-    dispatch_act.id = static_cast<int32_t>(op.kineto_correlation_id);
-    dispatch_act.device = libkineto::processId();  // CPU process PID
-    dispatch_act.resource = op.pytorch_os_tid;     // PyTorch calling thread OS tid
-    dispatch_act.threadId = op.pytorch_os_tid;
+    submit_act.startTime = op.submit_start_ns;
+    submit_act.endTime = op.submit_time_ns;
+    submit_act.id = static_cast<int32_t>(op.kineto_correlation_id);
+    submit_act.device = libkineto::processId();
+    submit_act.resource = op.pytorch_os_tid;
+    submit_act.threadId = op.pytorch_os_tid;
 
-    // Assign unique flow ID for this RUNTIME→DRIVER pair.
-    // Must be unique across all flow starts (enforced by collection.cpp:1152).
-    uint32_t flowId = nextFlowId_++;
-
-    // Flow arrow: RUNTIME → DRIVER (start)
-    dispatch_act.flow.id = flowId;
-    dispatch_act.flow.type = libkineto::kLinkAsyncCpuGpu;
-    dispatch_act.flow.start = 1;
-
-    // Link to the originating CPU activity via Kineto correlation
     if (op.kineto_correlation_id != 0 && cpuActivity_) {
-      dispatch_act.linked = cpuActivity_(static_cast<int32_t>(op.kineto_correlation_id));
+      submit_act.linked = cpuActivity_(static_cast<int32_t>(op.kineto_correlation_id));
     }
 
-    dispatch_act.addMetadata("nrt_sequence_id", op.nrt_sequence_id);
-    dispatch_act.addMetadata("stream_id", op.stream_id);
-    dispatch_act.addMetadata("pytorch_logical_tid", op.pytorch_thread_id);
-    dispatch_act.addMetadata("neuron_worker_tid", op.neuron_stream_os_tid);
+    submit_act.addMetadata("nrt_sequence_id", op.nrt_sequence_id);
+    submit_act.addMetadata("stream_id", op.stream_id);
+    submit_act.addMetadata("pytorch_seq_nr", op.pytorch_sequence_nr);
+    submit_act.addMetadata("pytorch_logical_tid", op.pytorch_thread_id);
+    submit_act.addMetadata("neuron_worker_tid", op.neuron_stream_os_tid);
     if (!op.hierarchy_string.empty()) {
-      dispatch_act.addMetadataQuoted("hierarchy", op.hierarchy_string);
+      submit_act.addMetadataQuoted("hierarchy", op.hierarchy_string);
     }
     if (!op.neff_cache_key.empty()) {
-      dispatch_act.addMetadataQuoted("neff_cache_key", op.neff_cache_key);
+      submit_act.addMetadataQuoted("neff_cache_key", op.neff_cache_key);
     }
     if (!op.persistent_cache_key.empty()) {
-      dispatch_act.addMetadataQuoted("persistent_cache_key", op.persistent_cache_key);
+      submit_act.addMetadataQuoted("persistent_cache_key", op.persistent_cache_key);
     }
 
-    dispatch_act.log(logger);
+    submit_act.log(logger);
 
-    // Activity 2: PRIVATEUSE1_DRIVER — device execution window (execute_start → execute_end)
+    // Activity 2: PRIVATEUSE1_RUNTIME — dispatch on RuntimeWorker thread
+    // Shows when the execution engine picks up the op and schedules it to NRT.
+    // DISPATCH encapsulates DRIVER: dispatch_start → execute_end.
+    // Only emit for device ops that were assigned a dispatch slot.
+    uint32_t flowId = nextFlowId_++;
+
+    if (op.dispatch_slot >= 0 && op.dispatch_start_ns > 0) {
+      TORCH_INTERNAL_ASSERT(op.xu_type >= 0, "dispatch_slot set but xu_type is negative");
+      // Device op — per-slot virtual tid
+      traceBuffer_->emplace_activity(traceBuffer_->span,
+                                     libkineto::ActivityType::PRIVATEUSE1_RUNTIME, op.op_name);
+      auto& dispatch_act = *traceBuffer_->activities.back();
+
+      dispatch_act.startTime = op.dispatch_start_ns;
+      dispatch_act.endTime = op.execute_end_ns;
+      dispatch_act.id = static_cast<int32_t>(op.kineto_correlation_id);
+      dispatch_act.device = libkineto::processId();
+
+      int32_t dispatch_tid =
+          kDispatchSlotTidBase + op.stream_id * kSlotsPerStream + op.xu_type * 8 + op.dispatch_slot;
+      dispatch_act.resource = dispatch_tid;
+      dispatch_act.threadId = dispatch_tid;
+
+      // Flow START: visual arrow from DISPATCH → DRIVER
+      dispatch_act.flow.id = flowId;
+      dispatch_act.flow.type = libkineto::kLinkAsyncCpuGpu;
+      dispatch_act.flow.start = 1;
+
+      if (op.kineto_correlation_id != 0 && cpuActivity_) {
+        dispatch_act.linked = cpuActivity_(static_cast<int32_t>(op.kineto_correlation_id));
+      }
+
+      dispatch_act.addMetadata("nrt_sequence_id", op.nrt_sequence_id);
+      dispatch_act.addMetadata("stream_id", op.stream_id);
+      dispatch_act.addMetadata("pytorch_seq_nr", op.pytorch_sequence_nr);
+      dispatch_act.addMetadata("dispatch_slot", op.dispatch_slot);
+      dispatch_act.addMetadataQuoted("xu_type", GetXUTypeName(op.xu_type));
+
+      dispatch_act.log(logger);
+
+      std::string slot_label = "Stream " + std::to_string(op.stream_id) + " / " +
+                               GetXUTypeName(op.xu_type) + " Slot " +
+                               std::to_string(op.dispatch_slot);
+      recordResource(libkineto::processId(), dispatch_tid, slot_label);
+    }
+
+    // Activity 3: PRIVATEUSE1_DRIVER — device execution per XU type
     traceBuffer_->emplace_activity(traceBuffer_->span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
                                    op.op_name);
     auto& exec_act = *traceBuffer_->activities.back();
@@ -496,19 +559,29 @@ void NeuronActivityProfilerSession::processTrace(
     exec_act.endTime = op.execute_end_ns;
     exec_act.id = static_cast<int32_t>(op.kineto_correlation_id);
     exec_act.device = static_cast<int32_t>(op.device_index);
-    exec_act.resource = static_cast<int32_t>(op.stream_id);
 
-    // Flow arrow endpoint: RUNTIME → DRIVER (end)
-    exec_act.flow.id = flowId;
-    exec_act.flow.type = libkineto::kLinkAsyncCpuGpu;
-    exec_act.flow.start = 0;  // flow END (destination)
+    // Resource encodes stream + XU type: 3 rows per stream
+    int32_t xu_resource = (op.xu_type >= 0)
+                              ? static_cast<int32_t>(op.stream_id * NRTA_XU_TYPE_NUM + op.xu_type)
+                              : static_cast<int32_t>(op.stream_id);
+    exec_act.resource = xu_resource;
 
-    // Link to the originating CPU activity
+    // Flow END: receives arrow from DISPATCH
+    if (op.dispatch_slot >= 0 && op.dispatch_start_ns > 0) {
+      exec_act.flow.id = flowId;
+      exec_act.flow.type = libkineto::kLinkAsyncCpuGpu;
+      exec_act.flow.start = 0;
+    }
+
     if (op.kineto_correlation_id != 0 && cpuActivity_) {
       exec_act.linked = cpuActivity_(static_cast<int32_t>(op.kineto_correlation_id));
     }
 
     exec_act.addMetadata("nrt_sequence_id", op.nrt_sequence_id);
+    exec_act.addMetadata("pytorch_seq_nr", op.pytorch_sequence_nr);
+    if (op.xu_type >= 0) {
+      exec_act.addMetadataQuoted("xu_type", GetXUTypeName(op.xu_type));
+    }
     if (!op.hierarchy_string.empty()) {
       exec_act.addMetadataQuoted("hierarchy", op.hierarchy_string);
     }
@@ -521,12 +594,38 @@ void NeuronActivityProfilerSession::processTrace(
 
     exec_act.log(logger);
 
-    // PyTorch thread registered under CPU process (for RUNTIME activity row label)
+    // Register resources
     recordResource(libkineto::processId(), op.pytorch_os_tid,
                    "PyTorch Thread " + std::to_string(op.pytorch_os_tid));
-    // Stream registered under device (for DRIVER activity row label)
-    recordResource(op.device_index, static_cast<int32_t>(op.stream_id),
-                   "Stream " + std::to_string(op.stream_id));
+    if (op.xu_type >= 0) {
+      std::string xu_label =
+          "Stream " + std::to_string(op.stream_id) + " / " + GetXUTypeName(op.xu_type);
+      recordResource(op.device_index, xu_resource, xu_label);
+    } else {
+      recordResource(op.device_index, xu_resource, "Stream " + std::to_string(op.stream_id));
+    }
+  }
+
+  // Emit RuntimeWorker sleep events on a dedicated virtual tid
+  auto sleep_events = eventBuffer_.drainSleepEvents();
+  if (!sleep_events.empty()) {
+    for (auto& evt : sleep_events) {
+      int64_t start = evt.start_ns + clockDomainOffset_;
+      int64_t end = evt.end_ns + clockDomainOffset_;
+      if (end < captureWindowStart_ || start > captureWindowEnd_) continue;
+
+      traceBuffer_->emplace_activity(
+          traceBuffer_->span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME, "RuntimeWorker::sleep");
+      auto& sleep_act = *traceBuffer_->activities.back();
+      sleep_act.startTime = start;
+      sleep_act.endTime = end;
+      sleep_act.device = libkineto::processId();
+      sleep_act.resource = kSleepTid;
+      sleep_act.threadId = kSleepTid;
+      sleep_act.log(logger);
+    }
+    recordResource(libkineto::processId(), kSleepTid, "RuntimeWorker / Idle");
+    NPROF_INFO("processTrace: emitted", sleep_events.size(), "sleep events");
   }
 
   NPROF_INFO("processTrace: emitted", traceBuffer_->activities.size(), "activities");

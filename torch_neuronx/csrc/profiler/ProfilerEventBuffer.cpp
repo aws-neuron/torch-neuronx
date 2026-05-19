@@ -35,10 +35,25 @@ void ProfilerEventBuffer::record(ProfiledOperation op) {
   events_.push_back(std::move(op));
 }
 
+void ProfilerEventBuffer::recordSleep(RuntimeSleepEvent event) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!active_) {
+    return;
+  }
+  sleep_events_.push_back(event);
+}
+
 std::vector<ProfiledOperation> ProfilerEventBuffer::drain() {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<ProfiledOperation> result;
   result.swap(events_);
+  return result;
+}
+
+std::vector<RuntimeSleepEvent> ProfilerEventBuffer::drainSleepEvents() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<RuntimeSleepEvent> result;
+  result.swap(sleep_events_);
   return result;
 }
 
