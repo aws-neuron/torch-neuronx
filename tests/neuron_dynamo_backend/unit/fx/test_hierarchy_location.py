@@ -347,3 +347,110 @@ class TestNeuronFxImporterMLIROutput:
         import re
 
         assert re.search(r":\d+", mlir_text)
+
+
+class TestHasHierarchyFlag:
+    """Tests for NeuronFxImporter.has_hierarchy flag tracking."""
+
+    def _import_model(self, model, input_shape=(2, 4)):
+        from torch_mlir.fx import OutputType, stateless_fx_import
+
+        gm = get_fx_graph(model, input_shape)
+        importer = NeuronFxImporter()
+        module = stateless_fx_import(gm, output_type=OutputType.RAW, fx_importer=importer)
+        return importer, module
+
+    def test_has_hierarchy_true_for_model_with_modules(self):
+        """Flag is set when a model with nn.Module ops is imported."""
+        importer, _ = self._import_model(SimpleLinear())
+        assert importer.has_hierarchy is True
+
+    def test_has_hierarchy_true_for_nested_model(self):
+        """Flag is set when a model with nested nn.Modules is imported."""
+        importer, _ = self._import_model(DeeplyNested())
+        assert importer.has_hierarchy is True
+
+    def test_has_hierarchy_initially_false(self):
+        """Flag defaults to False before any import happens."""
+        importer = NeuronFxImporter()
+        assert importer.has_hierarchy is False
+
+    def test_has_hierarchy_true_when_only_aten_suffix(self):
+        """Flag is set even without nn_module_stack — aten-op suffix counts as hierarchy."""
+        from torch_mlir.fx import OutputType, stateless_fx_import
+
+        gm = get_fx_graph(SimpleLinear())
+        # Strip module-stack metadata; call_function nodes still produce aten.<op>[<name>].
+        for node in gm.graph.nodes:
+            node.meta.pop("nn_module_stack", None)
+            node.meta.pop("fwd_nn_module_stack", None)
+        importer = NeuronFxImporter()
+        stateless_fx_import(gm, output_type=OutputType.RAW, fx_importer=importer)
+        assert importer.has_hierarchy is True
+
+    def test_has_hierarchy_false_when_no_hierarchy_nor_aten_suffix(self):
+        """Flag stays False when every processed node produces no hierarchy string.
+
+        Uses placeholder/output nodes (op != call_function) with their module-stack
+        stripped — neither branch of _get_hierarchy_string contributes.
+        """
+        from torch_mlir import ir
+        from torch_mlir.dialects import torch as torch_d
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronContextCache
+
+        gm = get_fx_graph(SimpleLinear())
+        non_call_nodes = [n for n in gm.graph.nodes if n.op != "call_function"]
+        assert non_call_nodes, "Expected placeholder/output nodes in the graph"
+        for node in non_call_nodes:
+            node.meta.pop("nn_module_stack", None)
+            node.meta.pop("fwd_nn_module_stack", None)
+            assert _get_hierarchy_string(node) is None
+
+        context = ir.Context()
+        torch_d.register_dialect(context)
+        cache = NeuronContextCache(context, py_attr_tracker=None)
+        with cache._c:
+            for node in non_call_nodes:
+                cache.get_node_location(node)
+        assert cache.has_hierarchy is False
+
+
+class TestHierarchySplitterCompatibleAttribute:
+    """Tests for stablehlo.hierarchy_splitter_compatible module attribute after
+    full FX -> StableHLO conversion (including all MLIR passes)."""
+
+    def _convert(self, model, input_shape=(2, 4)):
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
+            convert_fx_to_stablehlo,
+        )
+
+        gm = get_fx_graph(model, input_shape)
+        x = torch.randn(*input_shape)
+        stablehlo, _, _ = convert_fx_to_stablehlo(gm, [x])
+        return stablehlo
+
+    def test_attribute_set_for_model_with_modules(self):
+        """Attribute is present on the final StableHLO module when hierarchy was used."""
+        stablehlo = self._convert(SimpleLinear())
+        assert "stablehlo.hierarchy_splitter_compatible" in stablehlo.operation.attributes
+
+    def test_attribute_value_is_true(self):
+        """Attribute value is the string 'true'."""
+        stablehlo = self._convert(NestedModel())
+        attr = stablehlo.operation.attributes["stablehlo.hierarchy_splitter_compatible"]
+        assert str(attr.value) == "true"
+
+    def test_attribute_set_even_without_module_stack(self):
+        """Attribute is still present when only aten-suffix hierarchy is emitted."""
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
+            convert_fx_to_stablehlo,
+        )
+
+        gm = get_fx_graph(SimpleLinear())
+        for node in gm.graph.nodes:
+            node.meta.pop("nn_module_stack", None)
+            node.meta.pop("fwd_nn_module_stack", None)
+        x = torch.randn(2, 4)
+        stablehlo, _, _ = convert_fx_to_stablehlo(gm, [x])
+        assert "stablehlo.hierarchy_splitter_compatible" in stablehlo.operation.attributes
