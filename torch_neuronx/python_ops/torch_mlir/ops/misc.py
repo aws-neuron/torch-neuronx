@@ -27,50 +27,13 @@ def _validate_embedding_dense_backward(
 @register_aten(
     ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
     static_argnums=(2, 3, 4),
-    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    validate_static_inputs=_validate_embedding_dense_backward,
 )
 def torch_embedding_dense_backward(
     grad_output, indices, num_weights, padding_idx, scale_grad_by_freq, out=None
 ):
-    _validate_embedding_dense_backward(
+    return torch.ops.aten.embedding_dense_backward(
         grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
-    )
-
-    original_dtype = grad_output.dtype
-
-    def compute_fn(grad_output, indices, num_weights, padding_idx, scale_grad_by_freq):
-        """Scatter-add in f32, cast back to original dtype."""
-        embed_dim = grad_output.shape[-1]
-        indices_flat = indices.reshape(-1).to(torch.int64)
-        grad_flat = grad_output.reshape(-1, embed_dim).to(torch.float32)
-
-        if scale_grad_by_freq:
-            counts = torch.zeros(num_weights, dtype=torch.float32, device=grad_flat.device)
-            ones = torch.ones_like(indices_flat, dtype=torch.float32)
-            counts = torch.scatter_add(counts, 0, indices_flat, ones)
-            counts = torch.clamp(counts, min=1.0)
-            grad_flat = grad_flat / counts[indices_flat].unsqueeze(-1)
-
-        if padding_idx >= 0:
-            mask = (indices_flat != padding_idx).unsqueeze(-1).to(torch.float32)
-            grad_flat = grad_flat * mask
-
-        grad_weight = torch.zeros(
-            num_weights, embed_dim, dtype=torch.float32, device=grad_flat.device
-        )
-        index_expanded = indices_flat.unsqueeze(1).expand_as(grad_flat)
-        grad_weight = torch.scatter_add(grad_weight, 0, index_expanded, grad_flat)
-        return grad_weight
-
-    def postprocess_fn(result):
-        """Cast f32 result to original dtype."""
-        return result.to(original_dtype)
-
-    return (
-        compute_fn,
-        (grad_output, indices, num_weights, padding_idx, scale_grad_by_freq),
-        {},
-        postprocess_fn,
     )
 
 
