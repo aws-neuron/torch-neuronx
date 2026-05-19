@@ -260,6 +260,16 @@ inline NRT_STATUS GetInstanceOutputDir(const char* output_dir, char* instance_di
   return nrt_inspect_get_instance_output_dir(output_dir, instance_dir_buf, buf_size);
 }
 
+/**
+ * @brief Enable pre-caching of profile info during warmup iterations.
+ */
+inline void PrecacheEnable() { nrt_inspect_precache_enable(); }
+
+/**
+ * @brief Disable pre-caching of profile info.
+ */
+inline void PrecacheDisable() { nrt_inspect_precache_disable(); }
+
 // ============================================================================
 // Asynchronous NRT operations
 // ============================================================================
