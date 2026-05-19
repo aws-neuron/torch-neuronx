@@ -54,6 +54,22 @@ def _check_tensors_tensors(tensors1, tensors2):
             f"Tensor lists must have the same number of tensors, "
             f"got {len(tensors1)} and {len(tensors2)}"
         )
+    for t1, t2 in zip(tensors1, tensors2, strict=False):
+        if t1.numel() == 0 or t2.numel() == 0 or t1.shape == t2.shape:
+            continue
+        try:
+            torch.broadcast_shapes(t1.shape, t2.shape)
+        except RuntimeError:
+            for dim in range(max(t1.ndim, t2.ndim)):
+                d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
+                d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
+                if d1 != d2 and d1 != 1 and d2 != 1:
+                    actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
+                    raise RuntimeError(
+                        f"The size of tensor a ({d1}) must match the size of "
+                        f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
+                    ) from None
+            raise
 
 
 def _cast_results(op, results):
@@ -418,11 +434,32 @@ def _check_three_tensor_lists(self, tensor1, tensor2):
             f"Tensor lists must have the same number of tensors, "
             f"got {len(self)}, {len(tensor1)} and {len(tensor2)}"
         )
+    for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
+        if s.numel() == 0 or (s.shape == t1.shape and s.shape == t2.shape):
+            continue
+        for a, b, _name_a, _name_b in [(s, t1, "self", "tensor1"), (s, t2, "self", "tensor2")]:
+            if a.shape == b.shape:
+                continue
+            try:
+                torch.broadcast_shapes(a.shape, b.shape)
+            except RuntimeError:
+                for dim in range(max(a.ndim, b.ndim)):
+                    d1 = a.shape[-(dim + 1)] if dim < a.ndim else 1
+                    d2 = b.shape[-(dim + 1)] if dim < b.ndim else 1
+                    if d1 != d2 and d1 != 1 and d2 != 1:
+                        actual_dim = max(a.ndim, b.ndim) - 1 - dim
+                        raise RuntimeError(
+                            f"The size of tensor a ({d1}) must match the size of "
+                            f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
+                        ) from None
+                raise
 
 
 def _make_addcop_scalar(nki_fn):
     def fn(self, tensor1, tensor2, value=1, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         if self and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], value)
             self = [t.to(out_dtype) for t in self]
@@ -441,6 +478,8 @@ def _make_addcop_scalar(nki_fn):
 def _make_addcop_scalar_inplace(nki_fn):
     def fn(self, tensor1, tensor2, value=1, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, value)
         non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
         ne_self = [self[i] for i in non_empty_idx]
@@ -464,6 +503,8 @@ def _make_addcop_scalarlist(nki_fn):
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         if self and scalars and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], scalars[0])
             self = [t.to(out_dtype) for t in self]
@@ -483,6 +524,8 @@ def _make_addcop_scalarlist_inplace(nki_fn):
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, scalars)
         non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
         ne_self = [self[i] for i in non_empty_idx]
@@ -508,6 +551,8 @@ def _make_addcop_tensor(nki_scalarlist_fn):
 
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         self = _replace_empty(self)
         # TODO: need NKI support for passing in multiple scalars as a tensor
         scalar_list = scalars.tolist()
@@ -523,6 +568,8 @@ def _make_addcop_tensor(nki_scalarlist_fn):
 def _make_addcop_tensor_inplace(nki_scalarlist_fn):
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         # TODO: need NKI support for passing in multiple scalars as a tensor
         scalar_list = scalars.tolist()
         non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
