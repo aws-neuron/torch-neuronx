@@ -283,7 +283,7 @@ std::vector<torch::Tensor> ReconstructOutputs(const std::vector<torch::Tensor>& 
         if (input_tensor.device() != device) {
           input_tensor = input_tensor.to(device);
         }
-        full_outputs[out_idx] = input_tensor;
+        full_outputs[out_idx] = input_tensor.numel() == 0 ? input_tensor.clone() : input_tensor;
       }
     }
   }

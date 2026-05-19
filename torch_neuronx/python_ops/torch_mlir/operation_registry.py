@@ -2,9 +2,18 @@
 
 import inspect
 from collections.abc import Callable
+from enum import Enum
 
 import torch
 import torch.library
+
+
+class Preprocessing(Enum):
+    """Classification for ops that use the preprocessing protocol."""
+
+    SHAPE_ONLY = "shape_only"
+    VALUE_DEPENDENT = "value_dependent"
+
 
 # Global registry to collect decorated operations
 _PENDING_OPERATIONS = []
@@ -15,10 +24,11 @@ def register_aten(
     output_params: tuple[str, ...] | None = None,
     static_argnums: tuple[int, ...] | None = None,
     static_argnames: tuple[str, ...] | None = None,
-    uses_preprocessing: bool = False,
+    preprocessing: Preprocessing | None = None,
     validate_static_inputs: Callable | None = None,
     skip_dispatch_registration: bool = False,
     translate_args_fn: Callable | None = None,
+    **kwargs,
 ):
     """
     Decorator that registers torch-mlir implementations for ATen operations.
@@ -44,6 +54,12 @@ def register_aten(
     if isinstance(operations, str):
         operations = [operations]
 
+    if preprocessing is not None and not isinstance(preprocessing, Preprocessing):
+        raise ValueError(
+            f"preprocessing must be a Preprocessing enum value (SHAPE_ONLY or VALUE_DEPENDENT), "
+            f"got {preprocessing!r}"
+        )
+
     def decorator(func: Callable):
         # Extract metadata from function
         func_name = func.__name__
@@ -59,7 +75,7 @@ def register_aten(
                 "output_params": output_params,
                 "static_argnums": static_argnums,
                 "static_argnames": static_argnames,
-                "uses_preprocessing": uses_preprocessing,
+                "preprocessing": preprocessing,
                 "validate_static_inputs": validate_static_inputs,
                 "translate_args_fn": translate_args_fn,
             }
@@ -76,7 +92,7 @@ def register_aten(
 
         # Mark function with metadata
         func._aten_operations = operations
-        func.uses_preprocessing = uses_preprocessing
+        func.preprocessing = preprocessing
 
         return func
 
@@ -229,6 +245,196 @@ def _maybe_register_autograd(aten_name):
     _AUTOGRAD_LIBS[aten_name] = lib
 
 
+def _make_preprocessing_lower(
+    torch_fn, aten_name, output_params, static_argnums, static_argnames, validate_fn=None
+):
+    """Create a lower_func for a shape_only preprocessing op.
+
+    On cache miss, the C++ dispatcher calls this function. It runs the
+    preprocessing torch_fn to get (compute_fn, new_args, new_kwargs), then
+    creates a TorchMlirKernel for compute_fn and calls kernel.lower().
+
+    Returns a LoweringResult, required by the C++ dispatcher.
+    """
+    from torch_neuronx.utils import is_native_int64_enabled
+
+    from .kernel import TorchMlirKernel
+
+    _kernel_cache = {}  # compute_fn.__name__ → TorchMlirKernel
+
+    @torch._dynamo.disable
+    def lower(*args, original_args=None, original_kwargs=None, **kwargs):
+        # Run preprocessing on the downcasted args
+        result = torch_fn(*args, **kwargs)
+        if len(result) == 4:
+            compute_fn, new_args, new_kwargs, _ = result
+        else:
+            compute_fn, new_args, new_kwargs = result
+
+        # Empty args means nothing to compute (e.g., all tensors were empty).
+        if not new_args:
+            from torch_neuronx.python_ops.lowering_result import LoweringResult
+
+            return LoweringResult(
+                op_name=aten_name,
+                is_empty_tensor=True,
+                stablehlo_bytes=b"",
+            )
+
+        # Preprocess original (pre-downcast) args for dtype inference.
+        orig_new_args = None
+        orig_new_kwargs = None
+        if original_args is not None:
+            orig_kw = original_kwargs if original_kwargs else {}
+            orig_result = torch_fn(*original_args, **orig_kw)
+            if orig_result[1]:
+                orig_new_args = orig_result[1]
+                orig_new_kwargs = orig_result[2]
+
+        # Get or create cached kernel
+        fn_key = id(getattr(compute_fn, "__code__", compute_fn))
+        kernel = _kernel_cache.get(fn_key)
+        if kernel is None:
+            kernel = TorchMlirKernel(
+                torch_fn=compute_fn,
+                op_name=aten_name,
+                output_params=output_params,
+                static_argnums=static_argnums,
+                static_argnames=static_argnames,
+            )
+            if validate_fn is not None:
+                kernel.validate_static_inputs_func = validate_fn
+            _kernel_cache[fn_key] = kernel
+
+        # C++ DispatchImpl already ran PreprocessArgs (scalar→tensor, int64→int32,
+        # contiguous). Set static_argnums for this call's arg count.
+        # Note: mutates cached kernel state — safe because lower() is only called
+        # on C++ dispatch cache miss (single-threaded, GIL held).
+        kernel.arg_processor._static_argnums = kernel._normalize_static_argnums(len(new_args))
+        processed_new_args = kernel.arg_processor.preprocess_inputs(
+            new_args,
+            scalar_to_tensor=True,
+            convert_int64=not is_native_int64_enabled(),
+        )
+
+        return kernel.lower(
+            *processed_new_args,
+            original_args=orig_new_args,
+            original_kwargs=orig_new_kwargs,
+            **new_kwargs,
+        )
+
+    return lower
+
+
+def _make_preprocessing_dispatch(
+    torch_fn,
+    aten_name,
+    output_params,
+    static_argnums,
+    static_argnames,
+    validate_fn=None,
+    fallback_fn=None,
+):
+    """Create a dispatch (preprocess+execute) function for value-dependent preprocessing ops.
+
+    Called on every dispatch. Does preprocessing + kernel execution in one call.
+    """
+    from .kernel import TorchMlirKernel
+
+    _kernel_cache = {}
+    _upcast_map = {torch.int32: torch.int64, torch.float32: torch.float64}
+
+    @torch._dynamo.disable
+    def combined(*args, **kwargs):
+        # Validate
+        if validate_fn is not None:
+            validate_fn(*args, **kwargs)
+
+        # Preprocess
+        result = torch_fn(*args, **kwargs)
+        compute_fn = result[0]
+        new_args = result[1]
+        new_kwargs = result[2]
+
+        if not new_args:
+            import torch_neuronx._C as _C
+
+            _C._log_executed_op(aten_name)
+            return None
+
+        # Get or create kernel. Use compute_fn's __name__ as key since
+        # compute_fn is a new closure each call (different id() every time).
+        fn_key = id(getattr(compute_fn, "__code__", compute_fn))
+        kernel = _kernel_cache.get(fn_key)
+        if kernel is None:
+            kernel = TorchMlirKernel(
+                torch_fn=compute_fn,
+                op_name=aten_name,
+                output_params=output_params,
+                static_argnums=static_argnums,
+                static_argnames=static_argnames,
+            )
+            _kernel_cache[fn_key] = kernel
+
+        # Execute
+        # For inplace ops, ensure the kernel writes back to the original tensor.
+        # The preprocessing may not set out= for all inplace ops.
+        if aten_name.endswith("_") and new_kwargs.get("out") is None and new_args:
+            first = new_args[0]
+            if isinstance(first, torch.Tensor):
+                new_kwargs["out"] = first
+            elif isinstance(first, list | tuple) and first:
+                new_kwargs["out"] = tuple(first)
+
+        try:
+            exec_result = kernel(*new_args, **new_kwargs)
+        except (IndexError, ValueError, TypeError):
+            # Errors — re-raise to match PyTorch behavior.
+            raise
+        except Exception:
+            # Compilation or execution failure fall back to CPU.
+            if fallback_fn is not None:
+                return fallback_fn(*args, **kwargs)
+            raise
+
+        # Postprocess (only if 4-tuple returned)
+        if len(result) == 4 and result[3] is not None:
+            exec_result = result[3](exec_result)
+
+        # Upcast if preprocessed args had 64-bit dtype (Neuron downcasts 64→32)
+        first_preprocessed = new_args[0] if new_args else None
+        if first_preprocessed is not None:
+            orig_dtype = None
+            if isinstance(first_preprocessed, torch.Tensor):
+                if first_preprocessed.dtype in (torch.int64, torch.float64):
+                    orig_dtype = first_preprocessed.dtype
+            elif isinstance(first_preprocessed, list | tuple) and first_preprocessed:
+                t = first_preprocessed[0]
+                if isinstance(t, torch.Tensor) and t.dtype in (torch.int64, torch.float64):
+                    orig_dtype = t.dtype
+
+            if orig_dtype is not None and exec_result is not None:
+                target = orig_dtype
+                if isinstance(exec_result, torch.Tensor):
+                    if _upcast_map.get(exec_result.dtype) == target:
+                        exec_result = exec_result.to(target)
+                elif isinstance(exec_result, list | tuple):
+                    exec_result = type(exec_result)(
+                        r.to(target)
+                        if isinstance(r, torch.Tensor) and _upcast_map.get(r.dtype) == target
+                        else r
+                        for r in exec_result
+                    )
+
+        import torch_neuronx._C as _C
+
+        _C._log_executed_op(aten_name)
+        return exec_result
+
+    return combined
+
+
 def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
     """
     Complete registration for all pending operations via C++ NeuronDispatcher.
@@ -313,48 +519,80 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
             # Create wrapper function (Phase 1 fallback)
             wrapper_func = create_wrapper_function(aten_name, operation)
 
-            uses_preprocessing = reg_info.get("uses_preprocessing", False)
+            preprocessing = reg_info.get("preprocessing")
             op_name = aten_name.replace("aten::", "")
 
-            # Ops with uses_preprocessing=True use a factory-function protocol
-            # (returning compute_fn + out= + postprocess_fn) that the C++ dispatch
-            # pipeline doesn't support.  Register them via the Python aten_lib path.
-            if uses_preprocessing and aten_lib is not None:
-                # Wrap with validate_static_inputs if registered, so validation
-                # runs automatically on raw args before Operation.__call__.
+            # shape_only preprocessing — fold into lower_func, register
+            # with C++ dispatcher for full caching.
+            if preprocessing == Preprocessing.SHAPE_ONLY:
                 validate_fn = reg_info.get("validate_static_inputs")
-                if validate_fn is not None:
-                    original_wrapper = wrapper_func
-
-                    def make_validated_wrapper(vfn, orig):
-                        def validated_wrapper(*args, **kwargs):
-                            vfn(*args, **kwargs)
-                            return orig(*args, **kwargs)
-
-                        validated_wrapper.__name__ = orig.__name__
-                        return validated_wrapper
-
-                    wrapper_func = make_validated_wrapper(validate_fn, original_wrapper)
-
+                lower_func = _make_preprocessing_lower(
+                    torch_fn,
+                    aten_name,
+                    output_params,
+                    static_argnums,
+                    static_argnames,
+                    validate_fn,
+                )
                 try:
-                    aten_lib.impl(op_name, wrapper_func, "PrivateUse1")
+                    _C._register_neuron_op(
+                        op_name,
+                        wrapper_func,
+                        lower_func,
+                        list(static_argnums) if static_argnums else [],
+                        list(static_argnames) if static_argnames else [],
+                    )
                     registered_count += 1
+                    _maybe_register_autograd(aten_name)
+                    if verbose:
+                        print(
+                            f"[OK] Registered via C++ dispatcher (preprocessing=shape_only): "
+                            f"{aten_name} -> {func_name}"
+                        )
                 except Exception as e:
                     if verbose:
-                        print(f"[WARN] Failed to register {op_name} via aten_lib: {e}")
-                    continue
-                try:
-                    _maybe_register_autograd(aten_name)
-                except Exception as e:
-                    print(f"[WARN] Failed to register autograd for {aten_name}: {e}")
-                    import traceback
+                        print(f"[WARN] Failed to register {op_name} via C++ dispatcher: {e}")
+                continue
 
-                    traceback.print_exc()
-                if verbose:
-                    print(
-                        f"[OK] Registered via Python dispatch (uses_preprocessing): "
-                        f"{aten_name} -> {func_name}"
-                    )
+            # value_dependent preprocessing — these ops read tensor values
+            # during preprocessing, so they must call Python on every dispatch.
+            # Registered via aten_lib.impl (Python dispatch) with an optimized
+            # function that does preprocessing + cached kernel execution directly,
+            # bypassing the Operation.__call__ / TorchMlirOpImpl.execute() overhead.
+            # This is faster than routing through C++ boxed dispatch
+            if preprocessing == Preprocessing.VALUE_DEPENDENT:
+                validate_fn = reg_info.get("validate_static_inputs")
+                combined_fn = _make_preprocessing_dispatch(
+                    torch_fn,
+                    aten_name,
+                    output_params,
+                    static_argnums,
+                    static_argnames,
+                    validate_fn,
+                    fallback_fn=wrapper_func,
+                )
+                try:
+                    if aten_lib is not None:
+                        aten_lib.impl(op_name, combined_fn, "PrivateUse1")
+                    else:
+                        _C._register_neuron_op(
+                            op_name,
+                            wrapper_func,
+                            None,
+                            list(static_argnums) if static_argnums else [],
+                            list(static_argnames) if static_argnames else [],
+                            True,
+                            combined_fn,
+                        )
+                    registered_count += 1
+                    _maybe_register_autograd(aten_name)
+                    if verbose:
+                        print(
+                            f"[OK] Registered via optimized Phase 2: " f"{aten_name} -> {func_name}"
+                        )
+                except Exception as e:
+                    if verbose:
+                        print(f"[WARN] Failed to register {op_name}: {e}")
                 continue
 
             # Extract kernel.lower from the first implementation that has a kernel.

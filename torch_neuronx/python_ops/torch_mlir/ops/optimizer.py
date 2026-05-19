@@ -4,7 +4,7 @@ import torch
 
 from torch_neuronx.python_ops.nki_kernels.adamw import _has_nki_adam_kernels
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 def _adam_step_mlir(
@@ -192,7 +192,9 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
 def _register_fused_adam(op_names, decoupled_wd):
     static_args = (7, 8, 9, 10) if _has_nki_adam_kernels else ()
 
-    @register_aten(op_names, uses_preprocessing=True, static_argnums=static_args)
+    @register_aten(
+        op_names, preprocessing=Preprocessing.VALUE_DEPENDENT, static_argnums=static_args
+    )
     def fused_adam_impl(
         params,
         grads,
