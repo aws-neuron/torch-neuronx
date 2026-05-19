@@ -142,6 +142,22 @@ class TestIndexSelect:
         # This triggers CPU fallback which fails with IndexError about vector requirement
         torch.index_select(input_neuron, dim=0, index=indices.to(device))
 
+    @assert_raises(RuntimeError, match="unsupported operation")
+    def test_index_select_out_internal_overlap(self):
+        """Test index_select raises RuntimeError when out= has internal memory overlap.
+
+        CPU raises: 'unsupported operation: more than one element of the
+        written-to tensor refers to a single memory location.'
+        Neuron must match.
+        """
+        device = "neuron"
+        x = torch.randn(3, 6).to(device)
+        index = torch.tensor([0, 1], dtype=torch.int64).to(device)
+        # Create an out tensor with internal overlap (stride 0 in dim 0)
+        out = torch.randn(6, device=device).unsqueeze(0).expand(2, 6)
+        assert not out.is_contiguous()
+        torch.index_select(x, 1, index, out=out)
+
     @assert_raises(TypeError, match=r"received an invalid combination of arguments")
     def test_index_select_with_incorrect_value(self):
         """Test index select with index dtype float"""
