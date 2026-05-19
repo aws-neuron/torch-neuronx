@@ -5076,6 +5076,62 @@ def register_all_defaults(r):
         },
         source="builtin",
     )
+    r(
+        "aten::index_fill.int_Tensor_out",
+        {
+            "self": (256, 256),
+            "dim": 0,
+            "index": {"shape": (32,), "dtype": "long", "low": 0, "high": 256},
+            "value": {"shape": (), "dtype": "float"},
+            "out": (256, 256),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::gather.out",
+        {
+            "self": (256, 4096),
+            "dim": 0,
+            "index": {"shape": (64, 4096), "dtype": "long", "low": 0, "high": 256},
+            "out": (64, 4096),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::histc",
+        {"self": (4096,), "bins": 100, "min": 0.0, "max": 1.0},
+        source="builtin",
+    )
+    r(
+        "aten::baddbmm.dtype_out",
+        {
+            "self": (8, 256, 64),  # (B, M, N)
+            "batch1": (8, 256, 128),  # (B, M, K)
+            "batch2": (8, 128, 64),  # (B, K, N)
+            "out_dtype": "float",
+            "beta": 1.0,
+            "alpha": 1.0,
+            "out": (8, 256, 64),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_batch_norm_with_update.out",
+        {
+            "input": (2, 64, 1024),
+            "weight": (64,),
+            "bias": (64,),
+            "running_mean": (64,),
+            "running_var": (64,),
+            "momentum": 0.1,
+            "eps": 1e-5,
+            "out": (2, 64, 1024),
+            "save_mean": (64,),
+            "save_invstd": (64,),
+            "reserve": (0,),
+        },
+        source="builtin",
+    )
 
     # ── Dimname / names_out variants ──────────────────────────────────
     # These require named tensors, which our test dispatches (torch.ops.aten.*)

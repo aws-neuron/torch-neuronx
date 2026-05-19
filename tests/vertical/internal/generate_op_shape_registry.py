@@ -169,12 +169,18 @@ def _parse_token(token: str) -> Any:
     # TensorList / GenericList: parse tensor shapes from inner content
     if token.startswith(("TL[", "GL[")):
         inner = token[3:-1]  # Strip TL[...] or GL[...] outer brackets
+        # Empty bracket (e.g. "GL[]") is a legitimate empty list — return [],
+        # not the literal string.
+        if not inner:
+            return []
         tensors = []
         for m in _TENSOR_RE.finditer(inner):
             raw_dims, dtype_str = m.group(1).strip(), m.group(2)
             shape = [int(d) for d in raw_dims.split(",") if d.strip().isdigit()] if raw_dims else []
             dtype = _DTYPE_MAP.get(dtype_str, dtype_str.lower())
             tensors.append({"shape": shape, "dtype": dtype})
+        # Non-empty inner with no tensor matches: fall back to the raw token
+        # so the caller can log/debug it.
         return tensors if tensors else token
 
     logger.debug(f"Unknown cache key token: {token!r}")
@@ -259,11 +265,84 @@ def _get_schema(op_name: str):
     return getattr(op, "_schema", None) if op else None
 
 
+# Defaults for required non-Tensor schema args that cache keys encode as
+# dynamic (null). The value is synthesized so the op can actually execute at
+# test time — real models tend to train with these canonical scalars anyway.
+# Matched first by (base_op, arg_name), then by arg_name alone, then by
+# type_str heuristic.
+_SCALAR_DEFAULT_BY_OP_ARG: dict[tuple[str, str], object] = {
+    ("aten::_fused_adam_", "lr"): 0.001,
+    ("aten::_fused_adam_", "beta1"): 0.9,
+    ("aten::_fused_adam_", "beta2"): 0.999,
+    ("aten::_fused_adam_", "weight_decay"): 0.01,
+    ("aten::_fused_adam_", "eps"): 1e-8,
+    ("aten::_fused_adam_", "amsgrad"): False,
+    ("aten::_fused_adam_", "maximize"): False,
+    ("aten::_fused_adamw_", "lr"): 0.001,
+    ("aten::_fused_adamw_", "beta1"): 0.9,
+    ("aten::_fused_adamw_", "beta2"): 0.999,
+    ("aten::_fused_adamw_", "weight_decay"): 0.01,
+    ("aten::_fused_adamw_", "eps"): 1e-8,
+    ("aten::_fused_adamw_", "amsgrad"): False,
+    ("aten::_fused_adamw_", "maximize"): False,
+    ("aten::_fused_sgd_", "lr"): 0.001,
+    ("aten::_fused_sgd_", "momentum"): 0.9,
+    ("aten::_fused_sgd_", "dampening"): 0.0,
+    ("aten::_fused_sgd_", "weight_decay"): 0.0,
+    ("aten::_fused_sgd_", "nesterov"): False,
+    ("aten::_fused_sgd_", "maximize"): False,
+    ("aten::_fused_sgd_", "is_first_step"): False,
+}
+
+# Arg-name-scoped defaults (any op). Applied after the op-specific table.
+_SCALAR_DEFAULT_BY_NAME: dict[str, object] = {
+    "eps": 1e-5,  # layer_norm / batch_norm / group_norm canonical eps
+    "momentum": 0.1,
+    "alpha": 1.0,
+    "beta": 1.0,
+    "dim": 0,
+    "keepdim": False,
+    "unbiased": True,
+    "correction": 1,
+}
+
+# Type-based fallback: coarse but safe when we can't match by name.
+_SCALAR_DEFAULT_BY_TYPE: dict[str, object] = {
+    "float": 0.0,
+    "int": 0,
+    "SymInt": 0,
+    "bool": False,
+    "number": 0.0,
+    "Scalar": 0.0,
+    "str": "",
+}
+
+
+def _fill_scalar_default(op_name: str, arg) -> object | None:
+    """Return a sensible default for a required non-Tensor arg, or None if
+    we don't know. Looked up first by (op_name, arg_name), then arg_name
+    alone, then schema type."""
+    type_str = str(arg.type)
+    hit = _SCALAR_DEFAULT_BY_OP_ARG.get((op_name, arg.name))
+    if hit is not None:
+        return hit
+    hit = _SCALAR_DEFAULT_BY_NAME.get(arg.name)
+    if hit is not None:
+        return hit
+    return _SCALAR_DEFAULT_BY_TYPE.get(type_str)
+
+
 def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
     """Map parsed cache key values to schema arg names.
 
     Walks the op schema in order, consuming positional args sequentially
     and matching kwargs by name. For missing args, uses schema defaults or None.
+
+    Cache keys encode dynamic (SymFloat/SymInt) scalars as the tokens 'float'
+    and 'int', which ``_parse_token`` translates to ``None``. For schema args
+    that require a concrete non-None value at execution time (the aten
+    dispatcher won't accept None for a ``float lr``), we fill a plausible
+    default via ``_fill_scalar_default`` as a post-processing pass.
     """
     schema = _get_schema(op_name)
     if schema is None:
@@ -299,6 +378,29 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
                 arg_shapes[name] = arg.default_value
             elif "?" in type_str or "Optional" in type_str:
                 arg_shapes[name] = None
+
+    # Fill sensible defaults for required non-Tensor args captured as dynamic.
+    for arg in schema.arguments:
+        name = arg.name
+        type_str = str(arg.type)
+        if name not in arg_shapes or arg_shapes[name] is not None:
+            continue
+        # Only fill non-Tensor required args; Optional[Tensor]=None is legitimate,
+        # and writable kwargs are populated by the test's _with_out_kwargs.
+        if "Tensor" in type_str:
+            continue
+        if "?" in type_str or "Optional" in type_str:
+            continue
+        default = _fill_scalar_default(op_name, arg)
+        if default is not None:
+            arg_shapes[name] = default
+            logger.debug(
+                "%s: filled %s=%r (was null; schema type=%s)",
+                op_name,
+                name,
+                default,
+                type_str,
+            )
 
     for arg in schema.arguments:
         if arg.name not in arg_shapes:
