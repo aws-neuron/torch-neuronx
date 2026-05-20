@@ -415,45 +415,7 @@ class XLABuilderKernel(BaseNeuronKernel):
             except RuntimeError as e:
                 raise RuntimeError(f"Collective direct execution failed: {e}") from e
 
-        # Single output - simple path
-        if len(output_tensors) == 1:
-            # Concatenate multiple inputs if needed (e.g., reduce_scatter)
-            if len(non_static_inputs) > 1:
-                tensors = [t for t in non_static_inputs if t.dim() > 0]
-                inputs = (
-                    (torch.cat(tensors, dim=0),)
-                    if tensors
-                    else (torch.stack(list(non_static_inputs), dim=0),)
-                )
-            else:
-                inputs = non_static_inputs
-            submit(inputs, output_tensors)
-            if needs_avg_divide:
-                output_tensors[0].div_(world_size)
-            return
-
-        # Multiple outputs (coalesced ops) - check if shapes match
-        same_shape = all(t.shape == output_tensors[0].shape for t in output_tensors)
-        if same_shape:
-            # Stack for efficiency
-            if len(non_static_inputs) > 1:
-                tensors = [t for t in non_static_inputs if t.dim() > 0]
-                inputs = (
-                    (torch.cat(tensors, dim=0),)
-                    if tensors
-                    else (torch.stack(list(non_static_inputs), dim=0),)
-                )
-            else:
-                inputs = non_static_inputs
-            stacked = torch.stack(output_tensors, dim=0)
-            submit(inputs, (stacked,))
-            if needs_avg_divide:
-                stacked.div_(world_size)
-            for i, out in enumerate(output_tensors):
-                out.copy_(stacked[i])
-        else:
-            # Different shapes - process individually
-            for inp, out in zip(non_static_inputs, output_tensors, strict=False):
-                submit((inp,), (out,))
-                if needs_avg_divide:
-                    out.div_(world_size)
+        submit(non_static_inputs, output_tensors)
+        if needs_avg_divide:
+            for out in output_tensors:
+                out.div_(world_size)
