@@ -14,11 +14,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_native" / "runner"))
 
+from aggregate_panel import (
+    _aggregated_failures,
+    _build_status_breakdown_rows,
+    write_github_summary,
+)
 from aggregate_upstream_results import (
     _get_run_metadata,
+    _group_from_file,
     aggregate_summary,
     flatten_reports,
-    write_github_summary,
     write_run_metadata_csv,
 )
 
@@ -274,26 +279,46 @@ def test_summary_csv_remains_class_keyed(tmp_path: Path) -> None:
     assert classes == {"TestA", "TestB"}
 
 
-def test_write_github_summary_renders_file_level_when_file_stats_present(tmp_path, monkeypatch):
-    """Smoke: when file_stats is populated, the panel header reads
-    ``test_file`` and the rows are file paths, not class names."""
+def test_write_github_summary_renders_group_level_when_group_stats_present(tmp_path, monkeypatch):
+    """The per-group breakdown section uses ``group_stats`` when present;
+    class names from the canonical CSV must not leak into the panel."""
     target = tmp_path / "step_summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
 
     result = _summary_result(
         # Class-level data (would render in CSV).
         stats={"TestA": {"passed": 5}, "TestB": {"passed": 3}},
-        # File-level data (used by the panel).
-        file_stats={"test_x.py": {"passed": 8}},
+        # Group-level data (used by the panel).
+        group_stats={"dynamo/": {"passed": 8}},
     )
     write_github_summary(result)
 
     content = target.read_text()
-    assert "| test_file |" in content  # column header
-    assert "test_x.py" in content
-    # Class names should NOT appear — option 2 uses file-level rendering.
+    assert "## Per-group breakdown" in content
+    assert "| group |" in content  # column header
+    assert "dynamo/" in content
+    # Class names should NOT appear — panel uses group-level rendering.
     assert "TestA" not in content
     assert "TestB" not in content
+
+
+def test_write_github_summary_falls_back_to_file_stats(tmp_path, monkeypatch):
+    """When ``group_stats`` is absent, the panel falls back to ``file_stats``
+    so older callers keep rendering."""
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    result = _summary_result(
+        stats={"TestA": {"passed": 5}},
+        file_stats={"test_x.py": {"passed": 5}},
+    )
+    # Drop group_stats to force the fallback.
+    result.pop("group_stats", None)
+    result.pop("group_durations", None)
+    write_github_summary(result)
+
+    content = target.read_text()
+    assert "test_x.py" in content
 
 
 # ---------------------------------------------------------------------------
@@ -427,16 +452,18 @@ def _summary_result(
     durations: dict | None = None,
     file_stats: dict | None = None,
     file_durations: dict | None = None,
+    group_stats: dict | None = None,
+    group_durations: dict | None = None,
+    test_rows: list | None = None,
 ) -> dict:
     """Build the result dict aggregate_summary returns.
 
     Wraps each unit's stat dict in a defaultdict so missing-status lookups
     return 0 — matches what aggregate_summary produces in production.
 
-    By default ``file_stats`` mirrors ``stats`` (treating the class names as
-    file names) so simple tests can keep passing a single dict. Pass an
-    explicit ``file_stats`` to render the panel from a different grouping
-    than the canonical CSV.
+    By default ``file_stats`` and ``group_stats`` mirror ``stats`` so simple
+    tests can keep passing a single dict. Pass explicit overrides to render
+    the panel from a different grouping than the canonical CSV.
     """
     from collections import defaultdict
 
@@ -446,6 +473,10 @@ def _summary_result(
     file_stats = file_stats if file_stats is not None else stats
     file_durations = (
         file_durations if file_durations is not None else dict.fromkeys(file_stats, 1.0)
+    )
+    group_stats = group_stats if group_stats is not None else file_stats
+    group_durations = (
+        group_durations if group_durations is not None else dict.fromkeys(group_stats, 1.0)
     )
     if durations is None:
         durations = dict.fromkeys(stats, 1.0)
@@ -459,15 +490,18 @@ def _summary_result(
         "durations": durations,
         "file_stats": _wrap(file_stats),
         "file_durations": file_durations,
+        "group_stats": _wrap(group_stats),
+        "group_durations": group_durations,
         "sorted_statuses": sorted_statuses,
         "total_stats": total_stats,
+        "test_rows": test_rows or [],
     }
 
 
 def test_write_github_summary_hides_all_skipped_units(tmp_path, monkeypatch):
-    """Files where every test was skipped have pass_rate N/A and add no
-    signal — they're hidden from the panel. Visible files still render
-    with their per-file stats."""
+    """Groups where every test was skipped have pass_rate N/A and add no
+    signal — they're hidden from the per-group breakdown. Visible groups
+    still render with their stats."""
     target = tmp_path / "step_summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
 
@@ -479,11 +513,14 @@ def test_write_github_summary_hides_all_skipped_units(tmp_path, monkeypatch):
     write_github_summary(_summary_result(stats))
 
     content = target.read_text()
+    # Visible group renders.
     assert "test_ran.py" in content
-    assert "test_all_skipped.py" not in content
-    assert "test_also_all_skipped.py" not in content
+    # All-skipped groups omitted from the per-group breakdown table.
+    breakdown = content.split("## Per-group breakdown", 1)[1]
+    assert "test_all_skipped.py" not in breakdown
+    assert "test_also_all_skipped.py" not in breakdown
     # Hidden count is surfaced.
-    assert "Hiding 2 all-skipped file(s)" in content
+    assert "Hiding 2 all-skipped group(s)" in content
 
 
 def test_write_github_summary_shows_all_when_nothing_hidden(tmp_path, monkeypatch):
@@ -501,9 +538,11 @@ def test_write_github_summary_shows_all_when_nothing_hidden(tmp_path, monkeypatc
     assert "Hiding " not in content
 
 
-def test_write_github_summary_full_total_includes_hidden(tmp_path, monkeypatch):
-    """The footer's full-suite TOTAL must include the hidden files' rows
-    so the panel doesn't lie about how big the suite is."""
+def test_write_github_summary_headline_includes_full_total(tmp_path, monkeypatch):
+    """The headline's ``**Total:**`` covers the full suite (including hidden
+    all-skipped groups) so the panel doesn't lie about how big the suite is.
+    The per-group breakdown's ``TOTAL (visible)`` row covers only the
+    rendered groups."""
     target = tmp_path / "step_summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
 
@@ -513,10 +552,10 @@ def test_write_github_summary_full_total_includes_hidden(tmp_path, monkeypatch):
     }
     write_github_summary(_summary_result(stats))
     content = target.read_text()
-    # Visible TOTAL row covers only test_ran.py = 10.
+    # Headline covers the entire suite (10 ran + 1000 skipped = 1010).
+    assert "**Total:** 1010" in content
+    # Visible TOTAL row in the per-group breakdown only covers test_ran.py = 10.
     assert "**TOTAL (visible)** | 10" in content
-    # Footer mentions the full suite size including the hidden 1000.
-    assert "Full suite TOTAL: 1010 tests" in content
 
 
 def test_write_github_summary_no_op_when_env_unset(tmp_path, monkeypatch):
@@ -667,3 +706,236 @@ def test_summary_csv_does_not_include_metadata_columns(tmp_path, monkeypatch):
     assert "commit_sha" not in cols
     assert "branch" not in cols
     assert "run_id" not in cols
+
+
+# ---------------------------------------------------------------------------
+# _group_from_file — collapses subdirectory files into a single panel row
+# ---------------------------------------------------------------------------
+def test_group_from_file_collapses_subdir_files():
+    # All dynamo/ files render as one row in the panel.
+    assert _group_from_file("dynamo/test_compile.py") == "dynamo/"
+    assert _group_from_file("dynamo/test_misc.py") == "dynamo/"
+    assert _group_from_file("distributed/test_ddp.py") == "distributed/"
+
+
+def test_group_from_file_keeps_root_files_distinct():
+    # Root-level files keep their own row so we don't bury aten ops.
+    assert _group_from_file("test_ops.py") == "test_ops.py"
+    assert _group_from_file("test_autograd.py") == "test_autograd.py"
+
+
+def test_group_from_file_handles_unknown():
+    assert _group_from_file("unknown") == "unknown"
+    assert _group_from_file("") == ""
+
+
+# ---------------------------------------------------------------------------
+# _build_status_breakdown_rows — collapses raw statuses into semantic groups
+# ---------------------------------------------------------------------------
+def test_build_status_breakdown_rows_groups_passed_variants():
+    """All "this test ran and was good" statuses fold into the Passed row."""
+    total = {"passed": 100, "xpassed": 5, "subtests passed": 2}
+    rows = _build_status_breakdown_rows(total)
+    labels = [r[0] for r in rows]
+    assert "Passed" in labels
+    passed_row = next(r for r in rows if r[0] == "Passed")
+    assert passed_row[1] == 107
+    # Breakdown enumerates each contributing status.
+    assert "passed: 100" in passed_row[2]
+    assert "xpassed: 5" in passed_row[2]
+    assert "subtests passed: 2" in passed_row[2]
+
+
+def test_build_status_breakdown_rows_skips_zero_count_groups():
+    """Groups with 0 total don't get a row — keeps the panel terse."""
+    total = {"passed": 5}
+    rows = _build_status_breakdown_rows(total)
+    labels = [r[0] for r in rows]
+    assert labels == ["Passed"]
+    # Failed / Skipped / etc. omitted because they have 0 count.
+    assert "Failed" not in labels
+    assert "Skipped" not in labels
+
+
+def test_build_status_breakdown_rows_separates_failures_from_xfailed():
+    """xfailed is "known issue", not "failed" — they go in distinct rows."""
+    total = {"failed": 2, "error": 1, "xfailed": 50, "xfailed_on_retry": 3}
+    rows = _build_status_breakdown_rows(total)
+    by_label = {r[0]: r for r in rows}
+    assert by_label["Failed"][1] == 3  # failed + error
+    assert by_label["Known issues (xfailed)"][1] == 53
+
+
+def test_build_status_breakdown_rows_includes_passed_on_retry():
+    """Passed-on-retry is its own row — it's a flakiness signal, not a pass."""
+    total = {"passed": 10, "passed_on_retry": 2, "xpassed_on_retry": 1}
+    rows = _build_status_breakdown_rows(total)
+    by_label = {r[0]: r for r in rows}
+    assert by_label["Passed on retry (flaky)"][1] == 3
+
+
+def test_build_status_breakdown_rows_breakdown_only_shows_nonzero():
+    """The breakdown string omits zero-count contributors so a row that
+    only has ``passed`` doesn't pad with ``xpassed: 0 • subtests passed: 0``."""
+    total = {"passed": 5}
+    rows = _build_status_breakdown_rows(total)
+    passed_row = next(r for r in rows if r[0] == "Passed")
+    assert passed_row[2] == "passed: 5"
+    assert "xpassed" not in passed_row[2]
+
+
+# ---------------------------------------------------------------------------
+# _aggregated_failures — extracts and sorts failed/error rows for the panel
+# ---------------------------------------------------------------------------
+def test_aggregated_failures_filters_to_failed_and_error():
+    """Only failed/error rows survive; passed/xfailed/skipped are excluded."""
+    rows = [
+        {"test_id": "test_a.py::T::a", "status": "failed"},
+        {"test_id": "test_b.py::T::b", "status": "error"},
+        {"test_id": "test_c.py::T::c", "status": "passed"},
+        {"test_id": "test_d.py::T::d", "status": "xfailed"},
+        {"test_id": "test_e.py::T::e", "status": "skipped"},
+        # passed_on_retry was previously a failure but ultimately passed.
+        {"test_id": "test_f.py::T::f", "status": "passed_on_retry"},
+    ]
+    failures = _aggregated_failures(rows)
+    statuses = [r["status"] for r in failures]
+    assert set(statuses) == {"failed", "error"}
+    assert len(failures) == 2
+
+
+def test_aggregated_failures_sort_is_stable_across_runs():
+    """Sorted by (file, test_id) so two runs with the same failures produce
+    diffable panels."""
+    rows = [
+        {"test_id": "dynamo/test_z.py::T::z", "status": "failed"},
+        {"test_id": "test_a.py::T::a", "status": "failed"},
+        {"test_id": "dynamo/test_y.py::T::y", "status": "error"},
+    ]
+    failures = _aggregated_failures(rows)
+    # File ordering: dynamo/test_y.py < dynamo/test_z.py < test_a.py
+    assert [r["test_id"] for r in failures] == [
+        "dynamo/test_y.py::T::y",
+        "dynamo/test_z.py::T::z",
+        "test_a.py::T::a",
+    ]
+
+
+def test_aggregated_failures_returns_empty_on_clean_run():
+    rows = [{"test_id": "x.py::T::a", "status": "passed"}]
+    assert _aggregated_failures(rows) == []
+
+
+# ---------------------------------------------------------------------------
+# Three-section panel — headline + status breakdown / failures / per-group
+# ---------------------------------------------------------------------------
+def test_panel_renders_three_sections(tmp_path, monkeypatch):
+    """Smoke: all three section markers present in the rendered panel."""
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    test_rows = [{"test_id": "test_x.py::T::a", "status": "failed", "failure_reason": "boom"}]
+    result = _summary_result(
+        stats={"TestX": {"passed": 5, "failed": 1}},
+        group_stats={"test_x.py": {"passed": 5, "failed": 1}},
+        test_rows=test_rows,
+    )
+    write_github_summary(result)
+
+    content = target.read_text()
+    # 1: headline + status breakdown
+    assert "## PT Upstream Test Results" in content
+    assert "**Total:**" in content
+    assert "**Pass rate:**" in content
+    assert "**Failures:**" in content
+    assert "| group | count | breakdown |" in content
+    # 2: failures section
+    assert "## Failures" in content
+    assert "test_x.py::T::a" in content
+    # 3: per-group breakdown
+    assert "## Per-group breakdown" in content
+
+
+def test_panel_omits_failures_section_on_clean_run(tmp_path, monkeypatch):
+    """No ## Failures heading when there are no failed/error rows."""
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    result = _summary_result(
+        stats={"TestX": {"passed": 5}},
+        test_rows=[{"test_id": "test_x.py::T::a", "status": "passed"}],
+    )
+    write_github_summary(result)
+
+    content = target.read_text()
+    assert "## Failures" not in content
+
+
+def test_panel_caps_failures_table(tmp_path, monkeypatch):
+    """Failures past the cap are truncated; the panel surfaces the truncation."""
+    from aggregate_panel import _MAX_AGGREGATED_FAILURES_IN_PANEL
+
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    over_cap = _MAX_AGGREGATED_FAILURES_IN_PANEL + 25
+    test_rows = [
+        {"test_id": f"test_x.py::T::t{i:04d}", "status": "failed", "failure_reason": ""}
+        for i in range(over_cap)
+    ]
+    result = _summary_result(
+        stats={"TestX": {"failed": over_cap}},
+        test_rows=test_rows,
+    )
+    write_github_summary(result)
+
+    content = target.read_text()
+    # Total count in the heading reflects ALL failures, not just shown.
+    assert f"## Failures ({over_cap} total)" in content
+    # Truncation note present.
+    assert f"Showing first {_MAX_AGGREGATED_FAILURES_IN_PANEL}" in content
+    # The 1st test_id renders; the (cap+1)th does not.
+    assert "T::t0000" in content
+    assert f"T::t{_MAX_AGGREGATED_FAILURES_IN_PANEL:04d}" not in content
+
+
+def test_panel_failure_row_strips_pipes_and_newlines(tmp_path, monkeypatch):
+    """Failure reasons that contain ``|`` or newlines must not break the
+    markdown table."""
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    test_rows = [
+        {
+            "test_id": "test_x.py::T::pipe",
+            "status": "failed",
+            "failure_reason": "first line | with pipe\nsecond line",
+        }
+    ]
+    result = _summary_result(
+        stats={"TestX": {"failed": 1}},
+        test_rows=test_rows,
+    )
+    write_github_summary(result)
+
+    content = target.read_text()
+    # Pipe escaped, only the first line of the reason rendered.
+    assert "first line \\| with pipe" in content
+    assert "second line" not in content
+
+
+def test_panel_status_breakdown_skips_empty_groups(tmp_path, monkeypatch):
+    """Status-breakdown table only contains rows whose semantic group has
+    a non-zero count."""
+    target = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(target))
+
+    result = _summary_result(stats={"TestX": {"passed": 5}})
+    write_github_summary(result)
+
+    content = target.read_text()
+    breakdown = content.split("| group | count | breakdown |", 1)[1].split("##", 1)[0]
+    assert "Passed" in breakdown
+    # No Failed / Skipped rows since those groups have zero counts.
+    assert "Failed" not in breakdown
+    assert "Skipped" not in breakdown
