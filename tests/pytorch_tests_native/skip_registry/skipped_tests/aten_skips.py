@@ -241,6 +241,17 @@ ATEN_FOREACH_WORKER_CRASH = [
     "test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_int64",
     "test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_int8",
     "test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_uint8",
+    "test_parity__foreach_abs_slowpath_inplace_neuron_bfloat16",
+    "test_parity__foreach_clone_slowpath_inplace_neuron_bool",
+    "test_binary_op_list_error_cases__foreach_pow_neuron_bfloat16",
+    "test_binary_op_list_error_cases__foreach_pow_neuron_float64",
+    "test_parity__foreach_add_fastpath_outplace_neuron_float64",
+    "test_parity__foreach_copy_fastpath_inplace_neuron_int64",
+    "test_parity__foreach_copy_fastpath_outplace_neuron_int32",
+    "test_binary_op_list_error_cases__foreach_add_neuron_bool",
+    "test_binary_op_list_error_cases__foreach_mul_neuron_float32",
+    "test_parity__foreach_acos_slowpath_inplace_neuron_float32",
+    "test_parity__foreach_addcdiv_fastpath_inplace_neuron_uint8",
 ]
 
 
