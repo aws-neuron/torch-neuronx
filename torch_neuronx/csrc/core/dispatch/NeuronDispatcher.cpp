@@ -299,6 +299,9 @@ static torch::Tensor NeuronToContiguousCPU(const at::Tensor& src, bool non_block
 static torch::Tensor CopyNeuronToCPU(const at::Tensor& src, c10::ScalarType target_dtype,
                                      bool non_blocking = false) {
   auto cpu = NeuronToContiguousCPU(src, non_blocking);
+  // Materialize conj/neg bits that raw byte copy does not handle.
+  if (src.is_conj()) cpu = cpu.conj_physical_();
+  if (src.is_neg()) cpu = cpu.neg_();
   if (cpu.scalar_type() != target_dtype) {
     // Synchronize before reading data for the dtype cast — the non-blocking
     // copy may still be in flight.

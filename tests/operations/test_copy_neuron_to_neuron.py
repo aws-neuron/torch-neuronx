@@ -283,3 +283,127 @@ def test_to_copy_non_default_stream_uses_direct_primitive():
         torch.testing.assert_close(src.cpu().to(torch.float16), result.cpu())
 
     _run()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Conjugate / negation bit materialization during copy
+#
+#  The conj/neg bits are lazy metadata flags (set by .conj() and ._neg_view()).
+#  copy_ must materialize them into actual data. The CPU-bounce path in
+#  DispatchCopyImpl previously did a raw byte copy without applying these
+#  transformations, causing silent correctness bugs in complex autograd
+#  (e.g. view_as_complex backward producing swapped gradient rows).
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestConjBitCopyNeuronToNeuron:
+    """copy_ with conjugated complex source must negate imaginary parts."""
+
+    def test_copy_conj_basic(self):
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        dst = torch.empty(2, dtype=torch.complex64, device="neuron")
+        dst.copy_(t.conj())
+        expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_conj_2d(self):
+        t = torch.randn(8, 8, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(8, 8, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron.conj())
+        torch.testing.assert_close(dst.cpu(), t.conj().resolve_conj())
+
+    def test_copy_conj_no_conj_unchanged(self):
+        """Non-conjugated source copies data as-is."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron)
+        torch.testing.assert_close(dst.cpu(), t)
+
+    def test_copy_double_conj_cancels(self):
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron.conj().conj())
+        torch.testing.assert_close(dst.cpu(), t)
+
+    def test_clone_conj(self):
+        """clone() goes through copy_ — must also materialize conj."""
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        cloned = t.conj().clone()
+        expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(cloned.cpu(), expected)
+
+
+class TestNegBitCopyNeuronToNeuron:
+    """copy_ with negated source must negate all values."""
+
+    def test_copy_neg_basic(self):
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        dst = torch.empty(2, dtype=torch.complex64, device="neuron")
+        dst.copy_(t._neg_view())
+        expected = torch.tensor([-1.0 - 2.0j, -3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_clone_neg(self):
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        cloned = t_neuron._neg_view().clone()
+        torch.testing.assert_close(cloned.cpu(), -t)
+
+
+class TestConjNegEdgeCases:
+    """Edge cases: broadcast, combined bits, non-contiguous dst."""
+
+    def test_copy_conj_with_broadcast(self):
+        """copy_ with conj'd source that needs broadcasting."""
+        src = torch.randn(1, 4, dtype=torch.complex64)
+        src_neuron = src.to("neuron").conj()
+        dst = torch.empty(3, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(src_neuron)
+        expected = src.conj().resolve_conj().expand(3, 4)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_conj_and_neg_combined(self):
+        """Tensor with both conj and neg bits set."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()._neg_view()
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron)
+        expected = -(t.conj().resolve_conj())
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_neg_with_broadcast(self):
+        """copy_ with neg'd source that needs broadcasting."""
+        src = torch.randn(1, 4, dtype=torch.complex64)
+        src_neuron = src.to("neuron")._neg_view()
+        dst = torch.empty(3, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(src_neuron)
+        expected = (-src).expand(3, 4)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_to_copy_conj_neuron_to_neuron(self):
+        """_to_copy (via .clone()) on a conj'd Neuron tensor stays on device."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()
+        result = t_neuron.clone()
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), t.conj().resolve_conj())
+
+    def test_to_copy_neg_neuron_to_neuron(self):
+        """_to_copy (via .clone()) on a neg'd Neuron tensor stays on device."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")._neg_view()
+        result = t_neuron.clone()
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), -t)
+
+    def test_copy_conj_with_dtype_cast_neuron_to_neuron(self):
+        """copy_ conj'd complex64 src into complex128 dst on Neuron."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        src_neuron = t.to("neuron").conj()
+        dst = torch.empty(4, 4, dtype=torch.complex128, device="neuron")
+        dst.copy_(src_neuron)
+        expected = t.conj().resolve_conj().to(torch.complex128)
+        torch.testing.assert_close(dst.cpu(), expected)

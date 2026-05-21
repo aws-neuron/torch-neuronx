@@ -298,3 +298,89 @@ class TestComplexCPUFallbackOps:
             result.returncode == 0
         ), f"subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}"
         assert "OK" in result.stdout
+
+
+class TestConjNegNonContiguousCopy:
+    """Non-contiguous complex copy with conj/neg bits requires CPU fallback.
+
+    These tests exercise copy_ paths where the source or destination is
+    non-contiguous AND has conj/neg metadata. The contiguous() call on a
+    complex Neuron tensor falls back to CPU, so these need fallback enabled.
+    """
+
+    def test_copy_conj_non_contiguous_src_to_neuron(self):
+        """Transposed + conj'd source into contiguous Neuron dst."""
+        snippet = """
+            import torch
+            import torch_neuronx
+            t = torch.randn(4, 4, dtype=torch.complex64)
+            src_neuron = t.to("neuron").transpose(0, 1).conj()
+            dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+            dst.copy_(src_neuron)
+            expected = t.transpose(0, 1).conj().resolve_conj()
+            assert torch.allclose(dst.cpu(), expected, atol=1e-5), "mismatch"
+            print("OK")
+        """
+        result = _run_in_subprocess(snippet, flag_value="0")
+        assert (
+            result.returncode == 0
+        ), f"subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        assert "OK" in result.stdout
+
+    def test_copy_conj_into_non_contiguous_dst(self):
+        """Conj'd source into transposed (non-contiguous) Neuron destination."""
+        snippet = """
+            import torch
+            import torch_neuronx
+            src = torch.randn(4, 4, dtype=torch.complex64)
+            src_neuron = src.to("neuron").conj()
+            dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron").t()
+            dst.copy_(src_neuron)
+            expected = src.conj().resolve_conj()
+            assert torch.allclose(dst.cpu(), expected, atol=1e-5), "mismatch"
+            print("OK")
+        """
+        result = _run_in_subprocess(snippet, flag_value="0")
+        assert (
+            result.returncode == 0
+        ), f"subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        assert "OK" in result.stdout
+
+    @pytest.mark.xfail(reason="Segfaults — non-contiguous complex conj copy not yet supported")
+    def test_copy_conj_non_contiguous_src_to_cpu(self):
+        """Non-contiguous conj'd Neuron src copied directly to CPU dst."""
+        snippet = """
+            import torch
+            import torch_neuronx
+            t = torch.randn(4, 4, dtype=torch.complex64)
+            t_neuron = t.to("neuron").transpose(0, 1).conj()
+            dst = torch.empty(4, 4, dtype=torch.complex64)
+            dst.copy_(t_neuron)
+            expected = t.transpose(0, 1).conj().resolve_conj()
+            assert torch.allclose(dst, expected, atol=1e-5), "mismatch"
+            print("OK")
+        """
+        result = _run_in_subprocess(snippet, flag_value="0")
+        assert (
+            result.returncode == 0
+        ), f"subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        assert "OK" in result.stdout
+
+    @pytest.mark.xfail(reason="Segfaults — non-contiguous complex conj clone not yet supported")
+    def test_clone_conj_non_contiguous(self):
+        """clone() on a non-contiguous conj'd Neuron tensor."""
+        snippet = """
+            import torch
+            import torch_neuronx
+            t = torch.randn(4, 4, dtype=torch.complex64)
+            t_neuron = t.to("neuron").transpose(0, 1).conj()
+            result = t_neuron.clone().cpu()
+            expected = t.transpose(0, 1).conj().resolve_conj()
+            assert torch.allclose(result, expected, atol=1e-5), "mismatch"
+            print("OK")
+        """
+        result = _run_in_subprocess(snippet, flag_value="0")
+        assert (
+            result.returncode == 0
+        ), f"subprocess failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        assert "OK" in result.stdout
