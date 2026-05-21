@@ -2673,6 +2673,274 @@ class TestSiluBackwardDecompositionE2E:
         self._assert_parity(model_fn)
 
 
+class TestAddbmmDecomposition:
+    """Tests for addbmm decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.addbmm.default in decompositions.neuron_decompositions
+        ), "aten.addbmm.default not found in neuron_decompositions"
+
+    def test_basic(self):
+        """Test basic addbmm: self + (batch1 @ batch2).sum(dim=0)"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(3, 4)
+        batch1 = torch.randn(5, 3, 2)
+        batch2 = torch.randn(5, 2, 4)
+
+        result = decompositions.addbmm(self_tensor, batch1, batch2)
+        expected = torch.addbmm(self_tensor, batch1, batch2)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "alpha,beta",
+        [
+            (1, 1),
+            (2.0, 0.5),
+            (0.0, 1.0),
+            (1.0, 0.0),
+            (0.0, 0.0),
+            (-1.0, 2.0),
+        ],
+    )
+    def test_alpha_beta(self, alpha, beta):
+        """Test addbmm with various alpha and beta values"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(3, 4)
+        batch1 = torch.randn(5, 3, 2)
+        batch2 = torch.randn(5, 2, 4)
+
+        result = decompositions.addbmm(self_tensor, batch1, batch2, beta=beta, alpha=alpha)
+        expected = torch.addbmm(self_tensor, batch1, batch2, beta=beta, alpha=alpha)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float64, torch.float16, torch.bfloat16],
+    )
+    def test_dtypes(self, dtype):
+        """Test addbmm with various dtypes"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(3, 4, dtype=dtype)
+        batch1 = torch.randn(2, 3, 5, dtype=dtype)
+        batch2 = torch.randn(2, 5, 4, dtype=dtype)
+
+        result = decompositions.addbmm(self_tensor, batch1, batch2)
+        expected = torch.addbmm(self_tensor, batch1, batch2)
+
+        rtol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        atol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    def test_single_batch(self):
+        """Test addbmm with batch size 1"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(2, 3)
+        batch1 = torch.randn(1, 2, 4)
+        batch2 = torch.randn(1, 4, 3)
+
+        result = decompositions.addbmm(self_tensor, batch1, batch2)
+        expected = torch.addbmm(self_tensor, batch1, batch2)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_beta_zero_ignores_self(self):
+        """Test that beta=0 ignores self (even if self contains NaN)"""
+        self_tensor = torch.full((2, 3), float("nan"))
+        batch1 = torch.ones(1, 2, 4)
+        batch2 = torch.ones(1, 4, 3)
+
+        result = decompositions.addbmm(self_tensor, batch1, batch2, beta=0, alpha=1)
+        expected = torch.addbmm(self_tensor, batch1, batch2, beta=0, alpha=1)
+
+        torch.testing.assert_close(result, expected)
+
+
+class TestHypotDecomposition:
+    """Tests for hypot decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.hypot.default in decompositions.neuron_decompositions
+        ), "aten.hypot.default not found in neuron_decompositions"
+
+    def test_basic(self):
+        """Test basic hypot: sqrt(a^2 + b^2)"""
+        a = torch.tensor([3.0, 5.0, 0.0])
+        b = torch.tensor([4.0, 12.0, 0.0])
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float64, torch.float16, torch.bfloat16],
+    )
+    def test_dtypes(self, dtype):
+        """Test hypot with various dtypes"""
+        torch.manual_seed(42)
+        a = torch.randn(10, dtype=dtype)
+        b = torch.randn(10, dtype=dtype)
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        rtol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
+        atol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-5
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    def test_both_zeros(self):
+        """Test hypot when both inputs are zero"""
+        a = torch.zeros(5)
+        b = torch.zeros(5)
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_negative_values(self):
+        """Test hypot with negative values"""
+        a = torch.tensor([-3.0, -5.0, 3.0])
+        b = torch.tensor([4.0, -12.0, -4.0])
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(8,), (4, 5), (2, 3, 4)],
+    )
+    def test_shapes(self, shape):
+        """Test hypot with various tensor shapes"""
+        torch.manual_seed(42)
+        a = torch.randn(shape)
+        b = torch.randn(shape)
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_large_values(self):
+        """Test numerical stability with large values that would overflow naive sqrt(a^2+b^2)"""
+        a = torch.tensor([1e30, 1e38])
+        b = torch.tensor([1e30, 1e38])
+
+        result = decompositions.hypot(a, b)
+        expected = torch.hypot(a, b)
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+
+class TestAddmvDecomposition:
+    """Tests for addmv decomposition (registered via PyTorch get_decompositions)"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.addmv.default in decompositions.neuron_decompositions
+        ), "aten.addmv.default not found in neuron_decompositions"
+
+    def test_basic(self):
+        """Test basic addmv: self + (mat @ vec)"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(3)
+        mat = torch.randn(3, 4)
+        vec = torch.randn(4)
+
+        decomp_fn = decompositions.neuron_decompositions[torch.ops.aten.addmv.default]
+        result = decomp_fn(self_tensor, mat, vec)
+        expected = torch.addmv(self_tensor, mat, vec)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "alpha,beta",
+        [
+            (1, 1),
+            (2.0, 0.5),
+            (0.0, 1.0),
+            (1.0, 0.0),
+            (0.0, 0.0),
+            (-1.0, 2.0),
+        ],
+    )
+    def test_alpha_beta(self, alpha, beta):
+        """Test addmv with various alpha and beta values"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(3)
+        mat = torch.randn(3, 4)
+        vec = torch.randn(4)
+
+        decomp_fn = decompositions.neuron_decompositions[torch.ops.aten.addmv.default]
+        result = decomp_fn(self_tensor, mat, vec, beta=beta, alpha=alpha)
+        expected = torch.addmv(self_tensor, mat, vec, beta=beta, alpha=alpha)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float64, torch.float16, torch.bfloat16],
+    )
+    def test_dtypes(self, dtype):
+        """Test addmv with various dtypes"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(5, dtype=dtype)
+        mat = torch.randn(5, 3, dtype=dtype)
+        vec = torch.randn(3, dtype=dtype)
+
+        decomp_fn = decompositions.neuron_decompositions[torch.ops.aten.addmv.default]
+        result = decomp_fn(self_tensor, mat, vec)
+        expected = torch.addmv(self_tensor, mat, vec)
+
+        rtol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        atol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "m,n",
+        [
+            (1, 1),
+            (2, 8),
+            (10, 3),
+            (64, 64),
+        ],
+    )
+    def test_shapes(self, m, n):
+        """Test addmv with various matrix shapes"""
+        torch.manual_seed(42)
+        self_tensor = torch.randn(m)
+        mat = torch.randn(m, n)
+        vec = torch.randn(n)
+
+        decomp_fn = decompositions.neuron_decompositions[torch.ops.aten.addmv.default]
+        result = decomp_fn(self_tensor, mat, vec)
+        expected = torch.addmv(self_tensor, mat, vec)
+
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_beta_zero_ignores_self(self):
+        """Test that beta=0 ignores self (even if self contains NaN)"""
+        self_tensor = torch.full((3,), float("nan"))
+        mat = torch.ones(3, 4)
+        vec = torch.ones(4)
+
+        decomp_fn = decompositions.neuron_decompositions[torch.ops.aten.addmv.default]
+        result = decomp_fn(self_tensor, mat, vec, beta=0, alpha=1)
+        expected = torch.addmv(self_tensor, mat, vec, beta=0, alpha=1)
+
+        torch.testing.assert_close(result, expected)
+
+
 class TestSearchsortedDecomposition:
     """Tests for searchsorted decomposition"""
 
