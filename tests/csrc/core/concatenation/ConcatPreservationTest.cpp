@@ -30,14 +30,10 @@ class ConcatPreservationFixture {
  protected:
   void SetUpFixture() {
     manager = std::make_unique<IrNodeManager>();
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
     unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
   }
 
-  void TearDownFixture() {
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
-    unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
-  }
+  void TearDownFixture() { unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING"); }
 
   std::unique_ptr<IrNodeManager> manager;
 

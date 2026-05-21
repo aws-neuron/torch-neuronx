@@ -67,6 +67,26 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   return false;
 }
 
+// kHint/kAlloc/kDealloc are bufferable because the merge path consumes their
+// lifetime info; only kHLO is fusible. Everything else flushes the buffer.
+inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
+  switch (kernel_type) {
+    case KernelTypeEnum::kHLO:
+    case KernelTypeEnum::kHint:
+    case KernelTypeEnum::kAlloc:
+    case KernelTypeEnum::kDealloc:
+      return true;
+    case KernelTypeEnum::kCollective:
+    case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kWrite:
+    case KernelTypeEnum::kRead:
+    case KernelTypeEnum::kEvent:
+    case KernelTypeEnum::kBarrier:
+      return false;
+  }
+  return false;
+}
+
 // Convert device KernelTypeEnum to XU index for completion/inflight tracking.
 inline size_t GetXUIndex(KernelTypeEnum kernel_type) {
   switch (kernel_type) {

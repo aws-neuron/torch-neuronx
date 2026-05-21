@@ -25,14 +25,10 @@ class ConcatPruneExplorationTest : public ::testing::Test {
  protected:
   void SetUp() override {
     manager = std::make_unique<IrNodeManager>();
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
     unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
   }
 
-  void TearDown() override {
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
-    unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
-  }
+  void TearDown() override { unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING"); }
 
   std::unique_ptr<IrNodeManager> manager;
 

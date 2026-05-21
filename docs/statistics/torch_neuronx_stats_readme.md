@@ -148,6 +148,67 @@ Compilation stats are collected and exposed using `_C._get_compilation_cache_sta
 | `CompilationCache.CompilationTime` | Aggregated time spent compiling (with mean/min/max) |
 | `CompilationCache.NeffSize` | Aggregated size of compiled NEFFs (with mean/min/max) |
 
+#### Concatenation Stats
+
+Collected when `TORCH_NEURONX_METRICS_ENABLED=1` and
+`TORCH_NEURONX_ENABLE_CONCATENATION=1`. Concatenation merges consecutive
+compatible ops into a single fused graph; these metrics show how often it
+runs, how many ops it merges, and how many NEFFs it eliminates.
+
+`met.get_metrics_dict("Concatenation")` returns all `Concatenation.*` entries
+as a structured dict.
+
+**Counters:**
+
+| Name | Description |
+|------|-------------|
+| `Concatenation.Attempts` | Times concatenation was attempted |
+| `Concatenation.Successes` | Attempts that produced a merged group |
+| `Concatenation.Failures` | Post-compilation failures of a concatenated op |
+| `Concatenation.Fallbacks` | Fell back to op-by-op execution after a merge error |
+| `Concatenation.GroupsCreated` | Concatenated groups produced |
+| `Concatenation.OpsConcatenated` | Original ops absorbed into groups |
+| `Concatenation.GraphsReduced` | NEFFs eliminated (`N` ops → 1 graph saves `N-1`) |
+| `Concatenation.CacheHits` | IR concatenation cache hits |
+| `Concatenation.CacheMisses` | IR concatenation cache misses |
+| `Concatenation.CacheInvalidations` | Cache entries invalidated due to failures |
+| `Concatenation.BoundaryFlushes` | Buffer flushes triggered by a non-fusible boundary op |
+| `Concatenation.StreamChangeFlushes` | Buffer flushes due to stream changes |
+| `Concatenation.BufferLimitHits` | Buffer flushes from hitting `TORCH_NEURONX_CONCATENATION_BUFFER_SIZE_LIMIT` |
+
+**Metrics (with mean/min/max):**
+
+| Name | Description |
+|------|-------------|
+| `Concatenation.ProcessingTime` | End-to-end time per concatenation attempt |
+| `Concatenation.MergeTime` | Time spent in the IR merge pipeline |
+| `Concatenation.BufferSize` | Ops in the pending-op buffer at flush time |
+| `Concatenation.GroupSize` | Ops per concatenated group |
+
+**Op-tracking APIs** (always on, no env var needed). The
+`ConcatenatedOpTracker` records which original ops were merged into which
+group and how many times each group executed (count of 1 means compiled but
+never reused; count > 1 means cache hits):
+
+```python
+import torch_neuronx
+
+torch_neuronx.get_concatenation_status()              # is_active, diagnosis, etc.
+torch_neuronx.get_concatenated_ops()                  # group_name -> [original_ops]
+torch_neuronx.get_concatenated_op_execution_counts()  # group_name -> exec count
+torch_neuronx.get_concatenation_profiles()            # per-type merge times (opt-in, see below)
+torch_neuronx.clear_op_tracking()                     # reset trackers between runs
+```
+
+`get_concatenation_status()` returns one of: **ACTIVE** (merged ops detected),
+**ENABLED but NOT ACTIVE** (flag set but workload had no fusible sequences, or
+dispatch was too slow for the buffer to accumulate), or **DISABLED**.
+
+Per-type profiling (`get_concatenation_profiles()`) records per-invocation
+merge times and group sizes. It uses unbounded memory and is opt-in via
+`met.set_concatenation_profiling_enabled(True)` or
+`TORCH_NEURONX_CONCATENATION_PROFILING=1`.
+
 ### Available APIs
 
 ```python
@@ -157,6 +218,7 @@ met.get_counter_names()      # List all counter names
 met.get_counter_value(name)  # Get specific counter value
 met.get_metric_names()       # List all metric names
 met.get_metric_data(name)    # Get specific metric data
+met.get_metrics_dict(prefix) # Structured dict of all metrics, optionally filtered by prefix
 met.report()                 # Full metrics report
 met.report_filtered(...)     # Filtered report
 met.clear_counters()         # Reset counters
@@ -164,6 +226,7 @@ met.clear_metrics()          # Reset metrics
 met.clear_all()              # Reset everything
 met.is_enabled()             # Check if metrics enabled
 met.set_enabled(True)        # Enable metrics collection
+met.set_concatenation_profiling_enabled(True)  # Toggle per-type concat profiling
 ```
 
 ---
