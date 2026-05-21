@@ -106,7 +106,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Scalars not equal - comm count mismatch",
         tests=[
             "test_distribute_tensor_rank",
-            "test_dtensor_stride",
         ],
     ),
     SkipGroup(
@@ -167,7 +166,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " created by StridedShard placement are unsupported by Neuron collective impl"
         ),
         tests=[
-            "test_strided_shard_redistribution",
             "test_strided_shard_to_shard_redistribution",
         ],
     ),
@@ -209,7 +207,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " method. Dynamo fails tracing dist.get_process_group_ranks(self)"
         ),
         tests=[
-            "test_2d_fsdp_tp_ac_compile_use_ca_False",
             "test_2d_fsdp_tp_ac_compile_use_ca_True",
             "test_2d_fsdp_tp_compile_use_ca_False",
             "test_2d_fsdp_tp_compile_use_ca_True",
