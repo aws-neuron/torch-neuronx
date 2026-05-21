@@ -263,6 +263,7 @@ struct OperationContext {
   std::chrono::steady_clock::time_point execute_end = {};
   std::chrono::steady_clock::time_point concat_start = {};
   std::chrono::steady_clock::time_point concat_end = {};
+  std::chrono::steady_clock::time_point dispatch_start = {};  // RuntimeWorker picks up op
 
   // PyTorch tracing identifiers for linking with torch profiler and neuron-tools.
   // Upon SubmitOperationContext, pytorch_sequence_nr and pytorch_thread_id are populated with the
@@ -280,6 +281,8 @@ struct OperationContext {
 
   // OS thread ID (gettid) of the Neuron stream execution worker that scheduled this operation
   int32_t neuron_stream_os_tid{-1};  // -1 = not yet assigned; valid tids are positive (gettid())
+  int32_t xu_type{-1};               // Resolved XU type after scheduling (NRTA_XU_COMPUTE etc.)
+  int32_t dispatch_slot{-1};         // Inflight slot for parallel trace visualization (0-7 per XU)
   // Unique event ID for framework-to-NRT event linking
   uint64_t event_id = 0;
 
