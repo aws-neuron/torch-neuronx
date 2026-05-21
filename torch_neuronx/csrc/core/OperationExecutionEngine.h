@@ -130,9 +130,8 @@ class OperationExecutionEngine {
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
   void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
-
-  // Async scheduling helper.
   bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
+  bool ScheduleAllocOperation(OperationContext* op, StreamImpl* stream);
 
   std::atomic<int64_t> execution_queue_depth_{0};
 

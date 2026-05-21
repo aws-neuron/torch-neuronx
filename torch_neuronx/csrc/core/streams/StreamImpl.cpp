@@ -190,6 +190,8 @@ void StreamImpl::RemoveActiveOperation(const OperationContext* operation) {
       operation_to_destroy = std::move(*it);
       active_operations_.erase(it);
 
+      ReleaseDeferredAllocGates();
+
       completion_cv.notify_all();
       TORCH_NEURONX_DEBUG("Operation removed and completion_cv notified", "stream_id=", stream_id,
                           "operation=", op_name, "new_active_count=", active_operations_.size());
@@ -198,6 +200,61 @@ void StreamImpl::RemoveActiveOperation(const OperationContext* operation) {
                           "stream_id=", stream_id, "operation=", operation->GetOpName());
     }
   }
+}
+
+bool StreamImpl::IsStreamDrainedWithLockHeld() const {
+  // True iff no op is scheduled or pending-signal. Deferred kAllocs are
+  // parked, not draining, so a stream holding only Deferred kAllocs counts
+  // as drained (otherwise the drain hook could never fire).
+  for (const auto& op_ptr : active_operations_) {
+    if (op_ptr->nrt_async_state_.is_scheduled || op_ptr->nrt_async_state_.is_pending_signal) {
+      return false;
+    }
+    if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation() &&
+        op_ptr->GetConcatenatedOperation()->nrt_async_state_.is_scheduled) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void StreamImpl::ReleaseDeferredAllocGates() {
+  // Caller must hold active_operations_mutex_.
+  if (!IsStreamDrainedWithLockHeld()) {
+    return;
+  }
+  // Stream drained: flip any deferred kAlloc to RetryReady and rewind
+  // next_to_schedule_ to the earliest such kAlloc so the scheduler retries
+  // it on the next pass.
+  auto earliest_retry = active_operations_.end();
+  for (auto it = active_operations_.begin(); it != active_operations_.end(); ++it) {
+    auto& op_ptr = *it;
+    if (op_ptr->GetKernelType() == KernelTypeEnum::kAlloc) {
+      auto& alloc_kernel = op_ptr->GetKernel<KernelTypeEnum::kAlloc>();
+      if (alloc_kernel.GetAllocState() ==
+          at::neuron::AllocDirectKernelExecution::AllocState::Deferred) {
+        alloc_kernel.SetAllocState(at::neuron::AllocDirectKernelExecution::AllocState::RetryReady);
+        if (earliest_retry == active_operations_.end()) {
+          earliest_retry = it;
+        }
+      }
+    }
+  }
+  if (earliest_retry != active_operations_.end()) {
+    next_to_schedule_ = earliest_retry;
+    // Wake the runtime worker in case it is parked on completion_efd_.
+    auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+    engine.NotifyExecutionReady();
+  }
+}
+
+bool StreamImpl::TryDeferAlloc(AllocDirectKernelExecution& alloc_kernel) {
+  std::lock_guard<std::mutex> lock(active_operations_mutex_);
+  if (IsStreamDrainedWithLockHeld()) {
+    return false;
+  }
+  alloc_kernel.SetAllocState(AllocDirectKernelExecution::AllocState::Deferred);
+  return true;
 }
 
 namespace {
@@ -323,20 +380,27 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
     return nullptr;
   }
 
+  // Pure FIFO: park if the head isn't ready. A Deferred kAlloc acts as an
+  // in-band synchronize — preceding ops drain it (via ReleaseDeferredAllocGates)
+  // and subsequent ops wait for the retry to resolve.
   auto& op = *next_to_schedule_;
-  // Check if operation is ready to be scheduled
   if (op->IsSchedulable()) {
     return op.get();
   }
   return nullptr;
 }
 
-void StreamImpl::AdvanceToNextOperation() {
+void StreamImpl::AdvanceToNextOperation(OperationContext* just_scheduled) {
   std::lock_guard<std::mutex> lock(active_operations_mutex_);
 
-  if (next_to_schedule_ != active_operations_.end()) {
-    ++next_to_schedule_;
+  if (next_to_schedule_ == active_operations_.end()) {
+    return;
   }
+
+  if (just_scheduled != nullptr && next_to_schedule_->get() != just_scheduled) {
+    return;
+  }
+  ++next_to_schedule_;
 }
 
 bool StreamImpl::HasPendingAsyncOperations() const {
@@ -397,6 +461,10 @@ void StreamImpl::UpdateCompletionState() {
 
 ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
                                                    KernelTypeEnum kernel_type) {
+  // What next_to_schedule_ points at — `op` itself, except cascading concat
+  // ops where it's the cascading op. Used for the idempotent advance below.
+  OperationContext* scheduled_op = op;
+
   // Handle concatenated operations: cascading ops schedule their concat op first time,
   // subsequent cascading ops just advance since concat op is already scheduled.
   // Device ops require stream-specific hardware state (completion tracking, sequence IDs,
@@ -406,7 +474,7 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
 
     // Concat op already scheduled by a previous cascading op, just advance this one
     if (concat_op->nrt_async_state_.is_scheduled) {
-      AdvanceToNextOperation();
+      AdvanceToNextOperation(scheduled_op);
       return ScheduleResult::kAdvanced;
     }
 
@@ -442,7 +510,7 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
     op->nrt_status_ = NRT_SUCCESS;
     op->MarkScheduled(sequence_id);
   }
-  AdvanceToNextOperation();
+  AdvanceToNextOperation(scheduled_op);
 
   TORCH_NEURONX_DEBUG("Operation scheduled", "stream_id=", stream_id, "op=", op->GetOpName(),
                       "sequence_id=", sequence_id);

@@ -138,4 +138,15 @@ class MockEventDirectKernelExecution : public EventDirectKernelExecution {
   MOCK_METHOD(bool, IsReady, (), (const));
 };
 
+// GMock-based mock for AllocDirectKernelExecution.
+class MockAllocDirectKernelExecution : public AllocDirectKernelExecution {
+ public:
+  explicit MockAllocDirectKernelExecution(const std::string& op_name = "mock_alloc_op",
+                                          size_t size_bytes = 1024, int device_id = 0)
+      : AllocDirectKernelExecution(op_name, TensorDataRef(reinterpret_cast<void*>(0x1)), size_bytes,
+                                   device_id) {}
+
+  MOCK_METHOD(bool, Schedule, (NRT_STATUS*, nrt::SequenceId*, c10::StreamId), (const, override));
+};
+
 }  // namespace at::neuron::testing

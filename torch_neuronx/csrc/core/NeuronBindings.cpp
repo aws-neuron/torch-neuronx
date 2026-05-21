@@ -1652,6 +1652,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["num_ooms"] = stats.num_ooms;
         result["num_tensor_frees"] = stats.num_tensor_frees;
         result["allocation_requests"] = stats.allocation_requests;
+        result["num_alloc_deferred"] = stats.num_alloc_deferred;
+        result["num_alloc_drain_retry_ok"] = stats.num_alloc_drain_retry_ok;
+        result["num_alloc_drain_retry_fail"] = stats.num_alloc_drain_retry_fail;
         return result;
       },
       "Get memory statistics for a device", py::arg("device_index"));
@@ -1689,6 +1692,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["num_ooms"] = peak.stats.num_ooms;
         result["num_tensor_frees"] = peak.stats.num_tensor_frees;
         result["allocation_requests"] = peak.stats.allocation_requests;
+        result["num_alloc_deferred"] = peak.stats.num_alloc_deferred;
+        result["num_alloc_drain_retry_ok"] = peak.stats.num_alloc_drain_retry_ok;
+        result["num_alloc_drain_retry_fail"] = peak.stats.num_alloc_drain_retry_fail;
         return result;
       },
       "Get peak memory stats snapshot for a device", py::arg("device_index"));
