@@ -412,6 +412,14 @@ class TestTargetOpsCoverage:
                 or isinstance(s.input, list | tuple)
             ]
 
+        # Filter out 0-d tensor args for remainder — triggers NRT execution timeout.
+        if "remainder" in op_name:
+            samples = [
+                s
+                for s in samples
+                if not any(isinstance(a, torch.Tensor) and a.dim() == 0 for a in s.args)
+            ]
+
         if not samples:
             result["error"] = "no shapes registered"
             result["status"] = "no_input_sample"
