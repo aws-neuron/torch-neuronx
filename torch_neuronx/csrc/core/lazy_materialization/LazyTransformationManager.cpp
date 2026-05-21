@@ -205,25 +205,10 @@ void LazyTransformationManager::ProcessOperationInputs(
   std::string prologue_cache_key = OperationPrologue::ComputePrologueCacheKey(
       input_ptrs, input_contexts, op_name, kernel_transforms);
 
-  // Compute input deduplication by comparing storage base pointers.
+  // Compute input deduplication: inputs share a DMA slot only when they have the
+  // same storage base pointer AND the same shape.
   // This must happen before cache lookup so the dedup signature is part of the key.
-  std::unordered_map<uintptr_t, size_t> base_to_deduped_idx;
-  std::vector<size_t> input_dedup_map(input_ptrs.size());
-  size_t deduped_input_count = 0;
-
-  for (size_t i = 0; i < input_ptrs.size(); ++i) {
-    uintptr_t base_ptr =
-        reinterpret_cast<uintptr_t>(input_ptrs[i]) -
-        (input_contexts[i].get_storage_offset() * input_contexts[i].get_element_size());
-    auto it = base_to_deduped_idx.find(base_ptr);
-    if (it != base_to_deduped_idx.end()) {
-      input_dedup_map[i] = it->second;
-    } else {
-      base_to_deduped_idx[base_ptr] = deduped_input_count;
-      input_dedup_map[i] = deduped_input_count;
-      deduped_input_count++;
-    }
-  }
+  auto [input_dedup_map, deduped_input_count] = ComputeInputDedupMap(input_ptrs, input_contexts);
 
   // Include dedup signature in cache key so different storage layouts get different entries
   std::string dedup_suffix;
