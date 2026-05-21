@@ -8,6 +8,7 @@
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 
@@ -211,11 +212,21 @@ NeuronResourceManager::NeuronResourceManager() {
 }
 
 NeuronResourceManager::~NeuronResourceManager() {
-  // Shutdown execution engine first (stops worker threads)
+  // Producer-side fence: after this returns, every subsequent free() on the
+  // caching allocator short-circuits instead of submitting a kDealloc op.
+  c10_neuron::NeuronCachingAllocator::BeginShutdown();
+
+  // Drain anything the fence didn't already bar. Streams should be quiet
+  // at this point (module cleanup capsule already synced); the drain is
+  // the safety net for tensors that died between the capsule returning
+  // and this line.
+  at::neuron::drain_visible_device_streams("~NeuronResourceManager");
+
+  // Engine workers no longer needed — producers are fenced off, queue is drained.
   if (operation_execution_engine_) {
     operation_execution_engine_->Shutdown();
   }
-  // Now safe to cleanup stream pools
+
   CleanupStreamPools();
 }
 

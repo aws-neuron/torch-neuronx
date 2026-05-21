@@ -49,13 +49,42 @@ from .utils import (
 
 _WORLD_SIZE = None
 
+_USE_CPP_PROCESS_GROUP: bool = os.environ.get("TORCH_NEURONX_CPP_PROCESS_GROUP") != "0"
 
-def _create_neuron_process_group(prefix_store, rank, size, timeout):
+
+def _create_neuron_process_group(dist_backend_opts, pg_options):
+    """Factory for neuron backend. Called by c10d with extended_api=True."""
+    prefix_store = dist_backend_opts.store
+    rank = dist_backend_opts.group_rank
+    size = dist_backend_opts.group_size
+    timeout = dist_backend_opts.timeout
+    global_ranks_in_group = dist_backend_opts.global_ranks_in_group
+
+    global _WORLD_SIZE
+    if _WORLD_SIZE is None:
+        _WORLD_SIZE = size
+        _neuron_runtime_setup(rank, size, prefix_store)
+
+    if _USE_CPP_PROCESS_GROUP:
+        from torch._C._distributed_c10d import Backend as _CBackend
+
+        from torch_neuronx.distributed.cpp_backend import create_neuron_cpp_backend
+
+        options = _CBackend.Options(backend="neuron", timeout=timeout)
+        if global_ranks_in_group:
+            options.global_ranks_in_group = list(global_ranks_in_group)
+        else:
+            options.global_ranks_in_group = list(range(size))
+        # For subgroups, `size` is the group size; `_WORLD_SIZE` is the true world size.
+        return create_neuron_cpp_backend(options, rank, size, _WORLD_SIZE)
+
     return ProcessGroupNeuron(prefix_store, rank, size, timeout)
 
 
 def _register_neuron_backend():
-    dist.Backend.register_backend("neuron", _create_neuron_process_group, devices=["neuron"])
+    dist.Backend.register_backend(
+        "neuron", _create_neuron_process_group, extended_api=True, devices=["neuron"]
+    )
     dist.Backend.default_device_backend_map["neuron"] = "neuron"
 
 

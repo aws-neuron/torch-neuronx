@@ -351,7 +351,7 @@ class TestReduce(BaseCollectiveOpTest):
         """Test reduce with large tensors."""
         self.distributed_tester.run_test(run_large_tensor_test)
 
-    @assert_raises(RuntimeError, match=r".*Invalid rootRank .* for broadcast with world size.*")
+    @assert_raises(RuntimeError, match=r".*Invalid rootRank .* for reduce with world size.*")
     def test_error_handling_invalid_root(self):
         """Test error cases with invalid root rank."""
         self.distributed_tester.run_test(run_invalid_root_rank_test)
@@ -363,7 +363,7 @@ class TestReduce(BaseCollectiveOpTest):
     @assert_raises(
         RuntimeError,
         match=r".*(Failed to execute model|"
-        r"NRT Execution error occurred on Neuron for operation=all_reduce).*",
+        r"NRT Execution error occurred on Neuron for operation=all_?reduce).*",
     )
     def test_dtype_mismatch_error(self):
         """Test reduce error handling with dtype mismatch across ranks."""
@@ -376,7 +376,7 @@ class TestReduce(BaseCollectiveOpTest):
     @assert_raises(
         RuntimeError,
         match=r".*(Failed to execute model|"
-        r"NRT Execution error occurred on Neuron for operation=all_reduce).*",
+        r"NRT Execution error occurred on Neuron for operation=all_?reduce).*",
     )
     def test_shape_mismatch_error(self):
         """Test reduce error handling with shape mismatch across ranks."""
@@ -394,7 +394,11 @@ class TestReduce(BaseCollectiveOpTest):
         """Test reduce with tensors containing mixed special values (inf, nan, normal)."""
         self.distributed_tester.run_test(run_with_mixed_special_values_test)
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_different_devices(self):
         """Test reduce with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)

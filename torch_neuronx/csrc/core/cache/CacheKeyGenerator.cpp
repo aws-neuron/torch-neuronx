@@ -348,4 +348,33 @@ std::string CacheKeyGenerator::GenerateFromPython(
   return key.str();
 }
 
+void CacheKeyGenerator::AppendIntList(std::ostringstream& key, const std::vector<int>& vals) {
+  key << "IL[";
+  for (size_t i = 0; i < vals.size(); ++i) {
+    if (i > 0) key << ",";
+    AppendInt(key, static_cast<int64_t>(vals[i]), /*is_static=*/true);
+  }
+  key << "]";
+}
+
+std::string CacheKeyGenerator::GenerateCollective(
+    const std::string& op_type, const std::vector<at::Tensor>& inputs,
+    const std::vector<std::vector<int>>& replica_groups, int reduce_op, bool slice_output) {
+  std::ostringstream key;
+  key << "coll|" << op_type;
+  for (const auto& t : inputs) {
+    key << "|";
+    AppendTensor(key, t);
+  }
+  key << "|rg[";
+  for (size_t i = 0; i < replica_groups.size(); ++i) {
+    if (i > 0) key << ",";
+    AppendIntList(key, replica_groups[i]);
+  }
+  key << "]";
+  AppendInt(key, reduce_op, /*is_static=*/true);
+  if (slice_output) AppendBool(key, true);
+  return key.str();
+}
+
 }  // namespace at::neuron

@@ -503,4 +503,14 @@ bool EventDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceI
   return false;
 }
 
+// BarrierDirectKernelExecution
+BarrierDirectKernelExecution::BarrierDirectKernelExecution(int rank, int world_size, int device_id)
+    : NeuronKernelExecution("barrier", device_id), rank_(rank), world_size_(world_size) {}
+
+bool BarrierDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                                            c10::StreamId stream_id) const {
+  *nrt_status = at::neuron::nrt::Barrier(0, rank_, world_size_);
+  return false;  // synchronous, no async tracking needed
+}
+
 }  // namespace at::neuron

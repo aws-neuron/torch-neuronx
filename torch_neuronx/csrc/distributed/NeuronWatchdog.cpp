@@ -7,6 +7,7 @@
 #include <chrono>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
 
 namespace torch_neuronx {
@@ -37,21 +38,32 @@ void NeuronWatchdog::stop() {
   terminate_.store(true, std::memory_order_release);
 
   notify();  // Wake up thread immediately
-  // 1. The CV wait_for has a short timeout (SLEEP_MILLIS = 100ms)
-  // 2. The CV wait condition checks terminate_
-  // 3. We called notify() above to wake it immediately
-  // IMPORTANT: Release GIL before joining to prevent deadlock.
-  // The watchdog thread may need to acquire GIL during NeuronWork destruction
-  // (when tensors with PyObject refs are destroyed). If the main thread holds
-  // GIL while waiting for join, and watchdog needs GIL to complete, we deadlock.
-  {
+
+  // PyObject refs decref (stashed tensors).
+  const bool gil_available = Py_IsInitialized() && PyGILState_Check();
+  if (gil_available) {
     pybind11::gil_scoped_release release;
+    neuronCommWatchdogThread_.join();
+  } else {
     neuronCommWatchdogThread_.join();
   }
 
   // Clean up any remaining shelves that were queued during final loop iterations
-  // but never cleaned up (since cleanupCompletedShelves is only called from enqueueWork)
-  cleanupCompletedShelves();
+  // but never cleaned up (since cleanupCompletedShelves is only called from
+  // enqueueWork). Only safe under GIL because at::Tensor decref on
+  // Python-owned tensors can reenter Python.
+  //
+  // Non-GIL stop() (e.g., reached during C++ static teardown) deliberately
+  // defers both shelf cleanup and stream drain to ~NeuronResourceManager,
+  // which runs last and holds the only view of the still-live stream pool.
+  if (gil_available) {
+    cleanupCompletedShelves();
+    // Unstashed tensors drop their last ref, and the lazy-alloc path submits
+    // a kDealloc op per recorded stream. Drain those now while the engine
+    // workers are still alive — otherwise they survive past the cleanup
+    // capsule's sync and deadlock ~StreamImpl::Synchronize later.
+    at::neuron::drain_visible_device_streams("NeuronWatchdog::stop");
+  }
 
   LOG(INFO) << "Watchdog thread stopped";
 }
