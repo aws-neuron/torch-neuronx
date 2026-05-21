@@ -379,7 +379,6 @@ RUNTIME_NRT_ERROR = [
     "test_linalg.py::TestLinalgNEURON::test_norm_matrix_degenerate_shapes_old_numpy_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_old_cholesky_batched_upper_neuron_float64",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_jiterator_unary_neuron_float32",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_broadcast_fn_lt_neuron",
     "test_ops.py::TestFakeTensorNEURON::test_fake_histogram_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_histogramdd_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_arange_neuron_float32",
