@@ -27,6 +27,7 @@ extern "C" {
 #include <nrt/nrt.h>
 }
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iomanip>

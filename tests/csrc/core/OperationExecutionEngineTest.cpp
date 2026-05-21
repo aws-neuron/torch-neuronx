@@ -19,6 +19,7 @@
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 
@@ -1513,6 +1514,75 @@ TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarlie
       << "rewind should land on the earliest RetryReady kAlloc, not a later one";
 
   stream->active_operations_.clear();
+}
+
+// ============================================================================
+// Integration: ConcatenationEngine reorder against a real StreamImpl.
+//   pre:       [matmul, A_X, H1, A_Y, H2, D_X]
+//   partition: allocs={A_X,A_Y}, compute={H1,H2}, deallocs={D_X}
+//   post:      [matmul, A_X, A_Y, H1, H2, D_X]
+// ============================================================================
+namespace {
+OperationContext* MakeOpForReorder(StreamImpl* stream, KernelTypeEnum kt, const std::string& name) {
+  auto kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(name);
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(kt));
+  ON_CALL(*kernel, RequiresCompilation()).WillByDefault(Return(false));
+  ON_CALL(*kernel, RequiresPrepare()).WillByDefault(Return(false));
+  ON_CALL(*kernel, ValidateImpl()).WillByDefault(Return(true));
+  auto* op = new OperationContext(std::move(kernel));
+  op->stream = stream;
+  return op;
+}
+
+void PushBackForReorder(StreamImpl* stream, OperationContext* op) {
+  std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
+  bool was_empty = (stream->next_to_schedule_ == stream->active_operations_.end());
+  stream->active_operations_.emplace_back(std::shared_ptr<OperationContext>(op));
+  if (was_empty) {
+    stream->next_to_schedule_ = std::prev(stream->active_operations_.end());
+  }
+}
+
+std::vector<OperationContext*> ActiveOpsRaw(const StreamImpl* stream) {
+  std::vector<OperationContext*> out;
+  for (const auto& sp : stream->active_operations_) out.push_back(sp.get());
+  return out;
+}
+}  // namespace
+
+TEST_F(OperationExecutionEngineTest, ConcatenationReorderHonoursDeallocLifetimeOnStream) {
+  ConcatenationEngine concat_engine;
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto* matmul = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "matmul");
+  auto* a_x = MakeOpForReorder(stream.get(), KernelTypeEnum::kAlloc, "A_X");
+  auto* h1 = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "H1");
+  auto* a_y = MakeOpForReorder(stream.get(), KernelTypeEnum::kAlloc, "A_Y");
+  auto* h2 = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "H2");
+  auto* d_x = MakeOpForReorder(stream.get(), KernelTypeEnum::kDealloc, "D_X");
+
+  PushBackForReorder(stream.get(), matmul);
+  PushBackForReorder(stream.get(), a_x);
+  PushBackForReorder(stream.get(), h1);
+  PushBackForReorder(stream.get(), a_y);
+  PushBackForReorder(stream.get(), h2);
+  PushBackForReorder(stream.get(), d_x);
+
+  // matmul is outside the partition — fusion-region anchor that stays put.
+  concat_engine.ApplyFlushReorderToStream(stream.get(), {a_x, a_y}, {h1, h2}, {d_x});
+
+  auto order = ActiveOpsRaw(stream.get());
+  ASSERT_EQ(order.size(), 6u);
+  EXPECT_EQ(order[0], matmul);
+  EXPECT_EQ(order[1], a_x);
+  EXPECT_EQ(order[2], a_y);
+  EXPECT_EQ(order[3], h1);
+  EXPECT_EQ(order[4], h2);
+  EXPECT_EQ(order[5], d_x);
+
+  // Clear so ~StreamImpl's Synchronize() doesn't block.
+  stream->active_operations_.clear();
+  stream->next_to_schedule_ = stream->active_operations_.end();
 }
 
 int main(int argc, char** argv) {

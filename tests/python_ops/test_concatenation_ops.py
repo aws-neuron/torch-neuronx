@@ -6,10 +6,9 @@ and produces the same results as CPU execution. The concatenation
 system optimizes matmul-heavy workloads by accumulating operations
 and flushing them in batches for better hardware utilization.
 
-NOTE: These tests require the following environment variables:
-    os.environ["TORCH_NEURONX_SKIP_INTERMEDIATES"] = "1"
+NOTE: These tests require the following environment variable:
     os.environ["TORCH_NEURONX_ENABLE_CONCATENATION"] = "1"
-These must be set BEFORE running the tests to ensure concatenation
+This must be set BEFORE running the tests to ensure concatenation
 optimizations work correctly and the tests validate the intended behavior.
 
 IMPORTANT: To ensure concatenation happens:
@@ -39,19 +38,11 @@ def is_concatenation_enabled():
     return os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1"
 
 
-def is_skip_intermediates_enabled():
-    """Check if skip intermediates is enabled."""
-    return os.environ.get("TORCH_NEURONX_SKIP_INTERMEDIATES", "0") == "1"
-
-
 def skip_if_concatenation_disabled():
     """Skip test if concatenation is disabled."""
     return pytest.mark.skipif(
-        not is_concatenation_enabled() or not is_skip_intermediates_enabled(),
-        reason=(
-            "Concatenation tests require TORCH_NEURONX_ENABLE_CONCATENATION=1 "
-            "and TORCH_NEURONX_SKIP_INTERMEDIATES=1"
-        ),
+        not is_concatenation_enabled(),
+        reason="Concatenation tests require TORCH_NEURONX_ENABLE_CONCATENATION=1",
     )
 
 
@@ -133,10 +124,7 @@ class TestConcatenationBasicOps:
         device = "neuron"
 
         # 70B-model-like dimensions: (batch*seq, hidden) @ (hidden, hidden)
-        # For bfloat16, scale inputs down to keep output magnitudes small enough
-        # that hardware bf16 rounding (~1 ULP) stays within tight atol.
-        # At scale=1.0, outputs reach ~700 and bf16 ULP=2.0 exceeds atol=0.5.
-        # At scale=0.1, outputs reach ~7 and bf16 ULP=0.016 fits atol=0.05.
+        # For bfloat16, scale inputs by 0.1 so outputs (~7) fit within atol+rtol*|b|.
         input_scale = 0.1 if dtype == torch.bfloat16 else 1.0
 
         x_cpu = torch.randn(128, 8192, dtype=dtype) * input_scale

@@ -116,6 +116,30 @@ class ConcatenationEngineTest : public ::testing::Test {
     return op;
   }
 
+  // sentinel_tensors_ keeps the data_ptr() backing alive for the TensorDataRef.
+  OperationContext* CreateMockAllocOperation(const std::string& name = "alloc") {
+    sentinel_tensors_.push_back(torch::zeros({1}));
+    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(
+        name, std::vector<torch::Tensor>{}, std::vector<torch::Tensor>{sentinel_tensors_.back()},
+        0);
+    ON_CALL(*mock_kernel, GetKernelType()).WillByDefault(::testing::Return(KernelTypeEnum::kAlloc));
+    auto* op = new OperationContext(std::move(mock_kernel));
+    op->stream = test_stream_;
+    return op;
+  }
+
+  OperationContext* CreateMockDeallocOperation(const std::string& name = "dealloc") {
+    sentinel_tensors_.push_back(torch::zeros({1}));
+    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(
+        name, std::vector<torch::Tensor>{sentinel_tensors_.back()}, std::vector<torch::Tensor>{},
+        0);
+    ON_CALL(*mock_kernel, GetKernelType())
+        .WillByDefault(::testing::Return(KernelTypeEnum::kDealloc));
+    auto* op = new OperationContext(std::move(mock_kernel));
+    op->stream = test_stream_;
+    return op;
+  }
+
   // Helper to create an HLO operation with collectives
   OperationContext* CreateMockHLOOperationWithCollectives() {
     // Create with has_collectives = true in the constructor (not mocked)
@@ -136,6 +160,7 @@ class ConcatenationEngineTest : public ::testing::Test {
   StreamImpl* test_stream_;
   StreamImpl* test_stream2_;
   std::unique_ptr<MockOperationExecutionEngineWrapper> mock_engine_wrapper_;
+  std::vector<torch::Tensor> sentinel_tensors_;
 };
 
 // =============================================================================
@@ -1140,6 +1165,240 @@ TEST_F(ConcatenationEngineTest, MaybeTryConcatenate_SingleOperation) {
   EXPECT_GE(result.size(), 0);
 
   delete op;
+}
+
+// ============================================================================
+// Reorder-on-flush — partition into allocs → compute → deallocs (lazy alloc).
+// ============================================================================
+
+TEST_F(ConcatenationEngineTest, FlushReordersAllocsBeforeComputeBeforeDeallocs) {
+  ConcatenationEngine engine;
+
+  // matmul flips accumulation on and is emitted on its own.
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* d1 = CreateMockDeallocOperation("dealloc1");
+  OperationContext* hlo_a = CreateMockHLOOperation("aten::add");
+  OperationContext* a1 = CreateMockAllocOperation("alloc1");
+  OperationContext* hlo_b = CreateMockHLOOperation("aten::mul");
+  OperationContext* a2 = CreateMockAllocOperation("alloc2");
+  OperationContext* d2 = CreateMockDeallocOperation("dealloc2");
+  OperationContext* hlo_c = CreateMockHLOOperation("aten::sub");
+
+  engine.ProcessConcatenationTask(d1);
+  engine.ProcessConcatenationTask(hlo_a);
+  engine.ProcessConcatenationTask(a1);
+  engine.ProcessConcatenationTask(hlo_b);
+  engine.ProcessConcatenationTask(a2);
+  engine.ProcessConcatenationTask(d2);
+  engine.ProcessConcatenationTask(hlo_c);
+
+  // Non-fusible boundary triggers the flush; boundary is appended after.
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 8u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a1);
+  EXPECT_EQ(*it++, a2);
+  EXPECT_EQ(*it++, hlo_a);
+  EXPECT_EQ(*it++, hlo_b);
+  EXPECT_EQ(*it++, hlo_c);
+  EXPECT_EQ(*it++, d1);
+  EXPECT_EQ(*it++, d2);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete d1;
+  delete hlo_a;
+  delete a1;
+  delete hlo_b;
+  delete a2;
+  delete d2;
+  delete hlo_c;
+  delete boundary;
+}
+
+// All-compute buffer: partition is a no-op, ops emit in submission order.
+TEST_F(ConcatenationEngineTest, FlushReorderDegenerateOnlyCompute) {
+  ConcatenationEngine engine;
+
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* a = CreateMockHLOOperation("aten::add");
+  OperationContext* b = CreateMockHLOOperation("aten::mul");
+  OperationContext* c = CreateMockHLOOperation("aten::sub");
+  engine.ProcessConcatenationTask(a);
+  engine.ProcessConcatenationTask(b);
+  engine.ProcessConcatenationTask(c);
+
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 4u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a);
+  EXPECT_EQ(*it++, b);
+  EXPECT_EQ(*it++, c);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete a;
+  delete b;
+  delete c;
+  delete boundary;
+}
+
+// ============================================================================
+// ApplyFlushReorderToStream — splice into stream->active_operations_
+// ============================================================================
+
+namespace {
+OperationContext* MakeOpOfType(StreamImpl* stream, KernelTypeEnum kt,
+                               const std::string& name = "mock") {
+  auto kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(name);
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(kt));
+  ON_CALL(*kernel, RequiresCompilation()).WillByDefault(Return(false));
+  ON_CALL(*kernel, RequiresPrepare()).WillByDefault(Return(false));
+  ON_CALL(*kernel, ValidateImpl()).WillByDefault(Return(true));
+  auto* op = new OperationContext(std::move(kernel));
+  op->stream = stream;
+  return op;
+}
+
+void PushBack(StreamImpl* stream, OperationContext* op) {
+  std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
+  bool was_empty = (stream->next_to_schedule_ == stream->active_operations_.end());
+  stream->active_operations_.emplace_back(std::shared_ptr<OperationContext>(op));
+  if (was_empty) {
+    stream->next_to_schedule_ = std::prev(stream->active_operations_.end());
+  }
+}
+
+std::vector<OperationContext*> RawList(const StreamImpl* stream) {
+  std::vector<OperationContext*> out;
+  for (const auto& sp : stream->active_operations_) out.push_back(sp.get());
+  return out;
+}
+}  // namespace
+
+// submit: [A_X, H1*, A_Y, H2*, D_X]   expect: [A_X, A_Y, H1*, H2*, D_X]
+TEST_F(ConcatenationEngineTest, ApplyFlushReorderToStream_LazyAllocPartition) {
+  ConcatenationEngine engine;
+  auto* a_x = MakeOpOfType(test_stream_, KernelTypeEnum::kAlloc, "A_X");
+  auto* h1 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H1");
+  auto* a_y = MakeOpOfType(test_stream_, KernelTypeEnum::kAlloc, "A_Y");
+  auto* h2 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H2");
+  auto* d_x = MakeOpOfType(test_stream_, KernelTypeEnum::kDealloc, "D_X");
+
+  PushBack(test_stream_, a_x);
+  PushBack(test_stream_, h1);
+  PushBack(test_stream_, a_y);
+  PushBack(test_stream_, h2);
+  PushBack(test_stream_, d_x);
+
+  engine.ApplyFlushReorderToStream(test_stream_, {a_x, a_y}, {h1, h2}, {d_x});
+
+  auto order = RawList(test_stream_);
+  ASSERT_EQ(order.size(), 5u);
+  EXPECT_EQ(order[0], a_x);
+  EXPECT_EQ(order[1], a_y);
+  EXPECT_EQ(order[2], h1);
+  EXPECT_EQ(order[3], h2);
+  EXPECT_EQ(order[4], d_x);
+
+  EXPECT_EQ(test_stream_->next_to_schedule_->get(), a_x);
+
+  // Clear so ~StreamImpl's Synchronize() doesn't block.
+  test_stream_->active_operations_.clear();
+  test_stream_->next_to_schedule_ = test_stream_->active_operations_.end();
+}
+
+// submit: [A_X, H1*, D_Y, H2*]   expect: [A_X, H1*, H2*, D_Y]
+TEST_F(ConcatenationEngineTest, ApplyFlushReorderToStream_DeallocMovesToEnd) {
+  ConcatenationEngine engine;
+  auto* a_x = MakeOpOfType(test_stream_, KernelTypeEnum::kAlloc, "A_X");
+  auto* h1 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H1");
+  auto* d_y = MakeOpOfType(test_stream_, KernelTypeEnum::kDealloc, "D_Y");
+  auto* h2 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H2");
+
+  PushBack(test_stream_, a_x);
+  PushBack(test_stream_, h1);
+  PushBack(test_stream_, d_y);
+  PushBack(test_stream_, h2);
+
+  engine.ApplyFlushReorderToStream(test_stream_, {a_x}, {h1, h2}, {d_y});
+
+  auto order = RawList(test_stream_);
+  ASSERT_EQ(order.size(), 4u);
+  EXPECT_EQ(order[0], a_x);
+  EXPECT_EQ(order[1], h1);
+  EXPECT_EQ(order[2], h2);
+  EXPECT_EQ(order[3], d_y);
+
+  test_stream_->active_operations_.clear();
+  test_stream_->next_to_schedule_ = test_stream_->active_operations_.end();
+}
+
+// Non-partition ops (kCopy here) bracketing the partition keep their positions.
+TEST_F(ConcatenationEngineTest, ApplyFlushReorderToStream_NonPartitionOpsPreserved) {
+  ConcatenationEngine engine;
+  auto* copy_lead = MakeOpOfType(test_stream_, KernelTypeEnum::kCopy, "Copy_lead");
+  auto* a_x = MakeOpOfType(test_stream_, KernelTypeEnum::kAlloc, "A_X");
+  auto* h1 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H1");
+  auto* d_x = MakeOpOfType(test_stream_, KernelTypeEnum::kDealloc, "D_X");
+  auto* copy_trail = MakeOpOfType(test_stream_, KernelTypeEnum::kCopy, "Copy_trail");
+
+  PushBack(test_stream_, copy_lead);
+  PushBack(test_stream_, a_x);
+  PushBack(test_stream_, h1);
+  PushBack(test_stream_, d_x);
+  PushBack(test_stream_, copy_trail);
+
+  engine.ApplyFlushReorderToStream(test_stream_, {a_x}, {h1}, {d_x});
+
+  auto order = RawList(test_stream_);
+  ASSERT_EQ(order.size(), 5u);
+  EXPECT_EQ(order[0], copy_lead);
+  EXPECT_EQ(order[1], a_x);
+  EXPECT_EQ(order[2], h1);
+  EXPECT_EQ(order[3], d_x);
+  EXPECT_EQ(order[4], copy_trail);
+
+  test_stream_->active_operations_.clear();
+  test_stream_->next_to_schedule_ = test_stream_->active_operations_.end();
+}
+
+TEST_F(ConcatenationEngineTest, ApplyFlushReorderToStream_AllEmpty) {
+  ConcatenationEngine engine;
+  EXPECT_NO_THROW(engine.ApplyFlushReorderToStream(test_stream_, {}, {}, {}));
+  EXPECT_TRUE(test_stream_->active_operations_.empty());
+}
+
+// Concurrent RemoveActiveOperation may pull an op before flush runs — the
+// splice must skip it and not crash.
+TEST_F(ConcatenationEngineTest, ApplyFlushReorderToStream_MissingOpIgnored) {
+  ConcatenationEngine engine;
+  auto* a_x = MakeOpOfType(test_stream_, KernelTypeEnum::kAlloc, "A_X");
+  auto* h1 = MakeOpOfType(test_stream_, KernelTypeEnum::kHLO, "H1");
+  auto* d_x = MakeOpOfType(test_stream_, KernelTypeEnum::kDealloc, "D_X");
+
+  PushBack(test_stream_, a_x);
+  PushBack(test_stream_, h1);
+  // d_x not pushed — never made it onto active_operations_.
+
+  EXPECT_NO_THROW(engine.ApplyFlushReorderToStream(test_stream_, {a_x}, {h1}, {d_x}));
+
+  auto order = RawList(test_stream_);
+  ASSERT_EQ(order.size(), 2u);
+  EXPECT_EQ(order[0], a_x);
+  EXPECT_EQ(order[1], h1);
+
+  delete d_x;
+  test_stream_->active_operations_.clear();
+  test_stream_->next_to_schedule_ = test_stream_->active_operations_.end();
 }
 
 int main(int argc, char** argv) {

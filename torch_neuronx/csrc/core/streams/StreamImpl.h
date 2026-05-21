@@ -43,6 +43,7 @@ enum class ScheduleResult {
 class NeuronEvent;
 class ModelHandleCache;
 class OperationExecutionEngine;
+class ConcatenationEngine;
 
 // Per-XU completion tracking, sized to each XU's actual queue count.
 struct XUCompletionState {
@@ -89,6 +90,7 @@ struct XUCompletionState {
 // - Unified operation tracking: Manages operation lifecycle and cleanup
 struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   friend class OperationExecutionEngine;
+  friend class ConcatenationEngine;
 
   // Global device index
   c10::DeviceIndex device_index;

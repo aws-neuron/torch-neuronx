@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockCopyUtils.h"
-#include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/utils/TestUtils.h"
