@@ -335,18 +335,25 @@ struct MemoryStatistics {
   /**
    * Increase the stat by the given amount.
    * Updates current, peak (if new max), and allocated (historical total).
+   * If bumped is non-null, sets *bumped = true if this call updated peak.
    */
-  void increase(size_t amount) {
+  void increase(size_t amount, bool* bumped = nullptr) {
     int64_t new_current =
         current.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed) +
         static_cast<int64_t>(amount);
     allocated.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed);
 
     // Update peak using compare-exchange loop
+    bool updated_peak = false;
     int64_t prev_peak = peak.load(std::memory_order_relaxed);
-    while (new_current > prev_peak &&
-           !peak.compare_exchange_weak(prev_peak, new_current, std::memory_order_relaxed)) {
-      // prev_peak is updated by compare_exchange_weak on failure
+    while (new_current > prev_peak) {
+      if (peak.compare_exchange_weak(prev_peak, new_current, std::memory_order_relaxed)) {
+        updated_peak = true;
+        break;
+      }
+    }
+    if (bumped) {
+      *bumped = updated_peak;
     }
   }
 
@@ -479,6 +486,16 @@ struct DeviceMemoryStatsInfo {
   int64_t allocation_requests = 0;
 };
 
+/**
+ * Snapshot of memory stats captured at the moment allocated_bytes.current
+ * exceeds its previous peak. Cached per-device and dumped on OOM.
+ */
+struct PeakMemoryStats {
+  DeviceMemoryStatsInfo stats;
+  int64_t timestamp_ns = 0;  // When peak was recorded
+  bool valid = false;        // Whether a peak has been captured
+};
+
 // =============================================================================
 // Memory Statistics Helper Functions
 // These functions provide a clean API for recording memory allocation events.
@@ -582,11 +599,25 @@ class DeviceMemoryStatsRegistry {
    */
   void ResetAccumulatedStats(int device_index);
 
+  /**
+   * Cache a peak stats snapshot for a device.
+   * Called from RecordNewAllocation when allocated_bytes.increase() reports
+   * that this thread bumped the peak (via the bumped out-param).
+   * Only the thread that actually updated peak calls this, avoiding redundant snapshots.
+   */
+  void CachePeakStats(int device_index);
+
+  /**
+   * Get the cached peak stats for a device.
+   */
+  PeakMemoryStats GetPeakStats(int device_index);
+
  private:
   DeviceMemoryStatsRegistry() = default;
 
   std::mutex mutex_;  // Protects device_stats_ vector access
   std::vector<std::unique_ptr<DeviceMemoryStats>> device_stats_;
+  std::vector<PeakMemoryStats> peak_stats_;  // Per-device peak snapshots
 };
 
 }  // namespace at::neuron::metrics

@@ -84,6 +84,7 @@ cc_library(
         "torch_neuronx/csrc/core/utils/CPUFallbackContext.h",
         "torch_neuronx/csrc/core/utils/TempDirectory.h",
         "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h",
+        "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h",
         "torch_neuronx/csrc/core/NeuronTensorImpl.h",
         "torch_neuronx/csrc/core/NeuronDevice.h",
         "torch_neuronx/csrc/core/utils/NeuronExceptions.h",
