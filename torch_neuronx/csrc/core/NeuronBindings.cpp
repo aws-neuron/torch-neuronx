@@ -630,6 +630,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("unfold", &torch_neuronx::unfold_neuron);
   m.impl("as_strided", &torch_neuronx::as_strided_neuron);
   m.impl("_reshape_alias", &torch_neuronx::_reshape_alias_neuron);
+  m.impl("view_as_real", &torch_neuronx::view_as_real_neuron);
+  m.impl("view_as_complex", &torch_neuronx::view_as_complex_neuron);
   m.impl("select_backward", &torch_neuronx::select_backward_neuron);
   m.impl("argsort.stable", &torch_neuronx::argsort_stable_neuron);
   // Set Operations
