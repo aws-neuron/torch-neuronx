@@ -12,6 +12,7 @@
 #include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
@@ -47,26 +48,13 @@ void ExtractInputPtrsAndContexts(const std::vector<at::Tensor>& inputs,
   }
 }
 
-// Helper to compute input deduplication map from pointers and contexts
+// Thin wrapper around the shared ComputeInputDedupMap from LazyTransformationManager.h.
 void ComputeDedup(const std::vector<void*>& input_ptrs,
                   const std::vector<at::neuron::TensorContext>& input_contexts,
                   std::vector<size_t>& dedup_map, size_t& deduped_count) {
-  std::unordered_map<uintptr_t, size_t> base_to_idx;
-  dedup_map.resize(input_ptrs.size());
-  deduped_count = 0;
-  for (size_t i = 0; i < input_ptrs.size(); ++i) {
-    uintptr_t base =
-        reinterpret_cast<uintptr_t>(input_ptrs[i]) -
-        (input_contexts[i].get_storage_offset() * input_contexts[i].get_element_size());
-    auto it = base_to_idx.find(base);
-    if (it != base_to_idx.end()) {
-      dedup_map[i] = it->second;
-    } else {
-      base_to_idx[base] = deduped_count;
-      dedup_map[i] = deduped_count;
-      deduped_count++;
-    }
-  }
+  auto [dm, dc] = ComputeInputDedupMap(input_ptrs, input_contexts);
+  dedup_map = std::move(dm);
+  deduped_count = dc;
 }
 
 // Helper to create a Neuron tensor with NeuronStorageImpl
@@ -989,6 +977,53 @@ TEST_F(OperationPrologueTest, Dedup_MixedSharedAndIndependent) {
   EXPECT_EQ(result.input_dedup_map[3], 1);  // a2 → slot 1
   EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 2) << "MLIR should have 2 %args. Got:\n"
                                                             << result.prologue_mlir_str;
+}
+
+TEST_F(OperationPrologueTest, Dedup_SharedStorageDifferentShapes) {
+  // Views from the same storage but with DIFFERENT shapes should NOT dedup.
+  // This reproduces the split→transpose→reshape pattern where each slice produces
+  // a compound base tensor of different size (e.g., [18,18,1152] vs [36,18,1152]).
+  // The dedup key includes shape, so these must get independent DMA slots.
+  auto base = CreateNeuronTensor({72, 18, 1152}, c10::ScalarType::Float);
+
+  // Create 4 views with different shapes (simulating TryCreateCompound results)
+  auto v0 = CreateNeuronView(base, {18, 18, 1152}, 0);
+  auto v1 = CreateNeuronView(base, {36, 18, 1152}, 0);
+  auto v2 = CreateNeuronView(base, {54, 18, 1152}, 0);
+  auto v3 = CreateNeuronView(base, {72, 18, 1152}, 0);
+
+  std::vector<at::Tensor> inputs = {v0, v1, v2, v3};
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
+
+  // Each input has a SLICE transformation with its own shape
+  std::vector<std::vector<TensorTransformation>> kernel_transforms = {
+      {TensorTransformation(TransformationType::SLICE, {18, 18, 1152}, {18, 18, 1152}, "f32",
+                            {0, 18, 0, 18, 0, 1152})},
+      {TensorTransformation(TransformationType::SLICE, {36, 18, 1152}, {18, 18, 1152}, "f32",
+                            {18, 36, 0, 18, 0, 1152})},
+      {TensorTransformation(TransformationType::SLICE, {54, 18, 1152}, {18, 18, 1152}, "f32",
+                            {36, 54, 0, 18, 0, 1152})},
+      {TensorTransformation(TransformationType::SLICE, {72, 18, 1152}, {18, 18, 1152}, "f32",
+                            {54, 72, 0, 18, 0, 1152})},
+  };
+
+  auto cache_key = OperationPrologue::ComputePrologueCacheKey(input_ptrs, input_contexts,
+                                                              "aten::cat", kernel_transforms);
+  std::vector<size_t> dm;
+  size_t dc;
+  ComputeDedup(input_ptrs, input_contexts, dm, dc);
+  auto result = OperationPrologue::GeneratePrologue(input_ptrs, input_contexts, "aten::cat",
+                                                    kernel_transforms, cache_key, dm, dc);
+
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(result.has_transformations);
+  // Different shapes → no dedup, each input gets its own slot
+  EXPECT_EQ(result.deduped_input_count, 4) << "Different shapes from same storage should NOT dedup";
+  EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 4)
+      << "MLIR should have 4 %args (no dedup). Got:\n"
+      << result.prologue_mlir_str;
 }
 
 }  // namespace
