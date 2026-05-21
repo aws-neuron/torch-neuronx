@@ -26,7 +26,7 @@ std::string GenerateMlir(const TransformationTask& task);
 }  // namespace transformation_utils
 
 // ============================================================================
-// PrologueResult - Result of prologue generation
+// PrologueResult / EpilogueResult - Results of prologue/epilogue generation
 // ============================================================================
 
 // Contains the merged prologue StableHLO and tensor mappings
@@ -120,6 +120,9 @@ class OperationPrologue {
       const std::vector<at::neuron::TensorContext>& input_contexts, const std::string& op_name,
       const std::vector<std::vector<TensorTransformation>>& kernel_transforms = {});
 
+  // Allow OperationEpilogue to reuse CollectTransformationTasks
+  friend class OperationEpilogue;
+
  private:
   // Collect transformation tasks from kernel transformations
   // Converts them into TransformationTask objects
@@ -145,6 +148,59 @@ class OperationPrologue {
                                              const std::string& prologue_cache_key,
                                              const std::vector<size_t>& input_dedup_map,
                                              size_t deduped_input_count);
+};
+
+// ============================================================================
+// EpilogueResult - Result of epilogue generation
+// ============================================================================
+
+// Contains the merged epilogue StableHLO and tensor mappings.
+// Reuses the same MLIR generation pipeline as PrologueResult — the only
+// difference is the transformations themselves (inverse permutations, etc.)
+struct EpilogueResult {
+  bool success = true;
+  std::string error_message;
+  bool has_transformations = false;
+
+  std::string epilogue_mlir_str;
+  std::string epilogue_cache_key;
+
+  std::vector<bool> output_was_transformed;
+  std::vector<TransformationTask> tasks;
+
+  // True if any output chain contains SCATTER_IOTA.
+  // When true, the epilogue MLIR has an extra input (flat storage)
+  // that must be wired to the kernel's output buffer in ProcessEpilogueWithMlirMerge.
+  bool has_scatter_iota = false;
+
+  // Convenience: true if any epilogue transform has an extra base input
+  bool has_extra_base_input() const { return has_scatter_iota; }
+};
+
+// ============================================================================
+// OperationEpilogue - Generates merged inverse transformation epilogues
+//
+// Reuses OperationPrologue's internal machinery (CollectTransformationTasks,
+// MergeTransformations, transformation_utils::GenerateMlir) since the MLIR
+// generation pipeline is identical for both directions. The only difference
+// is that the transformations are inverse (e.g., inverse transpose permutation).
+// ============================================================================
+
+class OperationEpilogue {
+ public:
+  // Generate a merged epilogue StableHLO from output transformations.
+  // Reuses the same task collection and MLIR merge pipeline as prologue.
+  static EpilogueResult GenerateEpilogue(
+      const std::vector<void*>& output_ptrs,
+      const std::vector<at::neuron::TensorContext>& output_contexts, const std::string& op_name,
+      const std::vector<std::vector<TensorTransformation>>& kernel_transforms,
+      const std::string& epilogue_cache_key);
+
+  // Compute epilogue cache key (same format as prologue, different prefix)
+  static std::string ComputeEpilogueCacheKey(
+      const std::vector<void*>& output_ptrs,
+      const std::vector<at::neuron::TensorContext>& output_contexts, const std::string& op_name,
+      const std::vector<std::vector<TensorTransformation>>& kernel_transforms = {});
 };
 
 }  // namespace lazy

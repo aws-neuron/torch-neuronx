@@ -73,6 +73,7 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistration.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistry.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TypeUtils.h"
 // Internal operations
 #include "torch_neuronx/csrc/ops/InternalOps.h"
@@ -252,6 +253,54 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
           break;
         }
       }
+    }
+  }
+
+  return result;
+}
+
+// ProcessOutputTransformations — implementation of the function declared in NeuronOpsApi.h
+OutputTransformationResult ProcessOutputTransformations(const std::string& op_name,
+                                                        const std::vector<torch::Tensor>& outputs,
+                                                        bool has_collectives) {
+  OutputTransformationResult result;
+  result.final_outputs.reserve(outputs.size());
+  result.kernel_transforms.resize(outputs.size());
+
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    const auto& output = outputs[i];
+
+    // Check if output tensor is non-contiguous and epilogue is enabled
+    if (!output.is_contiguous() && IsEpilogueEnabled() && !has_collectives) {
+      TORCH_NEURONX_DEBUG("Detected non-contiguous output", "op=", op_name, "output_index=", i,
+                          "output_shape=", output.sizes(), "has_collectives=", has_collectives);
+
+      // Try to create epilogue (inverse) transformations
+      auto epilogue_result = c10_neuron::lazy::Creators::TryCreateEpilogue(output, op_name, i);
+
+      if (epilogue_result.has_value()) {
+        // SUPPORTED: record inverse transforms, use base tensor as output buffer
+        TORCH_NEURONX_DEBUG("Using epilogue transformation for output", "op=", op_name,
+                            "output_index=", i, "pattern=", epilogue_result->pattern_name,
+                            "num_transforms=", epilogue_result->transformations.size());
+
+        for (const auto& t : epilogue_result->transformations) {
+          result.kernel_transforms[i].push_back(t);
+        }
+        result.has_output_transforms = true;
+        result.final_outputs.push_back(epilogue_result->processed_input);  // base tensor
+      } else {
+        // UNSUPPORTED pattern — allocate contiguous temp for PrepareKernelTensors,
+        // CopyBackToOriginal will handle the scatter back to non-contiguous original.
+        TORCH_NEURONX_DEBUG("Epilogue unsupported for output, using contiguous temp fallback",
+                            "op=", op_name, "output_index=", i);
+        auto contiguous_temp = torch::empty(
+            output.sizes().vec(), output.options().memory_format(c10::MemoryFormat::Contiguous));
+        result.final_outputs.push_back(contiguous_temp);
+      }
+    } else {
+      // Contiguous output or epilogue disabled — pass through
+      result.final_outputs.push_back(output);
     }
   }
 
@@ -868,6 +917,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Resize an out= tensor with PyTorch's resize-output UserWarning on shape mismatch",
       py::arg("out"), py::arg("target_shape"));
+
+  m.def("_is_epilogue_enabled", &torch_neuronx::IsEpilogueEnabled,
+        "Check if operation epilogue is enabled (TORCH_NEURONX_ENABLE_EPILOGUE=1)");
 
   m.def("version", []() { return "0.1.0"; });
   m.def(

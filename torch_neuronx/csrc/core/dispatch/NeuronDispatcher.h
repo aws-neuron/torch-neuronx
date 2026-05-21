@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackContext.h"
 
 namespace torch_neuronx {
@@ -41,6 +42,10 @@ struct DispatchCacheEntry {
   struct OutputSpec {
     std::vector<int64_t> shape;
     c10::ScalarType dtype;
+    // When present, the dispatch allocates a physical-shape buffer and returns an
+    // as_strided view with target_strides. Epilogue is fused into the
+    // NEFF so it writes directly in the physical layout.
+    std::optional<std::vector<int64_t>> target_strides;
   };
   std::vector<OutputSpec> output_specs;           // For execution (potentially downcasted)
   std::vector<OutputSpec> original_output_specs;  // For upcast (original dtypes)
@@ -265,7 +270,7 @@ class NeuronDispatcher {
    */
   static void EnqueueXlaOperation(const std::string& op_name,
                                   const std::vector<torch::Tensor>& inputs,
-                                  const std::vector<torch::Tensor>& outputs,
+                                  std::vector<torch::Tensor>& outputs,
                                   const std::vector<uint8_t>& ir_bytes,
                                   const std::string& cache_key, bool has_collectives, int device_id,
                                   at::neuron::CPUFallbackContext fallback_ctx = {},

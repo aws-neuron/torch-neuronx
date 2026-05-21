@@ -92,9 +92,25 @@ void CopyBackToOriginal(torch::Tensor& orig, const torch::Tensor& result,
   // Copy with dtype conversion if needed.
   if (orig.scalar_type() != result.scalar_type()) {
     auto casted = NeuronSafeCast(result, orig.scalar_type());
-    orig.copy_(casted);
+    if (!orig.is_contiguous() && orig.is_privateuseone() && casted.is_contiguous() &&
+        casted.is_privateuseone()) {
+      // Non-contiguous Neuron dst: use CopyToNonContiguous directly to avoid
+      // re-dispatching aten::copy_ through DispatchCopy, which can infinitely
+      // recurse when the epilogue fallback path leads back here.
+      torch_neuronx::utils::CopyToNonContiguous(orig, casted);
+    } else {
+      orig.copy_(casted);
+    }
   } else {
-    orig.copy_(result);
+    if (!orig.is_contiguous() && orig.is_privateuseone() && result.is_contiguous() &&
+        result.is_privateuseone()) {
+      // Non-contiguous Neuron dst: use CopyToNonContiguous directly to avoid
+      // re-dispatching aten::copy_ through DispatchCopy, which can infinitely
+      // recurse when the epilogue fallback path leads back here.
+      torch_neuronx::utils::CopyToNonContiguous(orig, result);
+    } else {
+      orig.copy_(result);
+    }
   }
 }
 

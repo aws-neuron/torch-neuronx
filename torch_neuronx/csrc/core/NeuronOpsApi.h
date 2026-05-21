@@ -53,6 +53,54 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
                                                       bool has_collectives);
 
 // ═══════════════════════════════════════════════════════════════
+//  IsEpilogueEnabled
+//
+//  Check if the epilogue optimization is enabled via environment variable.
+//  Cached on first call — env var is read once at startup.
+//  When enabled, non-contiguous output tensors are handled by fusing an
+//  inverse transformation into the operation MLIR, eliminating the separate
+//  CopyBackToOriginal / .copy_() step.
+// ═══════════════════════════════════════════════════════════════
+
+inline bool IsEpilogueEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_ENABLE_EPILOGUE");
+    return env == nullptr || std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  OutputTransformationResult
+//
+//  Holds the output of ProcessOutputTransformations():
+//    - final_outputs:        tensors after epilogue processing (base tensors or contiguous temps)
+//    - kernel_transforms:    per-output transformation metadata for epilogue
+//    - has_output_transforms: quick flag — true if any kernel_transforms[i] is non-empty
+// ═══════════════════════════════════════════════════════════════
+
+struct OutputTransformationResult {
+  std::vector<torch::Tensor> final_outputs;
+  std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> kernel_transforms;
+  bool has_output_transforms = false;
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  ProcessOutputTransformations
+//
+//  Walks each output tensor:
+//    - If contiguous or epilogue disabled → pass through.
+//    - If non-contiguous + epilogue enabled → try epilogue transformation;
+//      fallback to contiguous temp if unsupported.
+//
+//  Defined in NeuronBindings.cpp.
+// ═══════════════════════════════════════════════════════════════
+
+OutputTransformationResult ProcessOutputTransformations(const std::string& op_name,
+                                                        const std::vector<torch::Tensor>& outputs,
+                                                        bool has_collectives);
+
+// ═══════════════════════════════════════════════════════════════
 //  PrepareKernelTensors
 //
 //  Converts a vector of torch::Tensors into the NRT-level

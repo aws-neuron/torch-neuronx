@@ -9,6 +9,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h"
+#include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/NeuronDispatcher.h"
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
@@ -169,9 +170,10 @@ std::vector<torch::Tensor> NkiDispatchCore(const c10::List<at::Tensor>& tensor_a
 
   int device_id = c10_neuron::GetTargetDeviceId(filtered_inputs, exec_outputs);
 
+  auto fallback_ctx = BuildCPUFallbackContext(ivalue_args, schema);
   NeuronDispatcher::EnqueueXlaOperation(entry->op_name, filtered_inputs, exec_outputs,
                                         entry->stablehlo_bytes, entry->neff_cache_key,
-                                        entry->has_collectives, device_id);
+                                        entry->has_collectives, device_id, std::move(fallback_ctx));
 
   auto final_outputs = ReconstructOutputs(exec_outputs, *entry, ivalue_args, device);
 

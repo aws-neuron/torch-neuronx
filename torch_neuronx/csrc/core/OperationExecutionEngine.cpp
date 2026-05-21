@@ -185,6 +185,12 @@ void OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operat
   const std::string& op_name = operation->GetOpName();
   TORCH_NEURONX_DEBUG("Processing preprocessing task", "op=", op_name);
   c10_neuron::lazy::LazyTransformationManager::ProcessOperationInputs(operation);
+  // Epilogue: merge output transformations into the operation MLIR (when enabled).
+  // Safe to call unconditionally — ProcessOperationOutputs early-exits if no
+  // output transforms are set (which is always the case when epilogue is OFF,
+  // since DetectEpilogueTransforms returns empty and SetOutputTransformations
+  // is never called).
+  c10_neuron::lazy::LazyTransformationManager::ProcessOperationOutputs(operation);
 }
 
 void OperationExecutionEngine::HandleCompilationComplete(OperationContext* operation) {

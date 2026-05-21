@@ -1395,6 +1395,767 @@ TEST_F(TransformationsTest, TryCreateAnyTransformation_RejectComplexDtype) {
   EXPECT_FALSE(result.has_value()) << "Should reject complex dtype tensor";
 }
 
+//============================================================================
+// DecomposeStrides Tests
+//============================================================================
+
+TEST_F(TransformationsTest, DecomposeStrides_PureTranspose_2D) {
+  // 2D transpose: [3, 4].t() → logical [4, 3], physical [3, 4]
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float)).t();
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = DecomposeStrides(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should decompose 2D transpose";
+  EXPECT_TRUE(result->base_tensor.is_contiguous()) << "Base tensor must be contiguous";
+  EXPECT_EQ(result->total_dims, 2);
+  EXPECT_EQ(result->element_type, "f32");
+
+  // No broadcast dims
+  EXPECT_FALSE(result->is_broadcast[0]);
+  EXPECT_FALSE(result->is_broadcast[1]);
+
+  // No slicing (starts are 0, steps are 1, base == target)
+  for (int i = 0; i < result->total_dims; ++i) {
+    EXPECT_EQ(result->phys_starts[i], 0) << "No slicing expected at dim " << i;
+    EXPECT_EQ(result->phys_steps[i], 1) << "No striding expected at dim " << i;
+  }
+}
+
+TEST_F(TransformationsTest, DecomposeStrides_RejectContiguous) {
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  ASSERT_TRUE(tensor.is_contiguous());
+
+  auto result = DecomposeStrides(tensor, "test_op", 0);
+  EXPECT_FALSE(result.has_value()) << "Should reject contiguous tensor";
+}
+
+TEST_F(TransformationsTest, DecomposeStrides_PureSlice) {
+  // [8, 10] sliced to [:, 3:7] → shape [8, 4], offset=3
+  auto tensor =
+      at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 3, 7);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = DecomposeStrides(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should decompose slice pattern";
+  EXPECT_TRUE(result->base_tensor.is_contiguous());
+  EXPECT_EQ(result->total_dims, 2);
+}
+
+TEST_F(TransformationsTest, DecomposeStrides_TransposeSlice_RoPE) {
+  // RoPE pattern: [1,8,4,8].transpose(1,2)[..., 4:]
+  auto base = at::zeros({1, 8, 4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 2).slice(3, 4, 8);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = DecomposeStrides(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should decompose transpose+slice (RoPE)";
+  EXPECT_TRUE(result->base_tensor.is_contiguous());
+  EXPECT_EQ(result->total_dims, 4);
+}
+
+//============================================================================
+// TryCreateEpilogue Tests
+//============================================================================
+
+TEST_F(TransformationsTest, TryCreateEpilogue_PureTranspose_2D) {
+  // 2D transpose: [3, 4].t() → logical [4, 3]
+  // Epilogue should produce inverse transpose to write [4, 3] contiguous → [3, 4] physical
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float)).t();
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for 2D transpose";
+  EXPECT_TRUE(result->is_supported);
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_TRANSPOSE");
+
+  // Base tensor must be contiguous
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+  EXPECT_EQ(result->processed_input.size(0), 3);
+  EXPECT_EQ(result->processed_input.size(1), 4);
+
+  // Should have exactly 1 TRANSPOSE transformation (the inverse)
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::TRANSPOSE);
+
+  // Input shape = logical shape [4, 3] (what the operation produces)
+  EXPECT_EQ(result->transformations[0].input_shape[0], 4);
+  EXPECT_EQ(result->transformations[0].input_shape[1], 3);
+
+  // Output shape = physical shape [3, 4] (base storage layout)
+  EXPECT_EQ(result->transformations[0].output_shape[0], 3);
+  EXPECT_EQ(result->transformations[0].output_shape[1], 4);
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_PureTranspose_4D_AttentionPattern) {
+  // 4D attention pattern: [2, 8, 4, 16].transpose(1, 2) → [2, 4, 8, 16]
+  auto base = at::zeros({2, 8, 4, 16}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 2);  // [2, 4, 8, 16]
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for 4D transpose";
+  EXPECT_TRUE(result->is_supported);
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_TRANSPOSE");
+
+  // Base tensor must be contiguous with physical shape [2, 8, 4, 16]
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+  EXPECT_EQ(result->processed_input.size(0), 2);
+  EXPECT_EQ(result->processed_input.size(1), 8);
+  EXPECT_EQ(result->processed_input.size(2), 4);
+  EXPECT_EQ(result->processed_input.size(3), 16);
+
+  // Should have exactly 1 TRANSPOSE transformation
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::TRANSPOSE);
+
+  // Input shape = logical [2, 4, 8, 16]
+  EXPECT_EQ(result->transformations[0].input_shape[0], 2);
+  EXPECT_EQ(result->transformations[0].input_shape[1], 4);
+  EXPECT_EQ(result->transformations[0].input_shape[2], 8);
+  EXPECT_EQ(result->transformations[0].input_shape[3], 16);
+
+  // Output shape = physical [2, 8, 4, 16]
+  EXPECT_EQ(result->transformations[0].output_shape[0], 2);
+  EXPECT_EQ(result->transformations[0].output_shape[1], 8);
+  EXPECT_EQ(result->transformations[0].output_shape[2], 4);
+  EXPECT_EQ(result->transformations[0].output_shape[3], 16);
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_InversePermutationIsCorrect) {
+  // Verify: composing prologue permutation with epilogue permutation = identity
+  // For [3, 4].t(): prologue perm = [1, 0], epilogue perm should also be [1, 0]
+  // (self-inverse for 2D transpose)
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float)).t();
+
+  auto prologue = Creators::TryCreateCompound(tensor, "test_op", 0);
+  auto epilogue = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(prologue.has_value());
+  ASSERT_TRUE(epilogue.has_value());
+
+  // Find the TRANSPOSE in prologue chain
+  const TensorTransformation* prologue_transpose = nullptr;
+  for (const auto& t : prologue->transformations) {
+    if (t.type == TransformationType::TRANSPOSE) {
+      prologue_transpose = &t;
+      break;
+    }
+  }
+  ASSERT_NE(prologue_transpose, nullptr) << "Prologue should have a TRANSPOSE";
+
+  // Epilogue has exactly 1 TRANSPOSE
+  ASSERT_EQ(epilogue->transformations.size(), 1u);
+  const auto& epilogue_transpose = epilogue->transformations[0];
+
+  // Compose: apply prologue perm then epilogue perm → should be identity
+  const auto& fwd_perm = prologue_transpose->params;
+  const auto& inv_perm = epilogue_transpose.params;
+  size_t ndims = fwd_perm.size();
+  ASSERT_EQ(inv_perm.size(), ndims);
+
+  for (size_t i = 0; i < ndims; ++i) {
+    // Apply forward then inverse: inv_perm[fwd_perm[i]] should == i
+    EXPECT_EQ(inv_perm[fwd_perm[i]], static_cast<int64_t>(i))
+        << "Composing prologue and epilogue permutations should yield identity at dim " << i;
+  }
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_RejectContiguousTensor) {
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  ASSERT_TRUE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  EXPECT_FALSE(result.has_value()) << "Should reject contiguous tensor";
+}
+
+// DISABLED_ tests: These represent the FINAL expected behavior for future phases.
+// They are disabled now because the inverse operations are not yet implemented,
+// but they define the TDD targets for Phase 2+ implementation.
+
+TEST_F(TransformationsTest, TryCreateEpilogue_SlicePattern) {
+  // SCATTER_IOTA: [8, 10] sliced to [:, 3:7] → epilogue scatters [8, 4] into 1D flat storage
+  auto tensor =
+      at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 3, 7);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for slice pattern";
+  EXPECT_TRUE(result->is_supported);
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_SLICE");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Should have exactly 1 SCATTER_IOTA transformation
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+
+  // Input shape = logical [8, 4] (what the operation produces)
+  EXPECT_EQ(result->transformations[0].input_shape[0], 8);
+  EXPECT_EQ(result->transformations[0].input_shape[1], 4);
+
+  // Output shape = 1D flat storage
+  EXPECT_EQ(result->transformations[0].output_shape.size(), 1u);
+  EXPECT_EQ(result->transformations[0].output_shape[0], 80);  // 8*10
+
+  // Base tensor should be 1D flat storage
+  EXPECT_EQ(result->processed_input.dim(), 1);
+  EXPECT_EQ(result->processed_input.size(0), 80);
+}
+
+TEST_F(TransformationsTest, DISABLED_TryCreateEpilogue_BroadcastPattern) {
+  // Phase 4 target: BROADCAST inverse should produce REDUCE or SLICE
+  // [3, 1] expanded to [3, 4] → epilogue collapses dim 1 back to size 1
+  auto base = at::zeros({3, 1}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.expand({3, 4});
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for broadcast pattern";
+  EXPECT_TRUE(result->is_supported);
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+}
+
+TEST_F(TransformationsTest, DISABLED_TryCreateEpilogue_TransposeSliceCompound) {
+  // Phase 3 target: Compound (transpose+slice) inverse
+  // [1,8,4,8].transpose(1,2)[..., 4:] → epilogue: inverse_transpose then scatter_iota
+  auto base = at::zeros({1, 8, 4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 2).slice(3, 4, 8);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for transpose+slice compound";
+  EXPECT_TRUE(result->is_supported);
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Should have at least 2 transformations (inverse transpose + inverse slice)
+  ASSERT_GE(result->transformations.size(), 2u);
+}
+
+// Phase 2: Slice and compound epilogues are now supported
+TEST_F(TransformationsTest, TryCreateEpilogue_SlicePattern_Phase2) {
+  // Phase 2: SLICE inverse produces scatter_iota
+  auto tensor =
+      at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 3, 7);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value()) << "Phase 2: Slice epilogue should now be supported";
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_SLICE");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_TransposeSliceCompound) {
+  // Compound epilogue (transpose+slice) is now supported by the new AnalyzeEpilogueLayout
+  // which reads base shape directly from strides instead of using DecomposeStrides.
+  auto base = at::zeros({1, 8, 4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 2).slice(3, 4, 8);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value()) << "Compound epilogue (transpose+slice) should be supported";
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_COMPOUND");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Should have 2 transformations: inverse transpose + SCATTER_IOTA
+  ASSERT_EQ(result->transformations.size(), 2u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::TRANSPOSE);
+  EXPECT_EQ(result->transformations[1].type, TransformationType::SCATTER_IOTA);
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_BaseIsContiguous) {
+  // For any supported epilogue pattern, the base tensor must be contiguous
+  auto tensor = at::zeros({4, 5, 6, 7}, at::TensorOptions().dtype(c10::ScalarType::Float))
+                    .transpose(1, 3);  // [4, 7, 6, 5]
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for 4D transpose";
+  EXPECT_TRUE(result->processed_input.is_contiguous()) << "Epilogue base tensor must be contiguous";
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_BFloat16Dtype) {
+  // Verify epilogue works with bfloat16 dtype
+  auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::BFloat16)).t();
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for bf16 transpose";
+  EXPECT_EQ(result->transformations[0].element_type, "bf16");
+}
+
+//============================================================================
+// Additional Epilogue Tests — Coverage Gaps
+//============================================================================
+
+TEST_F(TransformationsTest, TryCreateEpilogue_MultiAxisSlice) {
+  // Multi-axis slice: base[2:6, 3:7] on [8, 10]
+  // shape=[4, 4], strides=[10, 1], offset=23
+  auto base = at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.slice(0, 2, 6).slice(1, 3, 7);
+  ASSERT_FALSE(tensor.is_contiguous());
+  ASSERT_EQ(tensor.storage_offset(), 23);  // 2*10 + 3
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for multi-axis slice";
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_SLICE");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Base should be 1D flat storage (SCATTER_IOTA uses flat base)
+  EXPECT_EQ(result->processed_input.dim(), 1);
+  EXPECT_EQ(result->processed_input.size(0), 80);  // 8*10
+
+  // Should have 1 SCATTER_IOTA transformation (no transpose)
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_SliceOffset0_OriginalBugCase) {
+  // The original bug case: base[:, :4] on [4, 8]
+  // shape=[4, 4], strides=[8, 1], offset=0
+  // DecomposeStrides gave phys_base_shape=[4,4] (wrong), new analysis gives [4,8] (correct)
+  auto base = at::zeros({4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.slice(1, 0, 4);
+  ASSERT_FALSE(tensor.is_contiguous());
+  ASSERT_EQ(tensor.storage_offset(), 0);
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should create epilogue for offset=0 slice";
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_SLICE");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Base must be 1D flat (SCATTER_IOTA), storage = 4*8 = 32 elements
+  EXPECT_EQ(result->processed_input.dim(), 1);
+  EXPECT_EQ(result->processed_input.size(0), 32);
+  EXPECT_EQ(result->processed_input.storage_offset(), 0);
+
+  // Should use SCATTER_IOTA
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+
+  // params = [stride_0, stride_1, storage_offset, storage_span]
+  // For [4,4] with strides [8,1], offset=0:
+  ASSERT_EQ(result->transformations[0].params.size(), 4u);  // 2 strides + offset + span
+  EXPECT_EQ(result->transformations[0].params[0], 8);       // stride dim 0
+  EXPECT_EQ(result->transformations[0].params[1], 1);       // stride dim 1
+  EXPECT_EQ(result->transformations[0].params[2], 0);       // storage offset
+  EXPECT_EQ(result->transformations[0].params[3], 32);      // storage span
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_StridedSliceRejection) {
+  // Strided slice: base[::2] on [10, 4]
+  // shape=[5, 4], strides=[8, 1], offset=0 — innermost stride=1 but stride gap
+  auto base = at::zeros({10, 4}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.slice(0, 0, 10, 2);  // [::2] → shape [5, 4], strides [8, 1]
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  // Should reject: stride[0]=8 but base[0]*stride[1] = 8 and base[0]=8/1=8,
+  // but storage=40, outermost base = 40/8 = 5 which equals view size.
+  // Actually for this case: phys_base[0] = 40/8 = 5, phys_view[0] = 5 → no slice on dim 0.
+  // phys_base[1] = 8/1 = 8, phys_view[1] = 4 → has slice on dim 1.
+  // But wait — the stride gap check: strides[0]=8, strides[1]=1, 8/1=8, 8*1=8 ✓
+  // So it passes the contiguity check. The base would be [5, 8] but storage is only 40=5*8 ✓.
+  // This is actually a valid decomposition! The strided slice x[::2] on dim 0 looks like
+  // a slice on dim 1 from the stride perspective. Let me use a clearer strided slice.
+
+  // Use a 1D strided slice instead
+  auto base1d = at::zeros({10}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor1d = base1d.slice(0, 0, 10, 2);  // shape [5], stride [2]
+  ASSERT_FALSE(tensor1d.is_contiguous());
+
+  auto result1d = Creators::TryCreateEpilogue(tensor1d, "test_op", 0);
+  EXPECT_FALSE(result1d.has_value())
+      << "1D strided slice (stride=2) should be rejected (innermost stride != 1)";
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_Size1Dims) {
+  // Tensor with size-1 dims: [1, 4, 1, 8].transpose(1, 3) → [1, 8, 1, 4]
+  // Size-1 dims should be handled as identity (no effect on physical layout)
+  auto base = at::zeros({1, 4, 1, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 3);  // [1, 8, 1, 4]
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value()) << "Should handle size-1 dims in transpose";
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_TRANSPOSE");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+
+  // Base should have the physical shape [1, 4, 1, 8] (original contiguous layout)
+  // Active dims are 1 and 3 (size 4 and 8), size-1 dims stay in place
+  EXPECT_EQ(result->processed_input.numel(), 32);  // 1*4*1*8
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_BaseOffsetAlwaysZero) {
+  // Verify base_tensor.storage_offset() == 0 for various patterns
+
+  // Pure transpose
+  {
+    auto tensor = at::zeros({3, 4}, at::TensorOptions().dtype(c10::ScalarType::Float)).t();
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->processed_input.storage_offset(), 0) << "Transpose: base offset must be 0";
+  }
+
+  // Slice with offset
+  {
+    auto tensor =
+        at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 3, 7);
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->processed_input.storage_offset(), 0) << "Slice: base offset must be 0";
+  }
+
+  // Compound (transpose + slice)
+  {
+    auto base = at::zeros({1, 8, 4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+    auto tensor = base.transpose(1, 2).slice(3, 4, 8);
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->processed_input.storage_offset(), 0) << "Compound: base offset must be 0";
+  }
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_ScatterIotaParamsCorrect) {
+  // Verify SCATTER_IOTA params are correct for various slice patterns
+  // params layout: [stride_0, stride_1, ..., storage_offset, storage_span]
+
+  // Single-axis slice: [8, 10][:, 3:7] → strides [10, 1], offset=3, storage=80
+  {
+    auto tensor =
+        at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 3, 7);
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->transformations.size(), 1u);
+    EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+
+    // params = [stride_dim0, stride_dim1, storage_offset, storage_span]
+    const auto& params = result->transformations[0].params;
+    ASSERT_EQ(params.size(), 4u);  // 2 strides + offset + span
+    EXPECT_EQ(params[0], 10) << "Stride dim 0 should be 10";
+    EXPECT_EQ(params[1], 1) << "Stride dim 1 should be 1";
+    EXPECT_EQ(params[2], 3) << "Storage offset should be 3";
+    EXPECT_EQ(params[3], 80) << "Storage span should be 80 (8*10)";
+  }
+
+  // Slice from start: [4, 8][:, :4] → strides [8, 1], offset=0, storage=32
+  {
+    auto tensor =
+        at::zeros({4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(1, 0, 4);
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->transformations.size(), 1u);
+    EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+
+    const auto& params = result->transformations[0].params;
+    ASSERT_EQ(params.size(), 4u);
+    EXPECT_EQ(params[0], 8) << "Stride dim 0 should be 8";
+    EXPECT_EQ(params[1], 1) << "Stride dim 1 should be 1";
+    EXPECT_EQ(params[2], 0) << "Storage offset should be 0";
+    EXPECT_EQ(params[3], 32) << "Storage span should be 32 (4*8)";
+  }
+
+  // Row slice: [8, 10][2:6, :] → shape [4, 10], strides [10, 1]
+  // This is actually CONTIGUOUS (strides match row-major for shape [4, 10]),
+  // so TryCreateEpilogue correctly returns nullopt. No epilogue needed.
+  {
+    auto tensor =
+        at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float)).slice(0, 2, 6);
+    EXPECT_TRUE(tensor.is_contiguous()) << "Row slice produces contiguous tensor";
+    auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+    EXPECT_FALSE(result.has_value()) << "Row slice is contiguous — no epilogue needed";
+  }
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_ScatterIotaParams_CompoundPattern) {
+  // Compound (transpose+slice): [1, 8, 4, 8].transpose(1,2)[..., 4:]
+  // After inverse transpose, the physical-order strides are used for SCATTER_IOTA.
+  auto base = at::zeros({1, 8, 4, 8}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.transpose(1, 2).slice(3, 4, 8);
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->pattern_name, "EPILOGUE_COMPOUND");
+
+  // Should have [TRANSPOSE, SCATTER_IOTA]
+  ASSERT_EQ(result->transformations.size(), 2u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::TRANSPOSE);
+  EXPECT_EQ(result->transformations[1].type, TransformationType::SCATTER_IOTA);
+
+  // SCATTER_IOTA params: [strides..., offset, storage_span]
+  const auto& scatter = result->transformations[1];
+  size_t n = scatter.input_shape.size();
+  ASSERT_EQ(scatter.params.size(), n + 2) << "params = [strides..., offset, span]";
+
+  // Output must be 1D flat
+  ASSERT_EQ(scatter.output_shape.size(), 1u);
+  int64_t storage_span = scatter.params.back();
+  EXPECT_EQ(scatter.output_shape[0], storage_span);
+  EXPECT_EQ(storage_span, 1 * 8 * 4 * 8) << "Storage span = product of original base shape";
+
+  // Storage offset should be the original tensor's offset (4)
+  EXPECT_EQ(scatter.params[n], tensor.storage_offset());
+
+  // Base tensor should be 1D flat
+  EXPECT_EQ(result->processed_input.dim(), 1);
+  EXPECT_EQ(result->processed_input.size(0), storage_span);
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_ScatterIotaParams_MultiAxisSlice) {
+  // Multi-axis slice: base[2:6, 3:7] on [8, 10]
+  // shape=[4, 4], strides=[10, 1], offset=23 (2*10 + 3)
+  auto base = at::zeros({8, 10}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto tensor = base.slice(0, 2, 6).slice(1, 3, 7);
+  ASSERT_FALSE(tensor.is_contiguous());
+  ASSERT_EQ(tensor.storage_offset(), 23);
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  ASSERT_TRUE(result.has_value());
+
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::SCATTER_IOTA);
+
+  // params = [stride_0, stride_1, offset, storage_span]
+  const auto& params = result->transformations[0].params;
+  ASSERT_EQ(params.size(), 4u);
+  EXPECT_EQ(params[0], 10) << "Stride dim 0 should be 10";
+  EXPECT_EQ(params[1], 1) << "Stride dim 1 should be 1";
+  EXPECT_EQ(params[2], 23) << "Storage offset should be 23 (2*10 + 3)";
+  EXPECT_EQ(params[3], 80) << "Storage span should be 80 (8*10)";
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_Reject4GBBase) {
+  // Epilogue should reject when base tensor >= 4GB.
+  // [32, 16, 2048, 2048] float16 sliced to [32, 4, 2048, 2048] via [:, ::4, :, :]
+  // Full storage = 32 * 16 * 2048 * 2048 * 2 bytes = 4GB
+  auto base = at::zeros({32, 16, 2048, 2048}, at::TensorOptions().dtype(c10::ScalarType::Half));
+  auto tensor = base.slice(1, 0, 16, 4);  // [:, ::4, :, :]
+  ASSERT_FALSE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_4gb_epilogue_reject", 0);
+  EXPECT_FALSE(result.has_value()) << "TryCreateEpilogue must reject when base tensor >= 4GB";
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_RejectAllSize1Dims) {
+  // All dimensions are size 1: [1, 1, 1] — should be contiguous (no epilogue needed)
+  auto tensor = at::zeros({1, 1, 1}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  ASSERT_TRUE(tensor.is_contiguous());
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  EXPECT_FALSE(result.has_value()) << "All-size-1 tensor is contiguous, no epilogue";
+}
+
+TEST_F(TransformationsTest, TryCreateEpilogue_RejectScalarTensor) {
+  // 0-dim scalar tensor
+  auto tensor = at::zeros({}, at::TensorOptions().dtype(c10::ScalarType::Float));
+
+  auto result = Creators::TryCreateEpilogue(tensor, "test_op", 0);
+  EXPECT_FALSE(result.has_value()) << "Scalar tensor (0 dims) should be rejected";
+}
+
+//============================================================================
+// Epilogue Fuzz Test
+//
+// Generates random non-contiguous tensor views (transpose, step=1 slice,
+// select, permute, unsqueeze, squeeze) and verifies TryCreateEpilogue
+// produces correct results when it accepts a pattern.
+//============================================================================
+
+// Reuse RandomOp enum from prologue fuzz test (already defined above)
+
+TEST_F(TransformationsTest, TryCreateEpilogue_RandomMixedSequences) {
+  std::random_device rd;
+  const uint32_t seed = rd();
+  std::mt19937 rng(seed);
+
+  constexpr int kNumIterations = 10000;
+  constexpr int kMinOps = 1;
+  constexpr int kMaxOps = 5;
+
+  std::uniform_int_distribution<int> num_ops_dist(kMinOps, kMaxOps);
+  std::uniform_int_distribution<int> rank_dist(2, 4);
+  std::uniform_int_distribution<int64_t> dim_size_dist(2, 8);
+  // Only epilogue-friendly ops: TRANSPOSE=0, SLICE(step=1)=1, PERMUTE=3, UNSQUEEZE=5, SQUEEZE=6,
+  // SELECT=4
+  std::uniform_int_distribution<int> op_type_dist(0, 5);
+
+  int total_accepted = 0;
+  int total_fallback = 0;
+  int total_contiguous = 0;
+  int total_invalid = 0;
+  int total_errors = 0;
+
+  for (int iter = 0; iter < kNumIterations; ++iter) {
+    int rank = rank_dist(rng);
+    std::vector<int64_t> initial_shape;
+    for (int d = 0; d < rank; ++d) initial_shape.push_back(dim_size_dist(rng));
+
+    auto tensor = at::randn(c10::IntArrayRef(initial_shape),
+                            at::TensorOptions().dtype(c10::ScalarType::Float));
+
+    bool sequence_valid = true;
+    for (int op_idx = 0; op_idx < num_ops_dist(rng) && sequence_valid; ++op_idx) {
+      int64_t ndim = tensor.dim();
+      if (ndim < 2) {
+        sequence_valid = false;
+        break;
+      }
+
+      int op = op_type_dist(rng);
+      switch (op) {
+        case 0: {  // TRANSPOSE
+          std::uniform_int_distribution<int64_t> dd(0, ndim - 1);
+          int64_t d0 = dd(rng), d1 = dd(rng);
+          while (d1 == d0) d1 = dd(rng);
+          tensor = tensor.transpose(d0, d1);
+          break;
+        }
+        case 1: {  // SLICE (step=1 only)
+          std::uniform_int_distribution<int64_t> dd(0, ndim - 1);
+          int64_t dim = dd(rng);
+          int64_t sz = tensor.size(dim);
+          if (sz <= 2) break;
+          std::uniform_int_distribution<int64_t> sd(0, sz - 2);
+          int64_t start = sd(rng);
+          std::uniform_int_distribution<int64_t> ed(start + 1, sz - 1);
+          int64_t end = ed(rng);
+          tensor = tensor.slice(dim, start, end);  // step=1
+          break;
+        }
+        case 2: {  // PERMUTE
+          std::vector<int64_t> perm(ndim);
+          std::iota(perm.begin(), perm.end(), 0);
+          std::shuffle(perm.begin(), perm.end(), rng);
+          tensor = tensor.permute(c10::IntArrayRef(perm));
+          break;
+        }
+        case 3: {  // SELECT
+          if (ndim <= 2) break;
+          std::uniform_int_distribution<int64_t> dd(0, ndim - 1);
+          int64_t dim = dd(rng);
+          std::uniform_int_distribution<int64_t> id(0, tensor.size(dim) - 1);
+          tensor = tensor.select(dim, id(rng));
+          break;
+        }
+        case 4: {  // UNSQUEEZE
+          std::uniform_int_distribution<int64_t> pd(0, ndim);
+          tensor = tensor.unsqueeze(pd(rng));
+          break;
+        }
+        case 5: {  // SQUEEZE
+          if (ndim <= 2) break;
+          std::vector<int64_t> squeezable;
+          for (int64_t d = 0; d < ndim; ++d)
+            if (tensor.size(d) == 1) squeezable.push_back(d);
+          if (!squeezable.empty()) {
+            std::uniform_int_distribution<size_t> sd(0, squeezable.size() - 1);
+            tensor = tensor.squeeze(squeezable[sd(rng)]);
+          }
+          break;
+        }
+      }
+    }
+
+    if (!sequence_valid) {
+      total_invalid++;
+      continue;
+    }
+    if (tensor.is_contiguous()) {
+      total_contiguous++;
+      continue;
+    }
+
+    auto result = Creators::TryCreateEpilogue(tensor, "epilogue_fuzz", 0);
+
+    if (!result.has_value()) {
+      total_fallback++;
+      continue;
+    }
+
+    total_accepted++;
+
+    // Build error context
+    std::ostringstream ctx;
+    ctx << "\n=== EPILOGUE FUZZ FAILURE (seed=" << seed << ", iter=" << iter << ") ===\n"
+        << "Tensor: " << FormatTensorInfo(tensor) << "\n";
+    std::string err = ctx.str();
+
+    // Invariant 1: Base tensor is contiguous
+    EXPECT_TRUE(result->processed_input.is_contiguous()) << "Base must be contiguous" << err;
+
+    // Invariant 2: Base storage_offset == 0
+    EXPECT_EQ(result->processed_input.storage_offset(), 0) << "Base offset must be 0" << err;
+
+    // Invariant 3: Base fits in storage
+    int64_t base_numel = result->processed_input.numel();
+    int64_t storage_elems = static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size());
+    EXPECT_LE(base_numel, storage_elems) << "Base must fit in storage" << err;
+
+    // Invariant 4: Transformation chain well-formed
+    ASSERT_FALSE(result->transformations.empty()) << "Must have transforms" << err;
+    for (size_t t = 1; t < result->transformations.size(); ++t) {
+      EXPECT_EQ(result->transformations[t - 1].output_shape, result->transformations[t].input_shape)
+          << "Chain break at " << t << err;
+    }
+
+    // Invariant 5: First transform input = logical shape
+    const auto& first = result->transformations[0];
+    ASSERT_EQ(first.input_shape.size(), static_cast<size_t>(tensor.dim())) << err;
+    for (int64_t i = 0; i < tensor.dim(); ++i) {
+      EXPECT_EQ(first.input_shape[i], tensor.size(i)) << "Input shape mismatch dim " << i << err;
+    }
+
+    // Invariant 6: Last transform output = base shape
+    const auto& last = result->transformations.back();
+    ASSERT_EQ(last.output_shape.size(), static_cast<size_t>(result->processed_input.dim())) << err;
+    for (int64_t i = 0; i < result->processed_input.dim(); ++i) {
+      EXPECT_EQ(last.output_shape[i], result->processed_input.size(i))
+          << "Output shape mismatch dim " << i << err;
+    }
+
+    // Invariant 7: Only TRANSPOSE or SCATTER_IOTA (epilogue uses SCATTER_IOTA for slice patterns)
+    for (const auto& t : result->transformations) {
+      EXPECT_TRUE(t.type == TransformationType::TRANSPOSE ||
+                  t.type == TransformationType::SCATTER_IOTA)
+          << "Unexpected transform type" << err;
+    }
+
+    // Invariant 8: SCATTER_IOTA params validity check
+    for (const auto& t : result->transformations) {
+      if (t.type == TransformationType::SCATTER_IOTA) {
+        // params = [stride_0, ..., stride_{n-1}, storage_offset, storage_span]
+        // where n = input_shape.size()
+        size_t n = t.input_shape.size();
+        ASSERT_EQ(t.params.size(), n + 2) << "SCATTER_IOTA params size" << err;
+        // Last element is storage_span, must be positive
+        EXPECT_GT(t.params.back(), 0) << "SCATTER_IOTA storage_span" << err;
+        // Storage offset must be non-negative
+        EXPECT_GE(t.params[n], 0) << "SCATTER_IOTA offset" << err;
+        // Output must be 1D flat
+        ASSERT_EQ(t.output_shape.size(), 1u) << "SCATTER_IOTA output must be 1D" << err;
+      }
+    }
+  }
+
+  std::cout << "\n[EpilogueFuzz] seed=" << seed << " accepted=" << total_accepted
+            << " fallback=" << total_fallback << " contiguous=" << total_contiguous
+            << " invalid=" << total_invalid << " total=" << kNumIterations << std::endl;
+
+  // At least some patterns should be accepted
+  EXPECT_GT(total_accepted, 0) << "No patterns accepted (seed=" << seed << ")";
+}
+
 }  // namespace
 }  // namespace lazy
 }  // namespace c10_neuron
