@@ -133,9 +133,22 @@ def should_retry(exit_code: int) -> bool:
     return exit_code == 1
 
 
-def is_distributed(items: Sequence[str]) -> bool:
-    """Distributed items get a different pytest invocation (see module docstring)."""
+def needs_process_isolation_flag(items: Sequence[str]) -> bool:
+    """Suites that need --forked to isolate test execution.
+
+    Ensures each test runs in its own subprocess, preventing crashes
+    or segmentation faults from halting the entire test suite.
+    """
     return any(item.startswith("distributed") for item in items)
+
+
+def needs_process_isolation_with_timeouts_flag(items: Sequence[str]) -> bool:
+    """Suites that need process isolation and thread-based timeouts.
+
+    Uses --forked and --timeout-method thread together to reliably terminate
+    hanging tests via process isolation without crashing the entire test suite.
+    """
+    return any("test_foreach" in item for item in items)
 
 
 def build_pytest_argv(
@@ -167,8 +180,10 @@ def build_pytest_argv(
         "--continue-on-collection-errors",
         "-v",
     ]
-    if is_distributed(args.items):
+    if needs_process_isolation_flag(args.items):
         argv.append("--forked")
+    elif needs_process_isolation_with_timeouts_flag(args.items):
+        argv.extend(["--forked", f"--timeout={args.test_timeout}", "--timeout-method=thread"])
     else:
         argv.append(f"--timeout={args.test_timeout}")
     if args.shard_id is not None and args.num_shards is not None:
