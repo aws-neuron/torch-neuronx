@@ -459,14 +459,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
             "[prologue] Data-dependent NaN in standalone transpose NEFF for"
-            " non-contiguous fp16 tensors. The _refs.div decomposition"
-            " (promote->div->demote) triggers CopyToNonContiguous which uses"
-            " an on-device transpose that produces spurious NaN at row 128"
-            " for specific data patterns. Native torch.div with epilogue"
-            " works correctly. See .internal_docs/NaN_Bug_Investigation.md."
+            " non-contiguous fp16 tensors of shape (357, 789). The _refs"
+            " decomposition (promote->op->demote) triggers CopyToNonContiguous"
+            " which uses an on-device transpose that produces spurious NaN at"
+            " row 128 for specific data patterns. Affects any _refs op that"
+            " does promote/demote on this shape. Native ops with epilogue work"
+            " correctly."
         ),
         tests=[
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_div_no_rounding_mode_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_pow_neuron_float16",
         ],
     ),
 ]
