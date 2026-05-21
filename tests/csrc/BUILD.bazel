@@ -337,6 +337,24 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "OpConcatUtilsViewInsertionTest",
+    srcs = ["core/concatenation/OpConcatUtilsViewInsertionTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "OpConcatUtilsSharedInputReshapeTest",
+    srcs = ["core/concatenation/OpConcatUtilsSharedInputReshapeTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "OpConcatUtilsOptimizationTest",
     srcs = ["core/concatenation/OpConcatUtilsOptimizationTest.cpp"],
     deps = [
