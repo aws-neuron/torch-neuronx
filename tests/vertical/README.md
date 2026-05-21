@@ -21,17 +21,24 @@ tests/vertical/
 │   ├── neuron_op_db.py             # build_neuron_op_db() merging all sources
 │   ├── generate_op_shape_registry.py       # Tool: cache keys → op_shape_registry.json
 │   ├── test_generate_op_shape_registry.py  # Unit tests for the parser
-├── test_target_ops_coverage.py     # Coverage + perf + correctness for all target ops
+├── test_target_ops_coverage.py             # Eager coverage + perf + correctness
+├── test_target_ops_compile_coverage.py     # torch.compile coverage + perf + correctness
 ```
 
 ## Running Tests
 
 ```sh
-# Run all coverage tests in parallel (recommended)
+# Run all eager coverage tests in parallel (recommended)
 python -m pytest tests/vertical/test_target_ops_coverage.py -n 32 --tb=no -q
 
-# Run a single op
+# Run all compile coverage tests in parallel
+python -m pytest tests/vertical/test_target_ops_compile_coverage.py -n 32 --tb=no -q
+
+# Run a single op (eager)
 python -m pytest "tests/vertical/test_target_ops_coverage.py::TestTargetOpsCoverage::test_op[aten::linear[linalg]]" -v -s
+
+# Run a single op (compile)
+python -m pytest "tests/vertical/test_target_ops_compile_coverage.py::TestTargetOpsCompileCoverage::test_op_compile[aten::linear[linalg]]" -v -s
 
 # Run ops matching a pattern
 python -m pytest tests/vertical/test_target_ops_coverage.py -v -k "relu or gelu"
@@ -40,7 +47,9 @@ python -m pytest tests/vertical/test_target_ops_coverage.py -v -k "relu or gelu"
 
 ## Coverage CSV
 
-Results are aggregated into `target_ops_coverage_<timestamp>.csv`.
+Results are aggregated into:
+- **Eager**: `target_ops_coverage_<timestamp>.csv`
+- **Compile**: `target_ops_compile_coverage_<timestamp>.csv`
 
 | Column | Description |
 |--------|-------------|
