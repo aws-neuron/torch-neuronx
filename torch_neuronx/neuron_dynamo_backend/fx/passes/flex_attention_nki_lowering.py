@@ -5,13 +5,16 @@ Legalizes flex_attention higher-order operators by decomposing them into
 standard ATen operations that torch-mlir can handle.
 """
 
+import fcntl
 import functools
 import logging
 import math
 import operator
 import os
+import tempfile
 
 import nki
+import numpy as np
 import torch
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -39,6 +42,59 @@ _TILE_FULL = 2
 _Q_GRP_SZ = 128
 _V_TILE_SZ = 128
 _SECTION_LEN = 8192
+
+
+def _atomic_save_npy(path: str, array) -> None:
+    """Save a numpy array atomically with an exclusive file lock.
+
+    Prevents races in multi-rank/multi-process training where several
+    processes may compute the same content-hashed .npy concurrently. Without
+    this, a reader (the NKI compiler via ``nl.shared_constant``) can observe
+    a file that is zero-length or partially written, producing errors like
+    ``invalid npy magic bytes`` or ``npy data size mismatch: expected N
+    bytes, got 0``.
+
+    Strategy:
+      1. Acquire an exclusive flock on a sidecar ``.lock`` file.
+      2. If the target already exists with the correct size, skip (fast path
+         for repeat ranks — content hash guarantees bytes match).
+      3. Otherwise write to a unique temp path and ``os.replace`` onto the
+         final path. ``os.replace`` is atomic on the same filesystem, so
+         readers either see the old file or the fully-written new one.
+
+    Args:
+        path: Destination .npy path.
+        array: numpy array to save.
+    """
+    lock_path = path + ".lock"
+    target_dir = os.path.dirname(path) or "."
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            # Fast path: another rank already produced this file. Since the
+            # filename is content-hashed, existence implies correct contents.
+            # We still sanity-check it is non-empty to guard against stale
+            # crashes from a previous (unlocked) run.
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return
+
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir
+            )
+            try:
+                with os.fdopen(fd, "wb") as tmp_f:
+                    np.save(tmp_f, array)
+                    tmp_f.flush()
+                    os.fsync(tmp_f.fileno())
+                os.replace(tmp_path, path)
+            except Exception:
+                # Clean up temp file on failure
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _classify_tile(
@@ -164,14 +220,17 @@ def _generate_tile_types(
             masks_2d = np.zeros((_Q_GRP_SZ, 0), dtype=np.float32)
             masks_int8_2d = np.zeros((_Q_GRP_SZ, 0), dtype=np.int8)
 
-        # Write to artifacts directory with content hash for dedup
+        # Write to artifacts directory with content hash for dedup.
+        # Use a file lock + atomic rename to prevent races where one rank
+        # observes a partially-written .npy (empty or bad magic bytes)
+        # produced by another rank writing concurrently.
         npy_dir = Path(get_artifacts_directory()) / "flex_attention"
         npy_dir.mkdir(parents=True, exist_ok=True)
         content_hash = hashlib.sha256(masks_2d.tobytes() + masks_int8_2d.tobytes()).hexdigest()[:16]
         npy_path = str(npy_dir / f"tile_masks_2d_{content_hash}.npy")
         npy_int8_path = str(npy_dir / f"tile_masks_int8_2d_{content_hash}.npy")
-        np.save(npy_path, masks_2d)
-        np.save(npy_int8_path, masks_int8_2d)
+        _atomic_save_npy(npy_path, masks_2d)
+        _atomic_save_npy(npy_int8_path, masks_int8_2d)
 
         # Compute per-group last section with compute
         num_sections = max(1, math.ceil(seqlen_kv / _SECTION_LEN))
