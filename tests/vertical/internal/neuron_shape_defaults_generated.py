@@ -1413,11 +1413,11 @@ def register_all_defaults(r):
     )
     r(
         "aten::_log_softmax.out",
-        {"self": (256, 4096), "dim": 0, "half_to_float": False, "out": (0,)},
+        {"self": (256, 4096), "dim": 0, "half_to_float": False},
         source="builtin",
     )
     r("aten::_logcumsumexp", {"self": (256, 4096), "dim": 0}, source="builtin")
-    r("aten::_logcumsumexp.out", {"self": (256, 4096), "dim": 0, "out": (0,)}, source="builtin")
+    r("aten::_logcumsumexp.out", {"self": (256, 4096), "dim": 0}, source="builtin")
     r("aten::_prelu_kernel", {"self": (256, 4096), "weight": (1,)}, source="builtin")
     r(
         "aten::_prelu_kernel_backward",
@@ -1427,23 +1427,23 @@ def register_all_defaults(r):
     r("aten::_softmax", {"self": (256, 4096), "dim": 0, "half_to_float": False}, source="builtin")
     r(
         "aten::_softmax.out",
-        {"self": (256, 4096), "dim": 0, "half_to_float": False, "out": (0,)},
+        {"self": (256, 4096), "dim": 0, "half_to_float": False},
         source="builtin",
     )
     r("aten::_to_copy", {"self": (256, 4096)}, source="builtin")
-    r("aten::_to_copy.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
-    r("aten::abs.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::_to_copy.out", {"self": (256, 4096)}, source="builtin")
+    r("aten::abs.out", {"self": (256, 4096)}, source="builtin")
     r("aten::acos", {"self": (256, 4096)}, source="builtin")
-    r("aten::acos.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::acos.out", {"self": (256, 4096)}, source="builtin")
     r("aten::acosh", {"self": (256, 4096)}, source="builtin")
-    r("aten::acosh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::acosh.out", {"self": (256, 4096)}, source="builtin")
     r("aten::add.Scalar", {"self": (256, 4096), "other": 1.0, "alpha": 1.0}, source="builtin")
     r(
         "aten::add.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "alpha": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0, "alpha": 1.0},
         source="builtin",
     )
-    r("aten::add.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::add.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::add_.Scalar", {"self": (256, 4096), "other": 1.0, "alpha": 1.0}, source="builtin")
     r("aten::add_.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
@@ -1458,15 +1458,15 @@ def register_all_defaults(r):
     )
     r("aten::alias", {"self": (256, 4096)}, source="builtin")
     r("aten::asin", {"self": (256, 4096)}, source="builtin")
-    r("aten::asin.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::asin.out", {"self": (256, 4096)}, source="builtin")
     r("aten::asinh", {"self": (256, 4096)}, source="builtin")
-    r("aten::asinh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::asinh.out", {"self": (256, 4096)}, source="builtin")
     r("aten::atan", {"self": (256, 4096)}, source="builtin")
-    r("aten::atan.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::atan.out", {"self": (256, 4096)}, source="builtin")
     r("aten::atan2", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::atan2.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::atan2.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::atanh", {"self": (256, 4096)}, source="builtin")
-    r("aten::atanh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::atanh.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::avg_pool1d.out",
         {
@@ -1498,7 +1498,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::binary_cross_entropy_with_logits.out",
-        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "out": (0,)},
+        {"self": (256, 4096), "target": (256, 4096), "reduction": 1},
         source="builtin",
     )
     r(
@@ -1525,7 +1525,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::bitwise_left_shift.Tensor_Scalar_out",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0, "out": (0,)},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
         source="builtin",
     )
     r(
@@ -1539,7 +1539,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::bitwise_not.out",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "out": (0,)},
+        {"self": {"shape": (256, 1024), "dtype": "int"}},
         source="builtin",
     )
     r(
@@ -1566,7 +1566,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::bitwise_right_shift.Tensor_Scalar_out",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0, "out": (0,)},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
         source="builtin",
     )
     r(
@@ -1588,44 +1588,44 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::cauchy_", {"self": (256, 4096), "median": 1.0, "sigma": 1.0}, source="builtin")
-    r("aten::ceil.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::ceil.out", {"self": (256, 4096)}, source="builtin")
     r("aten::celu", {"self": (256, 4096), "alpha": 1.0}, source="builtin")
-    r("aten::celu.out", {"self": (256, 4096), "alpha": 1.0, "out": (0,)}, source="builtin")
+    r("aten::celu.out", {"self": (256, 4096), "alpha": 1.0}, source="builtin")
     r("aten::clamp_max", {"self": (256, 4096), "max": 1.0}, source="builtin")
     r("aten::clamp_max.Tensor", {"self": (256, 4096), "max": (256, 4096)}, source="builtin")
     r(
         "aten::clamp_max.Tensor_out",
-        {"self": (256, 4096), "max": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "max": (256, 4096)},
         source="builtin",
     )
-    r("aten::clamp_max.out", {"self": (256, 4096), "max": 1.0, "out": (0,)}, source="builtin")
+    r("aten::clamp_max.out", {"self": (256, 4096), "max": 1.0}, source="builtin")
     r("aten::clamp_min", {"self": (256, 4096), "min": 1.0}, source="builtin")
     r("aten::clamp_min.Tensor", {"self": (256, 4096), "min": (256, 4096)}, source="builtin")
     r(
         "aten::clamp_min.Tensor_out",
-        {"self": (256, 4096), "min": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "min": (256, 4096)},
         source="builtin",
     )
-    r("aten::clamp_min.out", {"self": (256, 4096), "min": 1.0, "out": (0,)}, source="builtin")
+    r("aten::clamp_min.out", {"self": (256, 4096), "min": 1.0}, source="builtin")
     r("aten::conj_physical", {"self": (256, 4096)}, source="builtin")
-    r("aten::conj_physical.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::conj_physical.out", {"self": (256, 4096)}, source="builtin")
     r("aten::copysign.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r(
         "aten::copysign.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r("aten::copysign.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::copysign.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::copysign_.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::copysign_.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::cos.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::cos.out", {"self": (256, 4096)}, source="builtin")
     r("aten::cosh", {"self": (256, 4096)}, source="builtin")
-    r("aten::cosh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::cosh.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::cross_entropy_loss",
         {
@@ -1638,26 +1638,26 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::deg2rad", {"self": (256, 4096)}, source="builtin")
-    r("aten::deg2rad.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::deg2rad.out", {"self": (256, 4096)}, source="builtin")
     r("aten::deg2rad_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::digamma", {"self": (256, 4096)}, source="builtin")
-    r("aten::digamma.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::digamma.out", {"self": (256, 4096)}, source="builtin")
     r("aten::digamma_.default", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::div.Scalar_mode_out",
-        {"self": (256, 4096), "other": 1.0, "rounding_mode": None, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0, "rounding_mode": None},
         source="builtin",
     )
-    r("aten::div.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::div.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r(
         "aten::div.Tensor_mode",
         {"self": (256, 4096), "other": (256, 4096), "rounding_mode": None},
         source="builtin",
     )
-    r("aten::div.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::div.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::div.out_mode",
-        {"self": (256, 4096), "other": (256, 4096), "rounding_mode": None, "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096), "rounding_mode": None},
         source="builtin",
     )
     r("aten::div_.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
@@ -1669,7 +1669,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::elu.out",
-        {"self": (256, 4096), "alpha": 1.0, "scale": 1.0, "input_scale": 1.0, "out": (0,)},
+        {"self": (256, 4096), "alpha": 1.0, "scale": 1.0, "input_scale": 1.0},
         source="builtin",
     )
     r(
@@ -1698,35 +1698,35 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::eq.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::eq.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::eq.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::eq.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::eq.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
-    r("aten::erf.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::erf.out", {"self": (256, 4096)}, source="builtin")
     r("aten::erfc", {"self": (256, 4096)}, source="builtin")
-    r("aten::erfc.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::erfc.out", {"self": (256, 4096)}, source="builtin")
     r("aten::erfc_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::erfinv", {"self": (256, 4096)}, source="builtin")
-    r("aten::erfinv.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::erfinv.out", {"self": (256, 4096)}, source="builtin")
     r("aten::erfinv_.default", {"self": (256, 4096)}, source="builtin")
-    r("aten::exp.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::exp.out", {"self": (256, 4096)}, source="builtin")
     r("aten::exp2", {"self": (256, 4096)}, source="builtin")
-    r("aten::exp2.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::exp2.out", {"self": (256, 4096)}, source="builtin")
     r("aten::exp2_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::expm1", {"self": (256, 4096)}, source="builtin")
-    r("aten::expm1.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::expm1.out", {"self": (256, 4096)}, source="builtin")
     r("aten::exponential_", {"self": (256, 4096), "lambd": 1.0}, source="builtin")
     r("aten::fill.Scalar", {"self": (256, 4096), "value": 1.0}, source="builtin")
-    r("aten::fill.Scalar_out", {"self": (256, 4096), "value": 1.0, "out": (0,)}, source="builtin")
+    r("aten::fill.Scalar_out", {"self": (256, 4096), "value": 1.0}, source="builtin")
     r("aten::fill.Tensor", {"self": (256, 4096), "value": ()}, source="builtin")
-    r("aten::fill.Tensor_out", {"self": (256, 4096), "value": (), "out": (0,)}, source="builtin")
+    r("aten::fill.Tensor_out", {"self": (256, 4096), "value": ()}, source="builtin")
     r("aten::fill_.Scalar", {"self": (256, 4096), "value": 1.0}, source="builtin")
     r("aten::fill_.Tensor", {"self": (256, 4096), "value": ()}, source="builtin")
     r("aten::fix", {"self": (256, 4096)}, source="builtin")
-    r("aten::fix.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::fix.out", {"self": (256, 4096)}, source="builtin")
     r("aten::fix_", {"self": (256, 4096)}, source="builtin")
     r("aten::float_power.Tensor_Scalar", {"self": (256, 4096), "exponent": 1.0}, source="builtin")
     r(
@@ -1748,33 +1748,33 @@ def register_all_defaults(r):
         },
         source="builtin",
     )
-    r("aten::floor.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::floor.out", {"self": (256, 4096)}, source="builtin")
     r("aten::floor_divide", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::floor_divide.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r(
         "aten::floor_divide.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::floor_divide_.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::fmax", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::fmax.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::fmax.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::fmin", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::fmin.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::fmin.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::fmod.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::fmod.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::fmod.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::fmod.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::fmod.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::frac", {"self": (256, 4096)}, source="builtin")
-    r("aten::frac.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::frac.out", {"self": (256, 4096)}, source="builtin")
     r("aten::frac_.default", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::gcd.out",
@@ -1794,14 +1794,14 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::ge.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::ge.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::ge.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::ge.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::ge.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
-    r("aten::gelu.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::gelu.out", {"self": (256, 4096)}, source="builtin")
     r("aten::gelu_", {"self": (256, 4096)}, source="builtin")
     r("aten::gelu_backward", {"grad_output": (256, 4096), "self": (256, 4096)}, source="builtin")
     r(
@@ -1811,7 +1811,7 @@ def register_all_defaults(r):
     )
     r("aten::geometric_", {"self": (256, 4096), "p": 0.5}, source="builtin")
     r("aten::glu", {"self": (256, 4096), "dim": 0}, source="builtin")
-    r("aten::glu.out", {"self": (256, 4096), "dim": 0, "out": (0,)}, source="builtin")
+    r("aten::glu.out", {"self": (256, 4096), "dim": 0}, source="builtin")
     r(
         "aten::glu_backward",
         {"grad_output": (128, 4096), "self": (256, 4096), "dim": 0},
@@ -1823,15 +1823,15 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::gt.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::gt.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::gt.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::gt.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::gt.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::hardshrink", {"self": (256, 4096), "lambd": 1.0}, source="builtin")
-    r("aten::hardshrink.out", {"self": (256, 4096), "lambd": 1.0, "out": (0,)}, source="builtin")
+    r("aten::hardshrink.out", {"self": (256, 4096), "lambd": 1.0}, source="builtin")
     r(
         "aten::hardshrink_backward",
         {"grad_out": (256, 4096), "self": (256, 4096), "lambd": 1.0},
@@ -1843,7 +1843,7 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::hardsigmoid", {"self": (256, 4096)}, source="builtin")
-    r("aten::hardsigmoid.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::hardsigmoid.out", {"self": (256, 4096)}, source="builtin")
     r("aten::hardsigmoid_.default", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::hardsigmoid_backward",
@@ -1856,7 +1856,7 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::hardswish", {"self": (256, 4096)}, source="builtin")
-    r("aten::hardswish.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::hardswish.out", {"self": (256, 4096)}, source="builtin")
     r("aten::hardswish_.default", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::hardswish_backward",
@@ -1865,13 +1865,13 @@ def register_all_defaults(r):
     )
     r(
         "aten::hardswish_backward.out",
-        {"grad_output": (256, 4096), "self": (256, 4096), "out": (0,)},
+        {"grad_output": (256, 4096), "self": (256, 4096)},
         source="builtin",
     )
     r("aten::hardtanh", {"self": (256, 4096), "min_val": -1.0, "max_val": 1.0}, source="builtin")
     r(
         "aten::hardtanh.out",
-        {"self": (256, 4096), "min_val": -1.0, "max_val": 1.0, "out": (0,)},
+        {"self": (256, 4096), "min_val": -1.0, "max_val": 1.0},
         source="builtin",
     )
     r(
@@ -1898,7 +1898,7 @@ def register_all_defaults(r):
     r("aten::heaviside", {"self": (256, 4096), "values": (256, 4096)}, source="builtin")
     r(
         "aten::heaviside.out",
-        {"self": (256, 4096), "values": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "values": (256, 4096)},
         source="builtin",
     )
     r("aten::heaviside_", {"self": (256, 4096), "values": (256, 4096)}, source="builtin")
@@ -1914,7 +1914,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::huber_loss.out",
-        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "delta": 1.0, "out": (0,)},
+        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "delta": 1.0},
         source="builtin",
     )
     r(
@@ -1930,20 +1930,20 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::hypot", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::hypot.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::hypot.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::hypot_", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::i0_", {"self": (256, 4096)}, source="builtin")
     r("aten::igamma", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::igamma.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::igamma_", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::igammac", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::igammac.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::igammac_", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
@@ -2035,19 +2035,19 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::ldexp.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
-    r("aten::ldexp.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::ldexp.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::le.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::le.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::le.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::le.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::le.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::leaky_relu", {"self": (256, 4096), "negative_slope": 1.0}, source="builtin")
     r(
         "aten::leaky_relu.out",
-        {"self": (256, 4096), "negative_slope": 1.0, "out": (0,)},
+        {"self": (256, 4096), "negative_slope": 1.0},
         source="builtin",
     )
     r(
@@ -2077,10 +2077,10 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::lgamma", {"self": (256, 4096)}, source="builtin")
-    r("aten::lgamma.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::lgamma.out", {"self": (256, 4096)}, source="builtin")
     r("aten::lgamma_", {"self": (256, 4096)}, source="builtin")
     r("aten::linalg_matrix_exp", {"self": (256, 256)}, source="builtin")
-    r("aten::linalg_matrix_exp.out", {"self": (256, 256), "out": (0,)}, source="builtin")
+    r("aten::linalg_matrix_exp.out", {"self": (256, 256)}, source="builtin")
     r(
         "aten::linalg_norm",
         {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False},
@@ -2088,12 +2088,12 @@ def register_all_defaults(r):
     )
     r(
         "aten::linalg_norm.out",
-        {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False, "out": (0,)},
+        {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False},
         source="builtin",
     )
     r("aten::linalg_svd", {"A": (256, 4096), "full_matrices": False}, source="builtin")
     r("aten::linalg_svdvals", {"A": (256, 4096)}, source="builtin")
-    r("aten::linalg_svdvals.out", {"A": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::linalg_svdvals.out", {"A": (256, 4096)}, source="builtin")
     r(
         "aten::linalg_vector_norm",
         {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False},
@@ -2101,24 +2101,24 @@ def register_all_defaults(r):
     )
     r(
         "aten::linalg_vector_norm.out",
-        {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False, "out": (0,)},
+        {"self": (256, 4096), "ord": 1.0, "dim": [0], "keepdim": False},
         source="builtin",
     )
     r(
         "aten::linear.out",
-        {"input": (256, 4096), "weight": (4096, 4096), "out": (0,)},
+        {"input": (256, 4096), "weight": (4096, 4096)},
         source="builtin",
     )
-    r("aten::log.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::log.out", {"self": (256, 4096)}, source="builtin")
     r("aten::log10", {"self": (256, 4096)}, source="builtin")
-    r("aten::log10.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::log10.out", {"self": (256, 4096)}, source="builtin")
     r("aten::log1p", {"self": (256, 4096)}, source="builtin")
-    r("aten::log1p.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::log1p.out", {"self": (256, 4096)}, source="builtin")
     r("aten::log2", {"self": (256, 4096)}, source="builtin")
-    r("aten::log2.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::log2.out", {"self": (256, 4096)}, source="builtin")
     r("aten::log_normal_", {"self": (256, 4096), "mean": 1.0, "std": 1.0}, source="builtin")
     r("aten::log_sigmoid", {"self": (256, 4096)}, source="builtin")
-    r("aten::log_sigmoid.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::log_sigmoid.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::log_sigmoid_backward",
         {"grad_output": (256, 4096), "self": (256, 4096), "buffer": (256, 4096)},
@@ -2143,31 +2143,31 @@ def register_all_defaults(r):
     r("aten::logaddexp", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::logaddexp.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::logical_and", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::logical_and.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::logical_not", {"self": (256, 4096)}, source="builtin")
-    r("aten::logical_not.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::logical_not.out", {"self": (256, 4096)}, source="builtin")
     r("aten::logical_or", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::logical_or.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::logical_xor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::logical_xor.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::logit", {"self": (256, 4096), "eps": 1e-5}, source="builtin")
-    r("aten::logit.out", {"self": (256, 4096), "eps": 1e-5, "out": (0,)}, source="builtin")
+    r("aten::logit.out", {"self": (256, 4096), "eps": 1e-5}, source="builtin")
     r("aten::logit_", {"self": (256, 4096), "eps": 1e-5}, source="builtin")
     r(
         "aten::logit_backward",
@@ -2180,11 +2180,11 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::lt.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::lt.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::lt.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::lt.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::lt.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r(
@@ -2206,17 +2206,17 @@ def register_all_defaults(r):
     r("aten::maximum", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::maximum.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::minimum", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::minimum.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::mish", {"self": (256, 4096)}, source="builtin")
-    r("aten::mish.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::mish.out", {"self": (256, 4096)}, source="builtin")
     r("aten::mish_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::mish_backward", {"grad_output": (256, 4096), "self": (256, 4096)}, source="builtin")
     r(
@@ -2226,7 +2226,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::mse_loss.out",
-        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "out": (0,)},
+        {"self": (256, 4096), "target": (256, 4096), "reduction": 1},
         source="builtin",
     )
     r(
@@ -2245,8 +2245,8 @@ def register_all_defaults(r):
         },
         source="builtin",
     )
-    r("aten::mul.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
-    r("aten::mul.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::mul.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
+    r("aten::mul.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::mul_.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::mul_.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
@@ -2299,7 +2299,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::nan_to_num.out",
-        {"self": (256, 4096), "nan": 1.0, "posinf": 1.0, "neginf": 1.0, "out": (0,)},
+        {"self": (256, 4096), "nan": 1.0, "posinf": 1.0, "neginf": 1.0},
         source="builtin",
     )
     r(
@@ -2320,18 +2320,18 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::ne.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
-    r("aten::ne.Scalar_out", {"self": (256, 4096), "other": 1.0, "out": (0,)}, source="builtin")
+    r("aten::ne.Scalar_out", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::ne.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::ne.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
-    r("aten::neg.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::neg.out", {"self": (256, 4096)}, source="builtin")
     r("aten::nextafter", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::nextafter.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::nextafter_", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
@@ -2450,17 +2450,17 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::pow.Scalar", {"self": 1.0, "exponent": (256, 4096)}, source="builtin")
-    r("aten::pow.Scalar_out", {"self": 1.0, "exponent": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::pow.Scalar_out", {"self": 1.0, "exponent": (256, 4096)}, source="builtin")
     r("aten::pow.Tensor_Scalar", {"self": (256, 4096), "exponent": 1.0}, source="builtin")
     r(
         "aten::pow.Tensor_Scalar_out",
-        {"self": (256, 4096), "exponent": 1.0, "out": (0,)},
+        {"self": (256, 4096), "exponent": 1.0},
         source="builtin",
     )
     r("aten::pow.Tensor_Tensor", {"self": (256, 4096), "exponent": (256, 4096)}, source="builtin")
     r(
         "aten::pow.Tensor_Tensor_out",
-        {"self": (256, 4096), "exponent": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "exponent": (256, 4096)},
         source="builtin",
     )
     r("aten::prelu", {"self": (256, 4096), "weight": (1,)}, source="builtin")
@@ -2476,12 +2476,12 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::rad2deg", {"self": (256, 4096)}, source="builtin")
-    r("aten::rad2deg.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::rad2deg.out", {"self": (256, 4096)}, source="builtin")
     r("aten::random_", {"self": (256, 4096)}, source="builtin")
     r("aten::random_.from", {"self": (256, 4096), "from": 0, "to": 10}, source="builtin")
     r("aten::random_.to", {"self": (256, 4096), "to": 1}, source="builtin")
     r("aten::reciprocal", {"self": (256, 4096)}, source="builtin")
-    r("aten::reciprocal.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::reciprocal.out", {"self": (256, 4096)}, source="builtin")
     r("aten::reciprocal_", {"self": (256, 4096)}, source="builtin")
     r("aten::reflection_pad1d", {"self": (1, 64, 4096), "padding": [1, 1]}, source="builtin")
     r(
@@ -2494,25 +2494,25 @@ def register_all_defaults(r):
         {"self": (1, 32, 16, 16, 16), "padding": [1, 1, 1, 1, 1, 1]},
         source="builtin",
     )
-    r("aten::relu.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::relu.out", {"self": (256, 4096)}, source="builtin")
     r("aten::relu6", {"self": (256, 4096)}, source="builtin")
     r("aten::relu_", {"self": (256, 4096)}, source="builtin")
     r("aten::remainder.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::remainder.Scalar_Tensor", {"self": 1.0, "other": (256, 4096)}, source="builtin")
     r(
         "aten::remainder.Scalar_Tensor_out",
-        {"self": 1.0, "other": (256, 4096), "out": (0,)},
+        {"self": 1.0, "other": (256, 4096)},
         source="builtin",
     )
     r(
         "aten::remainder.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r("aten::remainder.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::remainder.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r(
@@ -2522,7 +2522,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::replication_pad2d.out",
-        {"self": (1, 64, 32, 32), "padding": [1, 1, 1, 1], "out": (0,)},
+        {"self": (1, 64, 32, 32), "padding": [1, 1, 1, 1]},
         source="builtin",
     )
     r(
@@ -2534,10 +2534,10 @@ def register_all_defaults(r):
     r("aten::round.decimals", {"self": (256, 4096), "decimals": 1}, source="builtin")
     r(
         "aten::round.decimals_out",
-        {"self": (256, 4096), "decimals": 1, "out": (0,)},
+        {"self": (256, 4096), "decimals": 1},
         source="builtin",
     )
-    r("aten::round.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::round.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::rrelu",
         {"self": (256, 4096), "lower": 1.0, "upper": 1.0, "training": False},
@@ -2602,17 +2602,17 @@ def register_all_defaults(r):
         {"self": (256, 4096), "noise": (256, 4096), "lower": 1.0, "upper": 1.0, "training": False},
         source="builtin",
     )
-    r("aten::rsqrt.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::rsqrt.out", {"self": (256, 4096)}, source="builtin")
     r("aten::rsub.Scalar", {"self": (256, 4096), "other": 1.0, "alpha": 1.0}, source="builtin")
     r(
         "aten::rsub.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "alpha": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0, "alpha": 1.0},
         source="builtin",
     )
     r("aten::rsub.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::rsub.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r(
@@ -2628,9 +2628,9 @@ def register_all_defaults(r):
     r("aten::selu", {"self": (256, 4096)}, source="builtin")
     r("aten::selu_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::sgn", {"self": (256, 4096)}, source="builtin")
-    r("aten::sgn.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sgn.out", {"self": (256, 4096)}, source="builtin")
     r("aten::sgn_.default", {"self": (256, 4096)}, source="builtin")
-    r("aten::sigmoid.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sigmoid.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::sigmoid_backward",
         {"grad_output": (256, 4096), "output": (256, 4096)},
@@ -2642,21 +2642,21 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::sign", {"self": (256, 4096)}, source="builtin")
-    r("aten::sign.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sign.out", {"self": (256, 4096)}, source="builtin")
     r("aten::signbit", {"self": (256, 4096)}, source="builtin")
-    r("aten::signbit.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
-    r("aten::silu.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::signbit.out", {"self": (256, 4096)}, source="builtin")
+    r("aten::silu.out", {"self": (256, 4096)}, source="builtin")
     r("aten::silu_backward", {"grad_output": (256, 4096), "self": (256, 4096)}, source="builtin")
     r(
         "aten::silu_backward.grad_input",
         {"grad_output": (256, 4096), "self": (256, 4096), "grad_input": (256, 4096)},
         source="builtin",
     )
-    r("aten::sin.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sin.out", {"self": (256, 4096)}, source="builtin")
     r("aten::sinc", {"self": (256, 4096)}, source="builtin")
-    r("aten::sinc.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sinc.out", {"self": (256, 4096)}, source="builtin")
     r("aten::sinh", {"self": (256, 4096)}, source="builtin")
-    r("aten::sinh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sinh.out", {"self": (256, 4096)}, source="builtin")
     r(
         "aten::smooth_l1_loss",
         {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "beta": 1.0},
@@ -2664,7 +2664,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::smooth_l1_loss.out",
-        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "beta": 1.0, "out": (0,)},
+        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "beta": 1.0},
         source="builtin",
     )
     r(
@@ -2697,7 +2697,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::soft_margin_loss.out",
-        {"self": (256, 4096), "target": (256, 4096), "reduction": 1, "out": (0,)},
+        {"self": (256, 4096), "target": (256, 4096), "reduction": 1},
         source="builtin",
     )
     r(
@@ -2708,7 +2708,7 @@ def register_all_defaults(r):
     r("aten::softplus", {"self": (256, 4096), "beta": 1.0, "threshold": 1.0}, source="builtin")
     r(
         "aten::softplus.out",
-        {"self": (256, 4096), "beta": 1.0, "threshold": 1.0, "out": (0,)},
+        {"self": (256, 4096), "beta": 1.0, "threshold": 1.0},
         source="builtin",
     )
     r(
@@ -2728,7 +2728,7 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::softshrink", {"self": (256, 4096), "lambd": 1.0}, source="builtin")
-    r("aten::softshrink.out", {"self": (256, 4096), "lambd": 1.0, "out": (0,)}, source="builtin")
+    r("aten::softshrink.out", {"self": (256, 4096), "lambd": 1.0}, source="builtin")
     r(
         "aten::softshrink_backward",
         {"grad_output": (256, 4096), "self": (256, 4096), "lambd": 1.0},
@@ -2740,35 +2740,35 @@ def register_all_defaults(r):
         source="builtin",
     )
     r("aten::special_bessel_j0", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_bessel_j0.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_bessel_j0.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_bessel_j1", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_bessel_j1.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_bessel_j1.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_entr", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_entr.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_entr.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_erfc", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_erfc.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_erfc.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_erfcx", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_erfcx.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_erfcx.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_erfinv", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_erfinv.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_erfinv.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_gammainc", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::special_gammainc.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::special_gammaincc", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::special_gammaincc.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::special_i0e", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_i0e.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_i0e.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_i1", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_i1.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_i1.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_i1e", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_i1e.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_i1e.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_laguerre_polynomial_l", {"x": (256, 4096), "n": (256, 4096)}, source="builtin")
     r(
         "aten::special_laguerre_polynomial_l.n_scalar",
@@ -2777,12 +2777,12 @@ def register_all_defaults(r):
     )
     r(
         "aten::special_laguerre_polynomial_l.n_scalar_out",
-        {"x": (256, 4096), "n": 1.0, "out": (0,)},
+        {"x": (256, 4096), "n": 1.0},
         source="builtin",
     )
     r(
         "aten::special_laguerre_polynomial_l.out",
-        {"x": (256, 4096), "n": (256, 4096), "out": (0,)},
+        {"x": (256, 4096), "n": (256, 4096)},
         source="builtin",
     )
     r(
@@ -2792,63 +2792,63 @@ def register_all_defaults(r):
     )
     r(
         "aten::special_laguerre_polynomial_l.x_scalar_out",
-        {"x": 1.0, "n": (256, 4096), "out": (0,)},
+        {"x": 1.0, "n": (256, 4096)},
         source="builtin",
     )
     r("aten::special_log_ndtr", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_log_ndtr.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_log_ndtr.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_ndtri", {"self": (256, 4096)}, source="builtin")
-    r("aten::special_ndtri.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_ndtri.out", {"self": (256, 4096)}, source="builtin")
     r("aten::special_spherical_bessel_j0", {"x": (256, 4096)}, source="builtin")
-    r("aten::special_spherical_bessel_j0.out", {"x": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::special_spherical_bessel_j0.out", {"x": (256, 4096)}, source="builtin")
     r("aten::special_xlog1py", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::special_xlog1py.other_scalar_out",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r(
         "aten::special_xlog1py.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r(
         "aten::special_xlog1py.self_scalar_out",
-        {"self": 1.0, "other": (256, 4096), "out": (0,)},
+        {"self": 1.0, "other": (256, 4096)},
         source="builtin",
     )
     r("aten::special_zeta", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r(
         "aten::special_zeta.other_scalar_out",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r(
         "aten::special_zeta.out",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r(
         "aten::special_zeta.self_scalar_out",
-        {"self": 1.0, "other": (256, 4096), "out": (0,)},
+        {"self": 1.0, "other": (256, 4096)},
         source="builtin",
     )
-    r("aten::sqrt.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sqrt.out", {"self": (256, 4096)}, source="builtin")
     r("aten::square", {"self": (256, 4096)}, source="builtin")
-    r("aten::square.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::square.out", {"self": (256, 4096)}, source="builtin")
     r("aten::square_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::sub.Scalar", {"self": (256, 4096), "other": 1.0, "alpha": 1.0}, source="builtin")
     r(
         "aten::sub.Scalar_out",
-        {"self": (256, 4096), "other": 1.0, "alpha": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0, "alpha": 1.0},
         source="builtin",
     )
-    r("aten::sub.out", {"self": (256, 4096), "other": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::sub.out", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::sub_.Scalar", {"self": (256, 4096), "other": 1.0, "alpha": 1.0}, source="builtin")
     r("aten::sub_.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
     r("aten::tan", {"self": (256, 4096)}, source="builtin")
-    r("aten::tan.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
-    r("aten::tanh.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::tan.out", {"self": (256, 4096)}, source="builtin")
+    r("aten::tanh.out", {"self": (256, 4096)}, source="builtin")
     r("aten::tanh_backward", {"grad_output": (256, 4096), "output": (256, 4096)}, source="builtin")
     r(
         "aten::tanh_backward.grad_input",
@@ -2858,7 +2858,7 @@ def register_all_defaults(r):
     r("aten::threshold", {"self": (256, 4096), "threshold": 1.0, "value": 1.0}, source="builtin")
     r(
         "aten::threshold.out",
-        {"self": (256, 4096), "threshold": 1.0, "value": 1.0, "out": (0,)},
+        {"self": (256, 4096), "threshold": 1.0, "value": 1.0},
         source="builtin",
     )
     r(
@@ -2878,21 +2878,21 @@ def register_all_defaults(r):
     )
     r("aten::tril_", {"self": (256, 4096), "diagonal": 1}, source="builtin")
     r("aten::trunc", {"self": (256, 4096)}, source="builtin")
-    r("aten::trunc.out", {"self": (256, 4096), "out": (0,)}, source="builtin")
+    r("aten::trunc.out", {"self": (256, 4096)}, source="builtin")
     r("aten::uniform_", {"self": (256, 4096), "from": 1.0, "to": 1.0}, source="builtin")
     r(
         "aten::xlogy.OutScalar_Other",
-        {"self": (256, 4096), "other": 1.0, "out": (0,)},
+        {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
     r(
         "aten::xlogy.OutScalar_Self",
-        {"self": 1.0, "other": (256, 4096), "out": (0,)},
+        {"self": 1.0, "other": (256, 4096)},
         source="builtin",
     )
     r(
         "aten::xlogy.OutTensor",
-        {"self": (256, 4096), "other": (256, 4096), "out": (0,)},
+        {"self": (256, 4096), "other": (256, 4096)},
         source="builtin",
     )
     r("aten::xlogy.Scalar_Other", {"self": (256, 4096), "other": 1.0}, source="builtin")
@@ -3228,10 +3228,10 @@ def register_all_defaults(r):
 
     # Sparsification (Neuron-side likely no-ops; shapes just need to parse)
     r("aten::_to_sparse", {"self": (256, 256)}, source="builtin")
-    r("aten::_to_sparse.out", {"self": (256, 256), "out": (0,)}, source="builtin")
+    r("aten::_to_sparse.out", {"self": (256, 256)}, source="builtin")
     r(
         "aten::_to_sparse.sparse_dim_out",
-        {"self": (256, 256), "sparse_dim": 2, "out": (0,)},
+        {"self": (256, 256), "sparse_dim": 2},
         source="builtin",
     )
 
@@ -3562,7 +3562,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::_adaptive_avg_pool2d.out",
-        {"self": _pool2d_in, "output_size": _pool2d_adapt_out, "out": (0,)},
+        {"self": _pool2d_in, "output_size": _pool2d_adapt_out},
         source="builtin",
     )
     r(
@@ -3572,7 +3572,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::_adaptive_avg_pool2d_backward.out",
-        {"grad_output": _pool2d_adapt_shape, "self": _pool2d_in, "out": (0,)},
+        {"grad_output": _pool2d_adapt_shape, "self": _pool2d_in},
         source="builtin",
     )
     r(
@@ -3618,7 +3618,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::_adaptive_avg_pool3d.out",
-        {"self": _pool3d_in, "output_size": _pool3d_adapt_out, "out": (0,)},
+        {"self": _pool3d_in, "output_size": _pool3d_adapt_out},
         source="builtin",
     )
     r(
@@ -3628,7 +3628,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::_adaptive_avg_pool3d_backward.out",
-        {"grad_output": _pool3d_adapt_shape, "self": _pool3d_in, "out": (0,)},
+        {"grad_output": _pool3d_adapt_shape, "self": _pool3d_in},
         source="builtin",
     )
     r(
@@ -3670,7 +3670,7 @@ def register_all_defaults(r):
     r("aten::adaptive_avg_pool1d", {"self": (1, 64, 128), "output_size": [8]}, source="builtin")
     r(
         "aten::adaptive_avg_pool1d.out",
-        {"self": (1, 64, 128), "output_size": [8], "out": (0,)},
+        {"self": (1, 64, 128), "output_size": [8]},
         source="builtin",
     )
 
@@ -3684,7 +3684,7 @@ def register_all_defaults(r):
         "divisor_override": None,
     }
     r("aten::avg_pool2d", {"self": _pool2d_in, **_avg2d_kwargs}, source="builtin")
-    r("aten::avg_pool2d.out", {"self": _pool2d_in, **_avg2d_kwargs, "out": (0,)}, source="builtin")
+    r("aten::avg_pool2d.out", {"self": _pool2d_in, **_avg2d_kwargs}, source="builtin")
     r(
         "aten::avg_pool2d_backward",
         {"grad_output": _pool2d_out, "self": _pool2d_in, **_avg2d_kwargs},
@@ -3705,7 +3705,7 @@ def register_all_defaults(r):
         "divisor_override": None,
     }
     r("aten::avg_pool3d", {"self": _pool3d_in, **_avg3d_kwargs}, source="builtin")
-    r("aten::avg_pool3d.out", {"self": _pool3d_in, **_avg3d_kwargs, "out": (0,)}, source="builtin")
+    r("aten::avg_pool3d.out", {"self": _pool3d_in, **_avg3d_kwargs}, source="builtin")
     r(
         "aten::avg_pool3d_backward",
         {"grad_output": _pool3d_out, "self": _pool3d_in, **_avg3d_kwargs},
@@ -3899,7 +3899,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::upsample_nearest2d.vec_out",
-        {"input": _ups2d_in, "output_size": _ups2d_out, "scale_factors": None, "out": (0,)},
+        {"input": _ups2d_in, "output_size": _ups2d_out, "scale_factors": None},
         source="builtin",
     )
     r(
@@ -3940,12 +3940,12 @@ def register_all_defaults(r):
     )
     r(
         "aten::upsample_nearest1d.out",
-        {"self": (1, 64, 128), "output_size": [256], "scales": None, "out": (0,)},
+        {"self": (1, 64, 128), "output_size": [256], "scales": None},
         source="builtin",
     )
     r(
         "aten::_upsample_nearest_exact1d.out",
-        {"self": (1, 64, 128), "output_size": [256], "scales": None, "out": (0,)},
+        {"self": (1, 64, 128), "output_size": [256], "scales": None},
         source="builtin",
     )
 
@@ -4558,9 +4558,9 @@ def register_all_defaults(r):
     r("aten::angle", {"self": _ew_in}, source="builtin")
     r("aten::angle.out", {"self": _ew_in, "out": _ew_in}, source="builtin")
     r("aten::max", {"self": _ew_in}, source="builtin")
-    r("aten::max.unary_out", {"self": _ew_in, "out": ()}, source="builtin")
+    r("aten::max.unary_out", {"self": _ew_in}, source="builtin")
     r("aten::min", {"self": _ew_in}, source="builtin")
-    r("aten::min.unary_out", {"self": _ew_in, "out": ()}, source="builtin")
+    r("aten::min.unary_out", {"self": _ew_in}, source="builtin")
     r("aten::sym_storage_offset", {"self": _ew_in}, source="builtin")
 
     # clamp with optional scalar bounds (clamp.out already registered)
@@ -5001,7 +5001,7 @@ def register_all_defaults(r):
     # ── pdist / cdist ─────────────────────────────────────────────────
     # pdist: pairwise distances of N points in D-dim; output (N*(N-1)/2,)
     r("aten::_pdist_forward", {"self": (32, 16), "p": 2.0}, source="builtin")
-    r("aten::_pdist_forward.out", {"self": (32, 16), "p": 2.0, "out": (0,)}, source="builtin")
+    r("aten::_pdist_forward.out", {"self": (32, 16), "p": 2.0}, source="builtin")
     # cdist: pairwise distance between two point sets; x1 (B, P, D), x2 (B, R, D)
     r(
         "aten::_cdist_forward",
@@ -5010,7 +5010,7 @@ def register_all_defaults(r):
     )
     r(
         "aten::_cdist_forward.out",
-        {"x1": (4, 32, 16), "x2": (4, 32, 16), "p": 2.0, "compute_mode": None, "out": (0,)},
+        {"x1": (4, 32, 16), "x2": (4, 32, 16), "p": 2.0, "compute_mode": None},
         source="builtin",
     )
 
