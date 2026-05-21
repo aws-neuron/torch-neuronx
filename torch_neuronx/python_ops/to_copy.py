@@ -112,15 +112,6 @@ class ToCopyNeuronImpl(OperationImplementation):
                 target_dtype=(target_dtype if not no_dtype_change else None),
                 non_blocking=non_blocking,
             )
-            # Preserve strides for non-overlapping-and-dense sources (e.g. transpose)
-            if not self_tensor.is_contiguous() and torch.ops.aten.is_non_overlapping_and_dense(
-                self_tensor
-            ):
-                strided_out = torch.empty_strided(
-                    self_tensor.shape, self_tensor.stride(), dtype=cpu_dst.dtype
-                )
-                strided_out.copy_(cpu_dst)
-                cpu_dst = strided_out
             return ExecutionResult(success=True, output=cpu_dst)
 
         # Neuron -> Neuron (device may or may not change index)
