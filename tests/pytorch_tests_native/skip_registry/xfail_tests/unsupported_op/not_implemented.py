@@ -10,7 +10,6 @@ UNSUPPORTED_OP_NOT_IMPLEMENTED = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_TransformerEncoderLayer_empty_neuron",
     "test_view_ops.py::TestOldViewOpsNEURON::test_flatten_neuron",
     "test_view_ops.py::TestOldViewOpsNEURON::test_ravel_neuron",
-    "test_meta.py::TestMetaKernelRegistrations::test_padded_dense_to_jagged_total_L_zero",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nonzero_static_neuron_bfloat16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nonzero_static_neuron_bool",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nonzero_static_neuron_float16",

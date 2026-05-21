@@ -189,8 +189,15 @@ def run_with_timeout(cmd: list[str], log_path: Path, wall_timeout: int) -> int:
     Mirrors the prior ``timeout --signal=SIGINT --kill-after=300`` behavior:
     SIGINT first (lets pytest-xdist tear down workers cleanly), SIGKILL after
     a 5-minute grace period if the process hasn't exited.
+
+    Uses ``select`` for non-blocking reads so the deadline check fires
+    even when pytest produces no output for a long time (a hung test
+    can silence stdout indefinitely otherwise).
     """
+    import select
+
     grace_period = 300
+    poll_interval = 1.0  # seconds between deadline checks when no output
     print(f"$ {shlex.join(cmd)}", flush=True)
     with open(log_path, "w") as log_file:
         # start_new_session=True puts pytest in its own process group so the
@@ -207,14 +214,24 @@ def run_with_timeout(cmd: list[str], log_path: Path, wall_timeout: int) -> int:
         deadline = time.monotonic() + wall_timeout
         kill_deadline: float | None = None
         assert proc.stdout is not None
+        stdout_fd = proc.stdout.fileno()
         while True:
-            line = proc.stdout.readline()
-            if line:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                log_file.write(line)
-                log_file.flush()
+            # Wait up to poll_interval for output. select returns early when
+            # data is available; otherwise the loop tick lets us check the
+            # deadline regardless of how silent pytest has gone.
+            ready, _, _ = select.select([stdout_fd], [], [], poll_interval)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    log_file.write(line)
+                    log_file.flush()
+                elif proc.poll() is not None:
+                    # readline returned EOF and process has exited — done.
+                    break
             elif proc.poll() is not None:
+                # No pending output and process has exited.
                 break
             now = time.monotonic()
             if kill_deadline is None and now >= deadline:
