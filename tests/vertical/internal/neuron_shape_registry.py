@@ -10,10 +10,12 @@ Deduplicates on (op_name, arg_shapes). Merges counts across models.
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from math import prod
 from pathlib import Path
 
 
@@ -206,8 +208,76 @@ class NeuronShapeRegistry:
 SHAPE_REGISTRY = NeuronShapeRegistry()
 
 
-# ── Schema helpers for propagation (kept module-local to avoid the
-#    neuron_op_info ↔ neuron_shape_registry import cycle) ─────────────────────
+@functools.cache
+def _tensor_arg_names(op_name: str) -> frozenset[str]:
+    """Names of tensor-typed args for ``op_name`` per its aten schema.
+
+    Used by ``max_tensor_elems`` to identify which keys in an ``arg_shapes``
+    entry hold tensor shapes (as opposed to parameter lists like ``padding``
+    or ``dim``). Returns an empty frozenset when the schema can't be
+    resolved; callers degrade to registration-order sort in that case.
+    Cached because ``_aten_schema`` is hit once per op across many entries.
+    """
+    schema = _aten_schema(op_name)
+    if schema is None:
+        return frozenset()
+    return frozenset(a.name for a in schema.arguments if "Tensor" in str(a.type))
+
+
+def _shape_numel(shape) -> int:
+    """Element count of an int-tuple shape; 0 for malformed or empty."""
+    if not shape or not all(isinstance(x, int) for x in shape):
+        return 0
+    return prod(shape)
+
+
+def _value_numel(val) -> int:
+    """Element count for a single arg value of any tensor-shape encoding:
+
+    - ``None``                              → 0
+    - ``{"shape": [...], "dtype": "..."}``  → numel of shape
+    - ``(1, 2048, 4096)``                   → numel of shape
+    - ``[{"shape": (4,)}, {"shape": (8,)}]`` → max over per-tensor specs
+    - ``[(4, 4), (8, 8)]``                  → max over the shape tuples
+    """
+    if val is None:
+        return 0
+    if isinstance(val, dict):
+        sh = val.get("shape")
+        return _shape_numel(sh) if isinstance(sh, list | tuple) else 0
+    if isinstance(val, list | tuple):
+        if not val:
+            return 0
+        if all(isinstance(x, int) for x in val):
+            return _shape_numel(val)
+        return max((_value_numel(t) for t in val), default=0)
+    return 0
+
+
+def max_tensor_elems(arg_shapes: dict, op_name: str) -> int:
+    """Max ``numel()`` across every tensor-typed arg value in an entry.
+
+    Uses ``op_name``'s aten schema to pick which keys are tensors (so
+    ``padding`` / ``stride`` / ``dim`` / ``split_sizes`` and the like
+    are never mistaken for shape values) and supports every tensor-shape
+    encoding accepted elsewhere in the registry: nested
+    ``{"shape","dtype"}`` dicts, bare int tuples, lists of dicts, and
+    lists of bare tuples.
+
+    Returns 0 when the schema is unresolvable or the entry carries no
+    tensor values; callers treat that as "unrankable" and keep the
+    entry in its registered order.
+    """
+    if not arg_shapes:
+        return 0
+    tensor_names = _tensor_arg_names(op_name)
+    if not tensor_names:
+        return 0
+    best = 0
+    for key, val in arg_shapes.items():
+        if key in tensor_names:
+            best = max(best, _value_numel(val))
+    return best
 
 
 def _aten_schema(op_name: str):

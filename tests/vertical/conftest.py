@@ -5,12 +5,15 @@ Aggregates coverage results:
   test_target_ops_compile_coverage.py → target_ops_compile_coverage_<ts>.csv
 """
 
+import os
+
+# NEURON_LAUNCH_BLOCKING must be set BEFORE any torch_neuronx import
+os.environ.setdefault("NEURON_LAUNCH_BLOCKING", "1")
+
 import csv
 import json
 import logging
-import os
 import tempfile
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +60,7 @@ COVERAGE_FIELDS = [
     "supported_by",
     "input_source",
     "input_count",
+    "input_element_count",
     "neuron_primitive_ops",
     "fallback_primitive_ops",
     "time_to_first_ms",
@@ -85,6 +89,17 @@ def pytest_addoption(parser):
         default=None,
         help="Path to JSON shape registry file to load model-traced shapes",
     )
+    parser.addoption(
+        "--max-shapes-per-op",
+        default=10,
+        type=int,
+        help=(
+            "Cap shape-registry entries per op to the top-N by max tensor "
+            "element count. Model-traced registries can carry 500-1000 "
+            "entries per op; capping here keeps a single op's coverage run "
+            "tractable. Pass 0 (or a negative value) to disable the cap."
+        ),
+    )
 
 
 def pytest_configure(config):
@@ -93,6 +108,9 @@ def pytest_configure(config):
     registry_path = config.getoption("--shape-registry", default=None)
     if registry_path:
         os.environ["NEURON_SHAPE_REGISTRY"] = str(registry_path)
+    os.environ["NEURON_MAX_SHAPES_PER_OP"] = str(
+        config.getoption("--max-shapes-per-op", default=10)
+    )
 
 
 def pytest_sessionstart(session):
@@ -152,16 +170,6 @@ def _aggregate_metrics(metrics_dir: Path, prefix: str):
                     for k in COVERAGE_FIELDS
                 }
             )
-
-    by_status = Counter(r.get("status", "") for r in rows)
-    total = len(rows)
-    supported = by_status.get("supported", 0) + by_status.get("variant_covered", 0)
-    pending = by_status.get("pending_registry", 0)
-    print(
-        f"\n{prefix}: {output} ({total} ops, {supported}/{total} supported, "
-        f"{pending} pending_registry)"
-    )
-    print(f"  {dict(by_status.most_common())}")
 
     for fp in metrics_dir.glob("*.json"):
         fp.unlink()
