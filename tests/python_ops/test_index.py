@@ -125,6 +125,14 @@ class TestIndexRegistration:
         """Test boolean mask indexing"""
         x_cpu = torch.randn(shape)
         mask_cpu = torch.randint(0, 2, shape).bool()
+        # Guarantee at least one True element. Without this the random mask
+        # is all-False with probability (1/2)**numel(shape) — 3.125% for
+        # shape=(5,). In that case PyTorch short-circuits x[mask] to
+        # nonzero + empty and aten.index is never dispatched, making the
+        # assert_op_runs_on_neuron("index") assertion below fail.
+        # The all-False path is covered separately by
+        # test_boolean_mask_all_false.
+        mask_cpu.view(-1)[0] = True
         expected = x_cpu[mask_cpu]
 
         with track_neuron_ops():
