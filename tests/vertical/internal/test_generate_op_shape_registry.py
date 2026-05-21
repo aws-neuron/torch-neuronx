@@ -283,3 +283,74 @@ class TestScalarDefaultFilling:
             positional=[None, [4, 4]],  # self=None, other=shape
         )
         assert args["self"] is None
+
+
+class TestKwargUnderscoreParsing:
+    """Bug fix: tokenizer must not split on '_' inside kw:name=value when name contains '_'."""
+
+    def test_ignore_index_kwarg(self):
+        tokens = _tokenize_signature(
+            "_[1,2048]:BFloat16:S(C)_[1,2048]:Long:S(C)_kw:ignore_index=i-100_kw:reduction=i1"
+        )
+        kw_tokens = {name: val for name, val in tokens if name}
+        assert "ignore_index" in kw_tokens
+        assert kw_tokens["ignore_index"] == "i-100"
+        assert kw_tokens["reduction"] == "i1"
+
+    def test_use_deterministic_algorithms(self):
+        tokens = _tokenize_signature("_[4,4]:Float:S(C)_kw:use_deterministic_algorithms=b0")
+        kw_tokens = {name: val for name, val in tokens if name}
+        assert "use_deterministic_algorithms" in kw_tokens
+        assert kw_tokens["use_deterministic_algorithms"] == "b0"
+
+    def test_cross_entropy_full_parse(self):
+        ck = (
+            "cross_entropy_loss--_[1,2048,4096]:BFloat16:S(C)_[1,2048]:Long:S(C)"
+            "_kw:ignore_index=i-100_kw:reduction=i1"
+            ":abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        )
+        parsed = parse_cache_key(ck)
+        assert parsed is not None
+        assert parsed.kwargs["ignore_index"] == -100
+        assert parsed.kwargs["reduction"] == 1
+
+
+class TestScalarTensorConversion:
+    """Bug fix: 0-d tensor specs must be converted to numeric for Scalar-typed args."""
+
+    def test_0d_tensor_parse(self):
+        result = _parse_token("[]:Int:S(C)")
+        assert result == {"shape": [], "dtype": "int32"}
+
+    def test_0d_tensor_converted_for_scalar_arg(self):
+        from .generate_op_shape_registry import ParsedCacheKey, _build_arg_shapes
+
+        # _foreach_add_.Scalar expects (Tensor[] self, Scalar scalar)
+        # Cache key encodes scalar as 0-d tensor []:Int:S(C)
+        parsed = ParsedCacheKey(
+            op_name="aten::_foreach_add_.Scalar",
+            positional=[
+                [{"shape": [4096], "dtype": "bfloat16"}],  # self (Tensor[])
+                {"shape": [], "dtype": "int32"},  # scalar (0-d tensor → None → filled by defaults)
+            ],
+            kwargs={},
+        )
+        args = _build_arg_shapes("aten::_foreach_add_.Scalar", parsed)
+        # The Scalar arg should be numeric, not a dict
+        assert isinstance(args["scalar"], int | float)
+
+
+class TestNonKwargOnlyFromKwargs:
+    """Bug fix: non-kwarg_only args should check parsed.kwargs as fallback."""
+
+    def test_positional_arg_from_kwargs(self):
+        from .generate_op_shape_registry import ParsedCacheKey, _build_arg_shapes
+
+        # Simulate a case where a positional arg ended up in kwargs
+        parsed = ParsedCacheKey(
+            op_name="aten::add.Tensor",
+            positional=[[4, 4]],  # only self
+            kwargs={"other": [8, 8]},  # other ended up as kwarg
+        )
+        args = _build_arg_shapes("aten::add.Tensor", parsed)
+        assert args["other"] == [8, 8]

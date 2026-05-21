@@ -140,7 +140,10 @@ def _parse_token(token: str) -> Any:
     # Device: dev:neuron:0 → None (device indices are runtime-specific, not shape info)
     if token.startswith("dev:"):
         return None
-    # Scalar dynamic types
+    # Scalar dynamic types — the exact value is data-dependent and not
+    # recoverable from the cache key. Return None so _fill_scalar_default
+    # can apply op-specific defaults (lr=0.001, eps=1e-5, etc.) or fall back
+    # to type-based defaults (Scalar→0.0) as a last resort.
     if token.startswith("scalar:"):
         return None
     # Complex, generator
@@ -199,13 +202,14 @@ def _tokenize_signature(signature: str) -> list[tuple[str | None, str]]:
     tokens: list[tuple[str | None, str]] = []
     depth = 0  # bracket + paren nesting depth
     start = 0  # start of current token
+    in_kw = False  # True when accumulating a kw:name=value token
 
     for i, ch in enumerate(signature):
         if ch in ("[", "("):
             depth += 1
         elif ch in ("]", ")"):
             depth = max(0, depth - 1)
-        elif ch == "_" and depth == 0:
+        elif ch == "_" and depth == 0 and not in_kw:
             token = signature[start:i]
             if token:
                 if token.startswith("kw:") and "=" in token:
@@ -214,6 +218,11 @@ def _tokenize_signature(signature: str) -> list[tuple[str | None, str]]:
                 else:
                     tokens.append((None, token))
             start = i + 1
+
+        # Track whether we're inside a kw: token that hasn't reached = yet
+        if depth == 0:
+            current = signature[start : i + 1]
+            in_kw = current.startswith("kw:") and "=" not in current
 
     # Last token
     token = signature[start:]
@@ -370,6 +379,8 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
         if pos_idx < len(parsed.positional):
             arg_shapes[name] = parsed.positional[pos_idx]
             pos_idx += 1
+        elif name in parsed.kwargs:
+            arg_shapes[name] = parsed.kwargs[name]
         else:
             has_default = getattr(arg, "has_default_value", lambda: False)
             if callable(has_default):
@@ -378,6 +389,17 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
                 arg_shapes[name] = arg.default_value
             elif "?" in type_str or "Optional" in type_str:
                 arg_shapes[name] = None
+
+    # Convert 0-d tensor specs to None for Scalar-typed args: the cache key
+    # encodes a scalar value as a 0-d tensor []:Type:S(C), but the schema
+    # expects a number. The actual value is lost, so set to None and let
+    # _fill_scalar_default apply op-specific or type-based defaults below.
+    for arg in schema.arguments:
+        type_str = str(arg.type)
+        if "Scalar" in type_str and arg.name in arg_shapes:
+            val = arg_shapes[arg.name]
+            if isinstance(val, dict) and val.get("shape") == []:
+                arg_shapes[arg.name] = None
 
     # Fill sensible defaults for required non-Tensor args captured as dynamic.
     for arg in schema.arguments:
