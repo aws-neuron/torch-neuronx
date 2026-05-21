@@ -166,6 +166,19 @@ def _file_from_row(row: dict) -> str:
     return test_id or "unknown"
 
 
+def _group_from_file(test_file: str) -> str:
+    """Collapse a file path into its top-level group for the panel breakdown.
+
+    Files under a subdirectory (``dynamo/test_x.py``) collapse to that
+    directory (``dynamo/``); root-level files (``test_ops.py``) keep their
+    own row. Keeps the panel readable on the full suite (~hundreds of
+    files → ~tens of groups).
+    """
+    if "/" in test_file:
+        return test_file.split("/", 1)[0] + "/"
+    return test_file
+
+
 def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
     """Aggregate test stats from all node artifacts and write summary CSV.
 
@@ -208,6 +221,8 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
             "durations": {},
             "file_stats": {},
             "file_durations": {},
+            "group_stats": {},
+            "group_durations": {},
             "total_stats": {},
         }
 
@@ -223,11 +238,15 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         f"JSON report files to process"
     )
 
-    # Aggregate counts per class (canonical / CSV) and per file (panel).
+    # Aggregate counts per class (canonical / CSV), per file, and per
+    # top-level group (panel — collapses dynamo/foo.py + dynamo/bar.py
+    # into a single "dynamo/" row to keep the panel readable).
     stats = defaultdict(lambda: defaultdict(int))  # {class: {status: count}}
     durations = defaultdict(float)  # {class: total_duration}
     file_stats = defaultdict(lambda: defaultdict(int))  # {file: {status: count}}
     file_durations = defaultdict(float)  # {file: total_duration}
+    group_stats = defaultdict(lambda: defaultdict(int))  # {group: {status: count}}
+    group_durations = defaultdict(float)  # {group: total_duration}
     all_statuses = set()
     all_test_rows = []
 
@@ -244,14 +263,17 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         for row in main_rows:
             cls = row.get("test_class") or "unknown"
             test_file = _file_from_row(row)
+            group = _group_from_file(test_file)
             status = row.get("status") or "unknown"
             stats[cls][status] += 1
             file_stats[test_file][status] += 1
+            group_stats[group][status] += 1
             all_statuses.add(status)
             with contextlib.suppress(ValueError):
                 duration = float(row.get("duration(sec)", 0))
                 durations[cls] += duration
                 file_durations[test_file] += duration
+                group_durations[group] += duration
             all_test_rows.append(row)
 
     # Create summary CSV with dynamic columns
@@ -284,6 +306,8 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         "durations": dict(durations),
         "file_stats": {f: dict(s) for f, s in file_stats.items()},
         "file_durations": dict(file_durations),
+        "group_stats": {g: dict(s) for g, s in group_stats.items()},
+        "group_durations": dict(group_durations),
         "total_stats": dict(total_stats),
         "sorted_statuses": sorted_statuses,
     }
@@ -302,91 +326,6 @@ def _is_all_skipped(unit_stats: dict) -> bool:
 
 # Back-compat alias for tests that imported the old class-specific name.
 _is_all_skipped_class = _is_all_skipped
-
-
-def write_github_summary(result: dict) -> None:
-    """Write a GitHub Actions job summary (markdown table).
-
-    Renders one row per **test file** rather than per class — the full
-    suite has hundreds of classes, which is unreadable in the panel. The
-    canonical summary CSV stays class-keyed for finer-grained dashboards.
-
-    Hides files where every test was skipped (pass_rate would be N/A);
-    the hidden count is surfaced in a footer so readers can tell
-    missing-from-table from missing-entirely.
-    """
-    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_file:
-        return
-
-    # Use file-level stats for the panel; fall back to class-level if
-    # an older caller didn't populate file_stats.
-    panel_stats = result.get("file_stats") or result.get("stats", {})
-    panel_durations = result.get("file_durations") or result.get("durations", {})
-    sorted_statuses = result["sorted_statuses"]
-    total_stats = result["total_stats"]
-
-    visible_units = [u for u in sorted(panel_stats) if not _is_all_skipped(panel_stats[u])]
-    hidden_count = len(panel_stats) - len(visible_units)
-
-    metadata = _get_run_metadata()
-
-    with open(summary_file, "a") as f:
-        f.write("## PT Upstream Test Results\n\n")
-        # Commit/branch/run line lets a reader bisect by comparing two
-        # panels side by side without leaving the run page.
-        f.write(
-            f"**Commit:** `{metadata['commit_sha']}`  •  "
-            f"**Branch:** `{metadata['branch']}`  •  "
-            f"**Run:** `{metadata['run_id']}`\n\n"
-        )
-        header = (
-            f"| test_file | {' | '.join(sorted_statuses)} "
-            "| total | pass_rate(%) | duration(sec) |\n"
-        )
-        f.write(header)
-        f.write("|---" * (len(sorted_statuses) + 4) + "|\n")
-
-        totals = [0] * len(sorted_statuses)
-        total_duration = 0.0
-        for unit in visible_units:
-            counts = [panel_stats[unit].get(s, 0) for s in sorted_statuses]
-            pass_rate = _calc_pass_rate(panel_stats[unit])
-            f.write(
-                f"| {unit} | {' | '.join(str(c) for c in counts)} | "
-                f"{sum(counts)} | {pass_rate} | {round(panel_durations.get(unit, 0), 3)} |\n"
-            )
-            totals = [t + c for t, c in zip(totals, counts, strict=False)]
-            total_duration += panel_durations.get(unit, 0)
-
-        # Visible-only totals so the column sums match the displayed rows.
-        total_pass_rate = _calc_pass_rate(_sum_stats(panel_stats[u] for u in visible_units))
-        f.write(
-            f"| **TOTAL (visible)** | {' | '.join(str(t) for t in totals)} | "
-            f"**{sum(totals)}** | **{total_pass_rate}** | **{round(total_duration, 3)}** |\n"
-        )
-
-        if hidden_count:
-            # Surface the hidden count so readers can tell missing-from-table
-            # from missing-entirely. Show the full TOTAL too so the panel
-            # still summarizes the suite as a whole.
-            full_pass_rate = _calc_pass_rate(total_stats)
-            full_total = sum(total_stats.values())
-            full_duration = sum(panel_durations.values())
-            f.write(
-                f"\n_Hiding {hidden_count} all-skipped file(s) "
-                f"(pass_rate N/A). Full suite TOTAL: {full_total} tests, "
-                f"pass rate {full_pass_rate}%, duration {round(full_duration, 3)}s._\n"
-            )
-
-
-def _sum_stats(per_class_stats):
-    """Sum a sequence of per-class stat dicts into a single status→count dict."""
-    out: dict[str, int] = defaultdict(int)
-    for cls_stats in per_class_stats:
-        for status, count in cls_stats.items():
-            out[status] += count
-    return out
 
 
 def write_all_tests_csv(test_rows: list, output_csv: Path) -> None:
@@ -636,6 +575,11 @@ def main() -> int:
     write_skipped_csv(result["test_rows"], skipped_csv)
     write_run_metadata_csv(result, metadata_csv)
     merge_benchmark_jsonl(results_dir, benchmark_jsonl)
+
+    # Late import: aggregate_panel imports back from this module for shared
+    # helpers (FAILURE_STATUSES, _calc_pass_rate, etc.). Top-level import
+    # would create a circular dependency at module load.
+    from aggregate_panel import write_github_summary
 
     write_github_summary(result)
 
