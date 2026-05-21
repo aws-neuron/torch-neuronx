@@ -613,12 +613,16 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
-    // Wait events need prior async ops to drain first
+    // Same-stream kWait is redundant with FIFO ordering; only gate on
+    // cross-stream where the producer's completion is not implied here.
     if (kernel_type == KernelTypeEnum::kEvent &&
         op->GetKernel<KernelTypeEnum::kEvent>().GetEventAction() ==
             EventDirectKernelExecution::EventAction::kWait &&
         stream->HasPendingAsyncOperations()) {
-      return false;
+      auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+      if (event_kernel.GetEvent().recorded_stream_id() != stream->GetStreamId()) {
+        return false;
+      }
     }
     op->nrt_async_state_.is_pending_signal = true;
     pending_async_ops_count_.fetch_add(1);
