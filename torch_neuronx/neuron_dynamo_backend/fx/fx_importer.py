@@ -46,6 +46,10 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
 class NeuronContextCache(ContextCache):
     """Neuron custom context cache."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.has_hierarchy = False
+
     def get_node_location(self, node: torch.fx.Node) -> Location | None:
         """Get location with hierarchy string fused with source location."""
         source_loc = super().get_node_location(node)
@@ -54,6 +58,7 @@ class NeuronContextCache(ContextCache):
         if not hierarchy:
             return source_loc
 
+        self.has_hierarchy = True
         hierarchy_loc = Location.name(hierarchy, context=self._c)
         return (
             Location.fused([hierarchy_loc, source_loc], context=self._c)
@@ -78,3 +83,8 @@ class NeuronFxImporter(FxImporter):
         super().__init__(context=context, hooks=hooks, **kwargs)
 
         self._cc = NeuronContextCache(self._c, py_attr_tracker=self._py_attr_tracker)
+
+    @property
+    def has_hierarchy(self) -> bool:
+        """Returns True if any node had hierarchy metadata during import."""
+        return self._cc.has_hierarchy
