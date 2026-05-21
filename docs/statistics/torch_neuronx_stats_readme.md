@@ -278,7 +278,119 @@ mem.memory_reserved(device=None)        # Current segment (NRT) bytes held
 mem.max_memory_reserved(device=None)    # Peak segment bytes since last reset
 mem.reset_peak_memory_stats(device=None)       # Reset peak tracking
 mem.reset_accumulated_memory_stats(device=None) # Reset counters
+mem.peak_memory_stats(device=None)      # Peak snapshot (frozen at all-time peak)
+mem.segment_pool_analysis(device=None)  # Fragmentation & efficiency analysis
+mem.segment_pool_analysis_summary(device=None)  # Formatted analysis string
 ```
+
+---
+
+## 2b. Peak Memory Stats
+
+Captures a frozen snapshot of all memory stats at the moment `allocated_bytes`
+reaches its all-time peak. Automatically logged on OOM for diagnostics.
+
+### Motivation
+
+When debugging OOMs or memory pressure, you need to know what the memory state
+looked like at the moment of highest usage — not at the time you query it (which
+may be after cleanup). Peak memory stats capture this automatically.
+
+### Usage
+
+```python
+import torch
+import torch.neuron.memory as mem
+
+# Run your model
+x = torch.randn(1024, 1024, device="neuron")
+y = x @ x.T  # peak likely here
+
+torch.neuron.synchronize()
+
+# Get the frozen snapshot from the moment of peak
+peak = mem.peak_memory_stats()
+if peak["valid"]:
+    alloc = peak["allocated_bytes"]["current"]
+    active = peak["active_bytes"]["current"]
+    reserved = peak["reserved_bytes"]["current"]
+    frag = peak["internal_fragmentation"]
+    print(f"At peak: allocated={alloc}, active={active}, reserved={reserved}")
+    print(f"Internal fragmentation: {frag} bytes")
+```
+
+### Notes
+
+- Always on by default (near-zero overhead: one bool write per allocation).
+- NOT cleared by `reset_peak_memory_stats()` — that resets the live peak
+  counters (used per-step by training frameworks), not this snapshot.
+- On OOM, the peak snapshot is automatically logged via `TORCH_WARN`.
+
+---
+
+## 2c. Segment Pool Analysis
+
+Computes fragmentation and efficiency metrics from the current segment pool
+state. Useful for understanding memory layout quality.
+
+### Usage
+
+```python
+import torch
+import torch.neuron.memory as mem
+
+# After running your model
+torch.neuron.synchronize()
+
+# Get analysis dict
+analysis = mem.segment_pool_analysis()
+print(f"Fragmentation index: {analysis['fragmentation_index']:.4f}")
+print(f"Memory efficiency: {analysis['memory_efficiency']:.4f}")
+print(f"Largest free chunk: {analysis['largest_free'] / 1024**3:.2f} GiB")
+print(f"Segments: {analysis['num_segments']}")
+
+# Or get a formatted summary
+print(mem.segment_pool_analysis_summary())
+```
+
+### Example Output
+
+```
+===========================================================================
+  Segment Pool Analysis (current state at exit)
+===========================================================================
+  Allocated:            159.65 MiB  [167,408,640 B]
+  Reserved:               6.61 GiB  [7,098,859,520 B]
+  Active:               146.11 MiB  [153,208,160 B]
+  Total HBM:             24.00 GiB  [25,769,803,776 B]
+  ---
+  Free chunks:                  93
+  Largest free:          13.10 GiB  [14,063,616,000 B]
+  Total free:            23.84 GiB  [25,602,395,136 B]
+  NRT free:              17.39 GiB  [18,670,944,256 B]
+  Cached free:            6.46 GiB  [6,931,450,880 B]
+  Internal frag:         13.54 MiB  [14,200,480 B]
+  External frag:          4.29 GiB  [4,607,328,256 B]
+  Frag index:               0.1805
+  Mem efficiency:           0.6064
+  Address span:          10.90 GiB  [11,706,187,776 B]
+  Segments:                    101
+===========================================================================
+```
+
+### Metrics Explained
+
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| `total_hbm` | Device property | Full HBM capacity |
+| `nrt_free` | `total_hbm - reserved` | HBM not held by allocator |
+| `cached_free` | `reserved - allocated` | Free blocks within segments (reusable) |
+| `total_free` | `total_hbm - allocated` | All free memory |
+| `largest_free` | Max NRT free chunk | Largest contiguous NRT region |
+| `internal_fragmentation` | `Σ(seg.allocated - seg.active)` | Wasted space from rounding |
+| `external_fragmentation` | `total_free - largest_free - cached_free` | Scattered unusable free space |
+| `fragmentation_index` | `(external + internal) / total_free` | 0=ideal, 1=fully fragmented |
+| `memory_efficiency` | `reserved / address_span` | 1=packed, lower=gaps between segments |
 
 ---
 

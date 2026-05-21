@@ -142,7 +142,7 @@ def reset_accumulated_memory_stats(device: int | torch.device | None = None) -> 
     _C._reset_accumulated_memory_stats(device_index)
 
 
-def get_peak_memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
+def peak_memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
     """
     Return the memory stats snapshot captured at the moment allocated_bytes
     last exceeded its previous peak. Automatically dumped on OOM.
@@ -425,7 +425,8 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
     largest_free = max(nrt_free_chunks) if nrt_free_chunks else 0
 
     external_frag = max(total_free - largest_free - cached_free, 0)
-    frag_index = (external_frag + internal_frag) / total_free if total_free > 0 else 0.0
+    # No free memory = fully fragmented (can't allocate anything)
+    frag_index = (external_frag + internal_frag) / total_free if total_free > 0 else 1.0
     efficiency = reserved / address_span if address_span > 0 else 0.0
 
     return {
