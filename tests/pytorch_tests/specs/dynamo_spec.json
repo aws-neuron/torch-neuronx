@@ -180,6 +180,7 @@
             "test_cross_entropy_loss_fancy_ctor2_dynamic_shapes",
             "test_cross_entropy_loss_simple_ctor",
             "test_cross_entropy_loss_simple_ctor_dynamic_shapes",
+            "test_inplace_ops_propagate_requires_grad_metadata_copysign_neuron_float64",
             "test_dunder_call_explicitly",
             "test_dunder_call_explicitly_dynamic_shapes",
             "test_eager_sequence_nr",
