@@ -245,3 +245,14 @@ func.func @torch.aten.gather$rank0(%arg0: !torch.vtensor<[],bf16>, %arg1: !torch
   %0 = torch.aten.gather %arg0, %int0, %arg1, %false : !torch.vtensor<[],bf16>, !torch.int, !torch.vtensor<[],si32>, !torch.bool -> !torch.vtensor<[],bf16>
   return %0 : !torch.vtensor<[],bf16>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.index_select$rank0(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],f32>, %[[ARG1:.*]]: !torch.vtensor<[],si64>) -> !torch.vtensor<[],f32> {
+// CHECK:         return %[[ARG0]] : !torch.vtensor<[],f32>
+func.func @torch.aten.index_select$rank0(%arg0: !torch.vtensor<[],f32>, %arg1: !torch.vtensor<[],si64>) -> !torch.vtensor<[],f32> {
+  %int0 = torch.constant.int 0
+  %0 = torch.aten.index_select %arg0, %int0, %arg1 : !torch.vtensor<[],f32>, !torch.int, !torch.vtensor<[],si64> -> !torch.vtensor<[],f32>
+  return %0 : !torch.vtensor<[],f32>
+}

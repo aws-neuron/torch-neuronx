@@ -644,6 +644,14 @@ LogicalResult ConvertAtenOp<AtenIndexSelectOp>::matchAndRewrite(
     return rewriter.notifyMatchFailure(
         op, "only constant dim is currently supported");
   int64_t inputRank = selfTy.getRank();
+
+  // Rank-0 index select is a no-op: selecting from a scalar tensor returns
+  // the input directly.
+  if (inputRank == 0) {
+    rewriter.replaceOp(op, self);
+    return success();
+  }
+
   dim = toPositiveDim(dim, inputRank);
   if (!isValidDim(dim, inputRank))
     return rewriter.notifyMatchFailure(op, "dim is statically invalid");
