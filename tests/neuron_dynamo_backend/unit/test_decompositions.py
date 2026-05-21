@@ -2673,6 +2673,153 @@ class TestSiluBackwardDecompositionE2E:
         self._assert_parity(model_fn)
 
 
+class TestSearchsortedDecomposition:
+    """Tests for searchsorted decomposition"""
+
+    def test_searchsorted_tensor_basic(self):
+        """Test basic searchsorted with left (default) insertion"""
+        sorted_seq = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+        values = torch.tensor([2.0, 4.0, 6.0])
+        result = decompositions.searchsorted_tensor_decomposition(sorted_seq, values)
+        expected = torch.searchsorted(sorted_seq, values)
+        torch.testing.assert_close(result, expected)
+
+    def test_searchsorted_tensor_right(self):
+        """Test searchsorted with right insertion on duplicate boundaries"""
+        sorted_seq = torch.tensor([1.0, 2.0, 2.0, 3.0, 4.0])
+        values = torch.tensor([2.0])
+        result_left = decompositions.searchsorted_tensor_decomposition(sorted_seq, values)
+        result_right = decompositions.searchsorted_tensor_decomposition(
+            sorted_seq, values, right=True
+        )
+        expected_left = torch.searchsorted(sorted_seq, values)
+        expected_right = torch.searchsorted(sorted_seq, values, right=True)
+        torch.testing.assert_close(result_left, expected_left)
+        torch.testing.assert_close(result_right, expected_right)
+
+    def test_searchsorted_tensor_side_param(self):
+        """Test that side='right' behaves like right=True"""
+        sorted_seq = torch.tensor([1.0, 2.0, 2.0, 3.0])
+        values = torch.tensor([2.0])
+        result = decompositions.searchsorted_tensor_decomposition(sorted_seq, values, side="right")
+        expected = torch.searchsorted(sorted_seq, values, right=True)
+        torch.testing.assert_close(result, expected)
+
+    def test_searchsorted_tensor_sorter(self):
+        """Test searchsorted with a sorter index"""
+        unsorted_seq = torch.tensor([3.0, 1.0, 4.0, 2.0])
+        sorter = torch.argsort(unsorted_seq)
+        values = torch.tensor([2.5])
+        result = decompositions.searchsorted_tensor_decomposition(
+            unsorted_seq, values, sorter=sorter
+        )
+        expected = torch.searchsorted(unsorted_seq, values, sorter=sorter)
+        torch.testing.assert_close(result, expected)
+
+    def test_searchsorted_tensor_out_int32(self):
+        """Test out_int32 flag returns int32 dtype"""
+        sorted_seq = torch.tensor([1.0, 3.0, 5.0])
+        values = torch.tensor([2.0])
+        result = decompositions.searchsorted_tensor_decomposition(
+            sorted_seq, values, out_int32=True
+        )
+        assert result.dtype == torch.int32
+
+    def test_searchsorted_tensor_2d(self):
+        """Test searchsorted with batched 2D inputs"""
+        sorted_seq = torch.tensor([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+        values = torch.tensor([[2.0, 4.0], [3.0, 5.0]])
+        result = decompositions.searchsorted_tensor_decomposition(sorted_seq, values)
+        expected = torch.searchsorted(sorted_seq, values)
+        torch.testing.assert_close(result, expected)
+
+    def test_searchsorted_scalar(self):
+        """Test scalar variant wraps correctly"""
+        sorted_seq = torch.tensor([1.0, 3.0, 5.0, 7.0])
+        result = decompositions.searchsorted_scalar_decomposition(sorted_seq, 4.0)
+        expected = torch.searchsorted(sorted_seq, 4.0)
+        torch.testing.assert_close(result, expected)
+
+    def test_searchsorted_scalar_right(self):
+        """Test scalar variant with right insertion"""
+        sorted_seq = torch.tensor([1.0, 2.0, 2.0, 3.0])
+        result = decompositions.searchsorted_scalar_decomposition(sorted_seq, 2.0, right=True)
+        expected = torch.searchsorted(sorted_seq, 2.0, right=True)
+        torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestSearchsortedDecompositionCompileE2E:
+    """E2E tests for searchsorted decomposition via torch.compile with neuron backend"""
+
+    def test_searchsorted_basic_e2e(self):
+        """Test basic searchsorted via torch.compile"""
+
+        def fn(sorted_seq, values):
+            return torch.searchsorted(sorted_seq, values)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        sorted_seq = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0], device="neuron")
+        values = torch.tensor([2.0, 4.0, 6.0], device="neuron")
+
+        expected = torch.searchsorted(sorted_seq.cpu(), values.cpu())
+        result = compiled_fn(sorted_seq, values)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("right", [False, True])
+    def test_searchsorted_right_e2e(self, right):
+        """Test searchsorted left/right via torch.compile"""
+
+        def fn(sorted_seq, values):
+            return torch.searchsorted(sorted_seq, values, right=right)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        sorted_seq = torch.tensor([1.0, 2.0, 2.0, 3.0, 4.0], device="neuron")
+        values = torch.tensor([2.0, 3.0], device="neuron")
+
+        expected = torch.searchsorted(sorted_seq.cpu(), values.cpu(), right=right)
+        result = compiled_fn(sorted_seq, values)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_searchsorted_2d_e2e(self):
+        """Test batched 2D searchsorted via torch.compile"""
+
+        def fn(sorted_seq, values):
+            return torch.searchsorted(sorted_seq, values)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        sorted_seq = torch.tensor([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]], device="neuron")
+        values = torch.tensor([[2.0, 4.0], [3.0, 5.0]], device="neuron")
+
+        expected = torch.searchsorted(sorted_seq.cpu(), values.cpu())
+        result = compiled_fn(sorted_seq, values)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_searchsorted_dtypes_e2e(self, dtype):
+        """Test searchsorted with various dtypes via torch.compile"""
+        torch.manual_seed(42)
+
+        def fn(sorted_seq, values):
+            return torch.searchsorted(sorted_seq, values)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        sorted_seq = torch.sort(torch.randn(20, dtype=dtype))[0].to("neuron")
+        values = torch.randn(5, dtype=dtype).to("neuron")
+
+        expected = torch.searchsorted(sorted_seq.cpu(), values.cpu())
+        result = compiled_fn(sorted_seq, values)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+
 class TestNativeBatchNormDecomposition:
     """Tests for native_batch_norm decomposition numerical correctness.
 
