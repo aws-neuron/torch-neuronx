@@ -46,6 +46,9 @@ class NeuronConfig(_ExperimentalConfig):
         capture_enabled_for_nc: Comma-separated NeuronCore indices/ranges to capture
             (e.g., "0,1,2-5").
         profile_output_dir: Directory for NRT trace output files.
+        precache_node_info: When True, pre-cache expensive per-NEFF metadata
+            during wait iterations so the actively profiled iteration has reduced
+            overhead. Useful with torch.profiler.schedule(wait=N, warmup=M, active=K).
         neff_cache_dir: Path to the NEFF cache directory. When set, the cached
             NEFFs will be copied into the profile artifact directory when stopping
             the profile instead of creating an additional copy on load.
@@ -59,6 +62,7 @@ class NeuronConfig(_ExperimentalConfig):
         max_events_per_nc: int | None = None,
         capture_enabled_for_nc: str | None = None,
         profile_output_dir: str | None = None,
+        precache_node_info: bool = True,
         neff_cache_dir: str | None = None,
     ):
         if modes is None:
@@ -93,6 +97,12 @@ class NeuronConfig(_ExperimentalConfig):
         self.custom_profiler_config = config_str
         self.profile_output_dir = profile_output_dir
         self.neff_cache_dir = neff_cache_dir
+
+        # Pre-cache profile node info during warmup iterations so that the
+        # actively profiled iteration doesn't pay the cost of collecting
+        # instructions, DMA descriptors, and CC info from the device.
+        if precache_node_info:
+            _C._nrt_inspect_precache_enable()
 
     def get_session_dir(self) -> str:
         """Get the NRT instance output directory for the current profiling session.

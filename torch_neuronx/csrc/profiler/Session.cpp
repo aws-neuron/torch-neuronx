@@ -163,6 +163,14 @@ NeuronActivityProfilerSession::NeuronActivityProfilerSession(
     : activityTypes_(activityTypes), config_(config.clone()) {
   NPROF_INFO("Profiler session created.");
   NPROF_INFO("  Log file:", config_->activitiesLogFile());
+
+  // NRT config is initialized eagerly here (during prepare_trace / warmup phase)
+  // so that the config allocation cost is not paid during the profiled iteration.
+  // Pre-caching of node info is enabled from NeuronConfig.__init__ in Python,
+  // which fires before the profiler context is entered — covering both wait
+  // and warmup iterations.
+  torch_neuronx::maybe_lazy_init();
+  initNrtConfig();
 }
 
 void NeuronActivityProfilerSession::initNrtConfig() {
@@ -206,6 +214,8 @@ void NeuronActivityProfilerSession::applyCustomConfig() {
 
 NeuronActivityProfilerSession::~NeuronActivityProfilerSession() {
   NPROF_INFO("Session DESTROYED");
+  // Ensure precaching is disabled even if stop() was never called
+  nrt_inspect_precache_disable();
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (isActive_) {
@@ -242,21 +252,6 @@ void NeuronActivityProfilerSession::start() {
   }
 
   NPROF_INFO("Starting profiler session..");
-
-  // Neuron runtime will be initialized at the first device access, say
-  // but the profiler session can be started before that for example:
-  // ```cpp
-  //.     with pytorch.profiler.profile(activities=..) as prof:
-  //        torch.randn(10, 5, device="neuron")
-  //        ...
-  // ```
-  // But profiling does not work for neuron unless NRT is initialized.
-  // So we initialize runtime if it is not initialized.
-  torch_neuronx::maybe_lazy_init();
-
-  if (!nrtConfig_) {
-    initNrtConfig();
-  }
 
   if (!nrtConfig_) {
     NPROF_ERROR(errors_, "Cannot start: NRT config not initialized");
