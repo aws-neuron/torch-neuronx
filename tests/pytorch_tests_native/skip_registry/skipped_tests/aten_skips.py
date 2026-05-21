@@ -99,7 +99,6 @@ ATEN_INT64_OVERFLOW = [
 ]
 
 ATEN_SEGFAULT = [
-    "test_binary_op_list_error_cases__foreach_mul_neuron_int16",
     "test_comprehensive_unsqueeze_copy_neuron_bfloat16",
     "test_dispatch_meta_outplace_trapezoid_neuron_bfloat16",
     "test_foreach_reduce_large_input__foreach_norm_w_empty_False_neuron_int32",
@@ -205,14 +204,8 @@ ATEN_FOREACH_WORKER_CRASH = [
     "test_parity__foreach_clamp_min_fastpath_outplace_neuron_int32",
     "test_parity__foreach_copy_slowpath_inplace_neuron_uint8",
     "test_parity__foreach_exp_fastpath_inplace_neuron_float64",
-    "test_binary_op_list_error_cases__foreach_add_neuron_int32",
-    "test_binary_op_list_error_cases__foreach_add_neuron_int64",
-    "test_binary_op_list_error_cases__foreach_add_neuron_int8",
-    "test_binary_op_list_error_cases__foreach_add_neuron_uint8",
     "test_binary_op_scalar_with_overlapping_tensors__foreach_mul_neuron_int64",
     "test_binary_op_scalar_with_overlapping_tensors__foreach_pow_neuron_bool",
-    "test_parity__foreach_addcdiv_fastpath_outplace_neuron_bfloat16",
-    "test_parity__foreach_addcdiv_fastpath_outplace_neuron_bool",
     "test_parity__foreach_addcdiv_fastpath_outplace_neuron_float16",
     "test_parity__foreach_addcdiv_slowpath_inplace_neuron_bfloat16",
     "test_parity__foreach_addcdiv_slowpath_inplace_neuron_bool",
