@@ -2,7 +2,7 @@
 
 import torch
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 @register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
@@ -27,7 +27,7 @@ def _validate_embedding_dense_backward(
 @register_aten(
     ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
     static_argnums=(2, 3, 4),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
 )
 def torch_embedding_dense_backward(
     grad_output, indices, num_weights, padding_idx, scale_grad_by_freq, out=None
@@ -39,7 +39,7 @@ def torch_embedding_dense_backward(
     original_dtype = grad_output.dtype
 
     def compute_fn(grad_output, indices, num_weights, padding_idx, scale_grad_by_freq):
-        """Scatter-add in f32."""
+        """Scatter-add in f32, cast back to original dtype."""
         embed_dim = grad_output.shape[-1]
         indices_flat = indices.reshape(-1).to(torch.int64)
         grad_flat = grad_output.reshape(-1, embed_dim).to(torch.float32)
@@ -144,7 +144,7 @@ def _validate_histc(
         "aten::histc.out",
     ],
     static_argnames=("bins", "range_min", "range_max"),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_histc,
 )
 def torch_histc(

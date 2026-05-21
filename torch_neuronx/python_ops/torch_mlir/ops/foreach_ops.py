@@ -30,7 +30,7 @@ from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     foreach_sub_scalarlist_nki,
 )
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 # --- Validation helpers ---
 
@@ -384,14 +384,16 @@ def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
 # --- foreach_sqrt (unary) ---
 
 
-@register_aten(["aten::_foreach_sqrt", "aten::_foreach_sqrt.out"], uses_preprocessing=True)
+@register_aten(
+    ["aten::_foreach_sqrt", "aten::_foreach_sqrt.out"], preprocessing=Preprocessing.SHAPE_ONLY
+)
 def torch_foreach_sqrt(tensors, out=None):
     _check_tensors(tensors)
     tensors = _replace_empty(tensors)
     return foreach_sqrt_nki, (tensors,), {}, None
 
 
-@register_aten(["aten::_foreach_sqrt_"], uses_preprocessing=True)
+@register_aten(["aten::_foreach_sqrt_"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_sqrt_inplace(tensors, out=None):
     _check_tensors(tensors)
     non_empty = [t for t in tensors if t.numel() > 0]
@@ -577,7 +579,11 @@ for _op_name, _nki_fns in _ADDCOP_NKI_FNS.items():
         _fn = _factory(_nki_fn)
         _fn.__name__ = f"torch_foreach_{_op_name}_{_variant_name}"
         _aten_names = [f"aten::_foreach_{_op_name}{s}" for s in _suffixes]
-        register_aten(_aten_names, uses_preprocessing=True)(_fn)
+        # shape_only for non-inplace Scalar variant only.
+        _prep = (
+            Preprocessing.SHAPE_ONLY if _variant_name == "scalar" else Preprocessing.VALUE_DEPENDENT
+        )
+        register_aten(_aten_names, preprocessing=_prep)(_fn)
 
 
 # --- foreach_lerp ---
@@ -585,7 +591,7 @@ for _op_name, _nki_fns in _ADDCOP_NKI_FNS.items():
 
 @register_aten(
     ["aten::_foreach_lerp.Scalar", "aten::_foreach_lerp.Scalar_out"],
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
@@ -597,7 +603,7 @@ def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
     return compute_fn, (self, tensors1, weight), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.Scalar"], uses_preprocessing=True)
+@register_aten(["aten::_foreach_lerp_.Scalar"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
     non_empty_s = [s for s in self if s.numel() > 0]
@@ -621,7 +627,7 @@ def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
 
 @register_aten(
     ["aten::_foreach_lerp.List", "aten::_foreach_lerp.List_out"],
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_foreach_lerp_list(self, tensors1, weights, out=None):
     _check_tensors_tensors(self, tensors1)
@@ -634,7 +640,7 @@ def torch_foreach_lerp_list(self, tensors1, weights, out=None):
     return compute_fn, (self, tensors1, weights), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.List"], uses_preprocessing=True)
+@register_aten(["aten::_foreach_lerp_.List"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
@@ -656,7 +662,7 @@ def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
 
 @register_aten(
     ["aten::_foreach_lerp.ScalarList", "aten::_foreach_lerp.ScalarList_out"],
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
 )
 def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
@@ -669,7 +675,7 @@ def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
     return compute_fn, (self, tensors1, weight), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.ScalarList"], uses_preprocessing=True)
+@register_aten(["aten::_foreach_lerp_.ScalarList"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalarlist_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
@@ -712,4 +718,14 @@ for _op in ("add", "sub", "mul", "div"):
         _OP_REGISTRATIONS.append((_aten_names, _fn))
 
 for _aten_names, _fn in _OP_REGISTRATIONS:
-    register_aten(_aten_names, uses_preprocessing=True)(_fn)
+    # shape_only for non-inplace, non-div, non-scalarlist, non-scalar variants.
+    _is_inplace = any("_." in n for n in _aten_names)
+    _is_div = any("_foreach_div" in n for n in _aten_names)
+    _is_scalarlist = any("ScalarList" in n for n in _aten_names)
+    _is_scalar = any(n.endswith(".Scalar") or n.endswith(".Scalar_out") for n in _aten_names)
+    _prep = (
+        Preprocessing.SHAPE_ONLY
+        if (not _is_inplace and not _is_div and not _is_scalarlist and not _is_scalar)
+        else Preprocessing.VALUE_DEPENDENT
+    )
+    register_aten(_aten_names, preprocessing=_prep)(_fn)

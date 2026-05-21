@@ -145,3 +145,109 @@ No C++ changes needed for simple ops — the C++ dispatch
 
 
 ---
+
+## Onboarding Preprocessing Ops
+
+Preprocessing ops use a factory-function protocol: instead of computing the result
+directly, the `torch_fn` returns `(compute_fn, args, kwargs[, postprocess_fn])`.
+
+### Step 1: Choose the Tier
+
+Add `preprocessing=` to your `@register_aten` decorator:
+
+- **`Preprocessing.SHAPE_ONLY`** — preprocessing only reshapes/validates based on shapes.
+  Does NOT read tensor values. Gets full C++ caching (2-5x faster).
+- **`Preprocessing.VALUE_DEPENDENT`** — preprocessing reads tensor values (`.item()`,
+  `torch.nonzero()`, etc.). Uses optimized Python dispatch (1.03-1.32x faster).
+
+**When in doubt, use `Preprocessing.VALUE_DEPENDENT`** — it's the safe default. A wrong
+`Preprocessing.SHAPE_ONLY` classification can cause silent correctness bugs (stale cache).
+
+#### How to Choose
+
+Ask: **would my preprocessing produce the same `(compute_fn, args, kwargs)` for
+any two inputs with identical shapes, dtypes, and static params?**
+
+- If YES → `Preprocessing.SHAPE_ONLY`. The preprocessing only inspects `.shape`, `.dtype`,
+  `.dim()`, `.device`, and static arg values.
+- If NO → `Preprocessing.VALUE_DEPENDENT`. The preprocessing reads actual tensor data.
+
+**Quick test**: could your preprocessing run on **meta tensors** (tensors with
+shapes but no data) without error? If yes → `Preprocessing.SHAPE_ONLY`. If it would crash
+(e.g., `.item()` on meta tensor) → `Preprocessing.VALUE_DEPENDENT`.
+
+#### Common Patterns
+
+| Pattern | Classification | Why |
+|---------|---------------|-----|
+| Reshape args based on `.dim()` / `.shape` | `shape_only` | Shape metadata only |
+| Select conv1d/conv2d/conv3d based on ndim | `shape_only` | Shape metadata only |
+| Bounds check via `torch.any(idx >= size)` | `shape_only` | Validation-only side effect — raises or passes, doesn't change the compiled graph |
+| Replace empty tensors with dummies (`_replace_empty`) | `shape_only` | `numel() == 0` is shape-based |
+| Scalar→tensor conversion | `shape_only` | Type conversion, not value read |
+| `mask.sum().item()` for output size | `value_dependent` | Reads tensor values, output shape changes |
+| `torch.nonzero(bool_index)` for bool→int conversion | `value_dependent` | Output shape depends on number of True values |
+| `scalars.tolist()` to unpack tensor values | `value_dependent` | Reads tensor values |
+| `lr.item()` to extract learning rate | `value_dependent` | Reads tensor value |
+| `torch.max(x).item()` for num_classes | `value_dependent` | Reads tensor value |
+| Filter empty tensors from list (inplace ops) | `value_dependent` | Changes which tensors the NEFF operates on |
+| Int→float dtype promotion for div | `value_dependent` | Changes tensor dtypes in a way the C++ cache key doesn't capture |
+| Bool/int + scalar dtype promotion (`result_type`) | `value_dependent` | Promotes non-float tensors to int64; C++ cache key uses original dtype |
+
+### Step 2: Register
+
+```python
+from torch_neuronx.python_ops.torch_mlir.operation_registry import Preprocessing, register_aten
+
+@register_aten(
+    ["aten::my_op", "aten::my_op.out"],
+    static_argnums=(1,),           # compile-time constant positions
+    output_params=("out",),        # for .out variants (required!)
+    preprocessing=Preprocessing.SHAPE_ONLY,    # or `Preprocessing.VALUE_DEPENDENT`
+)
+def my_op(x, dim, value, out=None):
+    # Preprocessing: transform args
+    if not isinstance(value, torch.Tensor):
+        value = torch.tensor(value, dtype=x.dtype, device=x.device)
+
+    def compute_fn(x, dim, value):
+        return torch.scatter(x, dim, index, value)
+
+    return compute_fn, (x, dim, value), {}
+```
+
+**Important**: For `.out` / `.grad_input` variants, always set `output_params`
+to the names of the output tensor kwargs. Without this, `kernel.lower()` will
+crash when passing out-tensor kwargs to the torch function.
+
+### Step 3: Preprocessing Return Protocol
+
+```python
+# 3-tuple (no postprocess):
+return (compute_fn, new_args, new_kwargs)
+
+# 4-tuple (with postprocess):
+return (compute_fn, new_args, new_kwargs, postprocess_fn)
+```
+
+Supported postprocess patterns:
+- `None` — no postprocess (most ops)
+- `lambda result: None` — inplace ops (mutation via `out=` kwarg)
+- `lambda result: result.to(original_dtype)` — dtype cast after execution
+
+### Step 4: How It Works
+
+**Shape-only** → `_make_preprocessing_lower` wraps preprocessing into `lower_func`.
+C++ `DispatchImpl` calls it on cache miss. Cache hits are pure C++, zero Python.
+
+**Value-dependent** → `_make_preprocessing_dispatch` creates an optimized Python
+function registered via `aten_lib.impl`. Runs preprocessing + cached kernel
+execution directly, skipping `Operation.__call__` overhead.
+
+### Step 5: Testing Checklist
+
+- Test with int64 and float64 inputs (Neuron downcasts to 32-bit)
+- Test with empty tensors
+- Test error cases (wrong dtype, mixed CPU/neuron devices)
+- For inplace ops: verify original tensor is mutated
+- For `.out` variants: verify `output_params` is set

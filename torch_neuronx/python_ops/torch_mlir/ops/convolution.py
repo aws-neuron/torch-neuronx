@@ -2,7 +2,7 @@
 
 import torch
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
 
 
 def _expand_param_if_needed(param, num_spatial_dims):
@@ -92,7 +92,9 @@ def _validate_convolution_inputs(
             )
 
 
-@register_aten(["aten::convolution"], static_argnums=(3, 4, 5, 6, 7, 8), uses_preprocessing=True)
+@register_aten(
+    ["aten::convolution"], static_argnums=(3, 4, 5, 6, 7, 8), preprocessing=Preprocessing.SHAPE_ONLY
+)
 def torch_convolution(
     input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
 ):
