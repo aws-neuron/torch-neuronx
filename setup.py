@@ -327,6 +327,7 @@ if is_building:
                         "_mlirExecutionEngine.so",
                         "libmlir_c_runner_utils.so",
                         "libmlir_runner_utils.so",
+                        "_stablehlo.so",
                     ):
                         target_extension = (
                             ROOT_DIR
@@ -384,6 +385,7 @@ if is_building:
                 BazelExtension("//third_party/torch-mlir:_mlirExecutionEngine.so"),
                 BazelExtension("//third_party/torch-mlir:libmlir_c_runner_utils.so"),
                 BazelExtension("//third_party/torch-mlir:libmlir_runner_utils.so"),
+                BazelExtension("//third_party/torch-mlir:_stablehlo.so"),
             ]
 
             cmdclass = {
