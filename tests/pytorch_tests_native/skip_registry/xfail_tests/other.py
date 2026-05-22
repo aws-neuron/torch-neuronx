@@ -278,7 +278,6 @@ OTHER = [
     "TestForwardLossBackward::test_autograd_grad_double_backward_outside_compile",
     "TestForwardLossBackward::test_autograd_grad_manual_update_matches_eager",
     "TestForwardLossBackward::test_tensor_backward_duplicate_inputs",
-    "TestFullyShard1DTrainingCore::test_train_parity_multi_group_cpu_offload_eager",
     "TestImports::test_circular_dependencies",
     "TestImports::test_lazy_imports_are_lazy",
     "TestImports::test_no_mutate_global_logging_on_import_path_functorch",

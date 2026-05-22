@@ -76,7 +76,10 @@ class NeuronEvent {
 
   /// Complete the event (used by stream for async completion)
   void complete_event() const {
-    mark_completed();
+    {
+      std::lock_guard<std::mutex> lk(impl_->sync_mutex);
+      mark_completed();
+    }
     impl_->sync_cv.notify_all();
   }
 
