@@ -22,7 +22,7 @@ from run_upstream_tests import (
     build_pytest_argv,
     derive_report_paths,
     derive_safe_name,
-    is_distributed,
+    needs_process_isolation_flag,
     parse_args,
     retry_paths,
     should_retry,
@@ -110,7 +110,7 @@ def test_retry_paths_for_sharded(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# is_distributed
+# needs_process_isolation_flag
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "items, expected",
@@ -127,8 +127,8 @@ def test_retry_paths_for_sharded(tmp_path):
         ([], False),
     ],
 )
-def test_is_distributed(items, expected):
-    assert is_distributed(items) is expected
+def test_needs_process_isolation_flag(items, expected):
+    assert needs_process_isolation_flag(items) is expected
 
 
 # ---------------------------------------------------------------------------
