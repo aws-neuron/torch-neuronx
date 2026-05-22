@@ -9,16 +9,21 @@ namespace at::neuron {
 void NeuronEvent::record(const NeuronStream& stream) {
   impl_->device_index = stream.device_index();
   impl_->recorded_stream_id.store(stream.id(), std::memory_order_relaxed);
-  mark_recorded();
-  impl_->is_completed.store(false, std::memory_order_release);
 
   if (impl_->enable_timing) {
     impl_->record_time = std::chrono::steady_clock::now();
   }
 
-  if (stream.query()) {
-    // Stream is idle - event completes immediately
-    mark_completed();
+  bool stream_has_no_work = stream.query();
+  {
+    std::lock_guard<std::mutex> lk(impl_->sync_mutex);
+    mark_recorded();
+    impl_->is_completed.store(false, std::memory_order_release);
+    if (stream_has_no_work) {
+      mark_completed();
+    }
+  }
+  if (stream_has_no_work) {
     impl_->sync_cv.notify_all();
   } else {
     // Stream has work - submit event signal primitive
