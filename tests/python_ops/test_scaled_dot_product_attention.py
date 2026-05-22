@@ -1,5 +1,6 @@
 """Tests for scaled_dot_product_attention operation"""
 
+import math
 import time
 from unittest.mock import patch
 
@@ -893,3 +894,123 @@ def test_sdpa_noncontig_mlir(name, q_cpu_fn, cpp_dispatch):
 def test_sdpa_noncontig_nki(name, q_cpu_fn, cpp_dispatch):
     """SDPA output strides match CPU for non-contiguous inputs on the NKI path (D=64, L%512==0)."""
     _run_noncontig_sdpa(q_cpu_fn, cpp_dispatch)
+
+
+def test_scaled_dot_product_attention_fully_masked_rows():
+    """Bool attn_mask with rows that are entirely False must produce finite output.
+
+    Regression for fully-masked-row NaN in the MLIR softmax: a row of all-False
+    bool mask is converted to additive -inf and makes max_logits = -inf, so the
+    naive (logits - max_logits) subtraction yields NaN. The MLIR path now
+    detects fully-masked rows and zeros their attention weights.
+    """
+    if not torch.neuron.is_available():
+        pytest.skip("Neuron device not available")
+
+    torch.manual_seed(0)
+    device = torch.device("neuron", 0)
+    batch_size, num_heads, seq_len, d_head = 1, 4, 32, 32
+    left_pad = 10
+
+    q_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+    k_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+    v_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+
+    # Bool mask: first `left_pad` query positions cannot attend to anything;
+    # the active region is a (seq_len-left_pad)x(seq_len-left_pad) lower-triangular submatrix.
+    i = torch.arange(seq_len).unsqueeze(1)
+    j = torch.arange(seq_len).unsqueeze(0)
+    attn_mask_cpu = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=torch.bool)
+    attn_mask_cpu[0, 0] = (i >= left_pad) & (j >= left_pad) & (j <= i)
+
+    sdpa_kwargs = {"dropout_p": 0.0, "scale": 1.0 / math.sqrt(d_head), "is_causal": False}
+
+    with torch.no_grad():
+        output_cpu = F.scaled_dot_product_attention(
+            q_cpu, k_cpu, v_cpu, attn_mask=attn_mask_cpu, **sdpa_kwargs
+        )
+
+    with torch.no_grad(), track_neuron_ops():
+        output_neuron = F.scaled_dot_product_attention(
+            q_cpu.to(device),
+            k_cpu.to(device),
+            v_cpu.to(device),
+            attn_mask=attn_mask_cpu.to(device),
+            **sdpa_kwargs,
+        )
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
+
+    output_neuron_cpu = output_neuron.cpu()
+    assert torch.isfinite(output_neuron_cpu).all(), (
+        f"Output contains non-finite values: "
+        f"nan={int(torch.isnan(output_neuron_cpu).sum())}, "
+        f"inf={int(torch.isinf(output_neuron_cpu).sum())}"
+    )
+    # The first `left_pad` query rows are fully masked → output is 0.
+    assert torch.equal(
+        output_neuron_cpu[:, :, :left_pad, :],
+        torch.zeros(batch_size, num_heads, left_pad, d_head),
+    )
+    # The remaining rows should match CPU SDPA semantics on the active submatrix.
+    torch.testing.assert_close(
+        output_neuron_cpu[:, :, left_pad:, :],
+        output_cpu[:, :, left_pad:, :],
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_scaled_dot_product_attention_fully_masked_rows_backward():
+    """Bool attn_mask with fully-False rows must produce finite gradients.
+
+    Regression for fully-masked-row NaN in the MLIR backward: lse is -inf and
+    logits is -inf for those rows, so exp(logits - lse) would be NaN and
+    cascade into grad_q / grad_k / grad_v. The backward path now detects
+    fully-masked rows and zeros their probs (and thus their grads).
+    """
+    if not torch.neuron.is_available():
+        pytest.skip("Neuron device not available")
+
+    torch.manual_seed(0)
+    device = torch.device("neuron", 0)
+    batch_size, num_heads, seq_len, d_head = 1, 4, 32, 32
+    left_pad = 10
+
+    q_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+    k_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+    v_cpu = torch.rand(batch_size, num_heads, seq_len, d_head, dtype=torch.float32) * 3
+
+    i = torch.arange(seq_len).unsqueeze(1)
+    j = torch.arange(seq_len).unsqueeze(0)
+    attn_mask_cpu = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=torch.bool)
+    attn_mask_cpu[0, 0] = (i >= left_pad) & (j >= left_pad) & (j <= i)
+
+    sdpa_kwargs = {"dropout_p": 0.0, "scale": 1.0 / math.sqrt(d_head), "is_causal": False}
+
+    grad_output = torch.randn(batch_size, num_heads, seq_len, d_head, dtype=torch.float32)
+
+    q_neuron = q_cpu.detach().clone().to(device).requires_grad_(True)
+    k_neuron = k_cpu.detach().clone().to(device).requires_grad_(True)
+    v_neuron = v_cpu.detach().clone().to(device).requires_grad_(True)
+
+    with track_neuron_ops():
+        output_neuron = F.scaled_dot_product_attention(
+            q_neuron, k_neuron, v_neuron, attn_mask=attn_mask_cpu.to(device), **sdpa_kwargs
+        )
+        output_neuron.backward(grad_output.to(device))
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
+
+    grad_q = q_neuron.grad.cpu()
+    grad_k = k_neuron.grad.cpu()
+    grad_v = v_neuron.grad.cpu()
+
+    for name, grad in [("grad_q", grad_q), ("grad_k", grad_k), ("grad_v", grad_v)]:
+        assert torch.isfinite(grad).all(), (
+            f"{name} contains non-finite values: "
+            f"nan={int(torch.isnan(grad).sum())}, inf={int(torch.isinf(grad).sum())}"
+        )
+
+    # The first `left_pad` query rows are fully masked → grad_q is 0 on those rows.
+    assert torch.equal(
+        grad_q[:, :, :left_pad, :], torch.zeros(batch_size, num_heads, left_pad, d_head)
+    )

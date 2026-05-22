@@ -67,11 +67,16 @@ def compute_attention(
 
     # torch.logsumexp has MLIR lowering issues
     max_logits = torch.max(logits, dim=-1, keepdim=True)[0]
-    exp_logits = torch.exp(logits - max_logits)
+    # For queries where every key is masked, substitute 0 for the subtraction
+    # (so exp(-inf - 0) = 0) and 1 for the divisor, to avoid NaNs.
+    fully_masked = max_logits == float("-inf")
+    safe_max = torch.where(fully_masked, 0.0, max_logits)
+    exp_logits = torch.exp(logits - safe_max)
     sum_exp = torch.sum(exp_logits, dim=-1, keepdim=True)
     lse = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
+    safe_sum = torch.where(fully_masked, 1.0, sum_exp)
     # softmax
-    probs = exp_logits / sum_exp
+    probs = exp_logits / safe_sum
 
     if dropout_p > 0.0 and dropout_mask.numel() > 0:
         if dropout_p == 1.0:
@@ -333,7 +338,13 @@ def compute_attention_backward(
     elif attn_bias is not None:
         logits = logits + attn_bias
 
-    probs = torch.exp(logits - lse.unsqueeze(-1))
+    # For queries where every key is masked, lse is -inf and logits is -inf,
+    # so (logits - lse) would be NaN. Substitute 0 for the lse and zero out
+    # probs on those rows to avoid NaNs (mirrors the forward path).
+    fully_masked = lse == float("-inf")
+    safe_lse = torch.where(fully_masked, 0.0, lse)
+    probs = torch.exp(logits - safe_lse.unsqueeze(-1))
+    probs = torch.where(fully_masked.unsqueeze(-1), 0.0, probs)
 
     if dropout_p > 0.0 and dropout_mask.numel() > 1:
         if dropout_p == 1.0:
