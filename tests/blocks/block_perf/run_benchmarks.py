@@ -459,8 +459,8 @@ def collect_memory_stats(device_name):
 
     stats = torch_neuronx.memory_stats()
     memory_stats = {
-        "allocated_bytes_current": stats["allocated_bytes"]["current"],
-        "allocated_bytes_peak": stats["allocated_bytes"]["peak"],
+        "allocated_bytes_current": stats["allocated_bytes.all.current"],
+        "allocated_bytes_peak": stats["allocated_bytes.all.peak"],
         "num_alloc_retries": stats["num_alloc_retries"],
         "num_ooms": stats["num_ooms"],
     }

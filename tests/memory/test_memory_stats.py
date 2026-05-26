@@ -40,23 +40,43 @@ class TestMemoryStats:
         stats = torch_neuronx.memory_stats(device=0)
 
         assert isinstance(stats, dict)
-        assert "allocated_bytes" in stats
-        assert "reserved_bytes" in stats
-        assert "active_bytes" in stats
+        assert "allocated_bytes.all.current" in stats
+        assert "reserved_bytes.all.current" in stats
+        assert "active_bytes.all.current" in stats
         assert "num_alloc_retries" in stats
         assert "num_ooms" in stats
         assert "num_tensor_frees" in stats
         assert "allocation_requests" in stats
+        assert "num_alloc_deferred" in stats
+        assert "num_alloc_drain_retry_ok" in stats
+        assert "num_alloc_drain_retry_fail" in stats
 
     def test_memory_stats_byte_fields_have_current_and_peak(self):
-        """Test that byte stat fields have current and peak sub-keys."""
+        """Test that byte stat fields have flat keys for all pools."""
         stats = torch_neuronx.memory_stats(device=0)
 
         for field in ["allocated_bytes", "reserved_bytes", "active_bytes"]:
-            assert "current" in stats[field], f"{field} missing 'current'"
-            assert "peak" in stats[field], f"{field} missing 'peak'"
-            assert isinstance(stats[field]["current"], int)
-            assert isinstance(stats[field]["peak"], int)
+            for pool in ["all", "large_pool", "small_pool"]:
+                assert f"{field}.{pool}.current" in stats, f"{field}.{pool}.current missing"
+                assert f"{field}.{pool}.peak" in stats, f"{field}.{pool}.peak missing"
+                assert isinstance(stats[f"{field}.{pool}.current"], int)
+                assert isinstance(stats[f"{field}.{pool}.peak"], int)
+
+    def test_memory_stats_as_nested_dict(self):
+        """Test that memory_stats_as_nested_dict() returns nested structure."""
+        nested = torch_neuronx.memory_stats_as_nested_dict(device=0)
+
+        assert isinstance(nested, dict)
+        for field in ["allocated_bytes", "reserved_bytes", "active_bytes"]:
+            assert field in nested
+            assert isinstance(nested[field], dict)
+            for pool in ["all", "large_pool", "small_pool"]:
+                assert pool in nested[field], f"{field} missing pool '{pool}'"
+                assert "current" in nested[field][pool]
+                assert "peak" in nested[field][pool]
+                assert isinstance(nested[field][pool]["current"], int)
+        assert "num_alloc_retries" in nested
+        assert "num_ooms" in nested
 
     def test_memory_allocated_returns_int(self):
         """Test that memory_allocated() returns an integer."""
@@ -90,10 +110,10 @@ class TestMemoryStats:
         torch_neuronx.synchronize()
 
         stats = torch_neuronx.memory_stats()
-        assert stats["allocated_bytes"]["current"] == 0
-        assert stats["active_bytes"]["current"] == 0
+        assert stats["allocated_bytes.all.current"] == 0
+        assert stats["active_bytes.all.current"] == 0
         # Segment is still reserved (not freed until empty_cache)
-        assert stats["reserved_bytes"]["current"] > 0
+        assert stats["reserved_bytes.all.current"] > 0
         assert torch_neuronx.memory_allocated() == 0
         assert torch_neuronx.memory_reserved() > 0
 
@@ -112,9 +132,9 @@ class TestMemoryStats:
         torch_neuronx.empty_cache()
 
         stats = torch_neuronx.memory_stats()
-        assert stats["reserved_bytes"]["current"] == 0
-        assert stats["allocated_bytes"]["current"] == 0
-        assert stats["active_bytes"]["current"] == 0
+        assert stats["reserved_bytes.all.current"] == 0
+        assert stats["allocated_bytes.all.current"] == 0
+        assert stats["active_bytes.all.current"] == 0
         assert torch_neuronx.memory_reserved() == 0
 
     @_requires_lazy_alloc
@@ -124,14 +144,14 @@ class TestMemoryStats:
         """
         initial_allocated = torch_neuronx.memory_allocated()
         initial_stats = torch_neuronx.memory_stats()
-        initial_active = initial_stats["active_bytes"]["current"]
+        initial_active = initial_stats["active_bytes.all.current"]
 
         # 3 float32 elements = 12 bytes requested; rounds up to min block size.
         x = torch.empty(3, dtype=torch.float32, device="neuron")
         torch_neuronx.synchronize()
 
         stats = torch_neuronx.memory_stats()
-        active = stats["active_bytes"]["current"] - initial_active
+        active = stats["active_bytes.all.current"] - initial_active
         allocated = torch_neuronx.memory_allocated() - initial_allocated
 
         # Requested (active) should match the tensor's byte size
@@ -183,9 +203,9 @@ class TestMemoryStats:
         stats_after = torch_neuronx.memory_stats()
 
         # After reset, peak should equal current
-        assert stats_after["allocated_bytes"]["peak"] == stats_after["allocated_bytes"]["current"]
-        assert stats_after["reserved_bytes"]["peak"] == stats_after["reserved_bytes"]["current"]
-        assert stats_after["active_bytes"]["peak"] == stats_after["active_bytes"]["current"]
+        assert stats_after["allocated_bytes.all.peak"] == stats_after["allocated_bytes.all.current"]
+        assert stats_after["reserved_bytes.all.peak"] == stats_after["reserved_bytes.all.current"]
+        assert stats_after["active_bytes.all.peak"] == stats_after["active_bytes.all.current"]
 
     def test_memory_summary_returns_formatted_string(self):
         """Test that memory_summary() returns a formatted string."""

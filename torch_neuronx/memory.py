@@ -27,10 +27,10 @@ def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
         device: Device to get statistics for. Defaults to current device.
 
     Returns:
-        Dictionary containing:
-        - allocated_bytes: Total memory obtained from NRT (dict with current/peak/allocated/freed)
-        - reserved_bytes: Memory held in cache for reuse (dict, currently always 0)
-        - active_bytes: Memory in active use by tensors (dict, currently equals allocated_bytes)
+        Dictionary containing flat dot-separated keys:
+        - allocated_bytes.{pool}.{metric}: Total memory obtained from NRT
+        - reserved_bytes.{pool}.{metric}: Memory held in cache for reuse
+        - active_bytes.{pool}.{metric}: Memory in active use by tensors
         - num_alloc_retries: Count of OOM retries after cache flush
         - num_ooms: Count of final OOM failures
         - num_tensor_frees: Count of tensor deallocations
@@ -41,16 +41,142 @@ def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
         - num_alloc_drain_retry_fail: Deferred kAllocs whose retry also OOM'd and
           escalated to cache-drain recovery.
 
-        Each byte stat dict contains:
-        - current: Current value in bytes
-        - peak: Peak value since last reset
-        - allocated: Historical total bytes increased
-        - freed: Historical total bytes decreased
+        Where pool is one of: all, large_pool, small_pool
+        and metric is one of: current, peak, allocated, freed
     """
     from torch_neuronx import _C
 
     device_index = _get_device_index(device)
-    return _C._get_memory_stats(device_index)
+    raw = _C._get_memory_stats(device_index)
+
+    flat: dict[str, Any] = {}
+    _byte_categories = ("allocated_bytes", "reserved_bytes", "active_bytes")
+    _sub_keys = ("current", "peak", "allocated", "freed")
+
+    pool_current = _compute_per_pool_current(device_index)
+
+    for cat in _byte_categories:
+        sub = raw.get(cat, {})
+        if not isinstance(sub, dict):
+            raise TypeError(
+                f"Expected dict for '{cat}' from _get_memory_stats, got {type(sub).__name__}"
+            )
+        for metric in _sub_keys:
+            val = sub.get(metric, 0)
+            flat[f"{cat}.all.{metric}"] = val
+            if metric == "current":
+                flat[f"{cat}.large_pool.{metric}"] = pool_current.get(f"{cat}.large_pool", 0)
+                flat[f"{cat}.small_pool.{metric}"] = pool_current.get(f"{cat}.small_pool", 0)
+            else:
+                flat[f"{cat}.large_pool.{metric}"] = val
+                flat[f"{cat}.small_pool.{metric}"] = 0
+
+    for key in (
+        "num_alloc_retries",
+        "num_ooms",
+        "num_tensor_frees",
+        "allocation_requests",
+        "num_alloc_deferred",
+        "num_alloc_drain_retry_ok",
+        "num_alloc_drain_retry_fail",
+    ):
+        flat[key] = raw.get(key, 0)
+
+    return flat
+
+
+def memory_stats_as_nested_dict(device: int | torch.device | None = None) -> dict[str, Any]:
+    """
+    Return memory statistics as a nested dictionary.
+
+    Same data as :func:`memory_stats` but organized hierarchically::
+
+        {
+            "allocated_bytes": {
+                "all": {"current": ..., "peak": ..., "allocated": ..., "freed": ...},
+                "large_pool": {...},
+                "small_pool": {...},
+            },
+            ...
+        }
+
+    Args:
+        device: Device to get statistics for. Defaults to current device.
+
+    Returns:
+        Nested dictionary of memory statistics.
+    """
+    flat = memory_stats(device)
+    nested: dict[str, Any] = {}
+    _byte_categories = ("allocated_bytes", "reserved_bytes", "active_bytes")
+    _pools = ("all", "large_pool", "small_pool")
+    _sub_keys = ("current", "peak", "allocated", "freed")
+
+    for cat in _byte_categories:
+        nested[cat] = {}
+        for pool in _pools:
+            nested[cat][pool] = {}
+            for metric in _sub_keys:
+                nested[cat][pool][metric] = flat.get(f"{cat}.{pool}.{metric}", 0)
+
+    # Scalar counters
+    for key in (
+        "num_alloc_retries",
+        "num_ooms",
+        "num_tensor_frees",
+        "allocation_requests",
+        "num_alloc_deferred",
+        "num_alloc_drain_retry_ok",
+        "num_alloc_drain_retry_fail",
+    ):
+        nested[key] = flat.get(key, 0)
+
+    return nested
+
+
+def _compute_per_pool_current(device_index: int) -> dict[str, int]:
+    """Derive per-pool current byte stats from the memory snapshot.
+
+    Walks snapshot segments and sums sizes by pool category (is_small).
+    Returns a dict with keys like "allocated_bytes.large_pool", etc.
+    """
+    from torch_neuronx import _C
+
+    try:
+        snapshot = _C._neuron_memory_snapshot()
+    except Exception:
+        return {}
+
+    small_reserved = 0
+    small_allocated = 0
+    small_active = 0
+    large_reserved = 0
+    large_allocated = 0
+    large_active = 0
+
+    for seg in snapshot.get("segments", []):
+        if seg.get("device", -1) != device_index:
+            continue
+        total = seg.get("total_size", 0)
+        alloc = seg.get("allocated_size", 0)
+        active = seg.get("active_size", 0)
+        if seg.get("is_small", False):
+            small_reserved += total
+            small_allocated += alloc
+            small_active += active
+        else:
+            large_reserved += total
+            large_allocated += alloc
+            large_active += active
+
+    return {
+        "reserved_bytes.small_pool": small_reserved,
+        "allocated_bytes.small_pool": small_allocated,
+        "active_bytes.small_pool": small_active,
+        "reserved_bytes.large_pool": large_reserved,
+        "allocated_bytes.large_pool": large_allocated,
+        "active_bytes.large_pool": large_active,
+    }
 
 
 def memory_allocated(device: int | torch.device | None = None) -> int:
@@ -67,7 +193,7 @@ def memory_allocated(device: int | torch.device | None = None) -> int:
         Current allocated bytes as an integer.
     """
     stats = memory_stats(device)
-    return stats["allocated_bytes"]["current"]
+    return stats["allocated_bytes.all.current"]
 
 
 def max_memory_allocated(device: int | torch.device | None = None) -> int:
@@ -81,7 +207,7 @@ def max_memory_allocated(device: int | torch.device | None = None) -> int:
         Peak allocated bytes as an integer.
     """
     stats = memory_stats(device)
-    return stats["allocated_bytes"]["peak"]
+    return stats["allocated_bytes.all.peak"]
 
 
 def memory_reserved(device: int | torch.device | None = None) -> int:
@@ -97,7 +223,7 @@ def memory_reserved(device: int | torch.device | None = None) -> int:
         Current reserved (cached) bytes as an integer.
     """
     stats = memory_stats(device)
-    return stats["reserved_bytes"]["current"]
+    return stats["reserved_bytes.all.current"]
 
 
 def max_memory_reserved(device: int | torch.device | None = None) -> int:
@@ -113,7 +239,7 @@ def max_memory_reserved(device: int | torch.device | None = None) -> int:
         Peak reserved (cached) bytes as an integer.
     """
     stats = memory_stats(device)
-    return stats["reserved_bytes"]["peak"]
+    return stats["reserved_bytes.all.peak"]
 
 
 def reset_peak_memory_stats(device: int | torch.device | None = None) -> None:
@@ -178,6 +304,21 @@ def memory_summary(device: int | torch.device | None = None, abbreviated: bool =
 
     Returns:
         Formatted string showing memory statistics.
+
+    Example output::
+
+        ===========================================================================
+          Neuron Memory Summary, Device 0
+        ===========================================================================
+          Allocations: 1,234  |  Frees: 1,200
+          OOMs: 0  |  Alloc Retries: 0
+        ===========================================================================
+          Metric              | Current    | Peak       | Allocated  | Freed
+        ---------------------------------------------------------------------------
+          Allocated Memory   |   512 MiB  |   1.0 GiB  |   2.0 GiB  |   1.5 GiB
+          Reserved Memory    |   640 MiB  |   1.2 GiB  |   2.5 GiB  |   1.9 GiB
+          Active Memory      |   480 MiB  |   980 MiB  |   1.8 GiB  |   1.3 GiB
+        ===========================================================================
     """
     device_index = _get_device_index(device)
     stats = memory_stats(device_index)
@@ -210,10 +351,12 @@ def memory_summary(device: int | torch.device | None = None, abbreviated: bool =
         ("Reserved Memory", "reserved_bytes"),
         ("Active Memory", "active_bytes"),
     ]:
-        s = stats[key]
         lines.append(
-            f"  {name:<18} | {format_bytes(s['current']):>10} | {format_bytes(s['peak']):>10} "
-            f"| {format_bytes(s['allocated']):>10} | {format_bytes(s['freed']):>10}"
+            f"  {name:<18} "
+            f"| {format_bytes(stats[f'{key}.all.current']):>10} "
+            f"| {format_bytes(stats[f'{key}.all.peak']):>10} "
+            f"| {format_bytes(stats[f'{key}.all.allocated']):>10} "
+            f"| {format_bytes(stats[f'{key}.all.freed']):>10}"
         )
 
     lines.append("=" * 75)
@@ -370,7 +513,7 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
     from torch_neuronx import _C
 
     device_index = _get_device_index(device)
-    stats = _C._get_memory_stats(device_index)
+    stats = memory_stats(device_index)
     snapshot = _C._neuron_memory_snapshot()
     total_hbm = _C._neuron_getDeviceProperties(device_index).total_memory
 
@@ -416,14 +559,14 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
         address_span = 0
 
     # Edge unreserved HBM (outside segment span)
-    reserved = stats["reserved_bytes"]["current"]
+    reserved = stats["reserved_bytes.all.current"]
     nrt_free = total_hbm - reserved
     edge_unreserved = max(0, nrt_free - inter_seg_gap_total)
     if edge_unreserved > 0:
         nrt_free_chunks.append(edge_unreserved)
 
-    active = stats["active_bytes"]["current"]
-    allocated = stats["allocated_bytes"]["current"]
+    active = stats["active_bytes.all.current"]
+    allocated = stats["allocated_bytes.all.current"]
     total_free = max(0, total_hbm - allocated)
     cached_free = reserved - allocated
     all_free_chunks = nrt_free_chunks + cached_free_chunks

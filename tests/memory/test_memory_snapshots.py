@@ -223,7 +223,7 @@ class TestSnapshotAllocTracking:
 
         after_alloc = memory.memory_stats(0)
         assert after_alloc["allocation_requests"] > initial_stats["allocation_requests"]
-        assert after_alloc["active_bytes"]["current"] > initial_stats["active_bytes"]["current"]
+        assert after_alloc["active_bytes.all.current"] > initial_stats["active_bytes.all.current"]
 
         del t1
         sync()
