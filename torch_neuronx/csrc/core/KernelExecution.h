@@ -620,6 +620,7 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   EventAction GetEventAction() const { return action_; }
   const NeuronEvent& GetEvent() const { return event_; }
   virtual bool IsReady() const;
+  c10::StreamId GetSignalStreamId() const { return signal_stream_id_; }
 
  protected:
   bool ValidateImpl() const override;
@@ -627,6 +628,7 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
  private:
   NeuronEvent event_;
   EventAction action_;
+  c10::StreamId signal_stream_id_;
 };
 
 class AllocDirectKernelExecution

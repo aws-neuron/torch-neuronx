@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockCopyUtils.h"
+#include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/utils/TestUtils.h"
@@ -250,6 +251,52 @@ TEST_F(StreamImplTest, HasPendingAsyncOperationsEmptyStream) {
 TEST_F(StreamImplTest, GetNextOperationToScheduleEmptyStream) {
   auto* result = stream_->GetNextOperationToSchedule();
   EXPECT_EQ(result, nullptr);
+}
+
+namespace {
+
+// IsReady() defaults to false so the bypass path is exercised; execution is
+// marked ready so IsSchedulable() depends only on IsReady().
+std::shared_ptr<OperationContext> MakeEventOp(EventDirectKernelExecution::EventAction action,
+                                              c10::StreamId recorded_stream_id) {
+  NeuronEvent event;
+  event.get_impl()->recorded_stream_id.store(recorded_stream_id, std::memory_order_relaxed);
+  auto kernel = std::make_unique<MockEventDirectKernelExecution>("test_event", event, action, 0);
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->MarkExecutionReady();
+  return op;
+}
+
+}  // namespace
+
+TEST_F(StreamImplTest, GetNextOperationToScheduleSameStreamKWaitBypass) {
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id);
+  stream_->active_operations_.push_back(op);
+  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+
+  EXPECT_EQ(stream_->GetNextOperationToSchedule(), op.get());
+
+  stream_->active_operations_.clear();
+}
+
+TEST_F(StreamImplTest, GetNextOperationToScheduleCrossStreamKWaitGated) {
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id + 1);
+  stream_->active_operations_.push_back(op);
+  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+
+  EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
+
+  stream_->active_operations_.clear();
+}
+
+TEST_F(StreamImplTest, GetNextOperationToScheduleKSignalNotBypassed) {
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, stream_->stream_id);
+  stream_->active_operations_.push_back(op);
+  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+
+  EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
+
+  stream_->active_operations_.clear();
 }
 
 int main(int argc, char** argv) {

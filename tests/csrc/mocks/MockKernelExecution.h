@@ -135,6 +135,12 @@ class MockEventDirectKernelExecution : public EventDirectKernelExecution {
     ON_CALL(*this, IsReady()).WillByDefault(::testing::Return(false));
   }
 
+  MockEventDirectKernelExecution(const std::string& op_name, const NeuronEvent& event,
+                                 EventAction action, int device_id)
+      : EventDirectKernelExecution(op_name, event, action, device_id) {
+    ON_CALL(*this, IsReady()).WillByDefault(::testing::Return(false));
+  }
+
   MOCK_METHOD(bool, IsReady, (), (const));
 };
 
