@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # these env vars at module load. Non-xdist runs fall back to "main".
 _WORKER_ID = os.environ.get("PYTEST_XDIST_WORKER", "main")
 _COVERAGE_CACHE_DIR = Path(tempfile.gettempdir()) / f"neuron_coverage_cache_{_WORKER_ID}"
-os.environ.setdefault("TORCH_NEURONX_HLO_CACHE_DIR", str(_COVERAGE_CACHE_DIR / "hlo"))
-os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_DIR", str(_COVERAGE_CACHE_DIR / "neff"))
+os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "hlo")
+os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "neff")
 
 # Pin each xdist worker to a distinct logical NeuronCore. Without this, every
 # worker tries to grab the same core and all but one fail with
