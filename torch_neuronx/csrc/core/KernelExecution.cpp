@@ -487,7 +487,10 @@ bool ReadDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
 EventDirectKernelExecution::EventDirectKernelExecution(const std::string& op_name,
                                                        const NeuronEvent& event, EventAction action,
                                                        int device_id)
-    : NeuronKernelExecution(op_name, device_id), event_(event), action_(action) {}
+    : NeuronKernelExecution(op_name, device_id),
+      event_(event),
+      action_(action),
+      signal_stream_id_(event.recorded_stream_id()) {}
 
 bool EventDirectKernelExecution::ValidateImpl() const {
   // Event primitives don't require inputs/outputs

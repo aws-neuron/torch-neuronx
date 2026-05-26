@@ -392,6 +392,14 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
   if (op->IsSchedulable()) {
     return op.get();
   }
+
+  if (op->GetKernelType() == KernelTypeEnum::kEvent) {
+    auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+    if (event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
+        event_kernel.GetSignalStreamId() == stream_id) {
+      return op.get();
+    }
+  }
   return nullptr;
 }
 
