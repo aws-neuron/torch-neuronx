@@ -85,7 +85,7 @@ class TestNeuronOutputCode:
 
     def test_ensure_neff_loaded_raises_on_missing_hlo(self):
         """_ensure_neff_loaded should raise RuntimeError if HLO cache misses."""
-        oc = self._make_output_code(hlo_cache_key="nonexistent_key")
+        oc = self._make_output_code(cache_key="nonexistent_key", hlo_bytes=b"")
         with (
             patch("torch_neuronx.python_ops.compilation.hlo_cache.get", return_value=None),
             pytest.raises(RuntimeError, match="HLO cache miss"),
@@ -93,8 +93,56 @@ class TestNeuronOutputCode:
             oc._ensure_neff_loaded()
 
     def test_ensure_neff_loaded_skips_if_no_key(self):
-        """_ensure_neff_loaded should be a no-op if hlo_cache_key is empty."""
-        oc = self._make_output_code(hlo_cache_key="")
+        """_ensure_neff_loaded should be a no-op if both cache_key and hlo_cache_key are empty."""
+        oc = self._make_output_code(cache_key="", hlo_cache_key="")
         with patch("torch_neuronx.python_ops.compilation.hlo_cache.get") as mock_hlo_get:
             oc._ensure_neff_loaded()
             mock_hlo_get.assert_not_called()
+
+    def test_hlo_bytes_survives_pickle_roundtrip(self):
+        """Embedded hlo_bytes should survive a pickle round-trip."""
+        oc = self._make_output_code(hlo_bytes=b"fake_hlo_data")
+        data = pickle.dumps(oc)
+        restored = pickle.loads(data)
+        assert restored.hlo_bytes == b"fake_hlo_data"
+
+    def test_prepare_for_serialization_preserves_hlo_bytes(self):
+        """prepare_for_serialization clears _executor but preserves hlo_bytes."""
+        oc = self._make_output_code(hlo_bytes=b"keep_me")
+        oc._executor = object()
+        oc.prepare_for_serialization()
+        assert oc._executor is None
+        assert oc.hlo_bytes == b"keep_me"
+
+    def test_ensure_neff_loaded_uses_embedded_bytes_first(self):
+        """_ensure_neff_loaded should use embedded hlo_bytes without hitting HLO cache."""
+        oc = self._make_output_code(cache_key="key123", hlo_bytes=b"embedded")
+        with (
+            patch("torch_neuronx._C.compile_graph") as mock_compile,
+            patch("torch_neuronx.python_ops.compilation.hlo_cache.get") as mock_hlo_get,
+        ):
+            oc._ensure_neff_loaded()
+            mock_compile.assert_called_once_with("key123", b"embedded", False)
+            mock_hlo_get.assert_not_called()
+
+    def test_ensure_neff_loaded_falls_back_to_hlo_cache(self):
+        """_ensure_neff_loaded should fall back to HLO cache when hlo_bytes is empty."""
+        oc = self._make_output_code(cache_key="key123", hlo_bytes=b"")
+        with (
+            patch(
+                "torch_neuronx.python_ops.compilation.hlo_cache.get",
+                return_value=(b"from_cache", None, None, None, None, None, None),
+            ),
+            patch("torch_neuronx._C.compile_graph") as mock_compile,
+        ):
+            oc._ensure_neff_loaded()
+            mock_compile.assert_called_once_with("key123", b"from_cache", False)
+
+    def test_ensure_neff_loaded_raises_when_both_miss(self):
+        """_ensure_neff_loaded should raise when hlo_bytes is empty and HLO cache misses."""
+        oc = self._make_output_code(cache_key="missing", hlo_bytes=b"")
+        with (
+            patch("torch_neuronx.python_ops.compilation.hlo_cache.get", return_value=None),
+            pytest.raises(RuntimeError, match="HLO cache miss"),
+        ):
+            oc._ensure_neff_loaded()
