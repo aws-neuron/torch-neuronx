@@ -338,7 +338,7 @@ class TestGatherPriorityImpl:
         reason="C++ dispatch changes compiler call count due to contiguous path differences",
     )
     @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
         wraps=convert_fx_to_stablehlo,
     )
     def test_gather_nki_kernel_used(self, mock_compiler):

@@ -23,7 +23,6 @@ from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
-from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
     FunctionalizeCopyInplacePass,
 )
@@ -474,6 +473,8 @@ class TorchMlirKernel(BaseNeuronKernel):
         #     )
 
         # Convert to StableHLO
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+
         stablehlo_module, io_spec, cast_spec = convert_fx_to_stablehlo(
             gm, inputs, aliasing_info=aliasing_info
         )

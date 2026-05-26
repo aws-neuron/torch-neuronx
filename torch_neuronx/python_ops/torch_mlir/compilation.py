@@ -3,8 +3,6 @@
 import logging
 
 import torch
-from torch_mlir import fx
-from torch_mlir.compiler_utils import OutputType
 
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
 
@@ -26,6 +24,8 @@ class TorchMlirCompiler:
         Returns:
             MLIR module in StableHLO dialect
         """
+        from torch_mlir import fx
+        from torch_mlir.compiler_utils import OutputType
 
         # Wrap function with kwargs
         class OpWrapper(torch.nn.Module):

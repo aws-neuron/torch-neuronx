@@ -31,14 +31,21 @@ neuron_dynamo_backend environment variables:
         flags passed to neuronx-cc call
 """
 
+import contextlib
+
 # Register MegaCache artifact type for torch.compiler.save/load_cache_artifacts()
 import torch
 
+# Eagerly import torch_mlir.extras.fx_importer so its module-level
+# LITERAL_CONVERTER_MAP registrations (notably torch.device) run exactly
+# once. With dual-namespace torch_mlir installs, deferring this until
+# the lazy backend import below can leave a second LITERAL_CONVERTER_MAP
+# without those registrations, causing _import_argument to raise
+# "Unsupported argument type <class 'torch.device'>".
+with contextlib.suppress(ImportError):
+    import torch_mlir.extras.fx_importer
+
 from torch_neuronx.neuron_dynamo_backend import cache_artifact as _cache_artifact
-from torch_neuronx.neuron_dynamo_backend.backend import (
-    create_neuron_backend,
-    neuron_backend,
-)
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_model_name,
     get_rank,
@@ -51,14 +58,6 @@ from torch_neuronx.neuron_dynamo_backend.exceptions import (
 from torch_neuronx.neuron_dynamo_backend.metrics import (
     get_dynamo_metrics,
     reset_dynamo_metrics,
-)
-from torch_neuronx.neuron_dynamo_backend.utils.io_utils import (
-    fx_to_mlir_string,
-    load_mlir,
-    save_fx_as_mlir,
-    save_fx_graph_all_formats,
-    save_fx_graph_txt,
-    save_mlir,
 )
 
 __all__ = [
@@ -77,6 +76,59 @@ __all__ = [
     "save_mlir",
     "set_model_name",
 ]
+
+# Lazy imports for symbols that depend on torch_mlir.
+# These are deferred to break a circular import: torch_mlir.compiler_utils imports
+# torch, which autoloads torch_neuronx, which would import torch_mlir back before
+# it has finished initializing.
+_LAZY_BACKEND_IMPORTS = {
+    "create_neuron_backend",
+    "neuron_backend",
+}
+_LAZY_IO_IMPORTS = {
+    "fx_to_mlir_string",
+    "load_mlir",
+    "save_fx_as_mlir",
+    "save_fx_graph_all_formats",
+    "save_fx_graph_txt",
+    "save_mlir",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY_BACKEND_IMPORTS:
+        from torch_neuronx.neuron_dynamo_backend.backend import (
+            create_neuron_backend,
+            neuron_backend,
+        )
+
+        globals().update(
+            create_neuron_backend=create_neuron_backend,
+            neuron_backend=neuron_backend,
+        )
+        return globals()[name]
+
+    if name in _LAZY_IO_IMPORTS:
+        from torch_neuronx.neuron_dynamo_backend.utils.io_utils import (
+            fx_to_mlir_string,
+            load_mlir,
+            save_fx_as_mlir,
+            save_fx_graph_all_formats,
+            save_fx_graph_txt,
+            save_mlir,
+        )
+
+        globals().update(
+            fx_to_mlir_string=fx_to_mlir_string,
+            load_mlir=load_mlir,
+            save_fx_as_mlir=save_fx_as_mlir,
+            save_fx_graph_all_formats=save_fx_graph_all_formats,
+            save_fx_graph_txt=save_fx_graph_txt,
+            save_mlir=save_mlir,
+        )
+        return globals()[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Flex attention compatibility patches for Neuron backend
