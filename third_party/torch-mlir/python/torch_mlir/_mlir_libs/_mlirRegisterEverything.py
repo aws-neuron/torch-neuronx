@@ -12,11 +12,14 @@ def _get_lib():
         _lib = ctypes.CDLL(os.path.join(mlir_libs_dir, "_mlir.so"))
     return _lib
 
+_PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
+_PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+_PyCapsule_GetPointer.restype = ctypes.c_void_p
+
+
 def _get_capsule_ptr(obj, capsule_name):
     capsule = obj._CAPIPtr
-    ptr = ctypes.pythonapi.PyCapsule_GetPointer(
-        ctypes.py_object(capsule), capsule_name.encode()
-    )
+    ptr = _PyCapsule_GetPointer(capsule, capsule_name.encode())
     return ptr
 
 def register_dialects(registry):
