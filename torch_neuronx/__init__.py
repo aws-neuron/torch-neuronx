@@ -142,6 +142,7 @@ from .memory import (
     memory_allocated,
     memory_reserved,
     memory_stats,
+    memory_stats_as_nested_dict,
     memory_summary,
     peak_memory_stats,
     reset_accumulated_memory_stats,
