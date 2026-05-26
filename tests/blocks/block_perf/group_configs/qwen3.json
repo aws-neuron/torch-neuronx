@@ -1,0 +1,46 @@
+{
+  "tests": [
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "id": "qwen3-tp4-fsdp16",
+      "mfu_baseline": 9.96,
+      "mfu_baseline_date": "2026-04-29",
+      "mfu_threshold": 8.97,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "qwen3-8b-tp_fsdp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "id": "qwen3-tp1-fsdp64",
+      "mfu_baseline": 24.14,
+      "mfu_baseline_date": "2026-04-28",
+      "mfu_threshold": 21.73,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "qwen3-8b-fsdp",
+      "runner": "torchrun",
+      "tp_size": 1,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "id": "qwen3-tp4",
+      "mfu_baseline": 23.92,
+      "mfu_baseline_date": "2026-04-25",
+      "mfu_threshold": 21.53,
+      "n_layers": 4,
+      "nproc": 4,
+      "preset": "qwen3-8b-tp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    }
+  ]
+}

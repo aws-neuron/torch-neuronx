@@ -1,0 +1,46 @@
+{
+  "tests": [
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "id": "gpt-oss-tp4-fsdp16",
+      "mfu_baseline": 6.91,
+      "mfu_baseline_date": "2026-05-04",
+      "mfu_threshold": 6.22,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "gpt-oss-20b-tp_fsdp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "id": "gpt-oss-tp1-fsdp64",
+      "mfu_baseline": 18.37,
+      "mfu_baseline_date": "2026-04-24",
+      "mfu_threshold": 16.53,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "gpt-oss-20b-fsdp",
+      "runner": "torchrun",
+      "tp_size": 1,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "id": "gpt-oss-tp4",
+      "mfu_baseline": 15.62,
+      "mfu_baseline_date": "2026-04-25",
+      "mfu_threshold": 14.06,
+      "n_layers": 4,
+      "nproc": 4,
+      "preset": "gpt-oss-20b-tp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    }
+  ]
+}
