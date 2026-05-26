@@ -235,28 +235,12 @@ def neuron_backend_fx_compiler(
             )
             final_cache_key = compile_graph.compile()
 
-            # Save HLO bytes to the persistent HLO cache so warm loads can
-            # retrieve them and feed them back through compile_graph (which
-            # will hit the NEFF persistent cache).
-            hlo_cache_key = final_cache_key
-            try:
-                from torch_neuronx.python_ops.compilation.hlo_cache import put as hlo_cache_put
-
-                bytecode_buf = io.BytesIO()
-                stablehlo_mlir.operation.write_bytecode(bytecode_buf)
-                hlo_cache_put(
-                    hlo_cache_key,
-                    bytecode_buf.getvalue(),
-                    io_spec,
-                    list(range(len(io_spec.inputs))),  # kept_input_indices: all
-                    list(range(len(io_spec.outputs))),  # kept_output_indices: all
-                    None,  # downcasted_outputs
-                    None,  # original_outputs
-                    {},  # passthrough_mappings
-                )
-            except Exception:
-                logger.debug("Failed to save HLO to cache", exc_info=True)
-                hlo_cache_key = ""
+            # Serialize HLO bytes for embedding in NeuronOutputCode.
+            # The embedded bytes make the Dynamo cache self-contained —
+            # no dependency on the ephemeral /tmp/hlo_cache/ directory.
+            bytecode_buf = io.BytesIO()
+            stablehlo_mlir.operation.write_bytecode(bytecode_buf)
+            hlo_bytes_raw = bytecode_buf.getvalue()
 
             # Record compilation metrics (stablehlo_to_neff timing populated lazily at sync)
             record_compilation(
@@ -275,7 +259,7 @@ def neuron_backend_fx_compiler(
             output_code = NeuronOutputCode(
                 graph_name=model_name,
                 cache_key=final_cache_key,
-                hlo_cache_key=hlo_cache_key,
+                hlo_bytes=hlo_bytes_raw,
                 io_spec=io_spec,
                 cast_spec=cast_spec,
                 has_collectives=has_collectives,

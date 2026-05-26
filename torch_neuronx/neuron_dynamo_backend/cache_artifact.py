@@ -61,15 +61,15 @@ class NeuronNeffCacheArtifact(CacheArtifact):
 class NeuronOutputCode(OutputCode):
     """Serializable compiled output for the Neuron backend.
 
-    Holds trivially-picklable Executor constructor args plus an ``hlo_cache_key``
-    that maps to the StableHLO bytes in the persistent HLO cache.  On warm load
-    the HLO bytes are fed back through ``compile_graph`` which hits the NEFF
-    persistent cache — no recompilation happens.
+    Holds trivially-picklable Executor constructor args plus embedded StableHLO
+    bytes.  On warm load the HLO bytes are fed back through ``compile_graph``
+    which hits the NEFF persistent cache — no recompilation happens.
     """
 
     graph_name: str = ""
     cache_key: str = ""
-    hlo_cache_key: str = ""
+    hlo_cache_key: str = ""  # Deprecated: kept for backward compat with old cache entries
+    hlo_bytes: bytes = b""
     io_spec: FunctionIO | None = None
     cast_spec: list[TensorSpec] = dataclasses.field(default_factory=list)
     has_collectives: bool = False
@@ -86,22 +86,30 @@ class NeuronOutputCode(OutputCode):
     def _ensure_neff_loaded(self):
         """Re-run compile_graph with cached HLO bytes so the NEFF persistent
         cache is consulted and the NEFF is loaded into the in-memory cache."""
-        if not self.hlo_cache_key:
-            # HLO cache store may have failed
+        # Determine the cache key for compile_graph lookup
+        key = self.cache_key or self.hlo_cache_key
+        if not key:
             return
-        from torch_neuronx.python_ops.compilation.hlo_cache import get as hlo_cache_get
 
-        entry = hlo_cache_get(self.hlo_cache_key)
-        if entry is None:
-            raise RuntimeError(
-                f"HLO cache miss for key {self.hlo_cache_key}. "
-                "The Dynamo precompile cache references HLO artifacts that no longer exist. "
-                "Clear the Dynamo cache and recompile."
-            )
-        hlo_bytes = entry[0]
+        # Prefer embedded bytes (self-contained, survives /tmp wipe)
+        hlo_bytes = self.hlo_bytes if self.hlo_bytes else None
+
+        # Fall back to HLO cache for backward compat with old cache entries
+        if hlo_bytes is None:
+            from torch_neuronx.python_ops.compilation.hlo_cache import get as hlo_cache_get
+
+            entry = hlo_cache_get(key)
+            if entry is None:
+                raise RuntimeError(
+                    f"HLO cache miss for key {key}. "
+                    "The Dynamo precompile cache references HLO artifacts that no longer exist. "
+                    "Clear the Dynamo cache and recompile."
+                )
+            hlo_bytes = entry[0]
+
         # compile_graph is async but will hit the NEFF persistent cache
         torch_neuronx._C.compile_graph(
-            self.hlo_cache_key,
+            key,
             hlo_bytes,
             self.has_collectives,
         )
