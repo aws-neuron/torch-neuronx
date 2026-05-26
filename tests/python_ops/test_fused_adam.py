@@ -516,7 +516,7 @@ class TestFusedAdamWNKI:
         opt = torch.optim.AdamW(params, lr=0.001, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:
@@ -555,7 +555,7 @@ class TestFusedAdamWNKI:
         scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=5)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             # Step 1: compiles
@@ -592,7 +592,7 @@ class TestFusedAdamWNKI:
         opt = torch.optim.AdamW(params, lr=0.01, amsgrad=True, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:
@@ -843,7 +843,7 @@ class TestFusedAdam:
         opt = torch.optim.Adam(params, lr=0.001, weight_decay=0.01, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:
