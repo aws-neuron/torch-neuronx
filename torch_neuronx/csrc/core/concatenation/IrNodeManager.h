@@ -372,7 +372,9 @@ class IrNodeManager {
    *
    * @note Updates node->cache_key, node->module, node->ir_serialized, and output vectors
    */
-  bool PruneSingleOutput(StableHloNode* node, void* dealloc_address);
+  enum class PruneSource { kConcatAll, kDoubleBuffer };
+  bool PruneSingleOutput(StableHloNode* node, void* dealloc_address,
+                         PruneSource source = PruneSource::kConcatAll);
 
   mlir::MLIRContext* GetContext() const { return context.get(); }
 

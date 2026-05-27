@@ -565,6 +565,14 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "OutputDeduplicationTest",
+    srcs = ["core/concatenation/OutputDeduplicationTest.cpp"],
+    deps = [
+        "//:concatenation",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronWorkTest",
     srcs = ["core/distributed/NeuronWorkTest.cpp"],
     deps = ["//:distributed"],

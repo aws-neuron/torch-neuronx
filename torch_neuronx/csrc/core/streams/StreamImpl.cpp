@@ -491,9 +491,16 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
       return ScheduleResult::kAdvanced;
     }
 
-    // First cascading op needs to schedule the concat op - use concat op's kernel type
-    op = concat_op;
-    kernel_type = concat_op->GetKernelType();
+    if (!concat_op->GetCompilableKernel().HasCachedNeff()) {
+      TORCH_NEURONX_WARN("Concatenated op has no compiled NEFF, scheduling individual op",
+                         "concat_op:", concat_op->GetOpName(), "cascading_op:", op->GetOpName());
+      op->concatenation_state_ = nullptr;
+      kernel_type = op->GetKernelType();
+    } else {
+      // First cascading op needs to schedule the concat op - use concat op's kernel type
+      op = concat_op;
+      kernel_type = concat_op->GetKernelType();
+    }
   }
 
   // Cross-XU synchronization: ensure prior XU operation completes before switching XUs
