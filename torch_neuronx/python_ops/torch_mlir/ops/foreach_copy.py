@@ -16,12 +16,18 @@ Branches:
   - same-dtype, scattered:          per-tensor MLIR identity kernel
   - cross-dtype, contiguous dst:    cat sources + single fused MLIR cast kernel
   - cross-dtype, scattered:         per-tensor MLIR cast kernel
-  - unsupported dtype / non-default stream / mixed device: dst.copy_(src)
+  - unsupported dtype / mixed device: dst.copy_(src)
+
+On non-default stream + hostCC the MLIR path is gated; same-dtype routes to
+raw NRT instead of per-pair dst.copy_(src), cross-dtype falls back to
+dst.copy_(src) (no raw-NRT cast available yet).
 """
 
 from __future__ import annotations
 
 import torch
+
+import torch_neuronx._C as _C
 
 from ..operation_registry import Preprocessing, register_aten
 
@@ -90,6 +96,36 @@ def _fallback_copy(self_tensors, src_tensors):
         dst.copy_(src)
 
 
+def _has_lazy_bits(tensors) -> bool:
+    return any(t.is_neg() or t.is_conj() for t in tensors)
+
+
+def _raw_nrt_copy_same_dtype(self_tensors, src_tensors):
+    """Contiguous range -> 1 fused NRT copy. Scattered -> per-tensor NRT copy."""
+    if _is_contiguous_range(self_tensors) and _is_contiguous_range(src_tensors):
+        total_numel = sum(t.numel() for t in src_tensors)
+        src_view = torch.as_strided(
+            src_tensors[0],
+            (total_numel,),
+            (1,),
+            storage_offset=src_tensors[0].storage_offset(),
+        )
+        dst_view = torch.as_strided(
+            self_tensors[0],
+            (total_numel,),
+            (1,),
+            storage_offset=self_tensors[0].storage_offset(),
+        )
+        _C._nrt_copy_neuron_to_neuron_tensor(src_view, dst_view)
+        return
+
+    for dst, src in zip(self_tensors, src_tensors, strict=False):
+        _C._nrt_copy_neuron_to_neuron_tensor(src, dst)
+
+
+# No cross-dtype raw-NRT helper — device_cast goes through MLIR for cross-dtype.
+
+
 @register_aten(
     ["aten::_foreach_copy_"],
     preprocessing=Preprocessing.VALUE_DEPENDENT,
@@ -110,7 +146,7 @@ def torch_foreach_copy_inplace(self_tensors, src_tensors, non_blocking=False):
 
     # Mixed device — fall back to per-tensor copy_
     for d, s in zip(self_tensors, src_tensors, strict=False):
-        if d.device.type != "neuron" or s.device.type != "neuron":
+        if d.device != s.device or d.device.type != "neuron":
             _fallback_copy(self_tensors, src_tensors)
             return _copy_identity_compute, (), {}, lambda _r: None
 
@@ -118,8 +154,15 @@ def torch_foreach_copy_inplace(self_tensors, src_tensors, non_blocking=False):
 
     if same_dtype:
         dtype = self_tensors[0].dtype
-        if dtype in unsupported_dtypes or not _is_default_stream():
+        if dtype in unsupported_dtypes:
             _fallback_copy(self_tensors, src_tensors)
+            return _copy_identity_compute, (), {}, lambda _r: None
+        if not _is_default_stream():
+            # MLIR gated; raw NRT can't materialize neg/conj bits.
+            if _has_lazy_bits(src_tensors) or _has_lazy_bits(self_tensors):
+                _fallback_copy(self_tensors, src_tensors)
+            else:
+                _raw_nrt_copy_same_dtype(self_tensors, src_tensors)
             return _copy_identity_compute, (), {}, lambda _r: None
 
         if _is_contiguous_range(self_tensors) and _is_contiguous_range(src_tensors):

@@ -233,3 +233,86 @@ def test_unsupported_dtype_bool():
 
     for dst, src in zip(dsts, srcs, strict=False):
         torch.testing.assert_close(dst.cpu(), src.cpu())
+
+
+def test_nondefault_stream_same_dtype_raw_nrt():
+    """Non-default stream + hostCC: same-dtype contiguous range routes to raw NRT."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+
+    @requires_nrt_streams
+    def _run():
+        flat_src = torch.randn(1024, dtype=torch.bfloat16, device="neuron")
+        flat_dst = torch.zeros(1024, dtype=torch.bfloat16, device="neuron")
+        src_splits = list(torch.split(flat_src, [256, 256, 256, 256]))
+        dst_splits = list(torch.split(flat_dst, [256, 256, 256, 256]))
+
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            torch._foreach_copy_(dst_splits, src_splits)
+        stream.synchronize()
+        torch.testing.assert_close(flat_dst.cpu(), flat_src.cpu())
+
+    _run()
+
+
+def test_nondefault_stream_scattered_raw_nrt():
+    """Non-default stream + hostCC: scattered same-dtype routes per-tensor to raw NRT."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+
+    @requires_nrt_streams
+    def _run():
+        srcs = [torch.randn(128, dtype=torch.bfloat16, device="neuron") for _ in range(3)]
+        dsts = [torch.zeros(128, dtype=torch.bfloat16, device="neuron") for _ in range(3)]
+
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            torch._foreach_copy_(dsts, srcs)
+        stream.synchronize()
+        for d, s in zip(dsts, srcs, strict=False):
+            torch.testing.assert_close(d.cpu(), s.cpu())
+
+    _run()
+
+
+def test_nondefault_stream_neg_src_falls_back():
+    """Non-default stream + hostCC: src with .is_neg() falls through to dst.copy_(src)."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+
+    @requires_nrt_streams
+    def _run():
+        cpu_srcs = [torch.randn(64, dtype=torch.bfloat16) for _ in range(2)]
+        srcs = [s.to("neuron")._neg_view() for s in cpu_srcs]
+        dsts = [torch.zeros(64, dtype=torch.bfloat16, device="neuron") for _ in range(2)]
+
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            torch._foreach_copy_(dsts, srcs)
+        stream.synchronize()
+        for d, s in zip(dsts, cpu_srcs, strict=False):
+            torch.testing.assert_close(d.cpu(), -s)
+
+    _run()
+
+
+def test_nondefault_stream_cross_dtype_falls_back():
+    """Non-default stream + hostCC: cross-dtype falls through to per-pair dst.copy_(src)."""
+    from tests.utils.neuron_test_utils import requires_nrt_streams
+
+    @requires_nrt_streams
+    def _run():
+        cpu_srcs = [torch.randn(64, dtype=torch.float32) for _ in range(2)]
+        srcs = [s.to("neuron") for s in cpu_srcs]
+        dsts = [torch.zeros(64, dtype=torch.bfloat16, device="neuron") for _ in range(2)]
+
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            torch._foreach_copy_(dsts, srcs)
+        stream.synchronize()
+        for d, s in zip(dsts, cpu_srcs, strict=False):
+            torch.testing.assert_close(d.cpu(), s.to(torch.bfloat16))
+
+    _run()

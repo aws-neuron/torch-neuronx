@@ -46,6 +46,19 @@ bool HasEmptyOutputTensor(const std::vector<c10::IValue>& args, const c10::Funct
   return false;
 }
 
+bool RawNrtCopyOverlaps(const at::Tensor& src, const at::Tensor& dst) {
+  if (!src.has_storage() || !dst.has_storage() || src.storage().data() != dst.storage().data()) {
+    return false;
+  }
+  const int64_t src_es = src.element_size();
+  const int64_t dst_es = dst.element_size();
+  const int64_t a_lo = src.storage_offset() * src_es;
+  const int64_t a_hi = (src.storage_offset() + src.numel()) * src_es;
+  const int64_t b_lo = dst.storage_offset() * dst_es;
+  const int64_t b_hi = (dst.storage_offset() + dst.numel()) * dst_es;
+  return std::max(a_lo, b_lo) < std::min(a_hi, b_hi);
+}
+
 bool IsIndexOp(const std::string& op_name) {
   // Index-family ops where PyTorch's Meta dispatch does NOT validate
   // shapes/bounds.  CPU dispatch errors on these when shapes are invalid,
