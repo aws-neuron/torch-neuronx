@@ -157,126 +157,126 @@ func.func @test_aten.sort$other_dim(%arg0: !torch.vtensor<[10,20,30],f32>) -> (!
 // -----
 
 // CHECK-LABEL:   func.func @test_quantize_mx_e5m2_last_dim(
-// CHECK-SAME:                                              %[[VAL_0:.*]]: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>) {
+// CHECK-SAME:                                              %[[VAL_0:.*]]: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[890,128],bf16> -> tensor<890x128xbf16>
 // CHECK:           %[[VAL_2:.*]] = torch.constant.int -1
 // CHECK:           %[[VAL_3:.*]] = torch.constant.int 32
 // CHECK:           %[[VAL_4:.*]] = torch.constant.int 23
 // CHECK:           %[[VAL_5:.*]] = torch.constant.int 0
-// CHECK:           %[[VAL_6:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<890x128xbf16>) -> (tensor<890x32xui32>, tensor<890x4xf8E8M0FNU>)
+// CHECK:           %[[VAL_6:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<890x128xbf16>) -> (tensor<890x128xf8E5M2>, tensor<890x4xf8E8M0FNU>)
 // CHECK:           %[[VAL_7:.*]] = torch_c.from_builtin_tensor %[[VAL_6]]#1 : tensor<890x4xf8E8M0FNU> -> !torch.vtensor<[890,4],f8E8M0FNU>
-// CHECK:           %[[VAL_8:.*]] = torch_c.from_builtin_tensor %[[VAL_6]]#0 : tensor<890x32xui32> -> !torch.vtensor<[890,32],ui32>
-// CHECK:           return %[[VAL_8]], %[[VAL_7]] : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>
+// CHECK:           %[[VAL_8:.*]] = torch_c.from_builtin_tensor %[[VAL_6]]#0 : tensor<890x128xf8E5M2> -> !torch.vtensor<[890,128],f8E5M2>
+// CHECK:           return %[[VAL_8]], %[[VAL_7]] : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>
 // CHECK:         }
-func.func @test_quantize_mx_e5m2_last_dim(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>) {
+func.func @test_quantize_mx_e5m2_last_dim(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>) {
     %int-1 = torch.constant.int -1
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>
 }
 
 // -----
 
-// Test with ui8 scale output (current PyTorch convention).
-// The custom call returns f8E8M0FNU scale, so a bitcast_convert is inserted.
+// Test ui8 scale-output convention (legacy PyTorch): the custom call still
+// returns f8E8M0FNU and a bitcast_convert injects a ui8 view as a compat shim.
 // CHECK-LABEL:   func.func @test_quantize_mx_e5m2_scale_ui8(
-// CHECK-SAME:                                                %[[VAL_0:.*]]: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],ui8>) {
+// CHECK-SAME:                                                %[[VAL_0:.*]]: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],ui8>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[890,128],bf16> -> tensor<890x128xbf16>
 // CHECK:           %[[VAL_2:.*]] = torch.constant.int -1
 // CHECK:           %[[VAL_3:.*]] = torch.constant.int 32
 // CHECK:           %[[VAL_4:.*]] = torch.constant.int 23
 // CHECK:           %[[VAL_5:.*]] = torch.constant.int 0
-// CHECK:           %[[VAL_6:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<890x128xbf16>) -> (tensor<890x32xui32>, tensor<890x4xf8E8M0FNU>)
-// CHECK:           %[[VAL_7:.*]] = torch_c.from_builtin_tensor %[[VAL_6]]#0 : tensor<890x32xui32> -> !torch.vtensor<[890,32],ui32>
+// CHECK:           %[[VAL_6:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<890x128xbf16>) -> (tensor<890x128xf8E5M2>, tensor<890x4xf8E8M0FNU>)
+// CHECK:           %[[VAL_7:.*]] = torch_c.from_builtin_tensor %[[VAL_6]]#0 : tensor<890x128xf8E5M2> -> !torch.vtensor<[890,128],f8E5M2>
 // CHECK:           %[[VAL_8:.*]] = stablehlo.bitcast_convert %[[VAL_6]]#1 : (tensor<890x4xf8E8M0FNU>) -> tensor<890x4xui8>
 // CHECK:           %[[VAL_9:.*]] = torch_c.from_builtin_tensor %[[VAL_8]] : tensor<890x4xui8> -> !torch.vtensor<[890,4],ui8>
-// CHECK:           return %[[VAL_7]], %[[VAL_9]] : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],ui8>
+// CHECK:           return %[[VAL_7]], %[[VAL_9]] : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],ui8>
 // CHECK:         }
-func.func @test_quantize_mx_e5m2_scale_ui8(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],ui8>) {
+func.func @test_quantize_mx_e5m2_scale_ui8(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],ui8>) {
     %int-1 = torch.constant.int -1
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],ui8>
-    return %output, %scale : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],ui8>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],ui8>
+    return %output, %scale : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],ui8>
 }
 
 // -----
 
 // CHECK-LABEL:   func.func @test_quantize_mx_e4m3fn(
-// CHECK-SAME:                                        %[[VAL_0:.*]]: !torch.vtensor<[64,256],f16>) -> (!torch.vtensor<[64,64],ui32>, !torch.vtensor<[64,8],f8E8M0FNU>) {
+// CHECK-SAME:                                        %[[VAL_0:.*]]: !torch.vtensor<[64,256],f16>) -> (!torch.vtensor<[64,256],f8E4M3FN>, !torch.vtensor<[64,8],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[64,256],f16> -> tensor<64x256xf16>
-// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e4m3fn\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<64x256xf16>) -> (tensor<64x64xui32>, tensor<64x8xf8E8M0FNU>)
+// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e4m3fn\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<64x256xf16>) -> (tensor<64x256xf8E4M3FN>, tensor<64x8xf8E8M0FNU>)
 // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#1 : tensor<64x8xf8E8M0FNU> -> !torch.vtensor<[64,8],f8E8M0FNU>
-// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<64x64xui32> -> !torch.vtensor<[64,64],ui32>
-// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[64,64],ui32>, !torch.vtensor<[64,8],f8E8M0FNU>
+// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<64x256xf8E4M3FN> -> !torch.vtensor<[64,256],f8E4M3FN>
+// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[64,256],f8E4M3FN>, !torch.vtensor<[64,8],f8E8M0FNU>
 // CHECK:         }
-func.func @test_quantize_mx_e4m3fn(%arg0: !torch.vtensor<[64,256],f16>) -> (!torch.vtensor<[64,64],ui32>, !torch.vtensor<[64,8],f8E8M0FNU>) {
+func.func @test_quantize_mx_e4m3fn(%arg0: !torch.vtensor<[64,256],f16>) -> (!torch.vtensor<[64,256],f8E4M3FN>, !torch.vtensor<[64,8],f8E8M0FNU>) {
     %int-1 = torch.constant.int -1
     %int32 = torch.constant.int 32
     %int24 = torch.constant.int 24
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int24, %int0 : !torch.vtensor<[64,256],f16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[64,64],ui32>, !torch.vtensor<[64,8],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[64,64],ui32>, !torch.vtensor<[64,8],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int24, %int0 : !torch.vtensor<[64,256],f16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[64,256],f8E4M3FN>, !torch.vtensor<[64,8],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[64,256],f8E4M3FN>, !torch.vtensor<[64,8],f8E8M0FNU>
 }
 
 // -----
 
 // CHECK-LABEL:   func.func @test_quantize_mx_second_to_last_dim(
-// CHECK-SAME:                                                    %[[VAL_0:.*]]: !torch.vtensor<[128,64],bf16>) -> (!torch.vtensor<[32,64],ui32>, !torch.vtensor<[4,64],f8E8M0FNU>) {
+// CHECK-SAME:                                                    %[[VAL_0:.*]]: !torch.vtensor<[128,64],bf16>) -> (!torch.vtensor<[128,64],f8E5M2>, !torch.vtensor<[4,64],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[128,64],bf16> -> tensor<128x64xbf16>
-// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -2, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<128x64xbf16>) -> (tensor<32x64xui32>, tensor<4x64xf8E8M0FNU>)
+// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -2, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<128x64xbf16>) -> (tensor<128x64xf8E5M2>, tensor<4x64xf8E8M0FNU>)
 // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#1 : tensor<4x64xf8E8M0FNU> -> !torch.vtensor<[4,64],f8E8M0FNU>
-// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<32x64xui32> -> !torch.vtensor<[32,64],ui32>
-// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[32,64],ui32>, !torch.vtensor<[4,64],f8E8M0FNU>
+// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<128x64xf8E5M2> -> !torch.vtensor<[128,64],f8E5M2>
+// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[128,64],f8E5M2>, !torch.vtensor<[4,64],f8E8M0FNU>
 // CHECK:         }
-func.func @test_quantize_mx_second_to_last_dim(%arg0: !torch.vtensor<[128,64],bf16>) -> (!torch.vtensor<[32,64],ui32>, !torch.vtensor<[4,64],f8E8M0FNU>) {
+func.func @test_quantize_mx_second_to_last_dim(%arg0: !torch.vtensor<[128,64],bf16>) -> (!torch.vtensor<[128,64],f8E5M2>, !torch.vtensor<[4,64],f8E8M0FNU>) {
     %int-2 = torch.constant.int -2
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-2, %int32, %int23, %int0 : !torch.vtensor<[128,64],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[32,64],ui32>, !torch.vtensor<[4,64],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[32,64],ui32>, !torch.vtensor<[4,64],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-2, %int32, %int23, %int0 : !torch.vtensor<[128,64],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[128,64],f8E5M2>, !torch.vtensor<[4,64],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[128,64],f8E5M2>, !torch.vtensor<[4,64],f8E8M0FNU>
 }
 
 // -----
 
 // CHECK-LABEL:   func.func @test_quantize_mx_3d(
-// CHECK-SAME:                                    %[[VAL_0:.*]]: !torch.vtensor<[4,512,1024],bf16>) -> (!torch.vtensor<[4,512,256],ui32>, !torch.vtensor<[4,512,32],f8E8M0FNU>) {
+// CHECK-SAME:                                    %[[VAL_0:.*]]: !torch.vtensor<[4,512,1024],bf16>) -> (!torch.vtensor<[4,512,1024],f8E5M2>, !torch.vtensor<[4,512,32],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,512,1024],bf16> -> tensor<4x512x1024xbf16>
-// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<4x512x1024xbf16>) -> (tensor<4x512x256xui32>, tensor<4x512x32xf8E8M0FNU>)
+// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<4x512x1024xbf16>) -> (tensor<4x512x1024xf8E5M2>, tensor<4x512x32xf8E8M0FNU>)
 // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#1 : tensor<4x512x32xf8E8M0FNU> -> !torch.vtensor<[4,512,32],f8E8M0FNU>
-// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<4x512x256xui32> -> !torch.vtensor<[4,512,256],ui32>
-// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[4,512,256],ui32>, !torch.vtensor<[4,512,32],f8E8M0FNU>
+// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<4x512x1024xf8E5M2> -> !torch.vtensor<[4,512,1024],f8E5M2>
+// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[4,512,1024],f8E5M2>, !torch.vtensor<[4,512,32],f8E8M0FNU>
 // CHECK:         }
-func.func @test_quantize_mx_3d(%arg0: !torch.vtensor<[4,512,1024],bf16>) -> (!torch.vtensor<[4,512,256],ui32>, !torch.vtensor<[4,512,32],f8E8M0FNU>) {
+func.func @test_quantize_mx_3d(%arg0: !torch.vtensor<[4,512,1024],bf16>) -> (!torch.vtensor<[4,512,1024],f8E5M2>, !torch.vtensor<[4,512,32],f8E8M0FNU>) {
     %int-1 = torch.constant.int -1
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[4,512,1024],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[4,512,256],ui32>, !torch.vtensor<[4,512,32],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[4,512,256],ui32>, !torch.vtensor<[4,512,32],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int0 : !torch.vtensor<[4,512,1024],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[4,512,1024],f8E5M2>, !torch.vtensor<[4,512,32],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[4,512,1024],f8E5M2>, !torch.vtensor<[4,512,32],f8E8M0FNU>
 }
 
 // -----
 
 // CHECK-LABEL:   func.func @test_quantize_mx_4d_second_last(
-// CHECK-SAME:                                                %[[VAL_0:.*]]: !torch.vtensor<[2,8,1024,512],bf16>) -> (!torch.vtensor<[2,8,256,512],ui32>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>) {
+// CHECK-SAME:                                                %[[VAL_0:.*]]: !torch.vtensor<[2,8,1024,512],bf16>) -> (!torch.vtensor<[2,8,1024,512],f8E5M2>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[2,8,1024,512],bf16> -> tensor<2x8x1024x512xbf16>
-// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -2, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<2x8x1024x512xbf16>) -> (tensor<2x8x256x512xui32>, tensor<2x8x32x512xf8E8M0FNU>)
+// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[VAL_1]]) {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -2, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"} : (tensor<2x8x1024x512xbf16>) -> (tensor<2x8x1024x512xf8E5M2>, tensor<2x8x32x512xf8E8M0FNU>)
 // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#1 : tensor<2x8x32x512xf8E8M0FNU> -> !torch.vtensor<[2,8,32,512],f8E8M0FNU>
-// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<2x8x256x512xui32> -> !torch.vtensor<[2,8,256,512],ui32>
-// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[2,8,256,512],ui32>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
+// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_2]]#0 : tensor<2x8x1024x512xf8E5M2> -> !torch.vtensor<[2,8,1024,512],f8E5M2>
+// CHECK:           return %[[VAL_4]], %[[VAL_3]] : !torch.vtensor<[2,8,1024,512],f8E5M2>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
 // CHECK:         }
-func.func @test_quantize_mx_4d_second_last(%arg0: !torch.vtensor<[2,8,1024,512],bf16>) -> (!torch.vtensor<[2,8,256,512],ui32>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>) {
+func.func @test_quantize_mx_4d_second_last(%arg0: !torch.vtensor<[2,8,1024,512],bf16>) -> (!torch.vtensor<[2,8,1024,512],f8E5M2>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>) {
     %int-2 = torch.constant.int -2
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-2, %int32, %int23, %int0 : !torch.vtensor<[2,8,1024,512],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[2,8,256,512],ui32>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[2,8,256,512],ui32>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-2, %int32, %int23, %int0 : !torch.vtensor<[2,8,1024,512],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[2,8,1024,512],f8E5M2>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[2,8,1024,512],f8E5M2>, !torch.vtensor<[2,8,32,512],f8E8M0FNU>
 }
 
 // -----
@@ -402,7 +402,7 @@ func.func @test_neuron_rand_with_inputs(%arg0: !torch.vtensor<[2,3,4],f32>, %arg
 
 // Test fused_quantize_mx_scaled_mm: basic 2D case with e5m2, out_dtype=bf16
 // lhs: [64, 128] bf16 (M=64, K=128), rhs: [256, 128] bf16 (N=256, K=128)
-// Both quantize along last dim (K=128): packed K/4=32, scale K/32=4
+// Both quantize along last dim (K=128): FP8 [..., K], scale K/32=4
 // result: [64, 256] bf16 (M × N)
 // CHECK-LABEL:   func.func @test_fused_quantize_mx_scaled_mm_basic(
 // CHECK-SAME:                                                       %[[LHS:.*]]: !torch.vtensor<[64,128],bf16>,
@@ -411,13 +411,13 @@ func.func @test_neuron_rand_with_inputs(%arg0: !torch.vtensor<[2,3,4],f32>, %arg
 // CHECK-DAG:       %[[RHS_T:.*]] = torch_c.to_builtin_tensor %[[RHS]] : !torch.vtensor<[256,128],bf16> -> tensor<256x128xbf16>
 // CHECK:           %[[LHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[LHS_T]])
 // CHECK-SAME:        {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"}
-// CHECK-SAME:        : (tensor<64x128xbf16>) -> (tensor<64x32xui32>, tensor<64x4xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<64x128xbf16>) -> (tensor<64x128xf8E5M2>, tensor<64x4xf8E8M0FNU>)
 // CHECK:           %[[RHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX(%[[RHS_T]])
 // CHECK-SAME:        {backend_config = "{\22dtype\22: \22float8_e5m2\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"}
-// CHECK-SAME:        : (tensor<256x128xbf16>) -> (tensor<256x32xui32>, tensor<256x4xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<256x128xbf16>) -> (tensor<256x128xf8E5M2>, tensor<256x4xf8E8M0FNU>)
 // CHECK:           %[[DOT:.*]] = stablehlo.custom_call @__op$block_scaled_dot(%[[LHS_Q]]#0, %[[RHS_Q]]#0, %[[LHS_Q]]#1, %[[RHS_Q]]#1)
 // CHECK-SAME:        {backend_config = "{\22scaled_dot_backend_config\22: {\22lhs_batch_dimensions\22: [], \22rhs_batch_dimensions\22: [], \22lhs_contracting_dimensions\22: [1], \22rhs_contracting_dimensions\22: [1], \22dequantize_type\22: \22BF16\22, \22element_dtype\22: \22float8_e5m2\22}}"}
-// CHECK-SAME:        : (tensor<64x32xui32>, tensor<256x32xui32>, tensor<64x4xf8E8M0FNU>, tensor<256x4xf8E8M0FNU>) -> tensor<64x256xbf16>
+// CHECK-SAME:        : (tensor<64x128xf8E5M2>, tensor<256x128xf8E5M2>, tensor<64x4xf8E8M0FNU>, tensor<256x4xf8E8M0FNU>) -> tensor<64x256xbf16>
 // CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<64x256xbf16> -> !torch.vtensor<[64,256],bf16>
 // CHECK:           return %[[OUT]] : !torch.vtensor<[64,256],bf16>
 func.func @test_fused_quantize_mx_scaled_mm_basic(
@@ -438,18 +438,18 @@ func.func @test_fused_quantize_mx_scaled_mm_basic(
 
 // Test fused_quantize_mx_scaled_mm: e4m3fn fp8_dtype with f16 inputs
 // lhs: [32, 64] f16 (M=32, K=64), rhs: [128, 64] f16 (N=128, K=64)
-// K=64: packed K/4=16, scale K/32=2
+// K=64: FP8 shape K, scale K/32=2
 // result: [32, 128] bf16
 // CHECK-LABEL:   func.func @test_fused_quantize_mx_scaled_mm_e4m3fn(
 // CHECK:           %[[LHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX
 // CHECK-SAME:        {backend_config = "{\22dtype\22: \22float8_e4m3fn\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"}
-// CHECK-SAME:        : (tensor<32x64xf16>) -> (tensor<32x16xui32>, tensor<32x2xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<32x64xf16>) -> (tensor<32x64xf8E4M3FN>, tensor<32x2xf8E8M0FNU>)
 // CHECK:           %[[RHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX
 // CHECK-SAME:        {backend_config = "{\22dtype\22: \22float8_e4m3fn\22, \22dim\22: -1, \22block_size\22: 32, \22scale_method\22: \22EMAX\22}"}
-// CHECK-SAME:        : (tensor<128x64xf16>) -> (tensor<128x16xui32>, tensor<128x2xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<128x64xf16>) -> (tensor<128x64xf8E4M3FN>, tensor<128x2xf8E8M0FNU>)
 // CHECK:           %[[DOT:.*]] = stablehlo.custom_call @__op$block_scaled_dot(%[[LHS_Q]]#0, %[[RHS_Q]]#0, %[[LHS_Q]]#1, %[[RHS_Q]]#1)
 // CHECK-SAME:        \22element_dtype\22: \22float8_e4m3fn\22
-// CHECK-SAME:        : (tensor<32x16xui32>, tensor<128x16xui32>, tensor<32x2xf8E8M0FNU>, tensor<128x2xf8E8M0FNU>) -> tensor<32x128xbf16>
+// CHECK-SAME:        : (tensor<32x64xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<32x2xf8E8M0FNU>, tensor<128x2xf8E8M0FNU>) -> tensor<32x128xbf16>
 func.func @test_fused_quantize_mx_scaled_mm_e4m3fn(
     %arg0: !torch.vtensor<[32,64],f16>,
     %arg1: !torch.vtensor<[128,64],f16>) -> !torch.vtensor<[32,128],bf16> {
@@ -468,17 +468,17 @@ func.func @test_fused_quantize_mx_scaled_mm_e4m3fn(
 
 // Test fused_quantize_mx_scaled_mm: 3D batched case
 // lhs: [4, 512, 1024] bf16, rhs: [4, 2048, 1024] bf16
-// K=1024: packed K/4=256, scale K/32=32
+// K=1024: FP8 shape K, scale K/32=32
 // result: [4, 512, 2048] bf16
 // batch_dims=[0], contracting_dims=[2]
 // CHECK-LABEL:   func.func @test_fused_quantize_mx_scaled_mm_3d(
 // CHECK:           %[[LHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX
-// CHECK-SAME:        : (tensor<4x512x1024xbf16>) -> (tensor<4x512x256xui32>, tensor<4x512x32xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<4x512x1024xbf16>) -> (tensor<4x512x1024xf8E5M2>, tensor<4x512x32xf8E8M0FNU>)
 // CHECK:           %[[RHS_Q:.*]]:2 = stablehlo.custom_call @QuantizeMX
-// CHECK-SAME:        : (tensor<4x2048x1024xbf16>) -> (tensor<4x2048x256xui32>, tensor<4x2048x32xf8E8M0FNU>)
+// CHECK-SAME:        : (tensor<4x2048x1024xbf16>) -> (tensor<4x2048x1024xf8E5M2>, tensor<4x2048x32xf8E8M0FNU>)
 // CHECK:           %[[DOT:.*]] = stablehlo.custom_call @__op$block_scaled_dot(%[[LHS_Q]]#0, %[[RHS_Q]]#0, %[[LHS_Q]]#1, %[[RHS_Q]]#1)
 // CHECK-SAME:        {backend_config = "{\22scaled_dot_backend_config\22: {\22lhs_batch_dimensions\22: [0], \22rhs_batch_dimensions\22: [0], \22lhs_contracting_dimensions\22: [2], \22rhs_contracting_dimensions\22: [2], \22dequantize_type\22: \22BF16\22, \22element_dtype\22: \22float8_e5m2\22}}"}
-// CHECK-SAME:        : (tensor<4x512x256xui32>, tensor<4x2048x256xui32>, tensor<4x512x32xf8E8M0FNU>, tensor<4x2048x32xf8E8M0FNU>) -> tensor<4x512x2048xbf16>
+// CHECK-SAME:        : (tensor<4x512x1024xf8E5M2>, tensor<4x2048x1024xf8E5M2>, tensor<4x512x32xf8E8M0FNU>, tensor<4x2048x32xf8E8M0FNU>) -> tensor<4x512x2048xbf16>
 func.func @test_fused_quantize_mx_scaled_mm_3d(
     %arg0: !torch.vtensor<[4,512,1024],bf16>,
     %arg1: !torch.vtensor<[4,2048,1024],bf16>) -> !torch.vtensor<[4,512,2048],bf16> {
@@ -518,35 +518,35 @@ func.func @test_fused_quantize_mx_scaled_mm_f32_output(
 
 // -----
 
-// Test _scaled_mm: basic 2D case, ui32 packed inputs, out_dtype=bf16, fp8_dtype=e5m2
-// lhs: [64, 32] ui32 (M=64, K/4=32 packed), rhs: [256, 32] ui32 (N=256, K/4=32 packed, transposed)
-// lhs_scale: [64, 4] f8E8M0FNU (K/32 = (K/4)/8 = 32/8 = 4), rhs_scale: [256, 4] f8E8M0FNU
+// Test _scaled_mm: basic 2D case, FP8 inputs, out_dtype=bf16, fp8_dtype=e5m2
+// lhs: [64, 128] f8E5M2 (M=64, K=128), rhs: [256, 128] f8E5M2 (N=256, K=128, transposed)
+// lhs_scale: [64, 4] f8E8M0FNU (K/32 = 4), rhs_scale: [256, 4] f8E8M0FNU
 // result: [64, 256] bf16
 // CHECK-LABEL:   func.func @test_scaled_mm_basic(
-// CHECK-SAME:                                    %[[LHS:.*]]: !torch.vtensor<[64,32],ui32>,
+// CHECK-SAME:                                    %[[LHS:.*]]: !torch.vtensor<[64,128],f8E5M2>,
 // CHECK-SAME:                                    %[[SA:.*]]: !torch.vtensor<[64,4],f8E8M0FNU>,
-// CHECK-SAME:                                    %[[RHS:.*]]: !torch.vtensor<[256,32],ui32>,
+// CHECK-SAME:                                    %[[RHS:.*]]: !torch.vtensor<[256,128],f8E5M2>,
 // CHECK-SAME:                                    %[[SB:.*]]: !torch.vtensor<[256,4],f8E8M0FNU>)
-// CHECK-DAG:       %[[LHS_T:.*]] = torch_c.to_builtin_tensor %[[LHS]] : !torch.vtensor<[64,32],ui32> -> tensor<64x32xui32>
-// CHECK-DAG:       %[[RHS_T:.*]] = torch_c.to_builtin_tensor %[[RHS]] : !torch.vtensor<[256,32],ui32> -> tensor<256x32xui32>
+// CHECK-DAG:       %[[LHS_T:.*]] = torch_c.to_builtin_tensor %[[LHS]] : !torch.vtensor<[64,128],f8E5M2> -> tensor<64x128xf8E5M2>
+// CHECK-DAG:       %[[RHS_T:.*]] = torch_c.to_builtin_tensor %[[RHS]] : !torch.vtensor<[256,128],f8E5M2> -> tensor<256x128xf8E5M2>
 // CHECK-DAG:       %[[SA_T:.*]] = torch_c.to_builtin_tensor %[[SA]] : !torch.vtensor<[64,4],f8E8M0FNU> -> tensor<64x4xf8E8M0FNU>
 // CHECK-DAG:       %[[SB_T:.*]] = torch_c.to_builtin_tensor %[[SB]] : !torch.vtensor<[256,4],f8E8M0FNU> -> tensor<256x4xf8E8M0FNU>
 // CHECK:           %[[OUT:.*]] = stablehlo.custom_call @__op$block_scaled_dot(%[[LHS_T]], %[[RHS_T]], %[[SA_T]], %[[SB_T]])
 // CHECK-SAME:        {backend_config = "{\22scaled_dot_backend_config\22: {\22lhs_batch_dimensions\22: [], \22rhs_batch_dimensions\22: [], \22lhs_contracting_dimensions\22: [1], \22rhs_contracting_dimensions\22: [1], \22dequantize_type\22: \22BF16\22, \22element_dtype\22: \22float8_e5m2\22}}"}
-// CHECK-SAME:        : (tensor<64x32xui32>, tensor<256x32xui32>, tensor<64x4xf8E8M0FNU>, tensor<256x4xf8E8M0FNU>) -> tensor<64x256xbf16>
+// CHECK-SAME:        : (tensor<64x128xf8E5M2>, tensor<256x128xf8E5M2>, tensor<64x4xf8E8M0FNU>, tensor<256x4xf8E8M0FNU>) -> tensor<64x256xbf16>
 // CHECK:           %[[RES:.*]] = torch_c.from_builtin_tensor %[[OUT]] : tensor<64x256xbf16> -> !torch.vtensor<[64,256],bf16>
 // CHECK:           return %[[RES]] : !torch.vtensor<[64,256],bf16>
 func.func @test_scaled_mm_basic(
-    %arg0: !torch.vtensor<[64,32],ui32>,
+    %arg0: !torch.vtensor<[64,128],f8E5M2>,
     %arg1: !torch.vtensor<[64,4],f8E8M0FNU>,
-    %arg2: !torch.vtensor<[256,32],ui32>,
+    %arg2: !torch.vtensor<[256,128],f8E5M2>,
     %arg3: !torch.vtensor<[256,4],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
     %none = torch.constant.none
     %int15 = torch.constant.int 15
     %int23 = torch.constant.int 23
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
-        : (!torch.vtensor<[64,32],ui32>, !torch.vtensor<[64,4],f8E8M0FNU>,
-           !torch.vtensor<[256,32],ui32>, !torch.vtensor<[256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[64,128],f8E5M2>, !torch.vtensor<[64,4],f8E8M0FNU>,
+           !torch.vtensor<[256,128],f8E5M2>, !torch.vtensor<[256,4],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>
@@ -555,21 +555,22 @@ func.func @test_scaled_mm_basic(
 // -----
 
 // Test _scaled_mm: out_dtype=None defaults to bf16, fp8_dtype=None defaults to float8_e4m3fn
-// mat1: [16, 8] ui32 (M=16, K/4=8 packed), mat2: [64, 8] ui32 (N=64, K/4=8 packed, transposed)
+// mat1: [16, 32] f8E4M3FN (M=16, K=32), mat2: [64, 32] f8E4M3FN (N=64, K=32, transposed)
+// lhs_scale: [16, 1] (K/32=1), rhs_scale: [64, 1]
 // result: [16, 64] bf16
 // CHECK-LABEL:   func.func @test_scaled_mm_out_dtype_none(
 // CHECK:           %[[OUT:.*]] = stablehlo.custom_call @__op$block_scaled_dot
 // CHECK-SAME:        {backend_config = "{\22scaled_dot_backend_config\22: {\22lhs_batch_dimensions\22: [], \22rhs_batch_dimensions\22: [], \22lhs_contracting_dimensions\22: [1], \22rhs_contracting_dimensions\22: [1], \22dequantize_type\22: \22BF16\22, \22element_dtype\22: \22float8_e4m3fn\22}}"}
-// CHECK-SAME:        : (tensor<16x8xui32>, tensor<64x8xui32>, tensor<16x1xf8E8M0FNU>, tensor<64x1xf8E8M0FNU>) -> tensor<16x64xbf16>
+// CHECK-SAME:        : (tensor<16x32xf8E4M3FN>, tensor<64x32xf8E4M3FN>, tensor<16x1xf8E8M0FNU>, tensor<64x1xf8E8M0FNU>) -> tensor<16x64xbf16>
 func.func @test_scaled_mm_out_dtype_none(
-    %arg0: !torch.vtensor<[16,8],ui32>,
+    %arg0: !torch.vtensor<[16,32],f8E4M3FN>,
     %arg1: !torch.vtensor<[16,1],f8E8M0FNU>,
-    %arg2: !torch.vtensor<[64,8],ui32>,
+    %arg2: !torch.vtensor<[64,32],f8E4M3FN>,
     %arg3: !torch.vtensor<[64,1],f8E8M0FNU>) -> !torch.vtensor<[16,64],bf16> {
     %none = torch.constant.none
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %none, %none)
-        : (!torch.vtensor<[16,8],ui32>, !torch.vtensor<[16,1],f8E8M0FNU>,
-           !torch.vtensor<[64,8],ui32>, !torch.vtensor<[64,1],f8E8M0FNU>,
+        : (!torch.vtensor<[16,32],f8E4M3FN>, !torch.vtensor<[16,1],f8E8M0FNU>,
+           !torch.vtensor<[64,32],f8E4M3FN>, !torch.vtensor<[64,1],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.none, !torch.none)
         -> !torch.vtensor<[16,64],bf16>
     return %0 : !torch.vtensor<[16,64],bf16>
@@ -578,24 +579,50 @@ func.func @test_scaled_mm_out_dtype_none(
 // -----
 
 // Test _scaled_mm: 3D batched case, fp8_dtype=e5m2
-// mat1: [4, 64, 32] ui32 (M=64, K/4=32 packed), mat2: [4, 256, 32] ui32 (N=256, K/4=32 packed, transposed)
+// mat1: [4, 64, 128] f8E5M2 (M=64, K=128), mat2: [4, 256, 128] f8E5M2 (N=256, K=128, transposed)
+// lhs_scale: [4, 64, 4] (K/32=4), rhs_scale: [4, 256, 4]
 // result: [4, 64, 256] bf16
 // CHECK-LABEL:   func.func @test_scaled_mm_3d(
 // CHECK:           %[[OUT:.*]] = stablehlo.custom_call @__op$block_scaled_dot
 // CHECK-SAME:        {backend_config = "{\22scaled_dot_backend_config\22: {\22lhs_batch_dimensions\22: [0], \22rhs_batch_dimensions\22: [0], \22lhs_contracting_dimensions\22: [2], \22rhs_contracting_dimensions\22: [2], \22dequantize_type\22: \22BF16\22, \22element_dtype\22: \22float8_e5m2\22}}"}
-// CHECK-SAME:        : (tensor<4x64x32xui32>, tensor<4x256x32xui32>, tensor<4x64x4xf8E8M0FNU>, tensor<4x256x4xf8E8M0FNU>) -> tensor<4x64x256xbf16>
+// CHECK-SAME:        : (tensor<4x64x128xf8E5M2>, tensor<4x256x128xf8E5M2>, tensor<4x64x4xf8E8M0FNU>, tensor<4x256x4xf8E8M0FNU>) -> tensor<4x64x256xbf16>
 func.func @test_scaled_mm_3d(
-    %arg0: !torch.vtensor<[4,64,32],ui32>,
+    %arg0: !torch.vtensor<[4,64,128],f8E5M2>,
     %arg1: !torch.vtensor<[4,64,4],f8E8M0FNU>,
-    %arg2: !torch.vtensor<[4,256,32],ui32>,
+    %arg2: !torch.vtensor<[4,256,128],f8E5M2>,
     %arg3: !torch.vtensor<[4,256,4],f8E8M0FNU>) -> !torch.vtensor<[4,64,256],bf16> {
     %none = torch.constant.none
     %int15 = torch.constant.int 15
     %int23 = torch.constant.int 23
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
-        : (!torch.vtensor<[4,64,32],ui32>, !torch.vtensor<[4,64,4],f8E8M0FNU>,
-           !torch.vtensor<[4,256,32],ui32>, !torch.vtensor<[4,256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[4,64,128],f8E5M2>, !torch.vtensor<[4,64,4],f8E8M0FNU>,
+           !torch.vtensor<[4,256,128],f8E5M2>, !torch.vtensor<[4,256,4],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[4,64,256],bf16>
     return %0 : !torch.vtensor<[4,64,256],bf16>
+}
+
+// -----
+
+// Test _scaled_mm: explicit e4m3fn fp8_dtype with bf16 output
+// mat1: [64, 128] f8E4M3FN, mat2: [256, 128] f8E4M3FN (transposed)
+// scale: [64, 4] / [256, 4] (K/32=4), result: [64, 256] bf16
+// CHECK-LABEL:   func.func @test_scaled_mm_e4m3fn_explicit(
+// CHECK:           %[[OUT:.*]] = stablehlo.custom_call @__op$block_scaled_dot
+// CHECK-SAME:        \22element_dtype\22: \22float8_e4m3fn\22
+// CHECK-SAME:        : (tensor<64x128xf8E4M3FN>, tensor<256x128xf8E4M3FN>, tensor<64x4xf8E8M0FNU>, tensor<256x4xf8E8M0FNU>) -> tensor<64x256xbf16>
+func.func @test_scaled_mm_e4m3fn_explicit(
+    %arg0: !torch.vtensor<[64,128],f8E4M3FN>,
+    %arg1: !torch.vtensor<[64,4],f8E8M0FNU>,
+    %arg2: !torch.vtensor<[256,128],f8E4M3FN>,
+    %arg3: !torch.vtensor<[256,4],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
+    %none = torch.constant.none
+    %int15 = torch.constant.int 15
+    %int24 = torch.constant.int 24
+    %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int24)
+        : (!torch.vtensor<[64,128],f8E4M3FN>, !torch.vtensor<[64,4],f8E8M0FNU>,
+           !torch.vtensor<[256,128],f8E4M3FN>, !torch.vtensor<[256,4],f8E8M0FNU>,
+           !torch.none, !torch.none, !torch.int, !torch.int)
+        -> !torch.vtensor<[64,256],bf16>
+    return %0 : !torch.vtensor<[64,256],bf16>
 }
