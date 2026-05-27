@@ -21,34 +21,34 @@ module {
     return %values, %indices : !torch.vtensor<[10,18000],f32>, !torch.vtensor<[10,18000],si64>
   }
 
-  func.func @test_quantize_mx_invalid_scale_mode(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>) {
+  func.func @test_quantize_mx_invalid_scale_mode(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>) {
     %int-1 = torch.constant.int -1
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int1 = torch.constant.int 1
     // expected-error @+1 {{failed to legalize operation 'torch.aten.quantize_mx'}}
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int1 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,4],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int32, %int23, %int1 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>
   }
 
-  func.func @test_quantize_mx_invalid_block_size(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,2],f8E8M0FNU>) {
+  func.func @test_quantize_mx_invalid_block_size(%arg0: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,2],f8E8M0FNU>) {
     %int-1 = torch.constant.int -1
     %int64 = torch.constant.int 64
     %int23 = torch.constant.int 23
     %int0 = torch.constant.int 0
     // expected-error @+1 {{failed to legalize operation 'torch.aten.quantize_mx'}}
-    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int64, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,2],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[890,32],ui32>, !torch.vtensor<[890,2],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int-1, %int64, %int23, %int0 : !torch.vtensor<[890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,2],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,2],f8E8M0FNU>
   }
 
-  func.func @test_quantize_mx_invalid_dim(%arg0: !torch.vtensor<[4,890,128],bf16>) -> (!torch.vtensor<[1,890,128],ui32>, !torch.vtensor<[4,890,4],f8E8M0FNU>) {
+  func.func @test_quantize_mx_invalid_dim(%arg0: !torch.vtensor<[4,890,128],bf16>) -> (!torch.vtensor<[4,890,128],f8E5M2>, !torch.vtensor<[4,890,4],f8E8M0FNU>) {
     %int0 = torch.constant.int 0
     %int32 = torch.constant.int 32
     %int23 = torch.constant.int 23
     %int0_mode = torch.constant.int 0
     // expected-error @+1 {{failed to legalize operation 'torch.aten.quantize_mx'}}
-    %output, %scale = torch.aten.quantize_mx %arg0, %int0, %int32, %int23, %int0_mode : !torch.vtensor<[4,890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[1,890,128],ui32>, !torch.vtensor<[4,890,4],f8E8M0FNU>
-    return %output, %scale : !torch.vtensor<[1,890,128],ui32>, !torch.vtensor<[4,890,4],f8E8M0FNU>
+    %output, %scale = torch.aten.quantize_mx %arg0, %int0, %int32, %int23, %int0_mode : !torch.vtensor<[4,890,128],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[4,890,128],f8E5M2>, !torch.vtensor<[4,890,4],f8E8M0FNU>
+    return %output, %scale : !torch.vtensor<[4,890,128],f8E5M2>, !torch.vtensor<[4,890,4],f8E8M0FNU>
   }
 
   // Invalid fp8_dtype (not 23 or 24)
@@ -132,19 +132,20 @@ module {
     return %0 : !torch.vtensor<[64,256],bf16>
   }
 
-  // Invalid: non-ui32 input type (bf16 instead of packed ui32)
+  // Invalid: non-FP8 input type (bf16 instead of f8E5M2/f8E4M3FN).
+  // Expected to fail at the FP8 element-type check in transformScaledMm.
   func.func @test_scaled_mm_invalid_input_dtype(
-      %arg0: !torch.vtensor<[64,32],bf16>,
+      %arg0: !torch.vtensor<[64,128],bf16>,
       %arg1: !torch.vtensor<[64,4],f8E8M0FNU>,
-      %arg2: !torch.vtensor<[256,32],bf16>,
+      %arg2: !torch.vtensor<[256,128],bf16>,
       %arg3: !torch.vtensor<[256,4],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
     %none = torch.constant.none
     %int15 = torch.constant.int 15
     %int23 = torch.constant.int 23
     // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
-        : (!torch.vtensor<[64,32],bf16>, !torch.vtensor<[64,4],f8E8M0FNU>,
-           !torch.vtensor<[256,32],bf16>, !torch.vtensor<[256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[64,128],bf16>, !torch.vtensor<[64,4],f8E8M0FNU>,
+           !torch.vtensor<[256,128],bf16>, !torch.vtensor<[256,4],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>
@@ -152,9 +153,9 @@ module {
 
   // Invalid: bias is not None
   func.func @test_scaled_mm_bias_not_none(
-      %arg0: !torch.vtensor<[64,32],ui32>,
+      %arg0: !torch.vtensor<[64,128],f8E5M2>,
       %arg1: !torch.vtensor<[64,4],f8E8M0FNU>,
-      %arg2: !torch.vtensor<[256,32],ui32>,
+      %arg2: !torch.vtensor<[256,128],f8E5M2>,
       %arg3: !torch.vtensor<[256,4],f8E8M0FNU>,
       %arg4: !torch.vtensor<[256],bf16>) -> !torch.vtensor<[64,256],bf16> {
     %none = torch.constant.none
@@ -162,8 +163,8 @@ module {
     %int23 = torch.constant.int 23
     // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %arg4, %none, %int15, %int23)
-        : (!torch.vtensor<[64,32],ui32>, !torch.vtensor<[64,4],f8E8M0FNU>,
-           !torch.vtensor<[256,32],ui32>, !torch.vtensor<[256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[64,128],f8E5M2>, !torch.vtensor<[64,4],f8E8M0FNU>,
+           !torch.vtensor<[256,128],f8E5M2>, !torch.vtensor<[256,4],f8E8M0FNU>,
            !torch.vtensor<[256],bf16>, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>
@@ -172,17 +173,17 @@ module {
   // Invalid: out_dtype=Int (si32 = 3) is not a supported output type for block_scaled_dot;
   // only BFloat16 (15), Float (6), and Half (5) are accepted
   func.func @test_scaled_mm_invalid_out_dtype(
-      %arg0: !torch.vtensor<[64,32],ui32>,
+      %arg0: !torch.vtensor<[64,128],f8E5M2>,
       %arg1: !torch.vtensor<[64,4],f8E8M0FNU>,
-      %arg2: !torch.vtensor<[256,32],ui32>,
+      %arg2: !torch.vtensor<[256,128],f8E5M2>,
       %arg3: !torch.vtensor<[256,4],f8E8M0FNU>) -> !torch.vtensor<[64,256],si32> {
     %none = torch.constant.none
     %int3 = torch.constant.int 3
     %int23 = torch.constant.int 23
     // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int3, %int23)
-        : (!torch.vtensor<[64,32],ui32>, !torch.vtensor<[64,4],f8E8M0FNU>,
-           !torch.vtensor<[256,32],ui32>, !torch.vtensor<[256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[64,128],f8E5M2>, !torch.vtensor<[64,4],f8E8M0FNU>,
+           !torch.vtensor<[256,128],f8E5M2>, !torch.vtensor<[256,4],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],si32>
     return %0 : !torch.vtensor<[64,256],si32>
@@ -190,35 +191,71 @@ module {
 
   // Invalid: lhs_scale and rhs_scale are f32 instead of f8E8M0FNU
   func.func @test_scaled_mm_invalid_scale_dtype(
-      %arg0: !torch.vtensor<[64,32],ui32>,
+      %arg0: !torch.vtensor<[64,128],f8E5M2>,
       %arg1: !torch.vtensor<[64,4],f32>,
-      %arg2: !torch.vtensor<[256,32],ui32>,
+      %arg2: !torch.vtensor<[256,128],f8E5M2>,
       %arg3: !torch.vtensor<[256,4],f32>) -> !torch.vtensor<[64,256],bf16> {
     %none = torch.constant.none
     %int15 = torch.constant.int 15
     %int23 = torch.constant.int 23
     // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
-        : (!torch.vtensor<[64,32],ui32>, !torch.vtensor<[64,4],f32>,
-           !torch.vtensor<[256,32],ui32>, !torch.vtensor<[256,4],f32>,
+        : (!torch.vtensor<[64,128],f8E5M2>, !torch.vtensor<[64,4],f32>,
+           !torch.vtensor<[256,128],f8E5M2>, !torch.vtensor<[256,4],f32>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>
   }
 
-  // Invalid: lhs_scale contracting dim (2) is not 1/8 of lhs contracting dim (32)
+  // Invalid: lhs_scale contracting dim is 2 but expected K/32 = 128/32 = 4
   func.func @test_scaled_mm_invalid_scale_shape(
-      %arg0: !torch.vtensor<[64,32],ui32>,
+      %arg0: !torch.vtensor<[64,128],f8E5M2>,
       %arg1: !torch.vtensor<[64,2],f8E8M0FNU>,
-      %arg2: !torch.vtensor<[256,32],ui32>,
+      %arg2: !torch.vtensor<[256,128],f8E5M2>,
       %arg3: !torch.vtensor<[256,4],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
     %none = torch.constant.none
     %int15 = torch.constant.int 15
     %int23 = torch.constant.int 23
     // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
     %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
-        : (!torch.vtensor<[64,32],ui32>, !torch.vtensor<[64,2],f8E8M0FNU>,
-           !torch.vtensor<[256,32],ui32>, !torch.vtensor<[256,4],f8E8M0FNU>,
+        : (!torch.vtensor<[64,128],f8E5M2>, !torch.vtensor<[64,2],f8E8M0FNU>,
+           !torch.vtensor<[256,128],f8E5M2>, !torch.vtensor<[256,4],f8E8M0FNU>,
+           !torch.none, !torch.none, !torch.int, !torch.int)
+        -> !torch.vtensor<[64,256],bf16>
+    return %0 : !torch.vtensor<[64,256],bf16>
+  }
+
+  // Invalid: K=33 is not divisible by block_size (32).
+  func.func @test_scaled_mm_k_not_divisible_by_32(
+      %arg0: !torch.vtensor<[64,33],f8E5M2>,
+      %arg1: !torch.vtensor<[64,1],f8E8M0FNU>,
+      %arg2: !torch.vtensor<[256,33],f8E5M2>,
+      %arg3: !torch.vtensor<[256,1],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
+    %none = torch.constant.none
+    %int15 = torch.constant.int 15
+    %int23 = torch.constant.int 23
+    // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
+    %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
+        : (!torch.vtensor<[64,33],f8E5M2>, !torch.vtensor<[64,1],f8E8M0FNU>,
+           !torch.vtensor<[256,33],f8E5M2>, !torch.vtensor<[256,1],f8E8M0FNU>,
+           !torch.none, !torch.none, !torch.int, !torch.int)
+        -> !torch.vtensor<[64,256],bf16>
+    return %0 : !torch.vtensor<[64,256],bf16>
+  }
+
+  // Invalid: dynamic K is rejected (symmetric with the fused op).
+  func.func @test_scaled_mm_dynamic_k(
+      %arg0: !torch.vtensor<[64,?],f8E5M2>,
+      %arg1: !torch.vtensor<[64,?],f8E8M0FNU>,
+      %arg2: !torch.vtensor<[256,?],f8E5M2>,
+      %arg3: !torch.vtensor<[256,?],f8E8M0FNU>) -> !torch.vtensor<[64,256],bf16> {
+    %none = torch.constant.none
+    %int15 = torch.constant.int 15
+    %int23 = torch.constant.int 23
+    // expected-error @+1 {{failed to legalize operation 'torch.operator'}}
+    %0 = torch.operator "torch.neuron._scaled_mm"(%arg0, %arg1, %arg2, %arg3, %none, %none, %int15, %int23)
+        : (!torch.vtensor<[64,?],f8E5M2>, !torch.vtensor<[64,?],f8E8M0FNU>,
+           !torch.vtensor<[256,?],f8E5M2>, !torch.vtensor<[256,?],f8E8M0FNU>,
            !torch.none, !torch.none, !torch.int, !torch.int)
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>

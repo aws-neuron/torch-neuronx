@@ -33,6 +33,24 @@ namespace mlir::torch {
 #include "torch-mlir/Conversion/Passes.h.inc"
 
 namespace {
+
+// Returns true if `t` is one of the FP8 element types supported by the MX
+// custom ops (E5M2 or E4M3FN). The E8M0FNU type is used only for MX scale
+// factors and is intentionally excluded here.
+static bool isSupportedFp8(Type t) {
+  return isa<Float8E5M2Type, Float8E4M3FNType>(t);
+}
+
+// Maps the backend_config `dtype` string to the corresponding FP8 MLIR type.
+// Returns a null `Type` for unrecognized values so callers can error out.
+static Type fp8TypeFromStr(StringRef s, MLIRContext *ctx) {
+  if (s == "float8_e5m2")
+    return Float8E5M2Type::get(ctx);
+  if (s == "float8_e4m3fn")
+    return Float8E4M3FNType::get(ctx);
+  return {};
+}
+
 class ConvertNeuronOperatorOp : public OpConversionPattern<Torch::OperatorOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -1117,7 +1135,9 @@ public:
     if (operands.size() != 8)
       return rewriter.notifyMatchFailure(op, "expected 8 operands");
 
-    // 1. Validate lhs and rhs (must be packed ui32 ranked tensors)
+    // 1. Validate lhs and rhs (must be FP8 ranked tensors: E5M2 or E4M3FN).
+    // The downstream Neuron backend handles any target-specific ui32
+    // (FP8_x4) repacking, so this lowering stays FP8-native.
     Value mat1 = operands[0]; // lhs
     Value mat2 = operands[2]; // rhs
     auto mat1Type = dyn_cast<RankedTensorType>(mat1.getType());
@@ -1125,10 +1145,10 @@ public:
     if (!mat1Type || !mat2Type)
       return rewriter.notifyMatchFailure(op,
                                          "lhs and rhs must be ranked tensors");
-    if (!mat1Type.getElementType().isUnsignedInteger(32) ||
-        !mat2Type.getElementType().isUnsignedInteger(32))
+    if (!isSupportedFp8(mat1Type.getElementType()) ||
+        !isSupportedFp8(mat2Type.getElementType()))
       return rewriter.notifyMatchFailure(
-          op, "lhs and rhs element types must be ui32 (packed MX format)");
+          op, "lhs and rhs element types must be FP8 (E5M2 or E4M3FN)");
     int64_t mat1Rank = mat1Type.getRank();
     int64_t mat2Rank = mat2Type.getRank();
     if (mat1Rank < 2 || mat2Rank < 2)
@@ -1147,22 +1167,33 @@ public:
         !isa<Float8E8M0FNUType>(scaleBType.getElementType()))
       return rewriter.notifyMatchFailure(
           op, "lhs_scale and rhs_scale element types must be f8E8M0FNU");
-    // Validate scale contracting dim = packed contracting dim / 8
-    // (block_size=32, pack_size=4 → 32/4 = 8 packed elements per scale block)
-    int64_t packedKMat1 = mat1Type.getDimSize(mat1Rank - 1);
-    int64_t packedKMat2 = mat2Type.getDimSize(mat2Rank - 1);
+    if (scaleAType.getRank() != mat1Rank || scaleBType.getRank() != mat2Rank)
+      return rewriter.notifyMatchFailure(
+          op, "scale tensors must have the same rank as their data tensors");
+    // Reject dynamic contracting (K) dims: the contract-vs-scale and
+    // K-divisibility checks below cannot be enforced otherwise, and the
+    // downstream backend would surface an unhelpful runtime error.
+    constexpr int64_t kBlockSize = 32;
+    int64_t kMat1 = mat1Type.getDimSize(mat1Rank - 1);
+    int64_t kMat2 = mat2Type.getDimSize(mat2Rank - 1);
+    if (kMat1 == ShapedType::kDynamic || kMat2 == ShapedType::kDynamic)
+      return rewriter.notifyMatchFailure(
+          op, "lhs and rhs contracting (K) dimensions must be static");
+    if (kMat1 % kBlockSize != 0 || kMat2 % kBlockSize != 0)
+      return rewriter.notifyMatchFailure(
+          op, "lhs and rhs contracting (K) dimensions must be divisible "
+              "by block_size (32)");
+    // Validate scale contracting dim equals FP8 contracting dim / block_size.
     int64_t scaleKA = scaleAType.getDimSize(mat1Rank - 1);
     int64_t scaleKB = scaleBType.getDimSize(mat2Rank - 1);
-    if (packedKMat1 != ShapedType::kDynamic && scaleKA != ShapedType::kDynamic)
-      if (scaleKA != packedKMat1 / 8)
-        return rewriter.notifyMatchFailure(
-            op, "lhs_scale contracting dimension size must be 1/8 of lhs "
-                "contracting dimension size (block_size=32, pack_size=4)");
-    if (packedKMat2 != ShapedType::kDynamic && scaleKB != ShapedType::kDynamic)
-      if (scaleKB != packedKMat2 / 8)
-        return rewriter.notifyMatchFailure(
-            op, "rhs_scale contracting dimension size must be 1/8 of rhs "
-                "contracting dimension size (block_size=32, pack_size=4)");
+    if (scaleKA != ShapedType::kDynamic && scaleKA != kMat1 / kBlockSize)
+      return rewriter.notifyMatchFailure(
+          op, "lhs_scale contracting dimension size must equal lhs "
+              "contracting dimension size divided by block_size (32)");
+    if (scaleKB != ShapedType::kDynamic && scaleKB != kMat2 / kBlockSize)
+      return rewriter.notifyMatchFailure(
+          op, "rhs_scale contracting dimension size must equal rhs "
+              "contracting dimension size divided by block_size (32)");
 
     // 3. Validate bias and scale_result are None (unsupported for now)
     if (!isa<Torch::NoneType>(operands[4].getType()))
@@ -1221,8 +1252,8 @@ public:
       }
     }
 
-    // 7. Build result shape [..., M, N]
-    // mat1: [..., M, K/4] (packed), mat2: [..., N, K/4] (transposed, packed)
+    // 6. Build result shape [..., M, N]
+    // mat1: [..., M, K] FP8, mat2: [..., N, K] FP8 (rhs is already transposed).
     SmallVector<int64_t> resultShape;
     for (int64_t i = 0; i < mat1Rank - 2; ++i)
       resultShape.push_back(mat1Type.getDimSize(i));
@@ -1230,7 +1261,7 @@ public:
     resultShape.push_back(mat2Type.getDimSize(mat2Rank - 2)); // N
     auto resultType = RankedTensorType::get(resultShape, outElemType);
 
-    // 8. Build scaled_dot_backend_config JSON
+    // 7. Build scaled_dot_backend_config JSON
     auto formatDimList = [](const SmallVector<int64_t> &dims) -> std::string {
       std::string s = "[";
       for (size_t i = 0; i < dims.size(); ++i) {
@@ -1260,7 +1291,7 @@ public:
     auto dotConfig = rewriter.getStringAttr(dotConfigStr);
     auto dotCallTarget = rewriter.getStringAttr("__op$block_scaled_dot");
 
-    // 9. Emit custom call: (lhs, rhs, lhs_scale, rhs_scale) -> result
+    // 8. Emit custom call: (lhs, rhs, lhs_scale, rhs_scale) -> result
     auto customCall = stablehlo::CustomCallOp::create(
         rewriter, loc, TypeRange{resultType},
         ValueRange{mat1, mat2, scaleA, scaleB}, dotCallTarget, false, dotConfig,
@@ -1355,7 +1386,10 @@ public:
 
     // --- Validate quantization dimensions have static sizes ---
     // Both lhs and rhs quantize along their last dim (K dimension).
-    // lhs: [..., M, K], rhs: [..., N, K] (transposed layout)
+    // lhs: [..., M, K], rhs: [..., N, K] (transposed layout).
+    // Quantize-along-last-dim is intentional for the fused op; callers that
+    // need a non-innermost quant dim should use torch.aten.quantize_mx
+    // directly and feed the result into torch.neuron._scaled_mm.
     int64_t lhsQuantDim = lhsRank - 1;
     int64_t rhsQuantDim = rhsRank - 1;
     int64_t lhsK = lhsType.getDimSize(lhsQuantDim);
@@ -1367,8 +1401,9 @@ public:
     constexpr int64_t blockSize = 32;
 
     // --- Common types ---
-    auto ui32Type =
-        IntegerType::get(rewriter.getContext(), 32, IntegerType::Unsigned);
+    // QuantizeMX quantized_data is FP8 (E5M2 or E4M3FN). Any target-specific
+    // ui32 (FP8_x4) repacking is done by the downstream Neuron backend.
+    Type fp8ElemType = fp8TypeFromStr(fp8DtypeStr, rewriter.getContext());
     auto scaleElemType = Float8E8M0FNUType::get(rewriter.getContext());
 
     // --- QuantizeMX backend_config (same for both lhs and rhs) ---
@@ -1381,27 +1416,25 @@ public:
     auto quantCallTarget = rewriter.getStringAttr("QuantizeMX");
 
     // --- Create QuantizeMX for lhs ---
-    // Input: lhs [..., M, K] → packed [..., M, K/4], scale [..., M, K/32]
-    SmallVector<int64_t> lhsPackedShape(lhsType.getShape());
-    lhsPackedShape[lhsQuantDim] = lhsK / 4;
-    auto lhsPackedType = RankedTensorType::get(lhsPackedShape, ui32Type);
+    // Input: lhs [..., M, K] → FP8 [..., M, K], scale [..., M, K/32]
+    auto lhsQuantType = RankedTensorType::get(lhsType.getShape(), fp8ElemType);
 
     SmallVector<int64_t> lhsScaleShape(lhsType.getShape());
     lhsScaleShape[lhsQuantDim] = (lhsK + blockSize - 1) / blockSize;
     auto lhsScaleType = RankedTensorType::get(lhsScaleShape, scaleElemType);
 
+    // lhs/rhs are bf16/f16 here (high-precision inputs to QuantizeMX);
+    // promoteType is a no-op or widening cast, not an FP8 conversion.
     Value convertedLhs = hlo::promoteType(rewriter, loc, lhs, lhsElemType);
     auto lhsQuantOp = stablehlo::CustomCallOp::create(
-        rewriter, loc, TypeRange{lhsPackedType, lhsScaleType},
+        rewriter, loc, TypeRange{lhsQuantType, lhsScaleType},
         ValueRange{convertedLhs}, quantCallTarget, false, quantConfig,
         stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL, nullptr, nullptr,
         nullptr, nullptr);
 
     // --- Create QuantizeMX for rhs ---
-    // Input: rhs [..., N, K] → packed [..., N, K/4], scale [..., N, K/32]
-    SmallVector<int64_t> rhsPackedShape(rhsType.getShape());
-    rhsPackedShape[rhsQuantDim] = rhsK / 4;
-    auto rhsPackedType = RankedTensorType::get(rhsPackedShape, ui32Type);
+    // Input: rhs [..., N, K] → FP8 [..., N, K], scale [..., N, K/32]
+    auto rhsQuantType = RankedTensorType::get(rhsType.getShape(), fp8ElemType);
 
     SmallVector<int64_t> rhsScaleShape(rhsType.getShape());
     rhsScaleShape[rhsQuantDim] = (rhsK + blockSize - 1) / blockSize;
@@ -1409,14 +1442,14 @@ public:
 
     Value convertedRhs = hlo::promoteType(rewriter, loc, rhs, rhsElemType);
     auto rhsQuantOp = stablehlo::CustomCallOp::create(
-        rewriter, loc, TypeRange{rhsPackedType, rhsScaleType},
+        rewriter, loc, TypeRange{rhsQuantType, rhsScaleType},
         ValueRange{convertedRhs}, quantCallTarget, false, quantConfig,
         stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL, nullptr, nullptr,
         nullptr, nullptr);
 
     // --- Create block_scaled_dot ---
-    // lhs_packed [..., M, K/4] × rhs_packed [..., N, K/4] → [..., M, N]
-    // Both contract on last dim (K/4).
+    // lhs_fp8 [..., M, K] × rhs_fp8 [..., N, K] → [..., M, N]
+    // Both contract on last dim (K).
     // Batch dims: [0 .. rank-3], contracting: [rank-1]
     SmallVector<int64_t> batchDims;
     for (int64_t i = 0; i < lhsRank - 2; ++i)
@@ -1456,7 +1489,7 @@ public:
     auto dotConfig = rewriter.getStringAttr(dotConfigStr);
     auto dotCallTarget = rewriter.getStringAttr("__op$block_scaled_dot");
 
-    // Inputs: lhs_packed, rhs_packed, lhs_scale, rhs_scale
+    // Inputs: lhs_fp8, rhs_fp8, lhs_scale, rhs_scale
     SmallVector<Value> dotInputs = {
         lhsQuantOp.getResult(0), rhsQuantOp.getResult(0),
         lhsQuantOp.getResult(1), rhsQuantOp.getResult(1)};
@@ -1847,13 +1880,11 @@ public:
     }
 
     // 7. Build output types
-    // Output #0: quantized data - packed uint32 (4 FP8 values per element)
-    // Shape: same as input, but quantization dim divided by 4
-    auto ui32Type =
-        IntegerType::get(rewriter.getContext(), 32, IntegerType::Unsigned);
-    SmallVector<int64_t> packedShape(inputType.getShape());
-    packedShape[dim] = dimSize / 4;
-    auto outputType = RankedTensorType::get(packedShape, ui32Type);
+    // Output #0: quantized data - FP8 (E5M2 or E4M3FN), same shape as input.
+    // Any target-specific ui32 (FP8_x4) repacking at the hardware boundary
+    // is performed by the downstream Neuron backend.
+    Type fp8ElemType = fp8TypeFromStr(dtypeStr, rewriter.getContext());
+    auto outputType = RankedTensorType::get(inputType.getShape(), fp8ElemType);
 
     // Output #1: scale tensor - f8E8M0FNU, dim replaced by ceil(dimSize/32)
     auto scaleElemType = Float8E8M0FNUType::get(rewriter.getContext());

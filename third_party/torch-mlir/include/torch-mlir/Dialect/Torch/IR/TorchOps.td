@@ -1447,12 +1447,17 @@ def Torch_AtenQuantizeMxOp : Torch_Op<"aten.quantize_mx", [
     HasValueSemantics,
     ReadOnly
   ]> {
-  let summary = "Block-wise microscaling (MX) quantization of a tensor to packed uint32 format";
+  let summary = "Block-wise microscaling (MX) quantization of a tensor to FP8 format";
   let description = [{
     Performs MX quantization along a specified dimension, dividing the input
     into blocks and computing per-block scale factors. Returns the quantized
-    data as packed uint32 (4 FP8 values per element, quantization dimension
-    divided by 4) and the scale factors in F8E8M0FNU format.
+    data as FP8 (E5M2 or E4M3FN) with the same shape as the input and the
+    scale factors in F8E8M0FNU format (quantization dim divided by block_size).
+
+    The downstream Neuron backend is responsible for any target-specific
+    repacking (e.g. bitcasting groups of FP8 values into wider integer
+    types) required at the hardware boundary; producers emit the FP8 result
+    as-is.
 
     Maps to `aten::quantize_mx(Tensor self, int dim, int block_size,
     ScalarType dtype, int scale_calculation_mode) -> (Tensor, Tensor)`.
