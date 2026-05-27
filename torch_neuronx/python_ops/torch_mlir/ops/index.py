@@ -19,7 +19,7 @@ class IndexMLIRImpl(OperationImplementation):
         """Initialize the index kernel"""
         super().__init__()
 
-        def index_fn(tensor, indices):
+        def index_fn(tensor, indices, *, out=None):
             # Handle negative index values
             normalized_indices = []
             for i, idx in enumerate(indices):

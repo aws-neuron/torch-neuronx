@@ -267,3 +267,20 @@ class TestIndexRegistration:
             result.dtype == expected.dtype
         ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"
         torch.testing.assert_close(result.cpu(), expected)
+
+    def test_index_tensor_out_variant(self):
+        """Test index.Tensor_out variant with pre-allocated output tensor."""
+        x_cpu = torch.randn(4, 8)
+        idx = torch.tensor([0, 2, 3])
+
+        expected = torch.ops.aten.index(x_cpu, [idx])
+
+        x_neuron = x_cpu.to("neuron")
+        idx_neuron = idx.to("neuron")
+        out = torch.empty(3, 8, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.index.Tensor_out(x_neuron, [idx_neuron], out=out)
+            assert_op_runs_on_neuron("index")
+
+        torch.testing.assert_close(out.cpu(), expected, rtol=1e-4, atol=1e-4)

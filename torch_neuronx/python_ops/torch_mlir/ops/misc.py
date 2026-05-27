@@ -62,15 +62,18 @@ def torch_log_softmax(x, dim, dtype=None):
 
 
 @register_aten(
-    ["aten::_softmax_backward_data", "aten::_softmax_backward_data.out"], static_argnums=(2, 3)
+    ["aten::_softmax_backward_data", "aten::_softmax_backward_data.out"],
+    static_argnums=(2, 3),
+    output_params=("grad_input",),
 )
-def torch_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
+def torch_softmax_backward_data(grad_output, output, dim, input_dtype, grad_input=None):
     return torch.ops.aten._softmax_backward_data(grad_output, output, dim, input_dtype)
 
 
 @register_aten(
     ["aten::_log_softmax_backward_data", "aten::_log_softmax_backward_data.out"],
     static_argnums=(2, 3),
+    output_params=("out",),
 )
 def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
     return torch.ops.aten._log_softmax_backward_data(grad_output, output, dim, input_dtype)

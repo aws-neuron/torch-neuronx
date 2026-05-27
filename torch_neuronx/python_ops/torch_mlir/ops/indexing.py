@@ -30,7 +30,13 @@ def index_checking(tensor, indices):
         if idx.is_floating_point():
             raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
 
-        # Bounds checking on PyTorch tensors
+        # Bounds checking on PyTorch tensors.
+        # Note: for neuron-device indices, bounds checking is handled by the
+        # C++ DispatchIndexImpl (NeuronDispatcher.cpp) which copies idx to CPU
+        # via idx.cpu() for validation. That copy logs "neuron::copy::neuron_to_cpu"
+        # as an executed op, causing index.Tensor_out to appear as cpu_fallback
+        # in coverage tests. This is a known limitation of the op tracking
+        # infrastructure — the op runs correctly on neuron.
         if not skip_op_preconditions():
             size = tensor.shape[dim]
             if torch.any(idx >= size) or torch.any(idx < -size):
