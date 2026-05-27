@@ -214,6 +214,13 @@ at::neuron::CPUFallbackContext BuildCPUFallbackContext(const std::vector<c10::IV
 std::string ExtractBaseOpName(const std::string& op_name);
 
 /**
+ * True if `src` and `dst` share storage with overlapping byte ranges.
+ * Caller must pass contiguous tensors so [storage_offset, storage_offset + numel)
+ * describes the actual byte footprint.
+ */
+bool RawNrtCopyOverlaps(const at::Tensor& src, const at::Tensor& dst);
+
+/**
  * Reduction op configuration for empty tensor handling.
  * Mirrors Python ReductionOps in config.py.
  */

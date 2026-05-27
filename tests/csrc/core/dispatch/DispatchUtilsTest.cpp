@@ -543,6 +543,83 @@ TEST(IValueToMetaTest, GenericListWithTensors) {
   EXPECT_EQ(list[1].toInt(), 42);
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  RawNrtCopyOverlaps — byte-range overlap test for shared storage
+// ═══════════════════════════════════════════════════════════════
+
+TEST(RawNrtCopyOverlapsTest, DifferentStorageNeverOverlaps) {
+  auto a = torch::zeros({100}, torch::kFloat32);
+  auto b = torch::zeros({100}, torch::kFloat32);
+  EXPECT_FALSE(RawNrtCopyOverlaps(a, b));
+}
+
+TEST(RawNrtCopyOverlapsTest, IdenticalView) {
+  auto base = torch::zeros({100}, torch::kFloat32);
+  EXPECT_TRUE(RawNrtCopyOverlaps(base, base));
+}
+
+TEST(RawNrtCopyOverlapsTest, AdjacentViewsDoNotOverlap) {
+  auto base = torch::zeros({100}, torch::kFloat32);
+  auto a = base.slice(0, 0, 50);    // [0, 50)
+  auto b = base.slice(0, 50, 100);  // [50, 100)
+  EXPECT_FALSE(RawNrtCopyOverlaps(a, b));
+  EXPECT_FALSE(RawNrtCopyOverlaps(b, a));
+}
+
+TEST(RawNrtCopyOverlapsTest, PartialOverlap) {
+  auto base = torch::zeros({100}, torch::kFloat32);
+  auto a = base.slice(0, 10, 50);  // [10, 50)
+  auto b = base.slice(0, 30, 80);  // [30, 80)
+  EXPECT_TRUE(RawNrtCopyOverlaps(a, b));
+  EXPECT_TRUE(RawNrtCopyOverlaps(b, a));
+}
+
+TEST(RawNrtCopyOverlapsTest, ContainedView) {
+  auto base = torch::zeros({100}, torch::kFloat32);
+  auto outer = base.slice(0, 10, 80);  // [10, 80)
+  auto inner = base.slice(0, 30, 50);  // [30, 50)
+  EXPECT_TRUE(RawNrtCopyOverlaps(outer, inner));
+  EXPECT_TRUE(RawNrtCopyOverlaps(inner, outer));
+}
+
+TEST(RawNrtCopyOverlapsTest, ExactBoundaryDoesNotOverlap) {
+  // Half-open intervals: [0, 50) and [50, 100) touch but do not overlap.
+  auto base = torch::zeros({100}, torch::kFloat32);
+  auto a = base.slice(0, 0, 50);
+  auto b = base.slice(0, 50, 100);
+  EXPECT_FALSE(RawNrtCopyOverlaps(a, b));
+}
+
+TEST(RawNrtCopyOverlapsTest, DifferentDtypesSameStorage) {
+  // Bool view of fp32 storage via storage-sharing.
+  auto fp32 = torch::zeros({10}, torch::kFloat32);  // 40 bytes
+  auto i8_view = torch::empty({40}, torch::kInt8);
+  i8_view.set_(fp32.storage(), 0, {40}, {1});
+  // fp32[0:5] occupies bytes [0, 20); i8_view[10:30] occupies bytes [10, 30) —
+  // overlap on [10, 20).
+  auto fp32_slice = fp32.slice(0, 0, 5);
+  auto i8_slice = i8_view.slice(0, 10, 30);
+  EXPECT_TRUE(RawNrtCopyOverlaps(fp32_slice, i8_slice));
+}
+
+TEST(RawNrtCopyOverlapsTest, EmptyTensorsDoNotOverlap) {
+  auto base = torch::zeros({100}, torch::kFloat32);
+  auto empty = base.slice(0, 50, 50);  // numel == 0
+  auto nonempty = base.slice(0, 0, 100);
+  EXPECT_FALSE(RawNrtCopyOverlaps(empty, nonempty));
+  EXPECT_FALSE(RawNrtCopyOverlaps(nonempty, empty));
+}
+
+TEST(RawNrtCopyOverlapsTest, NonZeroStorageOffsets) {
+  auto base = torch::zeros({200}, torch::kFloat32);
+  auto a = base.slice(0, 50, 100);  // storage_offset=50
+  auto b = base.slice(0, 75, 125);  // storage_offset=75; overlap [75, 100)
+  EXPECT_TRUE(RawNrtCopyOverlaps(a, b));
+
+  auto c = base.slice(0, 100, 150);  // storage_offset=100; no overlap with a
+  EXPECT_FALSE(RawNrtCopyOverlaps(a, c));
+}
+
 }  // namespace
 }  // namespace dispatch
 }  // namespace torch_neuronx

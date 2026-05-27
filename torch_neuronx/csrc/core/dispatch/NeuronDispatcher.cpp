@@ -456,16 +456,16 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
   }
 
   // ── Neuron → Neuron ──
-  //
-  // Three tiers, most optimal first:
-  //   1. MLIR pipeline  — contiguous dst, supported dtypes, default stream
-  //   2. NRT on-device  — non-contiguous dst, same dtype, same shape
-  //   3. NRT CPU bounce — everything else
+  //   1. MLIR pipeline    — contiguous dst, supported dtypes, default stream
+  //   2. NRT on-device    — non-contiguous dst, same dtype, same shape
+  //   2.5. Raw NRT N→N    — same dtype, contiguous src, non-default stream + hostCC
+  //   3. NRT CPU bounce   — everything else
   if (src_is_neuron && dst_is_neuron) {
+    const bool is_non_default_hostcc = IsNonDefaultStreamWithHostCC(self_tensor.device().index());
     bool mlir_can_handle = self_tensor.dim() > 0 && self_tensor.is_contiguous() &&
                            IsCopyMlirDtypeSupported(src.scalar_type()) &&
                            IsCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
-                           !IsNonDefaultStreamWithHostCC(self_tensor.device().index());
+                           !is_non_default_hostcc;
 
     // ── 1. MLIR lowering pipeline (most optimal) ──
     // Mirrors Python CopyMLIRImpl.can_handle(): contiguous dst, supported
@@ -552,15 +552,31 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
+    // ── 2.5. Raw NRT on-device copy (non-default stream + hostCC) ──
+    // Identity copy has no fused collective, so raw NRT is safe even though
+    // MLIR is gated. Predicate rejects anything byte-copy can't reproduce.
+    if (is_non_default_hostcc && src.scalar_type() == self_tensor.scalar_type() &&
+        IsCopyMlirDtypeSupported(src.scalar_type()) && !needs_broadcast &&
+        src.device().index() == self_tensor.device().index() && !src.is_neg() && !src.is_conj() &&
+        !self_tensor.is_neg() && !self_tensor.is_conj() && src.is_contiguous() &&
+        !RawNrtCopyOverlaps(src, self_tensor)) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron raw NRT on-device",
+                                   " src_dtype=", src.scalar_type(), " src_shape=", src.sizes());
+      torch_neuronx::utils::copy_neuron_to_neuron(src, self_tensor);
+      logOperationExecuted("aten::copy_");
+      torch::jit::push(*stack, self_tensor);
+      return;
+    }
+
     // ── 3. NRT CPU bounce (least optimal) ──
-    // Contiguous dst but MLIR unavailable: unsupported dtype or non-default
-    // stream.  CPU bounce handles dtype cast + broadcast.
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron NRT CPU bounce");
+    bool async_write = is_non_default_hostcc;
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron NRT CPU bounce",
+                                 " async_write=", async_write);
     auto tmp_cpu = CopyNeuronToCPU(src, self_tensor.scalar_type());
     if (needs_broadcast) {
       tmp_cpu = tmp_cpu.expand_as(self_tensor).contiguous();
     }
-    CopyCPUIntoNeuron(tmp_cpu, self_tensor, /*non_blocking=*/false);
+    CopyCPUIntoNeuron(tmp_cpu, self_tensor, /*non_blocking=*/async_write);
     logOperationExecuted("aten::copy_");
     torch::jit::push(*stack, self_tensor);
     return;
@@ -696,14 +712,13 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
   }
 
   // ── Neuron → Neuron ──
-  //
-  // Two tiers, most optimal first:
-  //   1. MLIR pipeline  — supported dtypes, default stream
-  //   2. NRT CPU bounce — unsupported dtypes or non-default stream
+  //   1. MLIR pipeline   — supported dtypes, default stream (or hostCC off)
+  //   2. Raw NRT N→N     — same dtype, contiguous src, non-default stream + hostCC
+  //   3. NRT CPU bounce  — everything else
   if (src_is_neuron && dst_is_neuron) {
+    const bool is_non_default_hostcc = IsNonDefaultStreamWithHostCC(self_tensor.device().index());
     bool mlir_can_handle = IsToCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
-                           IsToCopyMlirDtypeSupported(target_dtype) &&
-                           !IsNonDefaultStreamWithHostCC(self_tensor.device().index());
+                           IsToCopyMlirDtypeSupported(target_dtype) && !is_non_default_hostcc;
 
     // ── 1. MLIR lowering pipeline (most optimal) ──
     if (mlir_can_handle) {
@@ -728,10 +743,29 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
-    // ── 2. NRT CPU bounce ──
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce");
+    // ── 2. Raw NRT on-device copy (non-default stream + hostCC, same dtype) ──
+    if (is_non_default_hostcc && self_tensor.scalar_type() == target_dtype &&
+        IsCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
+        self_tensor.device().index() == target_device.index() && !self_tensor.is_neg() &&
+        !self_tensor.is_conj() && self_tensor.is_contiguous()) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron raw NRT on-device",
+                                   " src_dtype=", self_tensor.scalar_type(),
+                                   " target_dtype=", target_dtype,
+                                   " src_shape=", self_tensor.sizes());
+      auto dst = at::empty(self_tensor.sizes(),
+                           at::TensorOptions().dtype(target_dtype).device(target_device));
+      torch_neuronx::utils::copy_neuron_to_neuron(self_tensor, dst);
+      logOperationExecuted("aten::_to_copy");
+      torch::jit::push(*stack, dst);
+      return;
+    }
+
+    // Async write on non-default stream + hostCC; default stream stays sync.
+    bool async_write = is_non_default_hostcc;
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce",
+                                 " async_write=", async_write);
     auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
-    auto dst = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/false);
+    auto dst = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/async_write);
     logOperationExecuted("aten::_to_copy");
     torch::jit::push(*stack, dst);
     return;
