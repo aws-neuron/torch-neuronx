@@ -10,14 +10,19 @@ import logging
 import torch
 from torch._library.fake_class_registry import FakeScriptObject
 from torch.distributed.device_mesh import DeviceMesh
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class ReplaceDeviceMeshPlaceholders(PassBase):
-    def __init__(self):
-        super().__init__()
+class ReplaceDeviceMeshPlaceholders(NeuronFXPass):
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.removed_indices: list[int] | None = None
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:

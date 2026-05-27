@@ -152,53 +152,57 @@ def neuron_backend_fx_compiler(
         logger.debug("Trivial graph detected (graph break artifact), using passthrough")
         return make_boxed_func(gm.forward)
 
-    logger.debug("Applying FX graph transformations...")
-    with dynamo_timed("torch_neuronx_fx_passes"):
-        post_aot_processing_result = post_aot_processing(gm)
-    gm = post_aot_processing_result.graph_module
-    mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
-    none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
-    shard_input_info = post_aot_processing_result.analysis.get("shard_input_info", None)
-    removed_device_mesh_indices = post_aot_processing_result.analysis.get(
-        "removed_device_mesh_indices", None
-    )
-    passthrough_info = post_aot_processing_result.analysis.get("passthrough_info", None)
-    aliasing_info = (
-        None
-        if pre_processing_analysis_info is None
-        else pre_processing_analysis_info.get("aliasing_analysis", None)
-    )
-
-    # Merge pass-through aliasing into aliasing_info for StableHLO input_output_alias.
-    # Pass-throughs are inputs returned unchanged — the compiler treats these as no-op
-    # when input_output_alias is set. Mutations are not merged here because they
-    # require the compiler to execute the computation and write into the aliased buffer.
-    if passthrough_info is not None and len(passthrough_info) > 0:
-        if aliasing_info is None:
-            aliasing_info = AliasingInfo()
-        for alias in passthrough_info.aliases:
-            aliasing_info.add(alias.parameter_number, alias.parameter_index, alias.output_index)
-
-    logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
-    logger.debug(
-        f"Example inputs: {[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
-    )
-
-    # Get model name from global variable
+    # Get model name from global variable (needed before compilation_job creation)
     model_name = get_model_name() if options is None else options.get("model_name", "model_default")
-
-    # Set retain device mode
-    retain_device = os.environ.get("TORCH_NEURONX_RETAIN_DEVICE_MODE", "0") == "1"
-
-    # Construct human-readable graph name from model_name and AOT compile ID
-    # get_aot_graph_name() returns: model__{aot_id}_{graph_type}_{nth}
-    # We replace generic "model" prefix with user's model_name
-    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
-    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
-    graph_name = f"{model_name}_{compile_id}"  # e.g., "LlamaForCausalLM_0_inference_0"
 
     # Create a CompilationJob for this compilation using context manager for automatic cleanup
     with compilation_job(op_name=model_name) as job:
+        # Save the FX graph before any transformations
+        job.save_fx_graph(model_name, gm)
+
+        logger.debug("Applying FX graph transformations...")
+        with dynamo_timed("torch_neuronx_fx_passes"):
+            post_aot_processing_result = post_aot_processing(gm, job=job, model_name=model_name)
+        gm = post_aot_processing_result.graph_module
+        mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
+        none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
+        shard_input_info = post_aot_processing_result.analysis.get("shard_input_info", None)
+        removed_device_mesh_indices = post_aot_processing_result.analysis.get(
+            "removed_device_mesh_indices", None
+        )
+        passthrough_info = post_aot_processing_result.analysis.get("passthrough_info", None)
+        aliasing_info = (
+            None
+            if pre_processing_analysis_info is None
+            else pre_processing_analysis_info.get("aliasing_analysis", None)
+        )
+
+        # Merge pass-through aliasing into aliasing_info for StableHLO input_output_alias.
+        # Pass-throughs are inputs returned unchanged — the compiler treats these as no-op
+        # when input_output_alias is set. Mutations are not merged here because they
+        # require the compiler to execute the computation and write into the aliased buffer.
+        if passthrough_info is not None and len(passthrough_info) > 0:
+            if aliasing_info is None:
+                aliasing_info = AliasingInfo()
+            for alias in passthrough_info.aliases:
+                aliasing_info.add(alias.parameter_number, alias.parameter_index, alias.output_index)
+
+        logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
+        logger.debug(
+            f"Example inputs: "
+            f"{[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
+        )
+
+        # Set retain device mode
+        retain_device = os.environ.get("TORCH_NEURONX_RETAIN_DEVICE_MODE", "0") == "1"
+
+        # Construct human-readable graph name from model_name and AOT compile ID
+        # get_aot_graph_name() returns: model__{aot_id}_{graph_type}_{nth}
+        # We replace generic "model" prefix with user's model_name
+        aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
+        compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
+        graph_name = f"{model_name}_{compile_id}"  # e.g., "LlamaForCausalLM_0_inference_0"
+
         segment_id = job.timestamp  # Use job timestamp as segment ID
 
         logger.debug(f"Model name: {model_name}")
@@ -208,9 +212,6 @@ def neuron_backend_fx_compiler(
             # Detect collectives early in the pipeline
             has_collectives = _has_collectives_in_graph(gm)
             logger.debug(f"Graph contains collectives: {has_collectives}")
-
-            # Save the FX graph we received
-            job.save_fx_graph(model_name, gm)
 
             stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
                 gm,

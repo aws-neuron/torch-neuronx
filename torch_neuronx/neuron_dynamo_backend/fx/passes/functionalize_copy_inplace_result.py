@@ -1,7 +1,11 @@
 import torch
 from torch.fx import GraphModule, Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 
 # Operations that MUTATE data in-place (scatter, copy, etc.)
@@ -45,7 +49,7 @@ TRACEABLE_OPS = {
 TRACEABLE_MUTATION_OPS = MUTATION_OPS | TRACEABLE_OPS
 
 
-class FunctionalizeCopyInplacePass(PassBase):
+class FunctionalizeCopyInplacePass(NeuronFXPass):
     """
     Pass that detects and records input-output mutation relationships.
 
@@ -58,8 +62,8 @@ class FunctionalizeCopyInplacePass(PassBase):
     aliasing but we still track that the output derives from mutating the input.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.mutation_info: AliasingInfo = AliasingInfo()
         self.passthrough_info: AliasingInfo = AliasingInfo()
 

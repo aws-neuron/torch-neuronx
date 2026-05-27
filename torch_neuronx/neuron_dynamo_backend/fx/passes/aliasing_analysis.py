@@ -16,14 +16,18 @@ from typing import ClassVar
 
 import torch
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 
 logger = logging.getLogger(__name__)
 
 
-class AliasingAnalysis(PassBase):
+class AliasingAnalysis(NeuronFXPass):
     """Aliasing and Mutation Analysis Pass for PyTorch FX Graphs.
 
     This pass analyzes a PyTorch FX GraphModule to identify:
@@ -35,8 +39,8 @@ class AliasingAnalysis(PassBase):
     followed by non-aliased explicit outputs.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.result: AliasingInfo | None = None
 
     @property

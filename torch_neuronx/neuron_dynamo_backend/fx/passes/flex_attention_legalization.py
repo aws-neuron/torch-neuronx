@@ -12,8 +12,13 @@ from dataclasses import dataclass
 import torch
 import torch.fx as fx
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 from torch.fx.passes.shape_prop import TensorMetadata
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +35,7 @@ class AttentionShapes:
     E: int  # head dimension
 
 
-class FlexAttentionLegalization(PassBase):
+class FlexAttentionLegalization(NeuronFXPass):
     """Flex Attention Legalization Pass for PyTorch FX Graphs.
 
     This pass legalizes flex_attention higher-order operators by decomposing
@@ -41,8 +46,8 @@ class FlexAttentionLegalization(PassBase):
     handles them explicitly.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self._forward_score_mod_name: str | None = None
         self._forward_score_mod_module: fx.GraphModule | None = None
         self._forward_mask_mod_module: fx.GraphModule | None = None

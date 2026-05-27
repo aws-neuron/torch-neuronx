@@ -26,8 +26,12 @@ import torch
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph, Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
 
 logger = logging.getLogger(__name__)
@@ -317,7 +321,7 @@ def _infer_shard_index(graph: fx.Graph) -> int | None:
     return None  # No patterns found — nothing to rewrite
 
 
-class ShardIndexInjection(PassBase):
+class ShardIndexInjection(NeuronFXPass):
     """Inject a vocab_shard_index scalar placeholder at the end of graph inputs.
 
     Guards:
@@ -327,8 +331,8 @@ class ShardIndexInjection(PassBase):
     - Skips if shard indices from different patterns conflict
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.result: ShardInputInfo | None = None
 
     def _no_op(self, graph_module: fx.GraphModule, count: int) -> PassResult:
@@ -380,7 +384,7 @@ class ShardIndexInjection(PassBase):
         return PassResult(graph_module, True)
 
 
-class VocabShardingSPMD(PassBase):
+class VocabShardingSPMD(NeuronFXPass):
     """Rewrite vocab sharding constants to vocab-shard-index-dependent expressions.
 
     Finds the vocab_shard_index placeholder injected by ShardIndexInjection, then rewrites

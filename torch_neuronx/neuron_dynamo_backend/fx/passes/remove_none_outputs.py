@@ -9,7 +9,12 @@ import logging
 from dataclasses import dataclass
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +28,9 @@ class NoneOutputInfo:
     new_output_count: int
 
 
-class RemoveNoneOutputs(PassBase):
-    def __init__(self):
-        super().__init__()
+class RemoveNoneOutputs(NeuronFXPass):
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.result: NoneOutputInfo | None = None
 
     def _normalize_outputs(self, output_node: torch.fx.Node) -> list[torch.fx.Node | None]:

@@ -19,7 +19,7 @@ import torch
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 from torch.fx.passes.shape_prop import TensorMetadata
 
 from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import (
@@ -29,6 +29,10 @@ from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import 
     generate_graph_lowering,
     jinja_env,
     save_and_import_kernel,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
 )
 from torch_neuronx.nki_hop import kernel_registry, nki_kernel_wrapper, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores, map_external_dtype_to_torch
@@ -351,14 +355,14 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale):
     return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types, lnc
 
 
-class FlexAttentionNKILowering(PassBase):
+class FlexAttentionNKILowering(NeuronFXPass):
     """Flex Attention Lowering Pass to a NKI kernel.
 
     This pass lowers the flex attention HOP to a NKI kernel.
     """
 
-    def __init__(self, static_tile_elimination=True):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None, static_tile_elimination=True):
+        super().__init__(state)
         self.tile_shape = [128, 128]
         self.static_tile_elimination = static_tile_elimination
 
