@@ -663,6 +663,182 @@ TEST_F(NeuronCompilerTest, DebugDir_SingleDotPath_WorksCorrectly) {
   std::system("rm -rf ./neuronx-cc");
 }
 
+// ============================================================================
+// Additional Args Tokenization Tests - verify single-quote-aware parsing
+// ============================================================================
+
+TEST_F(NeuronCompilerTest, AdditionalArgs_SingleQuotedValuePassedAsSingleArg) {
+  // Verify that a single-quoted value with an '=' is passed as one argument
+  // with quotes stripped. The mock script checks that the argument arrives intact.
+  std::string bin_dir = temp_dir_ + "/bin";
+  std::filesystem::create_directories(bin_dir);
+  std::string path = bin_dir + "/neuronx-cc";
+  std::ofstream f(path);
+  f << "#!/bin/bash\n"
+    << "for arg in \"$@\"; do\n"
+    << "  if [[ \"$arg\" == \"--options=--foo=bar\" ]]; then\n"
+    << "    for ((i=1; i<=$#; i++)); do\n"
+    << "      if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "        j=$((i+1)); echo -n 'quoted_ok' > \"${!j}\"; break\n"
+    << "      fi\n"
+    << "    done\n"
+    << "    exit 0\n"
+    << "  fi\n"
+    << "done\n"
+    << "exit 1\n";
+  f.close();
+  chmod(path.c_str(), 0755);
+  setenv("PATH", (bin_dir + ":" + original_path_).c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig("--options='--foo=bar'");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  std::string result_str(result.begin(), result.end());
+  EXPECT_EQ(result_str, "quoted_ok");
+}
+
+TEST_F(NeuronCompilerTest, AdditionalArgs_QuotedValueWithSpacesIsOneArg) {
+  // Verify that spaces inside single quotes do NOT split the token.
+  std::string bin_dir = temp_dir_ + "/bin";
+  std::filesystem::create_directories(bin_dir);
+  std::string path = bin_dir + "/neuronx-cc";
+  std::ofstream f(path);
+  f << "#!/bin/bash\n"
+    << "for arg in \"$@\"; do\n"
+    << "  if [[ \"$arg\" == \"--msg=hello world\" ]]; then\n"
+    << "    for ((i=1; i<=$#; i++)); do\n"
+    << "      if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "        j=$((i+1)); echo -n 'space_ok' > \"${!j}\"; break\n"
+    << "      fi\n"
+    << "    done\n"
+    << "    exit 0\n"
+    << "  fi\n"
+    << "done\n"
+    << "exit 1\n";
+  f.close();
+  chmod(path.c_str(), 0755);
+  setenv("PATH", (bin_dir + ":" + original_path_).c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig("--msg='hello world'");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  std::string result_str(result.begin(), result.end());
+  EXPECT_EQ(result_str, "space_ok");
+}
+
+TEST_F(NeuronCompilerTest, AdditionalArgs_DeepseekV3FlagsTokenizedCorrectly) {
+  // Reproduces the exact deepseek_v3_16b case from the bug:
+  // "--internal-disable-fma-on-ios
+  // --internal-hlo2tensorizer-options='--partitioner-bnt-labels=false'" Should produce exactly 2
+  // args (besides the standard ones).
+  std::string bin_dir = temp_dir_ + "/bin";
+  std::filesystem::create_directories(bin_dir);
+  std::string path = bin_dir + "/neuronx-cc";
+  std::ofstream f(path);
+  // Script checks that both args arrive correctly as separate tokens
+  f << "#!/bin/bash\n"
+    << "found_fma=0\n"
+    << "found_tensorizer=0\n"
+    << "for arg in \"$@\"; do\n"
+    << "  if [[ \"$arg\" == \"--internal-disable-fma-on-ios\" ]]; then\n"
+    << "    found_fma=1\n"
+    << "  fi\n"
+    << "  if [[ \"$arg\" == \"--internal-hlo2tensorizer-options=--partitioner-bnt-labels=false\" "
+       "]]; then\n"
+    << "    found_tensorizer=1\n"
+    << "  fi\n"
+    << "done\n"
+    << "if [[ $found_fma -eq 1 && $found_tensorizer -eq 1 ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'deepseek_ok' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
+    << "fi\n"
+    << "exit 1\n";
+  f.close();
+  chmod(path.c_str(), 0755);
+  setenv("PATH", (bin_dir + ":" + original_path_).c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig(
+      "--internal-disable-fma-on-ios "
+      "--internal-hlo2tensorizer-options='--partitioner-bnt-labels=false'");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  std::string result_str(result.begin(), result.end());
+  EXPECT_EQ(result_str, "deepseek_ok");
+}
+
+TEST_F(NeuronCompilerTest, AdditionalArgs_EmptyStringProducesNoExtraArgs) {
+  // Empty additional_args should not add any extra arguments.
+  // The mock script counts total args: compile, input, --framework, XLA,
+  // --target, trn2, --lnc, 2, -O2, --output, module.neff = 11 args
+  std::string bin_dir = temp_dir_ + "/bin";
+  std::filesystem::create_directories(bin_dir);
+  std::string path = bin_dir + "/neuronx-cc";
+  std::ofstream f(path);
+  f << "#!/bin/bash\n"
+    << "# With empty additional_args, expect exactly 11 args\n"
+    << "if [[ $# -eq 11 ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'empty_ok' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
+    << "fi\n"
+    << "exit 1\n";
+  f.close();
+  chmod(path.c_str(), 0755);
+  setenv("PATH", (bin_dir + ":" + original_path_).c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig("");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  std::string result_str(result.begin(), result.end());
+  EXPECT_EQ(result_str, "empty_ok");
+}
+
+TEST_F(NeuronCompilerTest, AdditionalArgs_MultipleSpacesBetweenArgsIgnored) {
+  // Multiple spaces between args should not produce empty tokens.
+  std::string bin_dir = temp_dir_ + "/bin";
+  std::filesystem::create_directories(bin_dir);
+  std::string path = bin_dir + "/neuronx-cc";
+  std::ofstream f(path);
+  f << "#!/bin/bash\n"
+    << "found_a=0\n"
+    << "found_b=0\n"
+    << "for arg in \"$@\"; do\n"
+    << "  if [[ \"$arg\" == \"--aaa\" ]]; then found_a=1; fi\n"
+    << "  if [[ \"$arg\" == \"--bbb\" ]]; then found_b=1; fi\n"
+    << "  if [[ \"$arg\" == \"\" ]]; then exit 1; fi\n"  // fail on empty arg
+    << "done\n"
+    << "if [[ $found_a -eq 1 && $found_b -eq 1 ]]; then\n"
+    << "  for ((i=1; i<=$#; i++)); do\n"
+    << "    if [[ \"${!i}\" == \"--output\" ]]; then\n"
+    << "      j=$((i+1)); echo -n 'spaces_ok' > \"${!j}\"; break\n"
+    << "    fi\n"
+    << "  done\n"
+    << "  exit 0\n"
+    << "fi\n"
+    << "exit 1\n";
+  f.close();
+  chmod(path.c_str(), 0755);
+  setenv("PATH", (bin_dir + ":" + original_path_).c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig("  --aaa    --bbb  ");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  std::string result_str(result.begin(), result.end());
+  EXPECT_EQ(result_str, "spaces_ok");
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   int result = RUN_ALL_TESTS();

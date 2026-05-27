@@ -89,11 +89,27 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
     compiler_args.push_back(config.optimization_level);
   }
 
-  // Parse and add additional compiler arguments
-  std::istringstream additional_args_stream(config.additional_args);
-  std::string single_arg;
-  while (additional_args_stream >> single_arg) {
-    compiler_args.push_back(single_arg);
+  // Parse and add additional compiler arguments (handles single-quoted values)
+  {
+    const std::string& args = config.additional_args;
+    std::string current;
+    bool in_quotes = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+      char c = args[i];
+      if (c == '\'') {
+        in_quotes = !in_quotes;
+      } else if (c == ' ' && !in_quotes) {
+        if (!current.empty()) {
+          compiler_args.push_back(current);
+          current.clear();
+        }
+      } else {
+        current += c;
+      }
+    }
+    if (!current.empty()) {
+      compiler_args.push_back(current);
+    }
   }
 
   compiler_args.push_back(kOutputFlag);
