@@ -412,13 +412,13 @@ class TestTargetOpsCoverage:
                 or isinstance(s.input, list | tuple)
             ]
 
-        # Filter out 0-d tensor args for remainder — triggers NRT execution timeout.
+        # Clamp zeros in divisor args for remainder — integer division by zero
+        # causes the compiled NEFF to hang on Neuron hardware.
         if "remainder" in op_name:
-            samples = [
-                s
-                for s in samples
-                if not any(isinstance(a, torch.Tensor) and a.dim() == 0 for a in s.args)
-            ]
+            for s in samples:
+                for a in s.args:
+                    if isinstance(a, torch.Tensor) and a.dtype in (torch.int32, torch.int64):
+                        a.clamp_(min=1)
 
         if not samples:
             result["error"] = "no shapes registered"
