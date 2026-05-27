@@ -4,7 +4,10 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import (
+    assert_op_did_not_run_on_neuron,
+    track_neuron_ops,
+)
 
 
 def test_to_copy_cpu_to_neuron():
@@ -142,3 +145,154 @@ def test_to_copy_preserves_strides_transpose(cpp_dispatch):
         torch.testing.assert_close(t_neu.cpu(), t)
     finally:
         os.environ.pop("TORCH_NEURONX_CPP_DISPATCH", None)
+
+
+def _make_tensor_with_stride(shape, dtype, pattern):
+    """Create a CPU tensor with the given stride pattern and random data."""
+
+    def _rand(s, dt):
+        if dt == torch.bool:
+            return torch.randint(0, 2, s, dtype=dt)
+        if dt in (torch.int32,):
+            return torch.randint(0, 4, s, dtype=dt)
+        return torch.randn(s, dtype=dt)
+
+    if pattern == "contiguous":
+        return _rand(shape, dtype)
+    elif pattern == "transpose":
+        return _rand((shape[1], shape[0]), dtype).t()
+    elif pattern == "slice_even_cols":
+        return _rand((shape[0], shape[1] * 2), dtype)[:, 0::2]
+    elif pattern == "slice_even_rows":
+        return _rand((shape[0] * 2, shape[1]), dtype)[0::2, :]
+    elif pattern == "as_strided_gaps":
+        base = _rand((shape[0], shape[1] * 2), dtype)
+        return base.as_strided(shape, (shape[1] * 2, 1))
+    elif pattern == "chunk":
+        return _rand((shape[0], shape[1] * 3), dtype).chunk(3, dim=-1)[1]
+
+
+@pytest.mark.parametrize(
+    "stride_pattern",
+    ["transpose", "slice_even_cols", "slice_even_rows", "as_strided_gaps", "chunk"],
+)
+def test_to_cpu_preserves_strides(stride_pattern):
+    """Test that neuron .cpu() produces correct strides matching PyTorch semantics.
+
+    Non-overlapping-and-dense (e.g. transpose): strides preserved.
+    Others (e.g. slices with gaps): output is contiguous.
+    """
+    shape = (64, 64)
+    t_cpu = _make_tensor_with_stride(shape, torch.float32, stride_pattern)
+    t_neuron = t_cpu.to("neuron")
+    result = t_neuron.cpu()
+
+    if torch.ops.aten.is_non_overlapping_and_dense(t_cpu):
+        expected_stride = t_cpu.stride()
+    else:
+        expected_stride = torch.empty(t_cpu.shape).stride()
+
+    assert (
+        result.stride() == expected_stride
+    ), f"stride mismatch: got {result.stride()}, expected {expected_stride}"
+    torch.testing.assert_close(result, t_cpu)
+
+
+_COPY_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.int32,
+    torch.bool,
+]
+_NO_CPU_BOUNCE_PATTERNS = {"contiguous", "transpose"}
+
+
+@pytest.mark.parametrize("src_dtype", _COPY_DTYPES, ids=[str(d) for d in _COPY_DTYPES])
+@pytest.mark.parametrize("dst_dtype", _COPY_DTYPES, ids=[str(d) for d in _COPY_DTYPES])
+@pytest.mark.parametrize(
+    "stride_pattern",
+    ["contiguous", "transpose", "slice_even_cols", "slice_even_rows", "as_strided_gaps", "chunk"],
+)
+def test_copy_neuron_to_neuron_dtype_cast_no_cpu_bounce(src_dtype, dst_dtype, stride_pattern):
+    """copy_ between Neuron tensors with dtype mismatch and non-contiguous dst
+    must cast on-device without CPU bounce for supported patterns, and produce
+    correct results for all patterns."""
+    shape = (64, 64)
+    src_cpu = _make_tensor_with_stride(shape, src_dtype, "contiguous")
+    dst_cpu = _make_tensor_with_stride(shape, dst_dtype, stride_pattern)
+
+    src_neuron = src_cpu.to("neuron")
+    dst_neuron = dst_cpu.to("neuron")
+
+    with track_neuron_ops():
+        dst_neuron.copy_(src_neuron)
+
+    if stride_pattern in _NO_CPU_BOUNCE_PATTERNS:
+        assert_op_did_not_run_on_neuron("neuron::copy::neuron_to_cpu")
+
+    # CPU reference — always check accuracy
+    dst_cpu.copy_(src_cpu)
+    assert (
+        dst_neuron.stride() == dst_cpu.stride()
+    ), f"stride mismatch: neuron={dst_neuron.stride()} cpu={dst_cpu.stride()}"
+    torch.testing.assert_close(dst_neuron.cpu(), dst_cpu)
+
+
+@pytest.mark.parametrize("src_dtype", _COPY_DTYPES, ids=[str(d) for d in _COPY_DTYPES])
+@pytest.mark.parametrize("dst_dtype", _COPY_DTYPES, ids=[str(d) for d in _COPY_DTYPES])
+@pytest.mark.parametrize(
+    "stride_pattern",
+    ["contiguous", "transpose", "slice_even_cols", "slice_even_rows", "as_strided_gaps", "chunk"],
+)
+def test_to_dtype_neuron_no_cpu_bounce(src_dtype, dst_dtype, stride_pattern):
+    """Neuron .to(dtype) with non-contiguous source must cast on-device without CPU bounce
+    for supported patterns, and produce correct results for all patterns."""
+    shape = (64, 64)
+    src_cpu = _make_tensor_with_stride(shape, src_dtype, stride_pattern)
+
+    src_neuron = src_cpu.to("neuron")
+
+    with track_neuron_ops():
+        result_neuron = src_neuron.to(dst_dtype)
+
+    if stride_pattern in _NO_CPU_BOUNCE_PATTERNS:
+        assert_op_did_not_run_on_neuron("neuron::copy::neuron_to_cpu")
+    assert result_neuron.dtype == dst_dtype
+
+    # CPU reference — always check accuracy
+    expected = src_cpu.to(dst_dtype)
+    assert (
+        result_neuron.stride() == expected.stride()
+    ), f"stride mismatch: neuron={result_neuron.stride()} cpu={expected.stride()}"
+    torch.testing.assert_close(result_neuron.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", _COPY_DTYPES, ids=[str(d) for d in _COPY_DTYPES])
+@pytest.mark.parametrize(
+    "src_shape,dst_base_shape,dst_slice",
+    [
+        ((5,), (1, 5, 5, 3), (slice(None), slice(None), slice(None), 0)),
+        ((5, 1), (1, 5, 5, 3), (slice(None), slice(None), slice(None), 0)),
+        ((5,), (5, 3), (slice(None), 0)),
+    ],
+    ids=["1d_into_3d_slice", "2d_into_3d_slice", "1d_into_2d_slice"],
+)
+def test_copy_broadcast_into_non_contiguous_dst(dtype, src_shape, dst_base_shape, dst_slice):
+    """copy_ with broadcast src into a non-contiguous dst (slice of a larger tensor)."""
+    if dtype in (torch.bool, torch.int32):
+        src_cpu = torch.randint(0, 2, src_shape, dtype=dtype)
+        base_cpu = torch.randint(0, 2, dst_base_shape, dtype=dtype)
+    else:
+        src_cpu = torch.randn(src_shape, dtype=dtype)
+        base_cpu = torch.randn(dst_base_shape, dtype=dtype)
+
+    dst_cpu = base_cpu[dst_slice]
+    base_neuron = base_cpu.to("neuron")
+    dst_neuron = base_neuron[dst_slice]
+    src_neuron = src_cpu.to("neuron")
+
+    dst_neuron.copy_(src_neuron)
+    dst_cpu.copy_(src_cpu)
+
+    torch.testing.assert_close(dst_neuron.cpu(), dst_cpu)
