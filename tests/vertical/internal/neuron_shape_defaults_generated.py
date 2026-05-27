@@ -2509,10 +2509,14 @@ def register_all_defaults(r):
         {"self": (256, 4096), "other": 1.0},
         source="builtin",
     )
-    r("aten::remainder.Tensor", {"self": (256, 4096), "other": (256, 4096)}, source="builtin")
+    r(
+        "aten::remainder.Tensor",
+        {"self": (256, 4096), "other": {"shape": (256, 4096), "low": 1}},
+        source="builtin",
+    )
     r(
         "aten::remainder.Tensor_out",
-        {"self": (256, 4096), "other": (256, 4096)},
+        {"self": (256, 4096), "other": {"shape": (256, 4096), "low": 1}},
         source="builtin",
     )
     r(
