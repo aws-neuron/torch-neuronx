@@ -132,6 +132,11 @@ class ConcatenationEngine {
   // Default: enabled. Set TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE=0 to disable
   bool skip_intermediate_enabled_ = true;
 
+  // Feature flag for in-place aliasing (removes in-place ops as boundaries)
+  // Controlled by TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING environment variable
+  // Default: disabled. Set TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 to enable
+  bool aliasing_enabled_ = false;
+
   /**
    * @brief Flush operations in global order to maintain submission ordering
    * Flushes buffered operations in global order (no concatenation)

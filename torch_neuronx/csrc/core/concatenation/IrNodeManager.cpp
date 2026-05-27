@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -595,6 +596,61 @@ bool IrNodeManager::PruneMlirFunction(StableHloNode* node, void* dealloc_address
     return false;
   }
 
+  // Remap mhlo.input_output_alias output indices after pruning. Drop entries for
+  // pruned outputs. Update both FuncOp and ModuleOp (alias can be on either).
+  auto remapAliasAttr = [&](mlir::Operation* op) {
+    if (!op->hasAttr("mhlo.input_output_alias")) return;
+
+    // Build old→new index mapping for kept outputs
+    std::unordered_map<size_t, size_t> old_to_new;
+    size_t new_idx = 0;
+    for (size_t i = 0; i < node->outputs.size(); i++) {
+      if (indicesToKeep.count(i)) {
+        old_to_new[i] = new_idx++;
+      }
+    }
+
+    mlir::OpBuilder builder(op->getContext());
+    auto oldAliasAttr = op->getAttrOfType<mlir::ArrayAttr>("mhlo.input_output_alias");
+    llvm::SmallVector<mlir::Attribute> newAliasList;
+
+    for (auto attr : oldAliasAttr) {
+      auto dictAttr = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+      if (!dictAttr) continue;
+
+      auto outputIdxAttr = dictAttr.getAs<mlir::DenseI64ArrayAttr>("output_index");
+      if (!outputIdxAttr || outputIdxAttr.empty()) continue;
+
+      size_t old_out_idx = static_cast<size_t>(outputIdxAttr[0]);
+
+      // If this aliased output was pruned, drop the entry
+      if (old_to_new.find(old_out_idx) == old_to_new.end()) {
+        TORCH_NEURONX_DEBUG("Removing alias entry for pruned output[", old_out_idx, "]");
+        continue;
+      }
+
+      // Remap to new index
+      size_t new_out_idx = old_to_new[old_out_idx];
+      auto aliasInner = dictAttr.getAs<mlir::DictionaryAttr>("alias");
+      auto newOutputIdxAttr = builder.getDenseI64ArrayAttr({static_cast<int64_t>(new_out_idx)});
+      auto newEntry =
+          builder.getDictionaryAttr({builder.getNamedAttr("alias", aliasInner),
+                                     builder.getNamedAttr("output_index", newOutputIdxAttr)});
+      newAliasList.push_back(newEntry);
+    }
+
+    if (newAliasList.empty()) {
+      op->removeAttr("mhlo.input_output_alias");
+    } else {
+      op->setAttr("mhlo.input_output_alias", builder.getArrayAttr(newAliasList));
+    }
+  };
+
+  // Remap alias on the FuncOp (set by ConcatAll overlap detection)
+  remapAliasAttr(funcOp.getOperation());
+  // Remap alias on the ModuleOp (set by OpConcatUtils during merge)
+  remapAliasAttr((*node->module)->getOperation());
+
   return true;
 }
 
@@ -651,7 +707,8 @@ void IrNodeManager::ValidatePostPruneConsistency(const StableHloNode* node) {
   }
 }
 
-bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address) {
+bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address,
+                                      PruneSource source) {
   if (!node || !node->module) {
     TORCH_NEURONX_WARN("Invalid node or module for pruning");
     return false;
@@ -673,7 +730,15 @@ bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address
 
   // Save the original cache key before any mutations for cache lookup
   std::string original_cache_key = node->cache_key;
-  std::string new_cache_key = GeneratePruningCacheKey(original_cache_key, pruned_indices);
+  // Differentiate prune source in the key to prevent collisions between
+  // ConcatAll skip-intermediates and double-buffer lookahead pruning.
+  std::string source_prefix = (source == PruneSource::kDoubleBuffer) ? "|db_pruned" : "|pruned";
+  std::vector<size_t> sorted_indices = pruned_indices;
+  std::sort(sorted_indices.begin(), sorted_indices.end());
+  std::string new_cache_key = original_cache_key + source_prefix;
+  for (size_t idx : sorted_indices) {
+    new_cache_key += "_" + std::to_string(idx);
+  }
   std::unordered_set<size_t> pruned_set(pruned_indices.begin(), pruned_indices.end());
 
   // Check cache for already-pruned MLIR
@@ -922,25 +987,63 @@ IrConcatResult IrNodeManager::ConcatAll(const std::list<IrNode*>& input_ir_list)
 
   // Build result
   if (state.merged_owned) {
-    // Check for input-output overlap (controlled by member variable)
+    // Annotate remaining input-output address overlap with mhlo.input_output_alias
+    // on the ModuleOp so the compiler knows these buffers are shared.
     bool has_overlap = false;
     if (check_overlap_enabled_) {
+      auto* hlo_node = static_cast<StableHloNode*>(state.merged);
       std::unordered_set<void*> input_addrs;
-      std::unordered_set<void*> output_addrs;
-
-      for (void* addr : state.merged->inputs) {
+      for (void* addr : hlo_node->inputs) {
         if (addr) input_addrs.insert(addr);
       }
 
-      for (void* addr : state.merged->outputs) {
-        if (addr) output_addrs.insert(addr);
-      }
-
-      for (void* addr : output_addrs) {
-        if (input_addrs.count(addr)) {
-          TORCH_NEURONX_DEBUG("Concatenated IR has input-output address overlap, addr=", addr);
+      std::vector<std::pair<size_t, size_t>> overlap_pairs;  // (output_idx, input_idx)
+      for (size_t out_idx = 0; out_idx < hlo_node->outputs.size(); out_idx++) {
+        void* out_addr = hlo_node->outputs[out_idx];
+        if (!out_addr) continue;
+        if (input_addrs.count(out_addr)) {
+          // Find the matching input index
+          for (size_t in_idx = 0; in_idx < hlo_node->inputs.size(); in_idx++) {
+            if (hlo_node->inputs[in_idx] == out_addr) {
+              overlap_pairs.emplace_back(out_idx, in_idx);
+              break;
+            }
+          }
           has_overlap = true;
         }
+      }
+
+      if (has_overlap && aliasing_enabled_) {
+        // Add mhlo.input_output_alias for overlapping pairs on the ModuleOp.
+        // Convention: alias attribute lives on the ModuleOp (matching OpConcatUtils
+        // addAliasingForConcatenatedModule and what neuronx-cc reads).
+        mlir::OpBuilder builder((*hlo_node->module)->getContext());
+        llvm::SmallVector<mlir::Attribute> aliasList;
+
+        for (auto& [out_idx, in_idx] : overlap_pairs) {
+          auto paramNumAttr = builder.getI64IntegerAttr(static_cast<int64_t>(in_idx));
+          auto paramIdxAttr = builder.getDenseI64ArrayAttr({});
+          auto kindAttr = builder.getStringAttr("must_alias");
+          auto aliasInner =
+              builder.getDictionaryAttr({builder.getNamedAttr("kind", kindAttr),
+                                         builder.getNamedAttr("parameter_number", paramNumAttr),
+                                         builder.getNamedAttr("parameter_index", paramIdxAttr)});
+          auto outputIdxAttr = builder.getDenseI64ArrayAttr({static_cast<int64_t>(out_idx)});
+          auto aliasOuter =
+              builder.getDictionaryAttr({builder.getNamedAttr("alias", aliasInner),
+                                         builder.getNamedAttr("output_index", outputIdxAttr)});
+          aliasList.push_back(aliasOuter);
+
+          TORCH_NEURONX_DEBUG("Added input_output_alias: output[", out_idx, "] -> input[", in_idx,
+                              "] addr=", hlo_node->outputs[out_idx]);
+        }
+
+        if (!aliasList.empty()) {
+          auto moduleOp = (*hlo_node->module)->getOperation();
+          moduleOp->setAttr(builder.getStringAttr("mhlo.input_output_alias"),
+                            builder.getArrayAttr(aliasList));
+        }
+        has_overlap = false;  // Handled via aliasing — don't discard
       }
     }
 

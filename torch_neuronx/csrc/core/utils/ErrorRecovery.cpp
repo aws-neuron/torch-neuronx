@@ -51,18 +51,12 @@ OperationContextResult ErrorRecovery::AttemptCompilableRecovery(OperationContext
   EXECUTION_RUNTIME_CHECK(operation->RequiresCompilation(),
                           "This operation requires a compilable kernel");
 
-  // Handle concatenation failure first - invalidate cache and cleanup
-  // For concatenated operations, we fall back to op-by-op execution
+  // Handle concatenation failure - invalidate cache, detach cascading ops,
+  // and return success so individual ops can be retried independently.
+  // Do NOT fall through to CPU fallback for concatenation-related ops.
   if (operation->HasConcatenatedOperation() || operation->IsConcatenatedOperation()) {
     RecoverConcatenationFailure(operation);
-    // For concatenated operations themselves, signal fallback and return success
-    // so the individual ops can be retried
-    if (operation->IsConcatenatedOperation() && !operation->HasConcatenatedOperation()) {
-      TORCH_NEURONX_DEBUG("Concatenated operation compilation failed, falling back to op-by-op",
-                          "stream_id=", operation->stream->stream_id,
-                          "op=", operation->GetOpName());
-      return OperationContextResult::CreateSuccess();
-    }
+    return OperationContextResult::CreateSuccess();
   }
 
   if (!ShouldAttemptCpuFallback()) {

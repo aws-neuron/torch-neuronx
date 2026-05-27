@@ -60,6 +60,12 @@ ConcatenationEngine::ConcatenationEngine()
     skip_intermediate_enabled_ = false;
     TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE=0 (disabled)");
   }
+
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    aliasing_enabled_ = true;
+    TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 (enabled)");
+  }
 }
 
 // Destructor
@@ -364,8 +370,13 @@ std::list<OperationContext*> ConcatenationEngine::ProcessConcatenationTask(
   // ========================================================================
   bool is_boundary;
   if (skip_intermediate_enabled_) {
-    // New behavior with skip intermediate enabled
-    is_boundary = IsNonFusibleBoundaryOperation(operation, stream) || IsInPlaceOperation(operation);
+    is_boundary = IsNonFusibleBoundaryOperation(operation, stream);
+    // In-place ops are only boundaries when aliasing is NOT enabled.
+    // With aliasing, the merge uses mhlo.input_output_alias to handle in-place
+    // outputs as intermediates that get overwritten.
+    if (!aliasing_enabled_) {
+      is_boundary = is_boundary || IsInPlaceOperation(operation);
+    }
   } else {
     // Old behavior without skip intermediate
     is_boundary =

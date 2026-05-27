@@ -913,12 +913,11 @@ static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
       void* input_addr = (input_module == 1) ? module1_input_addrs[orig_input_idx]
                                              : module2_input_addrs[orig_input_idx];
 
-      // Check if addresses match
+      // Check if addresses match — one alias entry per output (first matching input wins)
       if (input_addr == output_addr && input_addr != nullptr) {
         TORCH_NEURONX_DEBUG("Found aliasing: merged_input[", merged_input_idx,
                             "] == merged_output[", merged_output_idx, "] addr=", input_addr);
 
-        // Build alias attribute
         auto paramNumAttr = builder.getI64IntegerAttr(merged_input_idx);
         auto paramIdxAttr = builder.getDenseI64ArrayAttr({});
         auto kindAttr = builder.getStringAttr("must_alias");
@@ -936,6 +935,7 @@ static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
 
         aliasList.push_back(aliasOuter);
         TORCH_NEURONX_DEBUG("Added alias entry #", aliasList.size());
+        break;
       }
     }
   }
@@ -2527,10 +2527,36 @@ std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensorsInOrder(StableHlo
 
   auto mapping = std::make_unique<MergeMapping>();
 
+  // Skip module1 outputs that module2 overwrites in-place (same address as both
+  // its input and output) to avoid duplicate addresses in the merged result.
+  std::unordered_set<size_t> module1_skip;
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    // Find module2 outputs that are in-place (output_addr == input_addr)
+    std::unordered_set<void*> module2_inplace_addrs;
+    for (void* out_addr : module2_output_addrs) {
+      if (!out_addr) continue;
+      for (void* in_addr : module2_input_addrs) {
+        if (in_addr == out_addr) {
+          module2_inplace_addrs.insert(out_addr);
+          break;
+        }
+      }
+    }
+
+    // Skip module1 outputs whose address matches a module2 in-place address
+    // (module1 produced it, module2 overwrites it in-place → intermediate)
+    for (size_t i = 0; i < module1_output_addrs.size(); i++) {
+      if (module1_output_addrs[i] && module2_inplace_addrs.count(module1_output_addrs[i])) {
+        module1_skip.insert(i);
+      }
+    }
+  }
+
   // Use in-order merge
-  auto merged =
-      mergeModulesInOrder(*mod1, *mod2, context, module1_input_addrs, module1_output_addrs,
-                          module2_input_addrs, module2_output_addrs, mapping.get());
+  auto merged = mergeModulesInOrder(*mod1, *mod2, context, module1_input_addrs,
+                                    module1_output_addrs, module2_input_addrs, module2_output_addrs,
+                                    mapping.get(), true, module1_skip);
 
   if (!merged) {
     TORCH_NEURONX_DEBUG("ERROR: mergeStableHLOModulesWithTensorsInOrder: Merge failed");
