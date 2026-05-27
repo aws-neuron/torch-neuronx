@@ -17,8 +17,17 @@ def _copy_fn(src, out_dtype=None, out=None):
     produce an unsupported tensor<Nxindex> constant in StableHLO).
     """
     if out_dtype is not None:
-        return src.to(out_dtype) + 0
-    return src + 0
+        # Float-to-int requires explicit truncation to match PyTorch semantics
+        if out_dtype in (torch.int32, torch.int16, torch.int8) and src.is_floating_point():
+            src = src.trunc()
+        result = src.to(out_dtype)
+    else:
+        result = src
+    # Force a copy (prevent no-op graph). Use bitwise OR for bool to avoid
+    # int64 promotion from `bool + 0`.
+    if (out_dtype or src.dtype) == torch.bool:
+        return result | False
+    return result + 0
 
 
 @neuron_op("aten::copy_", disable_dtype_autocast=True, priority=90)
@@ -60,8 +69,7 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
         # - int64/uint64: Not natively supported on device, handled by NRT-based implementation
-        # - bool: Requires special handling, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64, torch.bool)
+        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64)
         if not (
             dest.device.type == "neuron"
             and src.device.type == "neuron"
@@ -101,6 +109,8 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         if not dest.is_contiguous():
             from ...cast_policy import _write_to_noncontiguous_neuron
 
+            if src_prepared.dtype != dest.dtype:
+                src_prepared = src_prepared.to(dest.dtype)
             _write_to_noncontiguous_neuron(dest, src_prepared)
             return ExecutionResult(success=True, output=dest)
 
