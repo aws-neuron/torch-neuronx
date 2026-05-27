@@ -173,6 +173,25 @@ class TestSoftmaxBackwardRegistration:
         assert x_neuron.grad.device.type == "neuron"
         torch.testing.assert_close(x_neuron.grad.cpu(), x.grad, rtol=1e-4, atol=1e-4)
 
+    def test_softmax_backward_out_variant(self):
+        """Test _softmax_backward_data.out variant with pre-allocated output tensor."""
+        x = torch.randn(3, 4)
+        output = torch.softmax(x, dim=1)
+        grad_output = torch.randn_like(output)
+
+        output_neuron = output.to("neuron")
+        grad_output_neuron = grad_output.to("neuron")
+        grad_input = torch.empty_like(grad_output_neuron)
+
+        with track_neuron_ops():
+            torch.ops.aten._softmax_backward_data.out(
+                grad_output_neuron, output_neuron, 1, torch.float32, grad_input=grad_input
+            )
+            assert_op_runs_on_neuron("aten::_softmax_backward_data")
+
+        ref = torch.ops.aten._softmax_backward_data(grad_output, output, 1, torch.float32)
+        torch.testing.assert_close(grad_input.cpu(), ref, rtol=1e-4, atol=1e-4)
+
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 class TestLogSoftmaxBackwardRegistration:
@@ -341,6 +360,25 @@ class TestLogSoftmaxBackwardRegistration:
         # Check that gradients match
         assert x_neuron.grad.device.type == "neuron"
         torch.testing.assert_close(x_neuron.grad.cpu(), x.grad, rtol=1e-4, atol=1e-4)
+
+    def test_log_softmax_backward_out_variant(self):
+        """Test _log_softmax_backward_data.out variant with pre-allocated output tensor."""
+        x = torch.randn(3, 4)
+        output = torch.log_softmax(x, dim=1)
+        grad_output = torch.randn_like(output)
+
+        output_neuron = output.to("neuron")
+        grad_output_neuron = grad_output.to("neuron")
+        out = torch.empty_like(grad_output_neuron)
+
+        with track_neuron_ops():
+            torch.ops.aten._log_softmax_backward_data.out(
+                grad_output_neuron, output_neuron, 1, torch.float32, out=out
+            )
+            assert_op_runs_on_neuron("aten::_log_softmax_backward_data")
+
+        ref = torch.ops.aten._log_softmax_backward_data(grad_output, output, 1, torch.float32)
+        torch.testing.assert_close(out.cpu(), ref, rtol=1e-4, atol=1e-4)
 
     def test_log_softmax_vs_softmax_backward(self):
         """Test that log_softmax backward matches log(softmax) backward."""

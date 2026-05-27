@@ -117,3 +117,21 @@ class TestBatchNormStats:
 
         assert mean_out.shape == (8,)
         assert invstd_out.shape == (8,)
+
+    def test_batch_norm_stats_out_variant(self):
+        """Test batch_norm_stats.out variant with pre-allocated output tensors."""
+        device = "neuron"
+        input_tensor = torch.randn(4, 16, 32, 32, device=device)
+        eps = 1e-5
+
+        out_mean = torch.empty(16, device=device)
+        out_invstd = torch.empty(16, device=device)
+
+        with track_neuron_ops():
+            torch.ops.aten.batch_norm_stats.out(input_tensor, eps, out0=out_mean, out1=out_invstd)
+            assert_op_runs_on_neuron("aten::batch_norm_stats")
+
+        assert out_mean.shape == (16,)
+        assert out_invstd.shape == (16,)
+        assert torch.all(torch.isfinite(out_mean))
+        assert torch.all(torch.isfinite(out_invstd))

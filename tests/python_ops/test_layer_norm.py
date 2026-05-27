@@ -427,6 +427,79 @@ class TestLayerNormOperations:
             else:
                 assert output_neuron.shape == output_cpu.shape
 
+    def test_native_layer_norm_out_variant(self):
+        """Test native_layer_norm.out variant with pre-allocated output tensors."""
+        input_cpu = torch.randn(4, 8)
+        input_neuron = input_cpu.to("neuron")
+        weight_cpu = torch.randn(8)
+        bias_cpu = torch.randn(8)
+        weight_neuron = weight_cpu.to("neuron")
+        bias_neuron = bias_cpu.to("neuron")
+
+        out0 = torch.empty(4, 8, device="neuron")
+        out1 = torch.empty(4, 1, device="neuron")
+        out2 = torch.empty(4, 1, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.native_layer_norm.out(
+                input_neuron,
+                [8],
+                weight_neuron,
+                bias_neuron,
+                1e-5,
+                out0=out0,
+                out1=out1,
+                out2=out2,
+            )
+            assert_op_runs_on_neuron("native_layer_norm")
+
+        ref_out, ref_mean, ref_rstd = torch.native_layer_norm(
+            input_cpu, [8], weight_cpu, bias_cpu, 1e-5
+        )
+        torch.testing.assert_close(out0.cpu(), ref_out, rtol=1e-4, atol=1e-4)
+
+    def test_native_layer_norm_backward_out_variant(self):
+        """Test native_layer_norm_backward.out variant with pre-allocated output tensors."""
+        input_cpu = torch.randn(4, 8, requires_grad=True)
+        weight_cpu = torch.randn(8, requires_grad=True)
+        bias_cpu = torch.randn(8, requires_grad=True)
+
+        out_cpu, mean_cpu, rstd_cpu = torch.native_layer_norm(
+            input_cpu, [8], weight_cpu, bias_cpu, 1e-5
+        )
+        grad_out_cpu = torch.randn_like(out_cpu)
+
+        input_neuron = input_cpu.detach().to("neuron")
+        mean_neuron = mean_cpu.detach().to("neuron")
+        rstd_neuron = rstd_cpu.detach().to("neuron")
+        weight_neuron = weight_cpu.detach().to("neuron")
+        bias_neuron = bias_cpu.detach().to("neuron")
+        grad_out_neuron = grad_out_cpu.to("neuron")
+
+        out0 = torch.empty_like(input_neuron)
+        out1 = torch.empty(8, device="neuron")
+        out2 = torch.empty(8, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.native_layer_norm_backward.out(
+                grad_out_neuron,
+                input_neuron,
+                [8],
+                mean_neuron,
+                rstd_neuron,
+                weight_neuron,
+                bias_neuron,
+                [True, True, True],
+                out0=out0,
+                out1=out1,
+                out2=out2,
+            )
+            assert_op_runs_on_neuron("native_layer_norm_backward")
+
+        assert out0.shape == input_neuron.shape
+        assert out1.shape == (8,)
+        assert out2.shape == (8,)
+
     @assert_raises(RuntimeError)
     def test_layer_norm_invalid_normalized_shape(self):
         """Test layer norm with invalid normalized_shape that causes shape mismatch."""

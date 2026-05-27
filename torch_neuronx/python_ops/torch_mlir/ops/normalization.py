@@ -5,17 +5,34 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::native_layer_norm", "aten::native_layer_norm.out"], static_argnums=(1, 4))
-def torch_native_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5, out=None):
+@register_aten(
+    ["aten::native_layer_norm", "aten::native_layer_norm.out"],
+    static_argnums=(1, 4),
+    output_params=("out0", "out1", "out2"),
+)
+def torch_native_layer_norm(
+    input, normalized_shape, weight=None, bias=None, eps=1e-5, out0=None, out1=None, out2=None
+):
     return torch.native_layer_norm(input, normalized_shape, weight, bias, eps)
 
 
 @register_aten(
     ["aten::native_layer_norm_backward", "aten::native_layer_norm_backward.out"],
     static_argnums=(2, 7),
+    output_params=("out0", "out1", "out2"),
 )
 def torch_native_layer_norm_backward(
-    grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+    grad_out,
+    input,
+    normalized_shape,
+    mean,
+    rstd,
+    weight,
+    bias,
+    output_mask,
+    out0=None,
+    out1=None,
+    out2=None,
 ):
     return torch.ops.aten.native_layer_norm_backward(
         grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
@@ -42,8 +59,12 @@ def torch_batch_norm_backward_elemt(
     return grad_input
 
 
-@register_aten(["aten::batch_norm_stats", "aten::batch_norm_stats.out"], static_argnames=("eps",))
-def torch_batch_norm_stats(input, eps, out=None):
+@register_aten(
+    ["aten::batch_norm_stats", "aten::batch_norm_stats.out"],
+    static_argnames=("eps",),
+    output_params=("out0", "out1"),
+)
+def torch_batch_norm_stats(input, eps, out0=None, out1=None):
     """Compute batch normalization statistics (mean and inverse std)."""
 
     # Reduction axes: all except channel dimension (index 1)
@@ -119,9 +140,23 @@ def torch_batch_norm_gather_stats_with_counts(
     return global_mean + fake_sum, global_invstd + fake_sum
 
 
-@register_aten(["aten::batch_norm_backward_reduce", "aten::batch_norm_backward_reduce.out"])
+@register_aten(
+    ["aten::batch_norm_backward_reduce", "aten::batch_norm_backward_reduce.out"],
+    output_params=("out0", "out1", "out2", "out3"),
+)
 def torch_batch_norm_backward_reduce(
-    grad_output, input, mean, invstd, weight, input_g, weight_g, bias_g, out=None
+    grad_output,
+    input,
+    mean,
+    invstd,
+    weight,
+    input_g,
+    weight_g,
+    bias_g,
+    out0=None,
+    out1=None,
+    out2=None,
+    out3=None,
 ):
     """Backward pass reduction for batch normalization."""
     # Reduction axes: all except channel dimension (index 1)
