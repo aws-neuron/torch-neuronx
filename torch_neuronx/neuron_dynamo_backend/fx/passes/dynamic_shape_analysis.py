@@ -7,15 +7,16 @@ as torch-neuronx requires static shapes for compilation.
 import logging
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class DynamicShapeAnalysis(PassBase):
-    def __init__(self):
-        super().__init__()
-
+class DynamicShapeAnalysis(NeuronFXPass):
     def _dynamic_shape_checker(self, gm: torch.fx.GraphModule) -> tuple[bool, str]:
         """Check for dynamic shapes in the FX graph and generate detailed error information.
 

@@ -12,9 +12,12 @@ import logging
 
 import torch
 import torch.distributed as dist
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
 from torch_neuronx.distributed.mesh_registry import get_all_replica_groups
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ def _get_process_group_ranks(group_name: str) -> list[list[int]]:
         return [list(range(world_size))]
 
 
-class CollectiveLegalization(PassBase):
+class CollectiveLegalization(NeuronFXPass):
     """
     Rewrite collective operation group names to explicit replica groups.
 

@@ -1,10 +1,12 @@
 """FX pass to ensure contiguous inputs for operations that require it."""
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 
-class EnsureContiguousInputs(PassBase):
+class EnsureContiguousInputs(NeuronFXPass):
     """Insert contiguous() before operations requiring contiguous memory layout."""
 
     def _is_contiguous(self, node: torch.fx.Node) -> bool:

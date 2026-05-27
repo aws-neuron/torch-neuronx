@@ -267,6 +267,87 @@ class TestDebugDirectoryCreationAndPopulation:
             assert str(artifacts_stablehlo).endswith(".stablehlo.mlir")
 
 
+class TestDumpAfterPass:
+    """Test that FX graph artifacts are dumped after each pass when preserve is enabled."""
+
+    def setup_method(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+
+    def teardown_method(self):
+        import shutil
+
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+
+    def test_pass_artifacts_dumped_when_preserve_enabled(self):
+        """When TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS is set, post_aot_processing
+        should dump an FX graph file after each pass under transformed_fx/."""
+        from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
+            post_aot_processing,
+        )
+
+        # Build a minimal FX graph: placeholder -> add -> output
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        x = gm.graph.placeholder("x")
+        add_node = gm.graph.call_function(torch.add, (x, x))
+        gm.graph.output((add_node,))
+        gm.recompile()
+
+        model_name = "test_model"
+
+        with patch.dict(
+            os.environ,
+            {
+                "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                "TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS": "true",
+            },
+        ):
+            job = CompilationJob(op_name=model_name)
+            assert job.preserve is True
+
+            result = post_aot_processing(gm, job=job, model_name=model_name)
+
+            # Should return a valid result
+            assert result.graph_module is not None
+
+            # Check that per-pass artifacts were written under transformed_fx/
+            pass_files = list(self.temp_dir.glob("**/transformed_fx/*.pass_*.fx.txt"))
+            assert len(pass_files) > 0, f"Expected at least 1 pass file, got 0: {pass_files}"
+
+            # Verify files are non-empty and ordered by pass index
+            indices = sorted(int(f.name.split(".pass_")[1].split("_")[0]) for f in pass_files)
+            assert indices == sorted(set(indices)) and len(indices) > 0
+
+    def test_no_pass_artifacts_when_preserve_disabled(self):
+        """When preserve is disabled, no per-pass artifacts should be created."""
+        from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
+            post_aot_processing,
+        )
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        x = gm.graph.placeholder("x")
+        add_node = gm.graph.call_function(torch.add, (x, x))
+        gm.graph.output((add_node,))
+        gm.recompile()
+
+        model_name = "test_model"
+
+        with patch.dict(
+            os.environ,
+            {
+                "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                "TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS": "false",
+            },
+        ):
+            job = CompilationJob(op_name=model_name)
+            assert job.preserve is False
+
+            post_aot_processing(gm, job=job, model_name=model_name)
+
+            pass_files = list(self.temp_dir.glob("**/transformed_fx/*.pass_*.fx.txt"))
+            assert len(pass_files) == 0, f"Expected no pass artifacts, got {pass_files}"
+
+
 class TestEnvironmentVariables:
     """Test all environment variables used in the backend"""
 

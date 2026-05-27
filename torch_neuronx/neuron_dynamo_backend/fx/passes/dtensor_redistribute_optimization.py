@@ -22,12 +22,14 @@ import operator
 
 import torch
 from torch.fx import Graph, GraphModule, Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 logger = logging.getLogger(__name__)
 
 
-class DTensorRedistributeOptimization(PassBase):
+class DTensorRedistributeOptimization(NeuronFXPass):
     """Optimize DTensor redistribution patterns to eliminate stablehlo.gather ops."""
 
     def call(self, graph_module: GraphModule) -> PassResult:

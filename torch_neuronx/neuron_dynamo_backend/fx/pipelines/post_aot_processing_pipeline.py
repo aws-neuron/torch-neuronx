@@ -11,6 +11,7 @@ from typing import NamedTuple
 import torch
 from torch.fx.passes.infra.pass_manager import PassManager
 
+from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     CollectiveLegalization,
 )
@@ -32,6 +33,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_bool_scalars import 
 from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_index_indices import (
     LegalizeIndexIndices,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
 from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import RemoveNoneOutputs
 from torch_neuronx.neuron_dynamo_backend.fx.passes.replace_device_mesh_placeholders import (
     ReplaceDeviceMeshPlaceholders,
@@ -49,29 +51,35 @@ class PostAOTProcessingResults(NamedTuple):
     analysis: dict
 
 
-def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
+def post_aot_processing(
+    gm: torch.fx.GraphModule, job: CompilationJob, model_name: str
+) -> PostAOTProcessingResults:
     """
     Apply FX graph analysis and transformations after AOTAutograd.
 
     Args:
         gm: Input GraphModule
+        job: CompilationJob for dumping FX graph after each pass.
+        model_name: model name for artifact filenames.
 
     Returns:
         PostAOTProcessingResults containing the graph and analysis results
     """
-    flex_lowering_pass = FlexAttentionNKILowering()
-    flex_attention_pass = FlexAttentionLegalization()
-    functionalize_pass = FunctionalizeCopyInplacePass()
-    legalize_bool_scalars_pass = LegalizeBoolScalars()
-    legalize_index_indices_pass = LegalizeIndexIndices()
-    remove_none_outputs = RemoveNoneOutputs()
-    replace_device_mesh = ReplaceDeviceMeshPlaceholders()
-    collective_legalization = CollectiveLegalization()
-    dtensor_redistribute = DTensorRedistributeOptimization()
+    config = NeuronFXPassState(job=job, model_name=model_name, dumping_enabled=job.preserve)
+
+    flex_lowering_pass = FlexAttentionNKILowering(config)
+    flex_attention_pass = FlexAttentionLegalization(config)
+    functionalize_pass = FunctionalizeCopyInplacePass(config)
+    legalize_bool_scalars_pass = LegalizeBoolScalars(config)
+    legalize_index_indices_pass = LegalizeIndexIndices(config)
+    remove_none_outputs = RemoveNoneOutputs(config)
+    replace_device_mesh = ReplaceDeviceMeshPlaceholders(config)
+    collective_legalization = CollectiveLegalization(config)
+    dtensor_redistribute = DTensorRedistributeOptimization(config)
 
     # Vocab sharding SPMD passes
-    shard_injection = ShardIndexInjection()
-    vocab_sharding = VocabShardingSPMD()
+    shard_injection = ShardIndexInjection(config)
+    vocab_sharding = VocabShardingSPMD(config)
     spmd_vocab_passes = [shard_injection, vocab_sharding]
 
     pm = PassManager(
