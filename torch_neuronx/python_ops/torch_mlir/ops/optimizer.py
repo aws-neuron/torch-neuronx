@@ -213,9 +213,6 @@ def _register_fused_adam(op_names, decoupled_wd):
         found_inf=None,
         **kwargs,
     ):
-        if isinstance(lr, torch.Tensor):
-            lr = lr.item()
-
         compute_fn = _make_adam_compute_fn(amsgrad, maximize, decoupled_wd)
 
         # Filter out zero-numel params

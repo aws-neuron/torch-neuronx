@@ -313,7 +313,9 @@ class TestFusedAdamW:
         param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
 
         optimizer_cpu = torch.optim.AdamW([param_cpu], lr=torch.tensor(0.01), fused=False)
-        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=torch.tensor(0.01), fused=True)
+        optimizer_neuron = torch.optim.AdamW(
+            [param_neuron], lr=torch.tensor(0.01, device="neuron"), fused=True
+        )
 
         for _ in range(3):
             loss_cpu = param_cpu.pow(2).sum()
