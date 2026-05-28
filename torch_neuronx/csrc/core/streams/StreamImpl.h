@@ -100,6 +100,9 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   std::list<std::shared_ptr<OperationContext>> active_operations_;
   std::mutex active_operations_mutex_;
 
+  // Number of kAllocs currently parked in AllocState::Deferred on this stream.
+  std::atomic<int> deferred_alloc_count_{0};
+
   // Iterator pointing to the next operation to be scheduled (for nrt-async mode)
   std::list<std::shared_ptr<OperationContext>>::iterator next_to_schedule_;
 

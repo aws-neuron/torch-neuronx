@@ -1292,13 +1292,15 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleAloneOnStreamEscalates) {
 TEST_F(OperationExecutionEngineTest, RemoveActiveOperationClearsAllocRetryPendingOnDrain) {
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  // Parked kAlloc op with AllocState::Deferred.
+  // Parked kAlloc op with AllocState::Deferred. Bypass TryDeferAlloc here, so
+  // we mirror the deferred_alloc_count_ bookkeeping it would have done.
   auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
   auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
   alloc_op->stream = stream.get();
   alloc_op->stream_id = stream->stream_id;
   alloc_op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
       AllocDirectKernelExecution::AllocState::Deferred);
+  stream->deferred_alloc_count_.fetch_add(1, std::memory_order_relaxed);
   alloc_op->MarkExecutionReady();
 
   // Prior scheduled op that will drain, triggering the hook.
@@ -1476,6 +1478,8 @@ TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarlie
     op->stream_id = stream->stream_id;
     op->GetKernel<KernelTypeEnum::kAlloc>().SetAllocState(
         AllocDirectKernelExecution::AllocState::Deferred);
+    // Bypass TryDeferAlloc; mirror its deferred_alloc_count_ bookkeeping.
+    stream->deferred_alloc_count_.fetch_add(1, std::memory_order_relaxed);
     op->MarkExecutionReady();
     return op;
   };
@@ -1512,6 +1516,89 @@ TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarlie
   ASSERT_NE(stream->next_to_schedule_, stream->active_operations_.end());
   EXPECT_EQ(stream->next_to_schedule_->get(), a.get())
       << "rewind should land on the earliest RetryReady kAlloc, not a later one";
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, DeferredAllocCountStaysZeroInSteadyState) {
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // A scheduled kHLO op being completed.
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream.get();
+  op->stream_id = stream->stream_id;
+  op->nrt_async_state_.is_scheduled = true;
+  stream->active_operations_.push_back(op);
+  stream->next_to_schedule_ = stream->active_operations_.end();
+
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
+
+  stream->RemoveActiveOperation(op.get());
+
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0)
+      << "counter must stay 0 in steady state";
+}
+
+TEST_F(OperationExecutionEngineTest, DeferredAllocCountTracksTryDeferAndDrain) {
+  // TryDeferAlloc must increment; ReleaseDeferredAllocGates flip-out must
+  // decrement; counter returns to 0 after a full park-then-drain cycle.
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  // Prior scheduled op so TryDeferAlloc sees drainable work.
+  auto prior_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*prior_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  auto prior_op = std::make_shared<OperationContext>(std::move(prior_kernel));
+  prior_op->stream = stream.get();
+  prior_op->stream_id = stream->stream_id;
+  prior_op->nrt_async_state_.is_scheduled = true;
+
+  // Fresh kAlloc behind it.
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  alloc_op->stream = stream.get();
+  alloc_op->stream_id = stream->stream_id;
+  alloc_op->MarkExecutionReady();
+
+  stream->active_operations_.push_back(prior_op);
+  stream->active_operations_.push_back(alloc_op);
+
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
+
+  // Park the kAlloc: counter -> 1.
+  EXPECT_TRUE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 1);
+
+  // Drain: removing the prior op triggers ReleaseDeferredAllocGates which
+  // flips the kAlloc to RetryReady and decrements the counter.
+  stream->RemoveActiveOperation(prior_op.get());
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
+            AllocDirectKernelExecution::AllocState::RetryReady);
+
+  // Removing the now-RetryReady alloc op must NOT underflow the counter.
+  // The drain hook should early-return on the zero counter.
+  stream->RemoveActiveOperation(alloc_op.get());
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0)
+      << "second RemoveActiveOperation must not underflow the counter";
+
+  stream->active_operations_.clear();
+}
+
+TEST_F(OperationExecutionEngineTest, DeferredAllocCountUnchangedWhenTryDeferFails) {
+  // TryDeferAlloc must NOT increment the counter when it returns false
+  // (no drainable work). State stays Fresh, counter stays 0.
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+
+  auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
+  auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
+  alloc_op->stream = stream.get();
+  alloc_op->stream_id = stream->stream_id;
+  stream->active_operations_.push_back(alloc_op);
+
+  EXPECT_FALSE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
+  EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
 
   stream->active_operations_.clear();
 }
