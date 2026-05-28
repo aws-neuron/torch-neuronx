@@ -562,6 +562,16 @@ class TestNeuronBackendFxCompiler:
         mock_gm.print_readable.return_value = "graph content"
         example_inputs = [torch.randn(2, 3)]
 
+        mock_post_aot = MagicMock()
+        mock_post_aot.graph_module = mock_gm
+        mock_post_aot.analysis = {
+            "mutation_info": None,
+            "none_output_info": None,
+            "shard_input_info": None,
+            "removed_device_mesh_indices": None,
+            "passthrough_info": None,
+        }
+
         with (
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
@@ -571,6 +581,10 @@ class TestNeuronBackendFxCompiler:
             patch(
                 "torch_neuronx.neuron_dynamo_backend.cache_artifact.NeuronOutputCode"
             ) as mock_output_code,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
+                return_value=mock_post_aot,
+            ),
         ):
             mock_stablehlo_mlir = MagicMock()
             mock_io_spec = MagicMock()
@@ -595,6 +609,229 @@ class TestNeuronBackendFxCompiler:
             result = compiled_fn(*example_inputs)
             assert torch.equal(result, fallback_output)
             mock_gm.forward.assert_called_once()
+
+    def test_execution_fallback_with_analysis_params(self):
+        """
+        Test execution-time fallback correctly applies shard_input_info,
+        removed_device_mesh_indices, and none_output_info.
+        """
+        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
+            NoneOutputInfo,
+        )
+        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        mock_gm.print_readable.return_value = "graph content"
+        out_tensor = torch.randn(2, 3)
+        mock_gm.forward.return_value = (out_tensor,)
+        example_inputs = [torch.randn(2, 3)]
+
+        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=9)
+        none_info = NoneOutputInfo(
+            non_none_positions=[0], original_output_count=2, new_output_count=1
+        )
+
+        mock_post_aot = MagicMock()
+        mock_post_aot.graph_module = mock_gm
+        mock_post_aot.analysis = {
+            "mutation_info": None,
+            "none_output_info": none_info,
+            "shard_input_info": shard_info,
+            "removed_device_mesh_indices": [1],
+            "passthrough_info": None,
+        }
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
+            ) as mock_compile_fx,
+            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch("torch_neuronx.neuron_dynamo_backend.backend.CompileGraph") as mock_compile_graph,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.cache_artifact.NeuronOutputCode"
+            ) as mock_output_code,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
+                return_value=mock_post_aot,
+            ),
+        ):
+            mock_stablehlo_mlir = MagicMock()
+            mock_io_spec = MagicMock()
+            mock_cast_spec = [MagicMock()]
+            mock_compile_fx.return_value = (
+                mock_stablehlo_mlir,
+                Path("test"),
+                mock_io_spec,
+                mock_cast_spec,
+            )
+
+            mock_compile_graph_instance = MagicMock()
+            mock_compile_graph_instance.compile.return_value = "cache_key_123"
+            mock_compile_graph.return_value = mock_compile_graph_instance
+
+            mock_output_code_instance = MagicMock()
+            mock_output_code_instance.side_effect = RuntimeError("Execution failed")
+            mock_output_code.return_value = mock_output_code_instance
+
+            compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
+
+            # Inputs: index 1 removed (device mesh), indices 0,2 kept, shard appended
+            t0 = torch.randn(2)
+            t1_mesh = torch.randn(1)
+            t2 = torch.randn(3)
+            result = compiled_fn([t0, t1_mesh, t2])
+
+            # gm.forward should receive t0, t2, shard_tensor(9)
+            args = mock_gm.forward.call_args[0]
+            assert len(args) == 3
+            assert torch.equal(args[0], t0)
+            assert torch.equal(args[1], t2)
+            assert args[2].item() == 9
+
+            # Output: [out_tensor, None]
+            assert len(result) == 2
+            assert torch.equal(result[0], out_tensor)
+            assert result[1] is None
+
+    def test_stablehlo_compile_failure_falls_back(self):
+        """Test that StableHLO conversion failure falls back to GraphModule execution"""
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        mock_gm.print_readable.return_value = "graph content"
+        fallback_output = torch.randn(2, 3)
+        mock_gm.forward.return_value = fallback_output
+        example_inputs = [torch.randn(2, 3)]
+
+        mock_post_aot = MagicMock()
+        mock_post_aot.graph_module = mock_gm
+        mock_post_aot.analysis = {
+            "mutation_info": None,
+            "none_output_info": None,
+            "shard_input_info": None,
+            "removed_device_mesh_indices": None,
+            "passthrough_info": None,
+        }
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo",
+                side_effect=RuntimeError("torch-mlir conversion failed"),
+            ),
+            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
+                return_value=mock_post_aot,
+            ),
+        ):
+            compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
+
+            assert callable(compiled_fn)
+            assert compiled_fn._boxed_call is True
+            result = compiled_fn(example_inputs)
+            assert torch.equal(result, fallback_output)
+            mock_gm.forward.assert_called_once()
+
+    def test_stablehlo_compile_failure_falls_back_with_analysis_params(self):
+        """
+        Test StableHLO fallback correctly applies shard_input_info,
+        removed_device_mesh_indices, and none_output_info.
+        """
+        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
+            NoneOutputInfo,
+        )
+        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        mock_gm.print_readable.return_value = "graph content"
+        out_tensor = torch.randn(2, 3)
+        mock_gm.forward.return_value = (out_tensor,)
+        example_inputs = [torch.randn(2, 3)]
+
+        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=4)
+        none_info = NoneOutputInfo(
+            non_none_positions=[1], original_output_count=3, new_output_count=1
+        )
+
+        mock_post_aot = MagicMock()
+        mock_post_aot.graph_module = mock_gm
+        mock_post_aot.analysis = {
+            "mutation_info": None,
+            "none_output_info": none_info,
+            "shard_input_info": shard_info,
+            "removed_device_mesh_indices": [0],
+            "passthrough_info": None,
+        }
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo",
+                side_effect=RuntimeError("conversion failed"),
+            ),
+            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
+                return_value=mock_post_aot,
+            ),
+        ):
+            compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
+
+            # Inputs: index 0 removed (device mesh), indices 1,2 kept, shard appended
+            t0_mesh = torch.randn(1)
+            t1 = torch.randn(2)
+            t2 = torch.randn(3)
+            result = compiled_fn([t0_mesh, t1, t2])
+
+            # gm.forward should receive t1, t2, shard_tensor(4)
+            args = mock_gm.forward.call_args[0]
+            assert len(args) == 3
+            assert torch.equal(args[0], t1)
+            assert torch.equal(args[1], t2)
+            assert args[2].item() == 4
+
+            # Output: [None, out_tensor, None]
+            assert len(result) == 3
+            assert result[0] is None
+            assert torch.equal(result[1], out_tensor)
+            assert result[2] is None
+
+    def test_stablehlo_compile_failure_raises_when_fallback_disabled(self):
+        """Test that StableHLO conversion failure raises when DISABLE_FALLBACK_EXECUTION is set"""
+        mock_gm = MagicMock()
+        mock_gm.graph.nodes = [MagicMock()]
+        mock_gm.print_readable.return_value = "graph content"
+        example_inputs = [torch.randn(2, 3)]
+
+        mock_post_aot = MagicMock()
+        mock_post_aot.graph_module = mock_gm
+        mock_post_aot.analysis = {
+            "mutation_info": None,
+            "none_output_info": None,
+            "shard_input_info": None,
+            "removed_device_mesh_indices": None,
+            "passthrough_info": None,
+        }
+
+        with (
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo",
+                side_effect=RuntimeError("torch-mlir conversion failed"),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                    "TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "true",
+                },
+            ),
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
+                return_value=mock_post_aot,
+            ),
+            pytest.raises(RuntimeError, match="torch-mlir conversion failed"),
+        ):
+            backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
 
     def test_trivial_graph_returns_passthrough(self):
         """Test that a trivial graph (no computation) returns passthrough."""
@@ -696,3 +933,150 @@ class TestBackendIntegration:
 
         # Check helper functions exist
         assert hasattr(backend, "_compile_fx_to_stablehlo")
+
+
+class TestMakeFallbackFn:
+    """Test _make_fallback_fn with each input/output adjustment the post-AOT passes produce."""
+
+    def test_basic_fallback(self):
+        """Fallback with no special adjustments passes inputs through to gm.forward."""
+        mock_gm = MagicMock()
+        expected = (torch.randn(2, 3),)
+        mock_gm.forward.return_value = expected
+
+        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None)
+
+        assert fn._boxed_call is True
+        inputs = [torch.randn(2, 3)]
+        result = fn(inputs)
+        assert result is expected
+        mock_gm.forward.assert_called_once_with(inputs[0])
+
+    def test_shard_input_appended(self):
+        """When shard_input_info indicates extra inputs, a shard index tensor is appended."""
+        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+
+        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=7)
+        mock_gm = MagicMock()
+        mock_gm.forward.return_value = (torch.randn(1),)
+
+        fn = backend._make_fallback_fn(mock_gm, shard_input_info=shard_info)
+
+        inputs = [torch.randn(2), torch.randn(3)]
+        fn(inputs)
+
+        args = mock_gm.forward.call_args[0]
+        assert len(args) == 3
+        # Last arg should be the shard index tensor
+        assert args[2].item() == 7
+        assert args[2].dtype == torch.int32
+
+    def test_shard_input_not_appended_when_counts_equal(self):
+        """No shard index appended when new_input_count == original_input_count."""
+        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+
+        shard_info = ShardInputInfo(original_input_count=2, new_input_count=2, shard_index=0)
+        mock_gm = MagicMock()
+        mock_gm.forward.return_value = (torch.randn(1),)
+
+        fn = backend._make_fallback_fn(mock_gm, shard_input_info=shard_info)
+
+        inputs = [torch.randn(2), torch.randn(3)]
+        fn(inputs)
+
+        args = mock_gm.forward.call_args[0]
+        assert len(args) == 2
+
+    def test_device_mesh_inputs_removed(self):
+        """DeviceMesh placeholder inputs are filtered out before calling gm.forward."""
+        mock_gm = MagicMock()
+        mock_gm.forward.return_value = (torch.randn(1),)
+
+        fn = backend._make_fallback_fn(
+            mock_gm, shard_input_info=None, removed_device_mesh_indices=[1, 3]
+        )
+
+        t0, t1, t2, t3, t4 = [torch.randn(i + 1) for i in range(5)]
+        fn([t0, t1, t2, t3, t4])
+
+        args = mock_gm.forward.call_args[0]
+        assert len(args) == 3
+        assert torch.equal(args[0], t0)
+        assert torch.equal(args[1], t2)
+        assert torch.equal(args[2], t4)
+
+    def test_none_outputs_reinserted(self):
+        """None outputs are re-inserted at their original positions."""
+        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
+            NoneOutputInfo,
+        )
+
+        # Original had 4 outputs, positions 0 and 2 were non-None
+        none_info = NoneOutputInfo(
+            non_none_positions=[0, 2], original_output_count=4, new_output_count=2
+        )
+        mock_gm = MagicMock()
+        t0, t1 = torch.randn(1), torch.randn(2)
+        mock_gm.forward.return_value = (t0, t1)
+
+        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None, none_output_info=none_info)
+
+        result = fn([torch.randn(1)])
+
+        assert len(result) == 4
+        assert torch.equal(result[0], t0)
+        assert result[1] is None
+        assert torch.equal(result[2], t1)
+        assert result[3] is None
+
+    def test_none_outputs_not_modified_when_no_info(self):
+        """Without none_output_info, gm.forward output is returned as-is."""
+        mock_gm = MagicMock()
+        expected = (torch.randn(1), torch.randn(2))
+        mock_gm.forward.return_value = expected
+
+        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None, none_output_info=None)
+
+        result = fn([torch.randn(1)])
+        assert result is expected
+
+    def test_all_adjustments_combined(self):
+        """All adjustments applied together: remove DeviceMesh, append shard, re-insert Nones."""
+        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
+            NoneOutputInfo,
+        )
+        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+
+        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=5)
+        none_info = NoneOutputInfo(
+            non_none_positions=[1], original_output_count=3, new_output_count=1
+        )
+        mock_gm = MagicMock()
+        out_tensor = torch.randn(4)
+        mock_gm.forward.return_value = (out_tensor,)
+
+        fn = backend._make_fallback_fn(
+            mock_gm,
+            shard_input_info=shard_info,
+            removed_device_mesh_indices=[0],
+            none_output_info=none_info,
+        )
+
+        # 3 inputs: index 0 is DeviceMesh (removed), indices 1,2 kept, then shard appended
+        t0_mesh = MagicMock()  # DeviceMesh placeholder
+        t1 = torch.randn(2)
+        t2 = torch.randn(3)
+        result = fn([t0_mesh, t1, t2])
+
+        # gm.forward should receive: t1, t2, shard_tensor
+        args = mock_gm.forward.call_args[0]
+        assert len(args) == 3
+        assert torch.equal(args[0], t1)
+        assert torch.equal(args[1], t2)
+        assert args[2].item() == 5
+
+        # Output: [None, out_tensor, None]
+        assert len(result) == 3
+        assert result[0] is None
+        assert torch.equal(result[1], out_tensor)
+        assert result[2] is None
