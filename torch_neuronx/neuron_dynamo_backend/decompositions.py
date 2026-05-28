@@ -1869,6 +1869,124 @@ def hypot(self, other):
     return torch.where(max_val == 0, max_val, max_val * torch.sqrt(1 + ratio * ratio))
 
 
+@register_decomposition([aten.batch_norm_stats.default])
+def batch_norm_stats_decomposition(input, eps):
+    """Compute batch normalization statistics (mean and inverse std)."""
+
+    # Reduction axes: all except channel dimension (index 1)
+    reduction_axes = tuple(i for i in range(input.ndim) if i != 1)
+
+    # Calculate mean and variance
+    mean = torch.mean(input, dim=reduction_axes, keepdim=False)
+    var = torch.var(input, dim=reduction_axes, unbiased=False, keepdim=False)
+
+    # Calculate inverse standard deviation
+    invstd = torch.rsqrt(var + eps)
+
+    return mean, invstd
+
+
+@register_decomposition([aten.batch_norm_elemt.default])
+def batch_norm_elemt_decomposition(input, weight, bias, mean, invstd, eps):
+    """Decompose batch_norm_elemt: (input - mean) * invstd * weight + bias."""
+    shape = [1] * input.ndim
+    shape[1] = -1
+    mean_reshaped = mean.view(shape)
+    invstd_reshaped = invstd.view(shape)
+    weight_reshaped = weight.view(shape) if weight is not None else 1.0
+    bias_reshaped = bias.view(shape) if bias is not None else 0.0
+    normalized = (input - mean_reshaped) * invstd_reshaped
+    return normalized * weight_reshaped + bias_reshaped
+
+
+@register_decomposition([aten.batch_norm_backward_elemt.default])
+def batch_norm_backward_elemt_decomposition(
+    grad_output, input, mean, invstd, weight, sum_dy, sum_dy_xmu, count
+):
+    """Decompose batch_norm_backward_elemt into primitive ops."""
+    shape = [1] * input.ndim
+    shape[1] = -1
+    mean_reshaped = mean.reshape(shape)
+    invstd_reshaped = invstd.reshape(shape)
+    weight_reshaped = weight.reshape(shape) if weight is not None else 1.0
+    sum_dy_reshaped = sum_dy.reshape(shape)
+    sum_dy_xmu_reshaped = sum_dy_xmu.reshape(shape)
+    total_count = count.sum() if torch.is_tensor(count) else count
+    xmu = input - mean_reshaped
+    k = sum_dy_xmu_reshaped * invstd_reshaped * invstd_reshaped / total_count
+    grad_input = (
+        (grad_output - sum_dy_reshaped / total_count - xmu * k) * invstd_reshaped * weight_reshaped
+    )
+    return grad_input
+
+
+@register_decomposition([aten.batch_norm_backward_reduce.default])
+def batch_norm_backward_reduce_decomposition(
+    grad_output, input, mean, invstd, weight, input_g, weight_g, bias_g
+):
+    """Decompose batch_norm_backward_reduce into sum reductions."""
+    # input_g, weight_g, bias_g are unused here because we unconditionally
+    # return the grads - may be worth optimizing in the future
+
+    reduction_axes = tuple(i for i in range(input.ndim) if i != 1)
+    shape = [1] * input.ndim
+    shape[1] = -1
+    mean_reshaped = mean.view(shape)
+    invstd_reshaped = invstd.view(shape)
+    xmu = input - mean_reshaped
+    xhat = xmu * invstd_reshaped
+    sum_dy = torch.sum(grad_output, dim=reduction_axes, keepdim=False)
+    sum_dy_xmu = torch.sum(grad_output * xmu, dim=reduction_axes, keepdim=False)
+    grad_weight = torch.sum(grad_output * xhat, dim=reduction_axes, keepdim=False)
+    grad_bias = sum_dy.clone()
+    return sum_dy, sum_dy_xmu, grad_weight, grad_bias
+
+
+@register_decomposition([aten.addcmul.default])
+def addcmul_decomposition(input, tensor1, tensor2, value=1):
+    """Decompose addcmul: input + value * tensor1 * tensor2."""
+    return input + value * tensor1 * tensor2
+
+
+@register_decomposition([aten.addcdiv.default])
+def addcdiv_decomposition(input, tensor1, tensor2, value=1):
+    """Decompose addcdiv: input + value * tensor1 / tensor2."""
+    return input + value * tensor1 / tensor2
+
+
+@register_decomposition([aten.erfinv.default])
+def erfinv_decomposition(y):
+    """Decompose erfinv using rational polynomial approximation."""
+    if not y.is_floating_point():
+        y = y.to(torch.float32)
+
+    a = [0.886226899, -1.645349621, 0.914624893, -0.140543331]
+    b = [-2.118377725, 1.442710462, -0.329097515, 0.012229801]
+    c = [-1.970840454, -1.624906493, 3.429567803, 1.641345311]
+    d = [3.543889200, 1.637067800]
+
+    y_abs = torch.abs(y)
+    result = torch.where(
+        torch.isnan(y) | (y_abs > 1.0), y * float("nan"), torch.sign(y) * float("inf")
+    )
+
+    mask_valid = y_abs < 1.0
+    z_low = y * y
+    num_low = ((a[3] * z_low + a[2]) * z_low + a[1]) * z_low + a[0]
+    dem_low = (((b[3] * z_low + b[2]) * z_low + b[1]) * z_low + b[0]) * z_low + 1.0
+    x_low = y * num_low / dem_low
+
+    z_high = torch.sqrt(-torch.log((1.0 - y_abs) / 2.0))
+    num_high = ((c[3] * z_high + c[2]) * z_high + c[1]) * z_high + c[0]
+    dem_high = (d[1] * z_high + d[0]) * z_high + 1.0
+    x_high = torch.sign(y) * num_high / dem_high
+
+    result = torch.where(mask_valid & (y_abs <= 0.7), x_low, result)
+    result = torch.where(mask_valid & (y_abs > 0.7), x_high, result)
+
+    return result
+
+
 def get_decomposition_table(decompose_all: bool = False) -> dict:
     """Get the decomposition table for the Neuron backend.
 
