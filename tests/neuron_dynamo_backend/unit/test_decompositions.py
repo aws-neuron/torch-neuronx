@@ -3131,3 +3131,449 @@ class TestNativeBatchNormDecomposition:
 
         assert decomp_out.dtype == torch.bfloat16
         torch.testing.assert_close(decomp_out.float(), ref_out, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestBatchNormStatsDecomposition:
+    """Tests for batch_norm_stats decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.batch_norm_stats.default in decompositions.neuron_decompositions
+        ), "aten.batch_norm_stats.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 16, 32, 32),
+            (8, 32, 128),
+            (2, 8, 4, 16, 16),
+            (1, 8, 16, 16),
+            (8, 64, 32, 32),
+        ],
+    )
+    def test_accuracy_e2e(self, shape):
+        """Test batch_norm_stats via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+        eps = 1e-5
+
+        def fn(x):
+            return torch.ops.aten.batch_norm_stats(x, eps)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(shape)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        expected_mean, expected_invstd = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_stats.default
+        ](x_cpu, eps)
+        result_mean, result_invstd = compiled_fn(x_neuron)
+
+        torch.testing.assert_close(result_mean.cpu(), expected_mean, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(result_invstd.cpu(), expected_invstd, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("eps", [1e-3, 1e-5, 1e-7])
+    def test_different_eps(self, eps):
+        """Test batch_norm_stats with different epsilon values"""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.ops.aten.batch_norm_stats(x, eps)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(4, 8, 16, 16)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        expected_mean, expected_invstd = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_stats.default
+        ](x_cpu, eps)
+        result_mean, result_invstd = compiled_fn(x_neuron)
+
+        torch.testing.assert_close(result_mean.cpu(), expected_mean, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(result_invstd.cpu(), expected_invstd, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestBatchNormElemtDecomposition:
+    """Tests for batch_norm_elemt decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.batch_norm_elemt.default in decompositions.neuron_decompositions
+        ), "aten.batch_norm_elemt.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(4, 8, 16, 16), (2, 16, 32, 32), (8, 32, 64)],
+    )
+    def test_accuracy_e2e(self, shape):
+        """Test batch_norm_elemt via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+        C = shape[1]
+        weight = torch.randn(C)
+        bias = torch.randn(C)
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+        eps = 1e-5
+
+        def fn(x, w, b, m, inv):
+            return torch.ops.aten.batch_norm_elemt(x, w, b, m, inv, eps)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(shape)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        expected = decompositions.neuron_decompositions[torch.ops.aten.batch_norm_elemt.default](
+            x_cpu, weight, bias, mean, invstd, eps
+        )
+        result = compiled_fn(
+            x_neuron,
+            weight.to("neuron"),
+            bias.to("neuron"),
+            mean.to("neuron"),
+            invstd.to("neuron"),
+        )
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_no_weight_no_bias(self):
+        """Test batch_norm_elemt without weight and bias"""
+        torch.manual_seed(42)
+        shape = (2, 16, 32, 32)
+        C = shape[1]
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+        eps = 1e-5
+
+        def fn(x, m, inv):
+            return torch.ops.aten.batch_norm_elemt(x, None, None, m, inv, eps)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(shape)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        expected = decompositions.neuron_decompositions[torch.ops.aten.batch_norm_elemt.default](
+            x_cpu, None, None, mean, invstd, eps
+        )
+        result = compiled_fn(x_neuron, mean.to("neuron"), invstd.to("neuron"))
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestBatchNormBackwardElemtDecomposition:
+    """Tests for batch_norm_backward_elemt decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.batch_norm_backward_elemt.default in decompositions.neuron_decompositions
+        ), "aten.batch_norm_backward_elemt.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape,count_val",
+        [
+            ((4, 8, 16, 16), 1024),
+            ((2, 16, 32, 32), 2048),
+            ((8, 32, 64), 512),
+            ((1, 8, 16, 16), 256),
+        ],
+    )
+    def test_accuracy_e2e(self, shape, count_val):
+        """Test batch_norm_backward_elemt via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+        C = shape[1]
+
+        weight = torch.randn(C)
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+        sum_dy = torch.randn(C)
+        sum_dy_xmu = torch.randn(C)
+        count = torch.tensor(count_val, dtype=torch.int32)
+
+        def fn(grad_out, inp, m, inv, w, sdy, sdyxmu, cnt):
+            return torch.ops.aten.batch_norm_backward_elemt(
+                grad_out, inp, m, inv, w, sdy, sdyxmu, cnt
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        grad_output = torch.randn(shape)
+        input_ = torch.randn(shape)
+
+        # No CPU kernel for this op — use decomposition as reference
+        decomp_fn = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_backward_elemt.default
+        ]
+        expected = decomp_fn(grad_output, input_, mean, invstd, weight, sum_dy, sum_dy_xmu, count)
+        result = compiled_fn(
+            grad_output.to("neuron"),
+            input_.to("neuron"),
+            mean.to("neuron"),
+            invstd.to("neuron"),
+            weight.to("neuron"),
+            sum_dy.to("neuron"),
+            sum_dy_xmu.to("neuron"),
+            count.to("neuron"),
+        )
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_no_weight(self):
+        """Test batch_norm_backward_elemt without weight"""
+        torch.manual_seed(42)
+        shape = (2, 16, 32, 32)
+        C = shape[1]
+
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+        sum_dy = torch.randn(C)
+        sum_dy_xmu = torch.randn(C)
+        count = torch.tensor(2048, dtype=torch.int32)
+
+        def fn(grad_out, inp, m, inv, sdy, sdyxmu, cnt):
+            return torch.ops.aten.batch_norm_backward_elemt(
+                grad_out, inp, m, inv, None, sdy, sdyxmu, cnt
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        grad_output = torch.randn(shape)
+        input_ = torch.randn(shape)
+
+        decomp_fn = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_backward_elemt.default
+        ]
+        expected = decomp_fn(grad_output, input_, mean, invstd, None, sum_dy, sum_dy_xmu, count)
+        result = compiled_fn(
+            grad_output.to("neuron"),
+            input_.to("neuron"),
+            mean.to("neuron"),
+            invstd.to("neuron"),
+            sum_dy.to("neuron"),
+            sum_dy_xmu.to("neuron"),
+            count.to("neuron"),
+        )
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestBatchNormBackwardReduceDecomposition:
+    """Tests for batch_norm_backward_reduce decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.batch_norm_backward_reduce.default
+            in decompositions.neuron_decompositions
+        ), "aten.batch_norm_backward_reduce.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(4, 8, 16, 16), (2, 16, 32, 32), (8, 32, 64), (2, 8, 16, 16)],
+    )
+    def test_accuracy_e2e(self, shape):
+        """Test batch_norm_backward_reduce via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+        C = shape[1]
+
+        weight = torch.randn(C)
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+
+        def fn(grad_out, inp, m, inv, w):
+            return torch.ops.aten.batch_norm_backward_reduce(
+                grad_out, inp, m, inv, w, True, True, True
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        grad_output = torch.randn(shape)
+        input_ = torch.randn(shape)
+
+        # No CPU kernel — use decomposition as reference
+        decomp_fn = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_backward_reduce.default
+        ]
+        expected = decomp_fn(grad_output, input_, mean, invstd, weight, True, True, True)
+        result = compiled_fn(
+            grad_output.to("neuron"),
+            input_.to("neuron"),
+            mean.to("neuron"),
+            invstd.to("neuron"),
+            weight.to("neuron"),
+        )
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "input_g,weight_g,bias_g",
+        [
+            (True, True, True),
+            (True, False, False),
+            (False, True, True),
+            (False, True, False),
+        ],
+    )
+    def test_output_flags(self, input_g, weight_g, bias_g):
+        """Test batch_norm_backward_reduce with various output flags"""
+        torch.manual_seed(42)
+        shape = (2, 8, 16, 16)
+        C = shape[1]
+
+        weight = torch.randn(C)
+        mean = torch.randn(C)
+        invstd = torch.rand(C) + 0.1
+
+        def fn(grad_out, inp, m, inv, w):
+            return torch.ops.aten.batch_norm_backward_reduce(
+                grad_out, inp, m, inv, w, input_g, weight_g, bias_g
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        grad_output = torch.randn(shape)
+        input_ = torch.randn(shape)
+
+        decomp_fn = decompositions.neuron_decompositions[
+            torch.ops.aten.batch_norm_backward_reduce.default
+        ]
+        expected = decomp_fn(grad_output, input_, mean, invstd, weight, input_g, weight_g, bias_g)
+        result = compiled_fn(
+            grad_output.to("neuron"),
+            input_.to("neuron"),
+            mean.to("neuron"),
+            invstd.to("neuron"),
+            weight.to("neuron"),
+        )
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestErfinvDecompositionE2E:
+    """E2E tests for erfinv decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.erfinv.default in decompositions.neuron_decompositions
+        ), "aten.erfinv.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(8,), (4, 8), (2, 4, 8)],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32])
+    def test_accuracy_e2e(self, shape, dtype):
+        """Test erfinv via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.erfinv(x)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        # erfinv input must be in (-1, 1)
+        x_cpu = torch.rand(shape, dtype=dtype) * 1.8 - 0.9
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        expected = fn(x_cpu)
+        result = compiled_fn(x_neuron)
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+    def test_boundary_values(self):
+        """Test erfinv near boundaries"""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.erfinv(x)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.tensor([-0.99, -0.5, 0.0, 0.5, 0.99])
+        x_neuron = x_cpu.to("neuron")
+
+        expected = fn(x_cpu)
+        result = compiled_fn(x_neuron)
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestAddcmulDecompositionE2E:
+    """E2E tests for addcmul decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.addcmul.default in decompositions.neuron_decompositions
+        ), "aten.addcmul.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(8,), (4, 8), (2, 4, 8)],
+    )
+    @pytest.mark.parametrize("value", [1, 0.5, 2.0, -1.0])
+    def test_accuracy_e2e(self, shape, value):
+        """Test addcmul via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+
+        def fn(input, t1, t2):
+            return torch.addcmul(input, t1, t2, value=value)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        input_cpu = torch.randn(shape)
+        t1_cpu = torch.randn(shape)
+        t2_cpu = torch.randn(shape)
+
+        expected = fn(input_cpu, t1_cpu, t2_cpu)
+        result = compiled_fn(input_cpu.to("neuron"), t1_cpu.to("neuron"), t2_cpu.to("neuron"))
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestAddcdivDecompositionE2E:
+    """E2E tests for addcdiv decomposition"""
+
+    def test_registered_in_decomposition_table(self):
+        """Test that the decomposition is registered in neuron_decompositions"""
+        assert (
+            torch.ops.aten.addcdiv.default in decompositions.neuron_decompositions
+        ), "aten.addcdiv.default not found in neuron_decompositions"
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(8,), (4, 8), (2, 4, 8)],
+    )
+    @pytest.mark.parametrize("value", [1, 0.5, 2.0, -1.0])
+    def test_accuracy_e2e(self, shape, value):
+        """Test addcdiv via torch.compile with neuron backend"""
+        torch.manual_seed(42)
+
+        def fn(input, t1, t2):
+            return torch.addcdiv(input, t1, t2, value=value)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        input_cpu = torch.randn(shape)
+        t1_cpu = torch.randn(shape)
+        # Avoid division by zero
+        t2_cpu = torch.randn(shape).abs() + 0.1
+
+        expected = fn(input_cpu, t1_cpu, t2_cpu)
+        result = compiled_fn(input_cpu.to("neuron"), t1_cpu.to("neuron"), t2_cpu.to("neuron"))
+
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
