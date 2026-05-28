@@ -220,7 +220,10 @@ bool StreamImpl::IsStreamDrainedWithLockHeld() const {
 }
 
 void StreamImpl::ReleaseDeferredAllocGates() {
-  // Caller must hold active_operations_mutex_.
+  // Short circuit if no parked deferred kAlloc on this stream.
+  if (deferred_alloc_count_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
   if (!IsStreamDrainedWithLockHeld()) {
     return;
   }
@@ -235,6 +238,7 @@ void StreamImpl::ReleaseDeferredAllocGates() {
       if (alloc_kernel.GetAllocState() ==
           at::neuron::AllocDirectKernelExecution::AllocState::Deferred) {
         alloc_kernel.SetAllocState(at::neuron::AllocDirectKernelExecution::AllocState::RetryReady);
+        deferred_alloc_count_.fetch_sub(1, std::memory_order_relaxed);
         if (earliest_retry == active_operations_.end()) {
           earliest_retry = it;
         }
@@ -255,6 +259,7 @@ bool StreamImpl::TryDeferAlloc(AllocDirectKernelExecution& alloc_kernel) {
     return false;
   }
   alloc_kernel.SetAllocState(AllocDirectKernelExecution::AllocState::Deferred);
+  deferred_alloc_count_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
