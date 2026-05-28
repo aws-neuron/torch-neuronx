@@ -38,7 +38,7 @@ The statistics system provides three types of instrumentation:
 import torch
 import torch_neuronx
 import torch_neuronx.metrics as met
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 # === General Metrics ===
 # Requires: export TORCH_NEURONX_METRICS_ENABLED=1
@@ -248,7 +248,7 @@ Memory stats help you:
 ```python
 import torch
 import torch.nn.functional as F
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 # Your model code
 x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).to("neuron")
@@ -331,7 +331,7 @@ decreases). `num_*` counters and `allocation_requests` are scalar ints.
 ### Available APIs
 
 ```python
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 mem.memory_stats(device=None)           # Dict of all stats
 mem.memory_summary(device=None)         # Human-readable summary
@@ -363,7 +363,7 @@ may be after cleanup). Peak memory stats capture this automatically.
 
 ```python
 import torch
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 # Run your model
 x = torch.randn(1024, 1024, device="neuron")
@@ -400,7 +400,7 @@ state. Useful for understanding memory layout quality.
 
 ```python
 import torch
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 # After running your model
 torch.neuron.synchronize()
@@ -473,7 +473,7 @@ Memory snapshots help you:
 
 ```python
 import torch
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 # Enable recording
 mem._record_memory_history()
@@ -520,7 +520,7 @@ mem._record_memory_history(
 ### Available APIs
 
 ```python
-import torch.neuron.memory as mem
+from torch.neuron import memory as mem
 
 mem._record_memory_history(...)  # Enable/disable recording
 mem._snapshot()                  # Get snapshot as dict
