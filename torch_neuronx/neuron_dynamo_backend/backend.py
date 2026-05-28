@@ -122,6 +122,35 @@ def _is_trivial_graph(gm: torch.fx.GraphModule) -> bool:
     return all(node.op in ("placeholder", "output", "get_attr") for node in gm.graph.nodes)
 
 
+def _make_fallback_fn(
+    gm, shard_input_info, removed_device_mesh_indices=None, none_output_info=None
+):
+    """Create a boxed fallback function that runs the original GraphModule."""
+
+    def fallback_fn(inputs):
+        fallback_inputs = list(inputs)
+        if removed_device_mesh_indices:
+            fallback_inputs = [
+                inp for i, inp in enumerate(fallback_inputs) if i not in removed_device_mesh_indices
+            ]
+        if (
+            shard_input_info
+            and shard_input_info.new_input_count > shard_input_info.original_input_count
+        ):
+            fallback_inputs.append(torch.tensor(shard_input_info.shard_index, dtype=torch.int32))
+        result = gm.forward(*fallback_inputs)
+        if none_output_info:
+            outputs = list(result) if isinstance(result, tuple) else [result]
+            result_with_nones = [None] * none_output_info.original_output_count
+            for i, pos in enumerate(none_output_info.non_none_positions):
+                result_with_nones[pos] = outputs[i]
+            result = tuple(result_with_nones)
+        return result
+
+    fallback_fn._boxed_call = True
+    return fallback_fn
+
+
 def neuron_backend_fx_compiler(
     gm: torch.fx.GraphModule, example_inputs, pre_processing_analysis_info=None, options=None
 ):
@@ -213,16 +242,24 @@ def neuron_backend_fx_compiler(
             has_collectives = _has_collectives_in_graph(gm)
             logger.debug(f"Graph contains collectives: {has_collectives}")
 
-            stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
-                gm,
-                example_inputs,
-                model_name,
-                segment_id,
-                job,
-                aliasing_info,
-                shard_input_info,
-            )
-
+            try:
+                stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
+                    gm,
+                    example_inputs,
+                    model_name,
+                    segment_id,
+                    job,
+                    aliasing_info,
+                    shard_input_info,
+                )
+            except Exception as stablehlo_err:
+                if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
+                    raise
+                logger.error(f"StableHLO conversion failed: {stablehlo_err}")
+                logger.warning("Falling back to original GraphModule execution")
+                return _make_fallback_fn(
+                    gm, shard_input_info, removed_device_mesh_indices, none_output_info
+                )
             use_tensorizer_backend = (
                 options.get("use_tensorizer_backend", False) if options else False
             )
@@ -282,15 +319,9 @@ def neuron_backend_fx_compiler(
                         raise
                     logger.error(f"Execution failed: {e}")
                     logger.warning("Falling back to original GraphModule execution")
-                    fallback_inputs = list(inputs)
-                    if (
-                        shard_input_info
-                        and shard_input_info.new_input_count > shard_input_info.original_input_count
-                    ):
-                        fallback_inputs.append(
-                            torch.tensor(shard_input_info.shard_index, dtype=torch.int32)
-                        )
-                    return gm.forward(*fallback_inputs)
+                    return _make_fallback_fn(
+                        gm, shard_input_info, removed_device_mesh_indices, none_output_info
+                    )(inputs)
 
             fallback_wrapper._boxed_call = True
             fallback_wrapper.__wrapped__ = output_code
