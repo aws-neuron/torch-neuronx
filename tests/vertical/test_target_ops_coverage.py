@@ -403,15 +403,6 @@ class TestTargetOpsCoverage:
             _save_result(result)
             pytest.skip(f"{op_name}: {result['status']}")
 
-        # Filter out scalar/0-d inputs for topk — triggers compiler crash
-        if "topk" in op_name:
-            samples = [
-                s
-                for s in samples
-                if (isinstance(s.input, torch.Tensor) and s.input.dim() > 0)
-                or isinstance(s.input, list | tuple)
-            ]
-
         # Clamp zeros in divisor args for remainder — integer division by zero
         # causes the compiled NEFF to hang on Neuron hardware.
         if "remainder" in op_name:

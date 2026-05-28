@@ -4306,6 +4306,7 @@ def register_all_defaults(r):
     )
 
     # arange family (excluding arange.out which is already registered)
+    r("aten::arange", {"end": 128}, source="builtin")
     r(
         "aten::arange.start",
         {"start": 0, "end": 128},

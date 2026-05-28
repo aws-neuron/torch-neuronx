@@ -5,15 +5,15 @@ import torch
 from ..operation_registry import register_aten
 
 
-@register_aten(
-    ["aten::arange", "aten::arange.start_out"], static_argnums=(0, 1, 2), static_argnames=("dtype",)
-)
-def torch_arange(start, end=None, step=1, dtype=None, out=None, **kwargs):
-    # When out is provided and dtype is not, use out's dtype to match PyTorch behavior
+@register_aten(["aten::arange"], static_argnums=(0,), static_argnames=("dtype",))
+def torch_arange_end(end, dtype=None, **kwargs):
+    return torch.arange(end, dtype=dtype, **kwargs)
+
+
+@register_aten(["aten::arange.start_out"], static_argnums=(0, 1, 2), static_argnames=("dtype",))
+def torch_arange(start, end, step=1, dtype=None, out=None, **kwargs):
     if dtype is None and out is not None and hasattr(out, "dtype"):
         dtype = out.dtype
-    if end is None:
-        return torch.arange(start, dtype=dtype, **kwargs)
     return torch.arange(start, end, step, dtype=dtype, **kwargs)
 
 

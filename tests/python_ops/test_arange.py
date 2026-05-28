@@ -134,3 +134,23 @@ class TestArange:
         assert (
             result_neuron.dtype == result_cpu.dtype
         ), f"dtype mismatch: neuron={result_neuron.dtype}, cpu={result_cpu.dtype}"
+
+    def test_arange_base_overload(self):
+        """Test aten::arange base overload (end only) dispatches correctly."""
+        device = "neuron"
+        with track_neuron_ops():
+            result = torch.ops.aten.arange(10, device=device)
+            expected = torch.arange(10)
+            assert result.device.type == device
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::arange")
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+    def test_arange_base_overload_dtypes(self, dtype):
+        """Test aten::arange base overload with various dtypes."""
+        device = "neuron"
+        with track_neuron_ops():
+            result = torch.ops.aten.arange(8, dtype=dtype, device=device)
+            expected = torch.arange(8, dtype=dtype)
+            assert result.dtype == dtype
+            torch.testing.assert_close(result.cpu(), expected)
