@@ -327,7 +327,10 @@ def torch_nonzero_static(tensor, size=None, fill_value=-1, out=None, with_count=
     ["aten::topk", "aten::topk.values"],
     static_argnums=(1, 2, 3, 4),
 )
-def torch_topk(x, k, dim=-1, largest=True, sorted=True):
+def torch_topk(x, k, dim=-1, largest=True, sorted=True, values=None, indices=None):
+    if x.ndim == 0:
+        vals, idxs = torch.topk(x.unsqueeze(0), k, dim=0, largest=largest, sorted=sorted)
+        return vals.squeeze(0), idxs.squeeze(0)
     return torch.topk(x, k, dim, largest=largest, sorted=sorted)
 
 
