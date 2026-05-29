@@ -10,10 +10,23 @@ before.
 """
 
 PT211_BF16_RECIPROCAL_REGRESSION = [
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_div_floor_rounding_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_div_no_rounding_mode_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_div_trunc_rounding_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_true_divide_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_floor_rounding_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_no_rounding_mode_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_trunc_rounding_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_true_divide_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_div_rounding_modes_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_div_rounding_modes_neuron_float16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig___rdiv___neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_floor_rounding_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_floor_rounding_neuron_float16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_no_rounding_mode_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_no_rounding_mode_neuron_float16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_trunc_rounding_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_trunc_rounding_neuron_float16",
+    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_true_divide_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_true_divide_neuron_float16",
 ]

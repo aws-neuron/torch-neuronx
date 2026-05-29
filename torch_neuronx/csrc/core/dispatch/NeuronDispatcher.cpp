@@ -1712,6 +1712,10 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     }
     PreprocessArgs(args, schema, effective_static_argnums, skip_contiguous);
 
+    // ── 4.5. Promote binary compare/logical op operands to a common dtype ──
+    // No-op for non-compare ops and for already same-dtype operands.
+    PromoteBinaryCompareOperands(args, schema);
+
     // ── 5. Run core dispatch pipeline ──
     // DispatchCore calls GetOrLowerOperation which, on cache miss, passes both
     // downcasted args (for HLO compilation) and original args (for dtype inference)

@@ -144,6 +144,15 @@ bool IsSupportedDtype(c10::ScalarType dt);
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema);
 
 /**
+ * Promote the two leading tensor operands to c10::promoteTypes(a, b) for
+ * binary compare/logical ops, mirroring TensorIterator's
+ * promote_inputs_to_common_dtype(true) on CPU/CUDA. Must be called
+ * after PreprocessArgs.
+ */
+void PromoteBinaryCompareOperands(std::vector<c10::IValue>& args,
+                                  const c10::FunctionSchema& schema);
+
+/**
  * Downcast a vector of tensors in-place to Neuron-supported dtypes.
  * Float64 → Float32; unsupported int types → Int32 (unless IsNativeInt64Enabled).
  * Returns true iff any tensor was downcasted.
