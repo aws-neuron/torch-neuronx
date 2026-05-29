@@ -1233,7 +1233,7 @@ def embedding_dense_backward_decomposition(
 
 @register_decomposition([aten.linear_backward])
 def linear_backward_decomposition(input_, grad_output_, weight_, output_mask):
-    """Decompose linear backward pass into matmul and tensordot.
+    """Decompose linear backward pass into 2D matmuls.
 
     Linear forward: y = xA^T + b
 
@@ -1253,10 +1253,14 @@ def linear_backward_decomposition(input_, grad_output_, weight_, output_mask):
     if output_mask[0]:
         grad_input = torch.matmul(grad_output_, weight_)
     if output_mask[1] or output_mask[2]:
-        # Must compute both grad_weight and grad_bias together to match PyTorch meta registration
-        batch_dims = "".join(chr(ord("a") + j) for j in range(input_.ndim - 1))
-        einsum_eq = f"{batch_dims}i,{batch_dims}j->ij"
-        grad_weight = torch.einsum(einsum_eq, grad_output_, input_)
+        # Must compute both grad_weight and grad_bias together to match PyTorch meta registration.
+        # Flatten leading dims to a single batch dim and use a 2D mm so neuronx-cc sees a clean
+        # reshape/transpose/dot_general instead of a unit-dim 4D transpose chain.
+        n = grad_output_.shape[-1]
+        k = input_.shape[-1]
+        grad_output_2d = grad_output_.reshape(-1, n)
+        input_2d = input_.reshape(-1, k)
+        grad_weight = torch.mm(grad_output_2d.t(), input_2d)
         if grad_output_.ndim == 1:
             grad_bias = grad_output_.clone()
         else:
