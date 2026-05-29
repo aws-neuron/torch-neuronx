@@ -207,6 +207,64 @@ bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  PromoteBinaryCompareOperands
+// ═══════════════════════════════════════════════════════════════
+
+// Mirrors PyTorch's binary-comparison whitelist (CPU/CUDA promote both
+// operands to common dtype before the kernel; Neuron bypasses
+// TensorIterator so we apply it here).
+//
+// Source: aten/src/ATen/native/BinaryOps.cpp:365-370 (compare ops),
+//         aten/src/ATen/native/BinaryOps.cpp:1497-1507 (logical ops).
+static bool IsBinaryCompareOpForPromotion(const c10::FunctionSchema& schema) {
+  static const std::unordered_set<std::string> kCompareOps = {
+      "aten::eq",          "aten::ne",           "aten::lt",          "aten::le",
+      "aten::gt",          "aten::ge",           "aten::logical_and", "aten::logical_or",
+      "aten::logical_xor", "aten::eq_",          "aten::ne_",         "aten::lt_",
+      "aten::le_",         "aten::gt_",          "aten::ge_",         "aten::logical_and_",
+      "aten::logical_or_", "aten::logical_xor_",
+  };
+  return kCompareOps.count(schema.operator_name().name) > 0;
+}
+
+void PromoteBinaryCompareOperands(std::vector<c10::IValue>& args,
+                                  const c10::FunctionSchema& schema) {
+  if (!IsBinaryCompareOpForPromotion(schema)) return;
+
+  // Locate the two leading positional Tensor operands ("self" and "other"
+  // in the schemas of all whitelisted ops). After PreprocessArgs, scalar
+  // operands have already been materialized as 0-dim tensors on the device,
+  // so we can rely on both arg[0] and arg[1] being tensors.
+  if (args.size() < 2 || !args[0].isTensor() || !args[1].isTensor()) return;
+  auto a = args[0].toTensor();
+  auto b = args[1].toTensor();
+  if (!a.defined() || !b.defined()) return;
+
+  auto dt_a = a.scalar_type();
+  auto dt_b = b.scalar_type();
+  if (dt_a == dt_b) return;
+
+  auto common = c10::promoteTypes(dt_a, dt_b);
+
+  // The whitelist contains only ops whose result dtype is bool, so the
+  // inputs are always non-bool/non-complex value tensors. Cast each operand
+  // to the common dtype if it differs. NeuronSafeCast handles unsupported
+  // source/target dtypes via CPU round-trip.
+  if (dt_a != common) {
+    auto promoted = NeuronSafeCast(a, common);
+    args[0] = c10::IValue(std::move(promoted));
+    TORCH_NEURONX_DISPATCH_DEBUG("[PromoteBinaryCompareOperands] ", schema.operator_name().name,
+                                 " arg[0] ", dt_a, " → ", common);
+  }
+  if (dt_b != common) {
+    auto promoted = NeuronSafeCast(b, common);
+    args[1] = c10::IValue(std::move(promoted));
+    TORCH_NEURONX_DISPATCH_DEBUG("[PromoteBinaryCompareOperands] ", schema.operator_name().name,
+                                 " arg[1] ", dt_b, " → ", common);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Dispatch snapshot helpers
 // ═══════════════════════════════════════════════════════════════
 
