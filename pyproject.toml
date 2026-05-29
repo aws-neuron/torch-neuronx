@@ -42,6 +42,7 @@ dev = [
     "pytest-forked",
     "PyYAML",
     "multiprocess",
+    "pyarrow",
 ]
 
 docs = [
