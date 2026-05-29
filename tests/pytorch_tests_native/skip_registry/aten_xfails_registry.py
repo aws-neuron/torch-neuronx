@@ -391,4 +391,24 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_pow_neuron_float16",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "scipy 1.18.0rc1 regression (PR #24481): kstest maps 'norm' to"
+            " scipy.special.ndtr which only accepts (x, out=None), not loc/scale."
+            " stats.kstest(data, 'norm', args=(mean, std)) raises TypeError."
+            " Not Neuron-specific — upstream PyTorch test + scipy incompatibility."
+        ),
+        tests=[
+            "test_init.py::TestNNInit::test_xavier_normal",
+            "test_init.py::TestNNInit::test_kaiming_normal",
+            "test_init.py::TestNNInit::test_normal",
+            "test_init.py::TestNNInit::test_sparse_default_std",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_kstest_neuron_float16",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_kstest_neuron_float32",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_kstest_neuron_float64",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_kstest_neuron_bfloat16",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_small_std_kstest_neuron_float16",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_small_std_kstest_neuron_bfloat16",
+        ],
+    ),
 ]
