@@ -705,6 +705,52 @@ class TestLinearBackwardDecomposition:
         torch.testing.assert_close(result_grad_weight, ref_grad_weight, rtol=rtol, atol=atol)
         torch.testing.assert_close(result_grad_bias, ref_grad_bias, rtol=rtol, atol=atol)
 
+    @pytest.mark.parametrize(
+        "input_shape,weight_shape,grad_output_shape",
+        [
+            ((3, 4), (5, 4), (3, 5)),
+            ((2, 3, 4), (5, 4), (2, 3, 5)),
+            ((1, 2, 3, 4), (5, 4), (1, 2, 3, 5)),
+        ],
+    )
+    def test_linear_backward_grad_weight_uses_2d_mm(
+        self, input_shape, weight_shape, grad_output_shape
+    ):
+        """grad_weight must lower to a 2D mm on flattened operands.
+
+        Regression guard for the einsum-based formulation, which lowered to a
+        4D-transpose-chain in StableHLO which is slower than 2D dot_general
+        """
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        torch.manual_seed(0)
+        input_ = torch.randn(input_shape)
+        weight_ = torch.randn(weight_shape)
+        grad_output_ = torch.randn(grad_output_shape)
+        # output_mask = [False, True, False] isolates the grad_weight branch
+        output_mask = [False, True, False]
+
+        gm = make_fx(decompositions.linear_backward_decomposition)(
+            input_, grad_output_, weight_, output_mask
+        )
+        targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+
+        assert (
+            torch.ops.aten.einsum.default not in targets
+        ), f"linear_backward grad_weight regressed to einsum: {targets}"
+        mm_targets = {torch.ops.aten.mm.default, torch.ops.aten.mm.out}
+        assert any(
+            t in mm_targets for t in targets
+        ), f"linear_backward grad_weight should use aten.mm; got: {targets}"
+
+        mm_nodes = [n for n in gm.graph.nodes if n.target in mm_targets]
+        for n in mm_nodes:
+            for arg in n.args[:2]:
+                if hasattr(arg, "meta") and "val" in arg.meta:
+                    assert (
+                        arg.meta["val"].ndim == 2
+                    ), f"mm operand should be 2D, got shape {arg.meta['val'].shape}"
+
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestLogsumexpDecompositionE2E:
