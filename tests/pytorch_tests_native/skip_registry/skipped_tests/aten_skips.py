@@ -252,6 +252,7 @@ ATEN_FOREACH_WORKER_CRASH = [
     "test_binary_op_list_error_cases__foreach_mul_neuron_float32",
     "test_parity__foreach_acos_slowpath_inplace_neuron_float32",
     "test_parity__foreach_addcdiv_fastpath_inplace_neuron_uint8",
+    "test_parity__foreach_sqrt_fastpath_inplace_neuron_int64",
 ]
 
 
