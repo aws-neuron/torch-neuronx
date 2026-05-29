@@ -1080,14 +1080,14 @@ def _allocate_attention_buffers(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * 4 + 3) * PSUM_BANK_SIZE),
+                address=(0, ((i % 2) * (nl.tile_size.psum_num_banks - 4) + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_flash_attn_correction_factor_psum.append(tp_flash_attn_correction_factor_psum_tile)
             tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * 4 + 3) * PSUM_BANK_SIZE),
+                address=(0, ((i % 2) * (nl.tile_size.psum_num_banks - 4) + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_exp_sum_reciprocal_psum.append(tp_exp_sum_reciprocal_psum_tile)
 
@@ -1204,14 +1204,14 @@ def _allocate_attention_buffers(
                     (mm2_n, mm2_p),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % 4)) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (j % (nl.tile_size.psum_num_banks - 4))) * PSUM_BANK_SIZE)),
                 )
             else:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_p, mm2_n),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % 4)) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (j % (nl.tile_size.psum_num_banks - 4))) * PSUM_BANK_SIZE)),
                 )
             grp_row.append(mm2_psum_tile)
         bufs.mm2_psum.append(grp_row)
