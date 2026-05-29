@@ -345,7 +345,12 @@ def make_composite_lower(operation):
                 if hasattr(impl, "get_lower_func"):
                     lower_fn = impl.get_lower_func()
                     if lower_fn is not None:
-                        return lower_fn(*args, **kwargs)
+                        return lower_fn(
+                            *args,
+                            original_args=original_args,
+                            original_kwargs=original_kwargs,
+                            **kwargs,
+                        )
                 if hasattr(impl, "kernel") and impl.kernel is not None:
                     return impl.kernel.lower(
                         *impl_args,

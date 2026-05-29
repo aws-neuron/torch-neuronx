@@ -299,6 +299,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.PT211_BF16_RECIPROCAL_REGRESSION,
     ),
     SkipGroup(
+        reason=("Compiler bug: stablehlo.transpose on f16 corrupts inf values to NaN."),
+        tests=x.COMPILER_F16_TRANSPOSE_INF_BUG,
+    ),
+    SkipGroup(
         reason=(
             "masked_sum on Neuron fp16 returns NaN when masked-out positions"
             " contain Inf, while torch CPU and numpy references correctly"

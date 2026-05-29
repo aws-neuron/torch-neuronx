@@ -517,3 +517,107 @@ class TestSlicedViewContiguousPerformance:
             f"Took {elapsed_ms:.0f}ms, expected <50ms. "
             "Likely hit slow copy_strided_neuron_to_neuron fallback."
         )
+
+
+class TestContiguousUnsupportedDtypes:
+    """Tests for contiguous() on float64/int64 non-contiguous tensors.
+
+    Regression tests for the bug where DowncastArgs/NeuronSafeCast makes the
+    tensor contiguous during lowering, causing composite_lower to return None.
+    The bug manifests when contiguous_internal is called from CopyToNonContiguous
+    during CPU fallback copy-back of unsupported-dtype tensors.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_permuted_3d(self, dtype):
+        """Reproduce: CPU fallback result copied into non-contiguous Neuron tensor.
+
+        This is the exact pattern that triggers the bug:
+        1. A non-contiguous Neuron tensor (dst) with unsupported dtype exists
+        2. A contiguous tensor (src) is copied into it via copy_
+        3. CopyToNonContiguous calls contiguous_internal on src.permute(perm)
+        4. DispatchContiguousImpl fails because DowncastArgs makes it contiguous
+        """
+        # Create a non-contiguous destination (simulates channels_last output)
+        base = torch.arange(24, device="neuron", dtype=dtype).reshape(2, 3, 4)
+        dst = base.permute(0, 2, 1)  # non-contiguous, shape (2, 4, 3)
+        assert not dst.is_contiguous()
+
+        # Create contiguous source with same logical shape
+        src = torch.ones(2, 4, 3, device="neuron", dtype=dtype)
+
+        # This triggers CopyToNonContiguous → contiguous_internal
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_upsample_like_cpu_fallback_pattern(self, dtype):
+        """Simulate the upsample_bilinear2d CPU fallback copy-back pattern.
+
+        The original failure: upsample_bilinear2d falls back to CPU, produces
+        a channels_last float64 result, _copy_from_and_resize copies it back
+        to a channels_last Neuron tensor.
+        """
+        # Channels-last Neuron tensor (the "output" that CPU fallback writes into)
+        dst = torch.zeros(2, 3, 4, 4, device="neuron", dtype=dtype)
+        dst = dst.contiguous(memory_format=torch.channels_last)
+        assert dst.is_contiguous(memory_format=torch.channels_last)
+        assert not dst.is_contiguous()  # not contiguous in standard format
+
+        # Simulate CPU fallback result being copied back
+        if dtype == torch.float64:
+            cpu_result = torch.randn(2, 3, 4, 4, dtype=dtype)
+        else:
+            cpu_result = torch.randint(0, 100, (2, 3, 4, 4), dtype=dtype)
+        cpu_result = cpu_result.contiguous(memory_format=torch.channels_last)
+        src = cpu_result.to("neuron")
+
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), cpu_result)
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_transposed_2d(self, dtype):
+        """Copy into a transposed 2D destination."""
+        base = torch.arange(12, device="neuron", dtype=dtype).reshape(3, 4)
+        dst = base.t()  # shape (4, 3), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(4, 3, device="neuron", dtype=dtype) * 7
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_sliced(self, dtype):
+        """Copy into a strided-slice destination."""
+        base = torch.zeros(6, 4, device="neuron", dtype=dtype)
+        dst = base[::2, :]  # shape (3, 4), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(3, 4, device="neuron", dtype=dtype) * 5
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        # Verify only sliced rows were written
+        expected = torch.zeros(6, 4, dtype=dtype)
+        expected[::2, :] = 5
+        torch.testing.assert_close(base.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_permuted_4d(self, dtype):
+        """Copy into a 4D permuted destination."""
+        base = torch.zeros(2, 3, 4, 5, device="neuron", dtype=dtype)
+        dst = base.permute(0, 2, 3, 1)  # shape (2, 4, 5, 3), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(2, 4, 5, 3, device="neuron", dtype=dtype) * 3
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())

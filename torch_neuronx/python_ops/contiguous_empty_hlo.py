@@ -41,12 +41,10 @@ class ContiguousEmptyHloImpl(OperationImplementation):
         if self_tensor.is_complex():
             return False
         # Channels-last handled by NRT strided copy in C++ DispatchContiguousImpl.
-        if memory_format is not None and memory_format not in (
+        return memory_format is None or memory_format in (
             torch.contiguous_format,
             torch.preserve_format,
-        ):
-            return False
-        return not self_tensor.is_contiguous()
+        )
 
     def __init__(self):
         super().__init__()
@@ -71,7 +69,11 @@ class ContiguousEmptyHloImpl(OperationImplementation):
         kernel = ContiguousEmptyHloImpl._kernel
 
         def contiguous_empty_hlo_lower(*args, **kwargs):
-            return kernel.lower(args[0])
+            original_args = kwargs.pop("original_args", None)
+            original_kwargs = kwargs.pop("original_kwargs", None)
+            return kernel.lower(
+                args[0], original_args=original_args, original_kwargs=original_kwargs
+            )
 
         return contiguous_empty_hlo_lower
 

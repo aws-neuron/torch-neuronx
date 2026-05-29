@@ -16,12 +16,4 @@ PT211_BF16_RECIPROCAL_REGRESSION = [
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_no_rounding_mode_neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_trunc_rounding_neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_true_divide_neuron_float16",
-    # Compiler bug: stablehlo.transpose on f16 corrupts inf values to NaN.
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_true_divide_neuron_float16",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_floor_rounding_neuron_float16",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_no_rounding_mode_neuron_float16",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_div_trunc_rounding_neuron_float16",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_contig_vs_transposed__refs_pow_neuron_float16",
-    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_div_no_rounding_mode_neuron_float16",
-    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_true_divide_neuron_float16",
 ]
