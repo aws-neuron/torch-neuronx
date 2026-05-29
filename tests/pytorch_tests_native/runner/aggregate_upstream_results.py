@@ -559,6 +559,30 @@ def main() -> int:
     metadata_csv = results_dir / f"upstream_pytorch_run_metadata_{run_timestamp}.csv"
     benchmark_jsonl = results_dir / "benchmark_results.jsonl"
 
+    # Parquet files for the dashboard pipeline are written into a
+    # partitioned subdirectory whose layout mirrors the S3 prefix the
+    # team uses for ingestion. The directory tree under
+    # ``custom-test-artifacts/`` is mirrored to S3 verbatim, so what we
+    # write here is exactly what Athena reads.
+    branch = os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "unknown")
+    run_id = os.environ.get("GITHUB_RUN_ID", "unknown")
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    parquet_root = results_dir / "custom-test-artifacts" / "upstream_pytorch"
+    run_metrics_parquet = (
+        parquet_root
+        / "run_metrics"
+        / f"branch={branch}"
+        / f"dt={run_date}"
+        / f"run_{run_id}.parquet"
+    )
+    test_failures_parquet = (
+        parquet_root
+        / "test_failures"
+        / f"branch={branch}"
+        / f"dt={run_date}"
+        / f"run_{run_id}.parquet"
+    )
+
     if not results_dir.exists():
         logger.error(f"Results directory not found: {results_dir}")
         return 1
@@ -576,11 +600,14 @@ def main() -> int:
     write_run_metadata_csv(result, metadata_csv)
     merge_benchmark_jsonl(results_dir, benchmark_jsonl)
 
-    # Late import: aggregate_panel imports back from this module for shared
-    # helpers (FAILURE_STATUSES, _calc_pass_rate, etc.). Top-level import
-    # would create a circular dependency at module load.
+    # Late import: write_parquet and aggregate_panel both import back
+    # from this module for shared helpers. Top-level imports would create
+    # a circular dependency at module load.
     from aggregate_panel import write_github_summary
+    from write_parquet import write_run_metrics_parquet, write_test_failures_parquet
 
+    write_run_metrics_parquet(result["test_rows"], run_metrics_parquet)
+    write_test_failures_parquet(result["test_rows"], test_failures_parquet)
     write_github_summary(result)
 
     flatten_reports(results_dir)
