@@ -1,3 +1,6 @@
+from .accuracy.compiler_f16_transpose_inf_bug import (
+    COMPILER_F16_TRANSPOSE_INF_BUG as COMPILER_F16_TRANSPOSE_INF_BUG,
+)
 from .accuracy.gradcheck import ACCURACY_GRADCHECK as ACCURACY_GRADCHECK
 from .accuracy.jacobian_mismatch import ACCURACY_JACOBIAN_MISMATCH as ACCURACY_JACOBIAN_MISMATCH
 from .accuracy.pt211_bf16_reciprocal_regression import (

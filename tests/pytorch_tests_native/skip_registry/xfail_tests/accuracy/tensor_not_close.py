@@ -444,4 +444,6 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_slowpath_inplace_neuron_bfloat16",
     "test_indexing.py::TestIndexingNEURON::test_index_put_non_accumulate_deterministic_neuron",
     "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_float32",
+    # Neuron saturates float→int32 at overflow boundaries; CPU wraps (undefined behavior).
+    "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_float_to_int_conversion_finite_neuron_int32",
 ]

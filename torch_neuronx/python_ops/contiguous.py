@@ -26,6 +26,10 @@ class ContiguousFunction(torch.autograd.Function):
         return output
 
     @staticmethod
+    def jvp(ctx, grad_input, grad_memory_format):
+        return grad_input
+
+    @staticmethod
     def backward(ctx, grad_output):
         # For contiguous operation, the gradient can flow back unchanged
         # since making a tensor contiguous doesn't change the mathematical operation

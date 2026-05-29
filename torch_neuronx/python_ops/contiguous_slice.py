@@ -289,5 +289,9 @@ class ContiguousSliceFunction(torch.autograd.Function):
         return impl._execute_impl_internal(self_tensor, memory_format)
 
     @staticmethod
+    def jvp(ctx, grad_self, grad_memory_format, grad_impl):
+        return grad_self
+
+    @staticmethod
     def backward(ctx, grad_output):
         return grad_output, None, None
