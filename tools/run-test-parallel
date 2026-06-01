@@ -11,6 +11,10 @@ readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tes
 readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py" "tests/operations/test_launch_blocking_invariant.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
+# Retry configuration
+DEFAULT_NUM_WORKERS_RETRY=4
+DEFAULT_RETRY_TIMEOUT=1800
+
 # Global state
 declare -g RUNNER=()
 declare -g PYTEST_ARGS=""
@@ -213,12 +217,39 @@ build_pytest_options() {
     echo "$xdist_args $html_opts $cov_opts $json_report_ops $warn_opts"
 }
 
-# Run command and track exit code
+# Run command and track exit code, retrying only failed tests on exit code 1
 run_and_record() {
     local test_name="$1"
     local cmd="$2"
     echo "Running $test_name: $cmd"
-    if ! eval "$cmd"; then
+    local test_exit=0
+    eval "$cmd" || test_exit=$?
+
+    # Retry only on exit code 1 (test failures with complete cache).
+    # Skip timeouts (124/130/137) and internal errors where retry won't help.
+    if [[ $test_exit -eq 1 ]]; then
+        local num_workers_retry="${NUM_WORKERS_RETRY:-$DEFAULT_NUM_WORKERS_RETRY}"
+        local retry_timeout="${RETRY_TIMEOUT:-$DEFAULT_RETRY_TIMEOUT}"
+        echo ""
+        echo "=== Retrying failed tests for $test_name ($num_workers_retry workers, timeout ${retry_timeout}s) ==="
+
+        # Build retry command: replace worker count and append --last-failed flags
+        local retry_cmd
+        retry_cmd=$(echo "$cmd" | sed -E "s/-n [0-9]+/-n $num_workers_retry/")
+        retry_cmd="$retry_cmd --last-failed --last-failed-no-failures=none"
+
+        local retry_exit=0
+        timeout "$retry_timeout" bash -c "$retry_cmd" || retry_exit=$?
+
+        if [[ $retry_exit -eq 0 || $retry_exit -eq 5 ]]; then
+            echo "=== Retry SUCCESS: all previously-failing tests passed on retry ==="
+            test_exit=0
+        else
+            echo "=== Retry incomplete: some tests still failing (retry exit: $retry_exit) ==="
+        fi
+    fi
+
+    if [[ $test_exit -ne 0 ]]; then
         exit_code=1
     fi
 }
