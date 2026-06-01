@@ -26,11 +26,6 @@ import torch_neuronx
 PYTORCH_MAX_DEVICES = torch.iinfo(torch.int8).max + 1
 
 
-@pytest.mark.xfail(
-    condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
-    reason="Legacy sync path LNC mismatch: set-seed kernel compiles with lnc=2 "
-    "but runtime uses lnc=1. Tracked by P415967206 / SEV2 V2169445680",
-)
 def test_device_count_lnc1_all_cores():
     """This test validates:
     1. NEURON_LOGICAL_NC_CONFIG is set to "1"

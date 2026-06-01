@@ -15,17 +15,18 @@ from .handlers import BaseEmptyTensorHandler
 _debug_messages_printed = set()
 
 
-def _should_use_sync_execution(impl, *args):
+def _needs_python_side_logging(impl, *args):
     """
-    Helper function to determine if op should be logged
-    or if current CPU fallback should be used for sync
-    execution (not async pipeline)
+    Helper function to determine if op should be logged from Python.
+
+    Ops that go through the C++ async pipeline have their execution logged
+    from C++. Ops without a kernel or with empty tensors are handled in
+    Python and need Python-side logging.
     """
     return (
         not hasattr(impl, "kernel")
         or impl.kernel is None
         or BaseEmptyTensorHandler().check_for_empty(*args)
-        or os.environ.get("NEURON_LAUNCH_BLOCKING", "0") == "1"
     )
 
 
@@ -774,7 +775,7 @@ class Operation(ABC):
                     # Log the op for all impl other than XLA/c10d kernels
                     # or NEURON_LAUNCH_BLOCKING=1
                     # TODO - remove this condition once all ops are onboarded to async pipeline
-                    if _should_use_sync_execution(impl, *args):
+                    if _needs_python_side_logging(impl, *args):
                         torch_neuronx._C._log_executed_op(self.op_name)
                     return result.output
                 # Log failure and continue to next implementation - debug print once only

@@ -35,7 +35,7 @@ from torch_neuronx.python_ops.shared import (
     IndexOps,
     ReductionOps,
 )
-from torch_neuronx.utils import global_version_hash, is_sync_mode_enabled
+from torch_neuronx.utils import global_version_hash
 
 from ..handlers.output import BaseOutputHandler
 from ..processors import ArgumentProcessor
@@ -985,31 +985,6 @@ class TorchMlirKernel(BaseNeuronKernel):
             cache_key,
         )
 
-    def _get_or_compile_neff(self, hlo_bytes: bytes, cache_key: str) -> bytes:
-        """Get NEFF from cache or compile if needed.
-
-        Args:
-            hlo_bytes: Compiled HLO bytes
-            cache_key: Cache key for lookup
-
-        Returns:
-            NEFF bytes
-        """
-        # Try cache first
-        neff_bytes = self.cache.get_neff(cache_key)
-        if neff_bytes is not None:
-            return neff_bytes
-
-        # Compile HLO to NEFF
-        neff_bytes = self.hlo_compiler.compile_to_neff(
-            hlo_bytes, ir_type="StableHLO", neff_cache_key=cache_key
-        )
-
-        # Store in cache
-        self.cache.store_neff(cache_key, neff_bytes)
-
-        return neff_bytes
-
     # ═══════════════════════════════════════════════════════════════
     #  lower() — produces LoweringResult for C++ NeuronDispatcher
     # ═══════════════════════════════════════════════════════════════
@@ -1454,33 +1429,23 @@ class TorchMlirKernel(BaseNeuronKernel):
             else (execution_tensors,)
         )
 
-        # Execute based on sync/async mode
-        if not is_sync_mode_enabled():
-            cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
-            if cpu_fallback_context is None:
-                original_inputs_for_ctx = (
-                    context.original_inputs if context and context.has_original_inputs() else args
-                )
-                cpu_fallback_context = {
-                    "original_inputs": list(original_inputs_for_ctx),
-                    "original_kwargs": {},
-                }
+        cpu_fallback_context = getattr(self, "_cpu_fallback_context", None)
+        if cpu_fallback_context is None:
+            original_inputs_for_ctx = (
+                context.original_inputs if context and context.has_original_inputs() else args
+            )
+            cpu_fallback_context = {
+                "original_inputs": list(original_inputs_for_ctx),
+                "original_kwargs": {},
+            }
 
-            self._execute_async(
-                filtered_inputs,
-                exec_tensors,
-                hlo_bytes,
-                cache_key,
-                cpu_fallback_context,
-            )
-        else:
-            neff_bytes = self._get_or_compile_neff(hlo_bytes, cache_key)
-            self._execute_sync(
-                filtered_inputs,
-                exec_tensors,
-                neff_bytes,
-                device,
-            )
+        self._execute(
+            filtered_inputs,
+            exec_tensors,
+            hlo_bytes,
+            cache_key,
+            cpu_fallback_context,
+        )
 
         # Upcast execution results based on original_outputs dtypes
         upcast_tensors = self._upcast_execution_results(
@@ -1506,7 +1471,7 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         return result
 
-    def _execute_async(
+    def _execute(
         self,
         filtered_inputs: tuple,
         execution_tensors: tuple,
@@ -1563,25 +1528,3 @@ class TorchMlirKernel(BaseNeuronKernel):
             )
         except RuntimeError as e:
             raise RuntimeError(f"XLA kernel execution failed: {e}") from e
-
-    def _execute_sync(
-        self,
-        filtered_inputs: tuple,
-        execution_tensors: tuple,
-        neff_bytes: bytes,
-        device: torch.device,
-    ):
-        """Execute kernel synchronously.
-
-        Args:
-            filtered_inputs: Pre-filtered input tensors
-            execution_tensors: Output tensors for execution
-            neff_bytes: Compiled NEFF bytes
-            device: Target device
-        """
-        # Prepare input/output dictionaries for NEFF execution
-        filtered_input_dict = {f"input{i}": inp for i, inp in enumerate(filtered_inputs)}
-        output_dict = {f"output{i}": out for i, out in enumerate(execution_tensors)}
-
-        # Execute NEFF (uses BaseNeuronKernel.execute_neff)
-        self.execute_neff(neff_bytes, filtered_input_dict, output_dict, op_name=self.op_name)

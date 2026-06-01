@@ -8,7 +8,7 @@ set -e
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback" "tests/vertical")
-readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py")
+readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py" "tests/operations/test_launch_blocking_invariant.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
 # Global state
@@ -269,7 +269,12 @@ run_additional_tests() {
 
         local pytest_opts
         pytest_opts=$(build_pytest_options "distributed-report" "$distributed_workers")
-        run_and_record "distributed_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed --ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
+        run_and_record "distributed_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed --ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py --ignore=tests/distributed/collective_ops/test_launch_blocking_collective_invariant.py"
+
+        # Launch blocking collective invariant test (requires CPP_DISPATCH=0)
+        local pytest_opts
+        pytest_opts=$(build_pytest_options "launch-blocking-collective-invariant-report" "1")
+        run_and_record "launch_blocking_collective_invariant" "TORCH_NEURONX_CPP_DISPATCH=0 NEURON_LAUNCH_BLOCKING=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_launch_blocking_collective_invariant.py"
     fi
 
     local pytest_opts
@@ -280,6 +285,11 @@ run_additional_tests() {
     local pytest_opts
     pytest_opts=$(build_pytest_options "lnc1-all-cores-report" "1")
     run_and_record "lnc1_all_cores_tests" "NEURON_LOGICAL_NC_CONFIG=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/device/test_device_lnc1_all_cores.py"
+
+    # Launch blocking invariant test (requires CPP_DISPATCH=0 to exercise Python kernel path)
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "launch-blocking-invariant-report" "1")
+    run_and_record "launch_blocking_invariant" "TORCH_NEURONX_CPP_DISPATCH=0 NEURON_LAUNCH_BLOCKING=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/operations/test_launch_blocking_invariant.py"
 
     local pytest_opts
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
