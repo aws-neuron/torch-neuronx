@@ -203,8 +203,10 @@ module {
 }
 ```
 
-Once the HLO is generated, `_execute_async` or `_execute_sync` calls neuronx-cc to compile the HLO
-into NEFF and execute the NEFF with provided input and output tensors.
+Once the HLO is generated, `_execute_async` submits the HLO bytes to the C++
+OperationExecutionEngine via `_submit_xla_task_to_pipeline`, which compiles the HLO into NEFF
+(via neuronx-cc) and executes the NEFF on hardware with provided input and output tensors.
+When `NEURON_LAUNCH_BLOCKING=1` is set, the C++ engine blocks until execution completes.
 
 ### Output Construction
 

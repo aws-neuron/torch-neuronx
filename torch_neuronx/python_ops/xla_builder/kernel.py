@@ -12,7 +12,7 @@ from torch_neuronx import _C
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron import current_stream, default_stream
-from torch_neuronx.utils import convert_for_neuron, is_host_cc_enabled, is_sync_mode_enabled
+from torch_neuronx.utils import convert_for_neuron, is_host_cc_enabled
 
 from ..compilation import CompilationCache, HloCompiler
 from ..processors import ArgumentProcessor
@@ -127,79 +127,29 @@ class XLABuilderKernel(BaseNeuronKernel):
         # need to handle the case where the kernel is created after impl.execute call
         if cpu_fallback_context is None:
             cpu_fallback_context = {"original_inputs": list(inputs), "original_kwargs": {}}
-        if is_sync_mode_enabled():
-            self._execute_sync(cache_key, processed_inputs, input_dict, kwargs, output_tensors)
+        # For collective operations on non-default stream, use direct host API path
+        # which doesn't require HLO compilation
+        if self.has_collectives and not self._is_default_stream() and is_host_cc_enabled():
+            self._execute_collective_direct(
+                tuple(input_dict.values()),
+                kwargs,
+                output_tensors,
+                cpu_fallback_context,
+            )
         else:
-            # For collective operations on non-default stream, use direct host API path
-            # which doesn't require HLO compilation
-            if self.has_collectives and not self._is_default_stream() and is_host_cc_enabled():
-                self._execute_collective_direct(
-                    tuple(input_dict.values()),
-                    kwargs,
-                    output_tensors,
-                    cpu_fallback_context,
-                )
-            else:
-                self._execute_async(
-                    cache_key,
-                    processed_inputs,
-                    tuple(input_dict.values()),
-                    kwargs,
-                    output_tensors,
-                    cpu_fallback_context,
-                )
+            self._execute(
+                cache_key,
+                processed_inputs,
+                tuple(input_dict.values()),
+                kwargs,
+                output_tensors,
+                cpu_fallback_context,
+            )
 
         # Apply dtype corrections and return
         return self._finalize_outputs(output_tensors, is_single_output)
 
-    def _get_or_compile_neff(self, cache_key: str, inputs: tuple, kwargs: dict) -> bytes:
-        """Get NEFF from cache or compile if needed.
-
-        Args:
-            inputs: Preprocessed inputs
-            kwargs: Keyword arguments
-
-        Returns:
-            Compiled NEFF bytes
-        """
-        # Try cache first
-        neff_bytes = self.cache.get_neff(cache_key)
-        if neff_bytes is not None:
-            return neff_bytes
-
-        hlo = self.xla_builder_compiler.compile_to_hlo(self.hlo_fn, inputs, kwargs)
-        # Collectives always use XLA (HLO protobuf), never StableHLO
-        ir_type = "XLA"  # xla_builder only support XLA IR
-        neff_bytes = self.hlo_compiler.compile_to_neff(
-            hlo.module_proto.SerializeToString(), ir_type=ir_type
-        )
-
-        # Store in cache
-        self.cache.store_neff(cache_key, neff_bytes)
-
-        return neff_bytes
-
-    def _execute_sync(
-        self,
-        cache_key: str,
-        processed_inputs: tuple,
-        input_dict: dict,
-        kwargs: dict,
-        output_tensors: tuple,
-    ) -> None:
-        """Execute kernel in blocking mode."""
-        neff_bytes = self._get_or_compile_neff(cache_key, processed_inputs, kwargs)
-        output_dict = {f"output{i}": out for i, out in enumerate(output_tensors)}
-
-        self.execute_neff(
-            neff_bytes,
-            input_dict,
-            output_dict,
-            op_name=self.op_name,
-            has_collectives=self.has_collectives,
-        )
-
-    def _execute_async(
+    def _execute(
         self,
         cache_key: str,
         processed_inputs: tuple,
