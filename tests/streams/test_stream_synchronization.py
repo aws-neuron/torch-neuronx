@@ -14,7 +14,8 @@ class TestStreamSynchronization:
     """Test stream synchronization methods."""
 
     def test_stream_query_empty_stream(self):
-        """Test stream query for completion status on empty stream."""
+        """Test stream query for completion status on a drained stream."""
+        torch_neuronx.synchronize()
         stream = torch.neuron.Stream()
         # Empty stream should be complete
         assert stream.query()

@@ -144,6 +144,8 @@ def test_scaled_dot_product_attention_accuracy(dtype, q_heads, kv_heads):
     if not torch.neuron.is_available():
         pytest.skip("Neuron device not available")
 
+    torch_neuronx.synchronize()
+
     torch.manual_seed(42)
     device = torch.device("neuron", 0)
     batch_size, seq_len, d_head = 1, 512, 64
@@ -175,20 +177,29 @@ def test_scaled_dot_product_attention_accuracy(dtype, q_heads, kv_heads):
         output_neuron = F.scaled_dot_product_attention(
             q_neuron, k_neuron, v_neuron, dropout_p=0.0, enable_gqa=True
         )
+        torch_neuronx.synchronize()
+        output_neuron_snapshot = output_neuron.detach().cpu()
+
         output_neuron.backward(grad_output.to(device))
 
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
         assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
+
+        # Ensure backward has fully completed before reading gradients off-device.
+        torch_neuronx.synchronize()
+        q_grad_neuron = q_neuron.grad.detach().cpu()
+        k_grad_neuron = k_neuron.grad.detach().cpu()
+        v_grad_neuron = v_neuron.grad.detach().cpu()
 
     # Compare results with dtype-appropriate tolerances
     # C++ dispatch compiles via make_fx tracing which introduces slightly more
     # float32 rounding than direct kernel execution, so float32 needs wider tolerance.
     rtol, atol = (1e-2, 1e-2) if dtype == torch.float32 else (5e-2, 5e-3)
 
-    torch.testing.assert_close(output_neuron.cpu(), output_cpu, rtol=rtol, atol=atol)
-    torch.testing.assert_close(q_neuron.grad.cpu(), q_grad_cpu, rtol=rtol, atol=atol)
-    torch.testing.assert_close(k_neuron.grad.cpu(), k_grad_cpu, rtol=rtol, atol=atol)
-    torch.testing.assert_close(v_neuron.grad.cpu(), v_grad_cpu, rtol=rtol, atol=atol)
+    torch.testing.assert_close(output_neuron_snapshot, output_cpu, rtol=rtol, atol=atol)
+    torch.testing.assert_close(q_grad_neuron, q_grad_cpu, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k_grad_neuron, k_grad_cpu, rtol=rtol, atol=atol)
+    torch.testing.assert_close(v_grad_neuron, v_grad_cpu, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(
