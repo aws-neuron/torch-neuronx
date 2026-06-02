@@ -490,3 +490,36 @@ class TestSlidingWindowMask:
 
         # With window=64 and tile=512, most tiles should be skipped
         assert skips / total > 0.5
+
+
+class TestGenerateTileTypesBakedDevice:
+    """Regression test for FX-traced mask_mods that return a non-CPU tensor.
+
+    Example: Upstream `torch.nn.attention.flex_attention.noop_mask` is
+        return batch.new_ones(size=(), dtype=torch.bool, device=batch.device)
+    """
+
+    def test_generate_tile_types_with_non_cpu_output(self):
+        """`_generate_tile_types` must handle a mask_mod whose output lands on a
+        non-CPU device by routing the module through `replace_device_with_cpu`
+        before per-tile evaluation.
+        """
+
+        class BakedDeviceMaskMod(torch.nn.Module):
+            def forward(self, b, h, q_idx, kv_idx):
+                return torch.ops.aten.new_ones.default(
+                    b,
+                    [],
+                    dtype=torch.bool,
+                    device=torch.device("neuron"),
+                    pin_memory=False,
+                )
+
+        mask_mod = fx.symbolic_trace(BakedDeviceMaskMod())
+
+        result = _generate_tile_types(mask_mod, seqlen_q=128, seqlen_kv=128, k_tile_sz=128)
+
+        # noop-style mask is all-True → every tile classified as FULL.
+        for row in result["qk_tile_types"]:
+            for t in row:
+                assert t == _TILE_FULL
