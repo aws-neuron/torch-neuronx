@@ -3623,3 +3623,259 @@ class TestAddcdivDecompositionE2E:
         result = compiled_fn(input_cpu.to("neuron"), t1_cpu.to("neuron"), t2_cpu.to("neuron"))
 
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+class TestForeachDecompositionCompileE2E:
+    """E2E tests for foreach op decompositions via torch.compile with neuron backend.
+
+    Verifies that foreach ops (used by optimizers) compile and produce
+    correct results through the Neuron backend.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_dynamo(self):
+        yield
+        torch._dynamo.reset()
+
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_foreach_list(self, op_name, dtype):
+        """Test foreach .List variants compile correctly."""
+        torch.manual_seed(42)
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").List
+
+        has_alpha = op_name in ("add", "sub")
+        kwargs = {"alpha": 0.5} if has_alpha else {}
+
+        def fn(t1, t2):
+            return aten_op(t1, t2, **kwargs)
+
+        t1 = [torch.randn(64, 128, dtype=dtype, device="neuron") for _ in range(3)]
+        # Avoid near-zero divisors for div in bf16
+        t2 = (
+            [torch.randn(64, 128, dtype=dtype, device="neuron").clamp(min=0.1) for _ in range(3)]
+            if op_name == "div"
+            else [torch.randn(64, 128, dtype=dtype, device="neuron") for _ in range(3)]
+        )
+
+        expected = aten_op([x.cpu() for x in t1], [x.cpu() for x in t2], **kwargs)
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    def test_foreach_scalar(self, op_name):
+        """Test foreach .Scalar variants compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").Scalar
+
+        def fn(tensors):
+            return aten_op(tensors, 2.5)
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        expected = aten_op([t.cpu() for t in tensors], 2.5)
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("op_name", ["add", "mul", "div"])
+    def test_foreach_tensor(self, op_name):
+        """Test foreach .Tensor variants compile correctly (sub has no .Tensor overload)."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").Tensor
+
+        has_alpha = op_name == "add"
+        kwargs = {"alpha": 0.5} if has_alpha else {}
+
+        def fn(tensors, scalar_t):
+            return aten_op(tensors, scalar_t, **kwargs)
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        scalar_t = torch.tensor(1.5, device="neuron")
+
+        expected = aten_op([t.cpu() for t in tensors], scalar_t.cpu(), **kwargs)
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors, scalar_t)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    def test_foreach_list_inplace(self, op_name):
+        """Test foreach inplace .List variants compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}_").List
+
+        has_alpha = op_name in ("add", "sub")
+        kwargs = {"alpha": 0.5} if has_alpha else {}
+
+        def fn(t1, t2):
+            aten_op(t1, t2, **kwargs)
+            return t1
+
+        t1 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+
+        t1_cpu = [x.cpu().clone() for x in t1]
+        t2_cpu = [x.cpu() for x in t2]
+        aten_op(t1_cpu, t2_cpu, **kwargs)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, t1_cpu, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    def test_foreach_scalar_inplace(self, op_name):
+        """Test foreach inplace .Scalar variants compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}_").Scalar
+
+        def fn(tensors):
+            aten_op(tensors, 2.0)
+            return tensors
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        tensors_cpu = [t.cpu().clone() for t in tensors]
+        aten_op(tensors_cpu, 2.0)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, tensors_cpu, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_sqrt(self):
+        """Test foreach sqrt compiles correctly."""
+
+        def fn(tensors):
+            return torch.ops.aten._foreach_sqrt.default(tensors)
+
+        tensors = [torch.rand(64, 128, device="neuron") + 0.1 for _ in range(3)]
+        expected = torch.ops.aten._foreach_sqrt.default([t.cpu() for t in tensors])
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_addcmul(self):
+        """Test foreach addcmul compiles correctly."""
+
+        def fn(s, t1, t2):
+            return torch.ops.aten._foreach_addcmul.Scalar(s, t1, t2, value=0.5)
+
+        s = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t1 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+
+        expected = torch.ops.aten._foreach_addcmul.Scalar(
+            [x.cpu() for x in s], [x.cpu() for x in t1], [x.cpu() for x in t2], value=0.5
+        )
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(s, t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_addcdiv(self):
+        """Test foreach addcdiv compiles correctly."""
+
+        def fn(s, t1, t2):
+            return torch.ops.aten._foreach_addcdiv.Scalar(s, t1, t2, value=0.5)
+
+        s = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t1 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(64, 128, device="neuron") + 1.0 for _ in range(3)]
+
+        expected = torch.ops.aten._foreach_addcdiv.Scalar(
+            [x.cpu() for x in s], [x.cpu() for x in t1], [x.cpu() for x in t2], value=0.5
+        )
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(s, t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_list_mixed_empty(self):
+        """Test foreach .List with mix of empty and non-empty tensors."""
+
+        def fn(t1, t2):
+            return torch.ops.aten._foreach_add.List(t1, t2)
+
+        t1 = [
+            torch.randn(64, device="neuron"),
+            torch.empty(0, device="neuron"),
+            torch.randn(32, device="neuron"),
+        ]
+        t2 = [
+            torch.randn(64, device="neuron"),
+            torch.empty(0, device="neuron"),
+            torch.randn(32, device="neuron"),
+        ]
+
+        expected = torch.ops.aten._foreach_add.List([x.cpu() for x in t1], [x.cpu() for x in t2])
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            assert r.shape == e.shape
+            if r.numel() > 0:
+                torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("op_name", ["add", "mul", "div"])
+    def test_foreach_scalar_dtype_promotion(self, op_name):
+        """Test foreach .Scalar with integer tensors (dtype promotion to float for div)."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").Scalar
+
+        def fn(tensors):
+            return aten_op(tensors, 2)
+
+        tensors = [torch.tensor([1, 2, 3], dtype=torch.int32, device="neuron")]
+        expected = aten_op([t.cpu() for t in tensors], 2)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            assert r.dtype == e.dtype
+            torch.testing.assert_close(r.cpu(), e)
+
+    def test_foreach_list_same_object(self):
+        """Test foreach .List where self and other are the same list (x + x = 2x)."""
+
+        def fn(t):
+            return torch.ops.aten._foreach_add.List(t, t)
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        expected = [t.cpu() * 2 for t in tensors]
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_adam_real_optimizer(self):
+        """Test real torch.optim.Adam compiles and runs."""
+        model = torch.nn.Linear(256, 128).to("neuron")
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        def train_step(x):
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(x).sum()
+            loss.backward()
+            optimizer.step()
+            return loss
+
+        x = torch.randn(32, 256, device="neuron")
+
+        compiled_step = torch.compile(train_step, backend="neuron")
+        loss = compiled_step(x)
+
+        assert loss.device.type == "neuron"
+        assert loss.numel() == 1
