@@ -34,6 +34,44 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
+_FAILURE_REASON_MAX_CHARS = 2000
+
+
+def _extract_failure_reason(test: dict) -> str:
+    """Best-effort failure-reason extraction across pytest report stages.
+
+    Sources tried, in order: ``call.crash.message``, ``call.longrepr``
+    (last non-empty line), the ``???`` synthetic stage (pytest-json-report
+    puts xdist worker-crash diagnostics here when ``call`` is empty —
+    common for NRT segfaults), and ``setup.crash.message``.
+    """
+    call = test.get("call") or {}
+    crash_msg = (call.get("crash") or {}).get("message") or ""
+    if crash_msg:
+        return crash_msg[:_FAILURE_REASON_MAX_CHARS]
+
+    call_longrepr = call.get("longrepr") or ""
+    if call_longrepr:
+        lines = [ln for ln in str(call_longrepr).split("\n") if ln.strip()]
+        if lines:
+            return lines[-1][:_FAILURE_REASON_MAX_CHARS]
+
+    crash_stage = test.get("???") or {}
+    crash_lr = crash_stage.get("longrepr") or ""
+    if crash_lr:
+        lines = [ln for ln in str(crash_lr).split("\n") if ln.strip()]
+        if lines:
+            return lines[-1][:_FAILURE_REASON_MAX_CHARS]
+
+    setup = test.get("setup") or {}
+    setup_msg = (setup.get("crash") or {}).get("message") or ""
+    if setup_msg:
+        # [setup] prefix so dashboards distinguish setup-stage failures.
+        return f"[setup] {setup_msg}"[:_FAILURE_REASON_MAX_CHARS]
+
+    return ""
+
+
 def extract_test_data_from_json(json_file: str) -> list[dict]:
     """Extract test data from a pytest JSON report.
 
@@ -69,15 +107,10 @@ def extract_test_data_from_json(json_file: str) -> list[dict]:
             teardown_duration = test.get("teardown", {}).get("duration", 0)
             total_duration = setup_duration + call_duration + teardown_duration
 
-            # Extract failure reason for failed and xfailed tests
-            failure_reason = ""
             outcome = test.get("outcome", "")
-            if outcome in ("failed", "xfailed"):
-                call_info = test.get("call", {})
-                failure_reason = call_info.get("crash", {}).get("message", "")
-                if not failure_reason and "longrepr" in call_info:
-                    failure_reason = str(call_info["longrepr"]).split("\n")[-1]
-                failure_reason = failure_reason[:500]
+            failure_reason = ""
+            if outcome in ("failed", "error", "xfailed"):
+                failure_reason = _extract_failure_reason(test)
 
             # test_id: short nodeid for easy re-running, e.g.
             # "test_ops.py::TestOpsNeuron::test_add_cpu_float32"

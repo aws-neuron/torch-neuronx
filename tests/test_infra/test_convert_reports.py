@@ -174,3 +174,130 @@ def test_csv_columns_match_extract_output(tmp_path):
         f"CSV columns drifted from extract_test_data_from_json output. "
         f"Expected (minus nodeid): {sorted(expected_cols)}, got: {sorted(actual_cols)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# extract_test_data_from_json — failure-reason extraction across stages
+# ---------------------------------------------------------------------------
+
+
+def _failed_test_with_call_crash(message: str) -> dict:
+    """Standard failure: pytest captured a crash in the call stage."""
+    return {
+        "nodeid": _real_nodeid("TestX", "test_y"),
+        "outcome": "failed",
+        "setup": {"duration": 0.0, "outcome": "passed"},
+        "call": {
+            "duration": 0.1,
+            "outcome": "failed",
+            "crash": {"path": "x.py", "lineno": 10, "message": message},
+        },
+        "teardown": {"duration": 0.0, "outcome": "passed"},
+    }
+
+
+def test_extract_reason_uses_call_crash_message(tmp_path):
+    json_path = tmp_path / "x.json"
+    _write_pytest_json(json_path, [_failed_test_with_call_crash("RuntimeError: boom\n  details")])
+
+    rows = extract_test_data_from_json(str(json_path))
+    assert rows[0]["failure_reason"] == "RuntimeError: boom\n  details"
+
+
+def test_extract_reason_recovers_worker_crash_victim(tmp_path):
+    """xdist-worker-crash victims have empty ``call`` and the diagnostic
+    under a literal ``???`` key — common for NRT segfaults. Without this
+    branch, dashboard categorization buckets miss them entirely."""
+    json_path = tmp_path / "x.json"
+    payload = [
+        {
+            "nodeid": _real_nodeid("TestCommonNEURON", "test_dtypes_constant_pad_nd_neuron"),
+            "outcome": "failed",
+            "setup": {"duration": 0.0, "outcome": "passed"},
+            "call": {},
+            "teardown": {},
+            "???": {
+                "duration": 0,
+                "outcome": "failed",
+                "longrepr": (
+                    "[gw26] linux -- Python 3.12.3\n"
+                    "worker 'gw26' crashed while running 'tests/x.py::T::a'"
+                ),
+            },
+        }
+    ]
+    _write_pytest_json(json_path, payload)
+
+    rows = extract_test_data_from_json(str(json_path))
+    assert "worker 'gw26' crashed" in rows[0]["failure_reason"]
+
+
+def test_extract_reason_falls_back_to_call_longrepr(tmp_path):
+    """When ``call.crash`` is absent, use last non-empty line of ``call.longrepr``."""
+    json_path = tmp_path / "x.json"
+    payload = [
+        {
+            "nodeid": _real_nodeid("TestX", "test_y"),
+            "outcome": "failed",
+            "setup": {"duration": 0.0, "outcome": "passed"},
+            "call": {
+                "duration": 0.1,
+                "outcome": "failed",
+                "longrepr": "tests/x.py:42: in test_y\n    foo()\nE   AssertionError: nope",
+            },
+            "teardown": {"duration": 0.0, "outcome": "passed"},
+        }
+    ]
+    _write_pytest_json(json_path, payload)
+
+    rows = extract_test_data_from_json(str(json_path))
+    assert "AssertionError: nope" in rows[0]["failure_reason"]
+
+
+def test_extract_reason_recovers_setup_stage_crash(tmp_path):
+    """Setup-stage failures get a ``[setup]`` prefix so dashboards can
+    distinguish fixture errors from test-body failures."""
+    json_path = tmp_path / "x.json"
+    payload = [
+        {
+            "nodeid": _real_nodeid("TestX", "test_y"),
+            "outcome": "failed",
+            "setup": {
+                "duration": 0.0,
+                "outcome": "failed",
+                "crash": {"path": "fix.py", "lineno": 5, "message": "FixtureError: missing"},
+            },
+            "call": {},
+            "teardown": {},
+        }
+    ]
+    _write_pytest_json(json_path, payload)
+
+    reason = extract_test_data_from_json(str(json_path))[0]["failure_reason"]
+    assert reason.startswith("[setup]") and "FixtureError" in reason
+
+
+def test_extract_reason_passed_test_has_empty_reason(tmp_path):
+    """Only failed/error/xfailed get a reason; everything else is empty
+    so panels filtering on ``failure_reason != ''`` aren't polluted."""
+    json_path = tmp_path / "x.json"
+    payload = [
+        _make_test("TestX", "test_pass", outcome="passed"),
+        _make_test("TestX", "test_skip", outcome="skipped"),
+        _make_test("TestX", "test_xpass", outcome="xpassed"),
+    ]
+    _write_pytest_json(json_path, payload)
+
+    rows = extract_test_data_from_json(str(json_path))
+    assert all(r["failure_reason"] == "" for r in rows)
+
+
+def test_extract_reason_truncates_very_long_messages(tmp_path):
+    """2000-char cap so a runaway longrepr can't bloat parquet files."""
+    long_msg = "RuntimeError: " + ("x" * 5000)
+    json_path = tmp_path / "x.json"
+    _write_pytest_json(json_path, [_failed_test_with_call_crash(long_msg)])
+
+    reason = extract_test_data_from_json(str(json_path))[0]["failure_reason"]
+    assert len(reason) <= 2000
+    assert reason.startswith("RuntimeError: ")

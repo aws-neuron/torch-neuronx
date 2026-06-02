@@ -1,6 +1,6 @@
 """Parquet writers for the upstream test dashboard pipeline.
 
-Two outputs, one file each per run:
+Three outputs, one file each per run:
 
   1. ``run_metrics`` — one row per ``(run, component)``, where
      ``component='overall'`` is the suite-wide roll-up. Drives the
@@ -10,15 +10,16 @@ Two outputs, one file each per run:
      the team is working through, not regressions). Drives the failures
      table panel and acts as the source for newly-failing test detection
      across runs.
+  3. ``test_aggregated`` — one row per non-skipped test (passed,
+     passed_on_retry, failed, error, xfailed, xpassed, and their
+     ``_on_retry`` variants). Mirrors the all-tests CSV but typed and
+     partition-pruned for Athena. Drives ad-hoc per-test analysis:
+     longest-duration tests, xfail categorization, status churn.
 
 The schemas, partitioning convention, and component split are documented
 in ``docs/pt_upstream/grafana_athena_setup.md``. Keep that doc and this
 module in sync — the Athena DDL there relies on the column names and
 types defined here.
-
-If you change the on-disk schema below, update the matching DDL in
-``athena/run_metrics.sql`` and ``athena/test_failures.sql`` in the same
-PR, then manually re-run the DDL on the prod Athena workgroup.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from aggregate_upstream_results import (
     FAILURE_STATUSES,
+    SKIPPED_STATUSES,
     _calc_pass_rate,
     _file_from_row,
     _get_run_metadata,
@@ -294,6 +297,108 @@ def _make_test_failures_table(
     return pa.table(columnar, schema=schema)
 
 
+# ---------------------------------------------------------------------------
+# test_aggregated — one row per non-skipped test
+# ---------------------------------------------------------------------------
+
+# Rules to collapse the first line of an error into an ``error_category``
+# bucket dashboards can ``GROUP BY``. Each rule replaces a variable token
+# (op name, worker ID, ...) with a stable placeholder so semantically
+# identical errors hit one bucket. Add a new rule when a new error family
+# fragments existing buckets in real data — the raw first line is always
+# preserved in ``error_signature``.
+_ERROR_CATEGORY_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # OpInfo dtype-mismatch: "for <op> on device type <dev>"
+    (re.compile(r" for [\w.]+ on device type \w+ "), " for <op> on device type <dev> "),
+    # NRT errors: "operation=aten::scatter_add_" → "operation=aten::<op>"
+    (re.compile(r"operation=aten::[\w.]+"), "operation=aten::<op>"),
+    # Worker-crash messages embed the test nodeid; collapse so all
+    # crashes share one bucket (the nodeid is in the test_id column).
+    (
+        re.compile(r"worker '[^']+' crashed while running '[^']+'"),
+        "worker '<gw>' crashed while running '<nodeid>'",
+    ),
+)
+
+
+def _normalize_signature(first_line: str) -> str:
+    """Collapse dynamic tokens in ``first_line`` per ``_ERROR_CATEGORY_RULES``."""
+    if not first_line:
+        return ""
+    out = first_line
+    for pattern, repl in _ERROR_CATEGORY_RULES:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def _make_test_aggregated_table(
+    test_rows: list[dict], metadata: dict, run_timestamp: datetime
+) -> pa.Table:
+    """Build the test_aggregated table — one row per non-skipped test.
+
+    Filter mirrors ``write_all_tests_csv`` (skipped excluded). Schema
+    diverges from ``test_failures`` by materializing ``test_class`` /
+    ``test_method`` (so dashboards group without regex), and by emitting
+    the raw first line as ``error_signature`` plus the normalized form as
+    ``error_category`` — see ``_ERROR_CATEGORY_RULES``.
+    """
+    # Sort by (component, test_id) so per-row-group min/max stats are
+    # tight enough for Athena's component-filter predicate pushdown.
+    rows = sorted(
+        (r for r in test_rows if r.get("status") not in SKIPPED_STATUSES),
+        key=lambda r: (
+            _component_for(_file_from_row(r)),
+            r.get("test_id") or r.get("nodeid") or "",
+        ),
+    )
+
+    schema = pa.schema(
+        [
+            ("commit_sha", pa.string()),
+            ("branch", pa.string()),
+            ("run_id", pa.string()),
+            ("run_timestamp", pa.timestamp("us")),
+            ("component", pa.string()),
+            ("test_id", pa.string()),
+            ("test_class", pa.string()),
+            ("test_method", pa.string()),
+            ("status", pa.string()),
+            ("duration_sec", pa.float64()),
+            ("failure_reason", pa.string()),
+            ("error_signature", pa.string()),
+            ("error_category", pa.string()),
+        ]
+    )
+
+    columnar: dict[str, list] = {name: [] for name in schema.names}
+    for row in rows:
+        try:
+            duration = float(row.get("duration(sec)", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+        # failure_reason is already capped by extract_test_data_from_json.
+        reason = (row.get("failure_reason") or "").strip()
+        signature = next((ln.strip() for ln in reason.split("\n") if ln.strip()), "")
+        category = _normalize_signature(signature)
+
+        columnar["commit_sha"].append(metadata["commit_sha"])
+        columnar["branch"].append(metadata["branch"])
+        columnar["run_id"].append(metadata["run_id"])
+        columnar["run_timestamp"].append(run_timestamp)
+        columnar["component"].append(_component_for(_file_from_row(row)))
+        columnar["test_id"].append(row.get("test_id") or row.get("nodeid") or "")
+        columnar["test_class"].append(row.get("test_class") or "")
+        columnar["test_method"].append(row.get("test_method") or "")
+        columnar["status"].append(row.get("status") or "")
+        columnar["duration_sec"].append(duration)
+        columnar["failure_reason"].append(reason)
+        columnar["error_signature"].append(signature)
+        columnar["error_category"].append(category)
+
+    return pa.table(columnar, schema=schema)
+
+
 def write_run_metrics_parquet(test_rows: list[dict], output_path: Path) -> None:
     """Write the run_metrics parquet file.
 
@@ -312,3 +417,16 @@ def write_test_failures_parquet(test_rows: list[dict], output_path: Path) -> Non
     table = _make_test_failures_table(test_rows, _get_run_metadata(), _resolve_run_timestamp())
     pq.write_table(table, output_path, compression="snappy")
     logger.info(f"Test failures parquet: {output_path} ({table.num_rows} rows)")
+
+
+def write_test_aggregated_parquet(test_rows: list[dict], output_path: Path) -> None:
+    """Write the test_aggregated parquet — one row per non-skipped test.
+
+    Mirrors the layout of ``upstream_pytorch_all_tests_aggregated_<ts>.csv``
+    but typed and partition-pruned for Athena. Skipped tests (which are
+    the majority of rows on a typical run) live only in the skipped CSV.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    table = _make_test_aggregated_table(test_rows, _get_run_metadata(), _resolve_run_timestamp())
+    pq.write_table(table, output_path, compression="snappy")
+    logger.info(f"Test aggregated parquet: {output_path} ({table.num_rows} rows)")
