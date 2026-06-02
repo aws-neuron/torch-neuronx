@@ -10,14 +10,17 @@
 #include <torch_neuronx/csrc/core/utils/NeuronExceptions.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
-
-// Shorthand for segment pool debug logging
-#define SEGMENT_POOL_DEBUG(...)                                                         \
-  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::DEBUG, torch_neuronx::LogCategory::MEMORY, \
-                    "[SEGMENT_POOL]", __VA_ARGS__)
 
 extern "C" {
 #include <nrt/nrt.h>
@@ -25,17 +28,235 @@ extern "C" {
 
 namespace c10_neuron {
 
-size_t NeuronSegmentPool::RoundSize(size_t size) {
+namespace {
+
+// ---------------------------------------------------------------------------
+// AllocatorConfig env-var parsing
+// ---------------------------------------------------------------------------
+//
+// First call to AllocatorConfig::Get() latches in defaults, applies any
+// AllocatorConfig::kEnvVarName override, validates the result, and returns
+// a const reference. The default NeuronSegmentPool constructor copies that
+// frozen singleton; the (device_id, config) constructor takes a
+// user-supplied config and validates it directly.
+// ---------------------------------------------------------------------------
+
+// Field key strings used in the env-var spec. Centralized so log messages
+// and the parser reference the same identifiers.
+constexpr std::string_view kKeyPoolBoundary = "kPoolBoundary";
+constexpr std::string_view kKeySmallSegmentSize = "kSmallSegmentSize";
+constexpr std::string_view kKeyMediumSegmentSize = "kMediumSegmentSize";
+constexpr std::string_view kKeyMediumThreshold = "kMediumThreshold";
+constexpr std::string_view kKeySegmentAlignment = "kSegmentAlignment";
+constexpr std::string_view kKeyMinRoundedSize = "kMinRoundedSize";
+constexpr std::string_view kKeySmallSplitThreshold = "kSmallSplitThreshold";
+constexpr std::string_view kKeyLargeSplitThreshold = "kLargeSplitThreshold";
+constexpr std::string_view kKeyMaxSplitSizeBytes = "kMaxSplitSizeBytes";
+constexpr std::string_view kKeyMaxNonSplitRoundingBytes = "kMaxNonSplitRoundingBytes";
+constexpr std::string_view kKeyRoundupPower2Divisions = "kRoundupPower2Divisions";
+
+// Largest representable threshold below the high bit of size_t so power-of-2
+// expansion in RoundSize can't overflow.
+constexpr size_t kMediumThresholdCap = (std::numeric_limits<size_t>::max)() / 2 + 1;
+
+// Compile-time invariants on the in-class defaults. AllocatorConfig is an
+// aggregate with constant default initializers, so the no-arg construction
+// is a constant expression.
+constexpr AllocatorConfig kAllocatorDefaults{};
+static_assert(kAllocatorDefaults.kMediumThreshold > 0 &&
+                  kAllocatorDefaults.kMediumThreshold <= kMediumThresholdCap,
+              "default kMediumThreshold must be in (0, 2^(bits(size_t)-1)]");
+static_assert(kAllocatorDefaults.kSegmentAlignment != 0 &&
+                  (kAllocatorDefaults.kSegmentAlignment &
+                   (kAllocatorDefaults.kSegmentAlignment - 1)) == 0,
+              "default kSegmentAlignment must be a power of 2");
+static_assert(kAllocatorDefaults.kMinRoundedSize > 0, "default kMinRoundedSize must be > 0");
+static_assert(kAllocatorDefaults.kRoundupPower2Divisions > 0,
+              "default kRoundupPower2Divisions must be > 0");
+
+// Trim leading/trailing ASCII whitespace.
+std::string_view Trim(std::string_view s) {
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+  return s;
+}
+
+// Parse `s` (after trimming) as a non-negative decimal integer with no
+// trailing characters. Returns nullopt on parse error or overflow.
+std::optional<size_t> ParseUnsigned(std::string_view s) {
+  s = Trim(s);
+  if (s.empty()) return std::nullopt;
+  for (char c : s) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) return std::nullopt;
+  }
+  try {
+    size_t pos = 0;
+    size_t value = std::stoull(std::string(s), &pos);
+    if (pos != s.size()) return std::nullopt;
+    return value;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+// Apply a single key=value override to `cfg`. Logs and skips on parse error.
+void ApplyOverride(AllocatorConfig& cfg, std::string_view key, std::string_view value) {
+  // All size_t fields parse uniformly; route them through one table to avoid
+  // a long if/else chain. Member pointers let the lookup write through to
+  // the matching field.
+  static const std::unordered_map<std::string_view, size_t AllocatorConfig::*> kSizeFields = {
+      {kKeyPoolBoundary, &AllocatorConfig::kPoolBoundary},
+      {kKeySmallSegmentSize, &AllocatorConfig::kSmallSegmentSize},
+      {kKeyMediumSegmentSize, &AllocatorConfig::kMediumSegmentSize},
+      {kKeyMediumThreshold, &AllocatorConfig::kMediumThreshold},
+      {kKeySegmentAlignment, &AllocatorConfig::kSegmentAlignment},
+      {kKeyMinRoundedSize, &AllocatorConfig::kMinRoundedSize},
+      {kKeySmallSplitThreshold, &AllocatorConfig::kSmallSplitThreshold},
+      {kKeyLargeSplitThreshold, &AllocatorConfig::kLargeSplitThreshold},
+      {kKeyMaxSplitSizeBytes, &AllocatorConfig::kMaxSplitSizeBytes},
+      {kKeyMaxNonSplitRoundingBytes, &AllocatorConfig::kMaxNonSplitRoundingBytes},
+  };
+
+  if (auto it = kSizeFields.find(key); it != kSizeFields.end()) {
+    if (auto v = ParseUnsigned(value)) {
+      cfg.*(it->second) = *v;
+    } else {
+      TORCH_NEURONX_ALLOCATOR_WARN("AllocatorConfig: invalid bytes value for ", key, "=", value);
+    }
+    return;
+  }
+
+  if (key == kKeyRoundupPower2Divisions) {
+    if (auto v = ParseUnsigned(value); v && *v >= 1 && *v <= 64) {
+      cfg.kRoundupPower2Divisions = static_cast<int>(*v);
+    } else {
+      TORCH_NEURONX_ALLOCATOR_WARN("AllocatorConfig: invalid value for ",
+                                   kKeyRoundupPower2Divisions,
+                                   " (expected integer in [1, 64])=", value);
+    }
+    return;
+  }
+
+  TORCH_NEURONX_ALLOCATOR_WARN("AllocatorConfig: unknown key in ", AllocatorConfig::kEnvVarName,
+                               ", ignoring: ", key);
+}
+
+// Parse "a=1048576,b=67108864,..." into a sequence of ApplyOverride calls.
+void ApplyEnvOverrides(AllocatorConfig& cfg) {
+  const char* env = std::getenv(AllocatorConfig::kEnvVarName);
+  if (!env || !*env) return;
+
+  std::string_view spec(env);
+  while (!spec.empty()) {
+    auto comma = spec.find(',');
+    std::string_view kv = (comma == std::string_view::npos) ? spec : spec.substr(0, comma);
+    auto eq = kv.find('=');
+    if (eq != std::string_view::npos) {
+      auto key = Trim(kv.substr(0, eq));
+      auto value = kv.substr(eq + 1);
+      ApplyOverride(cfg, key, value);
+    } else if (!kv.empty()) {
+      TORCH_NEURONX_ALLOCATOR_WARN("AllocatorConfig: malformed token in ",
+                                   AllocatorConfig::kEnvVarName, ": ", kv);
+    }
+    if (comma == std::string_view::npos) break;
+    spec.remove_prefix(comma + 1);
+  }
+}
+
+// Sanity-check a config and clamp obviously broken values back to defaults.
+// Logs every clamp so users can find the issue.
+void ValidateConfig(AllocatorConfig& cfg) {
+  // Print original values (which may be negative for kRoundupPower2Divisions)
+  // and replacement values without coercing to size_t.
+  auto warn_replace = [](std::string_view name, auto bad, auto replacement) {
+    TORCH_NEURONX_ALLOCATOR_WARN("AllocatorConfig: ", name, "=", bad, " is invalid, using ",
+                                 replacement);
+  };
+  auto is_pow2 = [](size_t v) { return v != 0 && (v & (v - 1)) == 0; };
+
+  // Per-field absolute invariants.
+  if (cfg.kSegmentAlignment == 0 || !is_pow2(cfg.kSegmentAlignment)) {
+    warn_replace("kSegmentAlignment (must be power of 2)", cfg.kSegmentAlignment,
+                 kAllocatorDefaults.kSegmentAlignment);
+    cfg.kSegmentAlignment = kAllocatorDefaults.kSegmentAlignment;
+  }
+  if (cfg.kMinRoundedSize == 0) {
+    warn_replace("kMinRoundedSize (must be > 0)", cfg.kMinRoundedSize,
+                 kAllocatorDefaults.kMinRoundedSize);
+    cfg.kMinRoundedSize = kAllocatorDefaults.kMinRoundedSize;
+  }
+  if (cfg.kRoundupPower2Divisions <= 0) {
+    warn_replace("kRoundupPower2Divisions (must be > 0)", cfg.kRoundupPower2Divisions,
+                 kAllocatorDefaults.kRoundupPower2Divisions);
+    cfg.kRoundupPower2Divisions = kAllocatorDefaults.kRoundupPower2Divisions;
+  }
+  if (cfg.kMediumThreshold == 0 || cfg.kMediumThreshold > kMediumThresholdCap) {
+    warn_replace("kMediumThreshold (must be in (0, 2^(bits-1)])", cfg.kMediumThreshold,
+                 kAllocatorDefaults.kMediumThreshold);
+    cfg.kMediumThreshold = kAllocatorDefaults.kMediumThreshold;
+  }
+
+  // Cross-field invariants. The small pool only services allocations
+  // < kPoolBoundary, so its segment must cover that range; the medium/large
+  // pool's RoundSize and ComputeSegmentSize both assume kMediumThreshold sits
+  // strictly above kPoolBoundary so the power-of-2 interval search has room.
+  if (cfg.kSmallSegmentSize < cfg.kPoolBoundary) {
+    warn_replace("kSmallSegmentSize (must be >= kPoolBoundary)", cfg.kSmallSegmentSize,
+                 cfg.kPoolBoundary);
+    cfg.kSmallSegmentSize = cfg.kPoolBoundary;
+  }
+  if (cfg.kMediumThreshold <= cfg.kPoolBoundary) {
+    size_t replacement =
+        (cfg.kPoolBoundary >= kMediumThresholdCap) ? kMediumThresholdCap : cfg.kPoolBoundary + 1;
+    warn_replace("kMediumThreshold (must be > kPoolBoundary)", cfg.kMediumThreshold, replacement);
+    cfg.kMediumThreshold = replacement;
+  }
+}
+
+const AllocatorConfig& EnsureInitialized() {
+  static std::mutex init_mutex;
+  static AllocatorConfig cfg;
+  static bool initialized = false;
+
+  std::lock_guard<std::mutex> lock(init_mutex);
+  if (!initialized) {
+    ApplyEnvOverrides(cfg);
+    ValidateConfig(cfg);
+    initialized = true;
+  }
+  return cfg;
+}
+
+}  // anonymous namespace
+
+const AllocatorConfig& AllocatorConfig::Get() { return EnsureInitialized(); }
+
+// ---------------------------------------------------------------------------
+// NeuronSegmentPool
+// ---------------------------------------------------------------------------
+
+// Default constructor: copy from the already validated global singleton.
+NeuronSegmentPool::NeuronSegmentPool(int device_id)
+    : device_id_(device_id), config_(AllocatorConfig::Get()) {}
+
+// User-supplied config: validate before storing so a bad caller config
+// produces the same warnings and clamps as a bad env-var override.
+NeuronSegmentPool::NeuronSegmentPool(int device_id, AllocatorConfig config)
+    : device_id_(device_id), config_(std::move(config)) {
+  ValidateConfig(config_);
+}
+
+NeuronSegmentPool::~NeuronSegmentPool() { EmptyCache(); }
+
+size_t NeuronSegmentPool::RoundSize(size_t size) const {
   if (size == 0) return 0;
-  if (size < AllocatorConfig::kMinRoundedSize) return AllocatorConfig::kMinRoundedSize;
+  if (size < config_.kMinRoundedSize) return config_.kMinRoundedSize;
   // For large allocations (above kMediumThreshold), skip power-of-2 rounding.
-  // We return same-sized segments with alignment in ComputeSegmentSize.
-  if (size >= AllocatorConfig::kMediumThreshold) return size;
+  // Same-sized segments are emitted with alignment in ComputeSegmentSize.
+  if (size >= config_.kMediumThreshold) return size;
 
-  static_assert(AllocatorConfig::kMediumThreshold <= (size_t{1} << (sizeof(size_t) * 8 - 1)),
-                "kMediumThreshold must be <= 2^(bits(size_t) - 1)");
-
-  constexpr int N = AllocatorConfig::kRoundupPower2Divisions;
+  const int N = config_.kRoundupPower2Divisions;
 
   // Find the enclosing power-of-2 interval: [lower_power, upper_power)
   // where lower_power <= size < upper_power
@@ -58,22 +279,16 @@ size_t NeuronSegmentPool::RoundSize(size_t size) {
   return upper_power;
 }
 
-size_t NeuronSegmentPool::ComputeSegmentSize(size_t size) {
-  if (size < AllocatorConfig::kPoolBoundary) {
-    return AllocatorConfig::kSmallSegmentSize;
-  } else if (size < AllocatorConfig::kMediumThreshold) {
-    return AllocatorConfig::kMediumSegmentSize;
-  } else {
-    constexpr size_t alignment = AllocatorConfig::kSegmentAlignment;
-    static_assert(alignment != 0 && (alignment & (alignment - 1)) == 0,
-                  "kSegmentAlignment must be a power of 2");
-    return (size + alignment - 1) & ~(alignment - 1);
+size_t NeuronSegmentPool::ComputeSegmentSize(size_t size) const {
+  if (size < config_.kPoolBoundary) {
+    return config_.kSmallSegmentSize;
+  } else if (size < config_.kMediumThreshold) {
+    return config_.kMediumSegmentSize;
   }
+  // size >= kMediumThreshold: round up to alignment.
+  size_t alignment = config_.kSegmentAlignment;
+  return (size + alignment - 1) & ~(alignment - 1);
 }
-
-NeuronSegmentPool::NeuronSegmentPool(int device_id) : device_id_(device_id) {}
-
-NeuronSegmentPool::~NeuronSegmentPool() { EmptyCache(); }
 
 Block* NeuronSegmentPool::Allocate(size_t requested_size) {
   if (requested_size == 0) return nullptr;
@@ -81,17 +296,17 @@ Block* NeuronSegmentPool::Allocate(size_t requested_size) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   size_t size = RoundSize(requested_size);
-  bool is_small = size < AllocatorConfig::kPoolBoundary;
+  bool is_small = size < config_.kPoolBoundary;
 
-  SEGMENT_POOL_DEBUG("Allocate requested_size=", requested_size, " rounded_size=", size,
-                     " pool=", (is_small ? "small" : "large"), " device=", device_id_);
+  TORCH_NEURONX_ALLOCATOR_DEBUG("Allocate requested_size=", requested_size, " rounded_size=", size,
+                                " pool=", (is_small ? "small" : "large"), " device=", device_id_);
 
   // Try best-fit from free pool
   Block* block = FindFreeBlock(size);
 
   // If not found, allocate a new segment from NRT
   if (!block) {
-    SEGMENT_POOL_DEBUG("No free block found, allocating new segment");
+    TORCH_NEURONX_ALLOCATOR_DEBUG("No free block found, allocating new segment");
     block = AllocateSegment(size, is_small);
   }
 
@@ -123,9 +338,9 @@ Block* NeuronSegmentPool::Allocate(size_t requested_size) {
   block->requested_size = requested_size;
   ptr_to_block_[block->data_ptr] = block;
 
-  SEGMENT_POOL_DEBUG("Allocate completed ptr=", block->data_ptr, " size=", block->size,
-                     " offset=", block->offset, " is_root=", block->is_root(),
-                     " is_split=", block->is_split());
+  TORCH_NEURONX_ALLOCATOR_DEBUG("Allocate completed ptr=", block->data_ptr, " size=", block->size,
+                                " offset=", block->offset, " is_root=", block->is_root(),
+                                " is_split=", block->is_split());
   return block;
 }
 
@@ -150,12 +365,12 @@ void NeuronSegmentPool::Free(Block* block) {
   block = MergeNeighbors(block);
   InsertIntoFreeSet(block);
 
-  SEGMENT_POOL_DEBUG("Free to pool completed ptr=", block->data_ptr, " size=", block->size,
-                     " is_root=", block->is_root());
+  TORCH_NEURONX_ALLOCATOR_DEBUG("Free to pool completed ptr=", block->data_ptr,
+                                " size=", block->size, " is_root=", block->is_root());
 }
 
 Block* NeuronSegmentPool::FindFreeBlock(size_t size) {
-  bool is_small = size < AllocatorConfig::kPoolBoundary;
+  bool is_small = size < config_.kPoolBoundary;
 
   // Create a search key block on stack
   Block search_key;
@@ -167,8 +382,20 @@ Block* NeuronSegmentPool::FindFreeBlock(size_t size) {
   auto it = free_set.lower_bound(&search_key);
   if (it != free_set.end()) {
     Block* block = *it;
+    // Non-split-reuse policy: when a free block is above the
+    // configured split cap (kMaxSplitSizeBytes), reject if the
+    // implied waste exceeds kMaxNonSplitRoundingBytes
+    // and let the caller allocate a fresh segment instead.
+    if (block->size > config_.kMaxSplitSizeBytes &&
+        block->size - size > config_.kMaxNonSplitRoundingBytes) {
+      TORCH_NEURONX_ALLOCATOR_DEBUG(
+          "FindFreeBlock rejecting non-split block: block_size=", block->size, " request=", size,
+          " waste=", block->size - size,
+          " kMaxNonSplitRoundingBytes=", config_.kMaxNonSplitRoundingBytes);
+      return nullptr;
+    }
     free_set.erase(it);
-    SEGMENT_POOL_DEBUG("FindFreeBlock hit size=", block->size);
+    TORCH_NEURONX_ALLOCATOR_DEBUG("FindFreeBlock hit size=", block->size);
     return block;
   }
 
@@ -211,17 +438,26 @@ Block* NeuronSegmentPool::AllocateSegment(size_t size, bool is_small) {
   // Track physical device memory reserved by the allocator
   at::neuron::metrics::RecordReserve(device_id_, segment_size);
 
-  SEGMENT_POOL_DEBUG("Allocated new segment block, size=", segment_size);
+  TORCH_NEURONX_ALLOCATOR_DEBUG("Allocated new segment block, size=", segment_size);
 
   return block;
 }
 
 Block* NeuronSegmentPool::MaybeSplit(Block* block, size_t size) {
+  // Blocks larger than kMaxSplitSizeBytes are never split. Combined with the
+  // FindFreeBlock acceptance check, this keeps large free blocks intact
+  // for future large requests.
+  if (block->size > config_.kMaxSplitSizeBytes) {
+    TORCH_NEURONX_ALLOCATOR_DEBUG("MaybeSplit skip (above split cap) block_size=", block->size,
+                                  " request=", size,
+                                  " kMaxSplitSizeBytes=", config_.kMaxSplitSizeBytes);
+    return block;
+  }
+
   size_t remaining = block->size - size;
 
   // Determine split threshold based on pool
-  size_t threshold = block->is_small ? AllocatorConfig::kSmallSplitThreshold
-                                     : AllocatorConfig::kLargeSplitThreshold;
+  size_t threshold = block->is_small ? config_.kSmallSplitThreshold : config_.kLargeSplitThreshold;
 
   if (remaining < threshold) {
     return block;
@@ -311,7 +547,7 @@ void NeuronSegmentPool::EmptyCache() {
 }
 
 void NeuronSegmentPool::EmptyCacheInternal() {
-  SEGMENT_POOL_DEBUG("EmptyCache starting total_blocks=", all_blocks_.size());
+  TORCH_NEURONX_ALLOCATOR_DEBUG("EmptyCache starting total_blocks=", all_blocks_.size());
 
   // Clear both pools' free sets
   for (int i = 0; i < kNumPools; ++i) {
@@ -357,7 +593,7 @@ void NeuronSegmentPool::EmptyCacheInternal() {
     RemoveDeadBlock(block);
   }
 
-  SEGMENT_POOL_DEBUG("EmptyCache completed freed_segments=", freeable_roots.size());
+  TORCH_NEURONX_ALLOCATOR_DEBUG("EmptyCache completed freed_segments=", freeable_roots.size());
 }
 
 size_t NeuronSegmentPool::GetFreeBlockCount() const {

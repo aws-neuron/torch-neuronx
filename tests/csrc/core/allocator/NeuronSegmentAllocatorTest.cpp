@@ -20,31 +20,44 @@ using ::testing::SetArgPointee;
 // RoundSize tests
 // ============================================================================
 
-TEST(RoundSizeTest, Zero) { EXPECT_EQ(NeuronSegmentPool::RoundSize(0), 0); }
+namespace {
+struct DefaultConfigPool {
+  NeuronSegmentPool pool{0, AllocatorConfig{}};
+  const AllocatorConfig& cfg() const { return pool.config(); }
+};
+}  // namespace
+
+TEST(RoundSizeTest, Zero) {
+  DefaultConfigPool p;
+  EXPECT_EQ(p.pool.RoundSize(0), 0);
+}
 
 TEST(RoundSizeTest, BelowMinimum) {
-  EXPECT_EQ(NeuronSegmentPool::RoundSize(255), AllocatorConfig::kMinRoundedSize);
+  DefaultConfigPool p;
+  EXPECT_EQ(p.pool.RoundSize(255), p.cfg().kMinRoundedSize);
 }
 
 TEST(RoundSizeTest, ExactPowerOf2) {
-  EXPECT_EQ(NeuronSegmentPool::RoundSize(1024), 1024);
-  EXPECT_EQ(NeuronSegmentPool::RoundSize(1 << 20), 1 << 20);  // 1MB
+  DefaultConfigPool p;
+  EXPECT_EQ(p.pool.RoundSize(1024), 1024);
+  EXPECT_EQ(p.pool.RoundSize(1 << 20), 1 << 20);  // 1MB
 }
 
 TEST(RoundSizeTest, LargeSizesPassThrough) {
   // Sizes at or above kMediumThreshold pass through without power-of-2 rounding.
   // ComputeSegmentSize handles alignment for these.
-  size_t large = AllocatorConfig::kMediumThreshold + 1;
-  EXPECT_EQ(NeuronSegmentPool::RoundSize(large), large);
+  DefaultConfigPool p;
+  size_t large = p.cfg().kMediumThreshold + 1;
+  EXPECT_EQ(p.pool.RoundSize(large), large);
 }
 
 // Helper: compute expected RoundSize for a given size using the same
 // algorithm, parameterized by N = kRoundupPower2Divisions.
-static size_t ExpectedRound(size_t size) {
+static size_t ExpectedRound(size_t size, const AllocatorConfig& cfg) {
   if (size == 0) return 0;
-  if (size < AllocatorConfig::kMinRoundedSize) return AllocatorConfig::kMinRoundedSize;
-  if (size >= AllocatorConfig::kMediumThreshold) return size;
-  constexpr int N = AllocatorConfig::kRoundupPower2Divisions;
+  if (size < cfg.kMinRoundedSize) return cfg.kMinRoundedSize;
+  if (size >= cfg.kMediumThreshold) return size;
+  const int N = cfg.kRoundupPower2Divisions;
   size_t upper = 1;
   while (upper < size) upper <<= 1;
   if (upper == size) return size;
@@ -61,7 +74,9 @@ static size_t ExpectedRound(size_t size) {
 TEST(RoundSizeTest, NDivisions) {
   // Verify RoundSize matches expected divisions for power-of-2 intervals.
   // Works for any kRoundupPower2Divisions value.
-  constexpr int N = AllocatorConfig::kRoundupPower2Divisions;
+  DefaultConfigPool p;
+  const auto& cfg = p.cfg();
+  const int N = cfg.kRoundupPower2Divisions;
 
   // Test in [512, 1024) interval
   size_t lo = 512, hi = 1024;
@@ -69,25 +84,25 @@ TEST(RoundSizeTest, NDivisions) {
   // Each division boundary should be exact
   for (int i = 1; i <= N; ++i) {
     size_t boundary = lo + step * i;
-    EXPECT_EQ(NeuronSegmentPool::RoundSize(boundary), boundary);
+    EXPECT_EQ(p.pool.RoundSize(boundary), boundary);
   }
   // Just above lower -> rounds to first division
-  EXPECT_EQ(NeuronSegmentPool::RoundSize(lo + 1), ExpectedRound(lo + 1));
+  EXPECT_EQ(p.pool.RoundSize(lo + 1), ExpectedRound(lo + 1, cfg));
   // Just above first division -> rounds to next
   if (N >= 2) {
-    EXPECT_EQ(NeuronSegmentPool::RoundSize(lo + step + 1), ExpectedRound(lo + step + 1));
+    EXPECT_EQ(p.pool.RoundSize(lo + step + 1), ExpectedRound(lo + step + 1, cfg));
   }
 
   // Test a larger interval if below kMediumThreshold
   size_t MB = 1024 * 1024;
-  if (2 * MB <= AllocatorConfig::kMediumThreshold) {
+  if (2 * MB <= cfg.kMediumThreshold) {
     size_t lo2 = MB, hi2 = 2 * MB;
     size_t step2 = (hi2 - lo2) / N;
     for (int i = 1; i <= N; ++i) {
       size_t b = lo2 + step2 * i;
-      EXPECT_EQ(NeuronSegmentPool::RoundSize(b), b);
+      EXPECT_EQ(p.pool.RoundSize(b), b);
     }
-    EXPECT_EQ(NeuronSegmentPool::RoundSize(lo2 + 1), ExpectedRound(lo2 + 1));
+    EXPECT_EQ(p.pool.RoundSize(lo2 + 1), ExpectedRound(lo2 + 1, cfg));
   }
 }
 
@@ -97,24 +112,23 @@ TEST(RoundSizeTest, NDivisions) {
 
 TEST(ComputeSegmentSizeTest, SmallPool) {
   // Anything below kPoolBoundary goes to small pool, kSmallSegmentSize
-  EXPECT_EQ(NeuronSegmentPool::ComputeSegmentSize(AllocatorConfig::kPoolBoundary - 1),
-            AllocatorConfig::kSmallSegmentSize);
+  DefaultConfigPool p;
+  EXPECT_EQ(p.pool.ComputeSegmentSize(p.cfg().kPoolBoundary - 1), p.cfg().kSmallSegmentSize);
 }
 
 TEST(ComputeSegmentSizeTest, MediumPool) {
   // kPoolBoundary <= size < kMediumThreshold, kMediumSegmentSize
-  EXPECT_EQ(NeuronSegmentPool::ComputeSegmentSize(AllocatorConfig::kPoolBoundary),
-            AllocatorConfig::kMediumSegmentSize);
-  EXPECT_EQ(NeuronSegmentPool::ComputeSegmentSize(AllocatorConfig::kMediumThreshold - 1),
-            AllocatorConfig::kMediumSegmentSize);
+  DefaultConfigPool p;
+  EXPECT_EQ(p.pool.ComputeSegmentSize(p.cfg().kPoolBoundary), p.cfg().kMediumSegmentSize);
+  EXPECT_EQ(p.pool.ComputeSegmentSize(p.cfg().kMediumThreshold - 1), p.cfg().kMediumSegmentSize);
 }
 
 TEST(ComputeSegmentSizeTest, LargeRoundedTo2MB) {
-  // size >= kMediumThreshold, round up to 2MB alignment
+  // size >= kMediumThreshold, round up to 2MB alignment (default config)
+  DefaultConfigPool p;
   size_t MB = 1024 * 1024;
-  EXPECT_EQ(NeuronSegmentPool::ComputeSegmentSize(AllocatorConfig::kMediumThreshold),
-            AllocatorConfig::kMediumThreshold);
-  EXPECT_EQ(NeuronSegmentPool::ComputeSegmentSize(100 * MB + 1), 102 * MB);
+  EXPECT_EQ(p.pool.ComputeSegmentSize(p.cfg().kMediumThreshold), p.cfg().kMediumThreshold);
+  EXPECT_EQ(p.pool.ComputeSegmentSize(100 * MB + 1), 102 * MB);
 }
 
 // ============================================================================
@@ -191,7 +205,7 @@ TEST_F(NeuronSegmentPoolTest, AllocateSmall) {
   ASSERT_NE(b, nullptr);
   EXPECT_TRUE(b->active);
   EXPECT_NE(b->data_ptr, nullptr);
-  EXPECT_GE(b->size, NeuronSegmentPool::RoundSize(1024));
+  EXPECT_GE(b->size, pool_->RoundSize(1024));
   EXPECT_TRUE(b->is_small);
   EXPECT_NE(b->nrt_slice, nullptr);
 }
@@ -242,7 +256,7 @@ TEST_F(NeuronSegmentPoolTest, FreeClearsNrtSlice) {
 TEST_F(NeuronSegmentPoolTest, SplitCreatesRemainder) {
   Block* b = pool_->Allocate(1024);
   ASSERT_NE(b, nullptr);
-  EXPECT_EQ(b->size, NeuronSegmentPool::RoundSize(1024));
+  EXPECT_EQ(b->size, pool_->RoundSize(1024));
   EXPECT_NE(b->next, nullptr);
   EXPECT_FALSE(b->next->active);
 }
@@ -334,11 +348,11 @@ TEST_F(NeuronSegmentPoolTest, MergeWithNextBlock) {
 
 TEST_F(NeuronSegmentPoolTest, FreeSetRetainsBlocksWithSameSizeAndOffset) {
   // Allocate from segment 1
-  Block* b1 = pool_->Allocate(AllocatorConfig::kMediumThreshold - 1);
+  Block* b1 = pool_->Allocate(pool_->config().kMediumThreshold - 1);
   ASSERT_NE(b1, nullptr);
 
   // Now allocate to force segment 2
-  Block* b2 = pool_->Allocate(AllocatorConfig::kMediumThreshold - 1);
+  Block* b2 = pool_->Allocate(pool_->config().kMediumThreshold - 1);
   ASSERT_NE(b2, nullptr);
 
   void* ptr1 = b1->data_ptr;
@@ -350,8 +364,8 @@ TEST_F(NeuronSegmentPoolTest, FreeSetRetainsBlocksWithSameSizeAndOffset) {
   pool_->Free(b2);
 
   // Both should be reusable
-  Block* r1 = pool_->Allocate(AllocatorConfig::kMediumThreshold - 1);
-  Block* r2 = pool_->Allocate(AllocatorConfig::kMediumThreshold - 1);
+  Block* r1 = pool_->Allocate(pool_->config().kMediumThreshold - 1);
+  Block* r2 = pool_->Allocate(pool_->config().kMediumThreshold - 1);
   ASSERT_NE(r1, nullptr);
   ASSERT_NE(r2, nullptr);
   EXPECT_NE(r1->data_ptr, r2->data_ptr);
@@ -439,7 +453,7 @@ TEST_F(NeuronSegmentPoolTest, BestFitSelectsSmallestFit) {
 
   Block* result = pool_->Allocate(2048);
   ASSERT_NE(result, nullptr);
-  EXPECT_EQ(result->size, NeuronSegmentPool::RoundSize(2048));
+  EXPECT_EQ(result->size, pool_->RoundSize(2048));
 }
 
 TEST_F(NeuronSegmentPoolTest, BestFitFallsBackToFirstFit) {
@@ -593,7 +607,7 @@ TEST_F(NeuronSegmentPoolTest, SnapshotSingleActiveBlock) {
   auto& seg = segs[0];
   EXPECT_EQ(seg.device, 0);
   EXPECT_EQ(seg.address, reinterpret_cast<size_t>(b->root->data_ptr));
-  EXPECT_EQ(seg.total_size, AllocatorConfig::kSmallSegmentSize);
+  EXPECT_EQ(seg.total_size, pool_->config().kSmallSegmentSize);
   EXPECT_TRUE(seg.is_small);
   EXPECT_GT(seg.allocated_size, 0u);
   EXPECT_GT(seg.active_size, 0u);
