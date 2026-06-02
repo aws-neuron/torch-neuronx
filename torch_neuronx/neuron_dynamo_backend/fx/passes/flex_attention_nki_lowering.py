@@ -161,10 +161,17 @@ def _generate_tile_types(
     import numpy as np
 
     from torch_neuronx.kernels.cache_utils import get_artifacts_directory
+    from torch_neuronx.neuron_dynamo_backend.utils.fx_utils import replace_device_with_cpu
 
     num_grps = math.ceil(seqlen_q / _Q_GRP_SZ)
     num_k_tiles = math.ceil(seqlen_kv / k_tile_sz)
     num_v_tiles = math.ceil(seqlen_kv / _V_TILE_SZ)
+
+    # Rewrite any non-CPU device literals baked into the FX trace (e.g.
+    # upstream noop_mask -> aten.new_ones(..., device=<trace-time>)) once,
+    # so all per-tile host-side replays produce CPU tensors. Original
+    # module is untouched.
+    mask_mod_module = replace_device_with_cpu(mask_mod_module)
 
     try:
         float32_min = -3.4028235e38
