@@ -23,10 +23,29 @@ from nkilib.core.attention.attention_cte import attention_cte
 from torch._decomp import get_decompositions
 
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
+    _has_nki_elementwise_kernels as _has_nki_foreach,
+)
 from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 
 if _has_nki_rng:
     from torch_neuronx.python_ops.nki_kernels.rng_state import rand
+
+if _has_nki_foreach:
+    from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
+        P_SIZE as _FOREACH_P_SIZE,
+    )
+    from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
+        _add_scalar_kernel,
+        _add_tensor_kernel,
+        _div_scalar_kernel,
+        _div_tensor_kernel,
+        _mul_scalar_kernel,
+        _mul_tensor_kernel,
+        _sqrt_kernel,
+        _sub_scalar_kernel,
+        _sub_tensor_kernel,
+    )
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -1274,6 +1293,27 @@ def _foreach_pow_scalar(tensors, exponent):
     return [torch.pow(t, exponent) for t in tensors]
 
 
+@register_decomposition([aten._foreach_pow.ScalarAndTensor])
+def _foreach_pow_scalar_and_tensor(scalar, exponents):
+    """Decompose _foreach_pow.ScalarAndTensor (scalar ** tensor_list)"""
+    return [torch.pow(scalar, e) for e in exponents]
+
+
+@register_decomposition([aten._foreach_neg.default])
+def _foreach_neg_decomp(self):
+    return [torch.neg(t) for t in self]
+
+
+@register_decomposition([aten._foreach_reciprocal.default])
+def _foreach_reciprocal_decomp(self):
+    return [torch.reciprocal(t) for t in self]
+
+
+@register_decomposition([aten._foreach_abs.default])
+def _foreach_abs_decomp(self):
+    return [torch.abs(t) for t in self]
+
+
 @register_decomposition([aten.__rshift__.Scalar])
 def rshift_scalar_decomp(x, shift):
     """Decompose right shift into floor division by power of 2"""
@@ -1989,6 +2029,205 @@ def erfinv_decomposition(y):
     result = torch.where(mask_valid & (y_abs > 0.7), x_high, result)
 
     return result
+
+
+# ── foreach decompositions ───────────────────────────────────────────────────
+# Decompose foreach ops into per-tensor NKI kernel calls with elementwise op
+# fallback for small/empty/mismatched tensors.
+
+_FOREACH_OPS = {"add": torch.add, "sub": torch.sub, "mul": torch.mul, "div": torch.div}
+_FOREACH_HAS_ALPHA = {"add", "sub"}
+_FOREACH_TENSOR_KERNELS = {}
+_FOREACH_SCALAR_KERNELS = {}
+if _has_nki_foreach:
+    _FOREACH_TENSOR_KERNELS = {
+        "add": _add_tensor_kernel,
+        "sub": _sub_tensor_kernel,
+        "mul": _mul_tensor_kernel,
+        "div": _div_tensor_kernel,
+    }
+    _FOREACH_SCALAR_KERNELS = {
+        "add": _add_scalar_kernel,
+        "sub": _sub_scalar_kernel,
+        "mul": _mul_scalar_kernel,
+        "div": _div_scalar_kernel,
+    }
+
+
+def _make_foreach_list_decomp(op):
+    has_alpha = op in _FOREACH_HAS_ALPHA
+    torch_op = _FOREACH_OPS[op]
+    nki_kernel = _FOREACH_TENSOR_KERNELS.get(op)
+
+    def decomp(self, other, alpha=1):
+        result = []
+        for a, b in zip(self, other, strict=False):
+            if a.numel() == 0:
+                result.append(a)
+            elif _has_nki_foreach and a.numel() > 1 and a.shape == b.shape:
+                out_dtype = torch.promote_types(a.dtype, b.dtype)
+                if has_alpha:
+                    alpha_t = torch.full(
+                        (_FOREACH_P_SIZE, 1), alpha, dtype=out_dtype, device=a.device
+                    )
+                    result.append(
+                        nki_kernel[(2,)](a.to(out_dtype), b.to(out_dtype), alpha_t, a.numel())
+                    )
+                else:
+                    result.append(nki_kernel[(2,)](a.to(out_dtype), b.to(out_dtype), a.numel()))
+            elif has_alpha:
+                result.append(torch_op(a, b, alpha=alpha))
+            else:
+                result.append(torch_op(a, b))
+        return result
+
+    return decomp
+
+
+def _make_foreach_scalar_decomp(op):
+    torch_op = _FOREACH_OPS[op]
+    nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
+
+    def decomp(self, scalar):
+        result = []
+        for t in self:
+            compute_dtype = torch.result_type(t, scalar)
+            if op == "div" and not compute_dtype.is_floating_point:
+                compute_dtype = torch.float32
+            if t.numel() == 0:
+                result.append(torch.empty_like(t, dtype=compute_dtype))
+            elif _has_nki_foreach and t.numel() > 1:
+                scalar_t = torch.full(
+                    (_FOREACH_P_SIZE, 1), scalar, dtype=compute_dtype, device=t.device
+                )
+                result.append(nki_kernel[(2,)](t.to(compute_dtype), scalar_t, t.numel()))
+            else:
+                result.append(torch_op(t.to(compute_dtype), scalar))
+        return result
+
+    return decomp
+
+
+def _make_foreach_tensor_decomp(op):
+    has_alpha = op in _FOREACH_HAS_ALPHA
+    torch_op = _FOREACH_OPS[op]
+    nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
+
+    def decomp(self, other, alpha=1):
+        effective = other * alpha if has_alpha else other
+        result = []
+        for t in self:
+            if t.numel() == 0:
+                result.append(t)
+            elif _has_nki_foreach and t.numel() > 1:
+                compute_dtype = torch.promote_types(t.dtype, effective.dtype)
+                scalar_t = (
+                    effective.to(compute_dtype)
+                    .reshape(1, 1)
+                    .expand(_FOREACH_P_SIZE, 1)
+                    .contiguous()
+                )
+                result.append(nki_kernel[(2,)](t.to(compute_dtype), scalar_t, t.numel()))
+            elif has_alpha:
+                result.append(torch_op(t, other, alpha=alpha))
+            else:
+                result.append(torch_op(t, other))
+        return result
+
+    return decomp
+
+
+def _make_foreach_list_inplace_decomp(op):
+    has_alpha = op in _FOREACH_HAS_ALPHA
+    torch_op = _FOREACH_OPS[op]
+
+    if has_alpha:
+
+        def decomp(self, other, alpha=1):
+            for s, o in zip(self, other, strict=False):
+                torch_op(s, o, alpha=alpha, out=s)
+    else:
+
+        def decomp(self, other):
+            for s, o in zip(self, other, strict=False):
+                torch_op(s, o, out=s)
+
+    return decomp
+
+
+def _make_foreach_scalar_inplace_decomp(op):
+    torch_op = _FOREACH_OPS[op]
+
+    def decomp(self, scalar):
+        for s in self:
+            torch_op(s, scalar, out=s)
+
+    return decomp
+
+
+for _op in ("add", "sub", "mul", "div"):
+    register_decomposition([getattr(aten, f"_foreach_{_op}").List])(_make_foreach_list_decomp(_op))
+    register_decomposition([getattr(aten, f"_foreach_{_op}").Scalar])(
+        _make_foreach_scalar_decomp(_op)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_op}_").List])(
+        _make_foreach_list_inplace_decomp(_op)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_op}_").Scalar])(
+        _make_foreach_scalar_inplace_decomp(_op)
+    )
+
+for _op in ("add", "mul", "div"):
+    register_decomposition([getattr(aten, f"_foreach_{_op}").Tensor])(
+        _make_foreach_tensor_decomp(_op)
+    )
+
+
+@register_decomposition([aten._foreach_sqrt.default])
+def _foreach_sqrt_decomp(self):
+    result = []
+    for t in self:
+        if t.numel() == 0:
+            result.append(t)
+        elif _has_nki_foreach and t.numel() > 1:
+            result.append(_sqrt_kernel[(2,)](t, t.numel()))
+        else:
+            result.append(torch.sqrt(t))
+    return result
+
+
+@register_decomposition([aten._foreach_sqrt_.default])
+def _foreach_sqrt_inplace_decomp(self):
+    for s in self:
+        torch.sqrt(s, out=s)
+
+
+@register_decomposition([aten._foreach_addcmul.Scalar])
+def _foreach_addcmul_decomp(self, tensor1, tensor2, value=1):
+    return [
+        torch.addcmul(s, t1, t2, value=value)
+        for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
+    ]
+
+
+@register_decomposition([aten._foreach_addcdiv.Scalar])
+def _foreach_addcdiv_decomp(self, tensor1, tensor2, value=1):
+    return [
+        torch.addcdiv(s, t1, t2, value=value)
+        for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
+    ]
+
+
+@register_decomposition([aten._foreach_addcmul_.Scalar])
+def _foreach_addcmul_inplace_decomp(self, tensor1, tensor2, value=1):
+    for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
+        s.addcmul_(t1, t2, value=value)
+
+
+@register_decomposition([aten._foreach_addcdiv_.Scalar])
+def _foreach_addcdiv_inplace_decomp(self, tensor1, tensor2, value=1):
+    for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
+        s.addcdiv_(t1, t2, value=value)
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
