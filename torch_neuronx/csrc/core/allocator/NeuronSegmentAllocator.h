@@ -23,31 +23,60 @@ struct StackContext;
 namespace c10_neuron {
 
 // ============================================================================
-// Configuration constants
+// Configuration
 // ============================================================================
+//
+// AllocatorConfig holds the segment-pool tuning knobs. Defaults match the
+// historical compile-time constants. Overrides are picked up from the
+// `TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG` environment variable on the first call to
+// `AllocatorConfig::Get()`. Format is comma-separated `key=value` pairs:
+//
+//   TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG="kPoolBoundary=1048576,kMediumThreshold=33554432"
+//
+// All values are raw non-negative decimal integers (sizes are in bytes).
+// All segment-pool internals read through `AllocatorConfig::Get()` once, at
+// pool construction, into a per-pool `config_` snapshot — so a pool's
+// behavior is fixed for its lifetime and unaffected by any later mutation.
 
 struct AllocatorConfig {
   // Pool boundary: allocations below this go to small pool
-  static constexpr size_t kPoolBoundary = 256 * 1024;  // 256 KB
+  size_t kPoolBoundary = 1024 * 1024;  // 1 MB
 
   // Segment (super tensor) sizes
-  static constexpr size_t kSmallSegmentSize = 2 * 1024 * 1024;    // 2MB
-  static constexpr size_t kMediumSegmentSize = 64 * 1024 * 1024;  // 64MB
-  static constexpr size_t kMediumThreshold = 16 * 1024 * 1024;    // 16MB
-  static constexpr size_t kSegmentAlignment = 2 * 1024 * 1024;    // 2MB
+  size_t kSmallSegmentSize = 2 * 1024 * 1024;    // 2MB
+  size_t kMediumSegmentSize = 64 * 1024 * 1024;  // 64MB
+  size_t kMediumThreshold = 16 * 1024 * 1024;    // 16MB
+  size_t kSegmentAlignment = 2 * 1024 * 1024;    // 2MB
 
-  // Rounding: power-of-2 with N divisions
-  // N=2 exactly matches common sizes
-  static constexpr int kRoundupPower2Divisions = 2;
-  static constexpr size_t kMinRoundedSize = 256;  // 256B
+  // Rounding: power-of-2 with N divisions.
+  int kRoundupPower2Divisions = 4;
+  size_t kMinRoundedSize = 256;  // 256B
 
-  // Split thresholds: don't split if remainder is smaller than this.
   // Small threshold: a remainder smaller than the minimum
   // allocation size would never be useful.
-  static constexpr size_t kSmallSplitThreshold = kMinRoundedSize;
+  size_t kSmallSplitThreshold = kMinRoundedSize;
   // Large threshold: allocation smaller than the small pool boundary size
   // will never go to this pool.
-  static constexpr size_t kLargeSplitThreshold = kPoolBoundary;
+  size_t kLargeSplitThreshold = kPoolBoundary;
+
+  // Cap above which a free block cannot be split. Default = SIZE_MAX
+  // (unlimited, all blocks re splittable). Setting a cap is a
+  // fragmentation-control trade-off. Pairs with kMaxNonSplitRoundingBytes
+  // for size-tolerant reuse of blocks this cap prevents from splitting.
+  size_t kMaxSplitSizeBytes = SIZE_MAX;
+
+  // When a free block is non-splittable (block.size > kMaxSplitSizeBytes),
+  // allow it to serve a request whose size is within this tolerance of the
+  // block's size. Increase to widen reuse at the cost of more internal fragmentation.
+  size_t kMaxNonSplitRoundingBytes = 20 * 1024 * 1024;  // 20 MB
+
+  /// Environment variable name parsed on the first call to `Get()`.
+  /// Exposed so tests and scripts can reference the canonical name.
+  static constexpr const char* kEnvVarName = "TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG";
+
+  /// Read-only access to the active config. First call latches the env-var
+  /// overrides; subsequent calls return the same instance.
+  static const AllocatorConfig& Get();
 };
 
 // ============================================================================
@@ -124,7 +153,18 @@ using FreeBlockSet = std::set<Block*, BlockSizeComparator>;
 ///   2. Allocate a new segment from NRT on miss
 class NeuronSegmentPool {
  public:
+  /// Default constructor. Snapshots the global AllocatorConfig::Get() (with
+  /// any env-var overrides already applied and validated) into this pool.
+  /// The snapshot is fixed for the pool's lifetime. Most callers go through
+  /// this path via NeuronResourceManager::GetSegmentPool.
   explicit NeuronSegmentPool(int device_id);
+
+  /// Config / test constructor. Uses the supplied `config` exactly
+  /// (no env-var lookup), validating it the same way env-var-driven configs
+  /// are validated. The pool's behavior for its lifetime is determined by
+  /// this snapshot; subsequent global config changes do not affect it.
+  NeuronSegmentPool(int device_id, AllocatorConfig config);
+
   ~NeuronSegmentPool();
 
   NeuronSegmentPool(const NeuronSegmentPool&) = delete;
@@ -156,16 +196,20 @@ class NeuronSegmentPool {
 
   int device_id() const { return device_id_; }
 
+  /// Read-only access to this pool's frozen-at-construction config.
+  const AllocatorConfig& config() const { return config_; }
+
   /// Return the total number of Block objects owned by the pool.
   size_t GetTotalBlockCount() const;
 
   // ---- Utilities ----
 
-  /// Round a size using power-of-2 with N divisions.
-  static size_t RoundSize(size_t size);
+  /// Round a size using power-of-2 with N divisions, per this pool's config.
+  size_t RoundSize(size_t size) const;
 
-  /// Compute the segment size for a given allocation size.
-  static size_t ComputeSegmentSize(size_t size);
+  /// Compute the segment size for a given allocation size, per this pool's
+  /// config.
+  size_t ComputeSegmentSize(size_t size) const;
 
  private:
   // Pool category index
@@ -211,6 +255,7 @@ class NeuronSegmentPool {
 
   // ---- Data ----
   int device_id_;
+  AllocatorConfig config_;
 
   // One free set per pool category: pools_[0] = small, pools_[1] = large.
   FreeBlockSet pools_[kNumPools];

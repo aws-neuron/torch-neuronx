@@ -58,6 +58,13 @@ These variables affect eager execution (non-compiled operations).
 - See [Neuron Runtime Configurable Parameters](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-configurable-parameters.html) for all runtime variables.
 - See [Logical NeuronCore Configuration](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-features/logical-neuroncore-config.html) for LNC details.
 
+## Metrics
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `TORCH_NEURONX_ENABLED_METRIC_TABLES` | str | `""` | Comma-separated metric tables to enable for CSV export. |
+| `TORCH_NEURONX_METRICS_DIR` | str | `/tmp` | Directory for metric CSV files. |
+
 ## Distributed
 
 | Variable | Type | Default | Description |
@@ -67,9 +74,61 @@ These variables affect eager execution (non-compiled operations).
 | `COLLECTIVE_BUCKETSIZE_IN_MB` | int | `512` | Maximum bucket size (MB) for collective operations. |
 | `COLLECTIVE_MIN_BUCKETS` | int | `0` | Minimum buckets for collectives. When > 1, forces splitting small tensors. |
 
-## Metrics
+## Neuron Memory Allocator Configuration
 
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `TORCH_NEURONX_ENABLED_METRIC_TABLES` | str | `""` | Comma-separated metric tables to enable for CSV export. |
-| `TORCH_NEURONX_METRICS_DIR` | str | `/tmp` | Directory for metric CSV files. |
+The Neuron caching allocator's segment-pool tuning knobs are exposed
+through a single environment variable:
+
+```
+TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG=key1=value1,key2=value2,...
+```
+
+The value is a comma-separated list of `key=value` pairs. The first call
+to the allocator parses the variable, validates the result, and snapshots
+it into the per-device `NeuronSegmentPool` at construction. The snapshot
+is fixed for the pool's lifetime. To change tuning, set the variable and
+restart the process.
+
+**Format**
+
+- **Sizes**: raw bytes as a non-negative decimal integer. No size
+  suffixes; `1048576` is valid, `1MB` is rejected with a warning.
+- **Plain integers** (only `kRoundupPower2Divisions` today): same syntax,
+  bare digits.
+- Unknown keys are ignored with a warning.
+- Invalid values are ignored with a warning; the field keeps its default.
+
+**Default values** are tuned from training-workload experiments. Override
+if running into OOM resulting from fragmentation.
+
+**WARNING**: changing values can have drastic effects on
+memory allocation training workloads and can potentially induce OOMs.
+| Key                              | Type  | Default (bytes)  | Definition |
+|----------------------------------|-------|------------------|------------|
+| `kPoolBoundary`                  | bytes | `1048576` (1 MB) | Allocations below this go to the small pool, at or above to the large pool. The two pools have separate free sets so small allocations cannot fragment large-pool segments and vice versa. |
+| `kSmallSegmentSize`              | bytes | `2097152` (2 MB) | Segment size NRT-allocates for small-pool requests. |
+| `kMediumSegmentSize`             | bytes | `67108864` (64 MB) | Segment size NRT-allocates for large-pool requests in `[kPoolBoundary, kMediumThreshold)`. |
+| `kMediumThreshold`               | bytes | `16777216` (16 MB) | Above this, each request gets its own per-request segment sized to the request rounded up to `kSegmentAlignment`. |
+| `kSegmentAlignment`              | bytes | `2097152` (2 MB) | Alignment for per-request segments above `kMediumThreshold`. Must be a power of 2. |
+| `kMinRoundedSize`                | bytes | `256`            | Floor for `RoundSize`. Requests smaller than this round up to it. |
+| `kRoundupPower2Divisions`        | int   | `4`              | `N` in the power-of-two-with-N-divisions block rounding scheme - i.e. number of equal-sized divisions between the lower and higher power of 2 value of the requested size. `N=1` is pure pow2; `N=4` gives 25% max waste; higher `N` reduces waste at the cost of more distinct buckets, lower cache hit rate, and greater overhead of splitting/merging free blocks. Valid range: `[1, 64]`. |
+| `kSmallSplitThreshold`           | bytes | `kMinRoundedSize` | Small-pool minimum split remainder. If carving a chosen free block would leave a remainder smaller than this, the block is handed out whole instead. |
+| `kLargeSplitThreshold`           | bytes | `kPoolBoundary`  | Large-pool minimum split remainder. Same idea as above for the large pool. |
+| `kMaxSplitSizeBytes`             | bytes | `SIZE_MAX`       | Cap above which a free block cannot be split. Default unlimited (all blocks splittable). Setting a finite cap keeps large blocks intact for future large requests, at the risk of cache misses for small requests when only above-cap blocks are free. Pairs with `kMaxNonSplitRoundingBytes`. |
+| `kMaxNonSplitRoundingBytes`      | bytes | `20971520` (20 MB) | When a free block is non-splittable (`block.size > kMaxSplitSizeBytes`), allow it to serve a request whose size is within this tolerance of the block's size. Increase to widen reuse at the cost of more internal fragmentation. |
+
+**Examples**
+
+Cap large-block splitting at 512 MB; allow up to 64 MB rounding waste on
+non-split reuse:
+
+```bash
+TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG="kMaxSplitSizeBytes=536870912,kMaxNonSplitRoundingBytes=67108864"
+```
+
+Reduce internal fragmentation in the medium-size range by widening
+rounding divisions to 8:
+
+```bash
+TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG="kRoundupPower2Divisions=8"
+```
