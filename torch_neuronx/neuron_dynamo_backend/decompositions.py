@@ -101,7 +101,6 @@ neuron_decompositions = get_decompositions(
         aten._log_softmax_backward_data,
         aten._softmax_backward_data,
         aten.select_backward,
-        aten.slice_backward,
         aten.softplus_backward,
         aten.col2im,  # accuracy mismatch on neuron, pending NCF-486
         aten.lerp,
@@ -1215,6 +1214,54 @@ def silu_backward_decomposition(grad_output, x):
     x = x.to(torch.float32)
     sigmoid_x = torch.sigmoid(x)
     return (grad_output * sigmoid_x * (1 + x * (1 - sigmoid_x))).to(orig_dtype)
+
+
+def _slice_backward_default(grad_output, input_sizes, dim, start, end, step):
+    """Fallback equivalent to PyTorch's default slice_backward: zeros + slice_scatter."""
+    grad_input = grad_output.new_zeros(input_sizes)
+    return torch.slice_scatter(grad_input, grad_output, dim, start, end, step)
+
+
+@register_decomposition([aten.slice_backward.default])
+def slice_backward_decomposition(grad_output, input_sizes, dim, start, end, step):
+    """Decompose slice_backward to constant_pad_nd for the common step==1 case.
+
+    PyTorch's default decomposition uses zeros + slice_scatter, which torch-mlir
+    lowers to stablehlo.scatter (indirect indexed writes). For contiguous
+    forward slices (step == 1), the gradient is just grad_output zero-padded
+    along dim, which lowers to stablehlo.pad (memset + DMA copy). RoPE
+    backward hits this path 4x per layer.
+
+    Falls back to zeros + slice_scatter for step != 1 (rare, e.g. strided slices).
+    """
+    if step != 1:
+        return _slice_backward_default(grad_output, input_sizes, dim, start, end, step)
+
+    if dim < 0:
+        dim = len(input_sizes) + dim
+
+    full = input_sizes[dim]
+    # Clamp to PyTorch slice semantics: start/end are clamped to [0, full].
+    start_clamped = max(0, min(full, start if start >= 0 else full + start))
+    end_clamped = max(0, min(full, end if end >= 0 else full + end))
+    if end_clamped < start_clamped:
+        end_clamped = start_clamped
+
+    low = start_clamped
+    high = full - end_clamped
+    if low < 0 or high < 0:
+        return _slice_backward_default(grad_output, input_sizes, dim, start, end, step)
+
+    # constant_pad_nd takes pads in highest-dim-first pairs of (low, high).
+    # Build a flat list with zeros for trailing dims after `dim`.
+    rank = len(input_sizes)
+    pad = []
+    for d in range(rank - 1, dim - 1, -1):
+        if d == dim:
+            pad.extend([low, high])
+        else:
+            pad.extend([0, 0])
+    return torch.ops.aten.constant_pad_nd.default(grad_output, pad, 0)
 
 
 @register_decomposition([aten.embedding_dense_backward.default])
