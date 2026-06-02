@@ -1735,6 +1735,72 @@ class TestSelectBackwardDecompositionE2E:
         torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
 
 
+class TestSliceBackwardDecomposition:
+    """Direct tests for the slice_backward decomposition function.
+
+    The fast path replaces zeros + slice_scatter (lowers to stablehlo.scatter)
+    with constant_pad_nd (lowers to stablehlo.pad). RoPE backward hits this
+    path 4x per layer.
+    """
+
+    @pytest.mark.parametrize(
+        "input_sizes,dim,start,end",
+        [
+            ([1, 8, 4096, 128], 3, 0, 64),  # RoPE backward shape: pad upper half
+            ([1, 8, 4096, 128], 3, 64, 128),  # RoPE backward shape: pad lower half
+            ([4, 6], 0, 1, 3),  # 2D, slice first dim
+            ([4, 6], 1, 2, 5),  # 2D, slice last dim
+            ([8], 0, 2, 6),  # 1D
+            ([3, 4, 5], 1, 1, 3),  # 3D, middle dim
+        ],
+    )
+    def test_fast_path_matches_pytorch(self, input_sizes, dim, start, end):
+        """Fast path output must match PyTorch's slice_backward for step=1."""
+        torch.manual_seed(42)
+        sliced_shape = list(input_sizes)
+        sliced_shape[dim] = end - start
+        grad_output = torch.randn(sliced_shape)
+
+        ours = decompositions.slice_backward_decomposition(
+            grad_output, input_sizes, dim, start, end, 1
+        )
+        # PyTorch's reference C++ implementation
+        reference = torch.ops.aten.slice_backward(grad_output, input_sizes, dim, start, end, 1)
+
+        assert ours is not NotImplemented
+        torch.testing.assert_close(ours, reference)
+
+    def test_fast_path_handles_negative_indices(self):
+        """Negative start follows Python slice semantics: -3 -> 5+(-3)=2."""
+        torch.manual_seed(42)
+        input_sizes = [5, 4]
+        # x[-3:, :] selects rows 2..5 along dim 0; grad has shape (3, 4)
+        grad_output = torch.randn(3, 4)
+        ours = decompositions.slice_backward_decomposition(grad_output, input_sizes, 0, -3, 5, 1)
+        reference = torch.ops.aten.slice_backward(grad_output, input_sizes, 0, -3, 5, 1)
+        assert ours is not NotImplemented
+        torch.testing.assert_close(ours, reference)
+
+    def test_fallback_for_non_unit_step(self):
+        """Strided slices use zeros + slice_scatter and must match PyTorch's reference."""
+        torch.manual_seed(42)
+        # x[0:6:2, :] selects rows 0, 2, 4 -> grad shape (3, 6)
+        grad_output = torch.randn(3, 6)
+        ours = decompositions.slice_backward_decomposition(grad_output, [6, 6], 0, 0, 6, 2)
+        reference = torch.ops.aten.slice_backward(grad_output, [6, 6], 0, 0, 6, 2)
+        torch.testing.assert_close(ours, reference)
+
+    def test_not_in_default_decomposition_table(self):
+        """slice_backward must NOT use PyTorch's default — that produces stablehlo.scatter."""
+        # The base table delegates to PyTorch defaults for any op listed at module load time.
+        # Our custom decomposition must be present and registered.
+        assert torch.ops.aten.slice_backward.default in decompositions.neuron_decompositions
+        assert (
+            decompositions.neuron_decompositions[torch.ops.aten.slice_backward.default]
+            is decompositions.slice_backward_decomposition
+        )
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSliceBackwardDecompositionE2E:
     """End-to-end tests for slice_backward decomposition using torch.compile with neuron backend"""
