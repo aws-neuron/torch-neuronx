@@ -169,6 +169,36 @@ def torch_cumsum(x, dim, dtype=None, out=None):
     return _reduce_with_promotion(torch.cumsum, target_dtype, dtype, x, dim)
 
 
+@register_aten(
+    ["aten::std.correction", "aten::std.correction_out"],
+    static_argnums=(1, 2, 3),
+)
+def torch_std_correction(self, dim=None, correction=1, keepdim=False, out=None, **kwargs):
+    if self.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return torch.zeros((), dtype=self.dtype, device=self.device)
+    return torch.std(self, dim=dim, correction=correction, keepdim=keepdim)
+
+
+@register_aten(
+    ["aten::std_mean.correction", "aten::std_mean.correction_out"],
+    static_argnums=(1, 2, 3),
+    output_params=("out0", "out1"),
+)
+def torch_std_mean_correction(
+    self, dim=None, correction=1, keepdim=False, out0=None, out1=None, **kwargs
+):
+    if self.ndim == 0 and dim is not None:
+        _validate_scalar_dim(dim)
+        return torch.zeros((), dtype=self.dtype, device=self.device), self.clone()
+    if dim is None:
+        return torch.std(self, correction=correction), torch.mean(self)
+    return (
+        torch.std(self, dim, correction=correction, keepdim=keepdim),
+        torch.mean(self, dim, keepdim=keepdim),
+    )
+
+
 @register_aten("aten::value_selecting_reduction_backward", static_argnums=(1, 3, 4))
 def torch_value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
     return torch.ops.aten.value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim)
