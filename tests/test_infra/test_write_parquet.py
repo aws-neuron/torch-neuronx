@@ -22,8 +22,10 @@ pq = pytest.importorskip("pyarrow.parquet")
 from write_parquet import (  # noqa: E402  (import-after-skip is intentional)
     _ATEN_OPS_FILES,
     _component_for,
+    _normalize_signature,
     _normalize_status,
     write_run_metrics_parquet,
+    write_test_aggregated_parquet,
     write_test_failures_parquet,
 )
 
@@ -388,3 +390,205 @@ def test_test_failures_preserves_full_test_id(tmp_path, monkeypatch):
 
     row = _read_parquet(out)[0]
     assert row["test_id"] == "test_ops.py::TestOps::test_index_put_neuron_float32"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_signature — error_category collapses dynamic tokens
+# ---------------------------------------------------------------------------
+def test_normalize_signature_collapses_op_and_device():
+    """OpInfo dtype-mismatch signatures across different ops must collapse
+    to one bucket — without this, every op produces its own row in the
+    "top error categories" panel."""
+    sig_a = "Exception: The supported dtypes for T on device type neuron are incorrect!"
+    sig_b = "Exception: The supported dtypes for _refs.take_along_dim on device type neuron are incorrect!"  # noqa: E501
+    sig_c = "Exception: The supported dtypes for addcdiv on device type cuda are incorrect!"
+
+    cat = _normalize_signature(sig_a)
+    assert cat == _normalize_signature(sig_b) == _normalize_signature(sig_c)
+    assert "supported dtypes" in cat and "incorrect!" in cat
+
+
+def test_normalize_signature_collapses_aten_op_names():
+    """NRT errors embed the op as ``operation=aten::<op>``."""
+    a = "RuntimeError: NRT execution failed for operation=aten::scatter_add_"
+    b = "RuntimeError: NRT execution failed for operation=aten::index_put"
+    assert _normalize_signature(a) == _normalize_signature(b)
+
+
+def test_normalize_signature_collapses_worker_crash_nodeid():
+    """Worker-crash messages embed the test nodeid in the message; without
+    stripping it each crash is its own bucket."""
+    a = "worker 'gw26' crashed while running 'tests/x.py::T::a'"
+    b = "worker 'gw3' crashed while running 'tests/x.py::T::b'"
+    assert _normalize_signature(a) == _normalize_signature(b)
+
+
+def test_normalize_signature_passes_through_empty():
+    assert _normalize_signature("") == ""
+
+
+# ---------------------------------------------------------------------------
+# write_test_aggregated_parquet — schema + filtering + reason fields
+# ---------------------------------------------------------------------------
+def test_test_aggregated_excludes_skipped_only(tmp_path, monkeypatch):
+    """Skipped/skipped_on_retry are filtered out (they dominate volume).
+    Every other outcome is kept. Mirrors ``write_all_tests_csv``."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [
+        _row("test_ops.py::T::a", "passed"),
+        _row("test_ops.py::T::b", "failed", reason="boom"),
+        _row("test_ops.py::T::c", "error", reason="setup err"),
+        _row("test_ops.py::T::d", "xfailed", reason="known issue"),
+        _row("test_ops.py::T::e", "xpassed"),
+        _row("test_ops.py::T::f", "passed_on_retry"),
+        _row("test_ops.py::T::g", "skipped"),  # excluded
+        _row("test_ops.py::T::h", "skipped_on_retry"),  # excluded
+    ]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    data = _read_parquet(out)
+    statuses = sorted({r["status"] for r in data})
+    assert statuses == ["error", "failed", "passed", "passed_on_retry", "xfailed", "xpassed"]
+    assert len(data) == 6
+
+
+def test_test_aggregated_schema_matches_expected_columns(tmp_path, monkeypatch):
+    """Schema-drift guard for the Athena-facing column set."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::TestOps::test_foo", "passed")]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    schema = pq.read_table(out).schema
+    expected = {
+        "commit_sha",
+        "branch",
+        "run_id",
+        "run_timestamp",
+        "component",
+        "test_id",
+        "test_class",
+        "test_method",
+        "status",
+        "duration_sec",
+        "failure_reason",
+        "error_signature",
+        "error_category",
+    }
+    assert set(schema.names) == expected
+
+
+def test_test_aggregated_error_signature_is_first_nonempty_line(tmp_path, monkeypatch):
+    """``error_signature`` is the first non-empty line of ``failure_reason``;
+    ``failure_reason`` itself is preserved verbatim."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [
+        _row("test_ops.py::T::a", "failed", reason="line one\nline two\nline three"),
+        _row("test_ops.py::T::b", "failed", reason="\n\nactual error here\nfollow-up"),
+        _row("test_ops.py::T::c", "passed"),
+    ]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    by_id = {r["test_id"]: r for r in _read_parquet(out)}
+    assert by_id["test_ops.py::T::a"]["error_signature"] == "line one"
+    assert by_id["test_ops.py::T::b"]["error_signature"] == "actual error here"
+    assert by_id["test_ops.py::T::c"]["error_signature"] == ""
+    assert by_id["test_ops.py::T::c"]["error_category"] == ""
+    assert by_id["test_ops.py::T::a"]["failure_reason"] == "line one\nline two\nline three"
+
+
+def test_test_aggregated_error_category_collapses_op_buckets(tmp_path, monkeypatch):
+    """End-to-end: different ops with the same error pattern collapse to
+    one ``error_category`` while ``error_signature`` stays per-op."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [
+        _row(
+            "test_ops.py::T::test_a",
+            "xfailed",
+            reason="Exception: The supported dtypes for T on device type neuron are incorrect!",
+        ),
+        _row(
+            "test_ops.py::T::test_b",
+            "xfailed",
+            reason="Exception: The supported dtypes for addcdiv on device type neuron are incorrect!",  # noqa: E501
+        ),
+    ]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    data = _read_parquet(out)
+    assert len({r["error_category"] for r in data}) == 1
+    assert len({r["error_signature"] for r in data}) == 2
+
+
+def test_test_aggregated_metadata_columns_propagate(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_SHA", "deadbeef")
+    monkeypatch.setenv("GITHUB_REF_NAME", "release/2.11")
+    monkeypatch.setenv("GITHUB_RUN_ID", "9876")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::T::a", "passed")]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    row = _read_parquet(out)[0]
+    assert row["commit_sha"] == "deadbeef"
+    assert row["branch"] == "release/2.11"
+    assert row["run_id"] == "9876"
+
+
+def test_test_aggregated_rows_sorted_by_component_then_test_id(tmp_path, monkeypatch):
+    """Same row-group-stats tightening as test_failures."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [
+        _row("test_ops.py::T::z", "failed"),
+        _row("dynamo/test_compile.py::T::a", "passed"),
+        _row("test_autograd.py::T::b", "passed"),
+        _row("dynamo/test_compile.py::T::aaa", "error"),
+        _row("distributed/test_ddp.py::T::x", "xfailed"),
+    ]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    data = _read_parquet(out)
+    keys = [(r["component"], r["test_id"]) for r in data]
+    assert keys == sorted(keys)
+
+
+def test_test_aggregated_empty_input_writes_schema_only_file(tmp_path, monkeypatch):
+    """An all-skipped (or empty) run still writes the file with the full
+    schema so downstream consumers (Athena, dashboards) don't break."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::T::a", "skipped")]
+    out = tmp_path / "ta.parquet"
+    write_test_aggregated_parquet(rows, out)
+
+    table = pq.read_table(out)
+    assert table.num_rows == 0
+    assert "error_category" in table.schema.names

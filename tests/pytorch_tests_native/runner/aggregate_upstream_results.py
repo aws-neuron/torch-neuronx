@@ -582,6 +582,13 @@ def main() -> int:
         / f"dt={run_date}"
         / f"run_{run_id}.parquet"
     )
+    test_aggregated_parquet = (
+        parquet_root
+        / "test_aggregated"
+        / f"branch={branch}"
+        / f"dt={run_date}"
+        / f"run_{run_id}.parquet"
+    )
 
     if not results_dir.exists():
         logger.error(f"Results directory not found: {results_dir}")
@@ -604,10 +611,15 @@ def main() -> int:
     # from this module for shared helpers. Top-level imports would create
     # a circular dependency at module load.
     from aggregate_panel import write_github_summary
-    from write_parquet import write_run_metrics_parquet, write_test_failures_parquet
+    from write_parquet import (
+        write_run_metrics_parquet,
+        write_test_aggregated_parquet,
+        write_test_failures_parquet,
+    )
 
     write_run_metrics_parquet(result["test_rows"], run_metrics_parquet)
     write_test_failures_parquet(result["test_rows"], test_failures_parquet)
+    write_test_aggregated_parquet(result["test_rows"], test_aggregated_parquet)
     write_github_summary(result)
 
     flatten_reports(results_dir)
