@@ -30,6 +30,9 @@ _COVERAGE_CACHE_DIR = Path(tempfile.gettempdir()) / f"neuron_coverage_cache_{_WO
 os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "hlo")
 os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "neff")
 
+# Disable torch.compile fallback for accurate lowering results
+os.environ["TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION"] = "1"
+
 # Pin each xdist worker to a distinct logical NeuronCore. Without this, every
 # worker tries to grab the same core and all but one fail with
 # "Failed to initialize Neuron Runtime: status code 1" during the first
