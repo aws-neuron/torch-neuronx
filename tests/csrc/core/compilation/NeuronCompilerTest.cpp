@@ -839,6 +839,54 @@ TEST_F(NeuronCompilerTest, AdditionalArgs_MultipleSpacesBetweenArgsIgnored) {
   EXPECT_EQ(result_str, "spaces_ok");
 }
 
+TEST_F(NeuronCompilerTest, CompilerTxt_QuotesPreservedForArgsWithSpaces) {
+  // Verify that compiler.txt wraps args containing spaces in single quotes.
+  // This is the exact pattern from NEURON_CC_FLAGS for multi-core compilation:
+  //   --internal-hlo2tensorizer-options='--partition --hierarchy-splitter'
+  SetupMockCompiler(0, "quotes_neff");
+  setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1", 1);
+  setenv("TORCH_NEURONX_DEBUG_DIR", temp_dir_.c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config =
+      CreateTestConfig("--internal-hlo2tensorizer-options='--partition --hierarchy-splitter'");
+  NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  auto workdirs = FindWorkdirs(temp_dir_);
+  ASSERT_EQ(workdirs.size(), 1u);
+
+  std::ifstream compiler_file(workdirs[0] + "/compiler.txt");
+  std::string content((std::istreambuf_iterator<char>(compiler_file)),
+                      std::istreambuf_iterator<char>());
+
+  EXPECT_NE(content.find("'--internal-hlo2tensorizer-options=--partition --hierarchy-splitter'"),
+            std::string::npos)
+      << "compiler.txt should preserve single quotes around args with spaces. Got: " << content;
+}
+
+TEST_F(NeuronCompilerTest, CompilerTxt_NoQuotesForSimpleArgs) {
+  // Args without spaces should not be quoted in compiler.txt.
+  SetupMockCompiler(0, "noquotes_neff");
+  setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1", 1);
+  setenv("TORCH_NEURONX_DEBUG_DIR", temp_dir_.c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompilationConfig config = CreateTestConfig("--model-type transformer --auto-cast=none");
+  NeuronCompiler::CompileHloToNeff(hlo, config);
+
+  auto workdirs = FindWorkdirs(temp_dir_);
+  ASSERT_EQ(workdirs.size(), 1u);
+
+  std::ifstream compiler_file(workdirs[0] + "/compiler.txt");
+  std::string content((std::istreambuf_iterator<char>(compiler_file)),
+                      std::istreambuf_iterator<char>());
+
+  EXPECT_NE(content.find("--model-type transformer --auto-cast=none"), std::string::npos)
+      << "Simple args should appear without quotes. Got: " << content;
+  EXPECT_EQ(content.find("'--model-type"), std::string::npos)
+      << "Simple args should not be quoted. Got: " << content;
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   int result = RUN_ALL_TESTS();

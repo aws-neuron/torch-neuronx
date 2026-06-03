@@ -133,7 +133,11 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
     std::ofstream compiler_args_file(compiler_args_path);
     if (compiler_args_file) {
       for (const auto& arg : compiler_args) {
-        compiler_args_file << arg << " ";
+        if (arg.find(' ') != std::string::npos) {
+          compiler_args_file << "'" << arg << "' ";
+        } else {
+          compiler_args_file << arg << " ";
+        }
       }
     }
   }
