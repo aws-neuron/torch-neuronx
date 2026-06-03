@@ -37,9 +37,9 @@ from run_upstream_tests import (
     [
         (0, False),  # success → no retry
         (1, True),  # test failures → retry
-        (2, False),  # usage error
+        (2, False),  # interrupted
         (3, False),  # internal error
-        (4, False),  # collection error
+        (4, False),  # usage error
         (5, False),  # no tests collected
         (124, False),  # timeout — cache incomplete
         (130, False),  # SIGINT
