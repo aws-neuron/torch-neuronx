@@ -58,6 +58,19 @@ void ApplyInputDedup(at::neuron::XLACompilableKernelExecution* kernel,
   std::vector<at::neuron::TensorContext> deduped_ctxs(deduped_count);
   std::vector<bool> slot_filled(deduped_count, false);
 
+  // First pass: find the maximum byte range across all inputs mapping to each slot.
+  // When multiple inputs share storage (same base_ptr, different shapes/offsets),
+  // the deduped slot must declare size_bytes large enough for the NEFF's prologue
+  // to access the full storage range. The prologue MLIR slices from offset 0, so
+  // the buffer must cover all inputs' data ranges: max(storage_offset + numel) * element_size.
+  std::vector<size_t> slot_max_size_bytes(deduped_count, 0);
+  for (size_t i = 0; i < dedup_map.size(); ++i) {
+    size_t slot = dedup_map[i];
+    size_t input_end_bytes =
+        (orig_src_ctxs[i].storage_offset + orig_src_ctxs[i].numel) * orig_src_ctxs[i].element_size;
+    slot_max_size_bytes[slot] = std::max(slot_max_size_bytes[slot], input_end_bytes);
+  }
+
   for (size_t i = 0; i < dedup_map.size(); ++i) {
     size_t slot = dedup_map[i];
     if (!slot_filled[slot]) {
@@ -67,7 +80,9 @@ void ApplyInputDedup(at::neuron::XLACompilableKernelExecution* kernel,
       const auto& shape = deduped_shapes[slot];
       size_t full_numel = 1;
       for (auto d : shape) full_numel *= d;
-      deduped_ctxs[slot].size_bytes = full_numel * deduped_ctxs[slot].element_size;
+      // Use the max byte range across all inputs sharing this slot.
+      // This ensures the NRT buffer covers all data the prologue may access.
+      deduped_ctxs[slot].size_bytes = slot_max_size_bytes[slot];
       deduped_ctxs[slot].numel = full_numel;
       deduped_ctxs[slot].shape = shape;
       slot_filled[slot] = true;

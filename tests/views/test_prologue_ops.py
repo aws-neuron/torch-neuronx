@@ -98,3 +98,241 @@ class TestSharedStorageDifferentShapes:
         assert torch.allclose(result.cpu(), expected.cpu()), "Numerical mismatch!"
 
         assert_no_unexpected_fallback()
+
+
+class TestSplitIndexCat:
+    """Tests for split→index→cat patterns with shared storage.
+
+    These patterns create contiguous views at different offsets within the same
+    storage. When input dedup collapses them, size_bytes must cover the full
+    storage range the prologue accesses.
+    """
+
+    def test_split_index_cat_multimodal_rope(self):
+        """Qwen2.5-VL apply_multimodal_rotary_pos_emb pattern (HunyuanVideo).
+
+        split(unequal sections, dim=-1) → index(dim=0) → cat(dim=-1)
+        All views share storage with different offsets and shapes.
+        """
+        cos_cpu = torch.randn(3, 1, 1108, 128, dtype=torch.float32)
+        cos_neuron = cos_cpu.to(device)
+
+        mrope_section = [16, 24, 24, 16, 24, 24]
+        splits_cpu = cos_cpu.split(mrope_section, dim=-1)
+        splits_neuron = cos_neuron.split(mrope_section, dim=-1)
+
+        cat_inputs_cpu = [s[i % 3] for i, s in enumerate(splits_cpu)]
+        cat_inputs_neuron = [s[i % 3] for i, s in enumerate(splits_neuron)]
+
+        expected = torch.cat(cat_inputs_cpu, dim=-1)
+        result = torch.cat(cat_inputs_neuron, dim=-1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-5
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_index_cat_equal_sections(self):
+        """Equal-sized split → index → cat."""
+        x_cpu = torch.randn(4, 8, 64, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        splits_cpu = x_cpu.split(16, dim=-1)  # 4 equal chunks of 16
+        splits_neuron = x_neuron.split(16, dim=-1)
+
+        # Index different slices along dim=0
+        cat_inputs_cpu = [s[i % 4] for i, s in enumerate(splits_cpu)]
+        cat_inputs_neuron = [s[i % 4] for i, s in enumerate(splits_neuron)]
+
+        expected = torch.cat(cat_inputs_cpu, dim=-1)
+        result = torch.cat(cat_inputs_neuron, dim=-1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-5
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_select_cat_small(self):
+        """Small tensor: split → select → cat (minimal repro)."""
+        x_cpu = torch.randn(2, 4, 8, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # Split into unequal chunks along last dim
+        splits_cpu = x_cpu.split([3, 5], dim=-1)
+        splits_neuron = x_neuron.split([3, 5], dim=-1)
+
+        # Select along dim=0
+        cat_inputs_cpu = [splits_cpu[0][0], splits_cpu[1][1]]
+        cat_inputs_neuron = [splits_neuron[0][0], splits_neuron[1][1]]
+
+        expected = torch.cat(cat_inputs_cpu, dim=-1)
+        result = torch.cat(cat_inputs_neuron, dim=-1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-5
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+
+class TestDedupSliceDimension:
+    """Tests for input dedup with shared-storage views sliced on different dimensions.
+
+    Validates that the dedup size_bytes computation (max byte range) is correct
+    for both major-dimension slices (contiguous views at different offsets) and
+    non-major-dimension slices (non-contiguous views requiring prologue transforms).
+    """
+
+    # ─── Slice on major (outermost) dimension ───────────────────────────────
+    # split(dim=0) produces contiguous views at different offsets within the
+    # same storage. These share (base_ptr, shape) so they WILL dedup. The
+    # deduped slot's size_bytes must cover the full storage range.
+
+    def test_split_dim0_cat_equal_chunks(self):
+        """split(dim=0, equal) → cat: contiguous views, same shape, different offsets."""
+        x_cpu = torch.randn(16, 32, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # 4 equal chunks along dim=0: each is [4, 32], contiguous, different offsets
+        chunks_cpu = x_cpu.split(4, dim=0)
+        chunks_neuron = x_neuron.split(4, dim=0)
+
+        # All chunks share storage and have same shape → dedup collapses to 1 slot
+        expected = torch.cat(list(chunks_cpu), dim=0)
+        result = torch.cat(list(chunks_neuron), dim=0)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim0_add_shared_views(self):
+        """split(dim=0) → add pairs: same-shaped views from same storage added together."""
+        x_cpu = torch.randn(8, 16, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        chunks_cpu = x_cpu.split(2, dim=0)  # 4 chunks of [2, 16]
+        chunks_neuron = x_neuron.split(2, dim=0)
+
+        # Add pairs: chunks[0]+chunks[2], chunks[1]+chunks[3]
+        # Both inputs to each add share storage + shape → dedup
+        expected = torch.cat([chunks_cpu[0] + chunks_cpu[2], chunks_cpu[1] + chunks_cpu[3]], dim=0)
+        result = torch.cat(
+            [chunks_neuron[0] + chunks_neuron[2], chunks_neuron[1] + chunks_neuron[3]],
+            dim=0,
+        )
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-5
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim0_unequal_cat(self):
+        """split(dim=0, unequal) → index → cat: different shapes, no dedup expected."""
+        x_cpu = torch.randn(10, 8, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # Unequal split: [3, 3, 4] along dim=0 — different shapes, same storage
+        chunks_cpu = x_cpu.split([3, 3, 4], dim=0)
+        chunks_neuron = x_neuron.split([3, 3, 4], dim=0)
+
+        expected = torch.cat(list(chunks_cpu), dim=0)
+        result = torch.cat(list(chunks_neuron), dim=0)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    # ─── Slice NOT on major dimension ───────────────────────────────────────
+    # split(dim=1) or split(dim=-1) produces non-contiguous views (the stride
+    # in the sliced dimension is larger than shape * inner_stride). The
+    # prologue must handle these via SLICE transformations. These views have
+    # different storage offsets but same shape when split equally.
+
+    def test_split_dim1_cat_equal_chunks(self):
+        """split(dim=1, equal) → cat: non-contiguous views, same shape, different offsets."""
+        x_cpu = torch.randn(8, 32, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # 4 equal chunks along dim=1: each is [8, 8], NON-contiguous
+        chunks_cpu = x_cpu.split(8, dim=1)
+        chunks_neuron = x_neuron.split(8, dim=1)
+
+        assert all(
+            not c.is_contiguous() for c in chunks_neuron[1:]
+        ), "Non-first dim=1 chunks should be non-contiguous"
+
+        expected = torch.cat(list(chunks_cpu), dim=1)
+        result = torch.cat(list(chunks_neuron), dim=1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim1_add_shared_views(self):
+        """split(dim=1) → add pairs: non-contiguous views requiring prologue slice."""
+        x_cpu = torch.randn(4, 16, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        chunks_cpu = x_cpu.split(4, dim=1)  # 4 chunks of [4, 4]
+        chunks_neuron = x_neuron.split(4, dim=1)
+
+        # Add pairs: non-contiguous views with same base_ptr and same shape → dedup
+        expected = torch.cat([chunks_cpu[0] + chunks_cpu[2], chunks_cpu[1] + chunks_cpu[3]], dim=1)
+        result = torch.cat(
+            [chunks_neuron[0] + chunks_neuron[2], chunks_neuron[1] + chunks_neuron[3]],
+            dim=1,
+        )
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-5
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim_last_cat_3d(self):
+        """split(dim=-1) on 3D tensor → cat: non-contiguous slices on last dim."""
+        x_cpu = torch.randn(2, 4, 24, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # Split last dim into 4 equal parts: each [2, 4, 6], non-contiguous
+        chunks_cpu = x_cpu.split(6, dim=-1)
+        chunks_neuron = x_neuron.split(6, dim=-1)
+
+        assert all(not c.is_contiguous() for c in chunks_neuron[1:])
+
+        expected = torch.cat(list(chunks_cpu), dim=-1)
+        result = torch.cat(list(chunks_neuron), dim=-1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim1_unequal_cat(self):
+        """split(dim=1, unequal) → cat: non-contiguous, different shapes, no dedup."""
+        x_cpu = torch.randn(4, 12, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # Unequal split along dim=1: [4, 4, 4] would dedup, [3, 4, 5] won't
+        chunks_cpu = x_cpu.split([3, 4, 5], dim=1)
+        chunks_neuron = x_neuron.split([3, 4, 5], dim=1)
+
+        expected = torch.cat(list(chunks_cpu), dim=1)
+        result = torch.cat(list(chunks_neuron), dim=1)
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+    def test_split_dim1_matmul_shared_storage(self):
+        """split(dim=1) → matmul with shared-storage non-contiguous views.
+
+        This tests that prologue correctly handles the size_bytes for
+        non-contiguous deduped inputs used in compute (not just cat).
+        """
+        x_cpu = torch.randn(4, 8, dtype=torch.float32)
+        x_neuron = x_cpu.to(device)
+
+        # Split into 2 chunks of [4, 4] along dim=1 (non-contiguous)
+        a_cpu, b_cpu = x_cpu.split(4, dim=1)
+        a_neuron, b_neuron = x_neuron.split(4, dim=1)
+
+        # a @ b.T — both share storage, same shape, but different offsets in dim=1
+        expected = a_cpu @ b_cpu.T
+        result = a_neuron @ b_neuron.T
+
+        assert torch.allclose(
+            result.cpu(), expected, atol=1e-4
+        ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
