@@ -41,6 +41,51 @@
       "runner": "torchrun",
       "tp_size": 4,
       "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "exec_mode": "compile",
+      "id": "qwen3-tp4-fsdp16-compile",
+      "mfu_baseline": 23.57,
+      "mfu_baseline_date": "2026-06-02",
+      "mfu_threshold": 22.39,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "qwen3-8b-tp_fsdp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "exec_mode": "compile",
+      "id": "qwen3-tp1-fsdp64-compile",
+      "mfu_baseline": 30.99,
+      "mfu_baseline_date": "2026-05-29",
+      "mfu_threshold": 27.89,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "qwen3-8b-fsdp",
+      "runner": "torchrun",
+      "tp_size": 1,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "qwen3_torchtitan",
+      "exec_mode": "compile",
+      "id": "qwen3-tp4-compile",
+      "mfu_baseline": 54.3,
+      "mfu_baseline_date": "2026-06-02",
+      "mfu_threshold": 51.58,
+      "n_layers": 4,
+      "nproc": 4,
+      "preset": "qwen3-8b-tp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
     }
   ]
 }

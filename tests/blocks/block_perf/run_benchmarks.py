@@ -551,6 +551,7 @@ def benchmark_block(
     with_optimizer=False,
     neuron_profile=False,
     with_stack=False,
+    exec_mode="eager",
 ):
     """
     Generic benchmark function for transformer blocks.
@@ -596,6 +597,7 @@ def benchmark_block(
         if with_optimizer:
             mode_str += " + Optimizer"
     printf(f"  Mode: {mode_str}")
+    printf(f"  Execution: {exec_mode}")
     printf(f"  Warmup runs: {warmup_runs}")
     printf(f"  Benchmark runs: {benchmark_runs}")
 
@@ -619,6 +621,9 @@ def benchmark_block(
         block = StackedBlocks(
             block_module.create_block, n_layers, config, device, dtype, tp_mesh, dp_mesh
         )
+
+    if exec_mode == "compile":
+        block = torch.compile(block, backend="neuron")
 
     # Create input tensor
     if block_type == "qwen3":
@@ -917,6 +922,14 @@ def main():
         help="Enable NeuronMetrics collection and print full metrics/op-tracking report",
     )
 
+    parser.add_argument(
+        "--exec_mode",
+        type=str,
+        default="eager",
+        choices=["eager", "compile"],
+        help="Execution mode: eager (default) or compile",
+    )
+
     # Parse all arguments
     args = parser.parse_args()
     setup_distributed(args.device)
@@ -973,6 +986,7 @@ def main():
         with_optimizer=args.with_optimizer,
         neuron_profile=args.neuron_profile,
         with_stack=args.with_stack,
+        exec_mode=args.exec_mode,
     )
 
     # Save results if requested
@@ -982,6 +996,7 @@ def main():
         output_data = {
             "block_type": args.block,
             "device": args.device,
+            "exec_mode": args.exec_mode,
             "results": {
                 "config": results["config"],
                 "mode": results.get("mode"),

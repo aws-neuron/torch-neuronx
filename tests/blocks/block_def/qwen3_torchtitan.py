@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as func
 
+from . import force_local_contiguous
 from .rope import apply_rotary_emb, precompute_rope_cache
 
 
@@ -87,7 +88,7 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)
 
         output = func.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
-        output = output.transpose(1, 2).contiguous()
+        output = force_local_contiguous(output.transpose(1, 2))
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
 

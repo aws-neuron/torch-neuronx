@@ -41,6 +41,51 @@
       "runner": "torchrun",
       "tp_size": 4,
       "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "exec_mode": "compile",
+      "id": "gpt-oss-tp4-fsdp16-compile",
+      "mfu_baseline": 13.82,
+      "mfu_baseline_date": "2026-06-02",
+      "mfu_threshold": 13.13,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "gpt-oss-20b-tp_fsdp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "exec_mode": "compile",
+      "id": "gpt-oss-tp1-fsdp64-compile",
+      "mfu_baseline": 22.47,
+      "mfu_baseline_date": "2026-05-29",
+      "mfu_threshold": 20.22,
+      "n_layers": 4,
+      "nproc": 64,
+      "preset": "gpt-oss-20b-fsdp",
+      "runner": "torchrun",
+      "tp_size": 1,
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "block": "gpt_oss_transformer",
+      "exec_mode": "compile",
+      "id": "gpt-oss-tp4-compile",
+      "mfu_baseline": 48.98,
+      "mfu_baseline_date": "2026-06-02",
+      "mfu_threshold": 46.53,
+      "n_layers": 4,
+      "nproc": 4,
+      "preset": "gpt-oss-20b-tp",
+      "runner": "torchrun",
+      "tp_size": 4,
+      "warmup_runs": 20
     }
   ]
 }
