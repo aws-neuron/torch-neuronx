@@ -37,6 +37,8 @@ def build_command(test, skip_mfu_threshold):
         ]
         if not skip_mfu_threshold and test.get("mfu_threshold"):
             cmd.extend(["--mfu-threshold", str(test["mfu_threshold"])])
+        if test.get("exec_mode"):
+            cmd.extend(["--exec_mode", test["exec_mode"]])
         return cmd
 
     elif runner == "singlecore":
@@ -56,6 +58,8 @@ def build_command(test, skip_mfu_threshold):
                 str(test["benchmark_runs"]),
             ]
         )
+        if test.get("exec_mode"):
+            cmd.extend(["--exec_mode", test["exec_mode"]])
         return cmd
 
     elif runner == "collective":
@@ -127,6 +131,11 @@ def main():
 
     results = []
     for test in tests:
+        if test.get("skip"):
+            reason = test.get("skip_reason", "")
+            suffix = f" — {reason}" if reason else ""
+            print(f"\n[{test['id']}] SKIPPED{suffix}")
+            continue
         passed = run_test(test, args.skip_mfu_threshold, args.timeout)
         results.append((test["id"], passed))
 

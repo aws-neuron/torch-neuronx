@@ -32,7 +32,7 @@ def run_single_test(core_id, preset, block, args):
     env["NEURON_RT_VISIBLE_CORES"] = str(core_id)
     env["NEURON_RT_NUM_CORES"] = "1"
 
-    output_file = f"results_{block}_{preset}_core{core_id}.json"
+    output_file = f"results_{block}_{preset}_{args.exec_mode}_core{core_id}.json"
 
     cmd = [
         "python",
@@ -51,6 +51,8 @@ def run_single_test(core_id, preset, block, args):
         str(args.warmup_runs),
         "--benchmark_runs",
         str(args.benchmark_runs),
+        "--exec_mode",
+        args.exec_mode,
         "--save_results",
         "--output_file",
         output_file,
@@ -96,6 +98,13 @@ def main():
     parser.add_argument("--forward-only", action="store_true")
     parser.add_argument("--max_parallel", type=int, default=64, help="Max parallel tests")
     parser.add_argument("--start_core", type=int, default=0, help="Starting core ID")
+    parser.add_argument(
+        "--exec_mode",
+        type=str,
+        default="eager",
+        choices=["eager", "compile"],
+        help="Execution mode forwarded to run_benchmarks.py (default: eager)",
+    )
     args = parser.parse_args()
 
     import importlib
