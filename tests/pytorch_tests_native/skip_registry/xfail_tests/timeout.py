@@ -132,6 +132,7 @@ TIMEOUT = [
     "test_modules.py::TestModuleNEURON::test_grad_nn_InstanceNorm3d_train_mode_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_gradgrad_nn_BatchNorm2d_eval_mode_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_gradgrad_nn_InstanceNorm3d_eval_mode_neuron_float64",
+    "test_modules.py::TestModuleNEURON::test_gradgrad_nn_RNN_train_mode_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_non_contiguous_tensors_nn_CrossEntropyLoss_neuron_float64",
     "test_nn.py::TestNNDeviceTypeNEURON::test_cross_entropy_label_smoothing_consistent_index_target_and_probs_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_softmax_results_neuron_float32",

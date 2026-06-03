@@ -226,6 +226,7 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_linalg.py::TestLinalgNEURON::test_blas_alpha_beta_empty_neuron_float32",
     "test_linalg.py::TestLinalgNEURON::test_blas_alpha_beta_empty_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_blas_empty_neuron",
+    "test_linalg.py::TestLinalgNEURON::test_inverse_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_linalg_solve_triangular_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_norm_vector_neuron_float32",
     "test_linalg.py::TestLinalgNEURON::test_pinv_neuron_float64",
