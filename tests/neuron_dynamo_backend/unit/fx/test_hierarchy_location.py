@@ -91,16 +91,6 @@ def get_nodes_without_hierarchy(gm):
     ]
 
 
-def _strip_aten_suffix(h):
-    """Strip the trailing `aten.<op>[<name>]` segment so module-only assertions still work."""
-    if h is None:
-        return None
-    parts = h.split("/")
-    if parts and parts[-1].startswith("aten."):
-        return "/".join(parts[:-1])
-    return h
-
-
 class TestGetHierarchyString:
     """Tests for _get_hierarchy_string (ClassName[attr][count]/... format)."""
 
@@ -108,14 +98,14 @@ class TestGetHierarchyString:
         gm = get_fx_graph(SimpleLinear())
         nodes = get_nodes_with_hierarchy(gm)
 
-        hierarchies = sorted([_strip_aten_suffix(_get_hierarchy_string(n)) for n in nodes])
+        hierarchies = sorted([_get_hierarchy_string(n) for n in nodes])
         assert hierarchies == ["Linear[linear][0]", "Linear[linear][0]"]
 
     def test_nested_model(self):
         gm = get_fx_graph(NestedModel())
         nodes = get_nodes_with_hierarchy(gm)
 
-        hierarchies = sorted([_strip_aten_suffix(_get_hierarchy_string(n)) for n in nodes])
+        hierarchies = sorted([_get_hierarchy_string(n) for n in nodes])
         assert hierarchies == [
             "Linear[layer2][0]",
             "Linear[layer2][0]",
@@ -127,7 +117,7 @@ class TestGetHierarchyString:
         gm = get_fx_graph(DeeplyNested())
         nodes = get_nodes_with_hierarchy(gm)
 
-        hierarchies = sorted([_strip_aten_suffix(_get_hierarchy_string(n)) for n in nodes])
+        hierarchies = sorted([_get_hierarchy_string(n) for n in nodes])
         assert hierarchies == [
             "Linear[decoder][0]",
             "Linear[decoder][0]",
@@ -141,7 +131,7 @@ class TestGetHierarchyString:
         gm = get_fx_graph(SequentialModel())
         nodes = get_nodes_with_hierarchy(gm)
 
-        hierarchies = sorted([_strip_aten_suffix(_get_hierarchy_string(n)) for n in nodes])
+        hierarchies = sorted([_get_hierarchy_string(n) for n in nodes])
         assert hierarchies == [
             "Sequential[layers][0]/Linear[0][0]",
             "Sequential[layers][0]/Linear[0][0]",
@@ -150,17 +140,12 @@ class TestGetHierarchyString:
             "Sequential[layers][0]/ReLU[1][0]",
         ]
 
-    def test_call_function_without_module_stack_returns_aten_only(self):
-        """Call_function nodes without nn_module_stack now get an op-only hierarchy."""
-        import re
-
+    def test_no_hierarchy_returns_none(self):
         gm = get_fx_graph(MixedModel())
         nodes_without = get_nodes_without_hierarchy(gm)
 
         for node in nodes_without:
-            result = _get_hierarchy_string(node)
-            assert result is not None
-            assert re.fullmatch(r"aten\.[^/]+\[[^/]+\]", result), result
+            assert _get_hierarchy_string(node) is None
 
     def test_no_lself_prefix(self):
         gm = get_fx_graph(SimpleLinear())
@@ -204,49 +189,6 @@ class TestGetHierarchyString:
     # def test_fallback_without_call_hierarchy(self):
     #     """Without call_hierarchy, falls back to nn_module_stack."""
     #     ...
-
-
-class TestAtenOpSuffix:
-    """Tests for the trailing aten-op segment appended to call_function hierarchies."""
-
-    def test_call_function_segment_is_aten_op(self):
-        """Final hierarchy segment for a call_function node matches aten.<op>[<node_name>]."""
-        import re
-
-        gm = get_fx_graph(NestedModel())
-        call_function_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
-        assert call_function_nodes
-
-        for node in call_function_nodes:
-            h = _get_hierarchy_string(node)
-            assert h is not None
-            last_segment = h.split("/")[-1]
-            assert re.fullmatch(r"aten\.[^/\[]+\[[^/\[\]]+\]", last_segment), last_segment
-
-    def test_aten_suffix_disambiguates_same_module_same_op(self):
-        """Two call_function nodes sharing module hierarchy still get unique hierarchy strings."""
-
-        class TwoAdds(nn.Module):
-            def forward(self, x):
-                return x + 1 + 2  # two aten.add nodes, both top-level
-
-        gm = get_fx_graph(TwoAdds())
-        adds = [n for n in gm.graph.nodes if n.op == "call_function" and "add" in n.name]
-        assert len(adds) >= 2
-
-        hierarchies = [_get_hierarchy_string(n) for n in adds]
-        assert len(set(hierarchies)) == len(hierarchies), hierarchies
-
-    def test_non_call_function_nodes_have_no_aten_suffix(self):
-        """Placeholder/output/get_attr nodes must not get an aten suffix."""
-        gm = get_fx_graph(SimpleLinear())
-        non_call = [n for n in gm.graph.nodes if n.op != "call_function"]
-
-        for node in non_call:
-            h = _get_hierarchy_string(node)
-            if h is None:
-                continue
-            assert not h.split("/")[-1].startswith("aten."), (node.op, h)
 
 
 class TestGetNodeLocation:
@@ -375,6 +317,7 @@ class TestHasHierarchyFlag:
         importer = NeuronFxImporter()
         assert importer.has_hierarchy is False
 
+    @pytest.mark.xfail(reason="Reverted hierarchy location changes")
     def test_has_hierarchy_true_when_only_aten_suffix(self):
         """Flag is set even without nn_module_stack — aten-op suffix counts as hierarchy."""
         from torch_mlir.fx import OutputType, stateless_fx_import
@@ -441,6 +384,7 @@ class TestHierarchySplitterCompatibleAttribute:
         attr = stablehlo.operation.attributes["stablehlo.hierarchy_splitter_compatible"]
         assert str(attr.value) == "true"
 
+    @pytest.mark.xfail(reason="Reverted hierarchy location changes")
     def test_attribute_set_even_without_module_stack(self):
         """Attribute is still present when only aten-suffix hierarchy is emitted."""
         from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
