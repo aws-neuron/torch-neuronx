@@ -64,6 +64,12 @@ METRICS_DIR = (
 # run on CPU.
 _OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
 
+# Ops that hang torch.compile due to 0d tensor inputs; skip entirely.
+_OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
+    "linspace",
+    "logspace",
+)
+
 if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:
     os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -314,6 +320,8 @@ class TestTargetOpsCompileCoverage:
     @pytest.mark.parametrize("op_info", _build_params())
     def test_op_compile(self, op_info: NeuronOpInfo):
         op_name = op_info.op_name
+        if any(pat in op_name for pat in _OPS_SKIP_COMPILE_HANG):
+            pytest.skip(f"{op_name}: skipped (hangs with 0d tensor inputs)")
         classification = _classify_op(op_name)
 
         result = {
