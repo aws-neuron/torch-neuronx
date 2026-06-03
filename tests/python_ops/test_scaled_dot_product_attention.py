@@ -134,7 +134,7 @@ def qkv_inputs(request):
             8,
             marks=pytest.mark.xfail(
                 reason="MHA float32 flaky test",
-                strict=True,
+                strict=False,
             ),
         ),  # MHA float32
         (torch.float16, 8, 8),  # MHA float16

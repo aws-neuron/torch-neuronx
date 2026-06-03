@@ -13,7 +13,7 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
     If 'call_hierarchy' metadata is present (function call and module stacks),
     uses it directly. Otherwise falls back to nn_module_stack (module-only).
 
-    Output format: ClassName[attr][count]/func_name[count]/.../aten.op.overload[node_name]
+    Output format: ClassName[attr][count]/func_name[count]/...
     """
     # Preferred path: unified call hierarchy
     call_hierarchy = node.meta.get("call_hierarchy")
@@ -24,9 +24,11 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
     # Fallback: module-only hierarchy from nn_module_stack
     # fwd_nn_module_stack is set by AOT autograd on backward nodes
     nn_module_stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
+    if not nn_module_stack:
+        return None
 
     segments = []
-    for key, (path, cls) in (nn_module_stack or {}).items():
+    for key, (path, cls) in nn_module_stack.items():
         path = path.replace("L['self'].", "")
 
         if path == "L['self']":
@@ -36,9 +38,6 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
         attr = path.rsplit(".", 1)[-1] if "." in path else path
         call_count = int(str(key).split("@")[1]) if "@" in str(key) else 0
         segments.append(f"{cls_name}[{attr}][{call_count}]")
-
-    if node.op == "call_function":
-        segments.append(f"{node.target}[{node.name}]")
 
     return "/".join(segments) if segments else None
 
