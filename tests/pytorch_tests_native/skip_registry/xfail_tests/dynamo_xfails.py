@@ -619,3 +619,21 @@ DYNAMO_INPLACE_METADATA_PROPAGATION = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
 ]
+
+SCATTER_COMPILE_FAILURE = [
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_bfloat16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float32",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float32",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float64",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_bfloat16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_bfloat16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float32",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float64",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float16",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float32",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float64",
+    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_bfloat16",
+]

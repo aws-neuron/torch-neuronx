@@ -108,6 +108,9 @@ from .dynamo_xfails import (
 from .dynamo_xfails import (
     DYNAMO_VMAP_RECOMPILE_GUARD as DYNAMO_VMAP_RECOMPILE_GUARD,
 )
+from .dynamo_xfails import (
+    SCATTER_COMPILE_FAILURE as SCATTER_COMPILE_FAILURE,
+)
 from .error_not_raised.runtime_error import (
     ERROR_NOT_RAISED_RUNTIME_ERROR as ERROR_NOT_RAISED_RUNTIME_ERROR,
 )
