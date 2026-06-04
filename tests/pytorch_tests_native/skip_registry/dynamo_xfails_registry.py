@@ -709,4 +709,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "MiscTestsDeviceNEURON::test_interpolate_propagate_real_tensors_neuron",
         ],
     ),
+    SkipGroup(
+        reason=("scatter reduce op compilation regressed in compiler for scalar inputs"),
+        tests=x.SCATTER_COMPILE_FAILURE,
+    ),
 ]
