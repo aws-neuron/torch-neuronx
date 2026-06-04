@@ -84,6 +84,8 @@
       "nproc": 4,
       "preset": "gpt-oss-20b-tp",
       "runner": "torchrun",
+      "skip": true,
+      "skip_reason": "test times out in GH CI.",
       "tp_size": 4,
       "warmup_runs": 20
     }
