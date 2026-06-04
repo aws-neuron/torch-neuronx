@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 
-def build_command(test, skip_mfu_threshold):
+def build_command(test, skip_mfu_threshold, mfu_threshold_multiplier=1.0):
     runner = test.get("runner", "torchrun")
 
     if runner == "torchrun":
@@ -36,7 +36,8 @@ def build_command(test, skip_mfu_threshold):
             f"outputs/{test['id']}.json",
         ]
         if not skip_mfu_threshold and test.get("mfu_threshold"):
-            cmd.extend(["--mfu-threshold", str(test["mfu_threshold"])])
+            effective = float(test["mfu_threshold"]) * mfu_threshold_multiplier
+            cmd.extend(["--mfu-threshold", f"{effective:.6f}"])
         if test.get("exec_mode"):
             cmd.extend(["--exec_mode", test["exec_mode"]])
         return cmd
@@ -87,8 +88,8 @@ def build_command(test, skip_mfu_threshold):
         return None
 
 
-def run_test(test, skip_mfu_threshold, timeout):
-    cmd = build_command(test, skip_mfu_threshold)
+def run_test(test, skip_mfu_threshold, timeout, mfu_threshold_multiplier=1.0):
+    cmd = build_command(test, skip_mfu_threshold, mfu_threshold_multiplier)
     if cmd is None:
         print(f"[{test['id']}] ERROR: unknown runner '{test.get('runner')}'")
         return False
@@ -120,6 +121,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--skip-mfu-threshold", action="store_true")
+    parser.add_argument(
+        "--mfu-threshold-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier on per-test mfu_threshold. <1.0 loosens the gate. "
+        "Used by nightly to enforce regressions with extra headroom (e.g. 0.95).",
+    )
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
@@ -136,7 +144,9 @@ def main():
             suffix = f" — {reason}" if reason else ""
             print(f"\n[{test['id']}] SKIPPED{suffix}")
             continue
-        passed = run_test(test, args.skip_mfu_threshold, args.timeout)
+        passed = run_test(
+            test, args.skip_mfu_threshold, args.timeout, args.mfu_threshold_multiplier
+        )
         results.append((test["id"], passed))
 
     # Summary
