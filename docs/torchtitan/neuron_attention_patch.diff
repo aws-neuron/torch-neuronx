@@ -1,0 +1,48 @@
+diff --git a/torchtitan/models/common/attention.py b/torchtitan/models/common/attention.py
+index fbfded20..2540a5e1 100644
+--- a/torchtitan/models/common/attention.py
++++ b/torchtitan/models/common/attention.py
+@@ -45,6 +46,22 @@ __all__ = [
+ ]
+ 
+ 
++def force_local_contiguous(t: torch.Tensor) -> torch.Tensor:
++    """Force DTensor local shards to be contiguous.
++
++    Workaround for PyTorch issue #173041: DTensor.contiguous() doesn't always
++    make local shards contiguous under torch.compile, causing view() to fail
++    during AC re-execution. In eager mode, DTensor.contiguous() works correctly.
++
++    Note: The from_local approach severs autograd in eager mode (optimizer sees
++    fewer params). Only use it under torch.compile where autograd is traced.
++    """
++    from torch.distributed._tensor import DTensor
++    if torch.compiler.is_compiling() and isinstance(t, DTensor):
++        local = t.to_local().contiguous()
++        return DTensor.from_local(local, t.device_mesh, t.placements, run_check=False)
++    return t.contiguous()
++
+ class VarlenMetadata(NamedTuple):
+     """
+     Cumulative sequence positions for queries and keys/values.
+@@ -527,17 +547,14 @@ class GQAttention(BaseAttention):
+                 )
+             case "sdpa":
+                 assert attention_masks is None
+-                output = (
+-                    self.inner_attention(
++                output = self.inner_attention(
+                         xq,
+                         xk,
+                         xv,
+                         enable_gqa=self.enable_gqa,
+                         **scale_kwargs,
+-                    )
+-                    .transpose(1, 2)
+-                    .contiguous()
+-                )
++                    ).transpose(1, 2)
++                output = force_local_contiguous(output)
+             case _:
+                 raise ValueError(f"Unknown attention type: {self.attn_backend}")
+ 
