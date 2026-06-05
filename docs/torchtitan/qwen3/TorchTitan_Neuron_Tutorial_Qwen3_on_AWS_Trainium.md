@@ -1,44 +1,61 @@
-# Training Qwen3-8B with torch-neuronx
+# Training Qwen3-32B with torch-neuronx
+
+This tutorial demonstrates how to train the Qwen3-32B dense model using
+TorchTitan on AWS Trainium (Trn2) instances.
 
 ## Setup TorchTitan
+
 ```shell
 cd ~
 git clone https://github.com/pytorch/torchtitan.git
 cd torchtitan
-git checkout 0a2107f984639e23a0e5b07fc278785345f03b73
-git apply ~/torch-neuronx/docs/torchtitan/qwen3/TorchTitan.diff
+git checkout 8d4f65a3167861dcc98c59343cdf00d8fe055c4d
+git apply ~/torch-neuronx/docs/torchtitan/neuron_attention_patch.diff
 uv pip install --system -r requirements.txt
+uv pip install -e .
 ```
 
+The patch adds a `force_local_contiguous` workaround in the SDPA attention path for the PyTorch issue [#173041](https://github.com/pytorch/pytorch/issues/173041) so DTensor local shards are made contiguous under `torch.compile`. See
+[neuron_attention_patch.diff](../neuron_attention_patch.diff) for the full diff.
 
-## Train with TorchTitan
+## Download Tokenizer (for c4 dataset)
 
-Download tokenizer (for c4 dataset)
 ```shell
-python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-8B --assets tokenizer
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-32B --assets tokenizer
 ```
 
-Test with a single core to ensure environment setup succeeded:
+## Train Qwen3-32B (Eager Mode)
+
 ```shell
-export NEURON_RT_NUM_CORES=1
-export CONFIG_FILE=~/torch-neuronx/docs/torchtitan/qwen3/qwen3_8b_tp4_fsdp.toml
+export NEURON_RT_NUM_CORES=64
 torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES --rdzv_id 101 \
 --local-ranks-filter 0 --role rank --tee 3 \
 --rdzv_backend c10d --rdzv_endpoint "localhost:29500" \
--m torchtitan.train --job.config_file ${CONFIG_FILE} \
---model.flavor debugmodel \
---model.hf_assets_path ./tests/assets/tokenizer \
---training.global_batch_size 2 \
---parallelism.tensor_parallel_degree 1
+-m torchtitan.train --module qwen3 --config qwen3_32b \
+--parallelism.tensor-parallel-degree 4 \
+--parallelism.data-parallel-shard-degree -1 \
+--training.local-batch-size 1 \
+--training.global-batch-size 16 \
+--activation-checkpoint.mode full
 ```
 
-Train the full scale model with single Trn2.48xlarge node:
+## Train Qwen3-32B with torch.compile
+
+Enable `torch.compile` with the Neuron backend by adding `--compile.enable
+--compile.backend neuron`.
+
 ```shell
-export NEURON_RT_NUM_CORES=64 # num_trn_cores
-export CONFIG_FILE=~/torch-neuronx/docs/torchtitan/qwen3/qwen3_8b_tp4_fsdp.toml
+export NEURON_RT_NUM_CORES=64
 torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES --rdzv_id 101 \
 --local-ranks-filter 0 --role rank --tee 3 \
 --rdzv_backend c10d --rdzv_endpoint "localhost:29500" \
--m torchtitan.train --job.config_file ${CONFIG_FILE}
+-m torchtitan.train --module qwen3 --config qwen3_32b \
+--parallelism.tensor-parallel-degree 4 \
+--parallelism.data-parallel-shard-degree -1 \
+--training.local-batch-size 1 \
+--training.global-batch-size 16 \
+--activation-checkpoint.mode full \
+--compile.enable --compile.backend neuron
 ```
+
 The first training step will take a few minutes, but after that, expect consistent throughput.
