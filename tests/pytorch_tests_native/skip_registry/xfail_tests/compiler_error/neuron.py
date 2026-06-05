@@ -168,6 +168,9 @@ COMPILER_ERROR_NEURON = [
     "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fn",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_neuron",
     "test_transformers.py::TestSDPAFailureModesNEURON::test_sdpa_unbacked_no_dde_neuron",
+    # [NCC_IBCG901] BIRCodeGenLoop assertion error:
+    # Too many strides!" when lowering aten::convolution with strided weights.
+    "test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv_noncontig_weights_neuron",
     # --- Persistent compile failures across three consistent runs ---
     # aten::convolution compile failure; shows up in cosine_embedding_loss,
     # ctc_loss, hinge_embedding_loss, and hardshrink (all internally invoke a
