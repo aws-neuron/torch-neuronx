@@ -21,10 +21,6 @@ Run [prerequisites.sh](prerequisites.sh)
 uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 uv pip install nki --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
-# Clone the repository
-git clone <repository-url>
-cd torch-neuronx
-
 #If permissions are needed, execute below command
 chmod +x ./tools/*
 
