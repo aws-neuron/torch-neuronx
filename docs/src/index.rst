@@ -9,9 +9,3 @@ torch-neuronx is a PyTorch backend for AWS Neuron devices. It uses PyTorch's `Pr
 
    environment_variables
    decompositions
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Tutorials:
-
-   tutorials/train_qwen3
