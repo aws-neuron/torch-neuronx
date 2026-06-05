@@ -28,9 +28,9 @@ python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-32B --assets tokenizer
 
 ```shell
 export NEURON_RT_NUM_CORES=64
-torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES --rdzv_id 101 \
+torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES \
 --local-ranks-filter 0 --role rank --tee 3 \
---rdzv_backend c10d --rdzv_endpoint "localhost:29500" \
+--rdzv_backend c10d --rdzv_endpoint "localhost:0" \
 -m torchtitan.train --module qwen3 --config qwen3_32b \
 --parallelism.tensor-parallel-degree 4 \
 --parallelism.data-parallel-shard-degree -1 \
@@ -46,9 +46,9 @@ Enable `torch.compile` with the Neuron backend by adding `--compile.enable
 
 ```shell
 export NEURON_RT_NUM_CORES=64
-torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES --rdzv_id 101 \
+torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES \
 --local-ranks-filter 0 --role rank --tee 3 \
---rdzv_backend c10d --rdzv_endpoint "localhost:29500" \
+--rdzv_backend c10d --rdzv_endpoint "localhost:0" \
 -m torchtitan.train --module qwen3 --config qwen3_32b \
 --parallelism.tensor-parallel-degree 4 \
 --parallelism.data-parallel-shard-degree -1 \
