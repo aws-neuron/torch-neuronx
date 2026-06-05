@@ -103,14 +103,6 @@ class ConcatenationEngine {
 
   int GetBufferSizeLimit() const { return buffer_size_limit; }
 
-  // Splice partitioned ops on stream->active_operations_ as
-  // allocs → compute → deallocs. Under lazy alloc the merged op resolves all
-  // I/O VAs at dispatch, so kAllocs must precede it and kDeallocs must follow.
-  // Ops absent from all three lists are unmoved.
-  void ApplyFlushReorderToStream(StreamImpl* stream, const std::list<OperationContext*>& alloc_ops,
-                                 const std::list<OperationContext*>& compute_ops,
-                                 const std::list<OperationContext*>& dealloc_ops);
-
  private:
   class BufferingImpl;
   std::unique_ptr<BufferingImpl> buffering_impl_;

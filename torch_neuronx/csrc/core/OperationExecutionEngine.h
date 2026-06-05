@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -30,7 +32,17 @@ constexpr int64_t DEFAULT_QUEUE_LOW_THRESHOLD = 15;
 // Default max inflight requests per XU (hardware queue depth limit)
 constexpr int kDefaultMaxInflightPerXU = 8;
 
-// Global execution engine that manages compilation and execution threads across all streams
+// Two-queue topology:
+//   - dispatch_queue_   : global mutable buffer; ConcatenationWorker reorders
+//                         and merges, then transfers ops to runtime_queue_.
+//                         Concat-OFF submits skip this entirely.
+//   - runtime_queue_    : per-stream committed FIFO on StreamImpl;
+//                         RuntimeWorker schedules from here.
+//
+// Storage invariant: at every observable instant, an op is in exactly one
+// of dispatch_queue_ or stream->runtime_queue_. ConcatenationEngine's
+// internal buffer is raw-pointer aliases into a contiguous prefix of
+// dispatch_queue_ (ownership stays in dispatch_queue_ until transfer).
 class OperationExecutionEngine {
  public:
   // Shutdown coordination
@@ -47,10 +59,24 @@ class OperationExecutionEngine {
   OperationExecutionEngine(OperationExecutionEngine&&) = delete;
   OperationExecutionEngine& operator=(OperationExecutionEngine&&) = delete;
 
+  // Single submit entry point. Routes internally based on whether
+  // concatenation is enabled:
+  //   - concat ON  → push onto dispatch_queue_ and wake the
+  //                  ConcatenationWorker, which reorders the buffered
+  //                  window and transfers a partitioned prefix into
+  //                  op->stream->runtime_queue_ at flush.
+  //   - concat OFF → park the shared_ptr directly in
+  //                  op->stream->runtime_queue_, no worker hop.
+  void SubmitOperation(std::shared_ptr<OperationContext> op);
+
+  // Push a host-side ALLOC/DEALLOC hint through dispatch_queue_. Hints are
+  // consumed by the concat engine and dropped at transfer time — they never
+  // reach runtime_queue_.
+  void RecordHint(std::unique_ptr<OperationContext> hint, const NeuronStream& stream);
+
   void SubmitCompilationTask(OperationContext* operation);
-  // Submit operation to concatenation queue (if enabled) or directly to compilation
-  void SubmitOperation(OperationContext* operation);
-  // Notify the execution worker that an operation is ready
+
+  // Notify the runtime worker that an operation is ready
   void NotifyExecutionReady() { WriteEventfd(); }
 
   // Execution queue depth management
@@ -64,8 +90,9 @@ class OperationExecutionEngine {
   // Handle concatenation failure - called by StreamImpl during error handling
   void HandleConcatenationFailure(OperationContext* operation);
 
-  // Submit a hint to the concatenation queue, bypassing active_operations_ and compilation.
-  void RecordHint(std::unique_ptr<OperationContext> hint, const NeuronStream& stream);
+  // True when both dispatch_queue_ and stream->runtime_queue_ are empty for
+  // `stream`. Used by Synchronize / Query.
+  bool IsStreamDrained(const StreamImpl* stream) const;
 
  private:
   // Worker threads
@@ -74,12 +101,10 @@ class OperationExecutionEngine {
 
   // Concatenation infrastructure (only initialized if flag is enabled)
   std::unique_ptr<ConcatenationEngine> concatenation_engine_;
-  std::deque<OperationContext*> concatenation_queue_;
   std::condition_variable concatenation_cv_;
   bool concatenation_enabled_{false};
 
   std::deque<OperationContext*> compilation_queue_;
-
   mutable std::mutex runtime_mutex_;
 
   int completion_efd_{-1};
@@ -98,6 +123,11 @@ class OperationExecutionEngine {
   void ConcatenationWorker();
   void RuntimeWorker();
   bool CompileNextPending();
+
+  // Hand a single shared_ptr off to op->stream->runtime_queue_. Sets the
+  // cursor to the inserted op when the queue was empty. Takes the stream's
+  // runtime_queue_mutex_ internally.
+  void EmitToRuntimeQueue(std::shared_ptr<OperationContext> operation_context);
 
   // Async execution helpers
   bool HasPendingAsyncOperations() const { return pending_async_ops_count_.load() > 0; }
@@ -133,6 +163,29 @@ class OperationExecutionEngine {
   bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
   bool ScheduleAllocOperation(OperationContext* op, StreamImpl* stream);
 
+  // Move ops onto each target stream->runtime_queue_ in the order of
+  // `partitioned_raws`. `owners` maps each raw pointer to its shared_ptr;
+  // kHint entries are dropped instead of transferred.
+  void MoveToRuntimeQueueInOrder(
+      const std::list<OperationContext*>& partitioned_raws,
+      std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>>& owners);
+
+  // Test-only helpers. Routed through the engine's friendship with StreamImpl.
+  void TestInjectIntoRuntimeQueue(StreamImpl* stream, std::shared_ptr<OperationContext> op);
+  void TestClearRuntimeQueue(StreamImpl* stream);
+  size_t TestRuntimeQueueSize(const StreamImpl* stream) const;
+  bool TestRuntimeCursorAtEnd(const StreamImpl* stream) const;
+  bool TestRuntimeCursorAt(const StreamImpl* stream, const OperationContext* op) const;
+  bool TestSetRuntimeCursorTo(StreamImpl* stream, const OperationContext* op);
+  OperationContext* TestRuntimeQueueFront(const StreamImpl* stream) const;
+  std::vector<OperationContext*> TestRuntimeQueueSnapshot(const StreamImpl* stream) const;
+
+  // Global, mutable. ConcatenationWorker drains in submission order.
+  // Sole owner during dispatch stage — engine's operation_buffer_ holds raw
+  // pointer aliases into a contiguous prefix of this list.
+  std::list<std::shared_ptr<OperationContext>> dispatch_queue_;
+  mutable std::mutex dispatch_mutex_;
+
   std::atomic<int64_t> execution_queue_depth_{0};
 
   // Track pending async operations count to avoid expensive iteration
@@ -147,14 +200,6 @@ class OperationExecutionEngine {
 
   // Configurable max inflight per XU
   size_t max_inflight_per_xu_{kDefaultMaxInflightPerXU};
-
-  // Guards concatenation_queue_ and hint_ownership_map_.
-  mutable std::mutex concatenation_mutex_;
-
-  // Owns hint unique_ptrs while the ConcatenationEngine holds their raw pointers.
-  // Keyed by raw pointer so we can free the correct hint when it's emitted back
-  // (hints may be emitted out of insertion order due to buffering in the engine).
-  std::unordered_map<OperationContext*, std::unique_ptr<OperationContext>> hint_ownership_map_;
 };
 
 }  // namespace at::neuron
