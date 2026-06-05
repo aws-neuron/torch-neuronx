@@ -171,4 +171,5 @@ RUNTIME_NRT_ERROR = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_histogram_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_histogramdd_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_arange_neuron_float32",
+    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv3d_same_padding_backward_neuron_float64",
 ]

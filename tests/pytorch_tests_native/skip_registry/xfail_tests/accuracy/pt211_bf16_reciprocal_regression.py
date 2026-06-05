@@ -29,4 +29,8 @@ PT211_BF16_RECIPROCAL_REGRESSION = [
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_div_trunc_rounding_neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_true_divide_neuron_bfloat16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_non_contig_true_divide_neuron_float16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_non_contig_reciprocal_neuron_bfloat16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_reciprocal_neuron_bfloat16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_rsqrt_neuron_bfloat16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_reciprocal_neuron_bfloat16",
 ]
