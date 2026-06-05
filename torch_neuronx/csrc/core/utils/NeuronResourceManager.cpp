@@ -166,6 +166,13 @@ OperationExecutionEngine& NeuronResourceManager::GetOperationExecutionEngine() {
   return *operation_execution_engine_;
 }
 
+std::unique_ptr<OperationExecutionEngine> NeuronResourceManager::SetExecutionEngineForTesting(
+    std::unique_ptr<OperationExecutionEngine> engine) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::swap(operation_execution_engine_, engine);
+  return engine;
+}
+
 ResourceSemaphore& NeuronResourceManager::GetResourceSemaphore() {
   std::lock_guard<std::mutex> lock(mutex_);
   return *resource_semaphore_;

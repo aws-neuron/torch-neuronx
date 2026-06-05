@@ -6,6 +6,7 @@
 #include <climits>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
@@ -407,6 +408,8 @@ TEST_F(OperationExecutionEngineTest, ConcatenatedOpCompilationFailureFallsBackTo
 TEST_F(OperationExecutionEngineTest, FindOperationBySeqFindsConcatOpViaCascadingOps) {
   setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
 
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Create the concatenated operation with a specific sequence ID
@@ -443,9 +446,9 @@ TEST_F(OperationExecutionEngineTest, FindOperationBySeqFindsConcatOpViaCascading
   }
   concat_op_ptr->concatenation_state_raw_ = concat_state.get();
 
-  // Add ONLY cascading ops to active_operations_ (concat op is owned by concat_state)
+  // Add ONLY cascading ops to runtime_queue_ (concat op is owned by concat_state)
   for (auto& op : cascading_ops) {
-    stream->active_operations_.push_back(op);
+    engine.InjectIntoRuntimeQueue(stream.get(), op);
   }
 
   // Test: FindOperationBySeq should find the concat op via its cascading ops
@@ -460,9 +463,9 @@ TEST_F(OperationExecutionEngineTest, FindOperationBySeqFindsConcatOpViaCascading
   OperationContext* not_found = stream->FindOperationBySeq(999);
   EXPECT_EQ(not_found, nullptr) << "Should not find op with non-existent sequence ID";
 
-  // Clean up: clear active_operations_ before stream destructor calls Synchronize()
-  // (StreamImpl::~StreamImpl calls Synchronize which waits for active_operations_ to be empty)
-  stream->active_operations_.clear();
+  // Clean up: clear runtime_queue_ before stream destructor calls Synchronize()
+  // (StreamImpl::~StreamImpl calls Synchronize which waits for runtime_queue_ to be empty)
+  engine.ClearRuntimeQueue(stream.get());
   cascading_ops.clear();
   concat_state.reset();
 
@@ -517,9 +520,9 @@ TEST_F(OperationExecutionEngineTest, ProcessAsyncErrorsConcatenatedOpFailsAllCas
   }
   concat_op_ptr->concatenation_state_raw_ = concat_state.get();
 
-  // Add cascading ops to active_operations_
+  // Add cascading ops to runtime_queue_
   for (auto& op : cascading_ops) {
-    stream->active_operations_.push_back(op);
+    engine.InjectIntoRuntimeQueue(stream.get(), op);
   }
 
   // Set initial counters:
@@ -531,7 +534,7 @@ TEST_F(OperationExecutionEngineTest, ProcessAsyncErrorsConcatenatedOpFailsAllCas
   // Verify initial state
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
   EXPECT_EQ(engine.GetExecutionQueueDepth(), 3);
-  EXPECT_EQ(stream->active_operations_.size(), 3);
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 3);
 
   // Verify the concatenation state is properly set up for error handling
   EXPECT_EQ(concat_state->GetCascadingOperationsCount(), 3);
@@ -545,8 +548,8 @@ TEST_F(OperationExecutionEngineTest, ProcessAsyncErrorsConcatenatedOpFailsAllCas
     EXPECT_EQ(retrieved_cascading_ops[i], cascading_ops_raw[i]);
   }
 
-  // Clean up: clear active_operations_ before stream destructor calls Synchronize()
-  stream->active_operations_.clear();
+  // Clean up: clear runtime_queue_ before stream destructor calls Synchronize()
+  engine.ClearRuntimeQueue(stream.get());
   cascading_ops.clear();
   concat_state.reset();
 
@@ -675,32 +678,33 @@ TEST_F(OperationExecutionEngineTest, DecrementQueueDepthSkipsConcatenatedOps) {
 // Test that ProcessCompletions correctly uses seq watermark comparison:
 // ops with NRTA_SEQ_GET_SEQ_NUM(seq) <= NRTA_SEQ_GET_SEQ_NUM(watermark) are completed,
 // ops above the watermark are not.
+//
+// ScopedTestEngine swaps the mock in as the GLOBAL engine because
+// stream->CompleteOperation → engine.DecrementExecutionQueueDepth runs against
+// the global instance.
 TEST_F(OperationExecutionEngineTest, ProcessCompletionsUsesSeqWatermark) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  // Create 3 operations with increasing sequence IDs
+  // Submit 3 ops through the production concat-off path; then mark each as
+  // post-schedule with increasing sequence IDs so ProcessCompletions has
+  // something to compare against the watermark.
   std::vector<std::shared_ptr<OperationContext>> ops;
   for (int i = 0; i < 3; ++i) {
     auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
     ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
     auto op = std::make_shared<OperationContext>(std::move(kernel));
     op->stream = stream.get();
+    engine.SubmitOperation(op);
     op->nrt_async_state_.is_scheduled = true;
     op->nrt_async_state_.sequence_id = static_cast<nrta_seq_t>(i + 1);  // seq 1, 2, 3
     op->nrt_status_ = NRT_SUCCESS;
     ops.push_back(op);
   }
 
-  // Add all ops to active_operations_
-  for (auto& op : ops) {
-    stream->active_operations_.push_back(op);
-  }
-
-  // Set pending count
   engine.pending_async_ops_count_.store(3);
 
   // Create watermark: only seq 1 and 2 are completed
@@ -712,24 +716,23 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsUsesSeqWatermark) {
   // Process completions
   engine.ProcessCompletions(stream.get(), completed_seqs);
 
-  // Ops with seq 1 and 2 should be completed (removed from active_operations_)
+  // Ops with seq 1 and 2 should be completed (removed from runtime_queue_)
   // Op with seq 3 should still be pending
-  EXPECT_EQ(stream->active_operations_.size(), 1);
-  EXPECT_EQ(stream->active_operations_.front()->nrt_async_state_.sequence_id, 3u);
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 1);
+  EXPECT_EQ(engine.RuntimeQueueFront(stream.get())->nrt_async_state_.sequence_id, 3u);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
 
   // Clean up
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 // Test that ProcessCompletions stops at the first incomplete op (preserves ordering).
 // Even if a later op's seq is below the watermark, it won't be completed if a prior op isn't.
 TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -738,6 +741,7 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
   ON_CALL(*kernel1, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
   auto op1 = std::make_shared<OperationContext>(std::move(kernel1));
   op1->stream = stream.get();
+  engine.SubmitOperation(op1);
   op1->nrt_async_state_.is_scheduled = true;
   op1->nrt_async_state_.sequence_id = 5;
   op1->nrt_status_ = NRT_SUCCESS;
@@ -747,12 +751,11 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
   ON_CALL(*kernel2, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
   auto op2 = std::make_shared<OperationContext>(std::move(kernel2));
   op2->stream = stream.get();
+  engine.SubmitOperation(op2);
   op2->nrt_async_state_.is_scheduled = true;
   op2->nrt_async_state_.sequence_id = 1;
   op2->nrt_status_ = NRT_SUCCESS;
 
-  stream->active_operations_.push_back(op1);
-  stream->active_operations_.push_back(op2);
   engine.pending_async_ops_count_.store(2);
 
   // Watermark at seq 3 — op2 (seq 1) would pass, but op1 (seq 5) blocks it
@@ -764,20 +767,19 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
   engine.ProcessCompletions(stream.get(), completed_seqs);
 
   // Neither op should be completed — op1 blocks op2
-  EXPECT_EQ(stream->active_operations_.size(), 2);
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 2);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 2);
 
   // Clean up
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 // Test that pending_signal ops (events/hints) are completed without seq comparison.
 TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -788,10 +790,10 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
   auto op = std::make_shared<OperationContext>(std::move(kernel));
   op->stream = stream.get();
   op->stream_id = stream->stream_id;
+  engine.SubmitOperation(op);
   op->nrt_async_state_.is_pending_signal = true;
   op->nrt_async_state_.is_scheduled = false;
 
-  stream->active_operations_.push_back(op);
   engine.pending_async_ops_count_.store(1);
 
   // Empty watermark — doesn't matter for pending_signal ops
@@ -800,17 +802,15 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
   engine.ProcessCompletions(stream.get(), completed_seqs);
 
   // Pending signal op should be completed regardless of watermark
-  EXPECT_EQ(stream->active_operations_.size(), 0);
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 0);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
-
-  engine.Shutdown();
 }
 
 // Test that when watermark is 0 (no completions yet), no ops are completed.
 TEST_F(OperationExecutionEngineTest, ProcessCompletionsZeroWatermarkCompletesNothing) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -818,11 +818,11 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsZeroWatermarkCompletesNot
   ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
   auto op = std::make_shared<OperationContext>(std::move(kernel));
   op->stream = stream.get();
+  engine.SubmitOperation(op);
   op->nrt_async_state_.is_scheduled = true;
   op->nrt_async_state_.sequence_id = 1;
   op->nrt_status_ = NRT_SUCCESS;
 
-  stream->active_operations_.push_back(op);
   engine.pending_async_ops_count_.store(1);
 
   // Zero watermark — nothing completed
@@ -831,13 +831,12 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsZeroWatermarkCompletesNot
   engine.ProcessCompletions(stream.get(), completed_seqs);
 
   // Op should NOT be completed (seq 1 > watermark 0)
-  EXPECT_EQ(stream->active_operations_.size(), 1);
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 1);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
 
   // Clean up
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 // =============================================================================
@@ -886,9 +885,10 @@ TEST_F(OperationExecutionEngineTest, RecordHintSafeDuringShutdown) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
 }
 
-// Test that hints submitted via RecordHint do NOT enter active_operations_
-// This is the core invariant of the hint short-circuit design
-TEST_F(OperationExecutionEngineTest, RecordHintDoesNotEnterActiveOperations) {
+// Test that hints submitted via RecordHint do NOT enter the per-stream runtime
+// queue. Hints flow through dispatch_queue_, are consumed by the concatenation
+// engine, and dropped at transfer time — they never reach runtime_queue_.
+TEST_F(OperationExecutionEngineTest, RecordHintDoesNotEnterRuntimeQueue) {
   setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
 
   CompilationCache compilation_cache;
@@ -897,11 +897,7 @@ TEST_F(OperationExecutionEngineTest, RecordHintDoesNotEnterActiveOperations) {
 
   auto stream_impl = GetDefaultStreamImpl(0);  // default stream on device 0
 
-  // Check active_operations_ is empty
-  {
-    std::lock_guard<std::mutex> lock(stream_impl->active_operations_mutex_);
-    EXPECT_TRUE(stream_impl->active_operations_.empty());
-  }
+  EXPECT_EQ(engine.RuntimeQueueSize(stream_impl), 0u);
 
   // Submit multiple hints via RecordHint
   for (int i = 0; i < 5; ++i) {
@@ -917,12 +913,8 @@ TEST_F(OperationExecutionEngineTest, RecordHintDoesNotEnterActiveOperations) {
   // Give the concatenation worker a moment to process
   std::this_thread::sleep_for(50ms);
 
-  // active_operations_ should still be empty — hints never enter it
-  {
-    std::lock_guard<std::mutex> lock(stream_impl->active_operations_mutex_);
-    EXPECT_TRUE(stream_impl->active_operations_.empty())
-        << "Hints submitted via RecordHint must NOT appear in active_operations_";
-  }
+  EXPECT_EQ(engine.RuntimeQueueSize(stream_impl), 0u)
+      << "Hints submitted via RecordHint must NOT appear in runtime_queue_";
 
   engine.Shutdown();
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
@@ -1016,10 +1008,12 @@ TEST_F(OperationExecutionEngineTest, RecordHintDoesNotAccumulateOwnership) {
   // Give the worker time to process all hints
   std::this_thread::sleep_for(200ms);
 
-  // hint_ownership_map_ should be empty — each hint destroyed on consumption
+  // dispatch_queue_ should be empty — each hint destroyed on consumption (its
+  // shared_ptr is dropped during transfer-to-runtime since hints never make
+  // it to runtime_queue_).
   {
-    std::lock_guard<std::mutex> lock(engine.concatenation_mutex_);
-    EXPECT_EQ(engine.hint_ownership_map_.size(), 0)
+    std::lock_guard<std::mutex> lock(engine.dispatch_mutex_);
+    EXPECT_EQ(engine.dispatch_queue_.size(), 0u)
         << "Hints should be destroyed immediately after consumption, not accumulated";
   }
 
@@ -1045,70 +1039,65 @@ std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, int64_t record
   return op;
 }
 
-std::shared_ptr<OperationContext> PushPendingDeviceOp(StreamImpl* stream) {
+std::shared_ptr<OperationContext> PushPendingDeviceOp(
+    StreamImpl* stream, at::neuron::testing::MockOperationExecutionEngine& engine) {
   auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
   ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
   auto op = std::make_shared<OperationContext>(std::move(kernel));
   op->stream = stream;
   op->nrt_async_state_.is_scheduled = true;
   op->nrt_async_state_.sequence_id = 1;
-  stream->active_operations_.push_back(op);
+  engine.InjectIntoRuntimeQueue(stream, op);
   return op;
 }
 
 }  // namespace
 
 TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitSameStreamBypassesGuard) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
-  PushPendingDeviceOp(stream.get());
+  PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
   auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/stream->stream_id);
-  stream->active_operations_.push_back(kwait);
-  stream->next_to_schedule_ = std::prev(stream->active_operations_.end());
+  engine.InjectIntoRuntimeQueue(stream.get(), kwait);
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());
 
   EXPECT_TRUE(engine.ScheduleOperation(kwait.get(), stream.get()));
   EXPECT_TRUE(kwait->nrt_async_state_.is_pending_signal);
-  EXPECT_EQ(stream->next_to_schedule_, stream->active_operations_.end());
+  EXPECT_TRUE(engine.RuntimeCursorAtEnd(stream.get()));
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
-  PushPendingDeviceOp(stream.get());
+  PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
   auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/99);
-  stream->active_operations_.push_back(kwait);
-  auto kwait_iter = std::prev(stream->active_operations_.end());
-  stream->next_to_schedule_ = kwait_iter;
+  engine.InjectIntoRuntimeQueue(stream.get(), kwait);
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());
 
   EXPECT_FALSE(engine.ScheduleOperation(kwait.get(), stream.get()));
   EXPECT_FALSE(kwait->nrt_async_state_.is_pending_signal);
-  EXPECT_EQ(stream->next_to_schedule_, kwait_iter);
+  EXPECT_TRUE(engine.RuntimeCursorAt(stream.get(), kwait.get()));
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -1121,7 +1110,7 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {
   auto op = std::make_shared<OperationContext>(std::move(kernel));
   op->stream = stream.get();
   op->stream_id = stream->stream_id;
-  stream->active_operations_.push_back(op);
+  engine.InjectIntoRuntimeQueue(stream.get(), op);
 
   bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
 
@@ -1132,15 +1121,13 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
 
   // Cleanup: clear before stream dtor
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 TEST_F(OperationExecutionEngineTest, AllocScheduleDeferOnNrtResourceParksOp) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -1163,8 +1150,8 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleDeferOnNrtResourceParksOp) {
   prior_op->stream_id = stream->stream_id;
   prior_op->nrt_async_state_.is_scheduled = true;
   prior_op->nrt_async_state_.sequence_id = 1;
-  stream->active_operations_.push_back(prior_op);
-  stream->active_operations_.push_back(op);
+  engine.InjectIntoRuntimeQueue(stream.get(), prior_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), op);
 
   // First schedule -> defer.
   bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
@@ -1192,15 +1179,13 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleDeferOnNrtResourceParksOp) {
             AllocDirectKernelExecution::AllocState::RetryReady);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 1);
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 TEST_F(OperationExecutionEngineTest, AllocScheduleSecondNrtResourceEscalates) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -1222,8 +1207,8 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleSecondNrtResourceEscalates) {
   prior_op->stream_id = stream->stream_id;
   prior_op->nrt_async_state_.is_scheduled = true;
   prior_op->nrt_async_state_.sequence_id = 1;
-  stream->active_operations_.push_back(prior_op);
-  stream->active_operations_.push_back(op);
+  engine.InjectIntoRuntimeQueue(stream.get(), prior_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), op);
 
   // First schedule -> defer.
   bool scheduled = engine.ScheduleOperation(op.get(), stream.get());
@@ -1244,15 +1229,13 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleSecondNrtResourceEscalates) {
     EXPECT_EQ(e.GetNRTStatus(), NRT_RESOURCE);
   }
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
-  engine.Shutdown();
 }
 
 TEST_F(OperationExecutionEngineTest, AllocScheduleAloneOnStreamEscalates) {
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
@@ -1268,7 +1251,7 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleAloneOnStreamEscalates) {
   // Only the kAlloc itself on the stream. TryDeferAlloc sees no drainable
   // work and returns false → we escalate with the "no pending ops" reason
   // so AttemptOOMRecovery gets a chance at the allocator cache.
-  stream->active_operations_.push_back(op);
+  engine.InjectIntoRuntimeQueue(stream.get(), op);
 
   try {
     engine.ScheduleOperation(op.get(), stream.get());
@@ -1285,11 +1268,12 @@ TEST_F(OperationExecutionEngineTest, AllocScheduleAloneOnStreamEscalates) {
   EXPECT_FALSE(op->nrt_async_state_.is_pending_signal);
   EXPECT_EQ(engine.pending_async_ops_count_.load(), 0);
 
-  stream->active_operations_.clear();
-  engine.Shutdown();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, RemoveActiveOperationClearsAllocRetryPendingOnDrain) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Parked kAlloc op with AllocState::Deferred. Bypass TryDeferAlloc here, so
@@ -1310,8 +1294,8 @@ TEST_F(OperationExecutionEngineTest, RemoveActiveOperationClearsAllocRetryPendin
   prior_op->stream = stream.get();
   prior_op->stream_id = stream->stream_id;
 
-  stream->active_operations_.push_back(prior_op);
-  stream->active_operations_.push_back(alloc_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), prior_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), alloc_op);
 
   EXPECT_FALSE(alloc_op->IsSchedulable());
 
@@ -1322,10 +1306,12 @@ TEST_F(OperationExecutionEngineTest, RemoveActiveOperationClearsAllocRetryPendin
             AllocDirectKernelExecution::AllocState::RetryReady);
   EXPECT_TRUE(alloc_op->IsSchedulable());
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, GetNextOperationParksOnDeferredKAllocAtHead) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Deferred kAlloc at the head.
@@ -1344,18 +1330,20 @@ TEST_F(OperationExecutionEngineTest, GetNextOperationParksOnDeferredKAllocAtHead
   hlo_op->stream_id = stream->stream_id;
   hlo_op->MarkExecutionReady();
 
-  stream->active_operations_.push_back(deferred_alloc);
-  stream->active_operations_.push_back(hlo_op);
-  stream->next_to_schedule_ = stream->active_operations_.begin();
+  engine.InjectIntoRuntimeQueue(stream.get(), deferred_alloc);
+  engine.InjectIntoRuntimeQueue(stream.get(), hlo_op);
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), deferred_alloc.get()));
 
   EXPECT_EQ(stream->GetNextOperationToSchedule(), nullptr);
-  // next_to_schedule_ stays on the Deferred kAlloc — it does not advance.
-  EXPECT_EQ(stream->next_to_schedule_->get(), deferred_alloc.get());
+  // Cursor stays on the Deferred kAlloc — it does not advance.
+  EXPECT_TRUE(engine.RuntimeCursorAt(stream.get(), deferred_alloc.get()));
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, GetNextOperationDoesNotSkipNonDeferredBlocker) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Non-schedulable, non-Deferred op at the head (kHLO with execution_ready=false).
@@ -1374,22 +1362,24 @@ TEST_F(OperationExecutionEngineTest, GetNextOperationDoesNotSkipNonDeferredBlock
   back_op->stream_id = stream->stream_id;
   back_op->MarkExecutionReady();
 
-  stream->active_operations_.push_back(head_op);
-  stream->active_operations_.push_back(back_op);
-  stream->next_to_schedule_ = stream->active_operations_.begin();
+  engine.InjectIntoRuntimeQueue(stream.get(), head_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), back_op);
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), head_op.get()));
 
   // Scheduler must return nullptr (head is a real blocker); back_op must not
   // be hoisted past the head.
   EXPECT_EQ(stream->GetNextOperationToSchedule(), nullptr);
-  EXPECT_EQ(stream->next_to_schedule_->get(), head_op.get());
+  EXPECT_TRUE(engine.RuntimeCursorAt(stream.get(), head_op.get()));
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, AdvanceToNextOperationIsIdempotent) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  // Two ops; next_to_schedule_ at the first.
+  // Two ops; runtime cursor at the first.
   auto op1_kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
   ON_CALL(*op1_kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
   auto op1 = std::make_shared<OperationContext>(std::move(op1_kernel));
@@ -1402,24 +1392,23 @@ TEST_F(OperationExecutionEngineTest, AdvanceToNextOperationIsIdempotent) {
   op2->stream = stream.get();
   op2->stream_id = stream->stream_id;
 
-  stream->active_operations_.push_back(op1);
-  stream->active_operations_.push_back(op2);
-  stream->next_to_schedule_ = stream->active_operations_.begin();
+  engine.InjectIntoRuntimeQueue(stream.get(), op1);
+  engine.InjectIntoRuntimeQueue(stream.get(), op2);
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), op1.get()));
 
   stream->RemoveActiveOperation(op1.get());
-  ASSERT_EQ(stream->next_to_schedule_->get(), op2.get());
+  ASSERT_TRUE(engine.RuntimeCursorAt(stream.get(), op2.get()));
 
-  stream->AdvanceToNextOperation(op1.get());
-  EXPECT_EQ(stream->next_to_schedule_->get(), op2.get());
+  // Re-advancing without a fresh op shouldn't mis-step the cursor.
+  stream->AdvanceToNextOperation();
+  EXPECT_TRUE(engine.RuntimeCursorAtEnd(stream.get()));
 
-  // Legacy nullptr form does an unconditional advance.
-  stream->AdvanceToNextOperation(nullptr);
-  EXPECT_EQ(stream->next_to_schedule_, stream->active_operations_.end());
-
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsTrueWhenDrainableWorkExists) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Scheduled op that hasn't completed yet.
@@ -1438,17 +1427,19 @@ TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsTrueWhenDrainableWorkEx
   ASSERT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
             AllocDirectKernelExecution::AllocState::Fresh);
 
-  stream->active_operations_.push_back(inflight_op);
-  stream->active_operations_.push_back(alloc_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), inflight_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), alloc_op);
 
   EXPECT_TRUE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
   EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
             AllocDirectKernelExecution::AllocState::Deferred);
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsFalseWhenStreamDrained) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
@@ -1456,17 +1447,19 @@ TEST_F(OperationExecutionEngineTest, TryDeferAllocReturnsFalseWhenStreamDrained)
   alloc_op->stream = stream.get();
   alloc_op->stream_id = stream->stream_id;
 
-  stream->active_operations_.push_back(alloc_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), alloc_op);
 
   EXPECT_FALSE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
   EXPECT_EQ(alloc_op->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
             AllocDirectKernelExecution::AllocState::Fresh)
       << "TryDeferAlloc must not mutate state on the no-defer path";
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarliest) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Three Deferred kAllocs in order, then a single in-flight op that keeps
@@ -1494,17 +1487,16 @@ TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarlie
   inflight->stream_id = stream->stream_id;
   inflight->nrt_async_state_.is_scheduled = true;
 
-  stream->active_operations_.push_back(a);
-  stream->active_operations_.push_back(b);
-  stream->active_operations_.push_back(c);
-  stream->active_operations_.push_back(inflight);
+  engine.InjectIntoRuntimeQueue(stream.get(), a);
+  engine.InjectIntoRuntimeQueue(stream.get(), b);
+  engine.InjectIntoRuntimeQueue(stream.get(), c);
+  engine.InjectIntoRuntimeQueue(stream.get(), inflight);
   // Simulate scheduler having scanned past all three Deferred kAllocs to
-  // reach `inflight` on a previous pass — next_to_schedule_ is now past
-  // them.
-  stream->next_to_schedule_ = std::next(stream->active_operations_.begin(), 3);
+  // reach `inflight` on a previous pass — cursor is now on `inflight`.
+  ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), inflight.get()));
 
   // Drain: remove the inflight op. All three Deferred kAllocs flip to
-  // RetryReady, and next_to_schedule_ rewinds to `a`.
+  // RetryReady, and the cursor rewinds to `a`.
   stream->RemoveActiveOperation(inflight.get());
 
   EXPECT_EQ(a->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
@@ -1513,14 +1505,15 @@ TEST_F(OperationExecutionEngineTest, MultipleDeferredKAllocsDrainRewindsToEarlie
             AllocDirectKernelExecution::AllocState::RetryReady);
   EXPECT_EQ(c->GetKernel<KernelTypeEnum::kAlloc>().GetAllocState(),
             AllocDirectKernelExecution::AllocState::RetryReady);
-  ASSERT_NE(stream->next_to_schedule_, stream->active_operations_.end());
-  EXPECT_EQ(stream->next_to_schedule_->get(), a.get())
+  EXPECT_TRUE(engine.RuntimeCursorAt(stream.get(), a.get()))
       << "rewind should land on the earliest RetryReady kAlloc, not a later one";
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, DeferredAllocCountStaysZeroInSteadyState) {
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // A scheduled kHLO op being completed.
@@ -1530,8 +1523,7 @@ TEST_F(OperationExecutionEngineTest, DeferredAllocCountStaysZeroInSteadyState) {
   op->stream = stream.get();
   op->stream_id = stream->stream_id;
   op->nrt_async_state_.is_scheduled = true;
-  stream->active_operations_.push_back(op);
-  stream->next_to_schedule_ = stream->active_operations_.end();
+  engine.InjectIntoRuntimeQueue(stream.get(), op);
 
   EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
 
@@ -1544,6 +1536,8 @@ TEST_F(OperationExecutionEngineTest, DeferredAllocCountStaysZeroInSteadyState) {
 TEST_F(OperationExecutionEngineTest, DeferredAllocCountTracksTryDeferAndDrain) {
   // TryDeferAlloc must increment; ReleaseDeferredAllocGates flip-out must
   // decrement; counter returns to 0 after a full park-then-drain cycle.
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   // Prior scheduled op so TryDeferAlloc sees drainable work.
@@ -1561,8 +1555,8 @@ TEST_F(OperationExecutionEngineTest, DeferredAllocCountTracksTryDeferAndDrain) {
   alloc_op->stream_id = stream->stream_id;
   alloc_op->MarkExecutionReady();
 
-  stream->active_operations_.push_back(prior_op);
-  stream->active_operations_.push_back(alloc_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), prior_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), alloc_op);
 
   EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
 
@@ -1583,93 +1577,106 @@ TEST_F(OperationExecutionEngineTest, DeferredAllocCountTracksTryDeferAndDrain) {
   EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0)
       << "second RemoveActiveOperation must not underflow the counter";
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
 TEST_F(OperationExecutionEngineTest, DeferredAllocCountUnchangedWhenTryDeferFails) {
   // TryDeferAlloc must NOT increment the counter when it returns false
   // (no drainable work). State stays Fresh, counter stays 0.
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
   auto alloc_kernel = std::make_unique<at::neuron::testing::MockAllocDirectKernelExecution>();
   auto alloc_op = std::make_shared<OperationContext>(std::move(alloc_kernel));
   alloc_op->stream = stream.get();
   alloc_op->stream_id = stream->stream_id;
-  stream->active_operations_.push_back(alloc_op);
+  engine.InjectIntoRuntimeQueue(stream.get(), alloc_op);
 
   EXPECT_FALSE(stream->TryDeferAlloc(alloc_op->GetKernel<KernelTypeEnum::kAlloc>()));
   EXPECT_EQ(stream->deferred_alloc_count_.load(std::memory_order_relaxed), 0);
 
-  stream->active_operations_.clear();
+  engine.ClearRuntimeQueue(stream.get());
 }
 
-// ============================================================================
-// Integration: ConcatenationEngine reorder against a real StreamImpl.
-//   pre:       [matmul, A_X, H1, A_Y, H2, D_X]
-//   partition: allocs={A_X,A_Y}, compute={H1,H2}, deallocs={D_X}
-//   post:      [matmul, A_X, A_Y, H1, H2, D_X]
-// ============================================================================
-namespace {
-OperationContext* MakeOpForReorder(StreamImpl* stream, KernelTypeEnum kt, const std::string& name) {
-  auto kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(name);
-  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(kt));
-  ON_CALL(*kernel, RequiresCompilation()).WillByDefault(Return(false));
-  ON_CALL(*kernel, RequiresPrepare()).WillByDefault(Return(false));
-  ON_CALL(*kernel, ValidateImpl()).WillByDefault(Return(true));
-  auto* op = new OperationContext(std::move(kernel));
-  op->stream = stream;
-  return op;
-}
+// =============================================================================
+// MoveToRuntimeQueueInOrder mechanics.
+//
+// Drives a known interleaved partition (allocs + computes + deallocs + a hint)
+// through an owners map, calls MoveToRuntimeQueueInOrder directly with the
+// reordered raw-pointer list, and asserts:
+//   1) stream->runtime_queue_ ends up exactly in the partition order given.
+//   2) The hint's OperationContext is destroyed at the move boundary.
+//   3) The owners map is empty afterward.
+// =============================================================================
+TEST_F(OperationExecutionEngineTest, MoveToRuntimeQueueInOrderCommitsPartitionAndDropsHint) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
 
-void PushBackForReorder(StreamImpl* stream, OperationContext* op) {
-  std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
-  bool was_empty = (stream->next_to_schedule_ == stream->active_operations_.end());
-  stream->active_operations_.emplace_back(std::shared_ptr<OperationContext>(op));
-  if (was_empty) {
-    stream->next_to_schedule_ = std::prev(stream->active_operations_.end());
-  }
-}
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
 
-std::vector<OperationContext*> ActiveOpsRaw(const StreamImpl* stream) {
-  std::vector<OperationContext*> out;
-  for (const auto& sp : stream->active_operations_) out.push_back(sp.get());
-  return out;
-}
-}  // namespace
-
-TEST_F(OperationExecutionEngineTest, ConcatenationReorderHonoursDeallocLifetimeOnStream) {
-  ConcatenationEngine concat_engine;
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  auto* matmul = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "matmul");
-  auto* a_x = MakeOpForReorder(stream.get(), KernelTypeEnum::kAlloc, "A_X");
-  auto* h1 = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "H1");
-  auto* a_y = MakeOpForReorder(stream.get(), KernelTypeEnum::kAlloc, "A_Y");
-  auto* h2 = MakeOpForReorder(stream.get(), KernelTypeEnum::kHLO, "H2");
-  auto* d_x = MakeOpForReorder(stream.get(), KernelTypeEnum::kDealloc, "D_X");
+  auto make_op = [&](KernelTypeEnum kt) {
+    auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+    ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(kt));
+    auto op = std::make_shared<OperationContext>(std::move(kernel));
+    op->stream = stream.get();
+    return op;
+  };
 
-  PushBackForReorder(stream.get(), matmul);
-  PushBackForReorder(stream.get(), a_x);
-  PushBackForReorder(stream.get(), h1);
-  PushBackForReorder(stream.get(), a_y);
-  PushBackForReorder(stream.get(), h2);
-  PushBackForReorder(stream.get(), d_x);
+  // Build an interleaved submission: alloc, hlo, hint, alloc, hlo, dealloc.
+  auto a1 = make_op(KernelTypeEnum::kAlloc);
+  auto h1 = make_op(KernelTypeEnum::kHLO);
+  auto hint = make_op(KernelTypeEnum::kHint);
+  auto a2 = make_op(KernelTypeEnum::kAlloc);
+  auto h2 = make_op(KernelTypeEnum::kHLO);
+  auto d1 = make_op(KernelTypeEnum::kDealloc);
 
-  // matmul is outside the partition — fusion-region anchor that stays put.
-  concat_engine.ApplyFlushReorderToStream(stream.get(), {a_x, a_y}, {h1, h2}, {d_x});
+  std::weak_ptr<OperationContext> hint_observer = hint;
+  OperationContext* hint_raw = hint.get();
 
-  auto order = ActiveOpsRaw(stream.get());
-  ASSERT_EQ(order.size(), 6u);
-  EXPECT_EQ(order[0], matmul);
-  EXPECT_EQ(order[1], a_x);
-  EXPECT_EQ(order[2], a_y);
-  EXPECT_EQ(order[3], h1);
-  EXPECT_EQ(order[4], h2);
-  EXPECT_EQ(order[5], d_x);
+  // Build the owners map (raw → shared_ptr) — this is what the worker hands
+  // to MoveToRuntimeQueueInOrder after draining dispatch_queue_.
+  std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>> owners;
+  owners.emplace(a1.get(), a1);
+  owners.emplace(h1.get(), h1);
+  owners.emplace(hint_raw, std::move(hint));
+  owners.emplace(a2.get(), a2);
+  owners.emplace(h2.get(), h2);
+  owners.emplace(d1.get(), d1);
 
-  // Clear so ~StreamImpl's Synchronize() doesn't block.
-  stream->active_operations_.clear();
-  stream->next_to_schedule_ = stream->active_operations_.end();
+  // The local `hint` shared_ptr was moved into owners, so dropping any other
+  // refs leaves owners as the sole holder of the hint. The weak_ptr observer
+  // must still be alive — ownership has not moved out of the map yet.
+  ASSERT_FALSE(hint_observer.expired());
+
+  // Reordered output as ConcatenationEngine would produce: allocs first,
+  // computes, then deallocs, with the hint mixed in (typical post-flush shape).
+  std::list<OperationContext*> partitioned_raws = {a1.get(), a2.get(), hint_raw,
+                                                   h1.get(), h2.get(), d1.get()};
+
+  engine.MoveToRuntimeQueueInOrder(partitioned_raws, owners);
+
+  // 1) Runtime queue holds the non-hint ops in partition order.
+  auto snapshot = engine.RuntimeQueueSnapshot(stream.get());
+  ASSERT_EQ(snapshot.size(), 5u);
+  EXPECT_EQ(snapshot[0], a1.get());
+  EXPECT_EQ(snapshot[1], a2.get());
+  EXPECT_EQ(snapshot[2], h1.get());
+  EXPECT_EQ(snapshot[3], h2.get());
+  EXPECT_EQ(snapshot[4], d1.get());
+
+  // 2) The hint's OperationContext is destroyed: owners erased its entry,
+  //    and no one else held a shared_ptr to it.
+  EXPECT_TRUE(hint_observer.expired()) << "Hint shared_ptr should be released at the move boundary";
+
+  // 3) Owners map is drained.
+  EXPECT_TRUE(owners.empty());
+
+  engine.ClearRuntimeQueue(stream.get());
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
 }
 
 int main(int argc, char** argv) {

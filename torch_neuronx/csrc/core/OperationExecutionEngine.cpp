@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
@@ -129,12 +130,6 @@ void OperationExecutionEngine::Shutdown() {
   if (completion_efd_ >= 0) {
     ::close(completion_efd_);
     completion_efd_ = -1;
-  }
-
-  // Clean up any remaining hint ownership
-  {
-    std::lock_guard<std::mutex> lock(concatenation_mutex_);
-    hint_ownership_map_.clear();
   }
 
   TORCH_NEURONX_DEBUG("OperationExecutionEngine shutdown complete");
@@ -318,15 +313,17 @@ void OperationExecutionEngine::RuntimeWorker() {
 }
 
 void OperationExecutionEngine::RegisterCompletionEvents() {
-  // Register eventfd on the front-of-queue scheduled operation per stream.
+  // Register eventfd on the front-of-queue scheduled op per stream. The
+  // inflight FIFO is the engine's per-stream runtime_queue_.
   auto devices = c10_neuron::get_visible_device_indices();
   for (auto device : devices) {
     ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
       if (!stream_impl->HasPendingAsyncOperations()) {
         return false;
       }
-      std::lock_guard<std::mutex> lock(stream_impl->active_operations_mutex_);
-      for (auto& op_ptr : stream_impl->active_operations_) {
+      std::lock_guard<std::mutex> qlock(stream_impl->runtime_queue_mutex_);
+      for (auto& operation_context : stream_impl->runtime_queue_) {
+        OperationContext* op_ptr = operation_context.get();
         if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
           auto* concat_op = op_ptr->GetConcatenatedOperation();
           if (concat_op->nrt_async_state_.is_scheduled) {
@@ -339,9 +336,9 @@ void OperationExecutionEngine::RegisterCompletionEvents() {
           break;
         }
         if (op_ptr->nrt_async_state_.is_pending_signal) {
-          continue;
+          continue;  // skip this op, continue walking
         }
-        break;
+        break;  // not scheduled / pending — stop
       }
       return false;
     });
@@ -367,23 +364,38 @@ void OperationExecutionEngine::WriteEventfd() {
   }
 }
 
-void OperationExecutionEngine::SubmitOperation(OperationContext* operation) {
+void OperationExecutionEngine::SubmitOperation(
+    std::shared_ptr<OperationContext> operation_context) {
   if (shutdown_requested_.load()) {
     TORCH_NEURONX_DEBUG("Rejecting operation submission during shutdown",
-                        "op=", operation->GetOpName());
+                        "op=", operation_context->GetOpName());
+    return;
+  }
+  EXECUTION_RUNTIME_CHECK(
+      operation_context->stream != nullptr,
+      "SubmitOperation: operation has null stream, op_name=", operation_context->GetOpName());
+
+  if (concatenation_enabled_) {
+    // Concat-ON: park on dispatch_queue_; ConcatenationWorker reorders the
+    // buffered window and transfers a partitioned prefix into
+    // stream->runtime_queue_ at flush.
+    {
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      dispatch_queue_.push_back(std::move(operation_context));
+    }
+    concatenation_cv_.notify_one();
     return;
   }
 
-  if (concatenation_enabled_) {
-    // Route through concatenation queue
-    {
-      std::lock_guard<std::mutex> lock(concatenation_mutex_);
-      concatenation_queue_.push_back(operation);
-    }
-    concatenation_cv_.notify_one();
+  // Concat-OFF fast path: shared_ptr lands directly in stream->runtime_queue_.
+  OperationContext* op_ptr = operation_context.get();
+  EmitToRuntimeQueue(std::move(operation_context));
+
+  if (op_ptr->RequiresCompilation()) {
+    SubmitCompilationTask(op_ptr);
   } else {
-    // Route directly to compilation queue
-    SubmitCompilationTask(operation);
+    op_ptr->MarkExecutionReady();
+    NotifyExecutionReady();
   }
 }
 
@@ -394,16 +406,11 @@ void OperationExecutionEngine::RecordHint(std::unique_ptr<OperationContext> hint
 
   // Hints need a valid StreamImpl* for the concatenation engine's stream-change detection.
   hint->stream = GetDefaultStreamImpl(stream.device_index());
-  OperationContext* raw_ptr = hint.get();
 
+  std::shared_ptr<OperationContext> shared = std::move(hint);
   {
-    std::lock_guard<std::mutex> lock(concatenation_mutex_);
-    auto [it, inserted] = hint_ownership_map_.try_emplace(raw_ptr, std::move(hint));
-    if (!inserted) {
-      throw std::runtime_error(
-          "RecordHint: Duplicate hint pointer detected — indicates double-insertion bug");
-    }
-    concatenation_queue_.push_back(raw_ptr);  // for concat engine processing
+    std::lock_guard<std::mutex> lock(dispatch_mutex_);
+    dispatch_queue_.push_back(std::move(shared));
   }
   concatenation_cv_.notify_one();
 }
@@ -422,11 +429,110 @@ void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation
   WriteEventfd();
 }
 
+void OperationExecutionEngine::EmitToRuntimeQueue(
+    std::shared_ptr<OperationContext> operation_context) {
+  StreamImpl* stream = operation_context->stream;
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  bool was_empty = (stream->next_to_schedule_ == stream->runtime_queue_.end());
+  stream->runtime_queue_.push_back(std::move(operation_context));
+  if (was_empty) {
+    stream->next_to_schedule_ = std::prev(stream->runtime_queue_.end());
+  }
+}
+
+void OperationExecutionEngine::MoveToRuntimeQueueInOrder(
+    const std::list<OperationContext*>& partitioned_raws,
+    std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>>& owners) {
+  for (OperationContext* raw : partitioned_raws) {
+    auto it = owners.find(raw);
+    EXECUTION_RUNTIME_CHECK(
+        it != owners.end(),
+        "MoveToRuntimeQueueInOrder: op missing from owners map. op_name=", raw->GetOpName());
+    if (raw->GetKernelType() == KernelTypeEnum::kHint) {
+      // Hints don't enter runtime_queue_; releasing the shared_ptr destroys the op.
+      owners.erase(it);
+      continue;
+    }
+    EmitToRuntimeQueue(std::move(it->second));
+    owners.erase(it);
+  }
+}
+
+void OperationExecutionEngine::TestInjectIntoRuntimeQueue(StreamImpl* stream,
+                                                          std::shared_ptr<OperationContext> op) {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  bool was_empty = (stream->next_to_schedule_ == stream->runtime_queue_.end());
+  stream->runtime_queue_.push_back(std::move(op));
+  if (was_empty) {
+    stream->next_to_schedule_ = std::prev(stream->runtime_queue_.end());
+  }
+}
+
+void OperationExecutionEngine::TestClearRuntimeQueue(StreamImpl* stream) {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  stream->runtime_queue_.clear();
+  stream->next_to_schedule_ = stream->runtime_queue_.end();
+}
+
+size_t OperationExecutionEngine::TestRuntimeQueueSize(const StreamImpl* stream) const {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  return stream->runtime_queue_.size();
+}
+
+bool OperationExecutionEngine::TestRuntimeCursorAtEnd(const StreamImpl* stream) const {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  return stream->next_to_schedule_ == stream->runtime_queue_.end();
+}
+
+bool OperationExecutionEngine::TestRuntimeCursorAt(const StreamImpl* stream,
+                                                   const OperationContext* op) const {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  if (stream->next_to_schedule_ == stream->runtime_queue_.end()) return false;
+  return stream->next_to_schedule_->get() == op;
+}
+
+bool OperationExecutionEngine::TestSetRuntimeCursorTo(StreamImpl* stream,
+                                                      const OperationContext* op) {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  auto qit = std::find_if(stream->runtime_queue_.begin(), stream->runtime_queue_.end(),
+                          [op](const auto& p) { return p.get() == op; });
+  if (qit == stream->runtime_queue_.end()) return false;
+  stream->next_to_schedule_ = qit;
+  return true;
+}
+
+OperationContext* OperationExecutionEngine::TestRuntimeQueueFront(const StreamImpl* stream) const {
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  return stream->runtime_queue_.empty() ? nullptr : stream->runtime_queue_.front().get();
+}
+
+std::vector<OperationContext*> OperationExecutionEngine::TestRuntimeQueueSnapshot(
+    const StreamImpl* stream) const {
+  std::vector<OperationContext*> out;
+  std::lock_guard<std::mutex> lock(stream->runtime_queue_mutex_);
+  for (auto& sp : stream->runtime_queue_) out.push_back(sp.get());
+  return out;
+}
+
+bool OperationExecutionEngine::IsStreamDrained(const StreamImpl* stream) const {
+  // drain_and_move holds dispatch_mutex_ across the pop + push, so the op is
+  // visible in exactly one of these two scans.
+  {
+    std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+    for (const auto& op : dispatch_queue_) {
+      if (op->stream == stream) return false;
+    }
+  }
+  std::lock_guard<std::mutex> slock(stream->runtime_queue_mutex_);
+  return stream->runtime_queue_.empty();
+}
+
 void OperationExecutionEngine::ConcatenationWorker() {
   TORCH_NEURONX_DEBUG("Concatenation worker thread started");
 
-  // Helper lambda to submit an operation to the next stage (compilation)
-  auto submitToNextStage = [this](OperationContext* op) {
+  // op's shared_ptr lives in stream->runtime_queue_ for the duration of this
+  // call; RuntimeWorker won't schedule it until MarkExecutionReady() below.
+  auto submit_compile_or_ready = [this](OperationContext* op) {
     if (IsDeviceKernelType(op->GetKernelType())) {
       execution_queue_depth_.fetch_add(1);
     }
@@ -438,138 +544,177 @@ void OperationExecutionEngine::ConcatenationWorker() {
     }
   };
 
+  // Drain `count` shared_ptrs off the front of dispatch_queue_ and move them
+  // onto each owner's stream->runtime_queue_ in `partitioned_raws` order.
+  // dispatch_mutex_ is held across both halves so IsStreamDrained's two-phase
+  // scan stays atomic.
+  auto drain_and_move = [this](size_t count, const std::list<OperationContext*>& partitioned_raws) {
+    if (count == 0) return;
+    std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>> owners;
+    owners.reserve(count);
+    std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+    for (size_t i = 0; i < count && !dispatch_queue_.empty(); ++i) {
+      auto sp = std::move(dispatch_queue_.front());
+      dispatch_queue_.pop_front();
+      OperationContext* raw = sp.get();
+      owners.emplace(raw, std::move(sp));
+    }
+    MoveToRuntimeQueueInOrder(partitioned_raws, owners);
+  };
+
   while (true) {
-    OperationContext* operation = nullptr;
-    std::list<OperationContext*> operations_to_compile;
+    // result_raws collects the partitioned, ready-to-commit raw pointers
+    // returned by ConcatenationEngine for this iteration.
+    std::list<OperationContext*> result_raws;
+    OperationContext* new_op = nullptr;
     bool needs_flush = false;
     bool shutdown = false;
 
-    // ========================================================================
-    // CRITICAL SECTION: Wait and pop from queue
-    // ========================================================================
+    // Wait for new work or flush trigger; identify the next not-yet-buffered
+    // op (if any) at the head of the unconsumed suffix.
     {
-      std::unique_lock<std::mutex> lock(concatenation_mutex_);
+      std::unique_lock<std::mutex> lock(dispatch_mutex_);
 
-      // Wait for: new operation, low queue depth with buffered ops, or shutdown.
       concatenation_cv_.wait(lock, [this] {
-        return !concatenation_queue_.empty() ||
-               (execution_queue_depth_.load() <= queue_low_threshold_ &&
-                concatenation_engine_->GetBufferedOperationsCount() > 0) ||
+        // Wake when:
+        //  1) dispatch_queue_ holds at least one not-yet-buffered op; OR
+        //  2) the engine has buffered ops and queue depth dropped low; OR
+        //  3) shutdown was requested.
+        size_t buffered = concatenation_engine_->GetBufferedOperationsCount();
+        bool has_new = dispatch_queue_.size() > buffered;
+        bool low_depth_with_buffer =
+            (execution_queue_depth_.load() <= queue_low_threshold_) && (buffered > 0);
+        return has_new || low_depth_with_buffer ||
                shutdown_requested_.load(std::memory_order_acquire);
       });
 
       shutdown = shutdown_requested_.load(std::memory_order_acquire);
 
-      // Check shutdown condition - only exit if queue is empty
-      if (shutdown && concatenation_queue_.empty()) {
-        // Flush any remaining buffered operations before exiting
-        break;
+      // Identify the next not-yet-buffered op without removing it: it lives
+      // at offset == buffered_count() into dispatch_queue_.
+      size_t buffered = concatenation_engine_->GetBufferedOperationsCount();
+      if (dispatch_queue_.size() > buffered) {
+        auto it = std::next(dispatch_queue_.begin(), buffered);
+        new_op = it->get();
       }
 
-      // Check if we need to flush (queue depth below threshold or shutdown)
       needs_flush = (execution_queue_depth_.load() <= queue_low_threshold_) || shutdown;
 
-      // Pop operation from queue if available
-      // During flush/shutdown: pop to include in flush
-      // During normal operation: pop for concatenation processing
-      if (!concatenation_queue_.empty()) {
-        operation = concatenation_queue_.front();
-        concatenation_queue_.pop_front();
+      if (shutdown && new_op == nullptr && buffered == 0) {
+        // Nothing to drain and no new ops — exit.
+        break;
       }
     }
-    // Lock released here - all queue operations complete
-
-    // ========================================================================
-    // Handle flush (low queue depth or shutdown)
-    // ========================================================================
+    // Run flush + concat-engine processing outside dispatch_mutex_. The
+    // engine's internal buffer is raw-pointer aliases into dispatch_queue_;
+    // the worker is the sole consumer, so prefix pointers stay stable while
+    // this thread doesn't mutate the queue.
     int64_t current_depth = execution_queue_depth_.load();
+
     if (needs_flush) {
-      // Flush ALL buffered operations without concatenation
-      operations_to_compile = concatenation_engine_->Flush(SIZE_MAX);
-      if (operations_to_compile.size() > 0) {
+      auto flushed = concatenation_engine_->Flush(SIZE_MAX);
+      if (!flushed.empty()) {
         TORCH_NEURONX_DEBUG("[CONCATENATION_WORKER] Flush triggered",
                             "reason=", shutdown ? "shutdown" : "low_queue_depth",
                             "current_depth=", current_depth, "threshold=", queue_low_threshold_,
-                            "flushed_count=", operations_to_compile.size());
+                            "flushed_count=", flushed.size());
       }
+      result_raws.splice(result_raws.end(), flushed);
     }
 
-    if (operation) {
-      // ========================================================================
-      // Normal operation processing (not flushing)
-      // ========================================================================
+    bool error_path = false;
+    std::shared_ptr<OperationContext> failed_owner;
+    std::string failed_what;
 
-      // Validate operation integrity before processing
-      EXECUTION_RUNTIME_CHECK(operation->kernel_execution != nullptr,
-                              "[CONCATENATION_WORKER] Operation has null kernel_execution, "
-                              "this indicates memory corruption or use-after-free");
-      EXECUTION_RUNTIME_CHECK(operation->stream != nullptr,
-                              "[CONCATENATION_WORKER] Operation has null stream field, "
-                              "op_name=",
-                              operation->GetOpName(),
-                              " kernel_type=", static_cast<int>(operation->GetKernelType()));
+    if (new_op != nullptr) {
+      EXECUTION_RUNTIME_CHECK(new_op->kernel_execution != nullptr,
+                              "[CONCATENATION_WORKER] Operation has null kernel_execution");
+      EXECUTION_RUNTIME_CHECK(
+          new_op->stream != nullptr,
+          "[CONCATENATION_WORKER] Operation has null stream field, op_name=", new_op->GetOpName(),
+          " kernel_type=", static_cast<int>(new_op->GetKernelType()));
 
-      TORCH_NEURONX_DEBUG(
-          "[CONCAT_WORKER] Processing task", "stream_id=", operation->stream->stream_id,
-          "op_name=", operation->GetOpName(), "pytorch_seq_nr=", operation->pytorch_sequence_nr);
+      TORCH_NEURONX_DEBUG("[CONCATENATION_WORKER] Processing task",
+                          "stream_id=", new_op->stream->stream_id, "op_name=", new_op->GetOpName(),
+                          "pytorch_seq_nr=", new_op->pytorch_sequence_nr);
 
-      // Process preprocessing task and concatenation with exception handling
       try {
-        ProcessPreprocessingTask(operation);
-        // If we have an operation from the queue, add it directly (no concatenation during low
-        // queue depth)
-        if (operations_to_compile.size() + current_depth <= queue_low_threshold_) {
-          operation->CompleteConcatenation();
-          operations_to_compile.push_back(operation);
+        ProcessPreprocessingTask(new_op);
+        if (result_raws.size() + current_depth <= static_cast<size_t>(queue_low_threshold_)) {
+          // Skip concatenation when total queue depth is low — keep the
+          // device fed.
+          new_op->CompleteConcatenation();
+          result_raws.push_back(new_op);
         } else {
-          // Process the operation through concatenation engine
-          // Use splice to APPEND to existing flushed operations (don't overwrite!)
-          auto concat_ops = concatenation_engine_->ProcessConcatenationTask(operation);
-          operations_to_compile.splice(operations_to_compile.end(), concat_ops);
+          auto concat_ops = concatenation_engine_->ProcessConcatenationTask(new_op);
+          result_raws.splice(result_raws.end(), concat_ops);
         }
       } catch (const std::exception& e) {
-        // Exception during preprocessing - handle error and flush
         TORCH_NEURONX_ERROR("[CONCATENATION_WORKER] Exception during preprocessing",
                             "error=", e.what());
-        operation->stream->HandleErrorWithCleanup(
-            operation, torch_neuronx::CompilationRuntimeException(e.what()));
-        // Use splice to APPEND flushed operations (don't overwrite!)
-        auto flushed_ops = concatenation_engine_->Flush(static_cast<size_t>(SIZE_MAX));
-        operations_to_compile.splice(operations_to_compile.end(), flushed_ops);
-        operations_to_compile.push_back(operation);
+        error_path = true;
+        failed_what = e.what();
+
+        // Pull new_op out of dispatch_queue_ so RemoveActiveOperation can find
+        // it once HandleErrorWithCleanup runs.
+        {
+          std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+          auto it = std::find_if(dispatch_queue_.begin(), dispatch_queue_.end(),
+                                 [new_op](const auto& sp) { return sp.get() == new_op; });
+          if (it != dispatch_queue_.end()) {
+            failed_owner = std::move(*it);
+            dispatch_queue_.erase(it);
+          }
+        }
+
+        // Drain anything the engine had buffered before new_op.
+        auto flushed = concatenation_engine_->Flush(SIZE_MAX);
+        result_raws.splice(result_raws.end(), flushed);
       }
     }
 
-    // Submit to next stage, skipping hints (consumed by concatenation engine only).
-    // Collect hint pointers to free after iteration (avoid modifying map while iterating list).
-    std::vector<OperationContext*> hints_to_free;
-    for (auto* op : operations_to_compile) {
-      if (op->GetKernelType() == KernelTypeEnum::kHint) {
-        hints_to_free.push_back(op);
-        continue;
+    // Snapshot non-hints before drain_and_move releases hint owners.
+    if (!result_raws.empty()) {
+      std::vector<OperationContext*> non_hint_ops;
+      non_hint_ops.reserve(result_raws.size());
+      for (auto* op : result_raws) {
+        if (op->GetKernelType() != KernelTypeEnum::kHint) {
+          non_hint_ops.push_back(op);
+        }
       }
-      submitToNextStage(op);
+      drain_and_move(result_raws.size(), result_raws);
+
+      for (auto* op : non_hint_ops) {
+        submit_compile_or_ready(op);
+      }
     }
 
-    // Free hint ownership by matching raw pointer — correct even when hints are emitted
-    // out of insertion order (due to buffering in the concatenation engine).
-    if (!hints_to_free.empty()) {
-      std::lock_guard<std::mutex> lock(concatenation_mutex_);
-      for (auto* hint_ptr : hints_to_free) {
-        hint_ownership_map_.erase(hint_ptr);
+    if (error_path && failed_owner) {
+      OperationContext* op_ptr = failed_owner.get();
+      EmitToRuntimeQueue(std::move(failed_owner));
+      if (IsDeviceKernelType(op_ptr->GetKernelType())) {
+        // Balances the DecrementExecutionQueueDepth in HandleErrorWithCleanup.
+        execution_queue_depth_.fetch_add(1);
       }
+      op_ptr->stream->HandleErrorWithCleanup(
+          op_ptr, torch_neuronx::CompilationRuntimeException(failed_what));
     }
   }
 
-  // Final flush — filter out hints
+  // Final shutdown flush.
   auto final_flush = concatenation_engine_->Flush(SIZE_MAX);
-  for (auto* op : final_flush) {
-    if (op->GetKernelType() == KernelTypeEnum::kHint) continue;
-    submitToNextStage(op);
-  }
-  {
-    std::lock_guard<std::mutex> lock(concatenation_mutex_);
-    hint_ownership_map_.clear();
+  if (!final_flush.empty()) {
+    std::vector<OperationContext*> non_hint_ops;
+    non_hint_ops.reserve(final_flush.size());
+    for (auto* op : final_flush) {
+      if (op->GetKernelType() != KernelTypeEnum::kHint) {
+        non_hint_ops.push_back(op);
+      }
+    }
+    drain_and_move(final_flush.size(), final_flush);
+    for (auto* op : non_hint_ops) {
+      submit_compile_or_ready(op);
+    }
   }
 
   TORCH_NEURONX_DEBUG("Concatenation worker thread terminated");
@@ -782,34 +927,33 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
     return NRTA_SEQ_GET_SEQ_NUM(seq_id) <= NRTA_SEQ_GET_SEQ_NUM(completed_seq);
   };
 
+  // Walk runtime_queue_ in submission order with front-of-queue early exit.
   {
-    std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
-
-    for (auto& op_ptr : stream->active_operations_) {
-      // Cascading op - check if its concat op has completed
+    std::lock_guard<std::mutex> qlock(stream->runtime_queue_mutex_);
+    for (auto& operation_context : stream->runtime_queue_) {
+      OperationContext* op_ptr = operation_context.get();
       if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
         auto* concat_op = op_ptr->GetConcatenatedOperation();
         if (concat_op->nrt_async_state_.is_scheduled) {
           if (IsSeqCompleted(concat_op->nrt_async_state_.sequence_id, concat_op->GetKernelType())) {
-            ops_to_complete.push_back(op_ptr.get());
+            ops_to_complete.push_back(op_ptr);
             continue;
           }
         }
-        break;  // Concat not done yet
+        break;  // concat not done yet — stop
       }
-
-      // Regular operation
       if (op_ptr->nrt_async_state_.is_scheduled) {
         if (IsSeqCompleted(op_ptr->nrt_async_state_.sequence_id, op_ptr->GetKernelType())) {
-          ops_to_complete.push_back(op_ptr.get());
-        } else {
-          break;
+          ops_to_complete.push_back(op_ptr);
+          continue;
         }
-      } else if (op_ptr->nrt_async_state_.is_pending_signal) {
-        ops_to_complete.push_back(op_ptr.get());
-      } else {
         break;
       }
+      if (op_ptr->nrt_async_state_.is_pending_signal) {
+        ops_to_complete.push_back(op_ptr);
+        continue;
+      }
+      break;
     }
   }
 

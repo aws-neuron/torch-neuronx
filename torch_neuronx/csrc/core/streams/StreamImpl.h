@@ -43,7 +43,6 @@ enum class ScheduleResult {
 class NeuronEvent;
 class ModelHandleCache;
 class OperationExecutionEngine;
-class ConcatenationEngine;
 
 // Per-XU completion tracking, sized to each XU's actual queue count.
 struct XUCompletionState {
@@ -83,28 +82,21 @@ struct XUCompletionState {
   }
 };
 
-// StreamImpl provides the core implementation for Neuron stream execution.
-// This class implements a multi-threaded pipeline for async operation execution:
-// - Build IR thread: Handles MLIR lowering and NEFF compilation
-// - Execution thread: Handles NRT async execution
-// - Unified operation tracking: Manages operation lifecycle and cleanup
+// StreamImpl owns the per-stream committed runtime queue — the FIFO that the
+// RuntimeWorker schedules from. The engine owns the global dispatch_queue_
+// in front of it; the concat worker transfers a partitioned prefix from
+// dispatch_queue_ into this stream's runtime_queue_ at flush time.
 struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
+  // Engine splices ops, advances the cursor, and inspects runtime_queue_.
   friend class OperationExecutionEngine;
-  friend class ConcatenationEngine;
 
   // Global device index
   c10::DeviceIndex device_index;
   // Physical stream ID
   c10::StreamId stream_id;
-  // Operation tracking
-  std::list<std::shared_ptr<OperationContext>> active_operations_;
-  std::mutex active_operations_mutex_;
 
   // Number of kAllocs currently parked in AllocState::Deferred on this stream.
   std::atomic<int> deferred_alloc_count_{0};
-
-  // Iterator pointing to the next operation to be scheduled (for nrt-async mode)
-  std::list<std::shared_ptr<OperationContext>>::iterator next_to_schedule_;
 
   // Per-stream error handling
   std::unique_ptr<ErrorHandler> error_handler_;
@@ -126,7 +118,8 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   std::mutex stashed_exception_mutex_;
 
   // Completion tracking for synchronization
-  std::condition_variable completion_cv;
+  std::condition_variable completion_cv_;
+  std::mutex completion_mutex_;
 
   StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id);
   ~StreamImpl();
@@ -174,7 +167,6 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   ScheduleResult ScheduleDeviceOperation(OperationContext* op, KernelTypeEnum kernel_type);
 
   // Find operation by sequence ID (for nrt-async error handling)
-  // Linear search bounded by kDefaultMaxInflightPerXU and only triggered on errors
   OperationContext* FindOperationBySeq(nrt::SequenceId sequence_id);
 
   void RemoveActiveOperation(const OperationContext* operation);
@@ -184,11 +176,11 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   void PrepareOperation(OperationContext* op);
 
   // True iff no scheduled / pending-signal ops remain (Deferred kAllocs are
-  // ignored). Caller must hold active_operations_mutex_.
+  // ignored). Caller must hold runtime_queue_mutex_.
   bool IsStreamDrainedWithLockHeld() const;
 
   // Flip parked kAllocs from Deferred to RetryReady when the stream is
-  // drained. Caller must hold active_operations_mutex_.
+  // drained. Caller must hold runtime_queue_mutex_.
   void ReleaseDeferredAllocGates();
 
   // Handle the respective error for the current operation
@@ -203,6 +195,12 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
       stashed_exception_ = std::move(eptr);
     }
   }
+
+  // Committed FIFO scheduled by the engine.
+  std::list<std::shared_ptr<OperationContext>> runtime_queue_;
+  mutable std::mutex runtime_queue_mutex_;
+  // Iterator into runtime_queue_; equals end() while empty.
+  std::list<std::shared_ptr<OperationContext>>::iterator next_to_schedule_;
 };
 
 }  // namespace at::neuron

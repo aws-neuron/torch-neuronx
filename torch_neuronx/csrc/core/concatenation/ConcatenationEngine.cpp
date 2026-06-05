@@ -129,9 +129,9 @@ std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* 
 
   // Partition for execution order allocs → compute → deallocs. Under lazy
   // alloc the merged op resolves all I/O VAs at dispatch, so kAllocs must
-  // precede it and kDeallocs must follow. Hints aren't in active_operations_
-  // (they live in hint_ownership_map_), so they bypass the splice but stay in
-  // the result list so the worker can free their owning unique_ptr.
+  // precede it and kDeallocs must follow. Hints flow back through the
+  // result list so the dispatch worker can drop their shared_ptr at
+  // transfer time.
   std::list<OperationContext*> alloc_ops;
   std::list<OperationContext*> compute_ops;
   std::list<OperationContext*> dealloc_ops;
@@ -167,90 +167,12 @@ std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* 
               buffering_impl_->operation_buffer_.size(),
               " This indicates a bug in buffer management.");
 
-  // Splice is only needed when a kAlloc/kDealloc could affect findTensor at
-  // dispatch. Pure-compute or hints-only flushes already match submission
-  // order in active_operations_.
-  if (!alloc_ops.empty() || !dealloc_ops.empty()) {
-    ApplyFlushReorderToStream(stream, alloc_ops, compute_ops, dealloc_ops);
-  }
-
   std::list<OperationContext*> result;
   result.splice(result.end(), alloc_ops);
   result.splice(result.end(), compute_ops);
   result.splice(result.end(), dealloc_ops);
   result.splice(result.end(), hint_ops);
   return result;
-}
-
-void ConcatenationEngine::ApplyFlushReorderToStream(
-    StreamImpl* stream, const std::list<OperationContext*>& alloc_ops,
-    const std::list<OperationContext*>& compute_ops,
-    const std::list<OperationContext*>& dealloc_ops) {
-  std::lock_guard<std::mutex> lock(stream->active_operations_mutex_);
-
-  std::unordered_set<const OperationContext*> partition_members;
-  partition_members.reserve(alloc_ops.size() + compute_ops.size() + dealloc_ops.size());
-  for (auto* op : alloc_ops) partition_members.insert(op);
-  for (auto* op : compute_ops) partition_members.insert(op);
-  for (auto* op : dealloc_ops) partition_members.insert(op);
-
-  // splice_anchor is the first non-partition op after the window — it must
-  // be non-partition because partition iterators are invalidated by the
-  // splices below.
-  std::unordered_map<const OperationContext*,
-                     std::list<std::shared_ptr<OperationContext>>::iterator>
-      pos;
-  pos.reserve(stream->active_operations_.size());
-  size_t cursor_index = stream->active_operations_.size();
-  size_t earliest_partition_index = std::numeric_limits<size_t>::max();
-  std::list<std::shared_ptr<OperationContext>>::iterator splice_anchor =
-      stream->active_operations_.end();
-  bool seen_partition = false;
-  size_t i = 0;
-  for (auto it = stream->active_operations_.begin(); it != stream->active_operations_.end();
-       ++it, ++i) {
-    pos[it->get()] = it;
-    if (it == stream->next_to_schedule_) cursor_index = i;
-    bool is_partition = partition_members.count(it->get()) > 0;
-    if (is_partition && i < earliest_partition_index) {
-      earliest_partition_index = i;
-    }
-    if (!is_partition && seen_partition && splice_anchor == stream->active_operations_.end()) {
-      splice_anchor = it;
-    }
-    seen_partition = seen_partition || is_partition;
-  }
-
-  if (earliest_partition_index == std::numeric_limits<size_t>::max()) {
-    // Concurrent RemoveActiveOperation pulled the partition before we ran.
-    return;
-  }
-
-  // Stage each move via single-element splice (O(1), only invalidates the
-  // moved iterator) so the remaining iterators in `pos` stay valid.
-  std::list<std::shared_ptr<OperationContext>> staging;
-  auto splice_one = [&](OperationContext* op) {
-    auto it = pos.find(op);
-    if (it == pos.end()) return;
-    staging.splice(staging.end(), stream->active_operations_, it->second);
-  };
-  for (auto* op : alloc_ops) splice_one(op);
-  for (auto* op : compute_ops) splice_one(op);
-  for (auto* op : dealloc_ops) splice_one(op);
-
-  auto first_staged_it = staging.begin();
-  stream->active_operations_.splice(splice_anchor, staging);
-
-  // Rewind only when the cursor was inside (or past) the partition window;
-  // the execution_ready_ interlock keeps it at-or-before that point.
-  if (cursor_index >= earliest_partition_index ||
-      stream->next_to_schedule_ == stream->active_operations_.end()) {
-    stream->next_to_schedule_ = first_staged_it;
-  }
-
-  TORCH_NEURONX_DEBUG("[CONCATENATION_ENGINE] Reorder applied to active_operations_",
-                      "stream_id=", stream->stream_id, "alloc_count=", alloc_ops.size(),
-                      "compute_count=", compute_ops.size(), "dealloc_count=", dealloc_ops.size());
 }
 
 bool ConcatenationEngine::IsFusibleBoundaryOperation(const OperationContext* operation) const {

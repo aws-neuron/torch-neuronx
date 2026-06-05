@@ -27,7 +27,6 @@ extern "C" {
 #include <nrt/nrt.h>
 }
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iomanip>
@@ -61,8 +60,8 @@ std::atomic<uint64_t> ProfilerMappingCollector::next_event_id_{1};
 StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
     : device_index(device_idx),
       stream_id(id),
-      next_to_schedule_(active_operations_.end()),
-      operation_timeout_(StreamConfig::kOperationTimeout) {
+      operation_timeout_(StreamConfig::kOperationTimeout),
+      next_to_schedule_(runtime_queue_.end()) {
   int dev_idx = static_cast<int>(device_index);
   int str_id = static_cast<int>(stream_id);
   TORCH_NEURONX_STREAM_DEBUG("Creating StreamImpl", "device_index=", dev_idx, "stream_id=", str_id);
@@ -76,10 +75,6 @@ StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
 
 StreamImpl::~StreamImpl() {
   TORCH_NEURONX_DEBUG("Destroying StreamImpl", "stream_id=", stream_id);
-
-  // Request graceful shutdown with active cancellation
-  TORCH_NEURONX_DEBUG("Requesting graceful shutdown with active cancellation",
-                      "stream_id=", stream_id);
 
   TORCH_NEURONX_DEBUG("Synchronizing stream before destruction", "stream_id=", stream_id);
   Synchronize();
@@ -98,31 +93,14 @@ std::shared_future<OperationContextResult> StreamImpl::SubmitOperationContext(
   OperationContext* op_ptr = operation.get();
   auto future = op_ptr->result_future;
 
-  {
-    // Queue operations in the same order to prevent inconsistencies.
-    std::lock_guard<std::mutex> lock(active_operations_mutex_);
-    bool was_empty = (next_to_schedule_ == active_operations_.end());
-    active_operations_.push_back(std::move(operation));
-    // If next_to_schedule_ was at end (no ops to schedule), point to the new op
-    if (was_empty) {
-      next_to_schedule_ = std::prev(active_operations_.end());
-    }
-    TORCH_NEURONX_STREAM_DEBUG("Added operation to active tracking", "stream_id=", stream_id,
-                               "op=", operation_name, "total_active=", active_operations_.size());
+  PrepareOperation(op_ptr);
 
-    // Ensure the operation is prepared, in case if consists of a staging step.
-    PrepareOperation(op_ptr);
-
-    // Always route through SubmitOperation to ensure consistent queue depth tracking
-    // Non-compilable operations will be handled specially in the concatenation/execution pipeline
-    auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
-    if (engine.IsConcatenationEnabled() || op_ptr->RequiresCompilation()) {
-      engine.SubmitOperation(op_ptr);
-    } else {
-      op_ptr->MarkExecutionReady();
-      engine.NotifyExecutionReady();
-    }
-  }
+  auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+  std::shared_ptr<OperationContext> shared = std::move(operation);
+  // engine.SubmitOperation routes internally: dispatch_queue_ when concat is
+  // on (ConcatenationWorker reorders + transfers to runtime_queue_ at flush),
+  // straight to stream->runtime_queue_ when concat is off.
+  engine.SubmitOperation(std::move(shared));
 
   TORCH_NEURONX_STREAM_DEBUG("Operation submitted successfully", "stream_id=", stream_id,
                              "op=", operation_name);
@@ -130,29 +108,24 @@ std::shared_future<OperationContextResult> StreamImpl::SubmitOperationContext(
 }
 
 bool StreamImpl::Query() const {
-  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(active_operations_mutex_));
-  return active_operations_.empty();
+  auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+  return engine.IsStreamDrained(this);
 }
 
 void StreamImpl::Synchronize() {
   TORCH_NEURONX_DEBUG("Synchronizing stream", "stream_id=", stream_id);
 
+  auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
+  auto is_complete = [this, &engine] { return engine.IsStreamDrained(this); };
+
   if (Py_IsInitialized() && PyGILState_Check()) {
     // Release GIL before waiting so worker threads can complete tensor cleanup
-    Py_BEGIN_ALLOW_THREADS std::unique_lock<std::mutex> lock(active_operations_mutex_);
-    completion_cv.wait(lock, [this] {
-      TORCH_NEURONX_STREAM_DEBUG("Waiting on synchronization, active_operations=",
-                                 active_operations_.size());
-      return active_operations_.empty();
-    });
+    Py_BEGIN_ALLOW_THREADS std::unique_lock<std::mutex> lock(completion_mutex_);
+    completion_cv_.wait(lock, is_complete);
     Py_END_ALLOW_THREADS
   } else {
-    std::unique_lock<std::mutex> lock(active_operations_mutex_);
-    completion_cv.wait(lock, [this] {
-      TORCH_NEURONX_STREAM_DEBUG("Waiting on synchronization, active_operations=",
-                                 active_operations_.size());
-      return active_operations_.empty();
-    });
+    std::unique_lock<std::mutex> lock(completion_mutex_);
+    completion_cv_.wait(lock, is_complete);
   }
 
   // After synchronization completes, check for and propagate any pending exceptions
@@ -172,42 +145,37 @@ void StreamImpl::Synchronize() {
 }
 
 void StreamImpl::RemoveActiveOperation(const OperationContext* operation) {
-  std::shared_ptr<OperationContext> operation_to_destroy;
+  std::shared_ptr<OperationContext> to_destroy;
   {
-    std::lock_guard<std::mutex> lock(active_operations_mutex_);
-    auto it = std::find_if(
-        active_operations_.begin(), active_operations_.end(),
-        [operation](const auto& active_operation) { return active_operation.get() == operation; });
-    if (it != active_operations_.end()) {
-      std::string op_name = it->get()->GetOpName();
-      TORCH_NEURONX_STREAM_DEBUG("Removing completed operation from active tracking",
-                                 "stream_id=", stream_id, "operation=", op_name,
-                                 "remaining_active=", active_operations_.size() - 1);
-      // If we're erasing the element that next_to_schedule_ points to, advance it first
-      // to avoid iterator invalidation
-      if (it == next_to_schedule_) {
-        ++next_to_schedule_;
-      }
-      operation_to_destroy = std::move(*it);
-      active_operations_.erase(it);
-
-      ReleaseDeferredAllocGates();
-
-      completion_cv.notify_all();
-      TORCH_NEURONX_DEBUG("Operation removed and completion_cv notified", "stream_id=", stream_id,
-                          "operation=", op_name, "new_active_count=", active_operations_.size());
-    } else {
+    std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
+    auto it = std::find_if(runtime_queue_.begin(), runtime_queue_.end(),
+                           [operation](const auto& sp) { return sp.get() == operation; });
+    if (it == runtime_queue_.end()) {
       TORCH_NEURONX_ERROR("Completed operation not found in active tracking",
                           "stream_id=", stream_id, "operation=", operation->GetOpName());
+      return;
     }
+    if (it == next_to_schedule_) {
+      ++next_to_schedule_;
+    }
+    to_destroy = std::move(*it);
+    runtime_queue_.erase(it);
+    // The removal may have drained the last running op; release any parked
+    // kAllocs so the scheduler can retry them.
+    ReleaseDeferredAllocGates();
   }
+  // completion_mutex_ doesn't guard the predicate state — it serializes the
+  // wait/notify pair against Synchronize() so the notify can't slip between
+  // a waiter's predicate check and its park.
+  std::lock_guard<std::mutex> lock(completion_mutex_);
+  completion_cv_.notify_all();
 }
 
 bool StreamImpl::IsStreamDrainedWithLockHeld() const {
   // True iff no op is scheduled or pending-signal. Deferred kAllocs are
   // parked, not draining, so a stream holding only Deferred kAllocs counts
   // as drained (otherwise the drain hook could never fire).
-  for (const auto& op_ptr : active_operations_) {
+  for (const auto& op_ptr : runtime_queue_) {
     if (op_ptr->nrt_async_state_.is_scheduled || op_ptr->nrt_async_state_.is_pending_signal) {
       return false;
     }
@@ -220,6 +188,7 @@ bool StreamImpl::IsStreamDrainedWithLockHeld() const {
 }
 
 void StreamImpl::ReleaseDeferredAllocGates() {
+  // Caller must hold runtime_queue_mutex_.
   // Short circuit if no parked deferred kAlloc on this stream.
   if (deferred_alloc_count_.load(std::memory_order_relaxed) == 0) {
     return;
@@ -230,8 +199,8 @@ void StreamImpl::ReleaseDeferredAllocGates() {
   // Stream drained: flip any deferred kAlloc to RetryReady and rewind
   // next_to_schedule_ to the earliest such kAlloc so the scheduler retries
   // it on the next pass.
-  auto earliest_retry = active_operations_.end();
-  for (auto it = active_operations_.begin(); it != active_operations_.end(); ++it) {
+  auto earliest_retry = runtime_queue_.end();
+  for (auto it = runtime_queue_.begin(); it != runtime_queue_.end(); ++it) {
     auto& op_ptr = *it;
     if (op_ptr->GetKernelType() == KernelTypeEnum::kAlloc) {
       auto& alloc_kernel = op_ptr->GetKernel<KernelTypeEnum::kAlloc>();
@@ -239,13 +208,13 @@ void StreamImpl::ReleaseDeferredAllocGates() {
           at::neuron::AllocDirectKernelExecution::AllocState::Deferred) {
         alloc_kernel.SetAllocState(at::neuron::AllocDirectKernelExecution::AllocState::RetryReady);
         deferred_alloc_count_.fetch_sub(1, std::memory_order_relaxed);
-        if (earliest_retry == active_operations_.end()) {
+        if (earliest_retry == runtime_queue_.end()) {
           earliest_retry = it;
         }
       }
     }
   }
-  if (earliest_retry != active_operations_.end()) {
+  if (earliest_retry != runtime_queue_.end()) {
     next_to_schedule_ = earliest_retry;
     // Wake the runtime worker in case it is parked on completion_efd_.
     auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
@@ -254,7 +223,7 @@ void StreamImpl::ReleaseDeferredAllocGates() {
 }
 
 bool StreamImpl::TryDeferAlloc(AllocDirectKernelExecution& alloc_kernel) {
-  std::lock_guard<std::mutex> lock(active_operations_mutex_);
+  std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
   if (IsStreamDrainedWithLockHeld()) {
     return false;
   }
@@ -384,9 +353,9 @@ void StreamImpl::HandleErrorWithExceptionPtr(OperationContext* operation, std::e
 }
 
 OperationContext* StreamImpl::GetNextOperationToSchedule() {
-  std::lock_guard<std::mutex> lock(active_operations_mutex_);
+  std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
 
-  if (next_to_schedule_ == active_operations_.end()) {
+  if (next_to_schedule_ == runtime_queue_.end()) {
     return nullptr;
   }
 
@@ -409,9 +378,9 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
 }
 
 void StreamImpl::AdvanceToNextOperation(OperationContext* just_scheduled) {
-  std::lock_guard<std::mutex> lock(active_operations_mutex_);
+  std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
 
-  if (next_to_schedule_ == active_operations_.end()) {
+  if (next_to_schedule_ == runtime_queue_.end()) {
     return;
   }
 
@@ -422,18 +391,16 @@ void StreamImpl::AdvanceToNextOperation(OperationContext* just_scheduled) {
 }
 
 bool StreamImpl::HasPendingAsyncOperations() const {
-  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(active_operations_mutex_));
+  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(runtime_queue_mutex_));
 
-  if (active_operations_.empty()) {
+  if (runtime_queue_.empty()) {
     return false;
   }
 
-  auto& front_op = active_operations_.front();
-  // Check if front op is directly scheduled or pending
+  auto& front_op = runtime_queue_.front();
   if (front_op->nrt_async_state_.is_scheduled || front_op->nrt_async_state_.is_pending_signal) {
     return true;
   }
-  // Check if front op is a cascading op whose concat op is scheduled
   if (front_op->HasConcatenatedOperation() && !front_op->IsConcatenatedOperation()) {
     auto* concat_op = front_op->GetConcatenatedOperation();
     return concat_op->nrt_async_state_.is_scheduled;
@@ -442,21 +409,17 @@ bool StreamImpl::HasPendingAsyncOperations() const {
 }
 
 OperationContext* StreamImpl::FindOperationBySeq(nrt::SequenceId sequence_id) {
-  std::lock_guard<std::mutex> lock(active_operations_mutex_);
-  for (auto& op_ptr : active_operations_) {
-    // Check regular scheduled ops
+  std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
+  for (auto& op_ptr : runtime_queue_) {
     if (op_ptr->nrt_async_state_.is_scheduled &&
         op_ptr->nrt_async_state_.sequence_id == sequence_id) {
       return op_ptr.get();
     }
-    // Check if this is a cascading op whose concat op matches the sequence ID
-    // This is needed because concat ops are not stored directly in active_operations_
-    // - they are owned by ConcatenationState, and only cascading ops are tracked here
     if (op_ptr->HasConcatenatedOperation() && !op_ptr->IsConcatenatedOperation()) {
       auto* concat_op = op_ptr->GetConcatenatedOperation();
       if (concat_op->nrt_async_state_.is_scheduled &&
           concat_op->nrt_async_state_.sequence_id == sequence_id) {
-        return concat_op;  // Return the concat op that failed
+        return concat_op;
       }
     }
   }
@@ -483,10 +446,11 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
   // ops where it's the cascading op. Used for the idempotent advance below.
   OperationContext* scheduled_op = op;
 
-  // Handle concatenated operations: cascading ops schedule their concat op first time,
-  // subsequent cascading ops just advance since concat op is already scheduled.
-  // Device ops require stream-specific hardware state (completion tracking, sequence IDs,
-  // cross-XU sync), so concatenation handling lives here rather than in the engine.
+  // The first cascading op we reach schedules the merged op; the rest advance.
+  // Ordering is already canonical (allocs → cascading → deallocs) because the
+  // ConcatenationWorker reorders the partition before transferring to
+  // runtime_queue_, so every required AllocBind has run by the time the
+  // first cascading op is scheduled.
   if (op->HasConcatenatedOperation() && !op->IsConcatenatedOperation()) {
     auto* concat_op = op->GetConcatenatedOperation();
 

@@ -131,7 +131,7 @@ TEST_F(StreamImplTest, ConcurrentSynchronizationEmptyStream) {
 // Test error handler initialization
 TEST_F(StreamImplTest, ErrorHandlerInitialization) { EXPECT_NE(stream_->error_handler_, nullptr); }
 
-// Test active_operations_ starts empty
+// Test runtime_queue_ starts empty
 TEST_F(StreamImplTest, ActiveOperationsStartsEmpty) {
   // Query returns true when no active operations
   EXPECT_TRUE(stream_->Query());
@@ -269,34 +269,40 @@ std::shared_ptr<OperationContext> MakeEventOp(EventDirectKernelExecution::EventA
 
 }  // namespace
 
+// With concat off, engine.SubmitOperation lands the shared_ptr directly into
+// stream->runtime_queue_, so we exercise the real production submit path
+// rather than test-only injection.
 TEST_F(StreamImplTest, GetNextOperationToScheduleSameStreamKWaitBypass) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id);
-  stream_->active_operations_.push_back(op);
-  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+  op->stream = stream_.get();
+  engine_->SubmitOperation(op);
 
   EXPECT_EQ(stream_->GetNextOperationToSchedule(), op.get());
 
-  stream_->active_operations_.clear();
+  stream_->RemoveActiveOperation(op.get());
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleCrossStreamKWaitGated) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id + 1);
-  stream_->active_operations_.push_back(op);
-  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+  op->stream = stream_.get();
+  engine_->SubmitOperation(op);
 
   EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
 
-  stream_->active_operations_.clear();
+  stream_->RemoveActiveOperation(op.get());
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleKSignalNotBypassed) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, stream_->stream_id);
-  stream_->active_operations_.push_back(op);
-  stream_->next_to_schedule_ = std::prev(stream_->active_operations_.end());
+  op->stream = stream_.get();
+  engine_->SubmitOperation(op);
 
   EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
 
-  stream_->active_operations_.clear();
+  stream_->RemoveActiveOperation(op.get());
 }
 
 int main(int argc, char** argv) {

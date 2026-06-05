@@ -145,6 +145,16 @@ class NeuronResourceManager {
   // Returns: Reference to the execution engine
   OperationExecutionEngine& GetOperationExecutionEngine();
 
+  // Test-only: swap in a different OperationExecutionEngine. Returns the
+  // previous one (which the caller is responsible for shutting down before
+  // destruction). Callers holding a previously-returned reference to the
+  // engine will see it dangle after this swap — quiesce all background
+  // workers and drop all engine references before calling. The swap itself
+  // is mutex-protected, but stale references obtained before the swap are
+  // not invalidated.
+  std::unique_ptr<OperationExecutionEngine> SetExecutionEngineForTesting(
+      std::unique_ptr<OperationExecutionEngine> engine);
+
   // Get the shared resource semaphore for general resource management
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
