@@ -1974,6 +1974,216 @@ class GraphNodeImporter:
         for i, value in enumerate(operation.results):
             self.bind_node_value(node, value, i + bind_none)
 
+    def _import_hop_auto_functionalized_v2(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+    ):
+        # Imports the torch._higher_order_ops.auto_functionalize.auto_functionalized_v2 HOP.
+        #
+        # v2 differs from v1 (see _import_hop_auto_functionalized) in how the
+        # mutable arguments are encoded. Instead of passing the mutable tensors
+        # directly by name, it passes a deduplicated list of base tensors via
+        # `_all_bases` plus per-argument "view information" that describes how
+        # to reconstruct each mutable argument from those bases. The HOP returns
+        # (*actual_returns, *new_bases), where `new_bases` mirrors `_all_bases`
+        # and carries the post-mutation values.
+        #
+        # See torch/_higher_order_ops/auto_functionalize.py:
+        #   - write_view_information_to_args (encoder)
+        #   - read_view_information_from_args (decoder)
+        #   - _generate_new_op_kwargs_from_bases
+        (op_overload,) = node.args
+        if isinstance(op_overload, HigherOrderOperator):
+            raise NotImplementedError(
+                "auto_functionalized_v2 wrapping a HigherOrderOperator is not "
+                "supported by the FxImporter"
+            )
+        schema = op_overload._schema
+        assert isinstance(schema, FunctionSchema)
+        mlir_op_name = _get_mlir_op_name_for_schema(schema)
+
+        kwargs = dict(node.kwargs)
+        all_bases = kwargs.pop("_all_bases", [])
+        # `_only_clone_these_bases` and `_op_schema` (HOP-only) are metadata that
+        # do not affect lowering; drop them if present.
+        kwargs.pop("_only_clone_these_bases", None)
+        kwargs.pop("_op_schema", None)
+
+        # Import each base tensor to an MLIR Value. These values are reused both
+        # as operands (via view reconstruction) and as the "new bases" returned
+        # by the HOP.
+        base_values: List[Value] = [
+            self._import_argument(loc, base, None) for base in all_bases
+        ]
+
+        def _is_tensor_like(jit_type) -> bool:
+            t = jit_type
+            if isinstance(t, torch.OptionalType):
+                t = t.getElementType()
+            return isinstance(t, torch.TensorType)
+
+        def _is_tensorlist_like(jit_type) -> bool:
+            t = jit_type
+            if isinstance(t, torch.OptionalType):
+                t = t.getElementType()
+            if not isinstance(t, torch.ListType):
+                return False
+            inner = t.getElementType()
+            if isinstance(inner, torch.OptionalType):
+                inner = inner.getElementType()
+            return isinstance(inner, torch.TensorType)
+
+        def _read_single_view(prefix: str) -> Optional[Value]:
+            # Mirror of read_single_view in PyTorch. Pops the view-info kwargs
+            # for `prefix` and emits an op to reconstruct the view from the
+            # appropriate base. Returns None if `{prefix}_base_index` is None
+            # (i.e. the original argument was None).
+            base_index = kwargs.pop(f"{prefix}_base_index")
+            if base_index is None:
+                return None
+            base_value = base_values[base_index]
+            if f"{prefix}_alias" in kwargs:
+                kwargs.pop(f"{prefix}_alias")
+                return Operation.create(
+                    name="torch.aten.alias",
+                    results=[base_value.type],
+                    operands=[base_value],
+                    loc=loc,
+                ).result
+            if f"{prefix}_storage_offset" in kwargs:
+                size = kwargs.pop(f"{prefix}_size")
+                stride = kwargs.pop(f"{prefix}_stride")
+                storage_offset = kwargs.pop(f"{prefix}_storage_offset")
+                size_v = self._import_default_value(
+                    loc, list(size), torch.ListType(torch.IntType.get())
+                )
+                stride_v = self._import_default_value(
+                    loc, list(stride), torch.ListType(torch.IntType.get())
+                )
+                offset_v = self._import_default_value(
+                    loc, storage_offset, torch.OptionalType(torch.IntType.get())
+                )
+                return Operation.create(
+                    name="torch.aten.as_strided",
+                    results=[base_value.type],
+                    operands=[base_value, size_v, stride_v, offset_v],
+                    loc=loc,
+                ).result
+            if f"{prefix}_slice_dim" in kwargs:
+                dim = kwargs.pop(f"{prefix}_slice_dim")
+                start = kwargs.pop(f"{prefix}_slice_start")
+                end = kwargs.pop(f"{prefix}_slice_end")
+                dim_v = self._import_default_value(loc, dim, torch.IntType.get())
+                start_v = self._import_default_value(
+                    loc, start, torch.OptionalType(torch.IntType.get())
+                )
+                end_v = self._import_default_value(
+                    loc, end, torch.OptionalType(torch.IntType.get())
+                )
+                step_v = self._import_default_value(loc, 1, torch.IntType.get())
+                return Operation.create(
+                    name="torch.aten.slice.Tensor",
+                    results=[base_value.type],
+                    operands=[base_value, dim_v, start_v, end_v, step_v],
+                    loc=loc,
+                ).result
+            # NotView: the argument is the base tensor itself.
+            return base_value
+
+        # Resolve each mutable argument from its view info, leaving non-mutable
+        # kwargs untouched for the operand-linearization pass below.
+        resolved_mutable: Dict[str, Optional[Value]] = {}
+        for parameter in schema.arguments:
+            alias_info = parameter.alias_info
+            if alias_info is None or not alias_info.is_write:
+                continue
+            arg_name = parameter.name
+            if _is_tensorlist_like(parameter.type):
+                length = kwargs.pop(f"_{arg_name}_length")
+                if length is None:
+                    resolved_mutable[arg_name] = None
+                else:
+                    elements = [
+                        _read_single_view(f"_{arg_name}_{i}") for i in range(length)
+                    ]
+                    list_type = IrType.parse(
+                        "!torch.list<vtensor>", context=self._c
+                    )
+                    resolved_mutable[arg_name] = Operation.create(
+                        "torch.prim.ListConstruct",
+                        results=[list_type],
+                        operands=elements,
+                        loc=loc,
+                    ).result
+            elif _is_tensor_like(parameter.type):
+                resolved_mutable[arg_name] = _read_single_view(f"_{arg_name}")
+            else:
+                raise NotImplementedError(
+                    f"auto_functionalized_v2: unsupported mutable arg type "
+                    f"{parameter.type} for {arg_name}"
+                )
+
+        # Decode op result types from the node meta. The HOP returns
+        # (*actual_returns, *new_bases). For void ops the actual returns collapse
+        # to a single None entry that has no MLIR representation but must still
+        # be bound so downstream getitem(node, 0) accesses resolve.
+        node_result_types = [
+            (None if v is None else self._cc.tensor_metadata_to_type(v))
+            for v in node.meta["val"]
+        ]
+
+        if len(schema.returns) == 0:
+            assert node_result_types and node_result_types[0] is None, (
+                "auto_functionalized_v2: expected leading None for a void op"
+            )
+            ir_op_result_types = []
+            bind_none = 1
+        else:
+            ir_op_result_types = node_result_types[: len(schema.returns)]
+            bind_none = 0
+
+        # Linearize operands in schema order: mutable args come from view
+        # reconstruction, non-mutable args from the original kwargs (or the
+        # parameter default when absent).
+        operands: List[Value] = []
+        for parameter in schema.arguments:
+            if parameter.name in resolved_mutable:
+                value = resolved_mutable[parameter.name]
+                if value is None:
+                    value = self._import_default_value(loc, None, parameter.type)
+                operands.append(value)
+            elif parameter.name in kwargs:
+                operands.append(
+                    self._import_argument(
+                        loc, kwargs[parameter.name], parameter.type
+                    )
+                )
+            else:
+                operands.append(
+                    self._import_default_value(
+                        loc, parameter.default_value, parameter.type
+                    )
+                )
+
+        operation = _emit_operation(
+            mlir_op_name,
+            result_types=ir_op_result_types,
+            operands=operands,
+            loc=loc,
+        )
+
+        # Bind the HOP results: leading entries from the underlying op (with a
+        # leading None for void ops), then `_all_bases` passed through as the
+        # post-mutation base values.
+        self._multi_result_nodes.add(node)
+        if bind_none:
+            self.bind_node_value(node, None, 0)
+        for i, value in enumerate(operation.results):
+            self.bind_node_value(node, value, i + bind_none)
+        for j, base_value in enumerate(base_values):
+            self.bind_node_value(
+                node, base_value, len(operation.results) + bind_none + j
+            )
+
     def _import_torch_op_overload(
         self,
         loc: Location,
