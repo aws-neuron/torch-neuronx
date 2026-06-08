@@ -3926,6 +3926,224 @@ class TestForeachDecompositionCompileE2E:
         for r, e in zip(result, expected, strict=False):
             torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    def test_foreach_scalarlist(self, op_name):
+        """Test foreach .ScalarList variants compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").ScalarList
+
+        def fn(tensors):
+            return aten_op(tensors, [1.5, 2.0, 0.5])
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        expected = aten_op([t.cpu() for t in tensors], [1.5, 2.0, 0.5])
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div"])
+    def test_foreach_scalarlist_inplace(self, op_name):
+        """Test foreach inplace .ScalarList variants compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}_").ScalarList
+
+        def fn(tensors):
+            aten_op(tensors, [1.5, 2.0, 0.5])
+            return tensors
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        tensors_cpu = [t.cpu().clone() for t in tensors]
+        aten_op(tensors_cpu, [1.5, 2.0, 0.5])
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, tensors_cpu, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize(
+        "op_name", ["exp", "log", "sin", "cos", "tanh", "sigmoid", "neg", "reciprocal", "abs"]
+    )
+    def test_foreach_unary(self, op_name):
+        """Test foreach unary ops compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}").default
+
+        def fn(tensors):
+            return aten_op(tensors)
+
+        tensors = [torch.rand(64, 128, device="neuron") + 0.1 for _ in range(3)]
+        expected = aten_op([t.cpu() for t in tensors])
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    def test_foreach_clamp_max(self):
+        """Test foreach clamp_max compiles correctly."""
+
+        def fn(tensors, others):
+            return torch.ops.aten._foreach_clamp_max.List(tensors, others)
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        others = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+
+        expected = torch.ops.aten._foreach_clamp_max.List(
+            [t.cpu() for t in tensors], [o.cpu() for o in others]
+        )
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors, others)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_lerp_scalar(self):
+        """Test foreach lerp with scalar weight compiles correctly."""
+
+        def fn(self, other):
+            return torch.ops.aten._foreach_lerp.Scalar(self, other, 0.3)
+
+        t1 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+
+        expected = torch.ops.aten._foreach_lerp.Scalar(
+            [t.cpu() for t in t1], [t.cpu() for t in t2], 0.3
+        )
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_list_small_tensors(self):
+        """Test foreach .List fallback path with numel=1 tensors (no NKI)."""
+        aten_op = torch.ops.aten._foreach_add.List
+
+        def fn(t1, t2):
+            return aten_op(t1, t2)
+
+        # numel=1 tensors should skip NKI and use torch.add fallback
+        t1 = [torch.randn(1, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(1, device="neuron") for _ in range(3)]
+
+        expected = aten_op([x.cpu() for x in t1], [x.cpu() for x in t2])
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_list_mismatched_shapes(self):
+        """Test foreach .List fallback with different shapes (no NKI)."""
+        aten_op = torch.ops.aten._foreach_add.List
+
+        def fn(t1, t2):
+            return aten_op(t1, t2)
+
+        # Different shapes → NKI skipped, uses torch.add with broadcasting
+        t1 = [torch.randn(4, 128, device="neuron"), torch.randn(64, 1, device="neuron")]
+        t2 = [torch.randn(4, 128, device="neuron"), torch.randn(1, 128, device="neuron")]
+
+        expected = aten_op([x.cpu() for x in t1], [x.cpu() for x in t2])
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    def test_foreach_scalar_small_tensor(self):
+        """Test foreach .Scalar fallback with numel=1 tensor."""
+        aten_op = torch.ops.aten._foreach_mul.Scalar
+
+        def fn(tensors):
+            return aten_op(tensors, 3.0)
+
+        tensors = [torch.randn(1, device="neuron"), torch.randn(1, device="neuron")]
+        expected = aten_op([t.cpu() for t in tensors], 3.0)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("op_name", ["exp", "sin", "tanh"])
+    def test_foreach_unary_inplace(self, op_name):
+        """Test foreach unary inplace ops compile correctly."""
+        aten_op = getattr(torch.ops.aten, f"_foreach_{op_name}_").default
+
+        def fn(tensors):
+            aten_op(tensors)
+            return tensors
+
+        tensors = [torch.rand(64, 128, device="neuron") + 0.1 for _ in range(3)]
+        tensors_cpu = [t.cpu().clone() for t in tensors]
+        getattr(torch.ops.aten, f"_foreach_{op_name}_").default(tensors_cpu)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, tensors_cpu, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    def test_foreach_nki_kernel_used(self):
+        """Verify NKI kernel is actually called for large tensors."""
+
+        from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import _add_tensor_kernel
+
+        call_count = {"n": 0}
+        original_call = _add_tensor_kernel.__class__.__call__
+
+        def counting_call(self, *args, **kwargs):
+            call_count["n"] += 1
+            return original_call(self, *args, **kwargs)
+
+        with patch.object(_add_tensor_kernel.__class__, "__call__", counting_call):
+
+            def fn(t1, t2):
+                return torch.ops.aten._foreach_add.List(t1, t2)
+
+            t1 = [torch.randn(256, 256, device="neuron") for _ in range(3)]
+            t2 = [torch.randn(256, 256, device="neuron") for _ in range(3)]
+            compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+            compiled(t1, t2)
+            import torch_neuronx as tnx
+
+            tnx.synchronize()
+
+        assert call_count["n"] == 3, f"Expected 3 NKI calls, got {call_count['n']}"
+
+    def test_foreach_nki_fallback(self, monkeypatch):
+        """Test that NKI kernel failure falls back to torch op."""
+        import torch_neuronx.neuron_dynamo_backend.decompositions as decomps
+
+        class FailingKernel:
+            def __getitem__(self, key):
+                return self
+
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError("NKI kernel failed intentionally")
+
+        # Patch the tensor kernel for add to always fail
+        monkeypatch.setitem(decomps._FOREACH_TENSOR_KERNELS, "add", FailingKernel())
+
+        def fn(t1, t2):
+            return torch.ops.aten._foreach_add.List(t1, t2)
+
+        t1 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        t2 = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+
+        expected = [a.cpu() + b.cpu() for a, b in zip(t1, t2, strict=False)]
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(t1, t2)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-3, atol=1e-3)
+
     def test_adam_real_optimizer(self):
         """Test real torch.optim.Adam compiles and runs."""
         model = torch.nn.Linear(256, 128).to("neuron")

@@ -15,6 +15,8 @@ import math
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
+logger = logging.getLogger(__name__)
+
 import torch
 import torch._decomp as decomp
 import torch.nn.functional as F  # noqa: N812
@@ -53,8 +55,6 @@ _P = ParamSpec("_P")
 aten = torch.ops.aten
 from torch_neuronx.nki_hop import wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
-
-logger = logging.getLogger(__name__)
 
 wrapped_flash_fwd = wrap_nki(attention_cte)
 wrapped_flash_bwd = wrap_nki(attention_bwd)
@@ -2107,25 +2107,30 @@ def _make_foreach_list_decomp(op):
     nki_kernel = _FOREACH_TENSOR_KERNELS.get(op)
 
     def decomp(self, other, alpha=1):
+        grid = (int(get_logical_neuron_cores()),)
         result = []
         for a, b in zip(self, other, strict=False):
             if a.numel() == 0:
                 result.append(a)
-            elif _has_nki_foreach and a.numel() > 1 and a.shape == b.shape:
-                out_dtype = torch.promote_types(a.dtype, b.dtype)
-                if has_alpha:
-                    alpha_t = torch.full(
-                        (_FOREACH_P_SIZE, 1), alpha, dtype=out_dtype, device=a.device
+                continue
+            if _has_nki_foreach and a.numel() > 1 and a.shape == b.shape:
+                try:
+                    out_dtype = torch.promote_types(a.dtype, b.dtype)
+                    if has_alpha:
+                        alpha_t = torch.full(
+                            (_FOREACH_P_SIZE, 1), alpha, dtype=out_dtype, device=a.device
+                        )
+                        result.append(
+                            nki_kernel[grid](a.to(out_dtype), b.to(out_dtype), alpha_t, a.numel())
+                        )
+                    else:
+                        result.append(nki_kernel[grid](a.to(out_dtype), b.to(out_dtype), a.numel()))
+                    continue
+                except Exception:
+                    logger.debug(
+                        "NKI foreach list kernel failed; falling back to torch op", exc_info=True
                     )
-                    result.append(
-                        nki_kernel[(2,)](a.to(out_dtype), b.to(out_dtype), alpha_t, a.numel())
-                    )
-                else:
-                    result.append(nki_kernel[(2,)](a.to(out_dtype), b.to(out_dtype), a.numel()))
-            elif has_alpha:
-                result.append(torch_op(a, b, alpha=alpha))
-            else:
-                result.append(torch_op(a, b))
+            result.append(torch_op(a, b, alpha=alpha) if has_alpha else torch_op(a, b))
         return result
 
     return decomp
@@ -2136,6 +2141,7 @@ def _make_foreach_scalar_decomp(op):
     nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
 
     def decomp(self, scalar):
+        grid = (int(get_logical_neuron_cores()),)
         result = []
         for t in self:
             compute_dtype = torch.result_type(t, scalar)
@@ -2143,13 +2149,19 @@ def _make_foreach_scalar_decomp(op):
                 compute_dtype = torch.float32
             if t.numel() == 0:
                 result.append(torch.empty_like(t, dtype=compute_dtype))
-            elif _has_nki_foreach and t.numel() > 1:
-                scalar_t = torch.full(
-                    (_FOREACH_P_SIZE, 1), scalar, dtype=compute_dtype, device=t.device
-                )
-                result.append(nki_kernel[(2,)](t.to(compute_dtype), scalar_t, t.numel()))
-            else:
-                result.append(torch_op(t.to(compute_dtype), scalar))
+                continue
+            if _has_nki_foreach and t.numel() > 1:
+                try:
+                    scalar_t = torch.full(
+                        (_FOREACH_P_SIZE, 1), scalar, dtype=compute_dtype, device=t.device
+                    )
+                    result.append(nki_kernel[grid](t.to(compute_dtype), scalar_t, t.numel()))
+                    continue
+                except Exception:
+                    logger.debug(
+                        "NKI foreach scalar kernel failed; falling back to torch op", exc_info=True
+                    )
+            result.append(torch_op(t.to(compute_dtype), scalar))
         return result
 
     return decomp
@@ -2161,24 +2173,30 @@ def _make_foreach_tensor_decomp(op):
     nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
 
     def decomp(self, other, alpha=1):
+        grid = (int(get_logical_neuron_cores()),)
         effective = other * alpha if has_alpha else other
         result = []
         for t in self:
             if t.numel() == 0:
                 result.append(t)
-            elif _has_nki_foreach and t.numel() > 1:
-                compute_dtype = torch.promote_types(t.dtype, effective.dtype)
-                scalar_t = (
-                    effective.to(compute_dtype)
-                    .reshape(1, 1)
-                    .expand(_FOREACH_P_SIZE, 1)
-                    .contiguous()
-                )
-                result.append(nki_kernel[(2,)](t.to(compute_dtype), scalar_t, t.numel()))
-            elif has_alpha:
-                result.append(torch_op(t, other, alpha=alpha))
-            else:
-                result.append(torch_op(t, other))
+                continue
+            if _has_nki_foreach and t.numel() > 1:
+                try:
+                    compute_dtype = torch.promote_types(t.dtype, effective.dtype)
+                    scalar_t = (
+                        effective.to(compute_dtype)
+                        .reshape(1, 1)
+                        .expand(_FOREACH_P_SIZE, 1)
+                        .contiguous()
+                    )
+                    result.append(nki_kernel[grid](t.to(compute_dtype), scalar_t, t.numel()))
+                    continue
+                except Exception:
+                    logger.debug(
+                        "NKI foreach tensor kernel failed; falling back to torch op",
+                        exc_info=True,
+                    )
+            result.append(torch_op(t, other, alpha=alpha) if has_alpha else torch_op(t, other))
         return result
 
     return decomp
@@ -2232,14 +2250,22 @@ for _op in ("add", "mul", "div"):
 
 @register_decomposition([aten._foreach_sqrt.default])
 def _foreach_sqrt_decomp(self):
+    grid = (int(get_logical_neuron_cores()),)
     result = []
     for t in self:
         if t.numel() == 0:
             result.append(t)
-        elif _has_nki_foreach and t.numel() > 1:
-            result.append(_sqrt_kernel[(2,)](t, t.numel()))
-        else:
-            result.append(torch.sqrt(t))
+            continue
+        if _has_nki_foreach and t.numel() > 1:
+            try:
+                result.append(_sqrt_kernel[grid](t, t.numel()))
+                continue
+            except Exception:
+                logger.debug(
+                    "NKI foreach sqrt kernel failed; falling back to torch.sqrt",
+                    exc_info=True,
+                )
+        result.append(torch.sqrt(t))
     return result
 
 
@@ -2249,32 +2275,319 @@ def _foreach_sqrt_inplace_decomp(self):
         torch.sqrt(s, out=s)
 
 
-@register_decomposition([aten._foreach_addcmul.Scalar])
-def _foreach_addcmul_decomp(self, tensor1, tensor2, value=1):
-    return [
-        torch.addcmul(s, t1, t2, value=value)
-        for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
-    ]
+# addcmul/addcdiv variants (Scalar, ScalarList, Tensor + inplace)
+_FOREACH_ADDCOP = {"addcmul": (torch.addcmul, "mul"), "addcdiv": (torch.addcdiv, "div")}
+
+for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
+
+    def _make_addcop_scalar(cop_fn):
+        def decomp(self, tensor1, tensor2, value=1):
+            return [
+                cop_fn(s, t1, t2, value=value)
+                for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
+            ]
+
+        return decomp
+
+    def _make_addcop_scalar_inplace(cop_name):
+        inplace_fn = getattr(torch.Tensor, f"{cop_name}_")
+
+        def decomp(self, tensor1, tensor2, value=1):
+            for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
+                inplace_fn(s, t1, t2, value=value)
+
+        return decomp
+
+    def _make_addcop_scalarlist(cop_fn):
+        def decomp(self, tensor1, tensor2, scalars):
+            return [
+                cop_fn(s, t1, t2, value=v)
+                for s, t1, t2, v in zip(self, tensor1, tensor2, scalars, strict=False)
+            ]
+
+        return decomp
+
+    def _make_addcop_scalarlist_inplace(cop_name):
+        inplace_fn = getattr(torch.Tensor, f"{cop_name}_")
+
+        def decomp(self, tensor1, tensor2, scalars):
+            for s, t1, t2, v in zip(self, tensor1, tensor2, scalars, strict=False):
+                inplace_fn(s, t1, t2, value=v)
+
+        return decomp
+
+    def _make_addcop_tensor(binop):
+        def decomp(self, tensor1, tensor2, scalars):
+            if binop == "mul":
+                return [
+                    s + scalars[i] * t1 * t2
+                    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=False))
+                ]
+            else:
+                return [
+                    s + scalars[i] * t1 / t2
+                    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=False))
+                ]
+
+        return decomp
+
+    def _make_addcop_tensor_inplace(binop):
+        def decomp(self, tensor1, tensor2, scalars):
+            for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=False)):
+                if binop == "mul":
+                    s.add_(scalars[i] * t1 * t2)
+                else:
+                    s.add_(scalars[i] * t1 / t2)
+
+        return decomp
+
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}").Scalar])(
+        _make_addcop_scalar(_cop_fn)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}_").Scalar])(
+        _make_addcop_scalar_inplace(_cop_name)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}").ScalarList])(
+        _make_addcop_scalarlist(_cop_fn)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}_").ScalarList])(
+        _make_addcop_scalarlist_inplace(_cop_name)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}").Tensor])(
+        _make_addcop_tensor(_cop_binop)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_cop_name}_").Tensor])(
+        _make_addcop_tensor_inplace(_cop_binop)
+    )
 
 
-@register_decomposition([aten._foreach_addcdiv.Scalar])
-def _foreach_addcdiv_decomp(self, tensor1, tensor2, value=1):
-    return [
-        torch.addcdiv(s, t1, t2, value=value)
-        for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
-    ]
+# ScalarList variants
+def _make_foreach_scalarlist_decomp(op):
+    has_alpha = op in _FOREACH_HAS_ALPHA
+    torch_op = _FOREACH_OPS[op]
+    nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
+
+    def decomp(self, scalars, alpha=1):
+        grid = (int(get_logical_neuron_cores()),)
+        result = []
+        for t, s in zip(self, scalars, strict=False):
+            effective_s = s * alpha if has_alpha else s
+            compute_dtype = torch.result_type(t, effective_s)
+            if op == "div" and not compute_dtype.is_floating_point:
+                compute_dtype = torch.float32
+            if t.numel() == 0:
+                result.append(torch.empty_like(t, dtype=compute_dtype))
+                continue
+            if _has_nki_foreach and t.numel() > 1:
+                try:
+                    scalar_t = torch.full(
+                        (_FOREACH_P_SIZE, 1), effective_s, dtype=compute_dtype, device=t.device
+                    )
+                    result.append(nki_kernel[grid](t.to(compute_dtype), scalar_t, t.numel()))
+                    continue
+                except Exception as exc:
+                    # Optional NKI fast-path failed; fall back to torch op implementation.
+                    logger.debug(
+                        "NKI foreach scalarlist kernel failed; falling back to torch op: %s", exc
+                    )
+            result.append(torch_op(t.to(compute_dtype), effective_s))
+        return result
+
+    return decomp
 
 
-@register_decomposition([aten._foreach_addcmul_.Scalar])
-def _foreach_addcmul_inplace_decomp(self, tensor1, tensor2, value=1):
-    for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
-        s.addcmul_(t1, t2, value=value)
+def _make_foreach_scalarlist_inplace_decomp(op):
+    has_alpha = op in _FOREACH_HAS_ALPHA
+    torch_op = _FOREACH_OPS[op]
+
+    if has_alpha:
+
+        def decomp(self, scalars, alpha=1):
+            for s, sc in zip(self, scalars, strict=False):
+                torch_op(s, sc * alpha, out=s)
+    else:
+
+        def decomp(self, scalars):
+            for s, sc in zip(self, scalars, strict=False):
+                torch_op(s, sc, out=s)
+
+    return decomp
 
 
-@register_decomposition([aten._foreach_addcdiv_.Scalar])
-def _foreach_addcdiv_inplace_decomp(self, tensor1, tensor2, value=1):
-    for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
-        s.addcdiv_(t1, t2, value=value)
+for _op in ("add", "sub", "mul", "div"):
+    register_decomposition([getattr(aten, f"_foreach_{_op}").ScalarList])(
+        _make_foreach_scalarlist_decomp(_op)
+    )
+    register_decomposition([getattr(aten, f"_foreach_{_op}_").ScalarList])(
+        _make_foreach_scalarlist_inplace_decomp(_op)
+    )
+
+
+# Unary foreach ops
+_FOREACH_UNARY_OPS = {
+    "acos": torch.acos,
+    "asin": torch.asin,
+    "atan": torch.atan,
+    "ceil": torch.ceil,
+    "cos": torch.cos,
+    "cosh": torch.cosh,
+    "erf": torch.erf,
+    "erfc": torch.erfc,
+    "exp": torch.exp,
+    "expm1": torch.expm1,
+    "floor": torch.floor,
+    "frac": torch.frac,
+    "lgamma": torch.lgamma,
+    "log": torch.log,
+    "log10": torch.log10,
+    "log1p": torch.log1p,
+    "log2": torch.log2,
+    "round": torch.round,
+    "rsqrt": torch.rsqrt,
+    "sigmoid": torch.sigmoid,
+    "sign": torch.sign,
+    "sin": torch.sin,
+    "sinh": torch.sinh,
+    "tan": torch.tan,
+    "tanh": torch.tanh,
+    "trunc": torch.trunc,
+}
+
+for _op_name, _torch_op in _FOREACH_UNARY_OPS.items():
+
+    def _make_unary(torch_op):
+        def decomp(self):
+            return [torch_op(t) for t in self]
+
+        return decomp
+
+    def _make_unary_inplace(torch_op):
+        def decomp(self):
+            for s in self:
+                torch_op(s, out=s)
+
+        return decomp
+
+    register_decomposition([getattr(aten, f"_foreach_{_op_name}").default])(_make_unary(_torch_op))
+    register_decomposition([getattr(aten, f"_foreach_{_op_name}_").default])(
+        _make_unary_inplace(_torch_op)
+    )
+
+
+# clamp_max / clamp_min (.List and .Scalar variants)
+@register_decomposition([aten._foreach_clamp_max.List])
+def _foreach_clamp_max_list_decomp(self, other):
+    return [torch.clamp(a, max=b) for a, b in zip(self, other, strict=False)]
+
+
+@register_decomposition([aten._foreach_clamp_max.Scalar])
+def _foreach_clamp_max_scalar_decomp(self, scalar):
+    return [torch.clamp(t, max=scalar) for t in self]
+
+
+@register_decomposition([aten._foreach_clamp_max_.List])
+def _foreach_clamp_max_list_inplace_decomp(self, other):
+    for s, o in zip(self, other, strict=False):
+        torch.clamp(s, max=o, out=s)
+
+
+@register_decomposition([aten._foreach_clamp_max_.Scalar])
+def _foreach_clamp_max_scalar_inplace_decomp(self, scalar):
+    for s in self:
+        torch.clamp(s, max=scalar, out=s)
+
+
+@register_decomposition([aten._foreach_clamp_min.List])
+def _foreach_clamp_min_list_decomp(self, other):
+    return [torch.clamp(a, min=b) for a, b in zip(self, other, strict=False)]
+
+
+@register_decomposition([aten._foreach_clamp_min.Scalar])
+def _foreach_clamp_min_scalar_decomp(self, scalar):
+    return [torch.clamp(t, min=scalar) for t in self]
+
+
+@register_decomposition([aten._foreach_clamp_min_.List])
+def _foreach_clamp_min_list_inplace_decomp(self, other):
+    for s, o in zip(self, other, strict=False):
+        torch.clamp(s, min=o, out=s)
+
+
+@register_decomposition([aten._foreach_clamp_min_.Scalar])
+def _foreach_clamp_min_scalar_inplace_decomp(self, scalar):
+    for s in self:
+        torch.clamp(s, min=scalar, out=s)
+
+
+# maximum / minimum
+@register_decomposition([aten._foreach_maximum.List])
+def _foreach_maximum_list_decomp(self, other):
+    return [torch.maximum(a, b) for a, b in zip(self, other, strict=False)]
+
+
+@register_decomposition([aten._foreach_minimum.List])
+def _foreach_minimum_list_decomp(self, other):
+    return [torch.minimum(a, b) for a, b in zip(self, other, strict=False)]
+
+
+@register_decomposition([aten._foreach_maximum_.List])
+def _foreach_maximum_list_inplace_decomp(self, other):
+    for s, o in zip(self, other, strict=False):
+        torch.maximum(s, o, out=s)
+
+
+@register_decomposition([aten._foreach_minimum_.List])
+def _foreach_minimum_list_inplace_decomp(self, other):
+    for s, o in zip(self, other, strict=False):
+        torch.minimum(s, o, out=s)
+
+
+# lerp
+@register_decomposition([aten._foreach_lerp.Scalar])
+def _foreach_lerp_scalar_decomp(self, other, weight):
+    return [torch.lerp(a, b, weight) for a, b in zip(self, other, strict=False)]
+
+
+@register_decomposition([aten._foreach_lerp.List])
+def _foreach_lerp_list_decomp(self, other, weight):
+    return [torch.lerp(a, b, w) for a, b, w in zip(self, other, weight, strict=False)]
+
+
+@register_decomposition([aten._foreach_lerp_.Scalar])
+def _foreach_lerp_scalar_inplace_decomp(self, other, weight):
+    for s, o in zip(self, other, strict=False):
+        s.lerp_(o, weight)
+
+
+@register_decomposition([aten._foreach_lerp_.List])
+def _foreach_lerp_list_inplace_decomp(self, other, weight):
+    for s, o, w in zip(self, other, weight, strict=False):
+        s.lerp_(o, w)
+
+
+# pow .List
+@register_decomposition([aten._foreach_pow.List])
+def _foreach_pow_list_decomp(self, other):
+    return [torch.pow(a, b) for a, b in zip(self, other, strict=False)]
+
+
+# zero_ and copy_
+@register_decomposition([aten._foreach_zero_.default])
+def _foreach_zero_inplace_decomp(self):
+    for s in self:
+        s.zero_()
+
+
+@register_decomposition([aten._foreach_copy_.default])
+def _foreach_copy_inplace_decomp(self, other):
+    for s, o in zip(self, other, strict=False):
+        s.copy_(o)
+
+
+# norm
+@register_decomposition([aten._foreach_norm.Scalar])
+def _foreach_norm_decomp(self, ord=2):
+    return [torch.linalg.vector_norm(t.flatten(), ord=ord) for t in self]
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
