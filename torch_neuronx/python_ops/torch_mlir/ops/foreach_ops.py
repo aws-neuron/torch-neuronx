@@ -38,6 +38,21 @@ from ..operation_registry import Preprocessing, register_aten
 def _check_tensors(tensors):
     if not tensors:
         raise RuntimeError("Tensor list must have at least one tensor.")
+    _check_same_device(tensors)
+
+
+def _check_same_device(*tensor_lists):
+    """Raise if tensors span more than one device."""
+    expected_device = None
+    for tensors in tensor_lists:
+        for t in tensors:
+            if expected_device is None:
+                expected_device = t.device
+            elif t.device != expected_device:
+                raise RuntimeError(
+                    "Expected all tensors to be on the same device, but found "
+                    f"at least two devices, {expected_device} and {t.device}!"
+                )
 
 
 def _check_tensors_scalars(tensors, scalars):
@@ -49,6 +64,7 @@ def _check_tensors_scalars(tensors, scalars):
 def _check_tensors_tensors(tensors1, tensors2):
     _check_tensors(tensors1)
     _check_tensors(tensors2)
+    _check_same_device(tensors1, tensors2)
     if len(tensors1) != len(tensors2):
         raise RuntimeError(
             f"Tensor lists must have the same number of tensors, "
@@ -429,6 +445,7 @@ def _check_three_tensor_lists(self, tensor1, tensor2):
     _check_tensors(self)
     _check_tensors(tensor1)
     _check_tensors(tensor2)
+    _check_same_device(self, tensor1, tensor2)
     if not (len(self) == len(tensor1) == len(tensor2)):
         raise RuntimeError(
             f"Tensor lists must have the same number of tensors, "
