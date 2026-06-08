@@ -956,6 +956,20 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
                 "' registered without lower_func — this should not happen");
   }
 
+  // Unsupported dtypes (float64, int64 without native support): DowncastArgs
+  // in DispatchWithCasting calls NeuronSafeCast which does a CPU roundtrip that
+  // inadvertently makes the tensor contiguous, causing composite_lower to fail.
+  // Short-circuit with a direct CPU roundtrip to avoid unnecessary HLO tracing.
+  if (!IsSupportedDtype(self_tensor.scalar_type())) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] unsupported dtype → CPU roundtrip",
+                                 " op=", op_name, " dtype=", self_tensor.scalar_type());
+    auto cpu_contiguous = NeuronToContiguousCPU(self_tensor, /*non_blocking=*/false);
+    auto result = CopyCPUToNewNeuron(cpu_contiguous, self_tensor.device(), /*non_blocking=*/false);
+    logOperationExecuted(op_name);
+    torch::jit::push(*stack, result);
+    return;
+  }
+
   auto original_args = args;
 
   std::string cache_key = GenerateCacheKey(lookup_name, schema, args, reg);

@@ -621,3 +621,16 @@ class TestContiguousUnsupportedDtypes:
 
         assert dst.dtype == dtype
         torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_contiguous_direct(self, dtype):
+        """Calling .contiguous() directly on a non-contiguous unsupported-dtype tensor."""
+        x = torch.arange(12, device="neuron", dtype=dtype).reshape(3, 4)
+        x_t = x.t()
+        assert not x_t.is_contiguous()
+
+        result = x_t.contiguous()
+
+        assert result.is_contiguous()
+        assert result.dtype == dtype
+        torch.testing.assert_close(result.cpu(), x_t.cpu().contiguous())
