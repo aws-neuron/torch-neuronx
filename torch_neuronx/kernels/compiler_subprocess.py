@@ -121,7 +121,7 @@ class CompilerSubprocess:
         hlo_protobuf: bytes,
         config: CompilerConfig,
         lnc_override: str | None = None,
-        ir_type: str = "XLA",
+        ir_type: str = "StableHLO",
         output_file: str | None = None,
         neff_cache_key: str | None = None,
     ) -> bytes:
@@ -131,7 +131,7 @@ class CompilerSubprocess:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
             config: Compiler configuration
             lnc_override: Optional override for logical neuron cores
-            ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+            ir_type: Type of IR ("StableHLO" for MLIR)
             output_file: Path to write output NEFF file (optional, for callers
                 that need the result at a specific path, e.g. neuronx_cc_wrapper)
             neff_cache_key: Optional override for NFS cache key. If provided,
@@ -260,7 +260,7 @@ class CompilerSubprocess:
         hlo_protobuf: bytes,
         config: CompilerConfig,
         lnc_override: str | None = None,
-        ir_type: str = "XLA",
+        ir_type: str = "StableHLO",
     ) -> bytes:
         """Compile HLO protobuf or MLIR directly to NEFF.
 
@@ -268,7 +268,7 @@ class CompilerSubprocess:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
             config: Compiler configuration
             lnc_override: Optional override for logical neuron cores
-            ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+            ir_type: Type of IR ("StableHLO" for MLIR)
 
         Returns:
             Compiled NEFF bytes
@@ -281,8 +281,8 @@ class CompilerSubprocess:
             workdir.mkdir(parents=True, exist_ok=True)
 
             # Determine file format based on ir_type
-            # "StableHLO" uses MLIR format, "XLA" uses HLO protobuf
-            input_file_name = "module.mlir" if ir_type == "StableHLO" else "module.hlo.pb"
+            # "StableHLO" uses MLIR format
+            input_file_name = "module.mlir"
             output_file_name = "module.neff"
             hlo_file = workdir / input_file_name
             hlo_file.write_bytes(hlo_protobuf)

@@ -93,10 +93,7 @@ std::vector<uint8_t> XLACompilableKernelExecution::CompileToNeff() const {
   }
 
   try {
-    // Determine IR type: collectives always use XLA (HLO protobuf),
-    // non-collectives may use StableHLO (MLIR) if environment variable is set
-    std::string ir_type =
-        (!HasCollectives() && NeuronCompiler::IsStableHLOEnabled()) ? "StableHLO" : "XLA";
+    std::string ir_type = "StableHLO";
 
     CompilationConfig config{.framework = "XLA",
                              .platform_target = utils::GetPlatformTarget(),

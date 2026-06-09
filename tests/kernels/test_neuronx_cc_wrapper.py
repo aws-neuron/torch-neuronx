@@ -131,42 +131,6 @@ class TestNeuronxCCWrapper:
         assert not hasattr(parsed.config, "output")
         assert not hasattr(parsed.config, "workdir")
 
-    def test_successful_compilation_hlo(
-        self, temp_dirs, sample_hlo, sample_neff, mock_compiler_subprocess
-    ):
-        """Test successful compilation with HLO input."""
-        # Setup files
-        input_file = temp_dirs["temp"] / "test.hlo.pb"
-        output = temp_dirs["temp"] / "test.neff"
-        atomic_write_bytes(input_file, sample_hlo)
-
-        wrapper = NeuronxCCWrapper()
-
-        args = [
-            "compile",
-            str(input_file),
-            "--output",
-            str(output),
-            "--framework",
-            "XLA",
-            "--target",
-            "trn2",
-            "--workdir",
-            str(temp_dirs["temp"]),
-        ]
-
-        result = wrapper.compile_with_caching(args)
-
-        assert result == 0
-        assert output.exists()
-        assert output.read_bytes() == sample_neff
-
-        # Verify CompilerSubprocess was called correctly
-        mock_compiler_subprocess.return_value.get_or_compile.assert_called_once()
-        call_args = mock_compiler_subprocess.return_value.get_or_compile.call_args
-        assert call_args[1]["hlo_protobuf"] == sample_hlo
-        assert call_args[1]["ir_type"] == "XLA"
-
     def test_successful_compilation_mlir(
         self, temp_dirs, sample_mlir, sample_neff, mock_compiler_subprocess
     ):

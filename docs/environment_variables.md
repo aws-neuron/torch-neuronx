@@ -29,7 +29,7 @@ The working directory used by all neuronx-cc calls is preserved under TORCH_NEUR
 └── neuronx-cc/
     └── {hash}/
         ├── log-neuron-cc.txt
-        ├── module.mlir (or module.hlo.pb)
+        ├── module.mlir
         ├── module.neff
         ├── metadata.txt
         └── compiler_args.txt

@@ -58,6 +58,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         static_argnames: tuple[str, ...] | None = None,
         compiler_config: CompilerConfig | None = None,
         output_params: tuple[str, ...] | None = None,
+        has_collectives: bool = False,
     ):
         super().__init__()
 
@@ -66,6 +67,12 @@ class TorchMlirKernel(BaseNeuronKernel):
         self.static_argnums = static_argnums or ()
         self.static_argnames = static_argnames or ()
         self.output_params = output_params or ()
+        # Marks that this kernel's traced graph CONTAINS c10d collective ops
+        # (torch._c10d_functional.*). It is a property of the graph, NOT a
+        # permission to emit collectives. The C++ NeuronBackend reads this
+        # flag off the LoweringResult to route the compiled NEFF through the
+        # collective execution path.
+        self.has_collectives = has_collectives
 
         # Initialize components
         self.mlir_compiler = TorchMlirCompiler()
@@ -1276,7 +1283,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 kw_input_specs=kw_input_specs,
                 op_name=self.op_name,
                 is_inplace=self._is_inplace_op(),
-                has_collectives=False,
+                has_collectives=self.has_collectives,
                 input_output_aliases=self._build_input_output_aliases(kept_input_indices),
                 inferred_output_dtypes=inferred_output_dtypes,
             )

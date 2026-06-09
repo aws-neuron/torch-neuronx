@@ -674,9 +674,7 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   auto start_time = std::chrono::steady_clock::now();
 
   // Dump IR details if requested (before compilation)
-  std::string ir_type = (!kernel_execution.HasCollectives() && NeuronCompiler::IsStableHLOEnabled())
-                            ? "StableHLO"
-                            : "XLA";
+  std::string ir_type = "StableHLO";
   if (debug::IsDumpEnabled()) {
     CompilationConfig config{.framework = "XLA",
                              .platform_target = utils::GetPlatformTarget(),

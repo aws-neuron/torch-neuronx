@@ -17,7 +17,6 @@ import os
 import shlex
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 from .compiler_config import CompilerConfig
 from .compiler_subprocess import CompilerSubprocess, NEFFCompilationError
@@ -74,7 +73,7 @@ class NeuronxCCWrapper:
                 return 1
 
             # Determine IR type based on file extension
-            ir_type = "StableHLO" if Path(parsed.input_file).suffix == ".mlir" else "XLA"
+            ir_type = "StableHLO"
 
             # Get cached neff or compile
             self.compiler.get_or_compile(

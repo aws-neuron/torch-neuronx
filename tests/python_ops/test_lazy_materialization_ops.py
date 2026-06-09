@@ -11,7 +11,6 @@ them with subsequent operations for better performance.
 
 NOTE: These tests require the following environment variables to be set:
     os.environ["TORCH_NEURONX_ENABLE_PROLOGUE"] = "1"
-    os.environ["TORCH_NEURONX_ENABLE_STABLEHLO"] = "1"
     os.environ["NEURON_LAUNCH_BLOCKING"] = "1"
 These must be set BEFORE running the tests to ensure lazy materialization
 optimizations work correctly and the tests validate the intended behavior.
@@ -33,7 +32,6 @@ class TestLazyMaterializationOps:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -81,7 +79,6 @@ class TestLazyMaterializationOps:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -129,7 +126,6 @@ class TestLazyMaterializationOps:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -194,7 +190,6 @@ class TestLazyMaterializationOps:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -242,7 +237,6 @@ class TestLazyMaterializationOps:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -305,7 +299,6 @@ class TestLazyMaterializationOps:
     )
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -465,7 +458,6 @@ class TestLazyMaterializationEdgeCases:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -506,7 +498,6 @@ class TestLazyMaterializationEdgeCases:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -565,7 +556,6 @@ class TestLazyMaterializationEdgeCases:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "
@@ -626,7 +616,6 @@ class TestLazyMaterializationEdgeCases:
 
     @pytest.mark.skipif(
         os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-        or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
         or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
         reason=(
             "Lazy materialization tests require prologue to be enabled (disabled in sync mode "

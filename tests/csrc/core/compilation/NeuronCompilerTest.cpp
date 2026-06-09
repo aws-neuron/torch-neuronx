@@ -310,7 +310,7 @@ TEST_F(NeuronCompilerTest, DebugArtifacts_CreatesWorkdirInDebugDir) {
   auto workdirs = FindWorkdirs(debug_dir);
   ASSERT_EQ(workdirs.size(), 1u);
   VerifyMetadataFiles(workdirs[0]);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
+  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 }
 
 TEST_F(NeuronCompilerTest, DebugArtifacts_CleansUpWorkdir_WhenPreserveFalse) {
@@ -394,25 +394,6 @@ TEST_F(NeuronCompilerTest, DebugArtifacts_StableHLO_UsesCorrectFilename) {
   auto workdirs = FindWorkdirs(temp_dir_);
   ASSERT_EQ(workdirs.size(), 1u);
   EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
-  EXPECT_FALSE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
-}
-
-TEST_F(NeuronCompilerTest, DebugArtifacts_XLA_UsesCorrectFilename) {
-  SetupMockCompiler(0, "xla_neff");
-  setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1", 1);
-  setenv("TORCH_NEURONX_DEBUG_DIR", temp_dir_.c_str(), 1);
-
-  std::vector<uint8_t> hlo = {0x01, 0x02, 0x03, 0x04};
-  CompilationConfig config = CreateTestConfig();
-  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config, "XLA");
-
-  std::string result_str(result.begin(), result.end());
-  EXPECT_EQ(result_str, "xla_neff");
-
-  auto workdirs = FindWorkdirs(temp_dir_);
-  ASSERT_EQ(workdirs.size(), 1u);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
-  EXPECT_FALSE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 }
 
 TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) {
@@ -422,8 +403,8 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) 
 
   std::vector<uint8_t> hlo = {0x01, 0x02, 0x03, 0x04};
   CompilationConfig config = CreateTestConfig("--verbose", "-O2");
-  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config, "XLA", "test_op",
-                                                                 "test_cache_key", "TestKernel");
+  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(
+      hlo, config, "StableHLO", "test_op", "test_cache_key", "TestKernel");
 
   auto workdirs = FindWorkdirs(temp_dir_);
   ASSERT_EQ(workdirs.size(), 1u);
@@ -445,7 +426,7 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) 
   EXPECT_EQ(lines[4], "trn2");
   EXPECT_EQ(lines[5], "2");
   EXPECT_EQ(lines[6], "-O2");
-  EXPECT_EQ(lines[7], "XLA");
+  EXPECT_EQ(lines[7], "StableHLO");
 
   // Verify compiler.txt content
   std::ifstream compiler_args_file(workdirs[0] + "/compiler.txt");
@@ -453,28 +434,6 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) 
                                     std::istreambuf_iterator<char>());
   EXPECT_NE(compiler_args_content.find("neuronx-cc"), std::string::npos);
   EXPECT_NE(compiler_args_content.find("--verbose"), std::string::npos);
-}
-
-TEST_F(NeuronCompilerTest, PreserveArtifacts_HloFileContainsInputData) {
-  SetupMockCompiler(0, "hlo_test_neff");
-  setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1", 1);
-  setenv("TORCH_NEURONX_DEBUG_DIR", temp_dir_.c_str(), 1);
-
-  std::vector<uint8_t> hlo = {0xAB, 0xCD, 0xEF, 0x12, 0x34};
-  CompilationConfig config = CreateTestConfig();
-  std::vector<uint8_t> result = NeuronCompiler::CompileHloToNeff(hlo, config);
-
-  auto workdirs = FindWorkdirs(temp_dir_);
-  ASSERT_EQ(workdirs.size(), 1u);
-  std::string hlo_path = workdirs[0] + "/module.hlo.pb";
-
-  ASSERT_TRUE(std::filesystem::exists(hlo_path)) << "module.hlo.pb not found";
-
-  std::ifstream hlo_file(hlo_path, std::ios::binary);
-  std::vector<uint8_t> hlo_content((std::istreambuf_iterator<char>(hlo_file)),
-                                   std::istreambuf_iterator<char>());
-
-  EXPECT_EQ(hlo_content, hlo);
 }
 
 TEST_F(NeuronCompilerTest, PreserveArtifacts_StableHloFileContainsInputData) {
@@ -512,7 +471,7 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_AllFilesCreatedTogether) {
   auto workdirs = FindWorkdirs(temp_dir_);
   ASSERT_EQ(workdirs.size(), 1u);
   VerifyMetadataFiles(workdirs[0]);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
+  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 }
 
 TEST_F(NeuronCompilerTest, DebugDir_RelativePath_CreatesDirectoryAndWorkdir) {
@@ -540,7 +499,7 @@ TEST_F(NeuronCompilerTest, DebugDir_RelativePath_CreatesDirectoryAndWorkdir) {
   auto workdirs = FindWorkdirs(relative_debug_dir);
   ASSERT_EQ(workdirs.size(), 1u);
   VerifyMetadataFiles(workdirs[0]);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
+  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 
   std::string cmd = "rm -rf " + relative_debug_dir;
   std::system(cmd.c_str());
@@ -564,7 +523,7 @@ TEST_F(NeuronCompilerTest, DebugDir_AbsolutePath_CreatesDirectoryAndWorkdir) {
   auto workdirs = FindWorkdirs(absolute_debug_dir);
   ASSERT_EQ(workdirs.size(), 1u);
   VerifyMetadataFiles(workdirs[0]);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
+  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 }
 
 TEST_F(NeuronCompilerTest, DebugDir_NonExistentPath_CreatesEntireHierarchy) {
@@ -591,7 +550,7 @@ TEST_F(NeuronCompilerTest, DebugDir_NonExistentPath_CreatesEntireHierarchy) {
   auto workdirs = FindWorkdirs(nonexistent_debug_dir);
   ASSERT_EQ(workdirs.size(), 1u);
   VerifyMetadataFiles(workdirs[0]);
-  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.hlo.pb"));
+  EXPECT_TRUE(std::filesystem::exists(workdirs[0] + "/module.mlir"));
 }
 
 TEST_F(NeuronCompilerTest, DebugDir_RelativePathWithDotDot_WorksCorrectly) {

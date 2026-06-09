@@ -6,7 +6,10 @@ import os
 import torch
 
 from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type
-from torch_neuronx.utils import convert_for_neuron
+from torch_neuronx.utils import (
+    convert_for_neuron,
+    is_sync_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +79,12 @@ class ArgumentProcessor:
             Tuple of preprocessed inputs
         """
 
-        # Prologues are enabled by default, disabled only if env var says so
-        prologue_disabled = os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in (
-            "0",
-            "false",
+        # Prologues are enabled by default, but disabled if:
+        # 1. TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
+        # 2. OR sync mode is enabled
+        prologue_disabled = (
+            os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false")
+            or is_sync_mode_enabled()
         )
 
         # Determine target device from first non-scalar tensor

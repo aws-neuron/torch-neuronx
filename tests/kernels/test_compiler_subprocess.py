@@ -388,10 +388,10 @@ class TestCompilerSubprocess:
             nfs_cache_dir=temp_dirs["nfs"], local_cache_dir=temp_dirs["local"]
         )
 
-        result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1", "XLA")
+        result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1", "StableHLO")
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "XLA")
+        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "StableHLO")
 
     @patch(
         "torch_neuronx.kernels.compiler_subprocess.CompilerSubprocess.compile_hlo_protobuf_to_neff"
@@ -470,7 +470,7 @@ class TestCompilerSubprocess:
             result = compiler.get_or_compile(sample_hlo, mock_config, "lnc1")
 
         assert result == sample_neff
-        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "XLA")
+        mock_compile.assert_called_once_with(sample_hlo, mock_config, "lnc1", "StableHLO")
 
         # Verify NFS cache was populated
         key = compiler._generate_cache_key(sample_hlo, mock_config, "lnc1", "v1.0")

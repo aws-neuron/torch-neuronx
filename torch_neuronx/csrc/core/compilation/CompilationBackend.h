@@ -26,7 +26,7 @@ class CompilationBackend {
   //
   // Args:
   //   hlo_bytes: Serialized HLO IR
-  //   ir_type: "XLA" or "StableHLO"
+  //   ir_type: "StableHLO"
   //   op_name: Operation name for IR dumping
   //   cache_key: Cache key for IR dumping
   //   compile_fn: Local compilation function (used by local backend, ignored by service)

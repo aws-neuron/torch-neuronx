@@ -12,7 +12,6 @@ Uses metrics for precise assertions. Optionally enable double buffering
 and debug mode for additional coverage.
 
 Requires:
-    TORCH_NEURONX_ENABLE_STABLEHLO=1
     TORCH_NEURONX_ENABLE_CONCATENATION=1
 
 Optional:
@@ -20,7 +19,6 @@ Optional:
     TORCH_NEURONX_CONCATENATION_DEBUG_MODE=1 (analysis only — not for correctness tests)
 
 Run with:
-    TORCH_NEURONX_ENABLE_STABLEHLO=1 \
     TORCH_NEURONX_ENABLE_CONCATENATION=1 \
     TORCH_NEURONX_ENABLE_DOUBLE_BUFFERING=1 \
     pytest tests/python_ops/test_view_insertion_concat.py -xvs
@@ -40,9 +38,7 @@ from tests.utils.neuron_test_utils import (
 
 
 def is_enabled():
-    return os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1" and os.environ.get(
-        "TORCH_NEURONX_ENABLE_STABLEHLO", "1"
-    ) not in ("0", "false")
+    return os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1"
 
 
 def is_debug_mode():
@@ -51,7 +47,7 @@ def is_debug_mode():
 
 skip_if_not_enabled = pytest.mark.skipif(
     not is_enabled(),
-    reason="Requires TORCH_NEURONX_ENABLE_CONCATENATION=1 and TORCH_NEURONX_ENABLE_STABLEHLO=1",
+    reason="Requires TORCH_NEURONX_ENABLE_CONCATENATION=1",
 )
 
 
