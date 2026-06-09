@@ -402,7 +402,7 @@ class TestMemoryStats:
         assert analysis["largest_free"] >= 0
         assert analysis["num_segments"] >= 1
         assert 0 <= analysis["fragmentation_index"] <= 1
-        assert analysis["memory_efficiency"] >= 0
+        assert analysis["memory_density"] >= 0
         assert analysis["internal_fragmentation"] >= 0
         assert analysis["cached_free"] >= 0
         del x
@@ -437,7 +437,7 @@ class TestMemoryStats:
         assert analysis["active_bytes"] == 0
         assert analysis["free_chunks"] >= 0
         assert analysis["fragmentation_index"] == 0.0
-        assert analysis["memory_efficiency"] == 0.0
+        assert analysis["memory_density"] == 0.0
         assert analysis["num_segments"] == 0
 
     def test_segment_pool_analysis_summary_empty_state(self):
