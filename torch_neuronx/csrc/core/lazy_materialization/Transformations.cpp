@@ -1906,13 +1906,12 @@ std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& 
   }
 
   // SCATTER_IOTA for slice patterns.
-  // Controlled by TORCH_NEURONX_ENABLE_SCATTER_IOTA (default OFF until compiler fix).
-  // When OFF, patterns requiring SCATTER_IOTA fall back to contiguous temp + CopyBackToOriginal.
-  //
-  // TODO(mengchiy): Change default to ON once compiler fix comes in.
+  // Controlled by TORCH_NEURONX_ENABLE_SCATTER_IOTA (default ON).
+  // When OFF (=0), patterns requiring SCATTER_IOTA fall back to contiguous temp +
+  // CopyBackToOriginal.
   static const bool scatter_iota_enabled = []() {
     const char* env = std::getenv("TORCH_NEURONX_ENABLE_SCATTER_IOTA");
-    return env != nullptr && std::string(env) == "1";
+    return env == nullptr || std::string(env) != "0";
   }();
   if (layout.has_slice && !scatter_iota_enabled) {
     TORCH_NEURONX_DEBUG("TryCreateEpilogue: SCATTER_IOTA disabled via env var", "op=", op_name);

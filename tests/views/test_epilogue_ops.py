@@ -33,12 +33,11 @@ def epilogue_enabled():
 
 
 def scatter_iota_enabled():
-    """Check if SCATTER_IOTA epilogue is enabled (default OFF until compiler fix).
+    """Check if SCATTER_IOTA epilogue is enabled (default ON).
 
-    TODO(mengchiy): Remove this helper and all skipif(not scatter_iota_enabled())
-    decorators once SCATTER_IOTA is re-enabled by default after compiler fix.
+    Set TORCH_NEURONX_ENABLE_SCATTER_IOTA=0 to disable.
     """
-    return os.environ.get("TORCH_NEURONX_ENABLE_SCATTER_IOTA", "0") == "1"
+    return os.environ.get("TORCH_NEURONX_ENABLE_SCATTER_IOTA", "1") != "0"
 
 
 def count_copy_ops(fn):
