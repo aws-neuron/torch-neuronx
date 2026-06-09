@@ -83,8 +83,8 @@ NrtTensorPool::TensorAllocationResult NrtTensorPool::AllocateWithRetry(
         }
         at::neuron::nrt::FreeTensor(&tensor);
         if (!was_recorded) {
-          at::neuron::metrics::RecordDeallocationCompleted(device, size, tensor_data_ptr, stream_id,
-                                                           stack_ctx);
+          at::neuron::metrics::RecordDeallocationCompleted(device, size, size, tensor_data_ptr,
+                                                           stream_id, stack_ctx);
         }
       }
     };
@@ -111,7 +111,7 @@ NrtTensorPool::TensorAllocationResult NrtTensorPool::AllocateWithRetry(
     status = at::neuron::nrt::AllocateTensor(
         NRT_TENSOR_PLACEMENT_DEVICE, c10_neuron::get_vnc_id(device_id_), size, nullptr, &raw);
     if (status == NRT_SUCCESS && raw) {
-      at::neuron::metrics::RecordOOMRetry(device_id_);
+      at::neuron::metrics::RecordOOMRetry(device_id_, size, stream_id);
       return finalize_allocation(raw);
     }
   }
@@ -432,7 +432,8 @@ void neuron_deleter(void* ctx) {
     bool was_recorded = deallocation_recorded->exchange(true, std::memory_order_acq_rel);
     if (!was_recorded) {
       at::neuron::metrics::RecordDeallocation(device, size, size, ptr, stream_id, stack_ctx);
-      at::neuron::metrics::RecordDeallocationCompleted(device, size, ptr, stream_id, stack_ctx);
+      at::neuron::metrics::RecordDeallocationCompleted(device, size, size, ptr, stream_id,
+                                                       stack_ctx);
     }
   }
 
@@ -773,7 +774,8 @@ void AllocBind(void* ptr, size_t size, int device_id) {
     info->deallocation_recorded = std::make_shared<std::atomic<bool>>(false);
   }
 
-  at::neuron::metrics::RecordNewAllocation(device_id, size, block->size, ptr,
+  // Record the ALLOC trace entry with on the real NRT VA (block->data_ptr).
+  at::neuron::metrics::RecordNewAllocation(device_id, size, block->size, block->data_ptr,
                                            info->allocation_stream.id(), info->context);
 }
 
@@ -789,9 +791,11 @@ void DeallocRelease(void* ptr, size_t size, int device_id, c10::StreamId stream_
     }
   }
 
-  // Capture block size before Free — merge may change block->size.
+  // Capture block size and VA before Free. Merge may change block->size, and
+  // the VA needs to match what AllocBind recorded for ALLOC/FREE pairing.
   Block* block = info->block;
   size_t block_size = block ? block->size : size;
+  void* block_va = block ? block->data_ptr : ptr;
 
   // Free the block back to the segment pool.
   if (block) {
@@ -799,9 +803,9 @@ void DeallocRelease(void* ptr, size_t size, int device_id, c10::StreamId stream_
     pool.Free(block);
   }
 
-  at::neuron::metrics::RecordDeallocation(device_id, size, block_size, ptr,
+  at::neuron::metrics::RecordDeallocation(device_id, size, block_size, block_va,
                                           info->allocation_stream.id(), info->context);
-  at::neuron::metrics::RecordDeallocationCompleted(device_id, size, ptr,
+  at::neuron::metrics::RecordDeallocationCompleted(device_id, size, block_size, block_va,
                                                    info->allocation_stream.id(), info->context);
 
   AllocatorRegistry::getInstance().remove(ptr);

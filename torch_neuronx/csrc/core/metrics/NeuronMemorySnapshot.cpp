@@ -181,6 +181,14 @@ const char* TraceActionToString(TraceAction action) {
       return "snapshot";
     case TraceAction::OOM:
       return "oom";
+    case TraceAction::ALLOC_DEFERRED:
+      return "alloc_deferred";
+    case TraceAction::ALLOC_DRAIN_RETRY_OK:
+      return "alloc_drain_retry_ok";
+    case TraceAction::ALLOC_DRAIN_RETRY_FAIL:
+      return "alloc_drain_retry_fail";
+    case TraceAction::ALLOC_CACHE_DRAIN_RETRY:
+      return "alloc_cache_drain_retry";
     default:
       return "unknown";
   }
@@ -215,13 +223,13 @@ void RecordHistory(bool enabled, RecordContext when, bool include_cpp_frames, si
 }
 
 void RecordTrace(TraceAction action, int device, size_t addr, size_t size, c10::StreamId stream,
-                 std::shared_ptr<StackContext> context, size_t device_free) {
+                 std::shared_ptr<StackContext> context, size_t device_free, size_t block_size) {
   if (!g_record_enabled.load(std::memory_order_acquire)) {
     return;
   }
 
   TraceEntry entry(action, device, addr, size, stream, GetCurrentTimestampUs(), std::move(context),
-                   device_free);
+                   device_free, block_size);
 
   getDeviceBuffer(device).insert(std::move(entry));
 }
@@ -336,7 +344,7 @@ SnapshotInfo snapshot() {
   // Record a SNAPSHOT trace event for correlation
   if (g_record_enabled.load(std::memory_order_acquire)) {
     // Record on device 0 by default
-    RecordTrace(TraceAction::SNAPSHOT, 0, 0, 0, 0, nullptr, 0);
+    RecordTrace(TraceAction::SNAPSHOT, 0, 0, 0, 0, nullptr, 0, 0);
   }
 
   // Get segments from the allocator - already in unified SegmentInfo format
