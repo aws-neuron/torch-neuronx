@@ -23,14 +23,14 @@ class HloCompiler:
     def compile_to_neff(
         self,
         hlo_protobuf: bytes,
-        ir_type: str = "XLA",
+        ir_type: str = "StableHLO",
         neff_cache_key: str | None = None,
     ) -> bytes:
         """Compile HLO protobuf or MLIR to NEFF.
 
         Args:
             hlo_protobuf: HLO protobuf bytes or MLIR bytes
-            ir_type: Type of IR ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+            ir_type: Type of IR ("StableHLO" for MLIR)
             neff_cache_key: Optional override for NFS cache key
 
         Returns:

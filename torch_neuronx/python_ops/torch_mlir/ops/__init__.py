@@ -3,6 +3,7 @@
 # Import all ops from submodules to maintain backward compatibility
 from .activation import *  # noqa: F403
 from .binary import *  # noqa: F403
+from .collectives import *  # noqa: F403
 from .comparison import *  # noqa: F403
 from .convolution import *  # noqa: F403
 from .copy import *  # noqa: F403

@@ -12,11 +12,9 @@ concatenated, the merged module takes X in one shape and inserts a reshape for
 the second module's expected shape.
 
 Requires:
-    TORCH_NEURONX_ENABLE_STABLEHLO=1
     TORCH_NEURONX_ENABLE_CONCATENATION=1
 
 Run with:
-    TORCH_NEURONX_ENABLE_STABLEHLO=1 \
     TORCH_NEURONX_ENABLE_CONCATENATION=1 \
     pytest tests/python_ops/test_shared_input_reshape_concat.py -xvs
 """
@@ -34,14 +32,12 @@ from tests.utils.neuron_test_utils import (
 
 
 def is_enabled():
-    return os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1" and os.environ.get(
-        "TORCH_NEURONX_ENABLE_STABLEHLO", "1"
-    ) not in ("0", "false")
+    return os.environ.get("TORCH_NEURONX_ENABLE_CONCATENATION", "0") == "1"
 
 
 skip_if_not_enabled = pytest.mark.skipif(
     not is_enabled(),
-    reason="Requires TORCH_NEURONX_ENABLE_CONCATENATION=1 and TORCH_NEURONX_ENABLE_STABLEHLO=1",
+    reason="Requires TORCH_NEURONX_ENABLE_CONCATENATION=1",
 )
 
 

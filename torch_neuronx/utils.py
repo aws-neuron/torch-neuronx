@@ -156,15 +156,6 @@ def use_mlir_aten_ops():
     return os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
 
 
-def is_stablehlo_enabled() -> bool:
-    """Check if StableHLO lowering is enabled via environment variable.
-
-    Returns:
-        True by default. False if TORCH_NEURONX_ENABLE_STABLEHLO is set to "0" or "false".
-    """
-    return os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") not in ("0", "false")
-
-
 def is_sync_mode_enabled():
     """Check if legacy launch blocking is enabled via environment variable.
 

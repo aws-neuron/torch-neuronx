@@ -953,17 +953,14 @@ public:
     if (!inputType)
       return rewriter.notifyMatchFailure(op, "input must be ranked tensor");
 
-    auto replicaGroupsAttr = createReplicaGroups(rewriter, group).first;
+    auto [replicaGroupsAttr, groupSize] = createReplicaGroups(rewriter, group);
     auto outType =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType(0)));
 
     // all_to_all uses split dimension 0
     uint64_t splitDim = 0;
     uint64_t concatDim = 0;
-    int64_t worldSize = 1;
-    if (const char *envWorldSize = std::getenv("WORLD_SIZE")) {
-      worldSize = std::strtol(envWorldSize, nullptr, 10);
-    }
+    int64_t worldSize = groupSize;
 
     // Check if splits are uniform
     bool isUniform = true;

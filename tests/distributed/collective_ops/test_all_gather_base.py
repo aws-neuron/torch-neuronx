@@ -299,7 +299,6 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test _allgather_base with input having more dims than output."""
         self.distributed_tester.run_test(run_all_gather_base_reverse_test)
 
-    @pytest.mark.xfail(reason="AG base with stacking outputs not supported yet")
     def test_all_gather_stack_outputs(self):
         """Test all_gather with stacked output tensors."""
         self.distributed_tester.run_test(run_all_gather_stack_outputs_test)
@@ -308,7 +307,6 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test all_gather with multiple single-dimension tensors."""
         self.distributed_tester.run_test(run_all_gather_multiple_single_dim_test)
 
-    @pytest.mark.xfail(reason="5GB tensor test expected to fail")
     def test_5gb_tensor(self):
         """Test all_gather_into_tensor with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)

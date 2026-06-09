@@ -152,24 +152,14 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
   const bool outputs_downcasted = dispatch::DowncastTensorList(working_outputs);
   (void)inputs_downcasted;  // Input downcast is permanent for this call; no copy-back.
 
-  // For AVG, append divisor tensor to inputs. Build it at the (possibly
-  // downcasted) working-input dtype so the compiled graph stays dtype-consistent.
-  std::vector<at::Tensor> effective_inputs = working_inputs;
-  if (reduce_op == static_cast<int>(c10d::ReduceOp::AVG) && !working_inputs.empty()) {
-    auto divisor = torch::tensor(
-        static_cast<double>(replica_groups[0].size()),
-        torch::TensorOptions().dtype(working_inputs[0].dtype()).device(working_inputs[0].device()));
-    effective_inputs.push_back(divisor);
-  }
-
   const auto& op_str = OpTypeToString(op_type);
   auto cache_key = at::neuron::CacheKeyGenerator::GenerateCollective(
-      op_str, effective_inputs, replica_groups, reduce_op, slice_output);
+      op_str, working_inputs, replica_groups, reduce_op, slice_output);
   auto entry = dispatch::NeuronDispatcher::Instance().GetOrLowerCollectiveOperation(
-      cache_key, lower_callback_, op_type, effective_inputs, working_outputs, replica_groups,
+      cache_key, lower_callback_, op_type, working_inputs, working_outputs, replica_groups,
       reduce_op, slice_output);
 
-  auto transform_result = torch_neuronx::ProcessInputTransformations(op_str, effective_inputs,
+  auto transform_result = torch_neuronx::ProcessInputTransformations(op_str, working_inputs,
                                                                      /*has_collectives=*/true);
   int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, working_outputs);
   auto [input_refs, input_contexts] =

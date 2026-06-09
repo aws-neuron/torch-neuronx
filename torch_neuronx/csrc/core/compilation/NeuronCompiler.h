@@ -8,7 +8,8 @@ namespace at::neuron {
 
 // Configuration for neuronx-cc compilation.
 struct CompilationConfig {
-  // Framework type for compilation (e.g., "XLA", "NKI")
+  // Framework type passed to neuronx-cc (e.g., "XLA", "NKI"). "XLA" is the
+  // canonical value neuronx-cc accepts for StableHLO MLIR input.
   std::string framework;
 
   // Platform target (e.g., "trn1", "trn2", "inf1")
@@ -37,7 +38,7 @@ class NeuronCompiler {
   // Args:
   //   hlo_bytes: The HLO module serialized as protobuf bytes or MLIR bytes
   //   config: Compilation configuration with framework, platform, and optimization settings
-  //   ir_type: Type of IR being compiled ("XLA" for HLO protobuf, "StableHLO" for MLIR)
+  //   ir_type: Type of IR being compiled ("StableHLO" for MLIR)
   //   op_name: Optional operation name for IR dumping
   //   cache_key: Optional cache key for IR dumping
   //   kernel_class_name: Optional kernel class name for IR dumping
@@ -49,16 +50,8 @@ class NeuronCompiler {
   //   std::runtime_error if compilation fails or neuronx-cc is not found
   static std::vector<uint8_t> CompileHloToNeff(
       const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
-      const std::string& ir_type = "XLA", const std::string& op_name = "",
+      const std::string& ir_type = "StableHLO", const std::string& op_name = "",
       const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");
-
-  // Checks if StableHLO lowering is enabled via the TORCH_NEURONX_ENABLE_STABLEHLO environment
-  // variable.
-  //
-  // Returns:
-  //   true by default. false only if TORCH_NEURONX_ENABLE_STABLEHLO is explicitly set to "0" or
-  //   "false"
-  static bool IsStableHLOEnabled();
 };
 
 }  // namespace at::neuron

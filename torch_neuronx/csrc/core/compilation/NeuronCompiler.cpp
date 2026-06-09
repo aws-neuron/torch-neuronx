@@ -30,7 +30,6 @@ CompilationConfig CompilationConfig::FromEnvironment() {
 namespace {
 
 // File names used during compilation process.
-constexpr const char* kHloFilename = "module.hlo.pb";
 constexpr const char* kMlirFilename = "module.mlir";
 constexpr const char* kBirFilename = "bir.json";
 constexpr const char* kNeffFilename = "module.neff";
@@ -59,17 +58,13 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
   TempDirectory temp_compilation_dir(workdir, /*is_full_path=*/true, preserve);
   const std::string& workdir_str = temp_compilation_dir.path();
 
-  // Determine file format based on ir_type parameter
-  // "BIR" requires sg00/ subdirectory, "StableHLO" uses MLIR format, "XLA" (default) uses HLO
-  // protobuf
+  // "BIR" requires sg00/ subdirectory; everything else is StableHLO (MLIR).
   std::string hlo_input_file;
   if (ir_type == "BIR") {
     std::filesystem::create_directories(temp_compilation_dir.path() + "/sg00");
     hlo_input_file = std::string("sg00/") + kBirFilename;
-  } else if (ir_type == "StableHLO") {
-    hlo_input_file = kMlirFilename;
   } else {
-    hlo_input_file = kHloFilename;
+    hlo_input_file = kMlirFilename;
   }
 
   // Write HLO bytes to temporary file
@@ -147,19 +142,6 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
                            workdir_str);
 
   return temp_compilation_dir.ReadFile(kNeffFilename);
-}
-
-bool NeuronCompiler::IsStableHLOEnabled() {
-  static const bool enabled = []() {
-    const char* env = std::getenv("TORCH_NEURONX_ENABLE_STABLEHLO");
-    // Default to enabled (true). Only disable if explicitly set to "0" or "false"
-    if (!env) {
-      return true;  // Default: enabled
-    }
-    std::string env_str(env);
-    return !(env_str == "0" || env_str == "false");
-  }();
-  return enabled;
 }
 
 }  // namespace at::neuron

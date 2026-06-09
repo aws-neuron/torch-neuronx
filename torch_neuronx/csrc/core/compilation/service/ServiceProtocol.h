@@ -20,7 +20,7 @@ enum class ServiceMsgType : uint8_t {
 struct CompileRequest {
   uint64_t req_id;
   std::string hlo_file_path;
-  std::string ir_type;             // "XLA" or "StableHLO" — per-HLO, depends on HasCollectives()
+  std::string ir_type;             // "StableHLO"
   std::string op_name;             // operation name for IR dumping
   std::string cache_key;           // cache key for IR dumping
   std::string optimization_level;  // per-op from kernel_execution.GetOptimizationLevel()

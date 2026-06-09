@@ -30,7 +30,6 @@ Run with:
 
 NOTE: These tests require the prologue system to be enabled. They are skipped when:
     - NEURON_LAUNCH_BLOCKING=1 (sync mode disables prologue)
-    - TORCH_NEURONX_ENABLE_STABLEHLO=0 (StableHLO disabled)
     - TORCH_NEURONX_ENABLE_PROLOGUE=0 (prologue explicitly disabled)
 """
 
@@ -46,11 +45,9 @@ import torch
 
 # These tests require the prologue system to be enabled. The prologue is disabled in:
 # 1. Sync mode (NEURON_LAUNCH_BLOCKING=1)
-# 2. When StableHLO is disabled (TORCH_NEURONX_ENABLE_STABLEHLO=0)
-# 3. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
+# 2. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
 SKIP_PROLOGUE_DISABLED = pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-    or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
     or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
     reason=(
         "Compound sweep tests require prologue to be enabled (disabled in sync mode "

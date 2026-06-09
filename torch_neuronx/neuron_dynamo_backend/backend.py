@@ -14,9 +14,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
 
-# Import process group variable tracking (needed for registration side effect)
 from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
-from torch_neuronx.neuron_dynamo_backend import process_group_variable
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_model_name,
@@ -40,9 +38,6 @@ from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Ensure process group registration happens
-_ = process_group_variable
 
 
 def _compile_fx_to_stablehlo(
