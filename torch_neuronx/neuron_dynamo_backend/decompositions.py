@@ -110,6 +110,72 @@ neuron_decompositions = get_decompositions(
         aten.log_sigmoid_forward,
         aten.log_sigmoid_backward,
         aten.addmv,
+        aten.erfc,  # Consider adding direct lowering to erf lookup
+        aten.igamma,
+        aten.igammac,
+        aten.digamma,
+        aten.gcd,
+        aten.lcm,
+        aten.lgamma,
+        aten.mvlgamma,
+        aten.i0,
+        aten.sinc,
+        aten.nextafter,
+        aten.vdot,
+        aten.take,
+        aten.frexp.Tensor,
+        aten.copysign.Scalar,
+        aten.xlogy,
+        aten.special_xlog1py,
+        aten.special_zeta,
+        aten.special_entr,
+        aten.special_log_ndtr,
+        aten.special_ndtri,
+        aten.special_erfcx,
+        aten.special_i0e,
+        aten.special_i1,
+        aten.special_i1e,
+        aten.special_bessel_j0,
+        aten.special_bessel_j1,
+        aten.special_spherical_bessel_j0,
+        aten.huber_loss,
+        aten.huber_loss_backward,
+        aten.smooth_l1_loss,
+        aten.smooth_l1_loss_backward,
+        aten.soft_margin_loss,
+        aten.soft_margin_loss_backward,
+        aten.glu_backward,
+        aten.hardsigmoid_backward,
+        aten.hardswish_backward,
+        aten.logit_backward,
+        aten._prelu_kernel,
+        aten._prelu_kernel_backward,
+        aten.bitwise_left_shift.Scalar_Tensor,
+        aten.bitwise_left_shift.Tensor_Scalar,
+        aten.bitwise_right_shift.Scalar_Tensor,
+        aten.bitwise_right_shift.Tensor_Scalar,
+        aten.bitwise_and.Scalar_Tensor,
+        aten.bitwise_or.Scalar_Tensor,
+        aten.bitwise_xor.Scalar_Tensor,
+        aten.normal,
+        aten.cauchy,
+        aten.geometric,
+        aten.log_normal,
+        aten.logspace,
+        aten.index_fill,
+        aten._unsafe_masked_index,
+        aten._unsafe_masked_index_put_accumulate,
+        aten.bucketize.Scalar,
+        aten.isin,
+        aten.std_mean.correction,
+        aten.all.dims,
+        aten._addmm_activation,
+        aten._chunk_cat,
+        aten.batch_norm_backward,
+        aten.grid_sampler_2d,
+        aten.remainder.Scalar_Tensor,
+        aten.rsub.Tensor,
+        aten.unfold_backward,
     ]
 )
 
@@ -955,6 +1021,53 @@ def scalar_tensor(
     """
     # Use full with empty shape to create a scalar tensor
     return torch.full((), value, dtype=dtype, device=device)
+
+
+@register_decomposition(
+    [aten.linspace.Scalar_Tensor, aten.linspace.Tensor_Scalar, aten.linspace.Tensor_Tensor]
+)
+def linspace_decomposition(
+    start,
+    end,
+    steps,
+    *,
+    dtype=None,
+    device=None,
+    layout=torch.strided,
+    pin_memory=False,
+    requires_grad=False,
+):
+    """Decompose linspace ensuring all intermediate tensors share the input device."""
+    # Infer device from tensor inputs when not explicitly provided
+    if device is None:
+        if isinstance(start, torch.Tensor):
+            device = start.device
+        elif isinstance(end, torch.Tensor):
+            device = end.device
+
+    dtype = dtype or torch.get_default_dtype()
+
+    if steps == 0:
+        return torch.full((0,), 0, dtype=dtype, device=device)
+    if steps == 1:
+        if isinstance(start, torch.Tensor):
+            return start.to(dtype=dtype, device=device).reshape(1)
+        return torch.full((1,), start, dtype=dtype, device=device)
+
+    # Cast start/end to float64 for precision
+    start = start.to(torch.float64) if isinstance(start, torch.Tensor) else float(start)
+    end = end.to(torch.float64) if isinstance(end, torch.Tensor) else float(end)
+
+    step = (end - start) / (steps - 1)
+    rg = torch.arange(0, steps, device=device, dtype=torch.float64)
+
+    # Use lerp-style computation for endpoint accuracy
+    out = torch.where(
+        rg < steps / 2,
+        start + step * rg,
+        end - step * ((steps - 1) - rg),
+    )
+    return out.to(dtype)
 
 
 @register_decomposition([aten.index_copy.default])
