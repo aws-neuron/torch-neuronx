@@ -272,7 +272,649 @@ std::optional<BroadcastInfo> DetectBroadcastPattern(const at::Tensor& tensor) {
   return BroadcastInfo{base_shape, broadcasted_dims};
 }
 
+// ============================================================================
+// FOLDED DECOMPOSITION — Shared Types
+// ============================================================================
+
+struct FoldedDecompositionResult {
+  at::Tensor base_tensor;
+  std::vector<int64_t> base_shape;
+  std::vector<TensorTransformation> transforms;
+};
+
+// ============================================================================
+// SINGLE-GROUP DECOMPOSITION
+// Searches for a single compact group of consecutive axes (in stride-sorted
+// order) that form a folded split of a base axis. Restricted to rank >= 3.
+//
+// Example (narrow→view→permute):
+//   x = randn(2, 3, 5).narrow(2, 0, 4).view(2, 3, 2, 2).permute(2, 0, 3, 1)
+//   shape=[2, 2, 2, 3], strides=[2, 15, 1, 5]
+//   → base [2, 3, 5] → SLICE [2, 3, 4] → RESHAPE [2, 3, 2, 2] → TRANSPOSE
+// ============================================================================
+std::optional<FoldedDecompositionResult> TrySingleGroupDecomposition(
+    const at::Tensor& tensor, const std::vector<int64_t>& pre_order,
+    const std::vector<int64_t>& pre_shape, const std::vector<int64_t>& pre_stride,
+    const std::string& op_name, size_t input_index) {
+  auto shape = tensor.sizes();
+  auto strides = tensor.strides();
+  int64_t ndims = shape.size();
+  int64_t offset = tensor.storage_offset();
+
+  if (ndims < 3) return std::nullopt;
+
+  {
+    for (int64_t group_len = 2; group_len <= ndims; ++group_len) {
+      for (int64_t group_start = 1; group_start <= ndims - group_len; ++group_start) {
+        int64_t group_end = group_start + group_len - 1;
+
+        // Constraint: keep folded-axis inference narrow — don't allow large trailing groups
+        if (group_end == ndims - 1 && group_len > 2) continue;
+
+        // Compute group shape and numel
+        int64_t group_numel = 1;
+        for (int64_t pos = group_start; pos <= group_end; ++pos) {
+          group_numel *= pre_shape[pos];
+        }
+        if (group_numel <= 1) continue;
+
+        // Find the first non-unit dim in the group and the outer non-unit dim
+        int64_t outer_pos = -1;
+        for (int64_t pos = group_start - 1; pos >= 0; --pos) {
+          if (pre_shape[pos] != 1) {
+            outer_pos = pos;
+            break;
+          }
+        }
+        int64_t first_group_pos = -1;
+        for (int64_t pos = group_start; pos <= group_end; ++pos) {
+          if (pre_shape[pos] != 1) {
+            first_group_pos = pos;
+            break;
+          }
+        }
+        int64_t last_group_pos = -1;
+        for (int64_t pos = group_end; pos >= group_start; --pos) {
+          if (pre_shape[pos] != 1) {
+            last_group_pos = pos;
+            break;
+          }
+        }
+        if (outer_pos < 0 || first_group_pos < 0 || last_group_pos < 0) continue;
+
+        // Check if outer stride == compact stride of the group (would mean no fold needed)
+        // The compact outer stride is inner_stride * group_numel: if the group were a
+        // contiguous sub-dim, this is what the next outer stride would be.
+        int64_t inner_stride = pre_stride[last_group_pos];
+        int64_t expected_compact_outer = inner_stride * group_numel;
+        if (pre_stride[outer_pos] == expected_compact_outer) {
+          // No stride gap — this isn't a folded pattern, skip
+          continue;
+        }
+
+        // Verify group axes have compact strides (each = next × next_size, from right to left)
+        int64_t expected_stride = inner_stride;
+        bool compact = true;
+        for (int64_t pos = group_end; pos >= group_start; --pos) {
+          if (pre_shape[pos] == 1) continue;
+          if (pre_stride[pos] != expected_stride) {
+            compact = false;
+            break;
+          }
+          expected_stride *= pre_shape[pos];
+        }
+        if (!compact) continue;
+
+        // Compute folded base size: outer_stride / inner_stride
+        int64_t outer_stride = pre_stride[outer_pos];
+        if (inner_stride <= 0 || outer_stride % inner_stride != 0) continue;
+        int64_t folded_base_size = outer_stride / inner_stride;
+        if (folded_base_size < group_numel) continue;
+
+        // Build base shape: replace the group with a single folded dimension
+        std::vector<int64_t> base_shape;
+        for (int64_t pos = 0; pos < group_start; ++pos) base_shape.push_back(pre_shape[pos]);
+        base_shape.push_back(folded_base_size);
+        for (int64_t pos = group_end + 1; pos < ndims; ++pos) base_shape.push_back(pre_shape[pos]);
+
+        // Build the required shape (after slice, before reshape)
+        std::vector<int64_t> required_shape;
+        for (int64_t pos = 0; pos < group_start; ++pos) required_shape.push_back(pre_shape[pos]);
+        required_shape.push_back(group_numel);
+        for (int64_t pos = group_end + 1; pos < ndims; ++pos)
+          required_shape.push_back(pre_shape[pos]);
+
+        // Compute base strides (contiguous)
+        auto base_strides = ComputeRowMajorStrides(base_shape);
+
+        // Decompose storage offset into per-dimension starts
+        int64_t remaining_offset = offset;
+        std::vector<int64_t> starts(base_shape.size(), 0);
+        for (size_t i = 0; i < base_shape.size(); ++i) {
+          if (base_strides[i] > 0 && remaining_offset >= base_strides[i]) {
+            starts[i] = remaining_offset / base_strides[i];
+            remaining_offset %= base_strides[i];
+          }
+        }
+        int64_t base_offset = remaining_offset;  // leftover becomes base_offset
+
+        // Validate: slice must fit within base dims
+        bool valid_slice = true;
+        for (size_t i = 0; i < base_shape.size(); ++i) {
+          if (starts[i] + required_shape[i] > base_shape[i]) {
+            valid_slice = false;
+            break;
+          }
+        }
+        if (!valid_slice) continue;
+
+        // Build permutation: pre_order maps pre-sorted position → original logical dim
+        // We need perm such that applying permute(perm) to pre_shape gives logical shape
+        std::vector<int64_t> perm(ndims);
+        for (int64_t i = 0; i < ndims; ++i) {
+          // Find where original dim i appears in pre_order
+          for (int64_t j = 0; j < ndims; ++j) {
+            if (pre_order[j] == i) {
+              perm[i] = j;
+              break;
+            }
+          }
+        }
+
+        // Verify reconstruction: apply transforms to base_shape and check strides match
+        // Compute what the logical strides would be after slice→reshape→permute
+        // Start with base contiguous strides after the fold
+        std::vector<int64_t> folded_strides(ndims);
+        {
+          // Strides in pre-order after unfolding the group from base
+          std::vector<int64_t> pre_reconstructed(ndims);
+          int64_t folded_dim_stride = base_strides[group_start];  // stride of the folded base dim
+          // Axes before group: same as base strides
+          for (int64_t pos = 0; pos < group_start; ++pos) {
+            pre_reconstructed[pos] = base_strides[pos];
+          }
+          // Group axes: compact from folded_dim_stride
+          int64_t group_stride = folded_dim_stride;
+          for (int64_t pos = group_end; pos >= group_start; --pos) {
+            pre_reconstructed[pos] = group_stride;
+            group_stride *= pre_shape[pos];
+          }
+          // Axes after group
+          int64_t base_pos = group_start + 1;  // base dim after the folded one
+          for (int64_t pos = group_end + 1; pos < ndims; ++pos) {
+            pre_reconstructed[pos] = base_strides[base_pos];
+            base_pos++;
+          }
+
+          // Apply permutation to get logical strides
+          for (int64_t i = 0; i < ndims; ++i) {
+            folded_strides[i] = pre_reconstructed[perm[i]];
+          }
+        }
+
+        // Verify logical strides match (skip size-1 dims)
+        bool strides_match = true;
+        for (int64_t i = 0; i < ndims; ++i) {
+          if (shape[i] == 1) continue;
+          if (folded_strides[i] != strides[i]) {
+            strides_match = false;
+            break;
+          }
+        }
+        if (!strides_match) continue;
+
+        // Verify base tensor fits in storage
+        int64_t base_elements = 1;
+        for (auto s : base_shape) base_elements *= s;
+        TORCH_INTERNAL_ASSERT(base_elements > 0,
+                              "TrySingleGroupDecomposition: base_elements overflow detected, "
+                              "base_shape product wrapped int64");
+        int64_t storage_elements =
+            static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size());
+        if (base_offset < 0 || base_offset + base_elements > storage_elements) continue;
+
+        // Reject if base tensor would exceed 4GB
+        {
+          int64_t base_bytes = base_elements * tensor.element_size();
+          constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
+          if (base_bytes >= kMaxBytes) continue;
+        }
+
+        // === SUCCESS: Build the transformation chain ===
+        std::string element_type = ScalarTypeToElementTypeString(tensor.scalar_type());
+
+        // Create base tensor
+        at::Tensor base_tensor = tensor.as_strided(c10::IntArrayRef(base_shape),
+                                                   c10::IntArrayRef(base_strides), base_offset);
+
+        std::vector<TensorTransformation> transforms;
+        std::vector<int64_t> cur_shape = base_shape;
+        int64_t base_rank = static_cast<int64_t>(base_shape.size());
+        std::vector<int64_t> id_perm_base(base_rank);
+        std::iota(id_perm_base.begin(), id_perm_base.end(), 0);
+
+        // SLICE (if any dimension needs slicing)
+        bool needs_slice = false;
+        for (size_t i = 0; i < base_shape.size(); ++i) {
+          if (starts[i] != 0 || required_shape[i] != base_shape[i]) {
+            needs_slice = true;
+            break;
+          }
+        }
+        if (needs_slice) {
+          std::vector<int64_t> slice_params;
+          for (size_t i = 0; i < base_shape.size(); ++i) {
+            slice_params.push_back(starts[i]);
+            slice_params.push_back(starts[i] + required_shape[i]);
+            slice_params.push_back(1);  // step=1
+          }
+          transforms.emplace_back(TransformationType::SLICE, cur_shape, required_shape,
+                                  element_type, slice_params, id_perm_base, id_perm_base);
+          cur_shape = required_shape;
+        }
+
+        // RESHAPE (unfold the folded dimension back into the group of sub-dimensions)
+        transforms.emplace_back(TransformationType::RESHAPE, cur_shape, pre_shape, element_type);
+        cur_shape = pre_shape;
+
+        // TRANSPOSE (if perm is not identity)
+        bool is_identity_perm = true;
+        for (int64_t i = 0; i < ndims; ++i) {
+          if (perm[i] != i) {
+            is_identity_perm = false;
+            break;
+          }
+        }
+        if (!is_identity_perm) {
+          std::vector<int64_t> logical_shape(ndims);
+          for (int64_t i = 0; i < ndims; ++i) logical_shape[i] = cur_shape[perm[i]];
+          std::vector<int64_t> id_perm_n(ndims);
+          std::iota(id_perm_n.begin(), id_perm_n.end(), 0);
+          transforms.emplace_back(TransformationType::TRANSPOSE, cur_shape, logical_shape,
+                                  element_type, perm, id_perm_n, perm);
+          cur_shape = logical_shape;
+        }
+
+        // Verify final shape matches
+        std::vector<int64_t> expected_shape(shape.begin(), shape.end());
+        if (cur_shape != expected_shape) continue;
+
+        TORCH_NEURONX_DEBUG("TryFoldedDecomposition succeeded", "op=", op_name,
+                            "input_index=", input_index, "base_shape=", base_shape,
+                            "group_start=", group_start, "group_end=", group_end,
+                            "folded_base_size=", folded_base_size);
+
+        return FoldedDecompositionResult{base_tensor, base_shape, std::move(transforms)};
+      }
+    }
+  }  // end single-group loop
+
+  return std::nullopt;
+}
+
+// ============================================================================
+// MULTI-GROUP DECOMPOSITION
+// Discovers ALL compact groups simultaneously via right-to-left stride scan.
+// Constructs a fully contiguous multi-dim grid base and emits:
+//   RESHAPE → SLICE → RESHAPE → TRANSPOSE → BROADCAST
+//
+// Example (multi-split narrow→view→permute):
+//   x = randn(3, 6).narrow(1, 1, 4).view(3, 2, 2).permute(1, 0, 2)
+//   shape=[2, 3, 2], strides=[2, 6, 1], offset=1, storage=18
+//   Groups: [{strides 6}, {strides 2, 1}] → base [3, 6]
+//   → RESHAPE [18] → [3, 6] → SLICE → RESHAPE [3, 2, 2] → TRANSPOSE
+// ============================================================================
+std::optional<FoldedDecompositionResult> TryMultiGroupDecomposition(const at::Tensor& tensor,
+                                                                    const std::string& op_name,
+                                                                    size_t input_index) {
+  auto shape = tensor.sizes();
+  auto strides = tensor.strides();
+  int64_t ndims = shape.size();
+  int64_t offset = tensor.storage_offset();
+
+  // Guard: skip if tensor is already contiguous (DecomposeStrides handles it above,
+  // but the multi-group path must NOT accept contiguous tensors)
+  if (tensor.is_contiguous()) return std::nullopt;
+
+  {
+    // Guard: reject negative strides (not supported)
+    for (int64_t i = 0; i < ndims; ++i) {
+      if (shape[i] > 1 && strides[i] < 0) return std::nullopt;
+    }
+
+    // Step 1: Filter active dims (size > 1 and stride > 0)
+    std::vector<int64_t> active_indices;
+    for (int64_t i = 0; i < ndims; ++i) {
+      if (shape[i] > 1 && strides[i] > 0) {
+        active_indices.push_back(i);
+      }
+    }
+    if (active_indices.size() < 2) return std::nullopt;
+
+    // Step 2: Sort active dims by stride descending
+    std::sort(active_indices.begin(), active_indices.end(), [&](int64_t a, int64_t b) {
+      if (strides[a] != strides[b]) return strides[a] > strides[b];
+      return a < b;
+    });
+
+    int64_t num_active = static_cast<int64_t>(active_indices.size());
+    std::vector<int64_t> act_shape(num_active);
+    std::vector<int64_t> act_stride(num_active);
+    for (int64_t i = 0; i < num_active; ++i) {
+      act_shape[i] = shape[active_indices[i]];
+      act_stride[i] = strides[active_indices[i]];
+    }
+
+    // Step 3: Discover compact groups (right-to-left scan)
+    std::vector<CompactGroup> groups = DiscoverCompactGroups(act_shape, act_stride);
+
+    // Guard: reject if no group contains more than one axis — this means no actual
+    // folding occurred (each logical dim maps to its own physical dim). Such patterns
+    // are simple slices, not folded reshapes, and should be handled by DecomposeStrides.
+    {
+      bool has_multi_axis_group = false;
+      for (const auto& g : groups) {
+        if (g.sorted_positions.size() > 1) {
+          has_multi_axis_group = true;
+          break;
+        }
+      }
+      if (!has_multi_axis_group) return std::nullopt;
+    }
+
+    // Step 4: Construct the fully contiguous multi-dimensional base shape
+    int64_t storage_elements =
+        static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size());
+    int64_t num_groups = static_cast<int64_t>(groups.size());
+
+    // Grid layout: one axis per group, plus trailing dim if innermost stride > 1
+    std::vector<int64_t> base_shape_mg;
+    std::vector<int64_t> slice_starts_mg(num_groups, 0);
+    std::vector<int64_t> slice_ends_mg(num_groups, 0);
+
+    for (int64_t g = 0; g < num_groups; ++g) {
+      int64_t group_dim_size = 0;
+      if (g == 0) {
+        // The outermost group's base dimension = storage_elements / inner_stride.
+        // This must divide evenly — otherwise the storage size is not a multiple of
+        // the group's stride (Limitation 2: non-integer stride ratio between storage
+        // extent and outermost group stride). Falls back to contiguous copy.
+        if (groups[g].inner_stride <= 0 || storage_elements % groups[g].inner_stride != 0) {
+          return std::nullopt;
+        }
+        group_dim_size = storage_elements / groups[g].inner_stride;
+      } else {
+        int64_t outer_inner_stride = groups[g - 1].inner_stride;
+        if (groups[g].inner_stride <= 0 || outer_inner_stride % groups[g].inner_stride != 0) {
+          return std::nullopt;
+        }
+        group_dim_size = outer_inner_stride / groups[g].inner_stride;
+      }
+      base_shape_mg.push_back(group_dim_size);
+    }
+
+    // Append trailing unit dimension to anchor remaining element stride spaces
+    if (groups.back().inner_stride > 1) {
+      base_shape_mg.push_back(groups.back().inner_stride);
+    }
+
+    // Step 5: Decompose global storage offset completely across the grid rank
+    int64_t grid_rank = static_cast<int64_t>(base_shape_mg.size());
+    slice_starts_mg.resize(grid_rank, 0);
+    slice_ends_mg.resize(grid_rank, 0);
+    int64_t remaining_offset = offset;
+
+    for (int64_t i = 0; i < grid_rank; ++i) {
+      int64_t dim_stride = (i < num_groups) ? groups[i].inner_stride : 1;
+      slice_starts_mg[i] = remaining_offset / dim_stride;
+      remaining_offset %= dim_stride;
+
+      int64_t required_size = (i < num_groups) ? groups[i].shape_product : 1;
+      slice_ends_mg[i] = slice_starts_mg[i] + required_size;
+
+      if (slice_ends_mg[i] > base_shape_mg[i]) return std::nullopt;
+    }
+    if (remaining_offset != 0) return std::nullopt;
+
+    // Step 6: Memory safety and 4GB allocation checks
+    int64_t base_elements = 1;
+    for (auto s : base_shape_mg) base_elements *= s;
+    if (base_elements > storage_elements) return std::nullopt;
+    {
+      int64_t base_bytes = base_elements * tensor.element_size();
+      constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
+      if (base_bytes >= kMaxBytes) return std::nullopt;
+    }
+
+    // === SUCCESS: Construct Lowering Transform Graph ===
+    std::string element_type = ScalarTypeToElementTypeString(tensor.scalar_type());
+
+    // Emit flat 1D base tensor starting at storage offset 0
+    at::Tensor base_tensor = tensor.as_strided({storage_elements}, {1}, 0);
+    std::vector<TensorTransformation> transforms;
+
+    // 1. RESHAPE: Flattened 1D storage → Contiguous Multi-Dim Grid
+    std::vector<int64_t> cur_shape_mg = base_shape_mg;
+    {
+      std::vector<int64_t> flat = {storage_elements};
+      std::vector<int64_t> id1 = {0};
+      // No params needed for reshape — output_shape is sufficient
+      transforms.emplace_back(TransformationType::RESHAPE, flat, cur_shape_mg, element_type);
+    }
+
+    // 2. SLICE: Carve out the active sub-volumes across group dimensions
+    std::vector<int64_t> post_slice_shape;
+    {
+      std::vector<int64_t> slice_params;
+      for (int64_t g = 0; g < num_groups; ++g) {
+        slice_params.push_back(slice_starts_mg[g]);
+        slice_params.push_back(slice_ends_mg[g]);
+        slice_params.push_back(1);  // unit stride step
+        post_slice_shape.push_back(groups[g].shape_product);
+      }
+      if (groups.back().inner_stride > 1) {
+        // Use the dynamically computed coordinate for the trailing anchor dimension
+        int64_t trailing_idx = grid_rank - 1;
+        slice_params.push_back(slice_starts_mg[trailing_idx]);
+        slice_params.push_back(slice_ends_mg[trailing_idx]);
+        slice_params.push_back(1);
+        post_slice_shape.push_back(slice_ends_mg[trailing_idx] - slice_starts_mg[trailing_idx]);
+      }
+
+      std::vector<int64_t> id_mg(cur_shape_mg.size());
+      std::iota(id_mg.begin(), id_mg.end(), 0);
+      transforms.emplace_back(TransformationType::SLICE, cur_shape_mg, post_slice_shape,
+                              element_type, slice_params, id_mg, id_mg);
+      cur_shape_mg = post_slice_shape;
+    }
+
+    // 3. RESHAPE: Explode flattened group dimensions back to active shapes
+    std::vector<int64_t> reshape_target;
+    for (int64_t i = 0; i < num_active; ++i) {
+      reshape_target.push_back(act_shape[i]);
+    }
+    // If there's a trailing anchor dimension, include it temporarily then strip
+    if (groups.back().inner_stride > 1) {
+      reshape_target.push_back(1);
+    }
+    transforms.emplace_back(TransformationType::RESHAPE, cur_shape_mg, reshape_target,
+                            element_type);
+    cur_shape_mg = reshape_target;
+
+    // Strip the trailing anchor dimension if it was added
+    if (groups.back().inner_stride > 1) {
+      std::vector<int64_t> stripped(cur_shape_mg.begin(), cur_shape_mg.end() - 1);
+      transforms.emplace_back(TransformationType::RESHAPE, cur_shape_mg, stripped, element_type);
+      cur_shape_mg = stripped;
+    }
+
+    // 4. TRANSPOSE: Map pre-sorted active dim order back to original logical order
+    std::vector<int64_t> logical_active_order;
+    for (int64_t i = 0; i < ndims; ++i) {
+      if (shape[i] > 1 && strides[i] > 0) logical_active_order.push_back(i);
+    }
+    std::vector<int64_t> perm_mg(num_active);
+    for (int64_t li = 0; li < num_active; ++li) {
+      int64_t logical_dim = logical_active_order[li];
+      for (int64_t si = 0; si < num_active; ++si) {
+        if (active_indices[si] == logical_dim) {
+          perm_mg[li] = si;
+          break;
+        }
+      }
+    }
+
+    bool is_identity = true;
+    for (int64_t i = 0; i < num_active; ++i) {
+      if (perm_mg[i] != i) {
+        is_identity = false;
+        break;
+      }
+    }
+    if (!is_identity) {
+      std::vector<int64_t> transposed_shape(num_active);
+      for (int64_t i = 0; i < num_active; ++i) transposed_shape[i] = cur_shape_mg[perm_mg[i]];
+      std::vector<int64_t> id_active(num_active);
+      std::iota(id_active.begin(), id_active.end(), 0);
+      transforms.emplace_back(TransformationType::TRANSPOSE, cur_shape_mg, transposed_shape,
+                              element_type, perm_mg, id_active, perm_mg);
+      cur_shape_mg = transposed_shape;
+    }
+
+    // 5. BROADCAST: Inflate or inject non-active size-1 and broadcast layout dims
+    std::vector<int64_t> full_shape(shape.begin(), shape.end());
+    if (cur_shape_mg != full_shape) {
+      std::vector<int64_t> with_bc_shape;
+      int64_t active_ptr = 0;
+      for (int64_t i = 0; i < ndims; ++i) {
+        if (shape[i] <= 1 || strides[i] <= 0) {
+          with_bc_shape.push_back(1);
+        } else {
+          with_bc_shape.push_back(cur_shape_mg[active_ptr++]);
+        }
+      }
+      if (with_bc_shape != cur_shape_mg) {
+        transforms.emplace_back(TransformationType::RESHAPE, cur_shape_mg, with_bc_shape,
+                                element_type);
+        cur_shape_mg = with_bc_shape;
+      }
+      if (cur_shape_mg != full_shape) {
+        std::vector<int64_t> bc_params(ndims);
+        std::iota(bc_params.begin(), bc_params.end(), 0);
+        std::vector<int64_t> id_full(ndims);
+        std::iota(id_full.begin(), id_full.end(), 0);
+        transforms.emplace_back(TransformationType::BROADCAST, cur_shape_mg, full_shape,
+                                element_type, bc_params, id_full, id_full);
+      }
+    }
+
+    TORCH_NEURONX_DEBUG("TryFoldedDecomposition multi-group pipeline succeeded", "op=", op_name,
+                        "input_index=", input_index, "num_groups=", num_groups);
+    return FoldedDecompositionResult{base_tensor, {storage_elements}, std::move(transforms)};
+  }
+
+  return std::nullopt;
+}
+
+// ============================================================================
+// FOLDED DECOMPOSITION DISPATCHER
+//
+// Fallback for non-contiguous tensors that DecomposeStrides rejects (GCD check
+// fails due to view-split creating coprime stride ratios).
+//
+// Approach: Discover "compact groups" of consecutive dimensions (in stride-sorted
+// order) where strides form an arithmetic progression. Each group maps to one
+// base dimension. Emit: per-group SLICE → RESHAPE → TRANSPOSE → BROADCAST.
+//
+// A group boundary occurs at index i when:
+//   pre_stride[i] != pre_stride[i+1] * pre_shape[i+1]
+//
+// For each group:
+//   - inner_stride = smallest stride in the group
+//   - shape_product = product of all shapes in the group
+//   - base_dim_size = outer_stride / inner_stride (for inner groups)
+//                   or storage_extent / inner_stride (for outermost group)
+//
+// Two strategies, tried in order:
+//   1. TrySingleGroupDecomposition (rank >= 3):
+//      Brute-force search for a single compact group within stride-sorted axes.
+//      Emits: base → SLICE → RESHAPE → TRANSPOSE
+//   2. TryMultiGroupDecomposition:
+//      Discovers ALL compact groups via right-to-left stride scan.
+//      Emits: flat storage → RESHAPE → SLICE → RESHAPE → TRANSPOSE → BROADCAST
+// ============================================================================
+std::optional<FoldedDecompositionResult> TryFoldedDecomposition(const at::Tensor& tensor,
+                                                                const std::string& op_name,
+                                                                size_t input_index) {
+  auto shape = tensor.sizes();
+  auto strides = tensor.strides();
+  int64_t ndims = shape.size();
+
+  // Reject negative strides (not supported).
+  // Note: broadcast dims (stride=0) are allowed — they are handled by the
+  // multi-group pipeline which filters them out and emits BROADCAST.
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (shape[i] > 1 && strides[i] < 0) return std::nullopt;
+  }
+
+  // Sort axes by stride descending (pre-permutation order)
+  std::vector<int64_t> pre_order(ndims);
+  std::iota(pre_order.begin(), pre_order.end(), 0);
+  std::sort(pre_order.begin(), pre_order.end(), [&](int64_t a, int64_t b) {
+    if (strides[a] != strides[b]) return strides[a] > strides[b];
+    return a < b;
+  });
+
+  std::vector<int64_t> pre_shape(ndims);
+  std::vector<int64_t> pre_stride(ndims);
+  for (int64_t i = 0; i < ndims; ++i) {
+    pre_shape[i] = shape[pre_order[i]];
+    pre_stride[i] = strides[pre_order[i]];
+  }
+
+  // Try single-group decomposition first (rank >= 3 only)
+  auto single =
+      TrySingleGroupDecomposition(tensor, pre_order, pre_shape, pre_stride, op_name, input_index);
+  if (single.has_value()) return single;
+
+  // Fall back to multi-group decomposition
+  return TryMultiGroupDecomposition(tensor, op_name, input_index);
+}
+
 }  // anonymous namespace
+
+// ============================================================================
+// INTERNAL UTILITIES IMPLEMENTATION
+// ============================================================================
+
+std::vector<CompactGroup> DiscoverCompactGroups(const std::vector<int64_t>& act_shape,
+                                                const std::vector<int64_t>& act_stride) {
+  int64_t num_active = static_cast<int64_t>(act_shape.size());
+  if (num_active == 0) return {};
+
+  std::vector<CompactGroup> groups;
+  CompactGroup current_group;
+  current_group.sorted_positions.push_back(num_active - 1);
+  current_group.inner_stride = act_stride[num_active - 1];
+  current_group.shape_product = act_shape[num_active - 1];
+
+  for (int64_t i = num_active - 2; i >= 0; --i) {
+    int64_t expected_stride = act_stride[i + 1] * act_shape[i + 1];
+    if (act_stride[i] == expected_stride) {
+      current_group.sorted_positions.push_back(i);
+      current_group.shape_product *= act_shape[i];
+    } else {
+      groups.push_back(std::move(current_group));
+      current_group = CompactGroup{};
+      current_group.sorted_positions.push_back(i);
+      current_group.inner_stride = act_stride[i];
+      current_group.shape_product = act_shape[i];
+    }
+  }
+  groups.push_back(std::move(current_group));
+  std::reverse(groups.begin(), groups.end());
+  return groups;
+}
 
 // ============================================================================
 // STRIDE DECOMPOSITION IMPLEMENTATION
@@ -819,11 +1461,13 @@ std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor&
 // TryCreateCompound: Decompose arbitrary non-contiguous tensor views
 //
 // GOAL: Given a non-contiguous tensor (produced by any combination of
-// transpose, slice, expand, select, unsqueeze, squeeze, permute, etc.),
-// reconstruct a contiguous base tensor and a chain of SLICE → TRANSPOSE →
-// BROADCAST operations that reproduce the original view.
+// transpose, slice, expand, select, unsqueeze, squeeze, permute, view/reshape,
+// etc.), reconstruct a contiguous base tensor and a chain of SLICE → RESHAPE →
+// TRANSPOSE → BROADCAST operations that reproduce the original view.
 //
-// APPROACH (GCD-based stride factorization):
+// TWO-PHASE APPROACH:
+//
+// Phase 1 — GCD-based stride factorization (DecomposeStrides):
 //   1. Separate broadcast dims (stride=0 or size=1) from non-broadcast dims.
 //   2. Sort non-broadcast dims by stride descending — this gives the
 //      "physical memory order" (outermost → innermost).
@@ -838,14 +1482,34 @@ std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor&
 //      then TRANSPOSE (if physical order ≠ logical order), then BROADCAST
 //      (if any dims were broadcast).
 //
+// Phase 2 — Folded decomposition fallback (TryFoldedDecomposition):
+//   When the GCD check rejects a pattern (coprime stride ratios from view-split
+//   on a narrowed tensor), TryFoldedDecomposition detects groups of consecutive
+//   axes (in stride-sorted order) that form a compact split of a single base
+//   axis. It emits SLICE → RESHAPE → TRANSPOSE to reconstruct the view.
+//   Example: x.narrow(2,0,4).view(2,3,2,2).permute(2,0,3,1) has strides
+//   [15, 5, 2, 1] where GCD(5,2)=1 — rejected by Phase 1, handled by Phase 2
+//   as base [2,3,5] → SLICE → RESHAPE → TRANSPOSE.
+//
 // LIMITATION:
-// 1. The algorithm assumes each output dimension maps to exactly one base
-//    dimension. This means:
-//      - Supported: transpose, slice, expand, select, squeeze, unsqueeze, permute
-//      - NOT supported: view/reshape that splits or merges dimensions (would need
-//        RESHAPE in the chain), overlapping strides (unfold with step < size),
-//        negative strides (flip)
-// 2. Different views of the same shared storage (e.g., FSDP flat parameter buffers)
+// 1. Uniform stride scaling (innermost active stride > 1): The multi-group pipeline
+//    creates a virtual row-major grid and carves sub-volumes with step=1 SLICE only.
+//    When all strides are scaled by a constant factor (e.g., strides=[32,16,8]),
+//    the grid inflates to absorb spacing, but non-zero offsets push slice bounds
+//    beyond physical allocation (slice_ends > base_shape). Falls back to contiguous.
+// 2. Non-monotonic stride ratios (non-integer stride[i]/stride[i+1]): Base shape is
+//    computed as stride[i]/stride[i+1]. Non-integer ratios (e.g., 49/21=2.33) break
+//    divisor properties. Shared identical strides collapse groups incorrectly.
+//    Falls back to contiguous.
+//    NOTE: Fixing 1-2 requires adding step>1 SLICE to the multi-group pipeline, which
+//    risks emitting multi-dimensional strided gathers that break memory coalescing in
+//    the MLIR/StableHLO backend. The contiguous copy fallback is actually net-positive
+//    for these layouts: a single sequential DMA burst guarantees 100% downstream
+//    vectorization efficiency, recovering the copy latency immediately.
+// 3. Overlapping strides (unfold with step < size): elements share memory in
+//    multiple output positions. Cannot be represented as any combination of
+//    SLICE + RESHAPE + TRANSPOSE + BROADCAST. Falls back to contiguous_generic_kernel.
+// 4. Different views of the same shared storage (e.g., FSDP flat parameter buffers)
 //    may produce different base tensor shapes through compound decomposition.
 //    This is handled by:
 //    a. ProcessInputTransformations (NeuronBindings.cpp): primary fix — detects
@@ -856,10 +1520,12 @@ std::optional<TransformationCreationResult> TryCreateBroadcast(const at::Tensor&
 //    c. TryCreateTranspose Step 3: defense-in-depth — rejects partial-storage
 //       views, deferring to TryCreateCompound.
 //
-// The GCD check (outer_stride_gcd[i] % base_strides[i+1] != 0) rejects
-// patterns where stride ratios aren't integer multiples — this happens when
-// view-split creates sub-dimensions of a single base dimension, making the
-// strides coprime (e.g., strides [15, 5, 2, 1] → GCD(5,2)=1).
+// SUPPORTED PATTERNS (all standard view operations):
+//   transpose, slice, expand, select, squeeze, unsqueeze, permute,
+//   view/reshape (split or merge dimensions), narrow, flip (as compute op)
+//
+// NOT SUPPORTED:
+//   overlapping strides (unfold with step < size), diagonal
 // ============================================================================
 // Variable glossary for TryCreateCompound:
 //   ndims              Total number of dimensions
@@ -980,6 +1646,17 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
   }
 
   return TransformationCreationResult{true, std::move(transforms), d.base_tensor, "COMPOUND"};
+}
+
+std::optional<TransformationCreationResult> TryCreateFoldedDecomposition(const at::Tensor& input,
+                                                                         const std::string& op_name,
+                                                                         size_t input_index) {
+  auto folded = TryFoldedDecomposition(input, op_name, input_index);
+  if (folded.has_value()) {
+    return TransformationCreationResult{true, std::move(folded->transforms), folded->base_tensor,
+                                        "COMPOUND_FOLDED"};
+  }
+  return std::nullopt;
 }
 
 // ============================================================================

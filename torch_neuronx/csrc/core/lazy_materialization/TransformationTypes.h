@@ -21,6 +21,7 @@ enum class TransformationType {
   SLICE,
   SCATTER_IOTA,  // Scatter with iota-computed indices — flat storage writeback (epilogue only)
   COMPOUND,
+  COMPOUND_FOLDED,  // Folded decomposition for narrow→view→permute patterns
   NONE
 };
 
@@ -107,6 +108,7 @@ struct TensorTransformation {
         break;
       case TransformationType::NONE:
       case TransformationType::COMPOUND:
+      case TransformationType::COMPOUND_FOLDED:
         break;  // No specific validation
       default:
         throw std::invalid_argument("TensorTransformation: Unknown transformation type");

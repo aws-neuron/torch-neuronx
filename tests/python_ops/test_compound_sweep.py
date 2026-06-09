@@ -254,6 +254,39 @@ def make_broadcast_transpose_slice(B, H, S, D, dtype, device):
     )  # [B, S, H, D//2]
 
 
+# --- Folded patterns (narrow→view→permute) ---
+
+
+def make_folded_narrow_view_permute(B, H, S, D, dtype, device):
+    """Narrow a dim, then view-split it, then permute.
+    This creates coprime stride ratios that the GCD check rejects,
+    handled by TryFoldedDecomposition (SLICE→RESHAPE→TRANSPOSE).
+    [B, H, D] -> narrow(2, 0, D-1) -> view(B, H, D//2-1, 2) -> permute(2, 0, 3, 1)
+    Requires D >= 6 for the factorization to work."""
+    base_d = D + 1  # ensure narrow produces something factorable
+    t = torch.randn(B, H, base_d, dtype=dtype, device=device)
+    narrowed_size = D  # narrow to D elements
+    # Factor D into two parts
+    factor_a = 2
+    factor_b = D // 2
+    return t.narrow(2, 0, narrowed_size).view(B, H, factor_a, factor_b).permute(2, 0, 3, 1)
+
+
+def make_folded_padded_sequence(B, H, S, D, dtype, device):
+    """Padded sequence pattern: base[:, :seq, :].view(B, h1, h2, w, c).permute(0, 4, 1, 2, 3).
+    Simulates the common NLP/vision pattern where variable-length sequences are packed.
+    Uses smaller dimensions to keep test fast."""
+    # Create a base with a padding dim slightly larger than needed
+    seq_len = S * 2  # total sequence slots
+    padded_len = seq_len + S  # add padding
+    c_dim = min(D, 8)  # channel dim
+    t = torch.randn(B, padded_len, c_dim, dtype=dtype, device=device)
+    # narrow to seq_len, then reshape into multi-dim sequence
+    h1 = 2
+    h2 = seq_len // h1
+    return t[:, :seq_len, :].view(B, h1, h2, c_dim).permute(0, 3, 1, 2)
+
+
 # --- View-based patterns ---
 
 
@@ -332,6 +365,9 @@ PATTERNS = {
         # contiguous tensor -- no negative strides. This tests end-to-end correctness.
         torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2).flip(-1)
     ),
+    # --- Folded patterns (narrow→view→permute, handled by TryFoldedDecomposition) ---
+    "folded_narrow_view_permute": make_folded_narrow_view_permute,
+    "folded_padded_sequence": make_folded_padded_sequence,
     # --- View-based patterns (view can preserve/create non-contiguous strides) ---
     "view_split_select": make_view_split_select,
     "view_split_transpose": make_view_split_transpose,
@@ -910,35 +946,17 @@ def _generate_and_apply_sequence(tensor, rng, num_ops):
 
                 if view_strategy == 0:
                     # Split a random dim into two factors.
-                    # IMPORTANT: Only on contiguous tensors. View-split on non-contiguous
-                    # tensors creates stride patterns that the prologue's GCD-based
-                    # factorization can't decompose back into base dimensions.
+                    # View-split on non-contiguous tensors creates stride patterns where
+                    # GCD-based factorization fails (coprime stride ratios). These are
+                    # handled by TryFoldedDecomposition which detects compact
+                    # sub-dimension groups and emits SLICE→RESHAPE→TRANSPOSE.
                     #
-                    # Example of the failure case:
+                    # Example:
                     #   x = torch.randn(2, 3, 5)
                     #   y = x.narrow(2, 0, 4).view(2, 3, 2, 2).permute(2, 0, 3, 1)
                     #   # shape=[2, 2, 2, 3], strides=(2, 15, 1, 5)
-                    #   # Sorted strides: [15, 5, 2, 1] → GCD(5, 2) = 1
-                    #
-                    # Why it happens: narrow creates a stride gap (stride 5 for size 4
-                    # in the last dim), then view splits the narrowed dim into two
-                    # sub-dims (strides 2, 1). After permute, these sub-dims interleave
-                    # with the gap dim, creating stride ratios that aren't integer
-                    # multiples of each other (GCD=1).
-                    #
-                    # Why it's hard to fix: the decomposition algorithm assumes each
-                    # output dimension maps to exactly one base dimension. View-split
-                    # creates output dimensions that are sub-divisions of a single base
-                    # dimension. Fixing this requires adding RESHAPE to the decomposition
-                    # chain (base → SLICE → RESHAPE → TRANSPOSE → BROADCAST).
-                    #
-                    # Note: this restriction only affects the fuzz test's random op
-                    # generation. The deterministic view-based test patterns
-                    # (make_view_split_select, make_view_split_transpose, etc.) work
-                    # because they start from contiguous tensors before the view-split.
-                    if not tensor.is_contiguous():
-                        op_log.append("view(split) SKIPPED (non-contiguous, known limitation)")
-                        continue
+                    #   # GCD(5, 2) = 1 → DecomposeStrides rejects
+                    #   # TryFoldedDecomposition: base [2, 3, 5] → SLICE → RESHAPE → TRANSPOSE
 
                     def _get_factors(n):
                         """Get all factor pairs (a, b) where a*b=n, a>1, b>1."""
