@@ -136,6 +136,22 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
                                                               size_t input_index);
 
 /**
+ * @brief Try to create a COMPOUND_FOLDED transformation (folded decomposition)
+ *
+ * Handles narrow→view→permute patterns where DecomposeStrides fails due to
+ * coprime stride ratios from view-split. Detects compact sub-dimension groups
+ * and emits SLICE→RESHAPE→TRANSPOSE.
+ *
+ * @param input Input tensor to analyze
+ * @param op_name Name of the operation for logging
+ * @param input_index Index of this input in the operation
+ * @return TransformationCreationResult if pattern detected, nullopt otherwise
+ */
+std::optional<TransformationCreationResult> TryCreateFoldedDecomposition(const at::Tensor& input,
+                                                                         const std::string& op_name,
+                                                                         size_t input_index);
+
+/**
  * @brief Try to create EPILOGUE (inverse) transformations for a non-contiguous output
  *
  * Analyzes the output tensor's stride pattern via AnalyzeEpilogueLayout() and
@@ -278,6 +294,33 @@ class ScatterIotaHandler : public TransformationHandler {
 };
 
 }  // namespace Handlers
+
+// ============================================================================
+// INTERNAL UTILITIES (exposed for unit testing)
+// ============================================================================
+
+/**
+ * @brief A compact group of consecutive dimensions (in stride-sorted order)
+ *        that share a contiguous stride progression.
+ */
+struct CompactGroup {
+  std::vector<int64_t> sorted_positions;  ///< positions in the pre-sorted order
+  int64_t inner_stride;                   ///< smallest stride in this group
+  int64_t shape_product;                  ///< product of all shapes in this group
+};
+
+/**
+ * @brief Discover compact groups from pre-sorted (stride-descending) shape and stride arrays.
+ *
+ * A group boundary occurs where act_stride[i] != act_stride[i+1] * act_shape[i+1].
+ * Returns groups ordered from outermost (largest stride) to innermost (smallest stride).
+ *
+ * @param act_shape  Shapes of active dimensions, sorted by stride descending
+ * @param act_stride Strides of active dimensions, sorted descending
+ * @return Vector of compact groups from outermost to innermost
+ */
+std::vector<CompactGroup> DiscoverCompactGroups(const std::vector<int64_t>& act_shape,
+                                                const std::vector<int64_t>& act_stride);
 
 }  // namespace lazy
 }  // namespace c10_neuron
