@@ -5,10 +5,15 @@ Provides memory statistics and management functions
 for monitoring device memory usage on Neuron hardware.
 """
 
+import json
+import logging
+import os
 import sys
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _get_device_index(device: int | torch.device | None = None) -> int:
@@ -509,13 +514,25 @@ def _snapshot(device: int | torch.device | None = None) -> dict[str, Any]:
 
 
 def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Compute segment pool fragmentation and efficiency stats from the memory snapshot."""
-    from torch_neuronx import _C
+    """Compute segment pool fragmentation and efficiency stats from the memory snapshot.
+
+    Pulls device totals from :func:`_neuron_getDeviceProperties` when the
+    runtime is initialized in this process; otherwise falls back to
+    ``total_hbm = 0`` and reports ``fragmentation_index = None`` (we can't
+    meaningfully compute the ratio without the device's HBM ceiling).
+    ``memory_density`` is unaffected because it depends only on snapshot
+    state, not the device total.
+    """
+    from torch_neuronx import _C, is_neuron_runtime_initialized
 
     device_index = _get_device_index(device)
     stats = memory_stats(device_index)
     snapshot = _C._neuron_memory_snapshot()
-    total_hbm = _C._neuron_getDeviceProperties(device_index).total_memory
+    # Only call into NRT when the runtime is alive in this process.
+    if is_neuron_runtime_initialized():
+        total_hbm = _C._neuron_getDeviceProperties(device_index).total_memory
+    else:
+        total_hbm = 0
 
     # Collect segments for this device, sorted by address
     segments = []
@@ -576,9 +593,14 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
     largest_free = max(nrt_free_chunks) if nrt_free_chunks else 0
 
     external_frag = max(total_free - largest_free - cached_free, 0)
-    # No free memory = fully fragmented (can't allocate anything)
-    frag_index = (external_frag + internal_frag) / total_free if total_free > 0 else 1.0
-    efficiency = reserved / address_span if address_span > 0 else 0.0
+    # No free memory = fully fragmented (can't allocate anything).
+    if total_hbm <= 0:
+        frag_index = None
+    elif total_free > 0:
+        frag_index = (external_frag + internal_frag) / total_free
+    else:
+        frag_index = 1.0
+    density = reserved / address_span if address_span > 0 else 0.0
 
     return {
         "free_chunks": free_chunks,
@@ -590,7 +612,7 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
         "external_fragmentation": external_frag,
         "cached_free": cached_free,
         "fragmentation_index": frag_index,
-        "memory_efficiency": efficiency,
+        "memory_density": density,
         "address_span": address_span,
         "num_segments": num_segments,
         "allocated_bytes": allocated,
@@ -602,6 +624,8 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
 def segment_pool_analysis_summary(device: int | torch.device | None = None) -> str:
     """Return a formatted string of the segment pool analysis."""
     s = segment_pool_analysis(device)
+    frag = s["fragmentation_index"]
+    frag_str = (f"{frag:.4f}" if frag is not None else "n/a").rjust(14)
 
     def _fmt(b: int | float) -> str:
         for u in ["B", "KiB", "MiB", "GiB", "TiB"]:
@@ -628,8 +652,8 @@ def segment_pool_analysis_summary(device: int | torch.device | None = None) -> s
         f"[{s['internal_fragmentation']:,} B]\n"
         f"  External frag:    {_fmt(s['external_fragmentation'])}  "
         f"[{s['external_fragmentation']:,} B]\n"
-        f"  Frag index:       {s['fragmentation_index']:>14.4f}\n"
-        f"  Mem efficiency:   {s['memory_efficiency']:>14.4f}\n"
+        f"  Frag index:       {frag_str}\n"
+        f"  Mem density:      {s['memory_density']:>14.4f}\n"
         f"  Address span:     {_fmt(s['address_span'])}  [{s['address_span']:,} B]\n"
         f"  Segments:         {s['num_segments']:>14}\n"
         f"{'=' * 75}"
@@ -657,3 +681,138 @@ def _dump_snapshot(filename: str = "memory_snapshot.pickle") -> None:
     snapshot = _snapshot()
     with open(filename, "wb") as f:
         pickle.dump(snapshot, f)
+
+
+# =============================================================================
+# On-demand dump of allocator-quality metrics
+# =============================================================================
+
+# When the Neuron metrics subsystem is enabled
+# (``torch_neuronx.metrics.set_enabled(True)`` or ``TORCH_NEURONX_METRICS_ENABLED=1``)
+# callers can invoke :func:`dump_allocator_stats` to write per-rank
+# ``allocator_stats_rank{rank}.json`` files. This is intended for torchrun-style
+# worker processes: the caller (e.g. the model training entrypoint) invokes
+# this before the runtime tears down so the orchestrator can read live
+# allocator state after the worker has exited.
+#
+# Output directory follows the existing torch_neuronx convention:
+#   ``TORCH_NEURONX_METRICS_DIR`` if set, else ``/tmp``.
+ALLOCATOR_STATS_METRICS_DIR_ENV = "TORCH_NEURONX_METRICS_DIR"
+DEFAULT_ALLOCATOR_STATS_DIR = "/tmp"
+
+
+def _allocator_stats_dump_rank() -> int:
+    """Best-effort rank lookup that doesn't require ``torch.distributed`` init."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception as e:
+        logger.debug(f"torch.distributed rank lookup failed, falling back: {e}")
+    rank_env = os.environ.get("RANK")
+    if rank_env is not None:
+        try:
+            return int(rank_env)
+        except ValueError:
+            pass
+    return 0
+
+
+def _collect_allocator_stats_per_device() -> list[dict[str, Any]]:
+    """Snapshot ``memory_stats`` and ``segment_pool_analysis`` for this rank's device.
+
+    Returns a single-element list keyed by the device index that the current
+    process owns. In SPMD torchrun-style runs each worker only sees one
+    Neuron core (other cores belong to sibling processes).
+    Returns an empty list if no current device is bound.
+    """
+    from torch_neuronx import current_device
+
+    try:
+        dev = current_device()
+    except Exception as e:
+        logger.debug(f"current_device() lookup failed: {e}")
+        return []
+
+    entry: dict[str, Any] = {"device": dev}
+    try:
+        entry["memory_stats"] = memory_stats(dev)
+    except Exception as e:
+        logger.debug(f"memory_stats failed for device {dev}: {e}")
+        entry["memory_stats"] = {}
+    try:
+        entry["segment_pool_analysis"] = segment_pool_analysis(dev)
+    except Exception as e:
+        logger.debug(f"segment_pool_analysis failed for device {dev}: {e}")
+        entry["segment_pool_analysis"] = {}
+    return [entry]
+
+
+def dump_allocator_stats(out_dir: str | None = None) -> str | None:
+    """Write per-rank allocator stats to disk.
+
+    Captures ``memory_stats`` and ``segment_pool_analysis`` for every visible
+    Neuron device into ``{out_dir}/allocator_stats_rank{rank}.json``. Intended
+    to be called by the worker process near the end of training (while the
+    runtime is still alive) so post-run tooling can aggregate per-rank values.
+
+    No-op when ``torch_neuronx.metrics.is_enabled()`` returns False — callers
+    opt in via the same knob they already use to enable other Neuron metrics.
+
+    Args:
+        out_dir: Destination directory. Defaults to ``$TORCH_NEURONX_METRICS_DIR``,
+            falling back to ``/tmp``.
+
+    Returns:
+        The path of the file that was written, or ``None`` if metrics are
+        disabled or writing failed.
+    """
+    try:
+        from torch_neuronx import metrics
+
+        if not metrics.is_enabled():
+            return None
+    except Exception:
+        return None
+
+    target_dir = out_dir or os.environ.get(
+        ALLOCATOR_STATS_METRICS_DIR_ENV, DEFAULT_ALLOCATOR_STATS_DIR
+    )
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as e:
+        logger.debug(f"Failed to create allocator stats dir {target_dir}: {e}")
+        return None
+
+    try:
+        # Drain in-flight kernels on this rank's device so accounting
+        # reflects the steady state.
+        from torch_neuronx import current_device, synchronize
+
+        try:
+            synchronize(current_device())
+        except Exception as e:
+            logger.debug(f"torch_neuronx.synchronize() failed during dump: {e}")
+
+        per_device = _collect_allocator_stats_per_device()
+    except Exception as e:
+        logger.debug(f"Failed to collect allocator stats: {e}")
+        return None
+
+    rank = _allocator_stats_dump_rank()
+    payload = {
+        "rank": rank,
+        "pid": os.getpid(),
+        "devices": per_device,
+    }
+
+    path = os.path.join(target_dir, f"allocator_stats_rank{rank}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.debug(f"Wrote allocator stats to {path}")
+        return path
+    except OSError as e:
+        logger.debug(f"Failed to write allocator stats to {path}: {e}")
+        return None

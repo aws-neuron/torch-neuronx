@@ -475,7 +475,7 @@ def segment_pool_analysis(device=None):
         device: Device index (optional)
 
     Returns:
-        dict: Analysis with fragmentation_index, memory_efficiency,
+        dict: Analysis with fragmentation_index, memory_density,
               largest_free, free_chunks, address_span, etc.
     """
     import torch_neuronx

@@ -408,7 +408,7 @@ torch.neuron.synchronize()
 # Get analysis dict
 analysis = mem.segment_pool_analysis()
 print(f"Fragmentation index: {analysis['fragmentation_index']:.4f}")
-print(f"Memory efficiency: {analysis['memory_efficiency']:.4f}")
+print(f"Memory density: {analysis['memory_density']:.4f}")
 print(f"Largest free chunk: {analysis['largest_free'] / 1024**3:.2f} GiB")
 print(f"Segments: {analysis['num_segments']}")
 
@@ -435,7 +435,7 @@ print(mem.segment_pool_analysis_summary())
   Internal frag:         13.54 MiB  [14,200,480 B]
   External frag:          4.29 GiB  [4,607,328,256 B]
   Frag index:               0.1805
-  Mem efficiency:           0.6064
+  Mem density:              0.6064
   Address span:          10.90 GiB  [11,706,187,776 B]
   Segments:                    101
 ===========================================================================
@@ -453,7 +453,7 @@ print(mem.segment_pool_analysis_summary())
 | `internal_fragmentation` | `Σ(seg.allocated - seg.active)` | Wasted space from rounding |
 | `external_fragmentation` | `total_free - largest_free - cached_free` | Scattered unusable free space |
 | `fragmentation_index` | `(external + internal) / total_free` | 0=ideal, 1=fully fragmented |
-| `memory_efficiency` | `reserved / address_span` | 1=packed, lower=gaps between segments |
+| `memory_density` | `reserved / address_span` | 1=packed, lower=gaps between segments |
 
 ---
 
