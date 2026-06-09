@@ -7,6 +7,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -77,27 +78,29 @@ bool ErrorRecovery::ShouldAttemptOOMRecovery(const torch_neuronx::ExecutionRunti
 }
 
 OperationContextResult ErrorRecovery::AttemptOOMRecovery(OperationContext* op) {
-  TORCH_NEURONX_DEBUG("Attempting OOM recovery via cache drain", "op=", op->GetOpName());
+  TORCH_NEURONX_DEBUG("Attempting OOM recovery via shelves cleanup + cache drain",
+                      "op=", op->GetOpName());
 
   const int device_id = op->kernel_execution->GetDeviceId();
-  metrics::RecordOOMRetry(device_id);
-
   size_t requested_size = 0;
   if (op->GetKernelType() == KernelTypeEnum::kAlloc) {
     requested_size = op->GetKernel<KernelTypeEnum::kAlloc>().GetSizeBytes();
   }
+  metrics::RecordOOMRetry(device_id, requested_size, op->stream_id);
 
+  torch_neuronx::distributed::triggerShelvesCleanup();
   c10_neuron::NeuronCachingAllocator::emptyNrtBufferCache();
   try {
     NRT_STATUS nrt_status = NRT_SUCCESS;
     nrt::SequenceId seq_id = 0;
     op->kernel_execution->Schedule(&nrt_status, &seq_id, op->stream_id);
     if (nrt_status == NRT_RESOURCE) {
-      TORCH_NEURONX_WARN("OOM recovery failed after cache drain", "op=", op->GetOpName(),
-                         "nrt_status=NRT_RESOURCE");
+      TORCH_NEURONX_WARN("OOM recovery failed after shelves cleanup + cache drain",
+                         "op=", op->GetOpName(), "nrt_status=NRT_RESOURCE");
       metrics::RecordOOMFailure(device_id, requested_size, op->stream_id, nullptr);
       return OperationContextResult::CreateError(
-          "OOM recovery failed: nrt_tensor_allocate still failed after cache drain");
+          "OOM recovery failed: nrt_tensor_allocate still failed after "
+          "shelves cleanup + cache drain");
     }
     TORCH_NEURONX_DEBUG("OOM recovery succeeded", "op=", op->GetOpName());
     return OperationContextResult::CreateSuccess();

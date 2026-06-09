@@ -318,7 +318,7 @@ Block* NeuronSegmentPool::Allocate(size_t requested_size) {
       total_active += seg.active_size;
     }
     TORCH_NEURONX_LOG(torch_neuronx::LogLevel::ERROR, torch_neuronx::LogCategory::MEMORY,
-                      "[SEGMENT_POOL] Allocation failed (OOM): requested_size=", requested_size,
+                      "[SEGMENT_POOL] Allocation failed: requested_size=", requested_size,
                       " rounded_size=", size, " device=", device_id_, " segments=", segments.size(),
                       " reserved=", total_reserved, " active=", total_active,
                       " cached_free=", (total_reserved - total_active));
@@ -396,6 +396,7 @@ Block* NeuronSegmentPool::FindFreeBlock(size_t size) {
     }
     free_set.erase(it);
     TORCH_NEURONX_ALLOCATOR_DEBUG("FindFreeBlock hit size=", block->size);
+    at::neuron::metrics::RecordAllocatorCacheHit(device_id_);
     return block;
   }
 
@@ -435,8 +436,11 @@ Block* NeuronSegmentPool::AllocateSegment(size_t size, bool is_small) {
   all_blocks_.push_back(std::move(block_ptr));
   block_index_[block] = all_blocks_.size() - 1;
 
-  // Track physical device memory reserved by the allocator
-  at::neuron::metrics::RecordReserve(device_id_, segment_size);
+  // Record cache miss on successful allocation
+  at::neuron::metrics::RecordAllocatorCacheMiss(device_id_);
+  // Track physical device memory reserved from NRT.
+  // Trace-only: emit SEGMENT_ALLOC. No-op when memory history recording disabled.
+  at::neuron::metrics::RecordSegmentReserve(device_id_, base_addr, segment_size);
 
   TORCH_NEURONX_ALLOCATOR_DEBUG("Allocated new segment block, size=", segment_size);
 
@@ -490,6 +494,7 @@ Block* NeuronSegmentPool::MaybeSplit(Block* block, size_t size) {
 
   all_blocks_.push_back(std::move(rest_ptr));
   block_index_[rest] = all_blocks_.size() - 1;
+  at::neuron::metrics::RecordSplit(device_id_);
   return block;
 }
 
@@ -517,6 +522,7 @@ Block* NeuronSegmentPool::MergeNeighbors(Block* block) {
     // Remove the absorbed block from ownership
     RemoveDeadBlock(block);
 
+    at::neuron::metrics::RecordMerge(device_id_);
     block = prev;
   }
 
@@ -536,6 +542,8 @@ Block* NeuronSegmentPool::MergeNeighbors(Block* block) {
 
     // Remove the absorbed block from ownership
     RemoveDeadBlock(next_block);
+
+    at::neuron::metrics::RecordMerge(device_id_);
   }
 
   return block;
@@ -582,10 +590,12 @@ void NeuronSegmentPool::EmptyCacheInternal() {
   // Release NRT tensors for the freeable roots
   for (Block* root : freeable_roots) {
     size_t seg_size = root->size;
+    void* seg_base = root->data_ptr;
     root->nrt_tensor.reset();
     root->data_ptr = nullptr;
     // Track physical device memory released back to NRT
-    at::neuron::metrics::RecordUnreserve(device_id_, seg_size);
+    // Trace-only: emit SEGMENT_FREE trace event (no-op when memory history recording disabled).
+    at::neuron::metrics::RecordSegmentUnreserve(device_id_, seg_base, seg_size);
   }
 
   // Remove freed roots and their sub-blocks from internal data structures

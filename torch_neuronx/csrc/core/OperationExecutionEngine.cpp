@@ -766,14 +766,16 @@ bool OperationExecutionEngine::ScheduleAllocOperation(OperationContext* op, Stre
   const int device_id = op->kernel_execution->GetDeviceId();
 
   if (alloc_status == NRT_RESOURCE) {
+    const size_t alloc_size = alloc_kernel.GetSizeBytes();
     // RetryReady is sticky: a second NRT_RESOURCE escalates, never re-defers.
     if (is_retry) {
-      metrics::RecordAllocDrainRetryFail(device_id);
+      metrics::RecordAllocDrainRetryFail(device_id, alloc_size, op->stream_id);
       throw torch_neuronx::ExecutionRuntimeException(
           "lazy::AllocBind: NRT_RESOURCE on retry after drain", NRT_RESOURCE);
     }
     if (stream->TryDeferAlloc(alloc_kernel)) {
-      metrics::RecordAllocDeferred(device_id);
+      TORCH_NEURONX_DEBUG("TryDeferAlloc: requested_size=", alloc_size);
+      metrics::RecordAllocDeferred(device_id, alloc_size, op->stream_id);
       return false;
     }
     throw torch_neuronx::ExecutionRuntimeException(
@@ -783,7 +785,8 @@ bool OperationExecutionEngine::ScheduleAllocOperation(OperationContext* op, Stre
   }
 
   if (is_retry) {
-    metrics::RecordAllocDrainRetryOk(device_id);
+    TORCH_NEURONX_DEBUG("DrainRetryOk: requested_size=", alloc_kernel.GetSizeBytes());
+    metrics::RecordAllocDrainRetryOk(device_id, alloc_kernel.GetSizeBytes(), op->stream_id);
   }
   op->nrt_status_ = NRT_SUCCESS;
   op->nrt_async_state_.is_pending_signal = true;

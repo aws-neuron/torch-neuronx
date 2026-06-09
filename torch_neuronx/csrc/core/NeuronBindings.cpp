@@ -1606,6 +1606,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["num_ooms"] = stats.num_ooms;
         result["num_tensor_frees"] = stats.num_tensor_frees;
         result["allocation_requests"] = stats.allocation_requests;
+        // Cache-behavior counters.
+        result["num_allocator_cache_hits"] = stats.num_allocator_cache_hits;
+        result["num_allocator_cache_misses"] = stats.num_allocator_cache_misses;
+        result["num_splits"] = stats.num_splits;
+        result["num_merges"] = stats.num_merges;
         result["num_alloc_deferred"] = stats.num_alloc_deferred;
         result["num_alloc_drain_retry_ok"] = stats.num_alloc_drain_retry_ok;
         result["num_alloc_drain_retry_fail"] = stats.num_alloc_drain_retry_fail;
@@ -1646,6 +1651,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["num_ooms"] = peak.stats.num_ooms;
         result["num_tensor_frees"] = peak.stats.num_tensor_frees;
         result["allocation_requests"] = peak.stats.allocation_requests;
+        result["num_allocator_cache_hits"] = peak.stats.num_allocator_cache_hits;
+        result["num_allocator_cache_misses"] = peak.stats.num_allocator_cache_misses;
+        result["num_splits"] = peak.stats.num_splits;
+        result["num_merges"] = peak.stats.num_merges;
         result["num_alloc_deferred"] = peak.stats.num_alloc_deferred;
         result["num_alloc_drain_retry_ok"] = peak.stats.num_alloc_drain_retry_ok;
         result["num_alloc_drain_retry_fail"] = peak.stats.num_alloc_drain_retry_fail;
@@ -1757,6 +1766,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             entry_dict["device"] = entry.device;
             entry_dict["addr"] = entry.addr;
             entry_dict["size"] = entry.size;
+            entry_dict["block_size"] = entry.block_size;
             entry_dict["stream"] = entry.stream;
             // Use absolute timestamp for pytorch.org/memory_viz compatibility
             entry_dict["time_us"] = entry.timestamp_us;

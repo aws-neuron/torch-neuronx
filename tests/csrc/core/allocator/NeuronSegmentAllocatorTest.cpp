@@ -22,7 +22,8 @@ using ::testing::SetArgPointee;
 
 namespace {
 struct DefaultConfigPool {
-  NeuronSegmentPool pool{0, AllocatorConfig{}};
+  NeuronSegmentPool pool;
+  DefaultConfigPool() : pool(0, AllocatorConfig{}) {}
   const AllocatorConfig& cfg() const { return pool.config(); }
 };
 }  // namespace

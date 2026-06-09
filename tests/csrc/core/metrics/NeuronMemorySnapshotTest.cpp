@@ -170,7 +170,7 @@ TEST_F(NeuronMemorySnapshotTest, RecordTraceWhenDisabled) {
   EXPECT_FALSE(IsRecordingEnabled());
 
   // Record a trace - should be ignored
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
 
   // Take snapshot - should have no traces
   auto snap = snapshot();
@@ -192,9 +192,9 @@ TEST_F(NeuronMemorySnapshotTest, RecordTraceWhenEnabled) {
   EXPECT_TRUE(IsRecordingEnabled());
 
   // Record some traces
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0);
-  RecordTrace(TraceAction::FREE_REQUESTED, 0, 0x1000, 4096, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::FREE_REQUESTED, 0, 0x1000, 4096, 0, nullptr, 0, 0);
 
   // Take snapshot
   auto snap = snapshot();
@@ -212,8 +212,8 @@ TEST_F(NeuronMemorySnapshotTest, ClearHistory) {
 
   // Enable recording and add traces
   RecordHistory(true, RecordContext::ALLOC, false, 100, true);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0, 0);
 
   // Clear history
   RecordHistory(true, RecordContext::ALLOC, false, 100, true);
@@ -245,7 +245,7 @@ TEST_F(NeuronMemorySnapshotTest, RingBufferCapacity) {
 
   // Record 10 traces (more than capacity)
   for (int i = 0; i < 10; i++) {
-    RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000 + i * 0x1000, 4096, 0, nullptr, 0);
+    RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000 + i * 0x1000, 4096, 0, nullptr, 0, 0);
   }
 
   // Take snapshot
@@ -274,7 +274,7 @@ TEST_F(NeuronMemorySnapshotTest, TraceEntryDefaultConstructor) {
 
 TEST_F(NeuronMemorySnapshotTest, TraceEntryParameterizedConstructor) {
   auto ctx = std::make_shared<StackContext>();
-  TraceEntry entry(TraceAction::OOM, 1, 0x5000, 1024, 42, 123456, ctx, 999);
+  TraceEntry entry(TraceAction::OOM, 1, 0x5000, 1024, 42, 123456, ctx, 999, 0);
 
   EXPECT_EQ(entry.action, TraceAction::OOM);
   EXPECT_EQ(entry.device, 1);
@@ -284,6 +284,7 @@ TEST_F(NeuronMemorySnapshotTest, TraceEntryParameterizedConstructor) {
   EXPECT_EQ(entry.timestamp_us, 123456);
   EXPECT_EQ(entry.context, ctx);
   EXPECT_EQ(entry.device_free, 999u);
+  EXPECT_EQ(entry.block_size, 1024u);  // defaults to size when blk_sz=0
 }
 
 // =============================================================================
