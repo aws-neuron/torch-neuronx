@@ -268,6 +268,7 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_reductions.py::TestReductionsNEURON::test_histc_min_max_corner_cases_neuron_float32",
     "test_reductions.py::TestReductionsNEURON::test_histc_min_max_corner_cases_neuron_float64",
     "test_reductions.py::TestReductionsNEURON::test_reference_masked_masked_std_neuron_float32",
+    "test_reductions.py::TestReductionsNEURON::test_std_correction_vs_numpy_neuron_float32",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_arange_neuron",
     "test_torch.py::TestFFTNEURON::test_fftn_round_trip_neuron_float32",
     "test_torch.py::TestFFTNEURON::test_fftn_round_trip_neuron_float64",

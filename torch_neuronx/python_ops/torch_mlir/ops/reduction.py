@@ -1,8 +1,36 @@
 """Reduction operations."""
 
+import warnings
+
 import torch
 
 from ..operation_registry import register_aten
+
+
+def _reduction_numel(tensor, dim):
+    """Compute the number of elements in the reduction dimensions."""
+    if dim is None:
+        return tensor.numel()
+    if isinstance(dim, list | tuple):
+        n = 1
+        for d in dim:
+            n *= tensor.shape[d]
+        return n
+    return tensor.shape[dim]
+
+
+def _reduced_shape(tensor, dim, keepdim):
+    """Compute the output shape after reduction."""
+    if dim is None:
+        return [1] * tensor.ndim if keepdim else []
+    dims = [dim] if not isinstance(dim, list | tuple) else list(dim)
+    out_shape = list(tensor.shape)
+    for d in sorted(dims, reverse=True):
+        if keepdim:
+            out_shape[d] = 1
+        else:
+            out_shape.pop(d)
+    return out_shape
 
 
 def _validate_scalar_dim(dim):
@@ -167,6 +195,89 @@ def torch_cumsum(x, dim, dtype=None, out=None):
     if x.ndim == 0:
         return x.clone().to(target_dtype) if target_dtype else x.clone()
     return _reduce_with_promotion(torch.cumsum, target_dtype, dtype, x, dim)
+
+
+def _validate_std_inputs(self, dim=None, correction=1, keepdim=False, out=None, **kwargs):
+    """Validate inputs for std/std_mean operations."""
+    if dim is not None and self.ndim >= 64:
+        raise RuntimeError("only tensors with up to 64 dims are supported")
+    if (
+        dim is not None
+        and not isinstance(dim, list | tuple)
+        and (dim >= self.ndim or dim < -self.ndim)
+    ):
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[{-self.ndim}, {self.ndim - 1}], but got {dim})"
+        )
+    if not self.is_floating_point() and self.ndim > 0:
+        raise RuntimeError("std and var only support floating point and complex dtypes")
+
+
+@register_aten(
+    ["aten::std.correction", "aten::std.correction_out"],
+    static_argnums=(1, 2, 3),
+    validate_static_inputs=_validate_std_inputs,
+)
+def torch_std_correction(self, dim=None, correction=1, keepdim=False, out=None, **kwargs):
+    if correction is None:
+        correction = 1
+    if self.ndim == 0:
+        if dim is not None:
+            _validate_scalar_dim(dim)
+        dtype = self.dtype if self.is_floating_point() else torch.float32
+        if correction > 0:
+            return torch.full((), float("nan"), dtype=dtype, device=self.device)
+        return torch.zeros((), dtype=dtype, device=self.device)
+    numel = _reduction_numel(self, dim)
+    if numel <= correction:
+        warnings.warn("std(): degrees of freedom is <= 0", stacklevel=2)
+        out_shape = _reduced_shape(self, dim, keepdim)
+        return torch.full(out_shape, float("nan"), dtype=self.dtype, device=self.device)
+    return torch.std(self, dim=dim, correction=correction, keepdim=keepdim)
+
+
+@register_aten(
+    ["aten::std_mean.correction", "aten::std_mean.correction_out"],
+    static_argnums=(1, 2, 3),
+    output_params=("out0", "out1"),
+    validate_static_inputs=_validate_std_inputs,
+)
+def torch_std_mean_correction(
+    self, dim=None, correction=1, keepdim=False, out0=None, out1=None, **kwargs
+):
+    if correction is None:
+        correction = 1
+    if self.ndim == 0:
+        if dim is not None:
+            _validate_scalar_dim(dim)
+        dtype = self.dtype if self.is_floating_point() else torch.float32
+        if correction > 0:
+            s = torch.full((), float("nan"), dtype=dtype, device=self.device)
+        else:
+            s = torch.zeros((), dtype=dtype, device=self.device)
+        return s, self.clone().to(dtype)
+    numel = _reduction_numel(self, dim)
+    if numel <= correction:
+        warnings.warn("std(): degrees of freedom is <= 0", stacklevel=2)
+        out_shape = _reduced_shape(self, dim, keepdim)
+        s = torch.full(out_shape, float("nan"), dtype=self.dtype, device=self.device)
+        m = torch.mean(self, dim=dim, keepdim=keepdim) if dim is not None else torch.mean(self)
+        if dim is None and keepdim:
+            m = m.reshape([1] * self.ndim)
+        return s, m
+    if dim is None:
+        s = torch.std(self, correction=correction)
+        m = torch.mean(self)
+        if keepdim:
+            shape = [1] * self.ndim
+            s = s.reshape(shape)
+            m = m.reshape(shape)
+        return s, m
+    return (
+        torch.std(self, dim, correction=correction, keepdim=keepdim),
+        torch.mean(self, dim, keepdim=keepdim),
+    )
 
 
 @register_aten("aten::value_selecting_reduction_backward", static_argnums=(1, 3, 4))
