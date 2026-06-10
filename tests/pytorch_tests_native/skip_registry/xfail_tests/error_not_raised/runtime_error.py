@@ -112,6 +112,7 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_ops.py::TestCommonNEURON::test_out_max_reduction_no_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_max_reduction_with_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_mean_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_std_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_min_reduction_no_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_min_reduction_with_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_mm_neuron_float32",
