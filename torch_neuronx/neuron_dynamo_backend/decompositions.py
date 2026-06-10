@@ -2703,6 +2703,11 @@ def _foreach_norm_decomp(self, ord=2):
     return [torch.linalg.vector_norm(t.flatten(), ord=ord) for t in self]
 
 
+@register_decomposition([aten.argmax.default])
+def argmax_decomposition(self, dim=-1, keepdim=False):
+    return self.max(dim=dim, keepdim=keepdim).indices
+
+
 def get_decomposition_table(decompose_all: bool = False) -> dict:
     """Get the decomposition table for the Neuron backend.
 
