@@ -43,6 +43,15 @@ def _check_tensors(tensors):
 
 def _check_same_device(*tensor_lists):
     """Raise if tensors span more than one device."""
+
+    # Move 0-d tensors (CPU scalars) to the first tensor's device.
+    target = tensor_lists[0][0].device if tensor_lists and tensor_lists[0] else None
+    if target is not None:
+        for tensors in tensor_lists:
+            for i, t in enumerate(tensors):
+                if t.dim() == 0 and t.device != target:
+                    tensors[i] = t.to(target)
+
     expected_device = None
     for tensors in tensor_lists:
         for t in tensors:
