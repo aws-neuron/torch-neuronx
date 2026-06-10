@@ -2152,6 +2152,7 @@ class TestArgsortDecompositionE2E:
 
         torch.testing.assert_close(result_neuron.cpu(), result_cpu)
 
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestArgmaxDecompositionE2E:
     """Tests for argmax decomposition"""
@@ -2227,31 +2228,32 @@ class TestArgmaxDecompositionE2E:
 
         def argmax_fn(x):
             return torch.argmax(x, dim=dim, keepdim=keepdim)
+
         compiled_fn = torch.compile(argmax_fn, backend="neuron")
-        
+
         x_cpu = torch.randn(4, 8)
         x_neuron = x_cpu.detach().clone().to("neuron")
-        
+
         result_cpu = argmax_fn(x_cpu)
         result_neuron = compiled_fn(x_neuron)
-        
+
         torch.testing.assert_close(result_neuron.cpu(), result_cpu)
-        
+
     def test_argmax_llm_decode_pattern(self):
         """Test the exact pattern used in LLM greedy decode: logits[:, -1, :].argmax(dim=-1)"""
         torch.manual_seed(42)
-        
+
         def greedy_decode(logits):
             return logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            
+
         compiled_fn = torch.compile(greedy_decode, backend="neuron")
-        
+
         logits_cpu = torch.randn(1, 1, 32000, dtype=torch.bfloat16)
         logits_neuron = logits_cpu.detach().clone().to("neuron")
-        
+
         result_cpu = greedy_decode(logits_cpu)
         result_neuron = compiled_fn(logits_neuron)
-        
+
         torch.testing.assert_close(result_neuron.cpu(), result_cpu)
 
 
