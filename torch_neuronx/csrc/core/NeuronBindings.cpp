@@ -584,24 +584,14 @@ NeuronDeviceProperties neuron_getDeviceProperties(int64_t device_id) {
   props.name = at::neuron::utils::GetInstanceType();
 
   // Get memory info from runtime using VNC stats
-  nrt_vnc_memory_stats_t memory_stats;
-  size_t stats_size_out;
-  NRT_STATUS status;
-
-  if (device_id < 0 || device_id > std::numeric_limits<uint32_t>::max()) {
-    status = NRT_FAILURE;
-  } else {
-    status = nrt_get_vnc_memory_stats(static_cast<uint32_t>(c10_neuron::get_vnc_id(device_id)),
-                                      &memory_stats, sizeof(memory_stats), &stats_size_out);
-  }
-
-  if (status == NRT_SUCCESS) {
-    props.total_memory = static_cast<int64_t>(memory_stats.bytes_limit);
+  uint64_t bytes_limit = 0;
+  if (c10_neuron::get_vnc_memory_stats(device_id, &bytes_limit, nullptr)) {
+    props.total_memory = static_cast<int64_t>(bytes_limit);
   } else {
     torch_neuronx::NeuronLogger::getInstance().log(
         torch_neuronx::LogLevel::WARNING, torch_neuronx::LogCategory::MEMORY,
         "Failed to get VNC memory stats for device " + std::to_string(device_id) +
-            ", status: " + std::to_string(status) + ". Falling back to total_memory=0");
+            ". Falling back to total_memory=0");
     props.total_memory = 0;
   }
 

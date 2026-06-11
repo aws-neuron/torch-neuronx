@@ -210,6 +210,21 @@ int get_vnc_id(int device_id) {
   return device_id - local_device_start_index;
 }
 
+bool get_vnc_memory_stats(int device_id, uint64_t* bytes_limit, uint64_t* bytes_used) {
+  if (device_id < 0) {
+    return false;
+  }
+  nrt_vnc_memory_stats_t stats;
+  size_t out_size = 0;
+  if (nrt_get_vnc_memory_stats(static_cast<uint32_t>(get_vnc_id(device_id)), &stats, sizeof(stats),
+                               &out_size) != NRT_SUCCESS) {
+    return false;
+  }
+  if (bytes_limit) *bytes_limit = stats.bytes_limit;
+  if (bytes_used) *bytes_used = stats.bytes_used;
+  return true;
+}
+
 int vnc_count() {
   if (rank_vnc_count != -1) {
     return rank_vnc_count;

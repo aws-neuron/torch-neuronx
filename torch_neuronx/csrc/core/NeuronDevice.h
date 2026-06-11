@@ -4,6 +4,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 
+#include <cstdint>
 #include <vector>
 
 namespace c10_neuron {
@@ -36,6 +37,10 @@ int get_local_device_start_index();
 std::vector<c10::DeviceIndex> get_visible_device_indices();
 
 int get_vnc_id(int device_id);
+
+// Query device HBM stats (maps device_id -> vnc_id). Returns false on failure;
+// out params are optional.
+bool get_vnc_memory_stats(int device_id, uint64_t* bytes_limit, uint64_t* bytes_used);
 
 int vnc_count();
 

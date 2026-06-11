@@ -14,7 +14,9 @@
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -367,14 +369,66 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
     return op.get();
   }
 
-  if (op->GetKernelType() == KernelTypeEnum::kEvent) {
-    auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-    if (event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
-        event_kernel.GetSignalStreamId() == stream_id) {
-      return op.get();
-    }
+  if (IsSameStreamWaitBypass(op.get(), stream_id) && IsRunAheadMemorySafe(device_index)) {
+    return op.get();
   }
   return nullptr;
+}
+
+bool StreamImpl::IsSameStreamWaitBypass(OperationContext* op, c10::StreamId stream_id) {
+  if (op->GetKernelType() != KernelTypeEnum::kEvent) {
+    return false;
+  }
+  auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+  return event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
+         event_kernel.GetSignalStreamId() == stream_id;
+}
+
+bool StreamImpl::IsRunAheadMemorySafe(c10::DeviceIndex device_index) {
+  // Default-on; Set TORCH_NEURONX_ENABLE_BOUNDED_RUNAHEAD=0
+  // (or "false") to disable and restore unbounded same-stream kWait bypass.
+  static const bool kBoundedRunaheadEnabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_ENABLE_BOUNDED_RUNAHEAD");
+    if (env == nullptr) {
+      return true;
+    }
+    const std::string value(env);
+    return value != "0" && value != "false";
+  }();
+  if (!kBoundedRunaheadEnabled) {
+    return true;
+  }
+
+  // Bound run-ahead by free device HBM so prefetched kAlloc bindings never
+  // starve the next allocation. The headroom auto-sizes per model as the
+  // largest observed single binding + slack.
+  constexpr int64_t kSlack = int64_t{2} << 30;          // fragmentation slack-2GB
+  constexpr int64_t kOverheadBound = int64_t{6} << 30;  // non-allocator HBM upper bound-6GB
+  const int64_t margin =
+      static_cast<int64_t>(c10_neuron::NeuronCachingAllocator::lazy::LargestAllocBytes()) + kSlack;
+  const int64_t reserved = at::neuron::metrics::DeviceMemoryStatsRegistry::Instance()
+                               .GetMemoryStats(device_index)
+                               .reserved_bytes.current;
+  static std::atomic<int64_t> cached_capacity{0};
+  const int64_t cap = cached_capacity.load(std::memory_order_relaxed);
+
+  // Cheap path: when the allocator is far from the ceiling there is ample room
+  // even with worst-case non-allocator overhead, so advance without an NRT
+  // syscall.
+  if (cap > 0 && cap - reserved >= margin + kOverheadBound) {
+    return true;
+  }
+  // Near the ceiling (or capacity not yet learned): precise free-HBM check via
+  // NRT, whose bytes_used also accounts for scratchpad/code/DMA the allocator
+  // cannot see. A query failure falls through to FIFO (park).
+  uint64_t bytes_limit = 0, bytes_used = 0;
+  if (c10_neuron::get_vnc_memory_stats(device_index, &bytes_limit, &bytes_used)) {
+    cached_capacity.store(static_cast<int64_t>(bytes_limit), std::memory_order_relaxed);
+    if (static_cast<int64_t>(bytes_limit - bytes_used) > margin) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void StreamImpl::AdvanceToNextOperation(OperationContext* just_scheduled) {

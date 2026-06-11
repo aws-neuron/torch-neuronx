@@ -631,12 +631,10 @@ void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream
       }
     }
     // Get total HBM
-    nrt_vnc_memory_stats_t hbm_stats;
-    size_t hbm_stats_size;
     size_t total_hbm = 0;
-    if (nrt_get_vnc_memory_stats(static_cast<uint32_t>(c10_neuron::get_vnc_id(device_id)),
-                                 &hbm_stats, sizeof(hbm_stats), &hbm_stats_size) == NRT_SUCCESS) {
-      total_hbm = hbm_stats.bytes_limit;
+    uint64_t bytes_limit = 0;
+    if (c10_neuron::get_vnc_memory_stats(device_id, &bytes_limit, nullptr)) {
+      total_hbm = bytes_limit;
     }
     auto& cur = registry.GetDeviceStats(device_id);
     int64_t allocated = cur.allocated_bytes.current.load(std::memory_order_relaxed);
@@ -660,13 +658,9 @@ void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream
   if (NeuronMemorySnapshot::IsRecordingEnabled()) {
     size_t device_free = 0;
     // Try to get free memory from VNC stats
-    nrt_vnc_memory_stats_t memory_stats;
-    size_t stats_size_out;
-    NRT_STATUS mem_status =
-        nrt_get_vnc_memory_stats(static_cast<uint32_t>(c10_neuron::get_vnc_id(device_id)),
-                                 &memory_stats, sizeof(memory_stats), &stats_size_out);
-    if (mem_status == NRT_SUCCESS) {
-      device_free = memory_stats.bytes_limit - memory_stats.bytes_used;
+    uint64_t bytes_limit = 0, bytes_used = 0;
+    if (c10_neuron::get_vnc_memory_stats(device_id, &bytes_limit, &bytes_used)) {
+      device_free = bytes_limit - bytes_used;
     }
 
     NeuronMemorySnapshot::RecordTrace(
