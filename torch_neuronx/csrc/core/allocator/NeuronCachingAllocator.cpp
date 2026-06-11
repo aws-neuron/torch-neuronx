@@ -112,15 +112,30 @@ NrtTensorPool::TensorAllocationResult NrtTensorPool::AllocateWithRetry(
         NRT_TENSOR_PLACEMENT_DEVICE, c10_neuron::get_vnc_id(device_id_), size, nullptr, &raw);
     if (status == NRT_SUCCESS && raw) {
       at::neuron::metrics::RecordOOMRetry(device_id_, size, stream_id);
+      TORCH_WARN("Neuron: OOM recovery succeeded after cache drain. Requested: ", size,
+                 " bytes. This allocation required a retry and may impact MFU.");
       return finalize_allocation(raw);
     }
   }
 
-  std::string msg = "NRT allocation failed for size " + std::to_string(size);
-  if (status == NRT_RESOURCE) {
-    msg += " (OOM)";
+  std::string msg = "Neuron OOM: Failed to allocate " + std::to_string(size) + " bytes";
+  // Add HBM context
+  nrt_vnc_memory_stats_t hbm_stats;
+  size_t hbm_stats_size;
+  if (nrt_get_vnc_memory_stats(static_cast<uint32_t>(c10_neuron::get_vnc_id(device_id_)),
+                               &hbm_stats, sizeof(hbm_stats), &hbm_stats_size) == NRT_SUCCESS) {
+    msg += " | HBM: " + std::to_string(hbm_stats.bytes_limit) + " total, " +
+           std::to_string(hbm_stats.bytes_used) + " used, " +
+           std::to_string(hbm_stats.bytes_limit - hbm_stats.bytes_used) + " free";
   }
   at::neuron::metrics::RecordOOMFailure(device_id_, size, stream_id, stack_ctx);
+  static const bool nrt_oom_log_disabled = []() {
+    const char* env = std::getenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG");
+    return env && std::string(env) == "0";
+  }();
+  if (nrt_oom_log_disabled) {
+    nrt_debug_log_oom_report(c10_neuron::get_vnc_id(device_id_));
+  }
   throw std::runtime_error(msg);
 }
 

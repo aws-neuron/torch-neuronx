@@ -4,11 +4,13 @@
 
 #include "CPUFallbackExecutor.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 
@@ -98,6 +100,14 @@ OperationContextResult ErrorRecovery::AttemptOOMRecovery(OperationContext* op) {
       TORCH_NEURONX_WARN("OOM recovery failed after shelves cleanup + cache drain",
                          "op=", op->GetOpName(), "nrt_status=NRT_RESOURCE");
       metrics::RecordOOMFailure(device_id, requested_size, op->stream_id, nullptr);
+      // Only trigger manual dump if NRT's automatic OOM logging is disabled
+      static const bool nrt_oom_log_disabled = []() {
+        const char* env = std::getenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG");
+        return env && std::string(env) == "0";
+      }();
+      if (nrt_oom_log_disabled) {
+        nrt_debug_log_oom_report(c10_neuron::get_vnc_id(device_id));
+      }
       return OperationContextResult::CreateError(
           "OOM recovery failed: nrt_tensor_allocate still failed after "
           "shelves cleanup + cache drain");
@@ -112,6 +122,13 @@ OperationContextResult ErrorRecovery::AttemptOOMRecovery(OperationContext* op) {
     // recovery failures but not OOMs and must not inflate num_ooms telemetry.
     if (retry_e.HasNRTStatus() && retry_e.GetNRTStatus() == NRT_RESOURCE) {
       metrics::RecordOOMFailure(device_id, requested_size, op->stream_id, nullptr);
+      static const bool nrt_oom_log_disabled = []() {
+        const char* env = std::getenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG");
+        return env && std::string(env) == "0";
+      }();
+      if (nrt_oom_log_disabled) {
+        nrt_debug_log_oom_report(c10_neuron::get_vnc_id(device_id));
+      }
     }
     return OperationContextResult::CreateError(std::string("OOM recovery failed: ") +
                                                retry_e.what());
