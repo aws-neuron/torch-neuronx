@@ -360,3 +360,23 @@ ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT = [
     "test_ops.py::TestCommonNEURON::test_dtypes_mvlgamma_mvlgamma_p_5_neuron",
     "test_ops.py::TestCommonNEURON::test_dtypes_masked_normalize_neuron",
 ]
+
+# No Neuron lowering for upsample_bilinear2d / upsample_bicubic2d
+ATEN_UPSAMPLINGBIMODE2D_NO_LOWERING = [
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bicubic_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bicubic_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bilinear_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bilinear_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bicubic_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bicubic_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bilinear_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bilinear_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bilinear_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bilinear_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format1_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bilinear_memory_format0_neuron",
+    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bilinear_memory_format1_neuron",
+]
