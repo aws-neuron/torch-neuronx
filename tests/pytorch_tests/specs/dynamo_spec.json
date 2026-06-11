@@ -2953,6 +2953,15 @@
             "test_mem_leak_guards",
             "test_mem_leak_guards_dynamic_shapes"
           ]
+        },
+        {
+          "reason": "Turned execution CPU fallback off",
+          "tests": [
+            "test_swin_base_tensor_attr_dynamic_shapes",
+            "test_subclass_dont_invoke_torch_function_on_overridden_method",
+            "test_subclass_override_shape_and_to",
+            "test_zero_dim_param_mixed_device_grad_neuron"
+          ]
         }
       ]
     }

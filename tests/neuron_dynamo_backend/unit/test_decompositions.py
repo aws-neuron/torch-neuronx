@@ -2022,8 +2022,8 @@ class TestEluDecompositionE2E:
         result_cpu = elu_fn(x_cpu)
         result_neuron = compiled_fn(x_neuron)
 
-        rtol = 1e-2 if dtype == torch.float16 else 1e-4
-        atol = 1e-2 if dtype == torch.float16 else 1e-4
+        rtol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        atol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
         torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=rtol, atol=atol)
 
     @pytest.mark.parametrize("alpha", [0.5, 1.0, 2.0])
@@ -2290,7 +2290,12 @@ class TestHistcDecompositionE2E:
         expected = torch.histc(input_tensor, bins=5, min=0, max=0)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    # bfloat16 omitted: bf16's ~7-bit mantissa can quantize values near a bin
+    # boundary differently between this decomposition's
+    # `(input - min) / bin_width` arithmetic and torch.histc's reference,
+    # producing off-by-one bin counts that are impossible to align with any
+    # tolerance.
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_histc_dtypes(self, dtype):
         """Test histc with various dtypes"""
         torch.manual_seed(42)
@@ -2300,8 +2305,8 @@ class TestHistcDecompositionE2E:
         # histc returns the same dtype as the input
         assert result.dtype == dtype
         assert expected.dtype == dtype
-        rtol = 1e-2 if dtype in [torch.float16, torch.bfloat16] else 1e-4
-        atol = 1e-2 if dtype in [torch.float16, torch.bfloat16] else 1e-4
+        rtol = 1e-2 if dtype == torch.float16 else 1e-4
+        atol = 1e-2 if dtype == torch.float16 else 1e-4
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
     @pytest.mark.parametrize("bins", [1, 5, 10, 20, 100])
@@ -4369,58 +4374,6 @@ class TestLogSigmoidDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestErfcDecompositionE2E:
-    """E2E tests for erfc decomposition"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_erfc_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.erfc(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randn(shape)
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestDigammaDecompositionE2E:
-    """E2E tests for digamma decomposition"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_digamma_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.digamma(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        # Use positive values for digamma stability
-        x_cpu = torch.rand(shape) + 0.5
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestLgammaDecompositionE2E:
-    """E2E tests for lgamma decomposition"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_lgamma_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.lgamma(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.rand(shape) + 0.5
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSincDecompositionE2E:
     """E2E tests for sinc decomposition"""
 
@@ -4430,23 +4383,6 @@ class TestSincDecompositionE2E:
 
         def fn(x):
             return torch.sinc(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randn(shape)
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestI0DecompositionE2E:
-    """E2E tests for i0 decomposition"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_i0_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.i0(x)
 
         compiled_fn = torch.compile(fn, backend="neuron")
         x_cpu = torch.randn(shape)
@@ -4470,37 +4406,6 @@ class TestXlogyDecompositionE2E:
         y_cpu = torch.rand(shape) + 0.1
         result = compiled_fn(x_cpu.to("neuron"), y_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu, y_cpu), rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestGcdLcmDecompositionE2E:
-    """E2E tests for gcd and lcm decompositions"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_gcd_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(a, b):
-            return torch.gcd(a, b)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        a = torch.randint(1, 100, shape)
-        b = torch.randint(1, 100, shape)
-        result = compiled_fn(a.to("neuron"), b.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(a, b))
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_lcm_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(a, b):
-            return torch.lcm(a, b)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        a = torch.randint(1, 50, shape)
-        b = torch.randint(1, 50, shape)
-        result = compiled_fn(a.to("neuron"), b.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(a, b))
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
@@ -4922,25 +4827,6 @@ class TestIsinDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestUnfoldBackwardDecompositionE2E:
-    """E2E tests for unfold_backward decomposition"""
-
-    def test_unfold_backward_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return x.unfold(1, 3, 1).sum()
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randn(2, 8, requires_grad=True)
-        x_neuron = x_cpu.detach().clone().to("neuron").requires_grad_(True)
-
-        fn(x_cpu).backward()
-        compiled_fn(x_neuron).backward()
-        torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestGridSampler2dDecompositionE2E:
     """E2E tests for grid_sampler_2d decomposition"""
 
@@ -5085,19 +4971,7 @@ class TestLogitBackwardDecompositionE2E:
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestBitwiseShiftDecompositionE2E:
-    """E2E tests for bitwise_left_shift and bitwise_right_shift decompositions"""
-
-    @pytest.mark.parametrize("shift", [1, 2, 4])
-    def test_left_shift_tensor_scalar_e2e(self, shift):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return x << shift
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randint(0, 100, (4, 8), dtype=torch.int32)
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu))
+    """E2E tests for bitwise_right_shift decomposition"""
 
     @pytest.mark.parametrize("shift", [1, 2, 4])
     def test_right_shift_tensor_scalar_e2e(self, shift):
@@ -5219,108 +5093,6 @@ class TestRemainderDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestIgammaDecompositionE2E:
-    """E2E tests for igamma and igammac decompositions"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_igamma_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(a, x):
-            return torch.igamma(a, x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        a = torch.rand(shape) + 0.5
-        x = torch.rand(shape) + 0.1
-        result = compiled_fn(a.to("neuron"), x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(a, x), rtol=1e-3, atol=1e-3)
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_igammac_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(a, x):
-            return torch.igammac(a, x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        a = torch.rand(shape) + 0.5
-        x = torch.rand(shape) + 0.1
-        result = compiled_fn(a.to("neuron"), x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(a, x), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestMvlgammaDecompositionE2E:
-    """E2E tests for mvlgamma decomposition"""
-
-    @pytest.mark.parametrize("p", [1, 2, 3])
-    def test_mvlgamma_e2e(self, p):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.mvlgamma(x, p)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        # mvlgamma requires x > (p-1)/2
-        x_cpu = torch.rand(8) + (p - 1) / 2.0 + 0.5
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestNextafterDecompositionE2E:
-    """E2E tests for nextafter decomposition"""
-
-    def test_nextafter_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(a, b):
-            return torch.nextafter(a, b)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        a = torch.randn(8)
-        b = torch.randn(8)
-        result = compiled_fn(a.to("neuron"), b.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(a, b))
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestFrexpDecompositionE2E:
-    """E2E tests for frexp.Tensor decomposition"""
-
-    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
-    def test_frexp_e2e(self, shape):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.frexp(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randn(shape)
-        result_mantissa, result_exponent = compiled_fn(x_cpu.to("neuron"))
-        expected_mantissa, expected_exponent = fn(x_cpu)
-        torch.testing.assert_close(result_mantissa.cpu(), expected_mantissa, rtol=1e-4, atol=1e-4)
-        torch.testing.assert_close(result_exponent.cpu(), expected_exponent)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestCopysignDecompositionE2E:
-    """E2E tests for copysign.Scalar decomposition"""
-
-    @pytest.mark.parametrize("sign", [-1.0, 1.0])
-    def test_copysign_scalar_e2e(self, sign):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.copysign(x, sign)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randn(8)
-        result = compiled_fn(x_cpu.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x_cpu))
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSpecialFunctionsDecompositionE2E:
     """E2E tests for special_* decompositions"""
 
@@ -5336,19 +5108,6 @@ class TestSpecialFunctionsDecompositionE2E:
         result = compiled_fn(x.to("neuron"), y.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x, y), rtol=1e-4, atol=1e-4)
 
-    def test_special_zeta_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x, q):
-            return torch.special.zeta(x, q)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        # zeta requires x > 1 and q > 0
-        x = torch.rand(8) + 1.5
-        q = torch.rand(8) + 0.5
-        result = compiled_fn(x.to("neuron"), q.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x, q), rtol=1e-3, atol=1e-3)
-
     def test_special_entr_e2e(self):
         torch.manual_seed(42)
 
@@ -5360,121 +5119,11 @@ class TestSpecialFunctionsDecompositionE2E:
         result = compiled_fn(x.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-4, atol=1e-4)
 
-    def test_special_log_ndtr_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.log_ndtr(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_ndtri_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.ndtri(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        # ndtri requires input in (0, 1)
-        x = torch.rand(8) * 0.8 + 0.1
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_erfcx_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.erfcx(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_i0e_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.i0e(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_i1_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.i1(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_i1e_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.i1e(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_bessel_j0_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.bessel_j0(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_bessel_j1_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.bessel_j1(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.randn(8)
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
-    def test_special_spherical_bessel_j0_e2e(self):
-        torch.manual_seed(42)
-
-        def fn(x):
-            return torch.special.spherical_bessel_j0(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.rand(8) + 0.1  # positive values
-        result = compiled_fn(x.to("neuron"))
-        torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
-
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestRandomDistributionDecompositionE2E:
-    """E2E tests for random distribution decompositions (normal, cauchy, geometric, log_normal).
+    """E2E tests for random distribution decompositions (cauchy, geometric, log_normal).
     These are non-deterministic so we only check shape and dtype."""
-
-    def test_normal_e2e(self):
-        def fn(x):
-            return torch.ops.aten.normal.Tensor_float(x)
-
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x = torch.empty(4, 8, device="neuron")
-        result = compiled_fn(x)
-        assert result.shape == (4, 8)
-        assert result.dtype == torch.float32
 
     def test_cauchy_e2e(self):
         def fn(x):

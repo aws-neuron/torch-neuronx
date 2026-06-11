@@ -576,7 +576,14 @@ class TestNeuronBackendFxCompiler:
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
             ) as mock_compile_fx,
-            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch.dict(
+                os.environ,
+                {
+                    "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                    # Opt in to fallback: package-level default disables it.
+                    "TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "false",
+                },
+            ),
             patch("torch_neuronx.neuron_dynamo_backend.backend.CompileGraph") as mock_compile_graph,
             patch(
                 "torch_neuronx.neuron_dynamo_backend.cache_artifact.NeuronOutputCode"
@@ -646,7 +653,14 @@ class TestNeuronBackendFxCompiler:
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo"
             ) as mock_compile_fx,
-            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch.dict(
+                os.environ,
+                {
+                    "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                    # Opt in to fallback: package-level default disables it.
+                    "TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "false",
+                },
+            ),
             patch("torch_neuronx.neuron_dynamo_backend.backend.CompileGraph") as mock_compile_graph,
             patch(
                 "torch_neuronx.neuron_dynamo_backend.cache_artifact.NeuronOutputCode"
@@ -718,7 +732,14 @@ class TestNeuronBackendFxCompiler:
                 "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo",
                 side_effect=RuntimeError("torch-mlir conversion failed"),
             ),
-            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch.dict(
+                os.environ,
+                {
+                    "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                    # Opt in to fallback: package-level default disables it.
+                    "TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "false",
+                },
+            ),
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
                 return_value=mock_post_aot,
@@ -769,7 +790,14 @@ class TestNeuronBackendFxCompiler:
                 "torch_neuronx.neuron_dynamo_backend.backend._compile_fx_to_stablehlo",
                 side_effect=RuntimeError("conversion failed"),
             ),
-            patch.dict(os.environ, {"TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir)}),
+            patch.dict(
+                os.environ,
+                {
+                    "TORCH_NEURONX_DEBUG_DIR": str(self.temp_dir),
+                    # Opt in to fallback: package-level default disables it.
+                    "TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION": "false",
+                },
+            ),
             patch(
                 "torch_neuronx.neuron_dynamo_backend.backend.post_aot_processing",
                 return_value=mock_post_aot,

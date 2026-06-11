@@ -69,6 +69,8 @@ os.environ.setdefault(
     "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED
 )
 
+os.environ.setdefault("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", "1")
+
 # Set default for aten ops lowering
 os.environ.setdefault("TORCH_NEURONX_MLIR_ATEN_OPS", DEFAULT_MLIR_ATEN_OPS)
 
