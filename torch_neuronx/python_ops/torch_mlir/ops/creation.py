@@ -17,11 +17,9 @@ def torch_arange(start, end, step=1, dtype=None, out=None, **kwargs):
     return torch.arange(start, end, step, dtype=dtype, **kwargs)
 
 
-@register_aten(
-    ["aten::zeros", "aten::zeros.out"], static_argnums=(0,), static_argnames=("dtype", "device")
-)
-def torch_zeros(size, dtype=None, layout=None, device=None, pin_memory=False, out=None, **kwargs):
-    return torch.zeros(size, dtype=dtype, device=device)
+@register_aten(["aten::zeros", "aten::zeros.out"], static_argnums=(0,), static_argnames=("dtype",))
+def torch_zeros(size, dtype=None, out=None, **kwargs):
+    return torch.zeros(size, dtype=dtype, **kwargs)
 
 
 @register_aten(["aten::ones", "aten::ones.out"], static_argnums=(0,), static_argnames=("dtype",))
