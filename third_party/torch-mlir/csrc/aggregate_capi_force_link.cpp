@@ -13,7 +13,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
@@ -44,7 +43,6 @@ void mlirRegisterAllDialects(MlirDialectRegistry registry) {
         mlir::scf::SCFDialect,
         mlir::linalg::LinalgDialect,
         mlir::math::MathDialect,
-        mlir::tosa::TosaDialect,
         mlir::cf::ControlFlowDialect,
         mlir::complex::ComplexDialect,
         mlir::shape::ShapeDialect,

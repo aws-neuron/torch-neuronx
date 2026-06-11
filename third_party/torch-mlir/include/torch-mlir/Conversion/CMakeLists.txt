@@ -1,5 +1,3 @@
-add_subdirectory(TorchOnnxToTorch)
-
 set(LLVM_TARGET_DEFINITIONS Passes.td)
 
 
