@@ -373,4 +373,11 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_native_multihead_self_attention_*",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "No Neuron lowering for the upsample_bilinear2d / upsample_bicubic2d /"
+            " _upsample_bilinear2d_aa / _upsample_bicubic2d_aa ops."
+        ),
+        tests=s.ATEN_UPSAMPLINGBIMODE2D_NO_LOWERING,
+    ),
 ]
