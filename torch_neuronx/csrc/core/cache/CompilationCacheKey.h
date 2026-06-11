@@ -24,15 +24,28 @@ enum class CacheKeySource : uint8_t {
  * 1. In-memory key: `base_key`
  *    Used for in-memory cache lookup. The `base_key` is a string from the
  *    frontend (e.g., op_name + shapes + dtypes from eager, or a hash string
- *    from torch.compile).
+ *    from torch.compile). Includes Python source/version info so that any
+ *    upstream change forces a re-trace/re-lower.
  *
- * 2. Persistent key: `hash(hlo_bytes || compiler_config)`
- *    Computed on the fly only when persistent cache access is needed.
- *    Uses HLO content hash + compiler config to ensure correctness across
- *    compiler/toolchain versions and different process invocations.
+ * 2. Persistent key: gated by TORCH_NEURONX_NEFF_KEY_FROM_HLO.
+ *    Computed lazily when persistent cache access is needed.
+ *
+ *    - Flag on  (dev/CI):  hash(hlo_bytes || compiler_config)
+ *      Content-derived from the lowered HLO/MLIR bytes plus compiler config
+ *      (platform, lnc, optimization level, compiler args, neuronx-cc version).
+ *      Does NOT include base_key — benign Python edits re-trace/re-lower
+ *      (cheap) but still hit the on-disk NEFF cache when HLO bytes are
+ *      unchanged, enabling cross-commit cache reuse.
+ *      Returns nullptr if HLO bytes are not available (e.g., NeffDirect
+ *      paths); callers gracefully skip the persistent cache in that case.
+ *
+ *    - Flag off (default/prod):  hash(base_key || compiler_config)
+ *      Legacy behavior. Any change in base_key (source/version_hash) busts
+ *      the persistent cache. Always available once the key is non-empty.
  *
  * ## In-memory key identity:  base_key
- * ## Persistent key identity: hash(hlo_bytes || compiler_config)
+ * ## Persistent key identity (flag on):  hash(hlo_bytes || compiler_config)
+ * ## Persistent key identity (flag off): hash(base_key || compiler_config)
  *
  */
 class CompilationCacheKey {
@@ -82,25 +95,29 @@ class CompilationCacheKey {
   }
 
   /**
-   * @brief Compute the persistent cache key from stored HLO bytes.
-   *
-   * Computes: XXH3_128(hlo_bytes || compiler_config) → 32-char hex
-   *
-   * Uses HLO bytes passed to Create(). Returns empty string if no HLO
-   * bytes were provided.
-   *
-   * @return 32-char hex string, or empty if HLO bytes not available
-   */
-  /**
    * @brief Get persistent key, computing lazily on first call.
-   * Returns nullptr if no HLO bytes were provided to Create().
+   *
+   * Computes XXH3_128 over either (hlo_bytes || compiler_config) or
+   * (base_key || compiler_config) depending on
+   * TORCH_NEURONX_NEFF_KEY_FROM_HLO.
+   *
+   * Returns nullptr when:
+   *   - The key is empty (default-constructed), OR
+   *   - HLO-content keying is enabled and no HLO bytes were provided
+   *     (e.g., the (key, source) constructor used by NeffDirectKernelExecution).
+   * Callers must check for nullptr and skip the persistent cache when so.
    */
   const std::string* GetPersistentKey() const;
 
   /**
-   * @brief Compute the persistent cache key from base_key + compiler config.
+   * @brief Compute the persistent cache key.
    *
-   * @return 32-char hex string (XXH3_128 of base_key || compiler_config)
+   * Hash input depends on TORCH_NEURONX_NEFF_KEY_FROM_HLO:
+   *   - on:  hlo_bytes || compiler_config (caller must ensure hlo_bytes_ptr_
+   *          is non-null/non-empty; GetPersistentKey() handles the guard)
+   *   - off: base_key  || compiler_config
+   *
+   * @return 32-char hex string (XXH3_128)
    */
   std::string ComputePersistentKey() const;
 
@@ -163,6 +180,10 @@ class CompilationCacheKey {
   // Platform metadata
   std::string platform_target_;
   std::string logical_neuron_cores_;
+
+  // neuronx-cc compiler version (sourced from NEURONXCC_VERSION env var).
+  // Included in BuildCompilerExtension so a compiler upgrade busts the cache.
+  std::string compiler_version_;
 
   // Non-owning pointer to HLO bytes for persistent key computation.
   // Lifetime managed by the kernel execution object that owns this key.

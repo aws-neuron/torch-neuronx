@@ -22,7 +22,7 @@ constexpr uint8_t kFieldSeparator = 0xFF;
 
 std::string CompilationCacheKey::BuildCompilerExtension() const {
   return platform_target_ + "_" + logical_neuron_cores_ + "_" + optimization_level_ + "_" +
-         compiler_args_;
+         compiler_args_ + "_v" + compiler_version_;
 }
 
 const char* CompilationCacheKey::SourceName(CacheKeySource source) {
@@ -46,6 +46,7 @@ CompilationCacheKey::CompilationCacheKey(const std::string& base_key,
       optimization_level_(optimization_level),
       platform_target_(utils::GetPlatformTarget()),
       logical_neuron_cores_(utils::GetLogicalNeuronCores()),
+      compiler_version_(utils::GetCompilerVersion()),
       hlo_bytes_ptr_(hlo_bytes_ptr),
       source_(source) {}
 
@@ -56,8 +57,16 @@ const std::string* CompilationCacheKey::GetPersistentKey() const {
   if (base_key_.empty()) {
     return nullptr;
   }
+  // When HLO-content keying is enabled, the persistent key requires HLO
+  // bytes — without them, persistent caching is not possible (e.g.,
+  // NeffDirectKernelExecution paths). Caller must skip the persistent cache
+  // lookup when this returns nullptr.
+  // When disabled (legacy / production default), persistent key derives from
+  // base_key, which is always present once we pass the IsEmpty check above.
+  if (utils::IsHloContentKeyEnabled() && (hlo_bytes_ptr_ == nullptr || hlo_bytes_ptr_->empty())) {
+    return nullptr;
+  }
   if (persistent_key_.empty()) {
-    // Use base_key for persistent key
     persistent_key_ = ComputePersistentKey();
     key_str_.clear();
   }
@@ -65,13 +74,27 @@ const std::string* CompilationCacheKey::GetPersistentKey() const {
 }
 
 std::string CompilationCacheKey::ComputePersistentKey() const {
-  // Build the hash input: base_key || 0xFF || compiler_config
+  // Persistent NEFF key composition is gated by TORCH_NEURONX_NEFF_KEY_FROM_HLO:
+  //   - on  (dev/CI): hash(hlo_bytes || compiler_config) — content-addressed.
+  //                   Lets benign Python source edits re-trace/re-lower (cheap)
+  //                   but still hit the on-disk NEFF cache when HLO bytes are
+  //                   unchanged, enabling cross-commit cache reuse.
+  //   - off (default/prod): hash(base_key || compiler_config) — legacy.
+  //                   Any source change in base_key invalidates the NEFF.
+  // GetPersistentKey() guarantees hlo_bytes_ptr_ is valid when the flag is on.
   std::string compiler_config = BuildCompilerExtension();
-  std::vector<uint8_t> combined;
-  combined.reserve(base_key_.size() + 1 + compiler_config.size());
+  const bool use_hlo = utils::IsHloContentKeyEnabled();
+  const size_t input_size = use_hlo ? hlo_bytes_ptr_->size() : base_key_.size();
 
-  combined.insert(combined.end(), reinterpret_cast<const uint8_t*>(base_key_.data()),
-                  reinterpret_cast<const uint8_t*>(base_key_.data()) + base_key_.size());
+  std::vector<uint8_t> combined;
+  combined.reserve(input_size + 1 + compiler_config.size());
+
+  if (use_hlo) {
+    combined.insert(combined.end(), hlo_bytes_ptr_->begin(), hlo_bytes_ptr_->end());
+  } else {
+    combined.insert(combined.end(), reinterpret_cast<const uint8_t*>(base_key_.data()),
+                    reinterpret_cast<const uint8_t*>(base_key_.data()) + base_key_.size());
+  }
   combined.push_back(kFieldSeparator);
 
   combined.insert(

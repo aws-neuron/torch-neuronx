@@ -6,6 +6,7 @@ Dispatches to compilation worker.
 import hashlib
 import io
 import logging
+import os
 import threading
 from typing import Final
 
@@ -126,11 +127,20 @@ class CompileGraph:
         self.mlir.operation.write_bytecode(bytecode_buffer)
         mlir_bytes = bytecode_buffer.getvalue()
 
-        # Use content-based cache key for persistent NEFF caching
+        # Cache key composition gated on TORCH_NEURONX_NEFF_KEY_FROM_HLO,
+        # mirroring the C++ CompilationCacheKey behavior:
+        #   - on  (dev/CI): pure MLIR-content hash. C++ rehashes mlir_bytes
+        #     for the persistent key; global_version_hash is excluded so
+        #     benign Python edits don't invalidate the on-disk NEFF cache.
+        #   - off (default/prod): legacy mlir_hash + ":" + global_version_hash.
+        #     The C++ persistent key derives from this base_key, so any
+        #     Python source change in the lowering directories busts the cache.
+        if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
+            content_key = hashlib.sha256(mlir_bytes).hexdigest()
+        else:
+            from torch_neuronx.utils import global_version_hash
 
-        from torch_neuronx.utils import global_version_hash
-
-        content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
+            content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
 
         exec_handle = torch_neuronx._C.compile_graph(
             content_key,

@@ -73,5 +73,88 @@ TEST_F(PlatformUtilsTest, GetPlatformTarget_Trn2_NoRevision) {
   EXPECT_EQ(GetPlatformTarget(), "trn2");
 }
 
+// --- GetCompilerVersion tests ---
+
+class GetCompilerVersionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    const char* existing = std::getenv("NEURONXCC_VERSION");
+    saved_value_ = existing ? std::string(existing) : "";
+    had_value_ = existing != nullptr;
+  }
+
+  void TearDown() override {
+    if (had_value_) {
+      ::setenv("NEURONXCC_VERSION", saved_value_.c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv("NEURONXCC_VERSION");
+    }
+  }
+
+  std::string saved_value_;
+  bool had_value_ = false;
+};
+
+TEST_F(GetCompilerVersionTest, ReturnsEnvVarWhenSet) {
+  ::setenv("NEURONXCC_VERSION", "2.18.123", /*overwrite=*/1);
+  EXPECT_EQ(GetCompilerVersion(), "2.18.123");
+}
+
+TEST_F(GetCompilerVersionTest, ReturnsEmptyWhenUnset) {
+  ::unsetenv("NEURONXCC_VERSION");
+  EXPECT_EQ(GetCompilerVersion(), "");
+}
+
+TEST_F(GetCompilerVersionTest, ReturnsEmptyWhenSetToEmptyString) {
+  ::setenv("NEURONXCC_VERSION", "", /*overwrite=*/1);
+  EXPECT_EQ(GetCompilerVersion(), "");
+}
+
+// --- IsHloContentKeyEnabled tests ---
+
+class IsHloContentKeyEnabledTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    const char* existing = std::getenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+    saved_value_ = existing ? std::string(existing) : "";
+    had_value_ = existing != nullptr;
+  }
+
+  void TearDown() override {
+    if (had_value_) {
+      ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", saved_value_.c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+    }
+  }
+
+  std::string saved_value_;
+  bool had_value_ = false;
+};
+
+TEST_F(IsHloContentKeyEnabledTest, FalseWhenUnset) {
+  ::unsetenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+  EXPECT_FALSE(IsHloContentKeyEnabled());
+}
+
+TEST_F(IsHloContentKeyEnabledTest, TrueWhenSetToOne) {
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1", /*overwrite=*/1);
+  EXPECT_TRUE(IsHloContentKeyEnabled());
+}
+
+TEST_F(IsHloContentKeyEnabledTest, FalseWhenSetToZero) {
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "0", /*overwrite=*/1);
+  EXPECT_FALSE(IsHloContentKeyEnabled());
+}
+
+TEST_F(IsHloContentKeyEnabledTest, FalseForOtherTruthyStrings) {
+  // Strict opt-in: only "1" enables. Avoids accidental enables from "true",
+  // "yes", etc. that other env vars in this codebase accept.
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "true", /*overwrite=*/1);
+  EXPECT_FALSE(IsHloContentKeyEnabled());
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "yes", /*overwrite=*/1);
+  EXPECT_FALSE(IsHloContentKeyEnabled());
+}
+
 }  // namespace
 }  // namespace at::neuron::utils

@@ -115,6 +115,17 @@ os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
 # Set default debug directory
 os.environ.setdefault("TORCH_NEURONX_DEBUG_DIR", "/tmp/neuron_backend")
 
+# Surface the neuronx-cc compiler version to C++ via env var so the persistent
+# NEFF cache key includes it (a compiler upgrade should bust cached NEFFs).
+# Read by utils::GetCompilerVersion() in PlatformUtils.cpp.
+if "NEURONXCC_VERSION" not in os.environ:
+    try:
+        import neuronxcc
+
+        os.environ["NEURONXCC_VERSION"] = getattr(neuronxcc, "__version__", "")
+    except Exception:
+        os.environ["NEURONXCC_VERSION"] = ""
+
 # Disable artifact preservation by default
 os.environ.setdefault("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "0")
 
