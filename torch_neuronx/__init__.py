@@ -84,9 +84,25 @@ os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
 # Set default for HBM mapping
 os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 
-# Set default for host-cc
+# Set default for host-cc and apply bundled defaults when enabled.
+# When host-cc is enabled, NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE MUST be true.
 os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
-os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
+if os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") == "1":
+    from torch_neuronx.utils import get_platform_target
+
+    if get_platform_target() == "trn2":
+        if os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "false":
+            raise RuntimeError(
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false is incompatible with "
+                "TORCH_NEURONX_ENABLE_HOST_CC=1 on trn2. This combination will "
+                "cause device deadlock. Remove the "
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or disable host-cc."
+            )
+        os.environ.setdefault("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "true")
+    os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
+    os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "1")
+else:
+    os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
 # Default to C++ NeuronBackend process group
 os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
