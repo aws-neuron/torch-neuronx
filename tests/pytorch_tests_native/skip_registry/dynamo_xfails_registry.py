@@ -713,4 +713,59 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("scatter reduce op compilation regressed in compiler for scalar inputs"),
         tests=x.SCATTER_COMPILE_FAILURE,
     ),
+    SkipGroup(
+        reason=(
+            "Test transitively imports `transformers`, which imports"
+            " `torchvision`. `torchvision::nms` operator is not registered in"
+            " the test environment. Environment issue, not a backend issue."
+        ),
+        tests=[
+            "HooksTests::test_global_module_forward_pre_hook",
+            "InPlaceCompilationTests::test_compile_frozen_module_error",
+            "InPlaceCompilationTests::test_compile_frozen_module_inductor_error",
+            "ReproTests::test_dynamo_set_recursion_limit_usage",
+            "TestDynamoConfigOverrideIntegration::test_dynamo_config_override_warning",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "neuronx-cc does not support integer pow (s64). The compiled NEFF"
+            " contains `s64[...] power(...)` which fails compilation."
+        ),
+        tests=[
+            "MiscTests::test_itertools_accumulate_tensors_builtins",
+            "MiscTests::test_torch_dynamo_codegen_pow",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "CPU input tensor passed to a Neuron-compiled function. The"
+            " executor's _prepare_inputs no longer accepts cpu tensors with"
+            " fallback disabled (executor.py:121: tensor = inp.to(device_str))."
+        ),
+        tests=[
+            "SubclassTests::test_subclass_dont_invoke_torch_function_on_overridden_method",
+            "TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "float64 inplace index_add: NEFF creation fails on Neuron. f64"
+            " support in neuronx-cc is limited; the index_add path produces"
+            " a graph that the compiler cannot lower."
+        ),
+        tests=[
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "TwoTensor subclass with nested differing sizes produces a"
+            " graph whose instruction count exceeds neuronx-cc's"
+            " 10,000,000 limit (NCC_EVRF007)."
+        ),
+        tests=[
+            "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
+        ],
+    ),
 ]

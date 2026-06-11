@@ -366,6 +366,7 @@ DYNAMO_FAILED_TO_LEGALIZE_CONSTANT_INT = [
     "DynamicShapesMiscTests::test_jacfwd_one_hot_dynamic_compile_dynamic_shapes",
     "DynamicShapesMiscTests::test_writes_to_cells_across_frames2_dynamic_shapes",
     "MiscTests::test_jacfwd_one_hot_dynamic_compile",
+    "TorchFunctionModeTests::test_builtin_equivalent_funcs",
 ]
 
 DYNAMO_LOWERING_FAILURE_ATEN_INT = [
