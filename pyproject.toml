@@ -76,6 +76,9 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "RUF"]
 "tests/*" = ["S101", "F401"]  # Allow assert and unused imports in tests (torch_neuronx needs to be imported for side effects)
 "examples/**/*" = ["F401"]  # Allow unused imports in examples for side effects
 
+[tool.pytest.ini_options]
+addopts = "--dist=loadgroup"
+
 [tool.mypy]
 python_version = "3.12"
 files = ["torch_neuronx"]

@@ -465,6 +465,10 @@ void neuron_init() {
     return;
   }
 
+  // Disable NRT's automatic OOM logging/file dumps. We control when to report
+  // OOM ourselves (only on final OOM, not on every recoverable retry).
+  setenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG", "0", 0);  // 0 = don't overwrite if user set
+
   // Initialize Neuron Runtime
   NRT_STATUS status = nrt_init(NRT_FRAMEWORK_TYPE_PYTORCH,  // Framework type
                                "2.0",                       // Framework version (PyTorch version)

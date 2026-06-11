@@ -476,6 +476,7 @@ class TestMemoryStats:
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 @pytest.mark.usefixtures("clean_device_state")
+@pytest.mark.xdist_group("oom_serial")
 class TestLazyAllocDeferRetry:
     """End-to-end tests for the lazy-alloc defer-retry path: parks an OOM'd
     kAlloc as Deferred, waits for the stream to drain so preceding kDeallocs
@@ -652,3 +653,58 @@ class TestLazyAllocDeferRetry:
         stats = torch_neuronx.memory_stats(device=0)
         assert stats["num_alloc_retries"] == 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
+
+    @_requires_lazy_alloc
+    def test_oom_report_fires_on_unrecoverable_oom(self):
+        """Unrecoverable OOM should produce a detailed NRT diagnostic dump
+        (log_dev_mem) for debugging, not just the basic nrt_infodump."""
+        import os
+        import tempfile
+
+        # Capture stderr at fd level (NRT writes via C fprintf)
+        with tempfile.TemporaryFile(mode="w+b") as tmp:
+            stderr_fd = os.dup(2)
+            os.dup2(tmp.fileno(), 2)
+
+            try:
+                floats = floats_for_mib(oversize_mib())
+                with pytest.raises(RuntimeError):
+                    big = torch.empty(floats, device="neuron", dtype=torch.float32)
+                    big.fill_(0.0)
+                    torch_neuronx.synchronize()
+            finally:
+                os.dup2(stderr_fd, 2)
+                os.close(stderr_fd)
+
+            tmp.seek(0)
+            captured = tmp.read().decode("utf-8", errors="replace")
+
+        assert "log_dev_mem" in captured, "Detailed OOM report should fire on unrecoverable OOM"
+
+    @_requires_lazy_alloc
+    def test_oom_report_suppressed_on_recoverable_oom(self):
+        """A recoverable OOM (defer-retry succeeds) must NOT produce a detailed
+        NRT dump — only true terminal OOMs should report."""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryFile(mode="w+b") as tmp:
+            stderr_fd = os.dup(2)
+            os.dup2(tmp.fileno(), 2)
+
+            try:
+                stage_pending_kdeallocs()
+                big = torch.empty(floats_for_mib(big_mib()), device="neuron", dtype=torch.float32)
+                big.fill_(0.0)
+                torch_neuronx.synchronize()
+                del big
+            finally:
+                os.dup2(stderr_fd, 2)
+                os.close(stderr_fd)
+
+            tmp.seek(0)
+            captured = tmp.read().decode("utf-8", errors="replace")
+
+        assert (
+            "log_dev_mem" not in captured
+        ), "Detailed OOM report fired on recoverable OOM — should only fire on terminal OOM"
