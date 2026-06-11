@@ -138,6 +138,12 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
 
   // For async execution worker (operation scheduling)
   OperationContext* GetNextOperationToSchedule();
+  // True iff `op` is a same-stream kWait eligible for run-ahead bypass; the
+  // free-HBM headroom check lives in IsRunAheadMemorySafe.
+  static bool IsSameStreamWaitBypass(OperationContext* op, c10::StreamId stream_id);
+  // True iff free device HBM has enough headroom to safely advance past a
+  // same-stream kWait. Disabled => always returns true.
+  static bool IsRunAheadMemorySafe(c10::DeviceIndex device_index);
   // Advance next_to_schedule_ past the op the caller just scheduled.
   void AdvanceToNextOperation(OperationContext* just_scheduled = nullptr);
 

@@ -756,6 +756,11 @@ std::vector<NeuronMemorySnapshot::SegmentInfo> getSnapshotSegments() {
 
 namespace lazy {
 
+// Largest single physical binding observed; sizes run-ahead headroom.
+std::atomic<size_t> g_largest_alloc_bytes{0};
+
+size_t LargestAllocBytes() { return g_largest_alloc_bytes.load(std::memory_order_relaxed); }
+
 void AllocBind(void* ptr, size_t size, int device_id) {
   auto* info = AllocatorRegistry::getInstance().find(ptr);
   EXECUTION_RUNTIME_CHECK(info, "lazy::AllocBind: AllocationInfo not found for ptr");
@@ -767,6 +772,11 @@ void AllocBind(void* ptr, size_t size, int device_id) {
   Block* block = pool.Allocate(size);
   EXECUTION_RUNTIME_CHECK(
       block, "lazy::AllocBind: segment pool block not found, size=" + std::to_string(size));
+
+  for (size_t prev = g_largest_alloc_bytes.load(std::memory_order_relaxed);
+       size > prev &&
+       !g_largest_alloc_bytes.compare_exchange_weak(prev, size, std::memory_order_relaxed);) {
+  }
 
   {
     std::lock_guard<std::mutex> lock(info->recorded_streams_mutex);

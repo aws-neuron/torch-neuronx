@@ -173,6 +173,8 @@ namespace lazy {
 void AllocBind(void* ptr, size_t size, int device_id);
 // Release physical memory for a lazy allocation VA.
 void DeallocRelease(void* ptr, size_t size, int device_id, c10::StreamId stream_id);
+// Largest single physical binding observed (bytes).
+size_t LargestAllocBytes();
 }  // namespace lazy
 
 }  // namespace NeuronCachingAllocator

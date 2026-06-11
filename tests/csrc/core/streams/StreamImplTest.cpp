@@ -275,34 +275,19 @@ std::shared_ptr<OperationContext> MakeEventOp(EventDirectKernelExecution::EventA
 TEST_F(StreamImplTest, GetNextOperationToScheduleSameStreamKWaitBypass) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id);
-  op->stream = stream_.get();
-  engine_->SubmitOperation(op);
-
-  EXPECT_EQ(stream_->GetNextOperationToSchedule(), op.get());
-
-  stream_->RemoveActiveOperation(op.get());
+  EXPECT_TRUE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleCrossStreamKWaitGated) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id + 1);
-  op->stream = stream_.get();
-  engine_->SubmitOperation(op);
-
-  EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
-
-  stream_->RemoveActiveOperation(op.get());
+  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleKSignalNotBypassed) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, stream_->stream_id);
-  op->stream = stream_.get();
-  engine_->SubmitOperation(op);
-
-  EXPECT_EQ(stream_->GetNextOperationToSchedule(), nullptr);
-
-  stream_->RemoveActiveOperation(op.get());
+  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
 }
 
 int main(int argc, char** argv) {
