@@ -41,6 +41,19 @@ When `TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1`, all directories and their
 
 See [Neuron Compiler CLI Reference](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/compiler/neuronx-cc/api-reference-guide/neuron-compiler-cli-reference-guide.html) for available flags.
 
+## Persistent NEFF / HLO Cache
+
+Compiled NEFFs and lowered HLO entries are cached on disk to avoid recompilation across runs. The cache is content-addressed; entries from one run can be reused by another as long as the inputs (HLO bytes, compiler config, compiler version) are unchanged.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `TORCH_NEURONX_NEFF_CACHE_DIR` | path | `/tmp/neff_cache` | Directory for persistent NEFF cache. Point at a shared mount (e.g. FSx) to reuse compiled NEFFs across runs and instances. |
+| `TORCH_NEURONX_HLO_CACHE_DIR` | path | `/tmp/hlo_cache` | Directory for persistent HLO cache. |
+| `TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR` | path | `/tmp/local_cache` | Local directory for filelocks and scratch. **Must stay on a local POSIX filesystem** (NFS/Lustre lock semantics are unreliable). |
+| `TORCH_NEURONX_NEFF_DISABLE_CACHE` | bool | `False` | When `1`, disables the persistent NEFF cache entirely. Every compile runs fresh. |
+| `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT` | int | `1200` | Seconds to wait for the per-key compile lock before giving up. |
+| `TORCH_NEURONX_NEFF_KEY_FROM_HLO` | bool | `False` | When `1`, the persistent NEFF key is derived from the lowered HLO bytes plus compiler config (instead of the in-memory base_key). Lets benign Python edits re-trace and re-lower without busting the on-disk cache. Off by default; opt in to enable. |
+
 ## General
 
 These variables affect eager execution (non-compiled operations).

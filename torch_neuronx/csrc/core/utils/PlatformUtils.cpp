@@ -97,5 +97,18 @@ std::string GetLogicalNeuronCores() {
   return GetPlatformConfigFor(GetInstanceType()).logical_cores;
 }
 
+std::string GetCompilerVersion() {
+  const char* env_version = std::getenv("NEURONXCC_VERSION");
+  if (env_version && env_version[0] != '\0') {
+    return std::string(env_version);
+  }
+  return "";
+}
+
+bool IsHloContentKeyEnabled() {
+  const char* v = std::getenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+  return v && std::string(v) == "1";
+}
+
 }  // namespace utils
 }  // namespace at::neuron

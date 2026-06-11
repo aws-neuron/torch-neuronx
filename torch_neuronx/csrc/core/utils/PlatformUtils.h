@@ -38,6 +38,24 @@ std::string GetPlatformTarget();
 //   std::runtime_error if the instance type is unknown or unsupported
 std::string GetLogicalNeuronCores();
 
+// Gets the neuronx-cc compiler version for cache key composition.
+// Reads NEURONXCC_VERSION environment variable, set by torch_neuronx Python
+// init from neuronxcc.__version__. Returns empty string if not set, in which
+// case callers should treat compiler version as unknown for keying purposes.
+//
+// Returns:
+//   Compiler version string (e.g., "2.18.123") or empty string if unset
+std::string GetCompilerVersion();
+
+// Returns true when the persistent NEFF cache key should be derived from
+// HLO/MLIR bytes (content-addressed, enables cross-commit cache reuse).
+// When false, the legacy base_key-derived persistent key is used.
+//
+// Gated on TORCH_NEURONX_NEFF_KEY_FROM_HLO=1. Default off so the
+// production behavior is preserved until the new keying scheme is validated
+// (see docs/work-in-progress/persistent-cache-context.md).
+bool IsHloContentKeyEnabled();
+
 }  // namespace utils
 
 }  // namespace at::neuron

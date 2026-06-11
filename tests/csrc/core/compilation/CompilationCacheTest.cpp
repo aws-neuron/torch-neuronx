@@ -84,9 +84,15 @@ class CompilationCacheTest : public ::testing::Test {
     SaveEnvVar("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
     SaveEnvVar("NEURON_COMPILE_SERVICE");
+    SaveEnvVar("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
 
     // Force local backend for unit tests (service backend calls real neuronx-cc)
     setenv("NEURON_COMPILE_SERVICE", "0", 1);
+
+    // Pin the HLO-content keying flag on for these tests. The graceful-skip
+    // and cross-commit-reuse cases below assert the new contract; the legacy
+    // (flag-off) path is exercised in CompilationCacheKeyLegacyKeyTest.
+    setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1", 1);
 
     // Create temp directories for persistent and local cache
     temp_dir_ = std::make_unique<TempDirectory>("compilation_cache_test_");
@@ -2302,6 +2308,115 @@ TEST_F(CompilationCacheTest, AsyncErrorStashedOnKernel) {
   EXPECT_TRUE(kernel.IsFailedCompilation());
   EXPECT_THAT(kernel.GetCompilationError(), ::testing::HasSubstr("neuronx-cc: unsupported op xyz"));
 }
+
+// ============================================================================
+// Tests for graceful-skip behavior when HLO bytes are not available.
+// Simulates NeffDirectKernelExecution-style paths where persistent caching
+// is intentionally disabled.
+// ============================================================================
+
+class NoHloKernelExecution : public CompilableKernelExecution {
+ public:
+  static std::atomic<int>& GetCompileCounter() {
+    static std::atomic<int> compile_counter{0};
+    return compile_counter;
+  }
+
+  static void ResetCompileCounter() { GetCompileCounter().store(0); }
+
+  explicit NoHloKernelExecution(const std::string& cache_key)
+      : CompilableKernelExecution(cache_key, "", "", false) {
+    // Intentionally do NOT call SetHloBytesPtr — persistent key is unavailable.
+  }
+
+  std::vector<uint8_t> CompileToNeff() const override {
+    GetCompileCounter()++;
+    std::string neff_content = "NEFF_NO_HLO_" + GetCacheKey();
+    return std::vector<uint8_t>(neff_content.begin(), neff_content.end());
+  }
+
+  // Returning empty matches the contract for paths without HLO.
+  const std::vector<uint8_t>& GetHloBytes() const override {
+    static const std::vector<uint8_t> empty;
+    return empty;
+  }
+};
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesCompilesWithoutCrash) {
+  // Without HLO bytes, GetPersistentKey() returns nullptr. Cache must
+  // fall through to in-memory-only mode, compile the kernel, and cache
+  // it without dereferencing the null persistent key.
+  NoHloKernelExecution::ResetCompileCounter();
+  NoHloKernelExecution kernel("no_hlo_key_1");
+
+  // Sanity: persistent key really is unavailable.
+  EXPECT_EQ(kernel.GetCompilationCacheKey().GetPersistentKey(), nullptr);
+
+  cache_->GetOrCompileNeff(kernel, /*stream_id=*/1);
+
+  EXPECT_TRUE(kernel.HasCachedNeff());
+  EXPECT_FALSE(kernel.GetCachedNeff().empty());
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesHitsInMemoryCache) {
+  // Even without persistent cache backing, in-memory cache should still
+  // dedupe on base_key — second lookup should not trigger a recompile.
+  NoHloKernelExecution::ResetCompileCounter();
+
+  NoHloKernelExecution k1("no_hlo_key_2");
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+
+  NoHloKernelExecution k2("no_hlo_key_2");
+  cache_->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);  // no recompile
+  EXPECT_EQ(k1.GetCachedNeff(), k2.GetCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesNotPersistedAcrossCacheInstances) {
+  // Without HLO bytes, the persistent cache layer is bypassed, so a fresh
+  // CompilationCache instance does NOT see the previously-compiled NEFF.
+  // This documents the cost of the graceful-skip path: in-memory only.
+  NoHloKernelExecution::ResetCompileCounter();
+
+  NoHloKernelExecution k1("no_hlo_key_3");
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+
+  // New cache instance — sharing the same persistent dir, but persistent
+  // cache wasn't populated for this kernel.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  NoHloKernelExecution k2("no_hlo_key_3");
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 2);  // recompiled
+}
+
+TEST_F(CompilationCacheTest, CrossCommitReuse_SameHloDifferentBaseKeyHitsPersistentCache) {
+  // The cross-commit reuse scenario: two kernels with different base_keys
+  // (simulating a Python source edit that bumped global_version_hash) but
+  // identical HLO bytes. After the first compile populates the persistent
+  // cache, a fresh CompilationCache instance should see the entry via the
+  // HLO-content-derived persistent key.
+  MockNeuronKernelExecution::ResetCompileCounter();
+  std::vector<uint8_t> shared_hlo = {0x42, 0x42, 0x42, 0x42};
+
+  // First "commit": base_key v1, populates persistent cache.
+  MockNeuronKernelExecution k1("base_key_v1_pre_edit", shared_hlo);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Second "commit" simulated via fresh cache (clears in-memory state).
+  // Different base_key but same HLO → persistent key matches → cache hit.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  MockNeuronKernelExecution k2("base_key_v2_post_edit", shared_hlo);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+
+  // No new compile — persistent cache served the previous NEFF.
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+  EXPECT_TRUE(k2.HasCachedNeff());
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

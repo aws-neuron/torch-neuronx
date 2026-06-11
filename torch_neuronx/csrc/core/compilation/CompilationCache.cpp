@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
@@ -245,10 +246,17 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
   }  // Lock released before I/O persistent cache check.
 
   // Check persistent cache (NFS/disk) using the persistent key from CompilationCacheKey.
+  // GetPersistentKey() returns nullptr if HLO bytes aren't available
+  // (e.g., NeffDirectKernelExecution paths) — gracefully skip persistent
+  // lookup in that case and register pending compilation.
   const std::string* persistent_cache_key = key.GetPersistentKey();
-  TORCH_CHECK(persistent_cache_key != nullptr,
-              "No HLO bytes available to compute persistent key. "
-              "Ensure HLO bytes are passed to CompilationCacheKey().");
+  if (persistent_cache_key == nullptr) {
+    TORCH_NEURONX_DEBUG("Skipping persistent cache (no HLO bytes):", key.ToString());
+    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
+    pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
+    return false;
+  }
   auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
   if (neff_bytes) {
     TORCH_NEURONX_DEBUG("Persistent cache hit:", key.ToString());
@@ -630,22 +638,24 @@ void CompilationCache::Compile(const CompilationCacheKey& key,
 std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
     const CompilableKernelExecution& kernel_execution, const CompilationCacheKey& key) {
   const std::string& cache_key = key.GetKey();
-  // Get persistent key for file lock and cache storage.
+  // Get persistent key for file lock and cache storage. May be nullptr when
+  // HLO bytes aren't available — in that case we compile without persistent
+  // coordination (no cross-process file lock, no persistent put).
   const std::string* persistent_cache_key = key.GetPersistentKey();
 
-  std::filesystem::path lock_path = GetLockPath(*persistent_cache_key);
-
-  TORCH_NEURONX_DEBUG("Acquiring compilation lock:", "CompilationCacheKey=", key.ToString(),
-                      "lock_path=", lock_path.string());
-
-  // Acquire file lock to coordinate compilation across processes.
-  FileLockGuard lock_guard(lock_path);
-
-  TORCH_NEURONX_DEBUG("Compilation lock acquired:", key.ToString());
+  // Optional file lock: only when we have a persistent key to coordinate on.
+  std::optional<FileLockGuard> lock_guard;
+  if (persistent_cache_key != nullptr) {
+    std::filesystem::path lock_path = GetLockPath(*persistent_cache_key);
+    TORCH_NEURONX_DEBUG("Acquiring compilation lock:", "CompilationCacheKey=", key.ToString(),
+                        "lock_path=", lock_path.string());
+    lock_guard.emplace(lock_path);
+    TORCH_NEURONX_DEBUG("Compilation lock acquired:", key.ToString());
+  }
 
   // Double-check persistent cache after acquiring lock.
   // Another process may have completed compilation while waiting for lock.
-  if (persistent_cache_) {
+  if (persistent_cache_ && persistent_cache_key != nullptr) {
     auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
     // Persistent cache hit - entry populated while waiting for compilation lock.
     if (neff_bytes) {
@@ -706,8 +716,12 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   TORCH_NEURONX_TIME_METRIC("CompilationCache.CompilationTime", start_time, end_time);
 
   // Create cache entry with compiled NEFF and timing information.
+  // Use persistent key when available, fall back to in-memory cache_key
+  // for entries that can't be persistently cached (no HLO bytes).
+  const std::string& entry_key =
+      persistent_cache_key != nullptr ? *persistent_cache_key : cache_key;
   auto cache_entry =
-      std::make_shared<CacheEntry>(std::move(neff_bytes), *persistent_cache_key, compilation_time);
+      std::make_shared<CacheEntry>(std::move(neff_bytes), entry_key, compilation_time);
 
   // Store the cache entry in memory using original cache_key.
   {
@@ -716,8 +730,8 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   }
 
   // Store to persistent cache (NFS/disk) for cross-process sharing.
-  // Use persistent_cache_key.
-  if (persistent_cache_) {
+  // Skip when no persistent key (no HLO bytes available).
+  if (persistent_cache_ && persistent_cache_key != nullptr) {
     if (persistent_cache_->Put(*persistent_cache_key, cache_entry->neff_bytes)) {
       TORCH_NEURONX_DEBUG("Stored to persistent cache", key.ToString());
     }
