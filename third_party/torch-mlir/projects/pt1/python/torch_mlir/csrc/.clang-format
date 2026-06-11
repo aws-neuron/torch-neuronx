@@ -1,4 +1,0 @@
-BasedOnStyle:  LLVM
-AlignAfterOpenBracket: AlwaysBreak  # BlockIndent
-PointerAlignment: Left
-ReflowComments: false

@@ -324,9 +324,6 @@ if is_building:
                     if ext.target_name in (
                         "_torchMlir.so",
                         "_mlir.so",
-                        "_mlirExecutionEngine.so",
-                        "libmlir_c_runner_utils.so",
-                        "libmlir_runner_utils.so",
                         "_stablehlo.so",
                     ):
                         target_extension = (
@@ -382,9 +379,6 @@ if is_building:
                 BazelExtension("//:_C.so"),
                 BazelExtension("//third_party/torch-mlir:_torchMlir.so"),
                 BazelExtension("//third_party/torch-mlir:_mlir.so"),
-                BazelExtension("//third_party/torch-mlir:_mlirExecutionEngine.so"),
-                BazelExtension("//third_party/torch-mlir:libmlir_c_runner_utils.so"),
-                BazelExtension("//third_party/torch-mlir:libmlir_runner_utils.so"),
                 BazelExtension("//third_party/torch-mlir:_stablehlo.so"),
             ]
 

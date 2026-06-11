@@ -23,29 +23,6 @@ class ModuleOp;
 namespace torch {
 namespace TorchConversion {
 
-/// Creates a pipeline that lowers from the torch backend contract to the
-/// linalg-on-tensors backend contract.
-void createTorchBackendToLinalgOnTensorsBackendPipeline(OpPassManager &pm);
-
-// Do not register the TOSA options if the TOSA target is disabled
-#ifdef TORCH_MLIR_ENABLE_TOSA
-struct TosaBackendPipelineOptions
-    : public PassPipelineOptions<TosaBackendPipelineOptions> {
-  Option<bool> requireFullTosaConversion{
-      *this, "require-full-tosa-conversion",
-      llvm::cl::desc("Require full TorchToTosa conversion by adding Torch "
-                     "Dialect to TorchToTosa list of illegal dialects"),
-      llvm::cl::init(true)};
-};
-
-/// Creates a pipeline that lowers from the torch backend contract to the
-/// TOSA backend contract.
-void createTorchBackendToTosaBackendPipeline(
-    OpPassManager &pm, const TosaBackendPipelineOptions &options);
-
-std::unique_ptr<OperationPass<ModuleOp>> createVerifyTosaBackendContractPass();
-#endif // TORCH_MLIR_ENABLE_TOSA
-
 // Do not register the stablehlo options if the stablehlo target is disabled
 #ifdef TORCH_MLIR_ENABLE_STABLEHLO
 struct StablehloBackendPipelineOptions
@@ -89,9 +66,6 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createUnpackQuantTensorPass();
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createConvertCustomQuantOpPass();
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createVerifyLinalgOnTensorsBackendContractPass();
 
 /// Creates a pipeline that lowers from the torch backend contract to the
 /// Neuron backend contract.

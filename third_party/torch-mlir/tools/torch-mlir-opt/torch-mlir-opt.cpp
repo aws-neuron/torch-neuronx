@@ -7,9 +7,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/MemRef/Transforms/Passes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 #include "torch-mlir/InitAll.h"
@@ -33,10 +30,6 @@ int main(int argc, char **argv) {
   registerViewOpGraphPass();
   registerStripDebugInfoPass();
   registerSymbolDCEPass();
-
-  // memref passes used in torch-backend-to-linalg-on-tensors-backend-pipeline
-  memref::registerExpandOpsPass();
-  memref::registerResolveShapedTypeResultDimsPass();
 
   DialectRegistry registry;
   mlir::torch::registerAllDialects(registry);
