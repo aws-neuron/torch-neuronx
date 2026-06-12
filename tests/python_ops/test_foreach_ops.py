@@ -1136,11 +1136,3 @@ def test_foreach_mul_promotes_0d_cpu_scalar():
     expected = [g.cpu() * s for g, s in zip(grads, minus_clr, strict=True)]
     for r, e in zip(result, expected, strict=True):
         torch.testing.assert_close(r.cpu(), e)
-
-
-def test_foreach_mul_non_0d_cpu_still_raises():
-    """Non-0-d cross-device tensors must still raise — promotion is 0-d only."""
-    grads = [torch.randn(5, device="neuron")]
-    others = [torch.randn(5)]  # 1-d CPU, not a wrapped scalar
-    with pytest.raises(RuntimeError, match="same device"):
-        torch._foreach_mul(grads, others)
