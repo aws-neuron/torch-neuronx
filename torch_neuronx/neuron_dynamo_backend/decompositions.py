@@ -153,6 +153,14 @@ neuron_decompositions = get_decompositions(
         aten.remainder.Scalar_Tensor,
         aten.rsub.Tensor,
         aten.unfold_backward,
+        aten.aminmax,
+        aten.diag_embed,
+        aten.hardtanh_backward,
+        aten.binary_cross_entropy_backward,
+        aten.nll_loss2d_forward,
+        aten.max_unpool2d,
+        aten.split_with_sizes_copy,
+        aten._adaptive_avg_pool2d,
     ]
 )
 
@@ -181,6 +189,85 @@ def register_decomposition(
         if op in neuron_decompositions:
             raise ValueError(f"Duplicate decomposition registration for: {op}")
     return decomp.register_decomposition(ops, neuron_decompositions)
+
+
+def _register_fake(qualname: str):
+    """Register a fake/meta impl, guarding against double-registration on
+    re-import (register_fake raises if the op already has one)."""
+
+    def deco(fn):
+        try:
+            torch.library.register_fake(qualname, fn)
+        except RuntimeError as e:
+            # Already registered — keep existing.
+            logger.debug("fake impl already present for %s: %s", qualname, e)
+        return fn
+
+    return deco
+
+
+@_register_fake("aten::bmm.dtype_out")
+def _bmm_dtype_out_fake(self, mat2, out_dtype, *, out):
+    return out
+
+
+@register_decomposition([aten.bmm.dtype])
+def bmm_dtype(self, mat2, out_dtype):
+    """Decompose bmm.dtype into a cast + plain bmm."""
+    return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
+
+
+def _clamp_promoted_dtype(self_dtype, *bounds):
+    """PyTorch clamp type promotion: a float scalar bound promotes an integer
+    input to the default float dtype, but leaves a float input unchanged."""
+    dt = self_dtype
+    for b in bounds:
+        if b is not None:
+            dt = torch.result_type(torch.empty((), dtype=dt), b)
+    return dt
+
+
+@register_decomposition([aten.clamp.default])
+def clamp_decomp(self, min=None, max=None):
+    """Lower scalar-bounded clamp via maximum/minimum."""
+    dt = _clamp_promoted_dtype(self.dtype, min, max)
+    out = self.to(dt) if dt != self.dtype else self
+    if min is not None:
+        out = torch.maximum(out, torch.full((), min, dtype=dt, device=self.device))
+    if max is not None:
+        out = torch.minimum(out, torch.full((), max, dtype=dt, device=self.device))
+    return out
+
+
+@register_decomposition([aten.cumprod.default])
+def cumprod_decomp(self, dim, *, dtype=None):
+    """Lower cumprod via a masked product."""
+    if dtype is not None:
+        self = self.to(dtype)
+    # cumprod over a 0-d tensor is identity (single element).
+    if self.dim() == 0:
+        return self.clone()
+    n = self.shape[dim]
+    x = self.movedim(dim, -1)
+    idx = torch.arange(n, device=self.device)
+    mask = idx.unsqueeze(0) <= idx.unsqueeze(1)
+    expanded = x.unsqueeze(-2).expand(*x.shape[:-1], n, n)
+    out = torch.where(mask, expanded, torch.ones_like(expanded)).prod(dim=-1)
+    return out.movedim(-1, dim)
+
+
+@register_decomposition([aten.unfold.default, aten.unfold_copy.default])
+def unfold_decomp(self, dimension, size, step):
+    """Lower unfold / unfold_copy via narrow + stack."""
+    if self.dim() == 0:
+        # unfold of a scalar produces a length-1 vector.
+        return self.reshape(1)
+    dimension = dimension % self.dim()
+    n = (self.shape[dimension] - size) // step + 1
+    windows = [
+        torch.narrow(self, dimension, i * step, size).movedim(dimension, -1) for i in range(n)
+    ]
+    return torch.stack(windows, dim=dimension)
 
 
 @register_decomposition([aten.as_strided.default])
@@ -1965,7 +2052,8 @@ def repeat_interleave_tensor_decomposition(repeats, output_size=None):
     # by comparing against cumsum boundaries
     group_ids = (indices.unsqueeze(1) >= cumsum.unsqueeze(0)).sum(1)
 
-    return group_ids
+    # return indices in the input ``repeats`` dtype
+    return group_ids.to(repeats.dtype)
 
 
 @register_decomposition([aten.select_scatter.default])

@@ -301,6 +301,14 @@ _SCALAR_DEFAULT_BY_OP_ARG: dict[tuple[str, str], object] = {
     ("aten::_fused_sgd_", "nesterov"): False,
     ("aten::_fused_sgd_", "maximize"): False,
     ("aten::_fused_sgd_", "is_first_step"): False,
+    # clamp rejects both bounds None; cache key drops the value. See _FORCE_FILL_OPTIONAL.
+    ("aten::clamp", "max"): 1.0,
+}
+
+# (op, arg) Optional args that must be filled anyway — the op is invalid when the
+# cache-key-dropped value defaults to None (e.g. clamp with both bounds None).
+_FORCE_FILL_OPTIONAL: set[tuple[str, str]] = {
+    ("aten::clamp", "max"),
 }
 
 # Arg-name-scoped defaults (any op). Applied after the op-specific table.
@@ -332,7 +340,8 @@ def _fill_scalar_default(op_name: str, arg) -> object | None:
     we don't know. Looked up first by (op_name, arg_name), then arg_name
     alone, then schema type."""
     type_str = str(arg.type)
-    hit = _SCALAR_DEFAULT_BY_OP_ARG.get((op_name, arg.name))
+    base = op_name.split(".", 1)[0]  # strip overload so .out etc. match
+    hit = _SCALAR_DEFAULT_BY_OP_ARG.get((base, arg.name))
     if hit is not None:
         return hit
     hit = _SCALAR_DEFAULT_BY_NAME.get(arg.name)
@@ -411,7 +420,10 @@ def _build_arg_shapes(op_name: str, parsed: ParsedCacheKey) -> dict[str, Any]:
         # and writable kwargs are populated by the test's _with_out_kwargs.
         if "Tensor" in type_str:
             continue
-        if "?" in type_str or "Optional" in type_str:
+        if ("?" in type_str or "Optional" in type_str) and (
+            op_name.split(".", 1)[0],
+            name,
+        ) not in _FORCE_FILL_OPTIONAL:
             continue
         default = _fill_scalar_default(op_name, arg)
         if default is not None:
