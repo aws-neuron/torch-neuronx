@@ -314,10 +314,14 @@ Examples:
 def clone_upstream_tests(branch: str) -> None:
     """Clone upstream PyTorch tests at the given branch. Non-fatal on failure.
 
-    A clone failure usually means we already have a stale-but-usable tree,
-    or CI cloned earlier. Either way the run can proceed; the test
-    discovery step will fail loudly if the tree is actually missing.
+    If tests are already baked into the Docker image (test/ directory exists),
+    skip the clone entirely.
     """
+    test_dir = Path("tests/pytorch_tests_native/test")
+    if test_dir.exists() and any(test_dir.iterdir()):
+        print(f"Upstream tests already present at {test_dir}, skipping clone")
+        return
+
     try:
         subprocess.run(
             [
