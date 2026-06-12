@@ -60,6 +60,9 @@ METRICS_DIR = (
     / "neuron_compile_coverage_metrics"
 )
 
+# Max chars of an exception string stored in the CSV ``error`` column
+ERROR_MAXLEN = int(os.environ.get("NEURON_COVERAGE_ERROR_MAXLEN", "1000"))
+
 # Ops for which the CPU correctness reference is too expensive or fails to
 # run on CPU.
 _OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
@@ -135,11 +138,35 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         out["t_compute_ms"] = roofline["t_compute_ms"]
         out["t_memory_ms"] = roofline["t_memory_ms"]
 
+    # CPU-oracle pre-flight: the shape registry is built from compile-cache keys,
+    # which encode tensor shapes/dtypes but NOT scalar runtime values — so a real
+    # `clamp(x, 0.0, 6.0)` is reconstructed as `clamp(x, None, None)`, a `str` dim
+    # arrives as an int, etc. This logic checks if sample is valid on CPU.
+    if not any(pat in op_name for pat in _OPS_SKIP_CPU_CORRECTNESS):
+        try:
+            cpu_args = tuple(_allocate_to_device(a, "cpu") for a in (sample.input, *sample.args))
+            cpu_kwargs = {k: _allocate_to_device(v, "cpu") for k, v in sample.kwargs.items()}
+            with torch.no_grad():
+                op(*cpu_args, **cpu_kwargs)
+        except Exception as e:
+            exc_str = str(e)
+            is_cpu_gap = (
+                ("backend" in exc_str and "Could not run" in exc_str)
+                or "not implemented for" in exc_str
+                or "does not support" in exc_str
+                or "with arguments from the 'CPU' backend" in exc_str
+            )
+            if not is_cpu_gap:
+                clean = exc_str.replace(chr(10), " ")
+                out["status"] = "invalid_sample"
+                out["error"] = f"invalid sample (CPU oracle): {clean[:ERROR_MAXLEN]}"
+                return out
+
     try:
         neuron_args = tuple(_allocate_to_device(a, "neuron") for a in (sample.input, *sample.args))
         neuron_kwargs = {k: _allocate_to_device(v, "neuron") for k, v in sample.kwargs.items()}
     except Exception as e:
-        out["error"] = f"allocation failed: {str(e)[:100]}"
+        out["error"] = f"allocation failed: {str(e)[:ERROR_MAXLEN]}"
         out["status"] = "failed_lowering"
         return out
 
@@ -150,7 +177,7 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
     try:
         compiled_fn = torch.compile(op_fn, backend="neuron", fullgraph=True)
     except Exception as e:
-        out["error"] = f"compile failed: {str(e)[:200]}"
+        out["error"] = f"compile failed: {str(e)[:ERROR_MAXLEN]}"
         out["status"] = "failed_lowering"
         return out
 
@@ -177,7 +204,7 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
             err_class = None
         except Exception as e:
             exc_str = str(e)
-            out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:200]
+            out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:ERROR_MAXLEN]
             # Dynamo raises "Unsupported" on graph break (with fullgraph=True);
             # everything else is a real compile/runtime failure.
             err_class = "graph_break" if "Unsupported" in exc_str else "failed_lowering"
@@ -249,9 +276,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                 )
                 out["correctness"] = "skip_no_cpu" if is_cpu_gap else "fail"
                 if not out["error"]:
-                    out["error"] = (
-                        f"correctness: {exc_str.replace(chr(10),' ').replace(chr(13),'')[:200]}"
-                    )
+                    clean = exc_str.replace(chr(10), " ").replace(chr(13), "")
+                    out["error"] = f"correctness: {clean[:ERROR_MAXLEN]}"
     finally:
         torch._dynamo.reset()
 
@@ -260,7 +286,11 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
 
 def _aggregate_compile_results(result: dict, per_shape: list[dict], classification: str) -> None:
     """Fold per-shape compile results into a single CSV row."""
-    worst = max(per_shape, key=lambda r: _STATUS_RANK.get(r["status"], 99))
+    # invalid_sample shapes are untestable. The op
+    # is invalid_sample ONLY if EVERY shape is invalid.
+    valid = [r for r in per_shape if r["status"] != "invalid_sample"]
+    ranked = valid if valid else per_shape
+    worst = max(ranked, key=lambda r: _STATUS_RANK.get(r["status"], 99))
     result["status"] = worst["status"]
     # supported_by mirrors op classification; per-shape entries may have
     # upgraded "unknown" to "compiled" when compilation succeeded via a
@@ -362,7 +392,7 @@ class TestTargetOpsCompileCoverage:
             samples = list(op_info.sample_inputs("cpu", torch.float32, requires_grad=False))
         except Exception as e:
             exc_str = str(e)
-            result["error"] = f"sample_inputs failed: {exc_str[:200]}"
+            result["error"] = f"sample_inputs failed: {exc_str[:ERROR_MAXLEN]}"
             from internal.common import classify_error as _cls_err
 
             err_class = _cls_err(exc_str)

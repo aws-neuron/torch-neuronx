@@ -454,6 +454,13 @@ public:
                                            outTy.getElementType());
     }
 
+    // Rank-0 reduce is a no-op: reducing a scalar tensor over any dim returns
+    // the scalar itself.
+    if (inputTy.getRank() == 0) {
+      rewriter.replaceOp(op, input);
+      return success();
+    }
+
     bool keepDim = false;
     if (!matchPattern(op.getKeepdim(), m_TorchConstantBool(&keepDim))) {
       return rewriter.notifyMatchFailure(op, "non-bool keepdim unsupported");

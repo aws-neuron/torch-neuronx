@@ -34,6 +34,8 @@ STATUS_RANK = {
     "graph_break": 2,
     # Shared (both paths)
     "no_input_sample": 1,
+    # Sample is invalid
+    "invalid_sample": 1,
     "unresolved": 2,
     "failed_lowering": 3,
 }

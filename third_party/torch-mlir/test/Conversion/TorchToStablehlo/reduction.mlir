@@ -59,3 +59,29 @@ func.func @torch.aten.min.dim$rank0(%arg0: !torch.vtensor<[],f32>) -> (!torch.vt
   %values, %indices = torch.aten.min.dim %arg0, %int0, %false : !torch.vtensor<[],f32>, !torch.int, !torch.bool -> !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
   return %values, %indices : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.amax$rank0(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[],f32> {
+// CHECK:         return %[[ARG0]] : !torch.vtensor<[],f32>
+func.func @torch.aten.amax$rank0(%arg0: !torch.vtensor<[],f32>) -> !torch.vtensor<[],f32> {
+  %int0 = torch.constant.int 0
+  %true = torch.constant.bool true
+  %dims = torch.prim.ListConstruct %int0 : (!torch.int) -> !torch.list<int>
+  %0 = torch.aten.amax %arg0, %dims, %true : !torch.vtensor<[],f32>, !torch.list<int>, !torch.bool -> !torch.vtensor<[],f32>
+  return %0 : !torch.vtensor<[],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.amin$rank0(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[],f32> {
+// CHECK:         return %[[ARG0]] : !torch.vtensor<[],f32>
+func.func @torch.aten.amin$rank0(%arg0: !torch.vtensor<[],f32>) -> !torch.vtensor<[],f32> {
+  %int0 = torch.constant.int 0
+  %true = torch.constant.bool true
+  %dims = torch.prim.ListConstruct %int0 : (!torch.int) -> !torch.list<int>
+  %0 = torch.aten.amin %arg0, %dims, %true : !torch.vtensor<[],f32>, !torch.list<int>, !torch.bool -> !torch.vtensor<[],f32>
+  return %0 : !torch.vtensor<[],f32>
+}

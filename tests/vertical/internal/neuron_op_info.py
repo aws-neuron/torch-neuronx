@@ -10,6 +10,7 @@ Design:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections.abc import Callable, Iterable
@@ -151,12 +152,42 @@ def _build_value(type_str, raw, device, dtype):
     return raw
 
 
-def _arg_default(arg, type_str):
+def _schema_positional_index(schema, name) -> int:
+    """Positional index of ``name`` among the schema's positional args, or a
+    large sentinel if ``name`` is kwarg-only / absent."""
+    idx = 0
+    for a in schema.arguments:
+        if a.kwarg_only:
+            continue
+        if a.name == name:
+            return idx
+        idx += 1
+    return 1 << 30
+
+
+def _schema_positional_bounds(schema) -> tuple[int, int]:
+    """(min_required, max_accepted) positional-arg counts for schema."""
+    positional = [a for a in schema.arguments if not a.kwarg_only]
+    required = sum(1 for a in positional if not a.has_default_value())
+    return required, len(positional)
+
+
+def _arg_default(arg, type_str, dtype=None):
     """Return default value for a missing positional arg, or raise KeyError to bail."""
     if arg.has_default_value():
         return arg.default_value
     if "?" in type_str or "Optional" in type_str:
         return None
+    # ``out_dtype`` is a required ScalarType positional on the *.dtype_out
+    # matmul overloads (mm/bmm/addmm/baddbmm.dtype_out).
+    if arg.name == "out_dtype" and dtype is not None:
+        return dtype
+    # Required ``dim`` on reduction ``.out``/dtype-out overloads (norm.out, ...)
+    if arg.name == "dim" and "str" not in type_str:
+        return [0] if ("[]" in type_str or "List" in type_str) else 0
+    # Required ``keepdim`` bool flag with no schema default.
+    if arg.name == "keepdim" and type_str == "bool":
+        return False
     raise KeyError(arg.name)
 
 
@@ -190,7 +221,7 @@ def _schema_make_sample(op, arg_shapes, device, dtype):
             continue
         else:
             try:
-                val = _arg_default(arg, type_str)
+                val = _arg_default(arg, type_str, dtype)
             except KeyError:
                 return None
         if arg.kwarg_only:
@@ -200,52 +231,78 @@ def _schema_make_sample(op, arg_shapes, device, dtype):
 
     if not positional:
         return None
+
     return SampleInput(positional[0], args=tuple(positional[1:]), kwargs=kwargs)
 
 
-def _probe_out_shape_dtype(op, sample) -> tuple[torch.Size, torch.dtype] | None:
-    """Infer expected out-variant shape+dtype via FakeTensorMode.
+def _is_out_schema(schema) -> bool:
+    """True if any argument is a write-alias (i.e. an ``out=`` overload)."""
+    return any(getattr(getattr(a, "alias_info", None), "is_write", False) for a in schema.arguments)
+
+
+def _functional_probe_candidates(op, n_positional: int):
+    """Functional (non-out) overloads of ``op``'s packet, best-match first."""
+    schema = getattr(op, "_schema", None)
+    if schema is None:
+        return []
+    base_name = schema.name.split("::")[-1]
+    pkt = getattr(torch.ops.aten, base_name, None)
+    if pkt is None:
+        return []
+
+    candidates = []
+    for overload in pkt.overloads():
+        cand = getattr(pkt, overload)
+        cand_schema = getattr(cand, "_schema", None)
+        if cand_schema is None or _is_out_schema(cand_schema):
+            continue
+        positional = [a for a in cand_schema.arguments if not a.kwarg_only]
+        required = [a for a in positional if not a.has_default_value()]
+        arity_ok = len(required) <= n_positional <= len(positional)
+        candidates.append((arity_ok, cand))
+    # Stable sort: arity-matching overloads first, original packet order within.
+    candidates.sort(key=lambda c: not c[0])
+    return [cand for _, cand in candidates]
+
+
+def _probe_out_specs(op, sample) -> list[tuple[torch.Size, torch.dtype]] | None:
+    """Infer expected out-variant output shapes+dtypes via FakeTensorMode.
 
     Runs the op's functional overload inside FakeTensorMode so no real kernel
     executes and no tensor storage is allocated. This prevents sample building
     from triggering Neuron compilation as a side effect (e.g., when a
     composite op decomposes onto device-sensitive primitives).
 
-    Returns ``None`` if FakeTensorMode can't dispatch the op (no meta kernel,
-    dynamic-shape output, etc.) — callers should then skip ``out=`` injection.
+    Returns one ``(shape, dtype)`` per output tensor — a single-element list
+    for ordinary ops and a multi-element list for multi-output ops.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    try:
-        kw = {k: v for k, v in sample.kwargs.items() if k != "out"}
-        schema = getattr(op, "_schema", None)
-        probe_op = op
-        if schema and schema.overload_name and "out" in schema.overload_name:
-            # Use the functional variant so probe result matches what .out
-            # would write into its pre-allocated out= kwarg. Strip the _out
-            # suffix (m_out → m, Scalar_out → Scalar, start_step_out →
-            # start_step); fall back to .default for plain .out and for
-            # unusual cases like .all_out where stripped name isn't an
-            # overload on this packet.
-            base_name = schema.name.split("::")[-1]
-            pkt = getattr(torch.ops.aten, base_name, None)
-            if pkt is not None:
-                overload = schema.overload_name
-                if overload == "out":
-                    candidate = "default"
-                elif overload.endswith("_out"):
-                    candidate = overload[:-4]
-                else:
-                    candidate = overload
-                probe_op = getattr(pkt, candidate, None) or getattr(pkt, "default", None) or pkt
-        with FakeTensorMode(allow_non_fake_inputs=True):
-            out = probe_op(sample.input, *sample.args, **kw)
-        if isinstance(out, torch.Tensor):
-            return out.shape, out.dtype
-        if isinstance(out, tuple | list) and out and isinstance(out[0], torch.Tensor):
-            return out[0].shape, out[0].dtype
-    except Exception as e:
-        logger.debug("out-probe failed for %s: %s", op, e)
+    kw = {k: v for k, v in sample.kwargs.items() if k != "out"}
+    schema = getattr(op, "_schema", None)
+
+    # Non-out ops (or ops with no schema) probe directly.
+    if schema is None or not _is_out_schema(schema):
+        probe_ops = [op]
+    else:
+        # Out overload: probe via a functional sibling. Try arity-ordered
+        # candidates and keep the first that dispatches under fake tensors.
+        probe_ops = _functional_probe_candidates(op, 1 + len(sample.args)) or [op]
+
+    for probe_op in probe_ops:
+        try:
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                out = probe_op(sample.input, *sample.args, **kw)
+            if isinstance(out, torch.Tensor):
+                return [(out.shape, out.dtype)]
+            if (
+                isinstance(out, tuple | list)
+                and out
+                and all(isinstance(o, torch.Tensor) for o in out)
+            ):
+                return [(o.shape, o.dtype) for o in out]
+        except Exception as e:
+            logger.debug("out-probe failed for %s via %s: %s", op, probe_op, e)
     return None
 
 
@@ -347,14 +404,48 @@ class NeuronOpInfo(OpInfo):
         # prevents spurious "expected at most N args but received M" errors
         # that were surfacing as false-positive `status=supported` rows.
         schema_arg_names = {a.name for a in schema.arguments} if schema is not None else None
+        # Required args the target overload declares but the functional opdb
+        # sample omits (no schema default, not Optional, not the write-alias
+        # `out`). Synthesized by name via `_arg_default` so the opdb sample
+        # matches the overload — e.g. ``out_dtype`` on *.dtype_out, ``dim``/
+        # ``keepdim`` on reduction .out/dtype-out. A positional arg passed as a
+        # kwarg is accepted by the ATen dispatcher.
+        synth_required = []
+        if schema is not None:
+            for a in schema.arguments:
+                ts = str(a.type)
+                if a.has_default_value() or "?" in ts or "Optional" in ts:
+                    continue
+                if getattr(getattr(a, "alias_info", None), "is_write", False):
+                    continue  # `out` filled by _with_out_kwargs
+                # KeyError = tensor/self args etc. — nothing to synthesize.
+                with contextlib.suppress(KeyError):
+                    synth_required.append((a.name, _arg_default(a, ts, dtype)))
+        # Positional-arity window of the overload bound to this op row. The
+        # functional opdb sample_inputs_func emits samples for every functional
+        # shape of the base op (e.g. eye(n) AND eye(n, m));
+        pos_max = _schema_positional_bounds(schema)[1] if schema is not None else None
         try:
             for sample in self._pytorch_sample_inputs_func(
                 op_info, device, dtype, requires_grad, **kwargs
             ):
+                if pos_max is not None and (1 + len(sample.args)) > pos_max:
+                    continue
                 if schema_arg_names is not None and sample.kwargs:
                     filtered = {k: v for k, v in sample.kwargs.items() if k in schema_arg_names}
                     if len(filtered) != len(sample.kwargs):
                         sample = SampleInput(sample.input, args=sample.args, kwargs=filtered)
+                if synth_required and schema is not None:
+                    n_pos = 1 + len(sample.args)
+                    missing = {
+                        nm: v
+                        for nm, v in synth_required
+                        if nm not in sample.kwargs and _schema_positional_index(schema, nm) >= n_pos
+                    }
+                    if missing:
+                        sample = SampleInput(
+                            sample.input, args=sample.args, kwargs={**sample.kwargs, **missing}
+                        )
                 yield self._with_out_kwargs(sample)
         except Exception as e:
             logger.debug("%s: opdb fallback failed: %s", self.op_name, e)
@@ -391,30 +482,38 @@ class NeuronOpInfo(OpInfo):
             and a.name not in sample.kwargs
             and getattr(getattr(a, "alias_info", None), "is_write", False)
         ]
-        if len(write_args) != 1:
-            return sample  # multi-out currently skipped; single-out only
-
-        probed = _probe_out_shape_dtype(self._resolved_op, sample)
-        if probed is None:
+        if not write_args:
             return sample
-        out_shape, out_dtype = probed
 
-        arg = write_args[0]
-        type_str = str(arg.type)
-        # Match both C++ schema style ("Tensor[]") and Python-style
-        # ("List[Tensor]") — torch returns the latter for _foreach_*_out.
-        if "Tensor[]" in type_str or "List[Tensor]" in type_str:
-            # list length inferred from first tensor-list input, else 2
-            n_list = 2
-            for a in (sample.input, *sample.args):
-                if isinstance(a, list) and a and isinstance(a[0], torch.Tensor):
-                    n_list = len(a)
-                    break
-            extra = {arg.name: [torch.empty(out_shape, dtype=out_dtype) for _ in range(n_list)]}
-        elif "Tensor" in type_str:
-            extra = {arg.name: torch.empty(out_shape, dtype=out_dtype)}
-        else:
+        specs = _probe_out_specs(self._resolved_op, sample)
+        if specs is None:
             return sample
+
+        single_tensor_list = len(write_args) == 1 and (
+            "Tensor[]" in str(write_args[0].type) or "List[Tensor]" in str(write_args[0].type)
+        )
+        if not single_tensor_list and len(specs) < len(write_args):
+            return sample
+
+        extra = {}
+        for i, arg in enumerate(write_args):
+            type_str = str(arg.type)
+            # Match both C++ schema style ("Tensor[]") and Python-style
+            # ("List[Tensor]") — torch returns the latter for _foreach_*_out.
+            if "Tensor[]" in type_str or "List[Tensor]" in type_str:
+                # list length inferred from first tensor-list input, else 2
+                n_list = 2
+                for a in (sample.input, *sample.args):
+                    if isinstance(a, list) and a and isinstance(a[0], torch.Tensor):
+                        n_list = len(a)
+                        break
+                shape, out_dtype = specs[0]
+                extra[arg.name] = [torch.empty(shape, dtype=out_dtype) for _ in range(n_list)]
+            elif "Tensor" in type_str:
+                shape, out_dtype = specs[i]
+                extra[arg.name] = torch.empty(shape, dtype=out_dtype)
+            else:
+                return sample
 
         return SampleInput(sample.input, args=sample.args, kwargs={**sample.kwargs, **extra})
 
