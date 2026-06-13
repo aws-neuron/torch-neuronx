@@ -768,15 +768,4 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
         ],
     ),
-    SkipGroup(
-        reason=(
-            "Tests fail on PT 2.11 (PR-gating image) but pass on torch nightly"
-            " 2.13 (post-merge image). Migrated from"
-            " tests/pytorch_tests/specs/dynamo_spec.json. Mostly AOT-compile"
-            " contracts (SerializableCallable), error/log message format"
-            " differences, and inplace-op metadata propagation that 2.13"
-            " handles differently."
-        ),
-        tests=x.DYNAMO_PT211_PASSES_NIGHTLY,
-    ),
 ]
