@@ -88,9 +88,6 @@ from .dynamo_xfails import (
     DYNAMO_NUMERICAL_PRECISION_NON_INPLACE as DYNAMO_NUMERICAL_PRECISION_NON_INPLACE,
 )
 from .dynamo_xfails import (
-    DYNAMO_PT211_PASSES_NIGHTLY as DYNAMO_PT211_PASSES_NIGHTLY,
-)
-from .dynamo_xfails import (
     DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH as DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH,
 )
 from .dynamo_xfails import (
