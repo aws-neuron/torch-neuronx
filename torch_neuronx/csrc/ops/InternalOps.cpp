@@ -3,7 +3,7 @@
 #include <ATen/ops/contiguous_native.h>
 #include <torch/extension.h>
 
-#include "../utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 namespace torch_neuronx {
 namespace ops {

@@ -114,20 +114,37 @@ int64_t CollectiveBucketSizeBytes() {
   return val;
 }
 
-bool UseSplitAllgather() {
-  static const bool val = []() {
-    const char* env = std::getenv("NEURON_USE_SPLIT_ALLGATHER");
-    return env == nullptr || std::string(env) == "1";
+// Default policy (in-NEFF flow only).
+bool UseSplitDefaultForCurrentStream() {
+  static const bool hostcc_enabled = []() {
+    const char* val = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
+    return val != nullptr && val[0] != '\0' && std::string(val) != "0";
   }();
-  return val;
+  if (!hostcc_enabled) return true;
+  auto current = at::neuron::getCurrentNeuronStream();
+  auto default_stream = at::neuron::getDefaultNeuronStream();
+  return current == default_stream;
+}
+
+// Sentinel for "user did not set the env var explicitly".
+constexpr int kSplitEnvUnset = -1;
+
+int ReadSplitEnvOnce(const char* env_name) {
+  const char* env = std::getenv(env_name);
+  if (env == nullptr) return kSplitEnvUnset;
+  return std::string(env) == "1" ? 1 : 0;
+}
+
+bool UseSplitAllgather() {
+  static const int env_override = ReadSplitEnvOnce("NEURON_USE_SPLIT_ALLGATHER");
+  if (env_override != kSplitEnvUnset) return env_override == 1;
+  return UseSplitDefaultForCurrentStream();
 }
 
 bool UseSplitReduceScatter() {
-  static const bool val = []() {
-    const char* env = std::getenv("NEURON_USE_SPLIT_REDUCE_SCATTER");
-    return env == nullptr || std::string(env) == "1";
-  }();
-  return val;
+  static const int env_override = ReadSplitEnvOnce("NEURON_USE_SPLIT_REDUCE_SCATTER");
+  if (env_override != kSplitEnvUnset) return env_override == 1;
+  return UseSplitDefaultForCurrentStream();
 }
 
 std::vector<std::vector<int>> CreateGlobalReplicaGroups(

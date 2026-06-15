@@ -167,6 +167,24 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "HostKernelExecutionTest",
+    srcs = ["core/HostKernelExecutionTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "HostWorkerPoolTest",
+    srcs = ["core/HostWorkerPoolTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "HostCCSchedulingTest",
+    srcs = ["core/HostCCSchedulingTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronBindingsTest",
     srcs = ["core/NeuronBindingsTest.cpp"],
     deps = ["//:runtime"],

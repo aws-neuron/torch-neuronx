@@ -19,11 +19,11 @@
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
 #include "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
 
 extern "C" {
 #include <nrt/nrt.h>
@@ -283,6 +283,7 @@ void StreamImpl::CompleteOperation(OperationContext* operation) {
     snapshot.xu_type = operation->xu_type;
     snapshot.dispatch_slot = operation->dispatch_slot;
     snapshot.pytorch_sequence_nr = operation->pytorch_sequence_nr;
+    snapshot.host_worker_idx = operation->host_worker_idx;
     snapshot.hierarchy_string = operation->hierarchy_string;
     if (operation->RequiresCompilation()) {
       auto& compilable_kernel = operation->GetCompilableKernel();
@@ -452,7 +453,9 @@ bool StreamImpl::HasPendingAsyncOperations() const {
   }
 
   auto& front_op = runtime_queue_.front();
-  if (front_op->nrt_async_state_.is_scheduled || front_op->nrt_async_state_.is_pending_signal) {
+  // Front op is in flight if directly scheduled, pending, or running on the host pool.
+  if (front_op->nrt_async_state_.is_scheduled || front_op->nrt_async_state_.is_pending_signal ||
+      front_op->nrt_async_state_.is_host_inflight.load(std::memory_order_acquire)) {
     return true;
   }
   if (front_op->HasConcatenatedOperation() && !front_op->IsConcatenatedOperation()) {
@@ -526,9 +529,23 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
     }
   }
 
-  // Cross-XU synchronization: ensure prior XU operation completes before switching XUs
+  // Cross-kind sync (device-after-kHost): a device op following a kHost must
+  // wait for RunHost() to complete, else its data deps through the kHost's CPU
+  // output buffer aren't satisfied.
+  if (last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kHost) {
+    HostCompletionSeq completed =
+        host_completion_state_.completed_seq_id.load(std::memory_order_acquire);
+    if (last_scheduled_info_.host_completion_seq > completed) {
+      return ScheduleResult::kNotReady;
+    }
+    // Host done; we're crossing back to device. Fall through to schedule.
+  }
+
+  // Cross-XU synchronization (device-after-device, different XU): ensure
+  // prior XU operation completes before switching XUs.
   auto current_xu = static_cast<nrta_xu_t>(GetXUIndex(kernel_type));
-  if (last_scheduled_info_.valid && last_scheduled_info_.xu != current_xu) {
+  if (last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kDeviceXU &&
+      last_scheduled_info_.xu != current_xu) {
     UpdateCompletionState();
     int queue = nrt::GetHardwareQueue(last_scheduled_info_.xu, stream_id);
     nrt::SequenceId completed_seq = xu_completed_seqs_.Get(last_scheduled_info_.xu, queue);
@@ -545,8 +562,10 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
 
   if (scheduled) {
     op->MarkScheduled(sequence_id);
+    last_scheduled_info_.kind = LastKind::kDeviceXU;
     last_scheduled_info_.xu = current_xu;
     last_scheduled_info_.sequence_id = sequence_id;
+    last_scheduled_info_.host_completion_seq = 0;
     last_scheduled_info_.valid = true;
   } else {
     // No NRT work — mark as immediately complete

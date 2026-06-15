@@ -102,6 +102,7 @@ cc_library(
         ":lazy_materialization",
         ":concatenation",
         ":non_temporal_memcpy",
+        ":dtype_cast_vec",
         "@xxhash",
         "@nrt//:nrt",
         "@torch//:headers",
@@ -132,9 +133,10 @@ cc_library(
         "torch_neuronx/csrc/core/utils/NeuronResourceManager.cpp",
         "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.cpp",
         "torch_neuronx/csrc/core/OperationExecutionEngine.cpp",
+        "torch_neuronx/csrc/core/utils/HostChain.cpp",
         "torch_neuronx/csrc/core/NeuronOpTracking.cpp",
-        "torch_neuronx/csrc/utils/CopyUtils.cpp",
-        "torch_neuronx/csrc/utils/NonTemporalMemcpy.cpp",
+        "torch_neuronx/csrc/core/utils/CopyUtils.cpp",
+        "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.cpp",
         "torch_neuronx/csrc/core/NeuronStorageImpl.cpp",
         "torch_neuronx/csrc/ops/InternalOps.cpp",
         "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.cpp",
@@ -163,10 +165,11 @@ cc_library(
         "torch_neuronx/csrc/core/utils/NeuronExceptions.h",
         "torch_neuronx/csrc/core/utils/NeuronResourceManager.h",
         "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h",
+        "torch_neuronx/csrc/core/utils/HostChain.h",
         "torch_neuronx/csrc/core/OperationExecutionEngine.h",
         "torch_neuronx/csrc/core/NeuronOpTracking.h",
-        "torch_neuronx/csrc/utils/CopyUtils.h",
-        "torch_neuronx/csrc/utils/NonTemporalMemcpy.h",
+        "torch_neuronx/csrc/core/utils/CopyUtils.h",
+        "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h",
         "torch_neuronx/csrc/core/NeuronStorageImpl.h",
         "torch_neuronx/csrc/ops/InternalOps.h",
         "torch_neuronx/csrc/core/utils/TensorContext.h",
@@ -434,9 +437,41 @@ cc_library(
 
 cc_library(
     name = "non_temporal_memcpy",
-    srcs = ["torch_neuronx/csrc/utils/NonTemporalMemcpy.cpp"],
-    hdrs = ["torch_neuronx/csrc/utils/NonTemporalMemcpy.h"],
+    srcs = ["torch_neuronx/csrc/core/utils/NonTemporalMemcpy.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h"],
     copts = ["-mavx2", "-mavx512f"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "dtype_cast_vec_avx512",
+    srcs = ["torch_neuronx/csrc/core/utils/DtypeCastVecAvx512.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/DtypeCastVecAvx512.h"],
+    copts = [
+        "-mavx2",
+        "-mavx512f",
+        "-mavx512bw",
+        "-mavx512vl",
+        "-mavx512dq",
+        "-mf16c",
+        "-DCPU_CAPABILITY_AVX512",
+        "-DCPU_CAPABILITY=AVX512",
+    ],
+    deps = [
+        "@torch//:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "dtype_cast_vec",
+    srcs = ["torch_neuronx/csrc/core/utils/DtypeCastVec.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/DtypeCastVec.h"],
+    deps = [
+        ":dtype_cast_vec_avx512",
+        ":non_temporal_memcpy",
+        "@torch//:headers",
+    ],
     visibility = ["//visibility:public"],
 )
 

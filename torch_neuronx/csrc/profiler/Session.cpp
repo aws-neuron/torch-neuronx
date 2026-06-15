@@ -558,12 +558,22 @@ void NeuronActivityProfilerSession::processTrace(
     exec_act.startTime = op.execute_start_ns;
     exec_act.endTime = op.execute_end_ns;
     exec_act.id = static_cast<int32_t>(op.kineto_correlation_id);
-    exec_act.device = static_cast<int32_t>(op.device_index);
 
-    // Resource encodes stream + XU type: 3 rows per stream
-    int32_t xu_resource = (op.xu_type >= 0)
-                              ? static_cast<int32_t>(op.stream_id * NRTA_XU_TYPE_NUM + op.xu_type)
-                              : static_cast<int32_t>(op.stream_id);
+    // kHost ops run on a HostWorkerPool CPU thread, so render them on the CPU
+    // process track under the worker's real OS tid (like the SUBMIT activity).
+    // Device-XU ops render on the NeuronDevice track, resource encoding
+    // stream + XU type (3 rows per stream).
+    int32_t xu_resource;
+    if (op.host_worker_idx >= 0) {
+      exec_act.device = libkineto::processId();
+      xu_resource = op.neuron_stream_os_tid;
+      exec_act.threadId = op.neuron_stream_os_tid;
+    } else {
+      exec_act.device = static_cast<int32_t>(op.device_index);
+      xu_resource = (op.xu_type >= 0)
+                        ? static_cast<int32_t>(op.stream_id * NRTA_XU_TYPE_NUM + op.xu_type)
+                        : static_cast<int32_t>(op.stream_id);
+    }
     exec_act.resource = xu_resource;
 
     // Flow END: receives arrow from DISPATCH
@@ -582,6 +592,9 @@ void NeuronActivityProfilerSession::processTrace(
     if (op.xu_type >= 0) {
       exec_act.addMetadataQuoted("xu_type", GetXUTypeName(op.xu_type));
     }
+    if (op.host_worker_idx >= 0) {
+      exec_act.addMetadata("host_worker_idx", op.host_worker_idx);
+    }
     if (!op.hierarchy_string.empty()) {
       exec_act.addMetadataQuoted("hierarchy", op.hierarchy_string);
     }
@@ -597,7 +610,11 @@ void NeuronActivityProfilerSession::processTrace(
     // Register resources
     recordResource(libkineto::processId(), op.pytorch_os_tid,
                    "PyTorch Thread " + std::to_string(op.pytorch_os_tid));
-    if (op.xu_type >= 0) {
+    if (op.host_worker_idx >= 0) {
+      // kHost op on the CPU process track under the host worker's OS tid.
+      recordResource(libkineto::processId(), op.neuron_stream_os_tid,
+                     "host_compute-w" + std::to_string(op.host_worker_idx));
+    } else if (op.xu_type >= 0) {
       std::string xu_label =
           "Stream " + std::to_string(op.stream_id) + " / " + GetXUTypeName(op.xu_type);
       recordResource(op.device_index, xu_resource, xu_label);

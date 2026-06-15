@@ -7,12 +7,14 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
@@ -25,6 +27,43 @@ namespace at::neuron {
 class CompilationCache;
 class ModelHandleCache;
 class ConcatenationEngine;
+
+// Number of HostWorkerPool threads.
+inline constexpr size_t kHostWorkerThreads = 1;
+
+// HostWorkerPool — runs RunHost() for kHost ops on dedicated CPU threads,
+// decoupled from the runtime worker (polls NRT) and the autograd thread.
+class HostWorkerPool {
+ public:
+  struct Job {
+    OperationContext* op;
+  };
+  using CompletionCb = std::function<void(OperationContext*, std::exception_ptr)>;
+
+  HostWorkerPool(size_t num_threads, CompletionCb on_complete);
+  ~HostWorkerPool();
+
+  HostWorkerPool(const HostWorkerPool&) = delete;
+  HostWorkerPool& operator=(const HostWorkerPool&) = delete;
+
+  // Submit a kHost OperationContext to be run on a worker thread.
+  void Submit(OperationContext* op);
+
+  // Stop accepting jobs and join all workers. Idempotent.
+  void Shutdown();
+
+  size_t NumThreads() const { return workers_.size(); }
+
+ private:
+  void WorkerLoop(size_t worker_idx);
+
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<Job> jobs_;
+  std::atomic<bool> shutdown_{false};
+  CompletionCb on_complete_;
+};
 
 // Default queue depth configuration for concatenation
 constexpr int64_t DEFAULT_QUEUE_LOW_THRESHOLD = 15;
@@ -109,6 +148,11 @@ class OperationExecutionEngine {
 
   int completion_efd_{-1};
 
+  std::unique_ptr<HostWorkerPool> host_worker_pool_;
+  std::mutex host_worker_pool_init_mutex_;
+  mutable std::mutex host_completed_mutex_;
+  std::deque<std::pair<OperationContext*, std::exception_ptr>> host_completed_queue_;
+
   // Shutdown coordination
   std::atomic<bool> shutdown_requested_{false};
 
@@ -144,6 +188,21 @@ class OperationExecutionEngine {
 
   // Process a single async execution task (schedule without waiting)
   void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
+
+  // Lazily construct host_worker_pool_ on first kHost dispatch. Idempotent;
+  // guarded by host_worker_pool_init_mutex_. Runs on the runtime worker
+  // thread (sole caller of ScheduleOperation). See host_worker_pool_.
+  void EnsureHostWorkerPool();
+
+  // Drain host_completed_queue_ on the runtime worker thread. Must be
+  // called from the runtime worker only — completions are routed through
+  // StreamImpl::CompleteOperation / HandleErrorWithExceptionPtr which mutate
+  // the stream's active_operations_ list.
+  void DrainHostCompletions();
+
+  // HostWorkerPool callback. Pushes the (op, eptr) pair onto
+  // host_completed_queue_ and notifies the runtime worker via eventfd.
+  void OnHostJobComplete(OperationContext* op, std::exception_ptr eptr) noexcept;
 
   // Preprocessing helpers prologue attached with operations if needed
   void ProcessPreprocessingTask(OperationContext* operation);

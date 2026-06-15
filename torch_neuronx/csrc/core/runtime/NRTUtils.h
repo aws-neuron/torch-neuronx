@@ -14,6 +14,7 @@ extern "C" {
 #include <nrt/nrt_profile.h>
 }
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -113,16 +114,18 @@ inline NRTReduceOp MapReduceOpToNRT(c10d::ReduceOp op) {
   }
 }
 
-// State for tracking async NRT operation scheduling
+// State for tracking async NRT operation scheduling.
 struct AsyncSchedulingState {
-  SequenceId sequence_id{0};      // Sequence number from Schedule()
-  bool is_scheduled{false};       // Whether async scheduling was called (in-flight)
-  bool is_pending_signal{false};  // kSignal event waiting for prior op to complete
+  SequenceId sequence_id{0};                  // Sequence number from Schedule()
+  bool is_scheduled{false};                   // Whether async scheduling was called (in-flight)
+  bool is_pending_signal{false};              // kSignal event waiting for prior op to complete
+  std::atomic<bool> is_host_inflight{false};  // kHost: submitted to HostWorkerPool
 
   void Reset() {
     sequence_id = 0;
     is_scheduled = false;
     is_pending_signal = false;
+    is_host_inflight.store(false, std::memory_order_release);
   }
 };
 
