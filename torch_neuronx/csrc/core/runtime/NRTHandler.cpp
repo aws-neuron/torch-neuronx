@@ -14,9 +14,9 @@
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
 
 extern "C" {
 #include <nrt/nrt.h>

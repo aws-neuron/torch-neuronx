@@ -2,7 +2,7 @@
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 namespace torch_neuronx {
 namespace dispatch {

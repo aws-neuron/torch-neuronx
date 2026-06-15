@@ -58,7 +58,7 @@
 // Include memory snapshot
 #include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
 // Copy helpers
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 // Dispatch helpers (shared out= resize/warning)
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"

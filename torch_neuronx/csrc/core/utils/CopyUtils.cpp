@@ -12,8 +12,8 @@
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h"
+#include "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
-#include "torch_neuronx/csrc/utils/NonTemporalMemcpy.h"
 
 namespace torch_neuronx {
 namespace utils {

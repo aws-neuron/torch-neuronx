@@ -1,10 +1,10 @@
 #include "KernelExecution.h"
 
-#include <c10/core/DynamicCast.h>
 #include <sys/mman.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
@@ -16,8 +16,8 @@
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
+#include "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
-#include "torch_neuronx/csrc/utils/NonTemporalMemcpy.h"
 
 namespace at::neuron {
 

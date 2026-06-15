@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -30,6 +31,154 @@
 #include "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h"
 
 namespace at::neuron {
+
+namespace {
+// Release the device-after-kHost gate by advancing the stream's host-completion
+// seq to this op's.
+inline void AdvanceHostCompletion(OperationContext* op) {
+  if (op == nullptr || op->stream == nullptr) {
+    return;
+  }
+  op->stream->host_completion_state_.AdvanceCompleted(op->host_completion_seq_);
+}
+}  // namespace
+
+HostWorkerPool::HostWorkerPool(size_t num_threads, CompletionCb on_complete)
+    : on_complete_(std::move(on_complete)) {
+  EXECUTION_RUNTIME_CHECK(num_threads > 0, "HostWorkerPool requires at least 1 thread");
+  EXECUTION_RUNTIME_CHECK(static_cast<bool>(on_complete_),
+                          "HostWorkerPool requires a non-null completion callback");
+  workers_.reserve(num_threads);
+  try {
+    for (size_t i = 0; i < num_threads; ++i) {
+      workers_.emplace_back([this, i] { WorkerLoop(i); });
+    }
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      shutdown_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
+    for (auto& t : workers_) {
+      if (t.joinable()) t.join();
+    }
+    throw;
+  }
+  TORCH_NEURONX_DEBUG("HostWorkerPool started", "num_threads=", num_threads);
+}
+
+HostWorkerPool::~HostWorkerPool() { Shutdown(); }
+
+void HostWorkerPool::Submit(OperationContext* op) {
+  EXECUTION_RUNTIME_CHECK(op != nullptr, "HostWorkerPool::Submit got null op");
+  bool reject = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_.load(std::memory_order_acquire)) {
+      reject = true;
+    } else {
+      jobs_.push_back(Job{op});
+    }
+  }
+  if (reject) {
+    // Shutting down — fail fast. Advance the stream's host-completion seq so
+    // any device op gated on this kHost (RunHost will never run) unblocks
+    // rather than hanging at Synchronize. Callback invoked outside the lock to
+    // avoid lock-order inversion with engine state.
+    AdvanceHostCompletion(op);
+    auto eptr = std::make_exception_ptr(
+        std::runtime_error("HostWorkerPool is shutting down; rejecting submission"));
+    on_complete_(op, eptr);
+    return;
+  }
+  cv_.notify_one();
+}
+
+void HostWorkerPool::Shutdown() {
+  // Single-shot guard: only the first caller does the join+drain. CAS outside
+  // the lock so repeat callers bail without contending.
+  bool expected = false;
+  if (!shutdown_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  // LOST-WAKEUP: re-store shutdown_ and notify_all under mutex_ so a worker
+  // mid-cv_.wait() predicate eval can't miss the notify.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_.store(true, std::memory_order_release);
+  }
+  cv_.notify_all();
+  for (auto& t : workers_) {
+    if (t.joinable()) t.join();
+  }
+  // Drain remaining jobs: surface a shutdown exception (RunHost never runs) and
+  // advance the host-completion seq so any gated device op unblocks.
+  std::deque<Job> leftover;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    leftover.swap(jobs_);
+  }
+  for (auto& job : leftover) {
+    AdvanceHostCompletion(job.op);
+    auto eptr =
+        std::make_exception_ptr(std::runtime_error("HostWorkerPool shut down before job ran"));
+    on_complete_(job.op, eptr);
+  }
+  TORCH_NEURONX_DEBUG("HostWorkerPool shutdown complete", "drained=", leftover.size());
+}
+
+void HostWorkerPool::WorkerLoop(size_t worker_idx) {
+  TORCH_NEURONX_DEBUG("HostWorkerPool worker started", "worker_idx=", worker_idx);
+  while (true) {
+    Job job;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock,
+               [this] { return !jobs_.empty() || shutdown_.load(std::memory_order_acquire); });
+      if (jobs_.empty() && shutdown_.load(std::memory_order_acquire)) {
+        break;
+      }
+      job = std::move(jobs_.front());
+      jobs_.pop_front();
+    }
+
+    std::exception_ptr eptr = nullptr;
+    try {
+      EXECUTION_RUNTIME_CHECK(job.op != nullptr, "HostWorkerPool got null op in queue");
+      EXECUTION_RUNTIME_CHECK(job.op->kernel_execution != nullptr,
+                              "HostWorkerPool op has null kernel_execution");
+      EXECUTION_RUNTIME_CHECK(job.op->GetKernelType() == KernelTypeEnum::kHost,
+                              "HostWorkerPool got non-kHost op");
+
+      // Stamp execute_start (profiler timing) and worker_idx (routes the DRIVER
+      // activity to a per-worker pftrace track).
+      job.op->execute_start = std::chrono::steady_clock::now();
+      job.op->neuron_stream_os_tid = getOsTid();
+      job.op->host_worker_idx = static_cast<int32_t>(worker_idx);
+
+      auto* host_kernel = static_cast<HostKernelExecution*>(job.op->kernel_execution.get());
+      host_kernel->RunHost();
+    } catch (...) {
+      eptr = std::current_exception();
+    }
+
+    // Advance the seq BEFORE on_complete_: the release store must happen-before
+    // the queue push / worker wake, so a device op that observes the seq also
+    // sees the kHost's output writes.
+    try {
+      AdvanceHostCompletion(job.op);
+      on_complete_(job.op, eptr);
+    } catch (const std::exception& e) {
+      TORCH_NEURONX_ERROR("HostWorkerPool: completion drain threw despite invariants: ", e.what(),
+                          " — op may leak; downstream device ops gated on the host completion",
+                          " seq may hang at Synchronize.");
+    } catch (...) {
+      TORCH_NEURONX_ERROR("HostWorkerPool: completion drain threw unknown exception",
+                          " despite invariants — op may leak.");
+    }
+  }
+  TORCH_NEURONX_DEBUG("HostWorkerPool worker exiting", "worker_idx=", worker_idx);
+}
 
 OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation_cache,
                                                    ModelHandleCache* model_handle_cache)
@@ -83,13 +232,22 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
     }
   }
 
-  // Start runtime worker thread
+  // Start the runtime worker thread. The host worker pool is created lazily on
+  // first kHost dispatch (EnsureHostWorkerPool), not here.
   try {
     completion_efd_ = eventfd(0, EFD_CLOEXEC);
     TORCH_CHECK(completion_efd_ >= 0, "Failed to create eventfd for runtime worker");
+
     runtime_thread_ = std::thread(&OperationExecutionEngine::RuntimeWorker, this);
   } catch (...) {
     shutdown_requested_.store(true, std::memory_order_release);
+    if (host_worker_pool_) {
+      host_worker_pool_->Shutdown();
+      // Drain entries the pool's Shutdown pushed before reset (empty in practice
+      // — no kHost ops can be submitted during ctor — but symmetric with Shutdown).
+      DrainHostCompletions();
+      host_worker_pool_.reset();
+    }
     if (completion_efd_ >= 0) {
       ::close(completion_efd_);
       completion_efd_ = -1;
@@ -102,11 +260,22 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
   }
 
   TORCH_NEURONX_DEBUG("OperationExecutionEngine worker threads started",
-                      "concatenation_enabled=", concatenation_enabled_,
+                      "concatenation_enabled=", concatenation_enabled_, "host_pool=lazy",
                       "runtime_thread_id=", runtime_thread_.get_id());
 }
 
 OperationExecutionEngine::~OperationExecutionEngine() { Shutdown(); }
+
+void OperationExecutionEngine::EnsureHostWorkerPool() {
+  std::lock_guard<std::mutex> lock(host_worker_pool_init_mutex_);
+  if (host_worker_pool_) {
+    return;
+  }
+  host_worker_pool_ = std::make_unique<HostWorkerPool>(
+      kHostWorkerThreads,
+      [this](OperationContext* op, std::exception_ptr eptr) { OnHostJobComplete(op, eptr); });
+  TORCH_NEURONX_DEBUG("Lazily initialized HostWorkerPool", "threads=", kHostWorkerThreads);
+}
 
 void OperationExecutionEngine::Shutdown() {
   bool expected = false;
@@ -127,6 +296,18 @@ void OperationExecutionEngine::Shutdown() {
   if (runtime_thread_.joinable()) {
     runtime_thread_.join();
   }
+
+  // Tear down the host worker pool AFTER the runtime thread has joined so any
+  // kHost ops it scheduled have a chance to run. Pool::Shutdown() waits for
+  // workers to exit and surfaces a shutdown error for any unrun jobs.
+  if (host_worker_pool_) {
+    host_worker_pool_->Shutdown();
+    // Drain any completion entries the pool pushed while we were tearing
+    // down — workers may have completed jobs after RuntimeWorker exited.
+    DrainHostCompletions();
+    host_worker_pool_.reset();
+  }
+
   if (completion_efd_ >= 0) {
     ::close(completion_efd_);
     completion_efd_ = -1;
@@ -269,6 +450,21 @@ void OperationExecutionEngine::RuntimeWorker() {
 
       CheckCompletions();
 
+      // Drain kHost completions right after CheckCompletions() so they flow
+      // through the same FIFO pass as device completions — a device op blocked
+      // on a kHost becomes schedulable next pass.
+      {
+        bool host_had_work;
+        {
+          std::lock_guard<std::mutex> lock(host_completed_mutex_);
+          host_had_work = !host_completed_queue_.empty();
+        }
+        if (host_had_work) {
+          DrainHostCompletions();
+          work_found = true;
+        }
+      }
+
       for (auto device : devices) {
         ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
           OperationContext* operation = stream_impl->GetNextOperationToSchedule();
@@ -361,6 +557,94 @@ void OperationExecutionEngine::WriteEventfd() {
     if (errno == EINTR) continue;
     TORCH_NEURONX_ERROR("write to completion_efd_ failed: ", strerror(errno));
     break;
+  }
+}
+
+void OperationExecutionEngine::OnHostJobComplete(OperationContext* op,
+                                                 std::exception_ptr eptr) noexcept {
+  // Called from a HostWorkerPool worker thread: push to queue + wake the runtime
+  // worker, which drains and routes through StreamImpl's completion paths.
+  //
+  // INVARIANT: must be noexcept. If a throw escapes, the op never reaches
+  // host_completed_queue_, pending_async_ops_count_ is never decremented, and
+  // Synchronize() hangs forever. The catch is the fallback: route the op
+  // directly through HandleErrorWithExceptionPtr and decrement the counter, so
+  // the op leaves active_operations_ even if the queue push (mutex/bad_alloc) fails.
+  try {
+    {
+      std::lock_guard<std::mutex> lock(host_completed_mutex_);
+      host_completed_queue_.emplace_back(op, eptr);
+    }
+    WriteEventfd();
+  } catch (...) {
+    // Fallback mirrors DrainHostCompletions. We are noexcept, so every leaf call
+    // that can throw (e.g. TORCH_NEURONX_ERROR's ostringstream → bad_alloc) is
+    // wrapped to swallow — a throw here → std::terminate, worse than a leak.
+    // fetch_sub is noexcept by spec.
+    int prior = pending_async_ops_count_.fetch_sub(1);
+    if (prior <= 0) {
+      // Underflow guard symmetric with DrainHostCompletions, but we cannot
+      // throw here (noexcept). Try to log; swallow if logging itself throws.
+      try {
+        TORCH_NEURONX_WARN("OnHostJobComplete fallback: pending_async_ops_count_ underflow ",
+                           "(prior=", prior, "); kHost increment/decrement asymmetry.");
+      } catch (...) {  // swallow — noexcept invariant
+      }
+    }
+    if (op && op->stream) {
+      auto fallback_eptr = eptr ? eptr : std::current_exception();
+      try {
+        op->stream->HandleErrorWithExceptionPtr(op, fallback_eptr);
+      } catch (...) {
+        // Last resort: log (wrapped — noexcept) and accept the leak over a hang.
+        try {
+          TORCH_NEURONX_ERROR(
+              "OnHostJobComplete fallback HandleErrorWithExceptionPtr threw — op may leak.");
+        } catch (...) {  // swallow — noexcept invariant
+        }
+      }
+    } else {
+      try {
+        TORCH_NEURONX_ERROR("OnHostJobComplete fallback: op has null stream — op leaked.");
+      } catch (...) {  // swallow — noexcept invariant
+      }
+    }
+  }
+}
+
+void OperationExecutionEngine::DrainHostCompletions() {
+  // Move out under the lock — completion processing touches the stream's
+  // active_operations_ which has its own mutex; we don't want nested locks.
+  std::deque<std::pair<OperationContext*, std::exception_ptr>> drained;
+  {
+    std::lock_guard<std::mutex> lock(host_completed_mutex_);
+    drained.swap(host_completed_queue_);
+  }
+
+  for (auto& entry : drained) {
+    OperationContext* op = entry.first;
+    std::exception_ptr eptr = entry.second;
+    if (!op) continue;
+    StreamImpl* stream = op->stream;
+    EXECUTION_RUNTIME_CHECK(stream != nullptr, "DrainHostCompletions: kHost op has null stream");
+
+    // Decrement the counter ScheduleOperation's host path incremented; a
+    // non-positive prior means an increment/decrement asymmetry (loud, not silent).
+    int prior = pending_async_ops_count_.fetch_sub(1);
+    EXECUTION_RUNTIME_CHECK(prior > 0,
+                            "DrainHostCompletions: pending_async_ops_count_ underflow "
+                            "(prior=",
+                            prior, "); kHost increment/decrement asymmetry");
+
+    if (eptr) {
+      stream->HandleErrorWithExceptionPtr(op, eptr);
+    } else {
+      try {
+        stream->CompleteOperation(op);
+      } catch (...) {
+        stream->HandleErrorWithExceptionPtr(op, std::current_exception());
+      }
+    }
   }
 }
 
@@ -801,6 +1085,56 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     return ScheduleAllocOperation(op, stream);
   }
 
+  // ── kHost: cross-kind sync gate, then submit to HostWorkerPool ────────────
+  // A kHost op may only start once any prior device op on this stream has
+  // retired (completion polling has caught up). We don't gate on prior kHost
+  // ops here — pool-internal FIFO + per-stream FIFO via active_operations_
+  // already preserves ordering for kHost→kHost on the same stream.
+  if (kernel_type == KernelTypeEnum::kHost) {
+    auto& info = stream->GetLastScheduledInfo();
+    if (info.valid && info.kind == LastKind::kDeviceXU) {
+      stream->UpdateCompletionState();
+      int queue = nrt::GetHardwareQueue(info.xu, stream->GetStreamId());
+      nrt::SequenceId completed_seq = stream->xu_completed_seqs_.Get(info.xu, queue);
+      if (NRTA_SEQ_GET_SEQ_NUM(info.sequence_id) > NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
+        // Prior device op not retired; runtime worker will retry on next pass
+        // (woken by NRT completion eventfd).
+        return false;
+      }
+    }
+
+    EnsureHostWorkerPool();
+    EXECUTION_RUNTIME_CHECK(host_worker_pool_ != nullptr,
+                            "Failed to lazily initialize HostWorkerPool");
+
+    // Order matters: mark inflight + stamp the host-completion seq into
+    // last_scheduled_info_ (so a following device op gates on it) + advance,
+    // all BEFORE Submit — once submitted the worker may run RunHost on another
+    // thread. is_host_inflight release-store pairs with the acquire-loads in
+    // HasPendingAsyncOperations / ProcessCompletions.
+    op->nrt_async_state_.is_host_inflight.store(true, std::memory_order_release);
+    pending_async_ops_count_.fetch_add(1);
+    op->host_completion_seq_ =
+        stream->host_completion_state_.next_seq_id.fetch_add(1, std::memory_order_relaxed);
+    info.kind = LastKind::kHost;
+    info.host_completion_seq = op->host_completion_seq_;
+    info.valid = true;
+    stream->AdvanceToNextOperation();
+    try {
+      host_worker_pool_->Submit(op);
+    } catch (...) {
+      // Submit threw → roll back the bookkeeping (else a phantom inflight op),
+      // and advance the seq so a downstream device op gated on this kHost (whose
+      // RunHost will never run) doesn't hang. The Submit error surfaces via the
+      // caller's HandleErrorWithExceptionPtr.
+      op->nrt_async_state_.is_host_inflight.store(false, std::memory_order_release);
+      pending_async_ops_count_.fetch_sub(1);
+      AdvanceHostCompletion(op);
+      throw;
+    }
+    return true;
+  }
+
   // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
   bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
@@ -945,7 +1279,12 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
         }
         break;  // concat not done yet — stop
       }
-      if (op_ptr->nrt_async_state_.is_scheduled) {
+      if (op_ptr->nrt_async_state_.is_host_inflight.load(std::memory_order_acquire)) {
+        // kHost: completion is the HostWorkerPool's responsibility, routed
+        // through DrainHostCompletions. We must stop the FIFO walk here so
+        // we don't complete a later op out of order.
+        break;
+      } else if (op_ptr->nrt_async_state_.is_scheduled) {
         if (IsSeqCompleted(op_ptr->nrt_async_state_.sequence_id, op_ptr->GetKernelType())) {
           ops_to_complete.push_back(op_ptr);
           continue;

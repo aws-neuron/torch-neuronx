@@ -27,6 +27,9 @@ namespace at::neuron {
 // OS thread ID via gettid(2) — avoids depending on Kineto's ThreadUtil.h from core code.
 inline int32_t getOsTid() { return static_cast<int32_t>(syscall(SYS_gettid)); }
 
+// Sequence number for kHost completion ordering.
+using HostCompletionSeq = uint64_t;
+
 // Forward declaration
 struct OperationContext;
 
@@ -158,6 +161,7 @@ DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kHint, HintDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kAlloc, AllocDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kDealloc, DeallocDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kHost, HostKernelExecution)
 
 #undef DEFINE_KERNEL_TYPE_TRAITS
 
@@ -239,6 +243,9 @@ struct OperationContext {
   // Default NRT_FAILURE ensures unset status is treated as error (fail-closed).
   NRT_STATUS nrt_status_{NRT_FAILURE};
 
+  // For kHost ops: the per-stream host-completion seq stamped at kHost dispatch.
+  HostCompletionSeq host_completion_seq_{0};
+
   bool HasNRTError() const { return nrt_status_ != NRT_SUCCESS; }
 
   torch_neuronx::ExecutionRuntimeException GetNRTError() const {
@@ -283,6 +290,11 @@ struct OperationContext {
   int32_t neuron_stream_os_tid{-1};  // -1 = not yet assigned; valid tids are positive (gettid())
   int32_t xu_type{-1};               // Resolved XU type after scheduling (NRTA_XU_COMPUTE etc.)
   int32_t dispatch_slot{-1};         // Inflight slot for parallel trace visualization (0-7 per XU)
+
+  // For kHost ops: index of the HostWorkerPool worker that ran RunHost (-1 if
+  // not a host-pool op).
+  int32_t host_worker_idx{-1};
+
   // Unique event ID for framework-to-NRT event linking
   uint64_t event_id = 0;
 
@@ -297,6 +309,14 @@ struct OperationContext {
         stream(nullptr),
         promise(),
         result_future(promise.get_future().share()) {}
+
+  // OperationContext is non-copyable / non-movable: it owns a std::promise
+  // member (promise) which is move-only, plus std::atomic members which are
+  // neither.
+  OperationContext(const OperationContext&) = delete;
+  OperationContext& operator=(const OperationContext&) = delete;
+  OperationContext(OperationContext&&) = delete;
+  OperationContext& operator=(OperationContext&&) = delete;
 
   // Accessor for CPU fallback context
   const CPUFallbackContext& GetCPUFallbackContext() const { return cpu_fallback_context; }

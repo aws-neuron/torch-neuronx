@@ -12,7 +12,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 // Include Neuron Runtime headers
 extern "C" {

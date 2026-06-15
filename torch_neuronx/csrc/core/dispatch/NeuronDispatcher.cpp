@@ -23,8 +23,10 @@
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/DtypeCastVec.h"
+#include "torch_neuronx/csrc/core/utils/HostChain.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -377,6 +379,52 @@ static bool IsNonDefaultStreamWithHostCC(c10::DeviceIndex device_index) {
   return current != default_s;
 }
 
+/// Dtype pair supported by `RunDtypeCast` v1: bf16↔fp32,
+/// fp16↔fp32, identity. Cross-dtype pairs outside this set fall through to the
+/// synchronous Tier-3 CPU bounce.
+static bool IsKHostCastSupported(c10::ScalarType src_dt, c10::ScalarType dst_dt) {
+  using ST = c10::ScalarType;
+  if (src_dt == dst_dt) return true;
+  return (src_dt == ST::BFloat16 && dst_dt == ST::Float) ||
+         (src_dt == ST::Float && dst_dt == ST::BFloat16) ||
+         (src_dt == ST::Half && dst_dt == ST::Float) || (src_dt == ST::Float && dst_dt == ST::Half);
+}
+
+/// Cast-specific thin wrapper over SubmitHostChain: dtype-cast src → dst via the
+/// kRead → kHost → kWrite chain. Returns false if the chain wasn't submitted
+/// (numel==0), so the caller can fall back to a synchronous path.
+static bool SubmitKHostCastChain(const at::Tensor& src, at::Tensor& dst) {
+  TORCH_INTERNAL_ASSERT(src.numel() == dst.numel(),
+                        "SubmitKHostCastChain requires src.numel() == dst.numel()");
+  const c10::ScalarType src_dtype = src.scalar_type();
+  const c10::ScalarType dst_dtype = dst.scalar_type();
+  TORCH_INTERNAL_ASSERT(IsKHostCastSupported(src_dtype, dst_dtype),
+                        "SubmitKHostCastChain: unsupported dtype pair ", src_dtype, " -> ",
+                        dst_dtype);
+  const int64_t numel = src.numel();
+  return at::neuron::SubmitHostChain(
+      "neuron::host::dtype_cast", {src}, {dst},
+      [src_dtype, dst_dtype, numel](const std::vector<at::neuron::TensorDataRef>& srcs,
+                                    const std::vector<at::neuron::TensorDataRef>& dsts) {
+        torch_neuronx::utils::RunDtypeCast(srcs[0].ptr, dsts[0].ptr, numel, src_dtype, dst_dtype);
+      });
+}
+
+/// Whether `src`→`dst` qualifies for the async kHost cross-dtype chain.
+static bool CanUseKHostCastChain(const at::Tensor& src, c10::ScalarType dst_dtype,
+                                 c10::DeviceIndex dst_device, bool is_non_default_hostcc) {
+  return is_non_default_hostcc && src.scalar_type() != dst_dtype &&
+         IsKHostCastSupported(src.scalar_type(), dst_dtype) && src.device().index() == dst_device &&
+         !src.is_neg() && !src.is_conj();
+}
+
+static bool RunKHostCastChain(const at::Tensor& src, at::Tensor& dst) {
+  auto src_prepared = src.is_contiguous() ? src
+                                          : torch_neuronx::ops::contiguous_internal(
+                                                src, c10::MemoryFormat::Contiguous);
+  return SubmitKHostCastChain(src_prepared, dst);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  aten::copy_ — CPU↔Neuron via NRT, Neuron→Neuron via MLIR or NRT
 // ═══════════════════════════════════════════════════════════════
@@ -568,7 +616,23 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
-    // ── 3. NRT CPU bounce (least optimal) ──
+    // ── 3a. kHost cross-dtype chain (FSDP-stream + cross-dtype + supported pair) ──
+    if (!needs_broadcast &&
+        CanUseKHostCastChain(src, self_tensor.scalar_type(), self_tensor.device().index(),
+                             is_non_default_hostcc)) {
+      TORCH_NEURONX_DISPATCH_DEBUG(
+          "[DispatchCopy] Neuron→Neuron kHost cross-dtype chain", " src_dtype=", src.scalar_type(),
+          " dst_dtype=", self_tensor.scalar_type(), " numel=", src.numel());
+      if (RunKHostCastChain(src, self_tensor)) {
+        logOperationExecuted("aten::copy_");
+        torch::jit::push(*stack, self_tensor);
+        return;
+      }
+      // Fall through on failure (numel==0 etc.)
+    }
+
+    // ── 3b. NRT CPU bounce (least optimal) ── when MLIR, raw-NRT, and the kHost
+    // chain all don't apply (unsupported dtype, broadcast, or non-v1 cast pair).
     bool async_write = is_non_default_hostcc;
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron NRT CPU bounce",
                                  " async_write=", async_write);
@@ -760,6 +824,23 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
+    // ── 3a. kHost cross-dtype chain (FSDP-stream + cross-dtype + supported pair) ──
+    if (CanUseKHostCastChain(self_tensor, target_dtype, target_device.index(),
+                             is_non_default_hostcc)) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron kHost cross-dtype chain",
+                                   " src_dtype=", self_tensor.scalar_type(),
+                                   " target_dtype=", target_dtype, " numel=", self_tensor.numel());
+      auto dst = at::empty(self_tensor.sizes(),
+                           at::TensorOptions().dtype(target_dtype).device(target_device));
+      if (RunKHostCastChain(self_tensor, dst)) {
+        logOperationExecuted("aten::_to_copy");
+        torch::jit::push(*stack, dst);
+        return;
+      }
+      // Fall through on failure (numel==0).
+    }
+
+    // ── 3b. NRT CPU bounce ──
     // Async write on non-default stream + hostCC; default stream stays sync.
     bool async_write = is_non_default_hostcc;
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce",

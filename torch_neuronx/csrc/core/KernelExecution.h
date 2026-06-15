@@ -44,11 +44,12 @@ enum class KernelTypeEnum {
   kHint,  // Merely a non-functional hint
   kAlloc,
   kDealloc,
+  kHost,
 };
 
 // Check if a kernel type represents a device operation (vs host-side operation).
 // Device operations: kHLO, kCollective, kCopy, kWrite, kRead
-// Host-side operations: kEvent, kBarrier, kHint
+// Host-side operations: kEvent, kBarrier, kHint, kAlloc, kDealloc, kHost
 inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
@@ -62,6 +63,7 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kHint:
     case KernelTypeEnum::kAlloc:
     case KernelTypeEnum::kDealloc:
+    case KernelTypeEnum::kHost:
       return false;
   }
   return false;
@@ -82,6 +84,7 @@ inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kRead:
     case KernelTypeEnum::kEvent:
     case KernelTypeEnum::kBarrier:
+    case KernelTypeEnum::kHost:
       return false;
   }
   return false;
@@ -766,6 +769,53 @@ class BarrierDirectKernelExecution : public NeuronKernelExecution {
  private:
   int rank_;
   int world_size_;
+};
+
+// THE single host-compute kernel — runs an arbitrary closure on a
+// HostWorkerPool worker thread.
+class HostKernelExecution final
+    : public NeuronKernelExecutionTyped<KernelTypeEnum::kHost, c10::DeviceType::CPU,
+                                        c10::DeviceType::CPU> {
+ public:
+  using HostFn = std::function<void(const std::vector<TensorDataRef>& srcs,
+                                    const std::vector<TensorDataRef>& dsts)>;
+
+  HostKernelExecution(const std::string& op_name, std::vector<TensorDataRef> src_refs,
+                      std::vector<TensorDataRef> dst_refs, HostFn fn, int device_id,
+                      std::vector<at::Tensor> keepalives = {})
+      : NeuronKernelExecutionTyped(op_name, std::move(src_refs), std::move(dst_refs), device_id),
+        fn_(std::move(fn)),
+        keepalives_(std::move(keepalives)) {}
+
+  // Called on a HostWorkerPool worker thread.
+  void RunHost() { fn_(src_data_refs_, dst_data_refs_); }
+
+  // Unreachable: kHost ops go to HostWorkerPool::Submit, never the device-XU
+  // Schedule() path. Assert so a mis-route surfaces loudly.
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override {
+    EXECUTION_RUNTIME_CHECK(false, "HostKernelExecution::Schedule() is unreachable");
+    return false;
+  }
+
+  KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kHost; }
+  bool RequiresCompilation() const override { return false; }
+
+  // Non-copyable/movable: copying would slice the fn_ closure and keepalives.
+  // OperationContext owns this via unique_ptr and never copies it.
+  HostKernelExecution(const HostKernelExecution&) = delete;
+  HostKernelExecution& operator=(const HostKernelExecution&) = delete;
+  HostKernelExecution(HostKernelExecution&&) = delete;
+  HostKernelExecution& operator=(HostKernelExecution&&) = delete;
+
+ protected:
+  // Valid iff a host fn was supplied. Buffer/shape validation is the op's
+  // responsibility inside its closure (the engine has no per-op knowledge here).
+  bool ValidateImpl() const override { return static_cast<bool>(fn_); }
+
+ private:
+  HostFn fn_;
+  std::vector<at::Tensor> keepalives_;
 };
 
 }  // namespace at::neuron

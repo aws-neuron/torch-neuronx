@@ -37,6 +37,9 @@ struct ProfiledOperation {
   int32_t pytorch_os_tid{0};         // OS tid (gettid) of the PyTorch calling thread
   int32_t dispatch_slot{-1};         // Inflight slot index for parallel row visualization
 
+  // For kHost operations: index of the HostWorkerPool worker.
+  int32_t host_worker_idx{-1};
+
   std::string hierarchy_string;      // nn.Module hierarchy (e.g. "Linear[fc1][1]/")
   std::string neff_cache_key;        // NEFF compilation cache key
   std::string persistent_cache_key;  // Persistent cache key (matches NEFF filename on disk)

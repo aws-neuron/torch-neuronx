@@ -23,11 +23,27 @@
 
 namespace at::neuron {
 
-// Tracking info for the last scheduled operation on a stream
-// Used for cross-XU synchronization
+// Discriminator for the last scheduled operation's "kind".
+// kDeviceXU: prior op was scheduled on an NRT device XU (kHLO/kCollective/
+//            kCopy/kWrite/kRead). Sync via xu_completed_seqs_ retire check.
+// kHost:     prior op was a kHost (host-compute on HostWorkerPool). Sync via
+//            host_completion_state_.completed_seq_id >= the producer's
+//            host_completion_seq (seq compare, same shape as the device gate).
+enum class LastKind : uint8_t { kDeviceXU, kHost };
+
+// Tracking info for the last scheduled operation on a stream.
+// Used for cross-XU and cross-kind (device↔host) synchronization.
 struct LastScheduledInfo {
+  LastKind kind{LastKind::kDeviceXU};
+
+  // Valid when kind == kDeviceXU
   nrta_xu_t xu{NRTA_XU_COMPUTE};
   nrt::SequenceId sequence_id{0};
+
+  // Valid when kind == kHost. The host-completion seq stamped to the prior
+  // kHost op;
+  HostCompletionSeq host_completion_seq{0};
+
   bool valid{false};
 };
 
@@ -82,6 +98,19 @@ struct XUCompletionState {
   }
 };
 
+// Per-stream kHost completion tracking — host-side analogue of XUCompletionState.
+struct HostCompletionState {
+  std::atomic<HostCompletionSeq> next_seq_id{1};
+  std::atomic<HostCompletionSeq> completed_seq_id{0};
+
+  void AdvanceCompleted(HostCompletionSeq seq_id) {
+    HostCompletionSeq cur = completed_seq_id.load(std::memory_order_relaxed);
+    while (cur < seq_id && !completed_seq_id.compare_exchange_weak(
+                               cur, seq_id, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+  }
+};
+
 // StreamImpl owns the per-stream committed runtime queue — the FIFO that the
 // RuntimeWorker schedules from. The engine owns the global dispatch_queue_
 // in front of it; the concat worker transfers a partitioned prefix from
@@ -106,6 +135,10 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
 
   // Per-stream completion tracking state for async NRT operations
   XUCompletionState xu_completed_seqs_;
+
+  // Per-stream kHost completion tracking (host-side analogue of the above).
+  // See HostCompletionState.
+  HostCompletionState host_completion_state_;
 
   // Last seq registered for eventfd notification
   nrt::SequenceId last_registered_efd_seq_{0};
