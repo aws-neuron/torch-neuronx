@@ -28,6 +28,7 @@ DYNAMO_DYNAMIC_SHAPES_UNSUPPORTED = [
     "test_check_compiles_when_predicate_true_and_message_has_no_closure_dynamic_shapes",
     "test_check_compiles_when_predicate_true_constant_and_message_None_dynamic_shapes",
     "test_check_compiles_when_predicate_true_constant_and_message_has_no_closure_dynamic_shapes",
+    "test_checkpoint_automatic_dynamic_graph_shadowing",
     "test_class_dict_dynamic_shapes",
     "test_class_duner_flags_dynamic_shapes",
     "test_class_duner_mro_dynamic_shapes",

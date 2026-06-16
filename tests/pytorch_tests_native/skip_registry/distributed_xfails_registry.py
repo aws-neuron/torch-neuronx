@@ -414,4 +414,13 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_replicate_training.py::TestReplicateSharedParams::test_train_parity_with_shared_params",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Asserts handler count on _c10d_logger; pytest 9.1+ attaches its"
+            " own capture handlers to non-propagating loggers, inflating the count."
+        ),
+        tests=[
+            "test_utils.py::TestMedatadaIndex::test_dcp_logger",
+        ],
+    ),
 ]

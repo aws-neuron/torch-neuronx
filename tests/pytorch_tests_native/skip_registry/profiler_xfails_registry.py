@@ -11,7 +11,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             "integral tensor min/max range not recorded in execution trace nodes"
         ),
         tests=[
-            "TestExecutionTracePRIVATEUSE1::test_execution_trace_record_integral_tensor_range_neuron"
+            "TestExecutionTraceNEURON::test_execution_trace_record_integral_tensor_range_neuron"
         ],
     ),
     SkipGroup(
