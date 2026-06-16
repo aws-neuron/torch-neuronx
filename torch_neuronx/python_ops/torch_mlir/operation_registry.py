@@ -191,7 +191,6 @@ def finalize_registrations(aten_lib=None, verbose: bool = False):
             # Register with PyTorch
             op_name = aten_name.replace("aten::", "")
             try:
-                # import pdb; pdb.set_trace()
                 aten_lib.impl(op_name, wrapper_func, "PrivateUse1")
                 registered_count += 1
                 if verbose:

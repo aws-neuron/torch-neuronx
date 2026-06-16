@@ -19,13 +19,47 @@
 namespace torch_neuronx {
 namespace dispatch {
 
-/// Check if native int64 (S64 HLO) is enabled via TORCH_NEURONX_NATIVE_INT64=1.
-/// Cached on first call — env var is read once at startup.
-inline bool IsNativeInt64Enabled() {
-  static const bool enabled = []() {
-    const char* env = std::getenv("TORCH_NEURONX_NATIVE_INT64");
-    return env != nullptr && std::string(env) == "1";
+/// Int64 execution mode — controls how int64 tensors are handled during dispatch.
+enum class Int64Mode : uint8_t {
+  kCpuBounce = 0,  // Move to CPU, cast to int32, move back (default)
+  kNative = 1,     // Pass int64 through to compiler as S64 HLO
+  kPacked = 2,     // Store as two int32 lanes; execute on low word only
+};
+
+/// Read TORCH_NEURONX_INT64_MODE (or legacy TORCH_NEURONX_NATIVE_INT64=1).
+/// Cached on first call.
+inline Int64Mode GetInt64Mode() {
+  static const Int64Mode mode = []() {
+    const char* mode_env = std::getenv("TORCH_NEURONX_INT64_MODE");
+    if (mode_env != nullptr) {
+      std::string val(mode_env);
+      if (val == "packed") return Int64Mode::kPacked;
+      if (val == "native") return Int64Mode::kNative;
+      if (val == "cpu_bounce") return Int64Mode::kCpuBounce;
+      TORCH_WARN("Invalid TORCH_NEURONX_INT64_MODE='", val,
+                 "'. Valid: packed, native, cpu_bounce. Defaulting to cpu_bounce.");
+      return Int64Mode::kCpuBounce;
+    }
+    // Legacy fallback
+    const char* legacy = std::getenv("TORCH_NEURONX_NATIVE_INT64");
+    if (legacy != nullptr && std::string(legacy) == "1") {
+      return Int64Mode::kNative;
+    }
+    return Int64Mode::kPacked;
   }();
+  return mode;
+}
+
+/// Check if native int64 (S64 HLO) is enabled.
+/// Cached on first call — delegates to GetInt64Mode().
+inline bool IsNativeInt64Enabled() {
+  static const bool enabled = (GetInt64Mode() == Int64Mode::kNative);
+  return enabled;
+}
+
+/// Check if packed int64 mode is enabled.
+inline bool IsPackedInt64Enabled() {
+  static const bool enabled = (GetInt64Mode() == Int64Mode::kPacked);
   return enabled;
 }
 

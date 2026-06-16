@@ -59,6 +59,7 @@
 #include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
 // Copy helpers
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
 
 // Dispatch helpers (shared out= resize/warning)
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
@@ -853,6 +854,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Strided copy between Neuron tensors — handles arbitrary src/dst strides", py::arg("src"),
       py::arg("dst"));
+
+  // ── Packed int64 utilities ──
+  m.def(
+      "_packed_int64_physical_view",
+      [](const at::Tensor& t) -> at::Tensor {
+        return torch_neuronx::packed_int64::physical_view(t);
+      },
+      "Create int32 physical view of a packed int64 tensor (zero-copy, shares storage)",
+      py::arg("t"));
+  m.def(
+      "_packed_int64_execution_view",
+      [](const at::Tensor& t) -> at::Tensor {
+        return torch_neuronx::packed_int64::execution_view(t);
+      },
+      "Extract contiguous int32 low words from packed int64 tensor (device-side strided copy)",
+      py::arg("t"));
 
   // Shared out= resize helper: resizes `out` to `target_shape` and emits the
   // same UserWarning as at::native::resize_output_check when `out` is
