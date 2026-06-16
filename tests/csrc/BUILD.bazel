@@ -662,3 +662,9 @@ torch_neuronx_cc_test(
     srcs = ["core/metrics/NeuronMemorySnapshotTest.cpp"],
     deps = ["//:runtime"],
 )
+
+torch_neuronx_cc_test(
+    name = "PackedInt64UtilsTest",
+    srcs = ["core/utils/PackedInt64UtilsTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)

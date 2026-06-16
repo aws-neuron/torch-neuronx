@@ -246,6 +246,9 @@ def parse_cache_key(cache_key: str) -> ParsedCacheKey | None:
     if not cache_key or "--" not in cache_key:
         return None
     op_name, signature = cache_key.split("--", 1)
+    # Skip optional int64 mode field
+    if signature.startswith(("p64--", "n64--")):
+        signature = signature.split("--", 1)[1]
     if not op_name or "alias:" in cache_key:
         return None
     if re.match(r"nki_\d+_", op_name) or re.match(r"[0-9a-f]+:[0-9a-f]+", op_name):

@@ -133,6 +133,7 @@ set(INTERNAL_OPS_SOURCES
 set(INTERNAL_OPS_HEADERS
     torch_neuronx/csrc/ops/InternalOps.h
     torch_neuronx/csrc/core/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.h
 )
 
 add_library(internal_ops STATIC ${INTERNAL_OPS_SOURCES})
@@ -203,6 +204,7 @@ set(ATEN_NEURON_SOURCES
     torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.cpp
     torch_neuronx/csrc/core/allocator/NeuronHostAllocator.cpp
     torch_neuronx/csrc/core/utils/CopyUtils.cpp
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.cpp
 )
 
 set(ATEN_NEURON_HEADERS
@@ -215,6 +217,7 @@ set(ATEN_NEURON_HEADERS
     torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h
     torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h
     torch_neuronx/csrc/core/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.h
     torch_neuronx/csrc/utils/SymIntUtils.h
 )
 

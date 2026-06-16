@@ -199,14 +199,19 @@ def skip_op_preconditions() -> bool:
 def is_native_int64_enabled() -> bool:
     """Check if native int64 passthrough to compiler is enabled.
 
-    When enabled, int64 tensors pass through to the compiler natively
-    via S64 HLO instead of being casted to int32. Disable with
-    TORCH_NEURONX_NATIVE_INT64=0 to fall back to int32 conversion.
+    .. deprecated::
+        Use ``torch_neuronx.int64_policy.get_int64_mode()`` instead.
+        This function now delegates to the new policy module which reads
+        TORCH_NEURONX_INT64_MODE (preferred) or TORCH_NEURONX_NATIVE_INT64
+        (legacy).
 
     Returns:
-        bool: False by default (TORCH_NEURONX_NATIVE_INT64 is "0")
+        bool: True when mode is NATIVE (TORCH_NEURONX_INT64_MODE=native
+              or legacy TORCH_NEURONX_NATIVE_INT64=1).
     """
-    return os.environ.get("TORCH_NEURONX_NATIVE_INT64", "0") == "1"
+    from torch_neuronx.int64_policy import is_native_int64_mode
+
+    return is_native_int64_mode()
 
 
 def get_logical_neuron_cores():
@@ -599,6 +604,37 @@ def convert_for_neuron(
     """
     # Determine if conversion is needed
     if tensor.dtype == torch.int64 and convert_int64:
+        # Packed mode: extract low words on-device (no CPU bounce)
+        from torch_neuronx.int64_policy import is_packed_int64_mode
+
+        if is_packed_int64_mode() and tensor.device.type == "neuron":
+            from torch_neuronx.packed_storage import packed_int64_execution_view
+
+            low = packed_int64_execution_view(tensor, contiguous=True)
+
+            # Optional overflow check (off by default for performance)
+            if os.environ.get("TORCH_NEURONX_PACKED_INT64_CHECK_OVERFLOW", "0") == "1":
+                from torch_neuronx.packed_storage import packed_int64_high_word_alias
+
+                # Gather the high lane. Contiguous → NKI kernel via the op (same
+                # fast path as the low words); non-contiguous → general int32
+                # copy of the lane alias.
+                high_alias = packed_int64_high_word_alias(tensor)
+                high = torch.empty_like(low)
+                if tensor.is_contiguous():
+                    torch.ops.neuron.nki_strided_copy_(high_alias, high)
+                else:
+                    high.copy_(high_alias)
+                expected_high = low >> 31
+                if not torch.eq(high, expected_high).all().item():
+                    raise OverflowError(
+                        "int64 tensor contains values outside int32 range "
+                        "[-2147483648, 2147483647]. Packed int64 mode only "
+                        "supports values representable in 32 bits. Set "
+                        "TORCH_NEURONX_INT64_MODE=cpu_bounce for full range."
+                    )
+
+            return low
         target_dtype = torch.int32
     elif tensor.dtype == torch.float64:
         target_dtype = torch.float32

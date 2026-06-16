@@ -276,3 +276,104 @@ def test_to_copy_int64_2d_small_values_to_float32():
     # int64 passes through to compiler natively (S64 HLO), no CPU bounce needed
     assert bounces["reads"] == 0, f"Expected 0 CPU reads, got {bounces['reads']}"
     assert bounces["writes"] == 0, f"Expected 0 CPU writes, got {bounces['writes']}"
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.bfloat16, torch.int32, torch.int64, torch.bool],
+)
+def test_to_copy_neuron_channels_last_same_dtype(dtype):
+    """_to_copy with memory_format=channels_last must preserve dtype, values, and layout.
+
+    Regression for a packed-int64 bug: int64->int64 with channels_last went
+    through the MLIR pipeline (which cannot carry int64) and silently came back
+    as int32. The MLIR _to_copy path also drops the channels_last layout for
+    *all* dtypes (returns contiguous), so this also guards the layout for the
+    supported dtypes. Mirrors how aten::contiguous(channels_last) is handled
+    (NRT strided copy), not the MLIR path.
+    """
+    # 4D tensor so channels_last is meaningful; input is contiguous (NCHW).
+    if dtype == torch.bool:
+        src = torch.randint(0, 2, (2, 3, 4, 5), device="neuron").bool()
+    elif dtype in (torch.float32, torch.bfloat16):
+        src = torch.randn(2, 3, 4, 5, dtype=dtype, device="neuron")
+    else:
+        src = torch.randint(0, 100, (2, 3, 4, 5), dtype=dtype, device="neuron")
+
+    dst = src.to(dtype=dtype, memory_format=torch.channels_last)
+    torch_neuronx.synchronize()
+
+    expected = src.cpu().to(dtype=dtype, memory_format=torch.channels_last)
+    assert dst.device.type == "neuron"
+    # dtype must be preserved (the int64->int32 corruption this guards against)
+    assert dst.dtype == dtype, f"dtype changed: {dst.dtype} != {dtype}"
+    assert dst.shape == src.shape
+    # layout must honor channels_last (MLIR path silently returns contiguous)
+    assert dst.cpu().is_contiguous(
+        memory_format=torch.channels_last
+    ), f"expected channels_last layout, got strides {dst.cpu().stride()}"
+    # values must be correct
+    assert torch.equal(dst.cpu(), expected)
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [
+        (torch.float32, torch.int64),  # → packed int64, + layout
+        (torch.int64, torch.float32),  # int64 source, + layout
+        (torch.int64, torch.int32),  # int64 → int32, + layout
+        (torch.float32, torch.int32),  # supported → supported, + layout
+        (torch.int32, torch.float32),
+    ],
+)
+def test_to_copy_neuron_channels_last_dtype_change(src_dtype, dst_dtype):
+    """_to_copy with BOTH a dtype change and memory_format=channels_last.
+
+    CPU honors channels_last regardless of any dtype change, so Neuron must too.
+    The dtype conversion (incl. packed int64 materialize/extract) runs first,
+    then the channels_last layout is applied — see DispatchToCopyImpl Phase 1/2.
+    """
+    # 4D, contiguous source (NCHW).
+    if src_dtype in (torch.float32, torch.bfloat16):
+        src = torch.randn(2, 3, 4, 5, dtype=src_dtype, device="neuron")
+    else:
+        # small magnitudes so float→int and packed-int64 (low 32 bits) match CPU
+        src = torch.randint(0, 50, (2, 3, 4, 5), dtype=src_dtype, device="neuron")
+
+    dst = src.to(dtype=dst_dtype, memory_format=torch.channels_last)
+    torch_neuronx.synchronize()
+
+    expected = src.cpu().to(dtype=dst_dtype, memory_format=torch.channels_last)
+    assert dst.device.type == "neuron"
+    assert dst.dtype == dst_dtype, f"dtype: {dst.dtype} != {dst_dtype}"
+    assert dst.shape == src.shape
+    assert dst.cpu().is_contiguous(
+        memory_format=torch.channels_last
+    ), f"expected channels_last layout, got strides {dst.cpu().stride()}"
+    if dst_dtype in (torch.int32, torch.int64):
+        assert torch.equal(dst.cpu(), expected)
+    else:
+        torch.testing.assert_close(dst.cpu(), expected)
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.parametrize("src_dtype", [torch.float32, torch.float64])
+def test_to_copy_float_to_int64_beyond_int32_range(src_dtype):
+    """float→int64 must preserve values outside int32 range (full 64 bits).
+
+    Regression: float→int64 used to go float→int32→materialize, which saturates
+    at int32 range (e.g. 2**40 → -2147483648). packed int64 storage holds both
+    lanes, so the conversion must keep full precision (via CPU bounce), matching
+    CPU. Only *compute* on packed int64 is limited to the low 32 bits.
+    """
+    vals = [2.0**40, -(2.0**40), 3.0e9, -3.0e9, 1.0, -1.0, 0.0, 16777217.0]
+    src = torch.tensor(vals, dtype=src_dtype, device="neuron")
+    dst = src.to(torch.int64)
+    torch_neuronx.synchronize()
+    expected = src.cpu().to(torch.int64)
+    assert dst.dtype == torch.int64
+    assert torch.equal(
+        dst.cpu(), expected
+    ), f"{src_dtype}→int64 mismatch: got {dst.cpu().tolist()} exp {expected.tolist()}"

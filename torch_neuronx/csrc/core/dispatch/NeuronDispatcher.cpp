@@ -26,6 +26,7 @@
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/DtypeCastVec.h"
 #include "torch_neuronx/csrc/core/utils/HostChain.h"
+#include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
 #include "torch_neuronx/csrc/ops/InternalOps.h"
 
 namespace torch_neuronx {
@@ -360,9 +361,11 @@ static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
 /// Dtype supported by the MLIR aten::_to_copy lowering.
 static bool IsToCopyMlirDtypeSupported(c10::ScalarType dt) {
   static const bool native_int64 = IsNativeInt64Enabled();
+  static const bool packed_int64 = IsPackedInt64Enabled();
   return dt == c10::ScalarType::Half || dt == c10::ScalarType::BFloat16 ||
          dt == c10::ScalarType::Float || dt == c10::ScalarType::Int ||
-         dt == c10::ScalarType::Bool || (native_int64 && dt == c10::ScalarType::Long);
+         dt == c10::ScalarType::Bool ||
+         ((native_int64 || packed_int64) && dt == c10::ScalarType::Long);
 }
 
 /// Returns true when on a non-default stream with host-cc enabled.
@@ -660,6 +663,12 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
 //  aten::_to_copy — CPU↔Neuron via NRT, Neuron→Neuron via MLIR or NRT
 // ═══════════════════════════════════════════════════════════════
 
+// Defined later in this file. Reorders a tensor into channels_last layout via
+// NRT strided copy (dtype-agnostic, bypasses MLIR). _to_copy reuses it for
+// channels_last reformats — see the Neuron→Neuron branch below.
+static torch::Tensor MakeChannelsLast(const torch::Tensor& self_tensor,
+                                      c10::MemoryFormat memory_format);
+
 void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
                                           c10::DispatchKeySet dispatch_keys,
                                           torch::jit::Stack* stack, const OpRegistration& reg) {
@@ -781,74 +790,152 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
   //   3. NRT CPU bounce  — everything else
   if (src_is_neuron && dst_is_neuron) {
     const bool is_non_default_hostcc = IsNonDefaultStreamWithHostCC(self_tensor.device().index());
-    bool mlir_can_handle = IsToCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
-                           IsToCopyMlirDtypeSupported(target_dtype) && !is_non_default_hostcc;
+    const bool same_dtype = (target_dtype == self_tensor.scalar_type());
+    const bool same_index = (self_tensor.device().index() == target_device.index());
 
-    // ── 1. MLIR lowering pipeline (most optimal) ──
-    if (mlir_can_handle) {
-      TORCH_NEURONX_DISPATCH_DEBUG(
-          "[DispatchToCopy] N2N MLIR", " src_dtype=", self_tensor.scalar_type(),
-          " target_dtype=", target_dtype, " src_shape=", self_tensor.sizes());
-      for (auto& arg : args) {
-        torch::jit::push(*stack, arg);
+    // ── host-CC, non-default stream: preserved as-is ──
+    // On a non-default stream with host-CC, MLIR lowering is disabled and these
+    // copies have stream-specific (async) semantics. Keep the original behavior
+    // verbatim and do not run it through the dtype/layout pipeline below.
+    if (is_non_default_hostcc) {
+      if (same_dtype && IsCopyMlirDtypeSupported(self_tensor.scalar_type()) && same_index &&
+          !self_tensor.is_neg() && !self_tensor.is_conj() && self_tensor.is_contiguous()) {
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron raw NRT on-device (hostCC)",
+                                     " dtype=", self_tensor.scalar_type(),
+                                     " src_shape=", self_tensor.sizes());
+        auto dst = at::empty(self_tensor.sizes(),
+                             at::TensorOptions().dtype(target_dtype).device(target_device));
+        torch_neuronx::utils::copy_neuron_to_neuron(self_tensor, dst);
+        logOperationExecuted("aten::_to_copy");
+        torch::jit::push(*stack, dst);
+        return;
       }
-      NeuronDispatcher::DispatchImpl(op, dispatch_keys, stack, reg);
-
-      // Preserve strides only when MemoryFormat::Preserve is requested (or unset)
-      // — to match PyTorch _to_copy semantics.
-      if (preserve_fmt && !self_tensor.is_contiguous() &&
-          self_tensor.is_non_overlapping_and_dense()) {
-        auto result = torch::jit::pop(*stack).toTensor();
-        auto strided_out =
-            torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), result.options());
-        strided_out.copy_(result);
-        torch::jit::push(*stack, strided_out);
+      // Cross-dtype kHost cast chain (FSDP-stream + cross-dtype + supported pair).
+      if (CanUseKHostCastChain(self_tensor, target_dtype, target_device.index(),
+                               is_non_default_hostcc)) {
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron kHost cross-dtype chain",
+                                     " src_dtype=", self_tensor.scalar_type(),
+                                     " target_dtype=", target_dtype,
+                                     " numel=", self_tensor.numel());
+        auto dst = at::empty(self_tensor.sizes(),
+                             at::TensorOptions().dtype(target_dtype).device(target_device));
+        if (RunKHostCastChain(self_tensor, dst)) {
+          logOperationExecuted("aten::_to_copy");
+          torch::jit::push(*stack, dst);
+          return;
+        }
+        // Fall through on failure (numel==0).
       }
-      return;
-    }
-
-    // ── 2. Raw NRT on-device copy (non-default stream + hostCC, same dtype) ──
-    if (is_non_default_hostcc && self_tensor.scalar_type() == target_dtype &&
-        IsCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
-        self_tensor.device().index() == target_device.index() && !self_tensor.is_neg() &&
-        !self_tensor.is_conj() && self_tensor.is_contiguous()) {
-      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron raw NRT on-device",
-                                   " src_dtype=", self_tensor.scalar_type(),
-                                   " target_dtype=", target_dtype,
-                                   " src_shape=", self_tensor.sizes());
-      auto dst = at::empty(self_tensor.sizes(),
-                           at::TensorOptions().dtype(target_dtype).device(target_device));
-      torch_neuronx::utils::copy_neuron_to_neuron(self_tensor, dst);
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce (hostCC async)");
+      auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
+      auto dst = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/true);
       logOperationExecuted("aten::_to_copy");
       torch::jit::push(*stack, dst);
       return;
     }
 
-    // ── 3a. kHost cross-dtype chain (FSDP-stream + cross-dtype + supported pair) ──
-    if (CanUseKHostCastChain(self_tensor, target_dtype, target_device.index(),
-                             is_non_default_hostcc)) {
-      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron kHost cross-dtype chain",
+    // ── default stream: dtype (Phase 1) then layout (Phase 2) ──
+    // _to_copy is two independent transforms — a dtype conversion and a
+    // memory_format change. Doing dtype first, layout second.
+    static const bool packed_int64 = IsPackedInt64Enabled();
+    const bool is_channels_last =
+        memory_format_opt.has_value() && (*memory_format_opt == c10::MemoryFormat::ChannelsLast ||
+                                          *memory_format_opt == c10::MemoryFormat::ChannelsLast3d);
+
+    // ===== Phase 1: dtype conversion → `converted` (target_dtype) =====
+    // `converted` is contiguous except for the same-dtype passthrough, which may
+    // keep self's (possibly non-contiguous) layout; Phase 2 fixes the layout.
+    const bool mlir_can_handle = IsToCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
+                                 IsToCopyMlirDtypeSupported(target_dtype);
+    torch::Tensor converted;
+    bool converted_contiguous = true;
+
+    if (packed_int64 && same_index &&
+        (target_dtype == c10::ScalarType::Long ||
+         self_tensor.scalar_type() == c10::ScalarType::Long)) {
+      // Packed int64 — bypass MLIR (it can't carry int64)
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase1 packed int64",
                                    " src_dtype=", self_tensor.scalar_type(),
-                                   " target_dtype=", target_dtype, " numel=", self_tensor.numel());
-      auto dst = at::empty(self_tensor.sizes(),
-                           at::TensorOptions().dtype(target_dtype).device(target_device));
-      if (RunKHostCastChain(self_tensor, dst)) {
-        logOperationExecuted("aten::_to_copy");
-        torch::jit::push(*stack, dst);
-        return;
+                                   " target_dtype=", target_dtype);
+      if (same_dtype) {
+        // int64 → int64: no dtype change; carry self into Phase 2 (the NRT
+        // layout copies there move whole 8-byte elements, preserving all bits).
+        converted = self_tensor;
+        converted_contiguous = self_tensor.is_contiguous();
+      } else if (target_dtype == c10::ScalarType::Long && !self_tensor.is_floating_point()) {
+        // integer source (≤32-bit: int8/int16/int32/bool) → int64: bring the
+        // source to int32, then materialize (low word + sign extension) on
+        // device. Exact because the source fits in int32.
+        auto self_contig = self_tensor.is_contiguous() ? self_tensor : self_tensor.contiguous();
+        auto as_int32 = (self_contig.scalar_type() == c10::ScalarType::Int)
+                            ? self_contig
+                            : self_contig.to(c10::ScalarType::Int);
+        converted = torch_neuronx::packed_int64::materialize_from_i32(as_int32);
+      } else if (target_dtype == c10::ScalarType::Int) {
+        // int64 → int32: extract the low words on device (matches int64→int32
+        // truncation to the low 32 bits).
+        auto self_contig = self_tensor.is_contiguous() ? self_tensor : self_tensor.contiguous();
+        converted = torch_neuronx::packed_int64::execution_view(self_contig);
+      } else {
+        // float → int64 and int64 → float/other: full-64-bit CPU bounce. Both
+        // need all 64 bits — materialize's low-word + sign-extend cannot
+        // represent an int64 outside int32 range (float→int64 of large values),
+        // and extracting int64's low words would truncate a →float conversion.
+        // Matches CPU.
+        auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
+        converted = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/false);
       }
-      // Fall through on failure (numel==0).
+    } else if (same_dtype) {
+      // No dtype change (reached only with a real layout change). Carry self
+      // into Phase 2.
+      converted = self_tensor;
+      converted_contiguous = self_tensor.is_contiguous();
+    } else if (mlir_can_handle) {
+      // MLIR _to_copy (contiguous output; it ignores memory_format — Phase 2
+      // applies the requested layout).
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase1 MLIR",
+                                   " src_dtype=", self_tensor.scalar_type(),
+                                   " target_dtype=", target_dtype);
+      for (auto& arg : args) {
+        torch::jit::push(*stack, arg);
+      }
+      NeuronDispatcher::DispatchImpl(op, dispatch_keys, stack, reg);
+      converted = torch::jit::pop(*stack).toTensor();
+      converted_contiguous = converted.is_contiguous();
+    } else {
+      // CPU bounce (fp64, complex128, other unsupported dtype conversions).
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase1 CPU bounce",
+                                   " src_dtype=", self_tensor.scalar_type(),
+                                   " target_dtype=", target_dtype);
+      auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
+      converted = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/false);
     }
 
-    // ── 3b. NRT CPU bounce ──
-    // Async write on non-default stream + hostCC; default stream stays sync.
-    bool async_write = is_non_default_hostcc;
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce",
-                                 " async_write=", async_write);
-    auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
-    auto dst = CopyCPUToNewNeuron(cpu_tmp, target_device, /*non_blocking=*/async_write);
+    // ===== Phase 2: layout (memory_format) =====
+    // One place handles every layout; the copies are dtype-agnostic whole-
+    // element NRT moves (byte-safe for int64/float64's 8-byte storage too).
+    torch::Tensor result;
+    if (is_channels_last) {
+      result = MakeChannelsLast(converted, *memory_format_opt);
+    } else if (preserve_fmt && !self_tensor.is_contiguous() &&
+               self_tensor.is_non_overlapping_and_dense()) {
+      // Preserve: replay the source's (dense) strides. Reached only with a dtype
+      // change — a same-dtype Preserve is a no-op handled at the top.
+      result =
+          torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), converted.options());
+      torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+    } else if (!converted_contiguous) {
+      // contiguous_format requested but `converted` is the non-contiguous
+      // same-dtype passthrough → materialize contiguous.
+      result = at::empty(self_tensor.sizes(),
+                         at::TensorOptions().dtype(target_dtype).device(target_device));
+      torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+    } else {
+      result = converted;
+    }
+
     logOperationExecuted("aten::_to_copy");
-    torch::jit::push(*stack, dst);
+    torch::jit::push(*stack, result);
     return;
   }
 

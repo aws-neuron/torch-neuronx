@@ -264,6 +264,9 @@ python_ops.register_python_operations()
 # Tell C++ that Python ops are now registered
 _C._set_python_ops_registered(True)
 
+# Register neuron::nki_strided_copy_ custom op for packed int64 support
+import torch_neuronx.nki_strided_copy_op
+
 # Apply mesh registry patch for SPMD collective legalization
 # TODO: Remove this patch once PyTorch's compile_on_one_rank lands upstream
 # (see https://github.com/pytorch/pytorch/pull/178116)

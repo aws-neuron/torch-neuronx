@@ -3,6 +3,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -12,8 +13,32 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     return t;
   }
 
+  // Packed int64: extract low words on-device via the NKI strided-copy kernel.
+  // Only for *contiguous* int64: the flat-stream gather assumes logical element
+  // k lives at pair k, which holds only for a row-major contiguous source. A
+  // non-contiguous int64 (broadcast, slice, transpose, permuted) falls through
+  // to the CPU round-trip below, which copies the full storage to CPU, restrides
+  // (correct for stride-0 broadcast), and casts int64->int32 on the host (the
+  // low word). is_contiguous() on the logical int64 is the right, simple gate.
+  static const bool packed_int64 = IsPackedInt64Enabled();
+  if (packed_int64 && t.scalar_type() == c10::ScalarType::Long &&
+      target_dtype == c10::ScalarType::Int && t.device().type() == c10::DeviceType::PrivateUse1 &&
+      t.is_contiguous()) {
+    return torch_neuronx::packed_int64::execution_view(t);
+  }
+
+  // Packed int64 output: int32 execution result → int64 packed storage.
+  // Allocates the int64 output and writes sign-extended (low, high) word pairs.
+  // materialize_from_i32 uses torch::empty (the empty_strided_neuron factory),
+  // which does NOT redispatch — this is essential to avoid infinite recursion
+  // back through UpcastExecutionOutputs -> NeuronSafeCast.
+  if (packed_int64 && t.scalar_type() == c10::ScalarType::Int &&
+      target_dtype == c10::ScalarType::Long && t.device().type() == c10::DeviceType::PrivateUse1) {
+    return torch_neuronx::packed_int64::materialize_from_i32(t);
+  }
+
   // Float64 always needs CPU bounce. Int64 needs CPU bounce only when
-  // native int64 is disabled — when enabled, MLIR handles S64 natively.
+  // native int64 is disabled and packed int64 is disabled.
   static const bool native_int64 = IsNativeInt64Enabled();
   bool is_unsupported_src = t.scalar_type() == c10::ScalarType::Double ||
                             (!native_int64 && t.scalar_type() == c10::ScalarType::Long);

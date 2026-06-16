@@ -7,6 +7,8 @@
 
 #include <algorithm>
 
+#include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
+
 namespace at::neuron {
 
 // ═══════════════════════════════════════════════════════════════
@@ -189,6 +191,13 @@ std::string CacheKeyGenerator::Generate(const std::string& op_name,
                                         const std::unordered_set<std::string>& static_argnames) {
   std::ostringstream key;
   key << op_name << "--";
+  // Int64 mode affects lowering — different modes must not share cache entries.
+  static const auto int64_mode = torch_neuronx::dispatch::GetInt64Mode();
+  if (int64_mode == torch_neuronx::dispatch::Int64Mode::kPacked) {
+    key << "p64--";
+  } else if (int64_mode == torch_neuronx::dispatch::Int64Mode::kNative) {
+    key << "n64--";
+  }
 
   const auto& schema_args = schema.arguments();
   const auto& filtered = FilteredKwargs();
@@ -305,6 +314,12 @@ std::string CacheKeyGenerator::GenerateFromPython(
     const std::unordered_set<std::string>& static_argnames) {
   std::ostringstream key;
   key << op_name << "--";
+  static const auto int64_mode = torch_neuronx::dispatch::GetInt64Mode();
+  if (int64_mode == torch_neuronx::dispatch::Int64Mode::kPacked) {
+    key << "p64--";
+  } else if (int64_mode == torch_neuronx::dispatch::Int64Mode::kNative) {
+    key << "n64--";
+  }
 
   const auto& filtered = FilteredKwargs();
 

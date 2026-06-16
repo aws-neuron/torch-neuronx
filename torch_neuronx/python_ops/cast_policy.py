@@ -31,9 +31,13 @@ def bounce_64bit(dtype: torch.dtype | None) -> bool:
         dtype: torch dtype or None
 
     Returns:
-        bool: True for torch.float64 or torch.int64
+        bool: True for torch.float64; True for torch.int64 only in cpu_bounce mode.
     """
     if is_native_int64_enabled():
+        return dtype == torch.float64
+    from torch_neuronx.int64_policy import is_packed_int64_mode
+
+    if is_packed_int64_mode():
         return dtype == torch.float64
     return dtype in (torch.float64, torch.int64)
 
@@ -86,6 +90,31 @@ def copy_cpu_to_neuron(
     device to match, preserving the same layout as CUDA's .to() behaviour.
     """
     import torch_neuronx._C as _C  # local import
+    from torch_neuronx.int64_policy import is_packed_int64_mode
+
+    # Packed int64: reinterpret bytes as int32 pairs, bulk upload, preserve strides
+    if is_packed_int64_mode() and target_dtype == torch.int64:
+        tmp = cpu_src if cpu_src.dtype == torch.int64 else cpu_src.to(torch.int64)
+        src_strides = tmp.stride()
+        src_is_contiguous = tmp.is_contiguous()
+        if not src_is_contiguous:
+            tmp = tmp.contiguous()
+        # Zero-copy reinterpret: contiguous int64 → int32 pairs
+        physical_cpu = tmp.view(torch.int32)
+        # Allocate contiguous int64 device tensor, upload via physical view
+        from torch_neuronx.packed_storage import packed_physical_view
+
+        dst = io_tensor.empty(tmp.shape, dtype=torch.int64, device=target_device)
+        dst_physical = packed_physical_view(dst)
+        _C._nrt_copy_cpu_to_neuron_tensor(physical_cpu, dst_physical, non_blocking=non_blocking)
+        if not src_is_contiguous:
+            strided = torch.empty_strided(
+                cpu_src.shape, src_strides, dtype=torch.int64, device=target_device
+            )
+            strided_phys = packed_physical_view(strided)
+            _C._nrt_copy_strided_neuron_to_neuron(dst_physical, strided_phys)
+            dst = strided
+        return dst
 
     tmp = cpu_src
     if tmp.dtype != target_dtype:
@@ -115,6 +144,30 @@ def copy_neuron_to_cpu(
     If `target_dtype` is provided and differs, the CPU cast is performed.
     """
     import torch_neuronx._C as _C  # local import
+    from torch_neuronx.int64_policy import is_packed_int64_mode
+
+    # Packed int64: download physical int32 pairs, reinterpret as int64
+    if is_packed_int64_mode() and neuron_src.dtype == torch.int64:
+        if not neuron_src.is_contiguous():
+            neuron_src = ensure_contiguous_on_device(neuron_src)
+        from torch_neuronx.packed_storage import packed_physical_view
+
+        src_physical = packed_physical_view(neuron_src)
+        cpu_physical = torch.empty(
+            src_physical.shape, dtype=torch.int32, device="cpu", pin_memory=non_blocking
+        )
+        _C._nrt_copy_neuron_to_cpu_tensor(src_physical, cpu_physical, non_blocking=non_blocking)
+        # Reinterpret int32 pairs back to int64, restoring the logical shape.
+        # (view(int64) alone collapses the trailing lane dim to (*, 1) instead
+        # of dropping it — packed_logical_view handles the reshape.)
+        from torch_neuronx.packed_storage import packed_logical_view
+
+        cpu_result = packed_logical_view(
+            cpu_physical, torch.int64, tuple(int(d) for d in neuron_src.shape)
+        )
+        if target_dtype is not None and target_dtype != torch.int64:
+            cpu_result = cpu_result.to(target_dtype)
+        return cpu_result
 
     if not neuron_src.is_contiguous():
         neuron_src = ensure_contiguous_on_device(neuron_src)
