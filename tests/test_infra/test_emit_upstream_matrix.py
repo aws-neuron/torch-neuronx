@@ -18,7 +18,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_n
 from emit_upstream_matrix import (
     CONFIG_DIR,
     DEFAULT_DIST_CONFIG,
+    _render_step_summary,
     _resolve_config_path,
+)
+from label_selection import (
+    RULE_FORCE_FULL_SUITE,
+    RULE_ITEMS_MATCH,
+    RULE_NO_LABELS,
+    RULE_NO_OVERLAP,
+    RULE_TERMINATOR,
+    RULE_UNKNOWN_LABELS,
+    SelectionDecision,
 )
 
 
@@ -106,3 +116,108 @@ def test_smoke_config_exists_and_is_minimal():
     assert (
         len(dist["nodes"]) <= 5
     ), f"Smoke config has {len(dist['nodes'])} nodes — that's not 'smoke' anymore."
+
+
+# ---------------------------------------------------------------------------
+# _render_step_summary — markdown panel for the matrix-compute job
+# ---------------------------------------------------------------------------
+def test_render_summary_no_labels_full_suite():
+    """No-labels branch renders the safe-default headline and node count."""
+    decision = SelectionDecision(rule=RULE_NO_LABELS, kept_count=28, total_count=28)
+    text = _render_step_summary(decision, "upstream_pytorch_test_distribution_config.json", 28)
+    assert "## PT Upstream — Matrix Selection" in text
+    assert "no PR labels" in text
+    assert "28 / 28" in text
+    # The "| PR labels |" table row only renders when labels are present.
+    assert "| PR labels |" not in text
+
+
+def test_render_summary_force_full_suite_shows_override():
+    decision = SelectionDecision(
+        rule=RULE_FORCE_FULL_SUITE,
+        labels=("ciflow:run-full-suite", "module:dynamo"),
+        kept_count=28,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 28)
+    assert "ciflow:run-full-suite" in text
+    assert "Full suite" in text
+
+
+def test_render_summary_items_match_lists_matched_labels_and_items():
+    """Filtered runs surface the matched labels + implied items so reviewers
+    can see *why* the matrix was reduced."""
+    decision = SelectionDecision(
+        rule=RULE_ITEMS_MATCH,
+        labels=("module:dynamo", "module:profiler"),
+        matched_labels=("module:dynamo", "module:profiler"),
+        implied_items=("dynamo", "profiler"),
+        kept_count=2,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 2)
+    assert "Filtered" in text
+    assert "2 / 28" in text
+    assert "`module:dynamo`" in text
+    assert "`module:profiler`" in text
+    assert "`dynamo`" in text
+    assert "`profiler`" in text
+
+
+def test_render_summary_terminator_shows_terminator_label():
+    decision = SelectionDecision(
+        rule=RULE_TERMINATOR,
+        labels=("module:dynamo", "module:runtime-core"),
+        terminator_labels=("module:runtime-core",),
+        kept_count=28,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 28)
+    assert "Terminator labels" in text
+    assert "`module:runtime-core`" in text
+
+
+def test_render_summary_unknown_labels():
+    decision = SelectionDecision(
+        rule=RULE_UNKNOWN_LABELS,
+        labels=("something:weird",),
+        kept_count=28,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 28)
+    assert "no recognized" in text
+    assert "`something:weird`" in text
+
+
+def test_render_summary_no_overlap_warns():
+    """Fallback branch — labels matched but nothing in dist config — should
+    visibly differ from a clean full-suite headline so reviewers notice."""
+    decision = SelectionDecision(
+        rule=RULE_NO_OVERLAP,
+        labels=("module:nonexistent",),
+        matched_labels=("module:nonexistent",),
+        implied_items=("nonexistent.py",),
+        kept_count=28,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 28)
+    assert "fallback" in text.lower() or "⚠️" in text
+    assert "`module:nonexistent`" in text
+
+
+def test_render_summary_includes_matrix_node_count():
+    """Sharding can expand a single dist-config node into multiple matrix
+    nodes (e.g. test_ops.py with num_shards=5 → 5 matrix nodes). The
+    panel surfaces the post-shard count too so reviewers know what
+    actually ran in parallel."""
+    decision = SelectionDecision(
+        rule=RULE_ITEMS_MATCH,
+        labels=("module:aten-ops",),
+        matched_labels=("module:aten-ops",),
+        implied_items=("test_ops.py",),
+        kept_count=1,
+        total_count=28,
+    )
+    text = _render_step_summary(decision, "config.json", 5)  # 5 shards
+    assert "1 / 28" in text  # nodes kept (pre-shard)
+    assert "**5**" in text  # matrix nodes (post-shard)
