@@ -71,6 +71,7 @@ _OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
 _OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
     "linspace",
     "logspace",
+    "aten::_softmax_backward_data",
 )
 
 if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:
