@@ -245,6 +245,40 @@ def patch_minifier_gen_test_code():
     tmc.MinifierTestBase._gen_test_code = patched_gen
 
 
+def patch_pytest_log_capture_skip_nonpropagating():
+    """Restore pytest 9.0.3 root-only log-capture attach.
+
+    Pytest 9.1.0 (commit 7e6161c68, pytest #3697) attaches log handlers
+    to every non-propagating logger. PT2 loggers are non-propagating, so
+    upstream's ``_handler_watcher`` (asserts ≤ 2 handlers) trips with 5.
+    """
+    try:
+        from _pytest import logging as _pytest_logging
+    except ImportError:
+        return
+
+    catching_logs = _pytest_logging.catching_logs
+    original_enter = catching_logs.__enter__
+    if getattr(original_enter, "_neuron_root_only", False):
+        return
+
+    import logging
+
+    def root_only_enter(self):
+        root_logger = logging.getLogger()
+        if self.level is not None:
+            self.handler.setLevel(self.level)
+        root_logger.addHandler(self.handler)
+        self.attached_loggers = [root_logger]
+        if self.level is not None:
+            self.orig_level = root_logger.level
+            root_logger.setLevel(min(self.orig_level, self.level))
+        return self.handler
+
+    root_only_enter._neuron_root_only = True
+    catching_logs.__enter__ = root_only_enter
+
+
 def apply_dynamo_patches():
     """Apply all patches needed for dynamo tests."""
 
@@ -281,6 +315,8 @@ def apply_dynamo_patches():
     patch_device_for_fx_namespace()
 
     patch_minifier_gen_test_code()
+
+    patch_pytest_log_capture_skip_nonpropagating()
 
     patch_jiterator_utils()
 
