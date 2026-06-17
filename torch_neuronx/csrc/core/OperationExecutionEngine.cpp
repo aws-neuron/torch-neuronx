@@ -673,14 +673,12 @@ void OperationExecutionEngine::SubmitOperation(
 
   // Concat-OFF fast path: shared_ptr lands directly in stream->runtime_queue_.
   OperationContext* op_ptr = operation_context.get();
-  const bool requires_compilation = op_ptr->RequiresCompilation();
-  if (requires_compilation) {
+  EmitToRuntimeQueue(std::move(operation_context));
+
+  if (op_ptr->RequiresCompilation()) {
     SubmitCompilationTask(op_ptr);
   } else {
     op_ptr->MarkExecutionReady();
-  }
-  EmitToRuntimeQueue(std::move(operation_context));
-  if (!requires_compilation) {
     NotifyExecutionReady();
   }
 }
