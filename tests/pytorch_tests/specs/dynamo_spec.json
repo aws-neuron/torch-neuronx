@@ -1696,6 +1696,12 @@
           ]
         },
         {
+          "reason": "Compiled graph allocates on device index 1, but the NEFF execution context exposes a single logical core (Number of LNCs 1), so NRT fails with Invalid Logical Core 1",
+          "tests": [
+            "test_gpu_current_device"
+          ]
+        },
+        {
           "reason": "E RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation eq failed to execute on Neuron (last implementation: ImplementationWrapper). Details: ImplementationWrapper: E Traceback (most recent call last): E File \"/workspace/torch_neuron_eager/torch_neuronx/python_ops/torch_mlir/op_impl.py\", line 99, in execute",
           "tests": [
             "test_items_type"
