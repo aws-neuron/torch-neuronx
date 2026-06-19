@@ -395,8 +395,6 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_small_exp_neuron_int32",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_small_reciprocal_neuron_bfloat16",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_small_reciprocal_neuron_float16",
-    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv1d_same_padding_backward_neuron_float32",
-    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv2d_same_padding_backward_neuron_float32",
     "nn/test_embedding.py::TestEmbeddingNNDeviceTypeNEURON::test_embedding_bag_2D_padding_idx_neuron_float32",
     "nn/test_embedding.py::TestEmbeddingNNDeviceTypeNEURON::test_embedding_bag_2D_padding_idx_neuron_float64",
     "nn/test_embedding.py::TestEmbeddingNNDeviceTypeNEURON::test_embedding_bag_device_neuron_int32_int32_bfloat16",

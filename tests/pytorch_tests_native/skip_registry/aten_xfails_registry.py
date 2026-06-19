@@ -411,4 +411,32 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_torch.py::TestTorchDeviceTypeNEURON::test_normal_small_std_kstest_neuron_bfloat16",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "[PT2.12 only] ExecutionTraceObserver disables itself mid-test"
+            " when Neuron's infer_outputs_from_meta() runs torch.gather with"
+            " meta tensors while the profiler is active. The C++ observer"
+            " (execution_trace_observer.cpp:770) intercepts the meta op and"
+            " calls .item() to record tensor_range, which raises"
+            " 'Tensor.item() cannot be called on meta tensors'. The observer"
+            " catches this and shuts down, so the real gather's tensor_range"
+            " is never recorded. This is a PT 2.12 observer bug — PT 2.13"
+            " handles meta tensors gracefully. Not a Neuron bug."
+        ),
+        tests=[
+            "profiler/test_execution_trace.py::TestExecutionTraceNEURON::test_execution_trace_record_integral_tensor_range_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.12 only] Automatic dynamic shapes recompilation triggers"
+            " neuron backend compilation with unbounded dynamic dims"
+            " (f32[?,8]) which neuron-cc rejects. Test uses aot_eager backend"
+            " but neuron executor intercepts the .to(device) path. Passes on"
+            " PT 2.13 nightly where the routing is handled correctly."
+        ),
+        tests=[
+            "test_autograd.py::TestAutograd::test_checkpoint_automatic_dynamic_graph_shadowing",
+        ],
+    ),
 ]
