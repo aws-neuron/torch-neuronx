@@ -28,13 +28,6 @@
       ],
       "kind": "items"
     },
-    "module:ci": {
-      "_comment": "CI-config changes (workflows, labeler) affect how tests are routed, not how they execute. A profiler-only run still validates the routing end-to-end. For changes to merge.yml / _upstream-tests.yml that touch the matrix-driving paths, reviewers can manually add ciflow:run-full-suite.",
-      "items": [
-        "profiler"
-      ],
-      "kind": "items"
-    },
     "module:distributed": {
       "items": [
         "distributed",
@@ -67,13 +60,6 @@
     "module:runtime-core": {
       "kind": "full_suite"
     },
-    "module:test-infra": {
-      "_comment": "Test-infra changes (runner post-processing, registries, label-selection JSON, etc.) usually don't affect how tests execute, just plumbing \u2014 so the smallest representative subset is enough to validate the change. Reviewers can manually add ciflow:run-full-suite when a runner-internals change warrants the safety net.",
-      "items": [
-        "profiler"
-      ],
-      "kind": "items"
-    },
     "module:torch-mlir": {
       "items": [
         "test_ops.py",
@@ -82,6 +68,13 @@
         "test_unary_ufuncs.py",
         "test_binary_ufuncs.py",
         "dynamo"
+      ],
+      "kind": "items"
+    },
+    "module:upstream-test-infra": {
+      "_comment": "Upstream test-infra changes (runner, conftest, dist config under tests/pytorch_tests_native/, excluding skip_registry which is metadata-only and labeled as module:ci). Plumbing rather than behavior \u2014 the smallest representative subset is enough to validate. Reviewers can manually add ciflow:run-full-suite when a runner-internals change warrants the safety net.",
+      "items": [
+        "profiler"
       ],
       "kind": "items"
     }
