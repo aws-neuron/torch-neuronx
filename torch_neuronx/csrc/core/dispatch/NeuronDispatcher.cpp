@@ -1687,8 +1687,15 @@ void NeuronDispatcher::DispatchSdpaBwdImpl(const c10::OperatorHandle& op,
       if (!grad.defined()) return;
       // Skip if epilogue already produced the correct non-contiguous layout
       if (torch_neuronx::IsEpilogueEnabled() && !grad.is_contiguous()) return;
-      if (grad.strides().vec() != ref.strides().vec()) {
-        auto fixed = torch::empty_strided(grad.sizes(), ref.strides(), grad.options());
+      // Use alloc_with_matching_layout (same as DispatchSdpaFwdImpl) instead of a
+      // raw empty_strided(ref.strides()). When ref is a broadcast/expand view
+      // (e.g. transformers' repeat_kv carries stride=0 on some dims), feeding
+      // those strides straight into empty_strided would allocate a
+      // storage-overlapping buffer and the following copy_ would trip PyTorch's
+      // overlap-write check.
+      at::Tensor fixed;
+      at::native::alloc_with_matching_layout(ref, fixed, grad.sizes().vec());
+      if (fixed.strides().vec() != grad.strides().vec()) {
         fixed.copy_(grad);
         grad = fixed;
       }

@@ -1033,3 +1033,104 @@ def test_scaled_dot_product_attention_fully_masked_rows_backward():
     assert torch.equal(
         grad_q[:, :, :left_pad, :], torch.zeros(batch_size, num_heads, left_pad, d_head)
     )
+
+
+def _repeat_kv_expand_reshape(t: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Verbatim of transformers.integrations.sdpa_attention.repeat_kv.
+
+    The expand+reshape produces a view with stride=0 on broadcast dims.
+    """
+    b, kv, s, d = t.shape
+    return t[:, :, None, :, :].expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
+
+
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,seq_len,d_head,dtype",
+    [
+        # MLIR backward path (D > 128).
+        (8, 1, 1280, 256, torch.bfloat16),
+        # NKI backward path (D <= 128, L % 512 == 0).
+        (8, 1, 512, 64, torch.bfloat16),
+    ],
+    ids=["mlir_path_d256", "nki_path_d64"],
+)
+def test_sdpa_backward_stride0_kv_from_expand_reshape(q_heads, kv_heads, seq_len, d_head, dtype):
+    """Regression: SDPA backward must not crash on stride=0 K/V from repeat_kv.
+
+    Numerical accuracy for GQA backward is covered by
+    test_scaled_dot_product_attention_accuracy.
+    """
+    if not torch.neuron.is_available():
+        pytest.skip("Neuron device not available")
+
+    torch.manual_seed(0)
+    device = torch.device("neuron", 0)
+    batch_size = 1
+    n_rep = q_heads // kv_heads
+
+    q = torch.randn(
+        batch_size, q_heads, seq_len, d_head, dtype=dtype, device=device
+    ).requires_grad_()
+    k = torch.randn(
+        batch_size, kv_heads, seq_len, d_head, dtype=dtype, device=device
+    ).requires_grad_()
+    v = torch.randn(
+        batch_size, kv_heads, seq_len, d_head, dtype=dtype, device=device
+    ).requires_grad_()
+
+    k_in = _repeat_kv_expand_reshape(k, n_rep)
+    v_in = _repeat_kv_expand_reshape(v, n_rep)
+    assert k_in.stride()[:2] == (0, 0), f"expected stride=(0,0,...), got {k_in.stride()}"
+    assert v_in.stride()[:2] == (0, 0), f"expected stride=(0,0,...), got {v_in.stride()}"
+
+    grad_output = torch.randn(batch_size, q_heads, seq_len, d_head, dtype=dtype, device=device)
+
+    with track_neuron_ops():
+        out = F.scaled_dot_product_attention(
+            q, k_in, v_in, attn_mask=None, dropout_p=0.0, is_causal=True, enable_gqa=False
+        )
+        out.backward(grad_output)  # used to raise overlap-write here
+
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable")
+        assert_op_runs_on_neuron("aten::_scaled_dot_product_fused_attention_overrideable_backward")
+
+    # autograd sum-reduces grads back to the original kv_heads shape
+    assert q.grad.shape == q.shape
+    assert k.grad.shape == k.shape
+    assert v.grad.shape == v.shape
+
+    for name, g in [("q.grad", q.grad), ("k.grad", k.grad), ("v.grad", v.grad)]:
+        assert torch.isfinite(g).all(), f"{name} contains non-finite values"
+
+    # Check leaf grad strides match CPU reference
+    cpu = torch.device("cpu")
+    q_cpu = torch.randn(
+        batch_size, q_heads, seq_len, d_head, dtype=dtype, device=cpu
+    ).requires_grad_()
+    k_cpu = torch.randn(
+        batch_size, kv_heads, seq_len, d_head, dtype=dtype, device=cpu
+    ).requires_grad_()
+    v_cpu = torch.randn(
+        batch_size, kv_heads, seq_len, d_head, dtype=dtype, device=cpu
+    ).requires_grad_()
+    assert q_cpu.device.type == "cpu"
+    assert k_cpu.device.type == "cpu"
+    assert v_cpu.device.type == "cpu"
+    k_in_cpu = _repeat_kv_expand_reshape(k_cpu, n_rep)
+    v_in_cpu = _repeat_kv_expand_reshape(v_cpu, n_rep)
+    grad_output_cpu = torch.randn(batch_size, q_heads, seq_len, d_head, dtype=dtype, device=cpu)
+
+    out_cpu = F.scaled_dot_product_attention(
+        q_cpu,
+        k_in_cpu,
+        v_in_cpu,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+        enable_gqa=False,
+    )
+    out_cpu.backward(grad_output_cpu)
+
+    assert q.grad.stride() == q_cpu.grad.stride(), (q.grad.stride(), q_cpu.grad.stride())
+    assert k.grad.stride() == k_cpu.grad.stride(), (k.grad.stride(), k_cpu.grad.stride())
+    assert v.grad.stride() == v_cpu.grad.stride(), (v.grad.stride(), v_cpu.grad.stride())
