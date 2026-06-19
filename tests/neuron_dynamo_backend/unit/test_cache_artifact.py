@@ -146,3 +146,50 @@ class TestNeuronOutputCode:
             pytest.raises(RuntimeError, match="HLO cache miss"),
         ):
             oc._ensure_neff_loaded()
+
+
+class TestLoadGuardsStateTracingFix:
+    """Tests for the load_guards_state patch from _apply_precompile_patches()."""
+
+    @staticmethod
+    def _pickle_import_source():
+        # ImportSource.__post_init__ calls install_guard, which needs a trace,
+        # so build it inside one to get bytes whose unpickle re-runs __post_init__.
+        from torch._dynamo.source import ImportSource
+        from torch._guards import TracingContext, tracing
+
+        with tracing(TracingContext(fake_mode=None)):
+            src = ImportSource(module_name="torch")
+        return pickle.dumps(src)
+
+    def test_unpatched_load_guards_state_raises(self):
+        """Without the patch, unpickling an ImportSource with no trace raises."""
+        import torch._dynamo.package as pkg
+        from torch._guards import TracingContext
+
+        payload = self._pickle_import_source()
+        assert TracingContext.try_get() is None
+        with pytest.raises(RuntimeError, match="must be called within an ongoing trace"):
+            pkg.load_guards_state(payload)
+
+    def test_unpickle_importsource_no_trace_does_not_raise(self):
+        """The patch lets the same unpickle succeed with no active trace."""
+        import torch._dynamo.package as pkg
+        from torch._dynamo.source import ImportSource
+        from torch._guards import TracingContext
+
+        from torch_neuronx.neuron_dynamo_backend.cache_artifact import (
+            _apply_precompile_patches,
+        )
+
+        payload = self._pickle_import_source()
+        orig = pkg.load_guards_state
+        try:
+            _apply_precompile_patches()
+            assert TracingContext.try_get() is None
+            result = pkg.load_guards_state(payload)
+            assert isinstance(result, ImportSource)
+            assert result.module_name == "torch"
+            assert TracingContext.try_get() is None
+        finally:
+            pkg.load_guards_state = orig
