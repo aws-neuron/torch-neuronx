@@ -7,7 +7,7 @@ set -e
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback" "tests/vertical")
+readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/pytorch_tests_native" "tests/cpu_fallback" "tests/vertical")
 readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py" "tests/operations/test_launch_blocking_invariant.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
