@@ -60,6 +60,9 @@ def attention_bwd(
     o_ref: nl.ndarray,
     dy_ref: nl.ndarray,
     lse_ref: Optional[nl.ndarray] = None,
+{% for name in all_extra_names %}
+    {{name}}: nl.ndarray = None,
+{% endfor %}
     neg_max_ref: Optional[nl.ndarray] = None,
     sum_recip_ref: Optional[nl.ndarray] = None,
     sinks_ref: Optional[nl.ndarray] = None,
@@ -189,6 +192,9 @@ def attention_bwd(
         mixed_precision,
         softmax_scale,
         sliding_window,
+{% for name in all_extra_names %}
+        {{name}}={{name}},
+{% endfor %}
     )
 
     if sinks_ref is not None:
@@ -881,6 +887,9 @@ def score_mod(
     h: Optional[int],
     q_idx: nl.ndarray,
     kv_idx: nl.ndarray,
+{% for name in score_extra_names %}
+    {{name}}: nl.ndarray = None,
+{% endfor %}
 ) -> nl.ndarray:
     """
     No-op score modification (hardcoded for causal attention).
@@ -915,6 +924,9 @@ def mask_mod(
     h: Optional[int],
     q_idx: nl.ndarray,
     kv_idx: nl.ndarray,
+{% for name in mask_extra_names %}
+    {{name}}: nl.ndarray = None,
+{% endfor %}
 ) -> nl.ndarray:
     """
     Compute causal (boolean) mask.
@@ -947,6 +959,9 @@ def joint_mod(
     q_idx: nl.ndarray,
     kv_idx: nl.ndarray,
     grad_score_mod: nl.ndarray,
+{% for name in score_extra_names %}
+    {{name}}: nl.ndarray = None,
+{% endfor %}
 ) -> nl.ndarray:
     """
     Joint graph for score_mod backward computation
@@ -993,6 +1008,9 @@ def recompute_qk_softmax(
     local_i_q_seq_tile: int,
     local_i_k_seq_tile: int,
     global_k_seq_offset: int = 0,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ) -> None:
     """
     Compute Q @ K^T and apply softmax (recomputation for backward pass).
@@ -1086,6 +1104,9 @@ def recompute_qk_softmax(
             q_head_idx,
             q_idx,
             kv_idx,
+{% for name in score_extra_names %}
+            {{name}},
+{% endfor %}
         )
 
         # ---------------------------------------------------------------------
@@ -1109,11 +1130,21 @@ def recompute_qk_softmax(
             # Additive masking: score + mask (mask is 0 for unmasked, -inf for masked)
             nisa.tensor_tensor(qk_res_buf[i_q_tile_group_size], post_mod_scores, mask_sb, nl.add)
 {% else %}
+        # Pre-load each capture buffer as a (1, S) SBUF row so it broadcasts
+        # to (128, S) inside the mask_mod (nl.broadcast_to requires P=1).
+        # A 1-D (S,) capture (e.g. document_id) is reshaped to (1, S); a 2-D
+        # (B, S) capture is sliced to the current batch row.
+{% for name in mask_extra_names %}
+        _{{name}}_row = nl.load({{name}}.reshape((1, {{name}}.size)) if len({{name}}.shape) == 1 else {{name}}[nl.ds(batch_idx % {{name}}.shape[0], 1), :])
+{% endfor %}
         boolean_mask = mask_mod(
             batch_idx,
             q_head_idx,
             q_idx,
             kv_idx,
+{% for name in mask_extra_names %}
+            _{{name}}_row,
+{% endfor %}
         )
         mask = nl.ndarray(
             qk_res_buf[i_q_tile_group_size].shape, dtype=qk_res_buf[i_q_tile_group_size].dtype, buffer=nl.sbuf
@@ -1156,6 +1187,9 @@ def compute_softmax_backward_dx(
     softmax_dx_local: List[nl.ndarray],
     local_i_q_seq_tile: int,
     local_i_k_seq_tile: int,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
     global_k_seq_offset: int = 0,
 ) -> None:
     """
@@ -1238,6 +1272,9 @@ def compute_softmax_backward_dx(
             q_idx,
             kv_idx,
             softmax_dx_local[i_q_tile_group_size],
+{% for name in score_extra_names %}
+            {{name}},
+{% endfor %}
         )
         nisa.tensor_copy(softmax_dx_local[i_q_tile_group_size], d_attn, engine=nisa.scalar_engine)
 
@@ -1260,6 +1297,9 @@ def flash_attn_bwd(
     mixed_precision: bool,
     softmax_scale: float,
     sliding_window: int,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ) -> None:
     """
     Flash attention backward pass.
@@ -1621,6 +1661,9 @@ def flash_attn_bwd(
                                 tile_required=tile_required,
                                 q_tile_group_size=cur_q_tile_group_size,
                                 global_k_seq_offset=k_seq_start,
+{% for name in all_extra_names %}
+                                {{name}}={{name}},
+{% endfor %}
                             )
 
                     # Write dq
@@ -1729,6 +1772,9 @@ def _flash_attn_bwd_core(
     tile_required: List[bool],
     q_tile_group_size: int = 1,
     global_k_seq_offset: int = 0,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ) -> None:
     """
     Core backward pass computation for flash attention.
@@ -1784,6 +1830,9 @@ def _flash_attn_bwd_core(
         local_i_q_seq_tile,
         local_i_k_seq_tile,
         global_k_seq_offset=global_k_seq_offset,
+{% for name in all_extra_names %}
+        {{name}}={{name}},
+{% endfor %}
     )
 
     # Step 4: Calculate the softmax backward gradients dL/dx, where y=softmax(x).
@@ -1804,6 +1853,9 @@ def _flash_attn_bwd_core(
         local_i_q_seq_tile=local_i_q_seq_tile,
         local_i_k_seq_tile=local_i_k_seq_tile,
         global_k_seq_offset=global_k_seq_offset,
+{% for name in all_extra_names %}
+        {{name}}={{name}},
+{% endfor %}
     )
     # Step 5.2 Calculate dQ
     transposed_k_local = ndarray(

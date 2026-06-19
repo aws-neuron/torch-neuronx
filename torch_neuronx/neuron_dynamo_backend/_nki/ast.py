@@ -66,6 +66,8 @@ class NISAOpValue:
         return self.name
 
     def codegen(self):
+        if hasattr(self, "_custom_codegen"):
+            return self._custom_codegen
         arg_string = ", ".join([f"{arg}" for arg in self.args])
         if self.kwargs:
             kwarg_string = ", ".join([f"{k}={v.name}" for k, v in self.kwargs.items()])

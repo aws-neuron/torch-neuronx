@@ -546,20 +546,18 @@ class FlexAttentionLegalization(NeuronFXPass):
         new_args: tuple,
         new_kwargs: dict,
         module_prefix: str,
+        submodule: fx.GraphModule,
     ) -> fx.Node:
         """Create a new node in the graph based on the operation type."""
         if node.op == "get_attr":
             # Copy the attribute from submodule to main module
             attr_name = node.target
-            # Get the parent module by traversing the graph module hierarchy
-            parent_module = gm
-            for part in module_prefix.split(".")[:-1]:
-                if part:
-                    parent_module = getattr(parent_module, part)
-
-            attr_value = getattr(parent_module, attr_name)
+            attr_value = getattr(submodule, attr_name)
             new_attr_name = f"_inlined_{module_prefix}_{attr_name}".replace(".", "_")
-            setattr(gm, new_attr_name, attr_value)
+            if isinstance(attr_value, torch.Tensor):
+                gm.register_buffer(new_attr_name, attr_value)
+            else:
+                setattr(gm, new_attr_name, attr_value)
             new_node = graph.get_attr(new_attr_name)
 
             # Set metadata based on actual tensor value
@@ -621,10 +619,10 @@ class FlexAttentionLegalization(NeuronFXPass):
             new_kwargs = self._map_node_kwargs(sub_node.kwargs, value_map)
 
             new_node = self._create_node_from_op(
-                graph, gm, sub_node, new_args, new_kwargs, module_prefix
+                graph, gm, sub_node, new_args, new_kwargs, module_prefix, submodule
             )
 
-            if sub_node.meta:
+            if sub_node.meta and sub_node.op != "get_attr":
                 new_node.meta = sub_node.meta.copy()
                 self._fix_score_mod_metadata(new_node, sub_node)
 
