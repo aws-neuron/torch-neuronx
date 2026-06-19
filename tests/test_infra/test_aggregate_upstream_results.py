@@ -23,6 +23,7 @@ from aggregate_upstream_results import (
     _get_run_metadata,
     _group_from_file,
     aggregate_summary,
+    evaluate_gate,
     flatten_reports,
     write_run_metadata_csv,
 )
@@ -939,3 +940,31 @@ def test_panel_status_breakdown_skips_empty_groups(tmp_path, monkeypatch):
     # No Failed / Skipped rows since those groups have zero counts.
     assert "Failed" not in breakdown
     assert "Skipped" not in breakdown
+
+
+def test_evaluate_gate_disabled_when_max_failures_none():
+    """No --max-failures => gating off: pass, emit no outputs (no verdict)."""
+    assert evaluate_gate(failure_count=10, max_failures=None) == (0, {})
+
+
+def test_evaluate_gate_fails_closed_when_no_test_data():
+    """failure_count=None means no reports were found (run likely broke).
+    With gating active we block the merge rather than wave it through."""
+    assert evaluate_gate(failure_count=None, max_failures=5) == (1, {"gate_passed": "false"})
+
+
+def test_evaluate_gate_passes_at_threshold():
+    """Boundary: failure_count == max_failures passes (threshold is inclusive).
+    Output tokens are the lowercase strings the YAML shell-compares against."""
+    assert evaluate_gate(failure_count=5, max_failures=5) == (
+        0,
+        {"failure_count": 5, "gate_passed": "true"},
+    )
+
+
+def test_evaluate_gate_fails_one_over_threshold():
+    """Boundary: one failure past the threshold blocks the merge."""
+    assert evaluate_gate(failure_count=6, max_failures=5) == (
+        1,
+        {"failure_count": 6, "gate_passed": "false"},
+    )

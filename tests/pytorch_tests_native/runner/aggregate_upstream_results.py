@@ -13,6 +13,7 @@ Flow:
     5. Write the summary CSV + a GitHub Actions job summary
 """
 
+import argparse
 import contextlib
 import csv
 import glob
@@ -548,8 +549,58 @@ def flatten_reports(results_dir: Path) -> dict[str, int]:
     return counts
 
 
-def main() -> int:
-    results_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/upstream-results")
+def _parse_args(argv: list | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Aggregate PyTorch upstream test results from all matrix nodes."
+    )
+    parser.add_argument(
+        "results_dir",
+        nargs="?",
+        default="/tmp/upstream-results",
+        help="Directory containing per-node artifact subdirectories.",
+    )
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=None,
+        help="If set, exit non-zero when failing tests (failed/error) exceed this threshold.",
+    )
+    return parser.parse_args(argv)
+
+
+def emit_github_outputs(**kwargs: object) -> None:
+    out_path = os.environ.get("GITHUB_OUTPUT")
+    if not out_path:
+        return
+    try:
+        with open(out_path, "a") as fh:
+            for key, value in kwargs.items():
+                fh.write(f"{key}={value}\n")
+    except OSError as exc:
+        logger.warning("Could not write GITHUB_OUTPUT (%s): %s", out_path, exc)
+
+
+def evaluate_gate(failure_count: int | None, max_failures: int | None) -> tuple[int, dict]:
+    """Pure merge-gate verdict: returns ``(exit_code, github_outputs)``.
+
+    ``max_failures=None`` means gating is disabled (no outputs emitted).
+    ``failure_count=None`` means no test data was found — fail closed.
+    """
+    if max_failures is None:
+        return 0, {}
+    if failure_count is None:
+        return 1, {"gate_passed": "false"}
+    passed = failure_count <= max_failures
+    return (0 if passed else 1), {
+        "failure_count": failure_count,
+        "gate_passed": "true" if passed else "false",
+    }
+
+
+def main(argv: list | None = None) -> int:
+    args = _parse_args(argv)
+    results_dir = Path(args.results_dir)
+    max_failures = args.max_failures
     run_timestamp = os.environ.get("TEST_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_csv = results_dir / f"upstream_pytorch_summary_{run_timestamp}.csv"
     all_tests_csv = results_dir / f"upstream_pytorch_all_tests_aggregated_{run_timestamp}.csv"
@@ -598,10 +649,19 @@ def main() -> int:
 
     if not result["test_rows"]:
         logger.warning("No test data found — skipping summary")
-        return 0
+        # Fail closed when gating: no data usually means the run broke.
+        if max_failures is not None:
+            logger.error(
+                "Failure gate active (--max-failures=%s) but no test data was found; "
+                "failing the gate.",
+                max_failures,
+            )
+        exit_code, outputs = evaluate_gate(None, max_failures)
+        emit_github_outputs(**outputs)
+        return exit_code
 
     write_all_tests_csv(result["test_rows"], all_tests_csv)
-    write_failures_only_csv(result["test_rows"], failures_csv)
+    failure_count = write_failures_only_csv(result["test_rows"], failures_csv)
     write_flaky_csv(result["test_rows"], flaky_csv)
     write_skipped_csv(result["test_rows"], skipped_csv)
     write_run_metadata_csv(result, metadata_csv)
@@ -631,7 +691,24 @@ def main() -> int:
     with open(summary_csv) as f:
         sys.stdout.write(f.read())
     print("=" * 60)
-    return 0
+    # Merge-queue gate; only enforced when --max-failures was supplied.
+    exit_code, outputs = evaluate_gate(failure_count, max_failures)
+    if max_failures is not None:
+        if exit_code:
+            logger.error(
+                "FAILURE GATE: %d failing tests exceeds the allowed maximum of %d. "
+                "Blocking merge.",
+                failure_count,
+                max_failures,
+            )
+        else:
+            logger.info(
+                "Failure gate passed: %d failing tests is within the allowed maximum of %d.",
+                failure_count,
+                max_failures,
+            )
+    emit_github_outputs(**outputs)
+    return exit_code
 
 
 if __name__ == "__main__":
