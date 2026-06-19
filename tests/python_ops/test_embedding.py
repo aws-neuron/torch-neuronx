@@ -309,6 +309,16 @@ class TestEmbedding:
             assert cpu_result.numel() == neuron_result.numel()
             assert_op_runs_on_neuron("aten::embedding")
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+    def test_nn_embedding_rejects_float_indices(self, dtype):
+        """Test that embedding raises RuntimeError for non-integer indices."""
+        embedding = nn.Embedding(10, 3).to("neuron")
+        float_indices = torch.tensor([1.5, 2.5], dtype=dtype).to("neuron")
+        with pytest.raises(
+            RuntimeError, match="Expected tensor for argument.*indices.*scalar type.*Long.*Int"
+        ):
+            embedding(float_indices)
+
     @pytest.mark.parametrize(
         "input_shape,expected_shape",
         [

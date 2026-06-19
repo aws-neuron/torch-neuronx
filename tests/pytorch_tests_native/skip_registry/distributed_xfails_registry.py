@@ -416,6 +416,17 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "[PT2.12] HSDP 2D device mesh collective init fails with"
+            " 'failed to init a collective algorithm. reason: no_hier no_mesh'."
+            " PT 2.12 runtime lacks support for the replica-group topology"
+            " required by HSDP DTensor state dict tests. Fixed in PT 2.13."
+        ),
+        tests=[
+            "test_hsdp_dtensor_state_dict.py::TestHSDPWithDeviceMeshAndDTensorNEURON::test_hsdp_init_with_device_mesh_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Asserts handler count on _c10d_logger; pytest 9.1+ attaches its"
             " own capture handlers to non-propagating loggers, inflating the count."
         ),

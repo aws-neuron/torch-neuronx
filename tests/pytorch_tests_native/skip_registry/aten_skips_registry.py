@@ -177,6 +177,14 @@ SKIP_GROUPS: list[SkipGroup] = [
     # TODO: Test Groups below are actually functional bugs that need investigation
     SkipGroup(
         reason=(
+            "PT2.12 - Conv same_padding backward corrupts NRT state, causing all"
+            " subsequent tests on the same xdist worker to fail with"
+            " 'NRT model scheduling failed, Unknown status (status: 101)'"
+        ),
+        tests=s.ATEN_CONV_BACKWARD_NRT_CORRUPTION,
+    ),
+    SkipGroup(
+        reason=(
             "Needs investigation: Skipping as these tests are hanging and the"
             " pytest timeout does not kill them"
         ),

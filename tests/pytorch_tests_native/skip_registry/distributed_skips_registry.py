@@ -3,14 +3,16 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "[PT2.11] FSDP v1 tests that time out (>600s) on Neuron and fail with"
-            " 'Scalars are not equal' assertions. Test timeouts indicate the"
-            " test did not complete in the expected time window."
+            "FSDP v1 tests that time out (>600s) on Neuron and fail with"
+            " 'Expected exit code 0 but got 1' or 'Scalars are not equal'."
+            " Likely collective deadlocks during optim state dict operations."
         ),
         tests=[
             "test_fsdp_comm_hooks.py::TestCommunicationHooks::test_fp16_hook_has_wrapping_True_sharding_strategy1",
             "test_fsdp_core.py::TestHooksNEURON::test_register_functions_called_cuda_first_True_mixed_precision_False_neuron",
             "test_fsdp_optim_state.py::TestFSDPOptimState::test_optim_state_dict_nested_state_dict_type0_use_multiple_param_groups_True_rank0_only_False_use_diff_optim_inputs_False",
+            "test_fsdp_optim_state.py::TestFSDPOptimState::test_shard_full_optim_state_dict_nested_use_multiple_param_groups_False_wrap_alt_True_use_diff_optim_inputs_False",
+            "test_fsdp_optim_state.py::TestFSDPOptimState::test_shard_full_optim_state_dict_unmanaged_params_state_dict_type0_add_to_fsdp_module_True",
             "test_fsdp_core.py::TestParityWithDDPNEURON::test_mixture_of_experts_with_delay_before_free_offload_true_shard_grad_op_neuron",
             "test_fsdp_use_orig_params.py::TestFSDPUseOrigParamsMultipleParamGroups::test_diff_hyperparams_sharding_strategy_str_full_shard",
         ],

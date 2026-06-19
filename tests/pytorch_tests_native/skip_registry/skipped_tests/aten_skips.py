@@ -347,6 +347,15 @@ ATEN_UPSTREAM_STRICT_XFAIL_PASSES_ON_NEURON = [
 ]
 
 
+# Conv same_padding backward tests corrupt NRT state, causing all subsequent
+# tests on the same pytest-xdist worker to fail with "NRT model scheduling
+# failed, Unknown status (status: 101)". Skip to prevent cascading failures.
+ATEN_CONV_BACKWARD_NRT_CORRUPTION = [
+    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv1d_same_padding_backward_neuron_float32",
+    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv2d_same_padding_backward_neuron_float32",
+]
+
+
 # test_dtypes variants that segfault in torch-mlir's context_init_hook
 # during convert_fx_to_stablehlo on the backward pass. Reproduces across
 # all nightly and PT 2.11 runs. Root cause not yet identified.

@@ -7,6 +7,11 @@ from ..operation_registry import Preprocessing, register_aten
 
 @register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
 def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    if indices.dtype not in (torch.long, torch.int):
+        raise RuntimeError(
+            f"Expected tensor for argument #1 'indices' to have one of the following "
+            f"scalar types: Long, Int; but got {indices.dtype} instead"
+        )
     return torch.embedding(
         weights, indices, padding_idx=padding_idx, scale_grad_by_freq=False, sparse=sparse
     )
