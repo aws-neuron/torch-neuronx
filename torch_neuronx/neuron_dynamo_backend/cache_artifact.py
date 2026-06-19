@@ -204,6 +204,26 @@ def _apply_precompile_patches():
     cache_base = torch._inductor.runtime.cache_dir_utils.cache_dir()
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_base, f"rank_{rank}")
 
+    # Fix precompile guard-state deserialization with no active trace.
+    # load_guards_state() unpickles dynamo Sources; ImportSource.__post_init__
+    # calls install_guard() which needs an active TracingContext, but cache load
+    # runs at torch.compile() time with no trace -> "must be called within an
+    # ongoing trace". Wrap the unpickle in a throwaway TracingContext; the guards
+    # it installs are discarded (the real set is rebuilt by CheckFunctionManager).
+    import torch._dynamo.package as _dynamo_package
+    from torch._guards import TracingContext as _TracingContext
+    from torch._guards import tracing as _tracing
+
+    _orig_load_guards_state = _dynamo_package.load_guards_state
+
+    def _load_guards_state_safe(guards_state):
+        if _TracingContext.try_get() is not None:
+            return _orig_load_guards_state(guards_state)
+        with _tracing(_TracingContext(fake_mode=None)):
+            return _orig_load_guards_state(guards_state)
+
+    _dynamo_package.load_guards_state = _load_guards_state_safe
+
     # Fix dataclass_with_cached_hash.__reduce__ to exclude init=False fields.
     # Without this, DefaultsSource (and other dataclasses with init=False
     # fields) fail to unpickle because __reduce__ includes all fields but
