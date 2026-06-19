@@ -28,7 +28,11 @@ from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
 )
+from torch_neuronx.python_ops.nki_kernels.nonzero import _has_nki_nonzero
 from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
+
+if _has_nki_nonzero:
+    from torch_neuronx.python_ops.nki_kernels.nonzero import _wrapped_nonzero
 
 if _has_nki_rng:
     from torch_neuronx.python_ops.nki_kernels.rng_state import rand
@@ -1231,6 +1235,63 @@ def index_copy(
     return torch.scatter(input, dim, index_expanded, source)
 
 
+def _unravel_flat_index(flat_idx, shape):
+    """Unravel row-major flat indices into per-dimension coordinate tensors.
+
+    Returns a list of len(shape) tensors; entry i holds the coordinate along
+    dim i for each flat index. For 1-D shapes the flat index is the coordinate.
+    """
+    if len(shape) == 1:
+        return [flat_idx]
+    coords = []
+    for i, dim_size in enumerate(shape):
+        stride = 1
+        for d in shape[i + 1 :]:
+            stride *= d
+        coords.append((flat_idx // stride) % dim_size)
+    return coords
+
+
+def _apply_fill_value(coords, size, count, fill_value, device):
+    """Overwrite padding slots (position >= count) of each coord with fill_value."""
+    if fill_value is None:
+        return coords
+    fill_mask = torch.arange(size, device=device) >= count
+    return [torch.where(fill_mask, fill_value, c) for c in coords]
+
+
+def _nonzero_with_count_nki(mask, shape, size, fill_value):
+    """NKI-backed nonzero: flat indices via nisa.nonzero_with_count, then unravel.
+
+    Args:
+        mask: boolean tensor (tensor != 0), same shape as the input.
+        shape: original input shape, for unraveling flat indices to coords.
+        size: fixed output length.
+        fill_value: value for padding slots (positions >= count); None to skip.
+
+    Returns (indices[size, ndim] long, count) matching nonzero_with_count.
+    """
+    numel = mask.numel()
+    device = mask.device
+    logical_neuron_cores = int(get_logical_neuron_cores())
+
+    # int32 mask avoids float edge cases; the wrapper handles chunk padding.
+    indices_1n, count_11 = _wrapped_nonzero[(logical_neuron_cores,)](
+        mask.to(torch.int32).reshape(1, numel)
+    )
+    flat_idx = indices_1n.reshape(numel)
+    count = count_11.reshape(())
+
+    # Trim/pad the flat-index buffer to exactly ``size`` slots.
+    fi = flat_idx[:size] if size <= numel else F.pad(flat_idx, (0, size - numel))
+
+    coords = _unravel_flat_index(fi, shape)
+    coords = _apply_fill_value(coords, size, count, fill_value, device)
+
+    result = torch.stack([c.to(torch.long) for c in coords], dim=1)
+    return result, count
+
+
 def nonzero_with_count(
     tensor: torch.Tensor,
     size: int,
@@ -1267,6 +1328,18 @@ def nonzero_with_count(
             return result, num_nonzero
         else:
             return result
+
+    # --- NKI fast path (Trn2/Trn3): flat nonzero via nisa.nonzero_with_count ---
+    # Avoids the cumsum/scatter_add reduce_window blowup that dominates compile
+    # time for large inputs. Falls back to the decomposition below on failure.
+    if _has_nki_nonzero:
+        try:
+            result, count = _nonzero_with_count_nki(mask, tensor.shape, size, fill_value)
+            if with_count:
+                return result, count
+            return result
+        except Exception as e:
+            logger.debug("NKI nonzero path failed, falling back to decomposition: %s", e)
 
     shape = tensor.shape
     ndim = len(shape)
@@ -1319,22 +1392,12 @@ def nonzero_with_count(
     if ndim == 1:
         coords = [out_col.to(torch.long)]
     else:
-        # Unravel row index into leading dimensions
-        row_flat = out_row.to(torch.long)
-        leading = shape[:-1]
-        coords = []
-        for i, dim_size in enumerate(leading):
-            stride = 1
-            for d in leading[i + 1 :]:
-                stride *= d
-            coords.append((row_flat // stride) % dim_size)
+        # out_row is the flat index into the leading dims; unravel it and append
+        # the within-slice column coordinate.
+        coords = _unravel_flat_index(out_row.to(torch.long), shape[:-1])
         coords.append(out_col.to(torch.long))
 
-    # Apply fill_value
-    if fill_value is not None:
-        fill_mask = torch.arange(size, device=device) >= num_nonzero
-        for i, coord in enumerate(coords):
-            coords[i] = torch.where(fill_mask, fill_value, coord)
+    coords = _apply_fill_value(coords, size, num_nonzero, fill_value, device)
 
     result = torch.stack(coords, dim=1)
     if with_count:
