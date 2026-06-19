@@ -256,12 +256,28 @@ def test_real_mapping_covers_known_labels():
         "module:profiler",
         "module:memory",
         "module:runtime-core",
-        "module:test-infra",
+        "module:upstream-test-infra",
         "module:build",
-        "module:ci",
     }
     missing = expected_labels - set(mapping.keys())
     assert not missing, f"label_test_selection.json missing entries for: {missing}"
+
+
+def test_module_ci_is_intentionally_unmapped():
+    """``module:ci`` is auto-applied by labeler.yml for non-functional
+    plumbing (.github/, tools/, tests/test_infra/, skip_registry/) and
+    is intentionally NOT mapped here. A pure-plumbing PR is paired with
+    ``ciflow:skip-upstream`` so upstream is skipped entirely; a mixed
+    PR (plumbing + real code) gets only the real-code label's items.
+    Adding ``module:ci`` to the mapping would re-introduce profiler
+    runs for plumbing changes — defeating the design.
+    """
+    mapping = load_mapping()
+    assert "module:ci" not in mapping, (
+        "module:ci must NOT be mapped — see docstring. "
+        "If you want plumbing PRs to run something, change labeler.yml "
+        "to apply a different module label, don't add module:ci here."
+    )
 
 
 def test_load_mapping_custom_path(tmp_path):
