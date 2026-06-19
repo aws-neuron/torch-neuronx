@@ -1520,12 +1520,12 @@ def register_all_defaults(r):
     )
     r(
         "aten::bitwise_left_shift.Tensor_Scalar",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1},
         source="builtin",
     )
     r(
         "aten::bitwise_left_shift.Tensor_Scalar_out",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1},
         source="builtin",
     )
     r(
@@ -1561,12 +1561,12 @@ def register_all_defaults(r):
     )
     r(
         "aten::bitwise_right_shift.Tensor_Scalar",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1},
         source="builtin",
     )
     r(
         "aten::bitwise_right_shift.Tensor_Scalar_out",
-        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1.0},
+        {"self": {"shape": (256, 1024), "dtype": "int"}, "other": 1},
         source="builtin",
     )
     r(

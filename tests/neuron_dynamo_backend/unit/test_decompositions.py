@@ -4755,6 +4755,62 @@ class TestXlogyDecompositionE2E:
         result = compiled_fn(x_cpu.to("neuron"), y_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu, y_cpu), rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
+    def test_xlogy_scalar_self_e2e(self, shape):
+        """xlogy.Scalar_Self: scalar * log(tensor). Routes through
+        prims.scalar_tensor, which needs the prims_scalar_tensor decomp to lower."""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.xlogy(2.0, x)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.rand(shape) + 0.1
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
+    def test_xlogy_scalar_other_e2e(self, shape):
+        """xlogy.Scalar_Other: tensor * log(scalar)."""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.xlogy(x, 2.0)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.rand(shape) + 0.1
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestPrimsScalarTensorDecompositionE2E:
+    """E2E tests for the prims.scalar_tensor decomp (prims_scalar_tensor)."""
+
+    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
+    def test_special_xlog1py_self_scalar_e2e(self, shape):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.special.xlog1py(2.0, x)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.rand(shape) + 0.1
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("shape", [(8,), (4, 8)])
+    def test_special_xlog1py_other_scalar_e2e(self, shape):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.special.xlog1py(x, 2.0)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.rand(shape) + 0.1
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestVdotDecompositionE2E:
@@ -5317,57 +5373,105 @@ class TestLogitBackwardDecompositionE2E:
         torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-3, atol=1e-3)
 
 
+# Integer dtypes the bitwise/shift bridges must handle. The bridge wraps the
+# scalar operand as a 0-d tensor of the input's dtype, so each dtype exercises a
+# distinct StableHLO path.
+_BITWISE_SHIFT_DTYPES = (
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestBitwiseShiftDecompositionE2E:
-    """E2E tests for bitwise_right_shift decomposition"""
+    """E2E tests for bitwise shift decompositions."""
 
-    @pytest.mark.parametrize("shift", [1, 2, 4])
-    def test_right_shift_tensor_scalar_e2e(self, shift):
+    @pytest.mark.parametrize("dtype", _BITWISE_SHIFT_DTYPES)
+    def test_right_shift_tensor_scalar_e2e(self, dtype):
         torch.manual_seed(42)
 
         def fn(x):
-            return x >> shift
+            return torch.bitwise_right_shift(x, 1)
 
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randint(0, 1000, (4, 8), dtype=torch.int32)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randint(0, 100, (4, 8), dtype=dtype)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu))
+
+    @pytest.mark.parametrize("dtype", _BITWISE_SHIFT_DTYPES)
+    def test_left_shift_tensor_scalar_e2e(self, dtype):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.bitwise_left_shift(x, 2)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randint(0, 8, (4, 8), dtype=dtype)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu))
+
+    @pytest.mark.parametrize("dtype", _BITWISE_SHIFT_DTYPES)
+    def test_left_shift_scalar_tensor_e2e(self, dtype):
+        """Scalar on the left: bitwise_left_shift(2, tensor)."""
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.bitwise_left_shift(2, x)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randint(0, 5, (4, 8), dtype=dtype)
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestBitwiseLogicalDecompositionE2E:
-    """E2E tests for bitwise_and, bitwise_or, bitwise_xor Scalar_Tensor decompositions"""
+    """E2E tests for bitwise_and/or/xor Scalar_Tensor decompositions."""
 
-    def test_bitwise_and_scalar_tensor_e2e(self):
+    # Logical bitwise ops support integer dtypes AND bool.
+    _DTYPES = (*_BITWISE_SHIFT_DTYPES, torch.bool)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_bitwise_and_scalar_tensor_e2e(self, dtype):
         torch.manual_seed(42)
+        scalar = True if dtype is torch.bool else 0xF
 
         def fn(x):
-            return 0xFF & x
+            return torch.bitwise_and(scalar, x)
 
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randint(0, 1000, (4, 8), dtype=torch.int32)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        hi = 2 if dtype is torch.bool else 100
+        x_cpu = torch.randint(0, hi, (4, 8), dtype=dtype)
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
 
-    def test_bitwise_or_scalar_tensor_e2e(self):
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_bitwise_or_scalar_tensor_e2e(self, dtype):
         torch.manual_seed(42)
+        scalar = True if dtype is torch.bool else 0x0F
 
         def fn(x):
-            return 0x0F | x
+            return torch.bitwise_or(scalar, x)
 
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randint(0, 100, (4, 8), dtype=torch.int32)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        hi = 2 if dtype is torch.bool else 100
+        x_cpu = torch.randint(0, hi, (4, 8), dtype=dtype)
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
 
-    def test_bitwise_xor_scalar_tensor_e2e(self):
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_bitwise_xor_scalar_tensor_e2e(self, dtype):
         torch.manual_seed(42)
+        scalar = True if dtype is torch.bool else 0xF
 
         def fn(x):
-            return 0xFF ^ x
+            return torch.bitwise_xor(scalar, x)
 
-        compiled_fn = torch.compile(fn, backend="neuron")
-        x_cpu = torch.randint(0, 256, (4, 8), dtype=torch.int32)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        hi = 2 if dtype is torch.bool else 100
+        x_cpu = torch.randint(0, hi, (4, 8), dtype=dtype)
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
 
@@ -5426,16 +5530,33 @@ class TestRsubDecompositionE2E:
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestRemainderDecompositionE2E:
-    """E2E tests for remainder.Scalar_Tensor decomposition"""
+    """E2E tests for remainder.Scalar_Tensor decomposition."""
 
     def test_remainder_scalar_tensor_e2e(self):
         torch.manual_seed(42)
 
         def fn(x):
-            return torch.remainder(torch.tensor(10.0), x)
+            return torch.remainder(10.0, x)
 
-        compiled_fn = torch.compile(fn, backend="neuron")
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
         x_cpu = torch.tensor([3.0, 4.0, 5.0, 7.0])
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestCopysignScalarDecompositionE2E:
+    """E2E tests for copysign.Scalar decomposition:q."""
+
+    @pytest.mark.parametrize("scalar", [2.0, -3.0])
+    def test_copysign_scalar_e2e(self, scalar):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.copysign(x, scalar)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randn(4, 8)
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
 

@@ -1087,6 +1087,72 @@ def scalar_tensor(
     return torch.full((), value, dtype=dtype, device=device)
 
 
+@register_decomposition([torch.ops.prims.scalar_tensor.default])
+def prims_scalar_tensor(s, dtype=None, device=None):
+    """prims.scalar_tensor (emitted by Scalar-overload _refs) doesn't lower; full() does."""
+    return torch.full((), s, dtype=dtype, device=device)
+
+
+def _both_tensors(self, other):
+    """Wrap whichever operand is a Python scalar as a 0-d tensor."""
+    ref = self if isinstance(self, torch.Tensor) else other
+    if not isinstance(self, torch.Tensor):
+        self = torch.full((), self, dtype=ref.dtype, device=ref.device)
+    if not isinstance(other, torch.Tensor):
+        other = torch.full((), other, dtype=ref.dtype, device=ref.device)
+    return self, other
+
+
+@register_decomposition([torch.ops.prims.shift_left.default])
+def prims_shift_left(self, other):
+    """prims.shift_left doesn't lower; route to the .Tensor leaf which does."""
+    self, other = _both_tensors(self, other)
+    return aten.bitwise_left_shift.Tensor(self, other)
+
+
+@register_decomposition([torch.ops.prims.shift_right_arithmetic.default])
+def prims_shift_right_arithmetic(self, other):
+    """Lower prims.shift_right_arithmetic to aten.bitwise_right_shift.Tensor."""
+    self, other = _both_tensors(self, other)
+    return aten.bitwise_right_shift.Tensor(self, other)
+
+
+@register_decomposition([torch.ops.prims.remainder.default])
+def prims_remainder(self, other):
+    """Lower prims.remainder to aten.remainder.Tensor."""
+    self, other = _both_tensors(self, other)
+    return aten.remainder.Tensor(self, other)
+
+
+@register_decomposition([torch.ops.prims.bitwise_and.default])
+def prims_bitwise_and(self, other):
+    """Lower prims.bitwise_and to aten.bitwise_and.Tensor."""
+    self, other = _both_tensors(self, other)
+    return aten.bitwise_and.Tensor(self, other)
+
+
+@register_decomposition([torch.ops.prims.bitwise_or.default])
+def prims_bitwise_or(self, other):
+    """Lower prims.bitwise_or to aten.bitwise_or.Tensor."""
+    self, other = _both_tensors(self, other)
+    return aten.bitwise_or.Tensor(self, other)
+
+
+@register_decomposition([torch.ops.prims.bitwise_xor.default])
+def prims_bitwise_xor(self, other):
+    """Lower prims.bitwise_xor to aten.bitwise_xor.Tensor."""
+    self, other = _both_tensors(self, other)
+    return aten.bitwise_xor.Tensor(self, other)
+
+
+@register_decomposition([aten.copysign.Scalar])
+def copysign_scalar(self, other):
+    """copysign.Scalar doesn't lower (its _refs route hits prims.signbit/where);
+    wrap the scalar and use the copysign.Tensor leaf, which does."""
+    other = torch.full((), other, dtype=self.dtype, device=self.device)
+    return aten.copysign.Tensor(self, other)
+
+
 @register_decomposition(
     [aten.linspace.Scalar_Tensor, aten.linspace.Tensor_Scalar, aten.linspace.Tensor_Tensor]
 )
