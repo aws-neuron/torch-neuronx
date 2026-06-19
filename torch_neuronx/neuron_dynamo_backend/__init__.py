@@ -27,6 +27,9 @@ neuron_dynamo_backend environment variables:
     TORCH_NEURONX_ENABLE_NKI_SDPA: bool (default=True)
         enables decomposing scaled_dot_product_attention to the NKI kernel if possible.
         currently, the decomposition happens only when seqlen % 2048 == 0 for queries.
+    TORCH_NEURONX_ENABLE_NKI_FREE_VAR: bool (default=False)
+        enables free-variable (score_mod_other_buffers / mask_mod_other_buffers)
+        plumbing through the NKI flex_attention lowering and kernel templates.
     NEURON_CC_FLAGS: str (default="")
         flags passed to neuronx-cc call
 """

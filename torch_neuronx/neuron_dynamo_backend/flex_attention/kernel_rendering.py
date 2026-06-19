@@ -9,6 +9,7 @@ import torch
 
 from torch_neuronx.kernels.cache_utils import get_artifacts_directory
 from torch_neuronx.neuron_dynamo_backend._nki.ast import NKIArray
+from torch_neuronx.neuron_dynamo_backend._nki.fx_to_nki import make_new_array
 from torch_neuronx.neuron_dynamo_backend._nki.subgraph_lowering import NISAPointwiseSubgraphLowering
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,47 @@ input_spec: list of (name, dtype)
 """
 
 
+# Ops that read a placeholder for shape/dtype only (they emit their own
+# constant), so a scalar b/h feeding only these never needs a real tile.
+_METADATA_ONLY_PACKETS = (
+    torch.ops.aten.new_ones,
+    torch.ops.aten.new_zeros,
+    torch.ops.aten.ones_like,
+    torch.ops.aten.zeros_like,
+)
+
+
+def _scalar_needs_materialization(node: torch.fx.Node) -> bool:
+    # b/h arrive as Python ints; materialize to a tile only if some op consumes
+    # their value (e.g. h*2). Otherwise the memset is dead — and crashes when a
+    # mod is invoked directly with a tile (nisa.memset wants an int value).
+    return any(
+        getattr(u.target, "overloadpacket", u.target) not in _METADATA_ONLY_PACKETS
+        for u in node.users
+    )
+
+
 def generate_graph_lowering(gm: torch.fx.GraphModule, input_spec, shape: tuple):
     graph_lowering = NISAPointwiseSubgraphLowering(gm, shape)
 
-    placeholder_inps = [
-        NKIArray(graph_lowering.ctx, "{{" + name + "}}", dtype, shape) for name, dtype in input_spec
-    ]
+    # input_spec entries are (name, dtype), or (name, dtype, capture_shape) for
+    # free-variable captures (lowered at their captured rank/shape). Scalars b/h
+    # become memset tiles when their value is used; everything else
+    # is a tile-shape NKIArray placeholder.
+    scalar_names = {"b", "h"}
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    placeholder_inps = []
+    for idx, spec in enumerate(input_spec):
+        name, dtype = spec[0], spec[1]
+        var = "{{" + name + "}}"
+        node = placeholders[idx] if idx < len(placeholders) else None
+
+        if len(spec) == 3:
+            placeholder_inps.append(NKIArray(graph_lowering.ctx, var, dtype, tuple(spec[2])))
+        elif name in scalar_names and node is not None and _scalar_needs_materialization(node):
+            placeholder_inps.append(make_new_array(graph_lowering.ctx, tuple(shape), var, dtype))
+        else:
+            placeholder_inps.append(NKIArray(graph_lowering.ctx, var, dtype, shape))
 
     graph_lowering.run(*placeholder_inps)
     return graph_lowering

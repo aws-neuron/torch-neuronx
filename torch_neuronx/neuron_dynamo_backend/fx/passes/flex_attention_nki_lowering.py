@@ -34,6 +34,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
     NeuronFXPass,
     NeuronFXPassState,
 )
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.nki_hop import kernel_registry, nki_kernel_wrapper, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores, map_external_dtype_to_torch
 
@@ -102,7 +103,12 @@ def _atomic_save_npy(path: str, array) -> None:
 
 
 def _classify_tile(
-    mask_mod_module: fx.GraphModule, q_grp: int, k_start: int, q_grp_sz: int, k_tile_sz: int
+    mask_mod_module: fx.GraphModule,
+    q_grp: int,
+    k_start: int,
+    q_grp_sz: int,
+    k_tile_sz: int,
+    extra_buffers: tuple = (),
 ) -> tuple[int, torch.Tensor]:
     """Evaluate mask_mod on a tile region and classify as SKIP/PARTIAL/FULL.
 
@@ -110,11 +116,23 @@ def _classify_tile(
     whether the entire tile is masked (SKIP), fully unmasked (FULL), or
     partially masked (PARTIAL).
 
+    Args:
+        mask_mod_module: FX submodule for the mask_mod closure.
+        q_grp, k_start, q_grp_sz, k_tile_sz: tile region.
+        extra_buffers: concrete CPU tensors for any captured free variables
+            lifted into the submodule's positional args (e.g. ``document_id``
+            and ``offsets`` for ``document_mask``). Order must match the
+            submodule placeholders after the first 4 (index >= 4), since
+            mask_mod is called as ``mask_mod_module(b, h, q_idx, k_idx,
+            *extra_buffers)``. Empty when the mask_mod is a pure function of
+            (b, h, q_idx, kv_idx).
+
     Returns:
         (tile_type, mask_tensor) where mask_tensor is the evaluated boolean mask.
 
     Raises if the mask_mod graph cannot be evaluated statically (e.g. it
-    depends on captured runtime buffers).
+    depends on captured runtime buffers whose values are not provided in
+    ``extra_buffers``).
     """
     from torch._subclasses.fake_tensor import unset_fake_temporarily
 
@@ -124,7 +142,7 @@ def _classify_tile(
         b = torch.zeros_like(q_idx, device="cpu")
         h = torch.zeros_like(q_idx, device="cpu")
 
-        result = mask_mod_module(b, h, q_idx, k_idx)
+        result = mask_mod_module(b, h, q_idx, k_idx, *extra_buffers)
 
         mask = result.float().detach().numpy()
 
@@ -135,8 +153,47 @@ def _classify_tile(
         return _TILE_SKIP, mask
 
 
+def _resolve_other_buffers(gm: fx.GraphModule, buffer_nodes: tuple) -> tuple:
+    """Resolve FX node references to concrete CPU tensors for host replay.
+
+    ``mask_mod_other_buffers`` (and its score_mod twin) come in as a tuple of
+    FX nodes. To replay the mask_mod submodule on host (for tile classification)
+    we need real tensor values. There are two cases:
+
+    - ``op == "get_attr"``: tensor is baked onto the parent GraphModule as a
+      buffer/constant; ``getattr(gm, node.target)`` returns it directly.
+    - ``op == "placeholder"``: tensor is a runtime input to the parent graph;
+      its value is not available at FX-pass time. We raise so the caller can
+      gracefully fall back to graph-based lowering.
+
+    Raises:
+        RuntimeError: if a buffer is a placeholder (value unavailable) or an
+            otherwise unsupported node op.
+    """
+    resolved = []
+    for n in buffer_nodes:
+        if not hasattr(n, "op"):
+            # Already a tensor (defensive).
+            resolved.append(n)
+            continue
+        if n.op == "get_attr":
+            resolved.append(getattr(gm, n.target).cpu())
+        elif n.op == "placeholder":
+            raise RuntimeError(
+                f"mask_mod captures runtime tensor {n.name!r} (placeholder of "
+                "parent graph); concrete value unavailable at FX-pass time"
+            )
+        else:
+            raise RuntimeError(f"mask_mod captures unsupported node op {n.op!r} for {n.name!r}")
+    return tuple(resolved)
+
+
 def _generate_tile_types(
-    mask_mod_module: fx.GraphModule, seqlen_q: int, seqlen_kv: int, k_tile_sz: int
+    mask_mod_module: fx.GraphModule,
+    seqlen_q: int,
+    seqlen_kv: int,
+    k_tile_sz: int,
+    extra_buffers: tuple = (),
 ) -> dict:
     """Generate tile type arrays and precomputed mask data from the mask_mod FX submodule.
 
@@ -189,7 +246,7 @@ def _generate_tile_types(
                 k_start = kt * k_tile_sz
                 actual_k_sz = min(seqlen_kv - k_start, k_tile_sz)
                 tile_type, mask_np = _classify_tile(
-                    mask_mod_module, g, k_start, _Q_GRP_SZ, actual_k_sz
+                    mask_mod_module, g, k_start, _Q_GRP_SZ, actual_k_sz, extra_buffers
                 )
                 type_row.append(tile_type)
                 if tile_type == _TILE_PARTIAL:
@@ -215,7 +272,9 @@ def _generate_tile_types(
             for vt in range(num_v_tiles):
                 k_start = vt * _V_TILE_SZ
                 actual_k_sz = min(seqlen_kv - k_start, _V_TILE_SZ)
-                tile_type, _ = _classify_tile(mask_mod_module, g, k_start, _Q_GRP_SZ, actual_k_sz)
+                tile_type, _ = _classify_tile(
+                    mask_mod_module, g, k_start, _Q_GRP_SZ, actual_k_sz, extra_buffers
+                )
                 row.append(tile_type)
             pv_types.append(row)
 
@@ -313,7 +372,9 @@ def add_metadata_to_node(node: fx.Node, example_tensor=None, shape=None, dtype=N
     return node
 
 
-def get_fwd_dumped_config(fwd_kernel, q, k, v, scale):
+def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
+    if other_buffers is None:
+        other_buffers = []
     kernel_idx = fwd_kernel.kernel_idx
     kernel = kernel_registry.get_kernel(kernel_idx)
     q_meta = torch.empty(q.meta["val"].shape, dtype=q.meta["val"].dtype, device="meta")
@@ -328,6 +389,9 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale):
     arg_names = list(sig.parameters.keys())
     # Build args dict matching the kernel's parameter order
     positional_values = [q_meta, k_meta, v_meta, scale]
+    for buf in other_buffers:
+        buf_val = buf.meta["val"] if hasattr(buf, "meta") else buf
+        positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
     meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
 
     dconfig = kernel[lnc].dump_config(**meta_args)
@@ -335,7 +399,9 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale):
     return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types, lnc
 
 
-def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale):
+def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=None):
+    if other_buffers is None:
+        other_buffers = []
     kernel_idx = bwd_kernel.kernel_idx
     kernel = kernel_registry.get_kernel(kernel_idx)
     q_meta = torch.empty(q.meta["val"].shape, dtype=q.meta["val"].dtype, device="meta")
@@ -352,6 +418,9 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale):
     arg_names = list(sig.parameters.keys())
     # Build args dict: positional args first, then softmax_scale as keyword
     positional_values = [q_meta, k_meta, v_meta, o_meta, dy_meta, lse_meta]
+    for buf in other_buffers:
+        buf_val = buf.meta["val"] if hasattr(buf, "meta") else buf
+        positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
     meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
     # Add softmax_scale if it's a recognized parameter
     if "softmax_scale" in arg_names:
@@ -377,14 +446,94 @@ class FlexAttentionNKILowering(NeuronFXPass):
     def name(self) -> str:
         return "flex_attention_nki_lowering"
 
+    @staticmethod
+    def _build_extra_buffer_args(score_mod_other_buffers, mask_mod_other_buffers):
+        """Build the deduplicated (nodes, names) for the captured free-variable
+        buffers passed as extra kernel args.
+
+        Names follow the score-then-mask ordering used by the dumped config
+        (``other_buf_0..`` for score, continuing for mask). Dedup is by FX node
+        identity so a buffer captured by both score_mod and mask_mod is passed
+        once.
+        """
+        extra_buf_nodes = []
+        extra_buf_names = []
+        seen_bufs = set()
+        for i, buf in enumerate(score_mod_other_buffers):
+            if id(buf) not in seen_bufs:
+                extra_buf_nodes.append(buf)
+                extra_buf_names.append(f"other_buf_{i}")
+                seen_bufs.add(id(buf))
+        for i, buf in enumerate(mask_mod_other_buffers):
+            if id(buf) not in seen_bufs:
+                extra_buf_nodes.append(buf)
+                extra_buf_names.append(f"other_buf_{len(score_mod_other_buffers) + i}")
+                seen_bufs.add(id(buf))
+        return extra_buf_nodes, extra_buf_names
+
+    @staticmethod
+    def _get_other_buffer_specs(other_buffers):
+        """Extract (name, dtype, shape) specs for free variable buffers.
+
+        Shape is the captured tensor's actual shape (e.g. [1024] for
+        document_mask's document_id) — needed by the index lowering to emit
+        a correct reshape, since the placeholder NKIArray it sees is fixed
+        to tile_shape (128, 128) regardless of capture rank.
+        """
+        specs = []
+        for i, buf in enumerate(other_buffers):
+            if hasattr(buf, "meta") and "val" in buf.meta:
+                v = buf.meta["val"]
+                specs.append((f"other_buf_{i}", v.dtype, tuple(v.shape)))
+        return specs
+
+    def _maybe_build_tile_info(
+        self, gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_kv, label=""
+    ):
+        """Return (use_static_tile_elimination, tile_info).
+
+        Returns (True, tile_info) when static-tile-elimination is enabled and the
+        mask_mod can be replayed on host to classify tiles. Returns (False, None)
+        when STE is disabled, when mask_mod captures runtime placeholders (host
+        replay can't resolve them), or when host replay otherwise fails.
+        """
+        if not self.static_tile_elimination:
+            return False, None
+        try:
+            extra_mask_buffers = _resolve_other_buffers(gm, mask_mod_other_buffers)
+            tile_info = _generate_tile_types(
+                fwd_mask_module,
+                seqlen_q,
+                seqlen_kv,
+                self.tile_shape[1],
+                extra_buffers=extra_mask_buffers,
+            )
+            logger.debug(
+                f"{label}Generated tile info: "
+                f"unique_masks={tile_info['num_unique_masks']}, "
+                f"max_large_tiles={tile_info['max_large_tiles_needed']}"
+            )
+            return True, tile_info
+        except RuntimeError as e:
+            logger.info(
+                f"{label}Skipping static-tile-elimination ({e}); " "using runtime-mask kernel path."
+            )
+            return False, None
+
     def _render_fwd_kernel_template(
         self,
         query_dtype,
         tile_shape,
         fwd_score_module,
         fwd_mask_module,
+        score_mod_other_buffers=(),
+        mask_mod_other_buffers=(),
         tile_info=None,
+        static_tile_elimination=None,
+        nheads_q=None,
     ):
+        if static_tile_elimination is None:
+            static_tile_elimination = self.static_tile_elimination
         input_score = [
             ("score", query_dtype),
             ("b", torch.int32),
@@ -398,14 +547,49 @@ class FlexAttentionNKILowering(NeuronFXPass):
             ("q_idx", torch.int32),
             ("kv_idx", torch.int32),
         ]
+        score_buf_specs = self._get_other_buffer_specs(score_mod_other_buffers)
+        mask_buf_specs = self._get_other_buffer_specs(mask_mod_other_buffers)
+        input_score.extend(score_buf_specs)
+        input_mask.extend(mask_buf_specs)
+
         score_graph_lowering = generate_graph_lowering(fwd_score_module, input_score, tile_shape)
         mask_graph_lowering = generate_graph_lowering(fwd_mask_module, input_mask, tile_shape)
 
+        # Identity score_mod: graph is just placeholders + an output returning
+        # score unchanged.
+        _score_graph_nodes = list(fwd_score_module.graph.nodes)
+        _score_placeholders = [n for n in _score_graph_nodes if n.op == "placeholder"]
+        _score_output = next((n for n in _score_graph_nodes if n.op == "output"), None)
+        is_identity_score_mod = (
+            _score_output is not None
+            and len(_score_placeholders) >= 1
+            and len(_score_graph_nodes) == len(_score_placeholders) + 1
+            and _score_output.args[0] is _score_placeholders[0]
+        )
+
+        # Build extra buffer arg names for template rendering
+        score_extra_names = [s[0] for s in score_buf_specs]
+        mask_extra_names = [s[0] for s in mask_buf_specs]
+        all_extra_names = []
+        seen = set()
+        for name in score_extra_names + mask_extra_names:
+            if name not in seen:
+                all_extra_names.append(name)
+                seen.add(name)
+
         def render_score_function(score, b, h, q_idx, kv_idx, prefix):
             body_template = generate_body_template(score_graph_lowering)
-            return jinja_env.from_string(body_template).render(
-                score=score, b=b, h=h, q_idx=q_idx, kv_idx=kv_idx, prefix=prefix
-            )
+            render_kwargs = {
+                "score": score,
+                "b": b,
+                "h": h,
+                "q_idx": q_idx,
+                "kv_idx": kv_idx,
+                "prefix": prefix,
+            }
+            for name in score_extra_names:
+                render_kwargs[name] = name
+            return jinja_env.from_string(body_template).render(**render_kwargs)
 
         score_buffer_initializer = functools.partial(
             generate_buffer_initializer, score_graph_lowering
@@ -414,9 +598,16 @@ class FlexAttentionNKILowering(NeuronFXPass):
 
         def render_mask_function(b, h, q_idx, kv_idx, prefix):
             body_template = generate_body_template(mask_graph_lowering)
-            return jinja_env.from_string(body_template).render(
-                b=b, h=h, q_idx=q_idx, kv_idx=kv_idx, prefix=prefix
-            )
+            render_kwargs = {
+                "b": b,
+                "h": h,
+                "q_idx": q_idx,
+                "kv_idx": kv_idx,
+                "prefix": prefix,
+            }
+            for name in mask_extra_names:
+                render_kwargs[name] = name
+            return jinja_env.from_string(body_template).render(**render_kwargs)
 
         mask_buffer_initializer = functools.partial(
             generate_buffer_initializer, mask_graph_lowering
@@ -433,7 +624,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         ti = tile_info or {}
         return template.render(
             k_tile_size=self.tile_shape[1],
-            static_tile_elimination=self.static_tile_elimination,
+            static_tile_elimination=static_tile_elimination,
             qk_tile_types=ti.get("qk_tile_types"),
             pv_tile_types=ti.get("pv_tile_types"),
             qk_mask_index=ti.get("qk_mask_index"),
@@ -448,6 +639,11 @@ class FlexAttentionNKILowering(NeuronFXPass):
             score_buffer_initializer=score_buffer_initializer,
             mask_buffer_allocator=mask_buffer_allocator,
             mask_buffer_initializer=mask_buffer_initializer,
+            score_extra_names=score_extra_names,
+            mask_extra_names=mask_extra_names,
+            all_extra_names=all_extra_names,
+            nheads_q=nheads_q,
+            is_identity_score_mod=is_identity_score_mod,
         )
 
     def _render_bwd_kernel_template(
@@ -456,8 +652,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
         fwd_score_module,
         fwd_mask_module,
         joint_mod_module,
+        score_mod_other_buffers=(),
+        mask_mod_other_buffers=(),
         tile_info=None,
+        static_tile_elimination=None,
     ):
+        if static_tile_elimination is None:
+            static_tile_elimination = self.static_tile_elimination
         input_score = [
             ("score", query_dtype),
             ("b", torch.int32),
@@ -479,6 +680,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
             ("kv_idx", torch.int32),
             ("grad_score_mod", query_dtype),
         ]
+        score_buf_specs = self._get_other_buffer_specs(score_mod_other_buffers)
+        mask_buf_specs = self._get_other_buffer_specs(mask_mod_other_buffers)
+        input_score.extend(score_buf_specs)
+        input_mask.extend(mask_buf_specs)
+        # joint_graph also receives the same free variable buffers as score_mod
+        input_joint.extend(score_buf_specs)
+
         score_graph_lowering = generate_graph_lowering(
             fwd_score_module, input_score, self.tile_shape
         )
@@ -487,29 +695,56 @@ class FlexAttentionNKILowering(NeuronFXPass):
             joint_mod_module, input_joint, self.tile_shape
         )
 
+        score_extra_names = [s[0] for s in score_buf_specs]
+        mask_extra_names = [s[0] for s in mask_buf_specs]
+        all_extra_names = []
+        seen = set()
+        for name in score_extra_names + mask_extra_names:
+            if name not in seen:
+                all_extra_names.append(name)
+                seen.add(name)
+
         def render_score_function(score, b, h, q_idx, kv_idx, prefix):
             body_template = generate_body_template(score_graph_lowering)
-            return jinja_env.from_string(body_template).render(
-                score=score, b=b, h=h, q_idx=q_idx, kv_idx=kv_idx, prefix=prefix
-            )
+            render_kwargs = {
+                "score": score,
+                "b": b,
+                "h": h,
+                "q_idx": q_idx,
+                "kv_idx": kv_idx,
+                "prefix": prefix,
+            }
+            for name in score_extra_names:
+                render_kwargs[name] = name
+            return jinja_env.from_string(body_template).render(**render_kwargs)
 
         def render_mask_function(b, h, q_idx, kv_idx, prefix):
             body_template = generate_body_template(mask_graph_lowering)
-            return jinja_env.from_string(body_template).render(
-                b=b, h=h, q_idx=q_idx, kv_idx=kv_idx, prefix=prefix
-            )
+            render_kwargs = {
+                "b": b,
+                "h": h,
+                "q_idx": q_idx,
+                "kv_idx": kv_idx,
+                "prefix": prefix,
+            }
+            for name in mask_extra_names:
+                render_kwargs[name] = name
+            return jinja_env.from_string(body_template).render(**render_kwargs)
 
         def render_joint_function(score, b, h, q_idx, kv_idx, grad_score_mod, prefix):
             body_template = generate_body_template(joint_graph_lowering)
-            return jinja_env.from_string(body_template).render(
-                score=score,
-                b=b,
-                h=h,
-                q_idx=q_idx,
-                kv_idx=kv_idx,
-                grad_score_mod=grad_score_mod,
-                prefix=prefix,
-            )
+            render_kwargs = {
+                "score": score,
+                "b": b,
+                "h": h,
+                "q_idx": q_idx,
+                "kv_idx": kv_idx,
+                "grad_score_mod": grad_score_mod,
+                "prefix": prefix,
+            }
+            for name in score_extra_names:
+                render_kwargs[name] = name
+            return jinja_env.from_string(body_template).render(**render_kwargs)
 
         score_buffer_allocator = functools.partial(generate_buffer_allocator, score_graph_lowering)
         mask_buffer_allocator = functools.partial(generate_buffer_allocator, mask_graph_lowering)
@@ -525,7 +760,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         ti = tile_info or {}
         return template.render(
             k_tile_size=self.tile_shape[1],
-            static_tile_elimination=self.static_tile_elimination,
+            static_tile_elimination=static_tile_elimination,
             qk_tile_types=ti.get("qk_tile_types"),
             pv_tile_types=ti.get("pv_tile_types"),
             qk_mask_index=ti.get("qk_mask_index"),
@@ -540,6 +775,9 @@ class FlexAttentionNKILowering(NeuronFXPass):
             score_buffer_allocator=score_buffer_allocator,
             mask_buffer_allocator=mask_buffer_allocator,
             joint_buffer_allocator=joint_buffer_allocator,
+            score_extra_names=score_extra_names,
+            mask_extra_names=mask_extra_names,
+            all_extra_names=all_extra_names,
         )
 
     @staticmethod
@@ -582,6 +820,14 @@ class FlexAttentionNKILowering(NeuronFXPass):
         score_mod_node = node.args[3]
         block_mask_node = node.args[4]
         scale = node.args[5]
+        # Free variable buffers, gated by TORCH_NEURONX_ENABLE_NKI_FREE_VAR;
+        # empty tuples when disabled.
+        if _getenv_bool("TORCH_NEURONX_ENABLE_NKI_FREE_VAR", False):
+            score_mod_other_buffers = node.args[7] if len(node.args) > 7 else ()
+            mask_mod_other_buffers = node.args[8] if len(node.args) > 8 else ()
+        else:
+            score_mod_other_buffers = ()
+            mask_mod_other_buffers = ()
 
         (
             _,  # q_length
@@ -622,24 +868,23 @@ class FlexAttentionNKILowering(NeuronFXPass):
             k_shape = key.meta["val"].shape
             seqlen_q = q_shape[-2]
             seqlen_kv = k_shape[-2]
+            # q_shape is [b, nheads_q, seqlen_q, d_head]; nheads_q used to split
+            # the combined batch*heads dim into (b_idx, h_idx) for score_mod/mask_mod.
+            nheads_q = q_shape[1]
 
-            tile_info = None
-            if self.static_tile_elimination:
-                tile_info = _generate_tile_types(
-                    fwd_mask_module, seqlen_q, seqlen_kv, self.tile_shape[1]
-                )
-                logger.debug(
-                    f"Generated tile info: "
-                    f"unique_masks={tile_info['num_unique_masks']}, "
-                    f"max_large_tiles={tile_info['max_large_tiles_needed']}"
-                )
-
+            use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
+                gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_kv
+            )
             rendered_kernel = self._render_fwd_kernel_template(
                 query_dtype,
                 self.tile_shape,
                 fwd_score_module,
                 fwd_mask_module,
+                score_mod_other_buffers=score_mod_other_buffers,
+                mask_mod_other_buffers=mask_mod_other_buffers,
                 tile_info=tile_info,
+                static_tile_elimination=use_static_tile_elimination,
+                nheads_q=nheads_q,
             )
             temp_module = save_and_import_kernel(
                 rendered_kernel, "temp_fwd_kernel", dir_name="flex_attention"
@@ -688,15 +933,24 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 )
                 add_metadata_to_node(v, shape=[batch_dim_kv, kv_seq_len, value_dim], dtype=v_dtype)
                 (backend_config, operand_output_aliases, return_types, lnc) = get_fwd_dumped_config(
-                    fwd_kernel, q, k, v, scale
+                    fwd_kernel,
+                    q,
+                    k,
+                    v,
+                    scale,
+                    other_buffers=list(score_mod_other_buffers) + list(mask_mod_other_buffers),
                 )
+                extra_buf_nodes, extra_buf_names = self._build_extra_buffer_args(
+                    score_mod_other_buffers, mask_mod_other_buffers
+                )
+
                 nki_kernel_args = {
                     "kernel_idx": fwd_kernel.kernel_idx,
                     "grid": [lnc],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
-                    "args": [q, k, v],
-                    "arg_names": ("q", "k", "v"),
+                    "args": [q, k, v, *extra_buf_nodes],
+                    "arg_names": ("q", "k", "v", *extra_buf_names),
                     "constant_args_key": -1,
                 }
                 nki_node = graph.call_function(nki_kernel_wrapper, args=(), kwargs=nki_kernel_args)
@@ -788,6 +1042,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
         joint_mod_node = node.args[8]
         block_mask_node = node.args[9]
         scale = node.args[10]
+        # Free variable buffers (gated by TORCH_NEURONX_ENABLE_NKI_FREE_VAR).
+        if _getenv_bool("TORCH_NEURONX_ENABLE_NKI_FREE_VAR", False):
+            score_mod_other_buffers = node.args[12] if len(node.args) > 12 else ()
+            mask_mod_other_buffers = node.args[13] if len(node.args) > 13 else ()
+        else:
+            score_mod_other_buffers = ()
+            mask_mod_other_buffers = ()
 
         q_shape = query.meta["val"].shape  # [bs, nheads, seqlen_q, d_head]
         k_shape = key.meta["val"].shape  # [bs, nheads_kv, seqlen_k, d_head]
@@ -833,23 +1094,18 @@ class FlexAttentionNKILowering(NeuronFXPass):
         )
 
         try:
-            tile_info = None
-            if self.static_tile_elimination:
-                tile_info = _generate_tile_types(
-                    fwd_mask_module, seqlen_q, seqlen_k, self.tile_shape[1]
-                )
-                logger.debug(
-                    f"BWD generated tile info: "
-                    f"unique_masks={tile_info['num_unique_masks']}, "
-                    f"max_large_tiles={tile_info['max_large_tiles_needed']}"
-                )
-
+            use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
+                gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_k, label="BWD: "
+            )
             rendered_kernel = self._render_bwd_kernel_template(
                 query_dtype,
                 fwd_score_module,
                 fwd_mask_module,
                 joint_mod_module,
+                score_mod_other_buffers=score_mod_other_buffers,
+                mask_mod_other_buffers=mask_mod_other_buffers,
                 tile_info=tile_info,
+                static_tile_elimination=use_static_tile_elimination,
             )
             temp_module = save_and_import_kernel(
                 rendered_kernel, "temp_bwd_kernel", dir_name="flex_attention"
@@ -907,15 +1163,27 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 """
 
                 (backend_config, operand_output_aliases, return_types, lnc) = get_bwd_dumped_config(
-                    bwd_kernel, q, k, v, o, dy, lse_transposed, scale
+                    bwd_kernel,
+                    q,
+                    k,
+                    v,
+                    o,
+                    dy,
+                    lse_transposed,
+                    scale,
+                    other_buffers=list(score_mod_other_buffers) + list(mask_mod_other_buffers),
                 )
+                extra_buf_nodes, extra_buf_names = self._build_extra_buffer_args(
+                    score_mod_other_buffers, mask_mod_other_buffers
+                )
+
                 nki_kernel_args = {
                     "kernel_idx": bwd_kernel.kernel_idx,
                     "grid": [lnc],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
-                    "args": [q, k, v, o, dy, lse_transposed],
-                    "arg_names": ("q", "k", "v", "o", "dy", "lse"),
+                    "args": [q, k, v, o, dy, lse_transposed, *extra_buf_nodes],
+                    "arg_names": ("q", "k", "v", "o", "dy", "lse", *extra_buf_names),
                     "constant_args_key": -1,
                 }
                 nki_node = graph.call_function(nki_kernel_wrapper, args=(), kwargs=nki_kernel_args)

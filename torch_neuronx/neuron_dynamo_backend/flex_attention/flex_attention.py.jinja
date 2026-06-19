@@ -60,7 +60,7 @@ _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
     _V_TILE_SZ  # for SWA, threshold above which allocate more q tiles and use range_select masking
 )
 
-def mask_mod(b_tile, h_tile, q_idx_tile, kv_idx_tile, bufs):
+def mask_mod(b_tile, h_tile, q_idx_tile, kv_idx_tile, bufs{% for name in mask_extra_names %}, {{name}}{% endfor %}):
     {{ render_mask_function(
             b="b_tile",
             h="h_tile",
@@ -69,7 +69,7 @@ def mask_mod(b_tile, h_tile, q_idx_tile, kv_idx_tile, bufs):
             prefix="bufs.mask_tmp",
         ) | indent(width=4)}}
 
-def score_mod(score_tile, b_tile, h_tile, q_idx_tile, kv_idx_tile, bufs):
+def score_mod(score_tile, b_tile, h_tile, q_idx_tile, kv_idx_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %}):
     {{ render_score_function(
             score="score_tile",
             b="b_tile",
@@ -85,6 +85,9 @@ def attention_cte(
     k: nl.ndarray,
     v: nl.ndarray,
     scale: float = 1.0,
+{% for name in all_extra_names %}
+    {{name}}: nl.ndarray = None,
+{% endfor %}
     causal_mask: bool = False,
     k_prior: Optional[nl.ndarray] = None,
     v_prior: Optional[nl.ndarray] = None,
@@ -328,6 +331,9 @@ def attention_cte(
             out_sum_recip=out_sum_recip,
             out_lse=out_softmax_exp_bias,
             cp_offset=cp_offset,
+{% for name in all_extra_names %}
+            {{name}}={{name}},
+{% endfor %}
         )
 
     has_remainder = (bs % num_shard) != 0
@@ -376,6 +382,9 @@ def attention_cte(
                 shard_seqlen_q_start=shard_id * batch_0_grp,
                 shard_seqlen_q_length=batch_length,
                 cp_offset=cp_offset,
+{% for name in all_extra_names %}
+                {{name}}={{name}},
+{% endfor %}
             )
         else:
             # Have core 0 do all the work
@@ -396,6 +405,9 @@ def attention_cte(
                     out_sum_recip=out_sum_recip,
                     out_lse=out_softmax_exp_bias,
                     cp_offset=cp_offset,
+{% for name in all_extra_names %}
+                    {{name}}={{name}},
+{% endfor %}
                 )
 
     if cache_softmax:
@@ -462,6 +474,9 @@ def _attention_cte_impl(
     shard_seqlen_q_start=-1,
     shard_seqlen_q_length=-1,
     cp_offset: Any = None,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ):
     """
     Internal implementation function for attention computation.
@@ -606,7 +621,7 @@ def _attention_cte_impl(
         if shard_seqlen_q_length <= 1:
             # no pipelining when there's only 1 group
             _load_q_impl(shard_seqlen_q_start, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
             _update_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _exp_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _pv_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
@@ -616,12 +631,12 @@ def _attention_cte_impl(
             # Do software pipelining. We have a group loop and some initial/final calls
             # outside the loop.
             _load_q_impl(shard_seqlen_q_start, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
             _update_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _exp_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
 
             _load_q_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
             _update_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs, sink)
             shard_seqlen_q_end = shard_seqlen_q_start + shard_seqlen_q_length
 
@@ -639,7 +654,7 @@ def _attention_cte_impl(
                 # grp_i+2 :  Load Q, QK+Max
                 _load_q_impl(grp_i + 2, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
                 _exp_impl(grp_i + 1, ac, atp, sp, bufs, sink)
-                _fused_qkmax_and_pv_impl(grp_i, ac, atp, sp, bufs)
+                _fused_qkmax_and_pv_impl(grp_i, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
                 _write_back_impl(grp_i, ac, atp, sp, bufs, o, batch_id)
                 _update_max_impl(grp_i + 2, ac, atp, sp, bufs, sink)
 
@@ -1791,6 +1806,9 @@ def _qk_and_max_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group.
     Also apply masking if relevant.
@@ -1798,7 +1816,7 @@ def _qk_and_max_impl(
     nisa.memset(bufs.mm1_partial_max[grp_i], value=_FLOAT32_MIN)
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
-        _qk_and_max_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs)
+        _qk_and_max_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
 
 
 def _update_max_impl(
@@ -2049,6 +2067,9 @@ def _fused_qkmax_and_pv_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ):
     """Fused implementation computing QK+max for group i+2 while computing PV for group i (software pipelining)."""
     qkmax_grp = grp_i + 2
@@ -2057,7 +2078,7 @@ def _fused_qkmax_and_pv_impl(
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
         _pv_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs)
-        _qk_and_max_large_tile_impl(qkmax_grp, large_tile_idx, ac, atp, sp, bufs)
+        _qk_and_max_large_tile_impl(qkmax_grp, large_tile_idx, ac, atp, sp, bufs{% for name in all_extra_names %}, {{name}}={{name}}{% endfor %})
 
 
 def _write_back_impl(
@@ -2319,6 +2340,9 @@ def _qk_and_max_large_tile_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+{% for name in all_extra_names %}
+    {{name}}=None,
+{% endfor %}
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group and large (2048) K tile.
     Also apply masking if relevant.
@@ -2378,7 +2402,18 @@ def _qk_and_max_large_tile_impl(
                     #-----------------------------------------------------------------------------------------------------
                     nisa.tensor_scalar(q_indices_sb_tile, bufs.q_iota_sb, nl.add, qkmax_grp * atp.sb_p)
                     nisa.tensor_scalar(k_indices_sb_tile, bufs.k_iota_sb, nl.add, k_start_pos)
-                    modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id, 0, q_indices_sb_tile, k_indices_sb_tile, bufs)
+                    if ac.scale != 1.0:
+                        # Pre-scale qk before score_mod: PyTorch's contract is
+                        # softmax(scale*qk + bias).
+                        nisa.tensor_scalar(
+                            mm1_copy_sb_tile[:num_q_free, :num_f],
+                            mm1_psum_tile[:num_q_free, :num_f],
+                            op0=nl.multiply,
+                            operand0=ac.scale,
+                        )
+                        modified_score = score_mod(mm1_copy_sb_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
+                    else:
+                        modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
 
                     nisa.tensor_copy(
                         mm1_copy_sb_tile[:num_p, :num_f],
@@ -2405,7 +2440,7 @@ def _qk_and_max_large_tile_impl(
                             mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
                             data=mm1_copy_sb_tile[:num_p, :num_f],
                             op0=nl.multiply,
-                            operand0=ac.scale,
+                            operand0=1.0,
                             reduce_op=nl.maximum,
                             reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
                         )
@@ -2413,16 +2448,41 @@ def _qk_and_max_large_tile_impl(
                     # Full tile: skip mask_mod but still apply score_mod
                     nisa.tensor_scalar(q_indices_sb_tile, bufs.q_iota_sb, nl.add, qkmax_grp * atp.sb_p)
                     nisa.tensor_scalar(k_indices_sb_tile, bufs.k_iota_sb, nl.add, k_start_pos)
-                    modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id, 0, q_indices_sb_tile, k_indices_sb_tile, bufs)
-
+{% if is_identity_score_mod %}
+                    # Identity score_mod: use PSUM directly with operand0=ac.scale to avoid
+                    # a PSUM→SBUF precision round-trip.  Non-identity mods (e.g. alibi) need
+                    # scale*qk passed into score_mod, so they take the branch below.
                     nisa.tensor_scalar_reduce(
                         mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                        data=modified_score[:num_p, :num_f],
+                        data=mm1_psum_tile[:num_q_free, :num_f],
                         op0=nl.multiply,
                         operand0=ac.scale,
                         reduce_op=nl.maximum,
                         reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
                     )
+{% else %}
+                    if ac.scale != 1.0:
+                        # Pre-scale qk before score_mod: PyTorch's contract is
+                        # softmax(scale*qk + bias).
+                        nisa.tensor_scalar(
+                            mm1_copy_sb_tile[:num_q_free, :num_f],
+                            mm1_psum_tile[:num_q_free, :num_f],
+                            op0=nl.multiply,
+                            operand0=ac.scale,
+                        )
+                        modified_score = score_mod(mm1_copy_sb_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
+                    else:
+                        modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
+
+                    nisa.tensor_scalar_reduce(
+                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        data=modified_score[:num_p, :num_f],
+                        op0=nl.multiply,
+                        operand0=1.0,
+                        reduce_op=nl.maximum,
+                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                    )
+{% endif %}
 {% else %}
             # Step 1: MM1 matmul
             nisa.nc_matmul(
@@ -2438,17 +2498,52 @@ def _qk_and_max_large_tile_impl(
             #-----------------------------------------------------------------------------------------------------
             nisa.tensor_scalar(q_indices_sb_tile, bufs.q_iota_sb, nl.add, qkmax_grp * atp.sb_p)
             nisa.tensor_scalar(k_indices_sb_tile, bufs.k_iota_sb, nl.add, k_start_pos)
-            modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id, 0, q_indices_sb_tile, k_indices_sb_tile, bufs)
+{% if is_identity_score_mod %}
+            # Identity score_mod: apply scale directly into mm1_copy_sb_tile without
+            # routing through score_mod, preserving clarity and avoiding unnecessary aliasing.
+            if ac.scale != 1.0:
+                nisa.tensor_scalar(
+                    mm1_copy_sb_tile[:num_q_free, :num_f],
+                    mm1_psum_tile[:num_q_free, :num_f],
+                    op0=nl.multiply,
+                    operand0=ac.scale,
+                )
+            else:
+                nisa.tensor_copy(
+                    mm1_copy_sb_tile[:num_p, :num_f],
+                    mm1_psum_tile[:num_p, :num_f],
+                )
+{% else %}
+            if ac.scale != 1.0:
+                # Pre-scale qk before score_mod: PyTorch's contract is
+                # softmax(scale*qk + bias).
+                nisa.tensor_scalar(
+                    mm1_copy_sb_tile[:num_q_free, :num_f],
+                    mm1_psum_tile[:num_q_free, :num_f],
+                    op0=nl.multiply,
+                    operand0=ac.scale,
+                )
+                modified_score = score_mod(mm1_copy_sb_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
+            else:
+                modified_score = score_mod(mm1_psum_tile[:num_q_free, :num_f], sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in score_extra_names %}, {{name}}{% endfor %})
 
             # Step 2: Masking
             nisa.tensor_copy(
                 mm1_copy_sb_tile[:num_p, :num_f],
                 modified_score[:num_p, :num_f],
             )
+{% endif %}
             #-----------------------------------------------------------------------------------------------------
             # Generated mask_mod
             #-----------------------------------------------------------------------------------------------------
-            mask_tile = mask_mod(sp.batch_id, 0, q_indices_sb_tile, k_indices_sb_tile, bufs)
+            # Pre-load each capture buffer as a (1, S) SBUF row so it broadcasts
+            # to (128, S) inside the mask_mod (nl.broadcast_to requires P=1).
+            # A 1-D (S,) capture (e.g. document_id) is reshaped to (1, S); a 2-D
+            # (B, S) capture is sliced to the current batch row.
+{% for name in mask_extra_names %}
+            _{{name}}_row = nl.load({{name}}.reshape((1, {{name}}.size)) if len({{name}}.shape) == 1 else {{name}}[nl.ds(sp.batch_id % {{name}}.shape[0], 1), :])
+{% endfor %}
+            mask_tile = mask_mod(sp.batch_id // {{nheads_q}}, sp.batch_id % {{nheads_q}}, q_indices_sb_tile, k_indices_sb_tile, bufs{% for name in mask_extra_names %}, _{{name}}_row{% endfor %})
             nisa.tensor_copy(bufs.mask_sb, mask_tile)
 
             nisa.tensor_tensor(mm1_affine_select_output_tile[:num_p, :num_f], mm1_copy_sb_tile[:num_p, :num_f], bufs.mask_sb[:num_p, :num_f], nl.multiply)
@@ -2461,7 +2556,7 @@ def _qk_and_max_large_tile_impl(
                 mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
                 data=mm1_affine_select_output_tile[:num_p, :num_f],
                 op0=nl.multiply,
-                operand0=ac.scale,
+                operand0=1.0,
                 reduce_op=nl.maximum,
                 reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
             )
