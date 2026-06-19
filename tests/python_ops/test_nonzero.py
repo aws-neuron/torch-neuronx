@@ -148,3 +148,36 @@ class TestNonzero:
 
         expected = embeds.cpu()[mask.cpu()]
         torch.testing.assert_close(result.cpu().float(), expected.float())
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4096,),
+            (8192,),
+            (65535,),
+            (100000,),
+            (1, 100000),
+            (200, 2048),
+            (1048576,),
+            (1024, 1024),
+            (4096, 1024),
+            (128, 128, 64),
+        ],
+    )
+    def test_nonzero_large_multichunk(self, device, shape):
+        """Large inputs that span multiple NKI tiles (chunk_size=8192).
+
+        Exercises the tiled + compacted flat-nonzero path and the running-offset
+        compaction across chunk boundaries.
+        """
+        with track_neuron_ops():
+            # ~30% density, fixed seed for reproducibility
+            torch.manual_seed(0)
+            x = (torch.rand(shape) < 0.3).to(torch.int32).to(device)
+            neuron_result = torch.nonzero(x)
+            cpu_result = torch.nonzero(x.cpu())
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.shape == cpu_result.shape
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::nonzero")
