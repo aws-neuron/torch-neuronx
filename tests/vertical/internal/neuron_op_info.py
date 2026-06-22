@@ -76,12 +76,17 @@ def _tensor_from_spec(spec, device, default_dtype):
     """Build a tensor from a shape tuple/list or a dict spec.
 
     Supported dict keys:
-      shape (required), dtype, low, high, sigmoid, names.
+      shape (required), dtype, low, high, sigmoid, names, sorted, starts_at.
 
     When ``names`` is provided (tuple of strings matching ``len(shape)``),
     the tensor is tagged with those names via ``refine_names`` so it can be
     passed to ``.dimname`` / ``.names_out`` schema variants that require
     named-tensor inputs.
+
+    When ``sorted`` is True, the tensor values are sorted in ascending order.
+    When ``starts_at`` is set, the first element is forced to that value.
+    These are useful for ops like embedding_bag that require monotonically
+    increasing offsets starting at 0.
     """
     if isinstance(spec, dict):
         shape = tuple(spec["shape"])
@@ -97,6 +102,10 @@ def _tensor_from_spec(spec, device, default_dtype):
             t = torch.randn(shape, device=device, dtype=dt)
             if spec.get("sigmoid"):
                 t = t.sigmoid()
+        if spec.get("sorted"):
+            t = t.sort().values
+        if "starts_at" in spec:
+            t[0] = spec["starts_at"]
         names = spec.get("names")
         if names:
             t = t.refine_names(*names)
