@@ -3820,6 +3820,12 @@ def register_all_defaults(r):
     # Upsample 2D
     _ups2d_in = (1, 64, 32, 32)
     _ups2d_out = [64, 64]
+    # NOTE: write-alias kwargs (out=/grad_input=) are intentionally omitted.
+    # NeuronOpInfo._with_out_kwargs probes the correct output shape via
+    # FakeTensorMode and allocates the tensor. A placeholder like out=(0,) is a
+    # valid eager input (PyTorch resizes it) but graph-breaks under
+    # torch.compile(fullgraph=True) ("Shape mismatch with out= tensor variant"),
+    # so leaving the slot empty is required for the compile-coverage path.
     r(
         "aten::upsample_bicubic2d.out",
         {
@@ -3828,7 +3834,6 @@ def register_all_defaults(r):
             "align_corners": False,
             "scales_h": None,
             "scales_w": None,
-            "out": (0,),
         },
         source="builtin",
     )
@@ -3840,7 +3845,6 @@ def register_all_defaults(r):
             "align_corners": False,
             "scales_h": None,
             "scales_w": None,
-            "out": (0,),
         },
         source="builtin",
     )
@@ -3851,7 +3855,6 @@ def register_all_defaults(r):
             "output_size": _ups2d_out,
             "align_corners": False,
             "scale_factors": None,
-            "out": (0,),
         },
         source="builtin",
     )
@@ -3886,7 +3889,6 @@ def register_all_defaults(r):
             "align_corners": False,
             "scales_h": None,
             "scales_w": None,
-            "grad_input": (0,),
         },
         source="builtin",
     )
@@ -3897,7 +3899,6 @@ def register_all_defaults(r):
             "output_size": _ups2d_out,
             "scales_h": None,
             "scales_w": None,
-            "out": (0,),
         },
         source="builtin",
     )
@@ -3925,7 +3926,6 @@ def register_all_defaults(r):
             "input_size": [1, 64, 32, 32],
             "scales_h": None,
             "scales_w": None,
-            "grad_input": (0,),
         },
         source="builtin",
     )
@@ -3938,7 +3938,6 @@ def register_all_defaults(r):
             "output_size": [256],
             "align_corners": False,
             "scales": None,
-            "out": (0,),
         },
         source="builtin",
     )
@@ -3963,7 +3962,6 @@ def register_all_defaults(r):
             "scales_d": None,
             "scales_h": None,
             "scales_w": None,
-            "out": (0,),
         },
         source="builtin",
     )

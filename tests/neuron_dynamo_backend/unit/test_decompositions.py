@@ -105,6 +105,14 @@ class TestDecompositionTable:
             torch.ops.aten.unfold_copy.default,
             torch.ops.aten.split_with_sizes_copy.default,
             torch.ops.aten._adaptive_avg_pool2d.default,
+            # Upsample forward ops covered by PyTorch builtins.
+            # Registering the functional packet registers .default and .vec.
+            # NOTE: the linear family (bilinear2d/linear1d/trilinear3d) is NOT
+            # here — those builtins are wrong on Neuron and are replaced by
+            # custom decompositions (see TestUpsampleLinearFamilyDecomposition).
+            torch.ops.aten.upsample_nearest2d.default,
+            torch.ops.aten.upsample_nearest2d.vec,
+            torch.ops.aten.upsample_bicubic2d.default,
         ],
     )
     def test_pytorch_builtin_decompositions_registered(self, op):
@@ -5916,3 +5924,190 @@ class TestAllDimsDecompositionE2E:
         x_cpu[1, 2] = 0
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
+
+
+class TestUpsampleNearest2dBackwardDecomposition:
+    """Tests for the custom upsample_nearest2d_backward decomposition."""
+
+    def _reference(self, grad, output_size, input_size, scales_h=None, scales_w=None):
+        return torch.ops.aten.upsample_nearest2d_backward.default(
+            grad, output_size, input_size, scales_h, scales_w
+        )
+
+    @pytest.mark.parametrize(
+        "input_size,output_size",
+        [
+            ([2, 3, 4, 4], [8, 8]),  # integer 2x upsample
+            ([1, 2, 5, 3], [10, 9]),  # non-integer, asymmetric
+            ([2, 1, 4, 4], [2, 2]),  # downsample (output < input)
+            ([1, 1, 3, 3], [7, 5]),  # odd ratios
+            ([2, 3, 4, 4], [4, 4]),  # identity size
+        ],
+    )
+    def test_matches_aten(self, input_size, output_size):
+        """Decomposition matches aten's native backward for various shapes."""
+        grad = torch.randn(input_size[0], input_size[1], *output_size, dtype=torch.float64)
+        result = decompositions.upsample_nearest2d_backward_decomposition(
+            grad, output_size, input_size
+        )
+        expected = self._reference(grad, output_size, input_size)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "input_size,output_size,scales_h,scales_w",
+        [
+            ([2, 3, 4, 4], [8, 8], 2.0, 2.0),
+            ([1, 2, 4, 6], [8, 18], 2.0, 3.0),
+        ],
+    )
+    def test_matches_aten_with_scales(self, input_size, output_size, scales_h, scales_w):
+        """Explicit scales_h/scales_w match aten's source-index computation."""
+        grad = torch.randn(input_size[0], input_size[1], *output_size, dtype=torch.float64)
+        result = decompositions.upsample_nearest2d_backward_decomposition(
+            grad, output_size, input_size, scales_h, scales_w
+        )
+        expected = self._reference(grad, output_size, input_size, scales_h, scales_w)
+        torch.testing.assert_close(result, expected)
+
+    def test_registered(self):
+        """The op is registered in the Neuron decomposition table."""
+        assert (
+            torch.ops.aten.upsample_nearest2d_backward.default
+            in decompositions.neuron_decompositions
+        )
+
+
+class TestUpsampleLinearFamilyDecomposition:
+    """Tests for the custom linear-family upsample decompositions.
+
+    PyTorch's builtins are wrong on Neuron, so we replace them with separable
+    matmul decompositions; these must match aten on CPU.
+    """
+
+    @pytest.mark.parametrize(
+        "in_l,out_l",
+        [(8, 16), (16, 8), (7, 10), (8, 8)],
+    )
+    def test_linear1d_matches_aten(self, in_l, out_l):
+        x = torch.randn(2, 3, in_l, dtype=torch.float64)
+        result = decompositions.upsample_linear1d_decomposition(x, [out_l], False)
+        expected = torch.ops.aten.upsample_linear1d.default(x, [out_l], False, None)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "in_hw,out_hw",
+        [((8, 8), (16, 16)), ((16, 16), (8, 8)), ((7, 9), (10, 6)), ((8, 8), (8, 8))],
+    )
+    def test_bilinear2d_matches_aten(self, in_hw, out_hw):
+        x = torch.randn(2, 3, *in_hw, dtype=torch.float64)
+        result = decompositions.upsample_bilinear2d_decomposition(x, list(out_hw), False)
+        expected = torch.ops.aten.upsample_bilinear2d.default(x, list(out_hw), False)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "in_dhw,out_dhw",
+        [((4, 4, 4), (8, 8, 8)), ((6, 5, 7), (2, 3, 4))],
+    )
+    def test_trilinear3d_matches_aten(self, in_dhw, out_dhw):
+        x = torch.randn(1, 2, *in_dhw, dtype=torch.float64)
+        result = decompositions.upsample_trilinear3d_decomposition(x, list(out_dhw), False)
+        expected = torch.ops.aten.upsample_trilinear3d.default(x, list(out_dhw), False)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("in_hw,out_hw", [((8, 8), (16, 16)), ((7, 9), (4, 4))])
+    def test_bilinear2d_align_corners_matches_aten(self, in_hw, out_hw):
+        """align_corners=True is supported (distinct center formula, no AA)."""
+        x = torch.randn(2, 3, *in_hw, dtype=torch.float64)
+        result = decompositions.upsample_bilinear2d_decomposition(x, list(out_hw), True)
+        expected = torch.ops.aten.upsample_bilinear2d.default(x, list(out_hw), True)
+        torch.testing.assert_close(result, expected)
+
+    def test_vec_matches_aten(self):
+        """The .vec overloads match aten (both output_size and scale_factors)."""
+        x = torch.randn(2, 3, 8, 8, dtype=torch.float64)
+        torch.testing.assert_close(
+            decompositions.upsample_bilinear2d_vec_decomposition(x, [16, 16], False, None),
+            torch.ops.aten.upsample_bilinear2d.vec(x, [16, 16], False, None),
+        )
+        torch.testing.assert_close(
+            decompositions.upsample_bilinear2d_vec_decomposition(x, None, False, [2.0, 2.0]),
+            torch.ops.aten.upsample_bilinear2d.vec(x, None, False, [2.0, 2.0]),
+        )
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.upsample_linear1d.default,
+            torch.ops.aten.upsample_linear1d.vec,
+            torch.ops.aten.upsample_bilinear2d.default,
+            torch.ops.aten.upsample_bilinear2d.vec,
+            torch.ops.aten.upsample_trilinear3d.default,
+            torch.ops.aten.upsample_trilinear3d.vec,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+
+class TestUpsampleBilinear2dAADecomposition:
+    """Tests for the anti-aliased bilinear upsample decompositions."""
+
+    @pytest.mark.parametrize(
+        "in_hw,out_hw",
+        [
+            ((8, 8), (4, 4)),  # downsample (AA active)
+            ((8, 8), (3, 5)),  # asymmetric downsample
+            ((7, 9), (8, 8)),  # mixed up/down
+            ((16, 16), (10, 10)),  # downsample non-integer ratio
+            ((4, 4), (8, 8)),  # pure upsample (AA collapses to bilinear)
+        ],
+    )
+    def test_forward_matches_aten(self, in_hw, out_hw):
+        x = torch.randn(2, 3, *in_hw, dtype=torch.float64)
+        result = decompositions.upsample_bilinear2d_aa_decomposition(x, list(out_hw), False)
+        expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, list(out_hw), False)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "in_hw,out_hw",
+        [((8, 8), (4, 4)), ((7, 9), (3, 5)), ((4, 4), (8, 8))],
+    )
+    def test_backward_matches_aten(self, in_hw, out_hw):
+        grad = torch.randn(2, 3, *out_hw, dtype=torch.float64)
+        input_size = [2, 3, *in_hw]
+        result = decompositions.upsample_bilinear2d_aa_backward_decomposition(
+            grad, list(out_hw), input_size, False
+        )
+        expected = torch.ops.aten._upsample_bilinear2d_aa_backward.default(
+            grad, list(out_hw), input_size, False
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_vec_matches_default(self):
+        """The .vec overload resolves output_size and matches the default path."""
+        x = torch.randn(1, 3, 8, 8, dtype=torch.float64)
+        result = decompositions.upsample_bilinear2d_aa_vec_decomposition(x, [4, 4], False, None)
+        expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, [4, 4], False)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("out_hw", [(3, 3), (5, 5)])
+    def test_align_corners_matches_aten(self, out_hw):
+        """align_corners=True reproduces aten's (degenerate) AA output exactly.
+
+        Uses the OpInfo sample shape (6,3,10,20) where this combination occurs.
+        """
+        x = torch.randn(6, 3, 10, 20, dtype=torch.float64)
+        result = decompositions.upsample_bilinear2d_aa_decomposition(x, list(out_hw), True)
+        expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, list(out_hw), True)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten._upsample_bilinear2d_aa.default,
+            torch.ops.aten._upsample_bilinear2d_aa.vec,
+            torch.ops.aten._upsample_bilinear2d_aa_backward.default,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
