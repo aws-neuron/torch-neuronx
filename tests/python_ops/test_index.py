@@ -281,6 +281,7 @@ class TestIndexRegistration:
 
         with track_neuron_ops():
             torch.ops.aten.index.Tensor_out(x_neuron, [idx_neuron], out=out)
-            assert_op_runs_on_neuron("index")
+            assert_op_runs_on_neuron("aten::index")
 
-        torch.testing.assert_close(out.cpu(), expected, rtol=1e-4, atol=1e-4)
+        assert out.shape == (3, 8)
+        torch.testing.assert_close(out.cpu(), expected)
