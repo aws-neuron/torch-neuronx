@@ -165,6 +165,16 @@ neuron_decompositions = get_decompositions(
         aten.max_unpool2d,
         aten.split_with_sizes_copy,
         aten._adaptive_avg_pool2d,
+        # Upsample/interpolate forward ops. PyTorch's built-in
+        # decompositions for nearest2d and bicubic2d lower correctly on Neuron,
+        # so we pull them in directly. Registering the functional packet also
+        # covers the .vec and (via functionalization) .out overloads.
+        # NOTE: the linear-family builtins (bilinear2d/linear1d/trilinear3d)
+        # produce incorrect results on Neuron (~99% mismatch vs CPU), so those
+        # are handled by the custom separable-matmul decompositions below
+        # instead of being registered here.
+        aten.upsample_nearest2d,
+        aten.upsample_bicubic2d,
     ]
 )
 
@@ -2900,6 +2910,226 @@ def _foreach_norm_decomp(self, ord=2):
 @register_decomposition([aten.argmax.default])
 def argmax_decomposition(self, dim=-1, keepdim=False):
     return self.max(dim=dim, keepdim=keepdim).indices
+
+
+def _nearest_src_index(out_size, in_size, scale, device):
+    """Map each output index to its nearest source index.
+
+    Mirrors aten's ``compute_scales_value`` + ``nearest_neighbor_compute_source_index``:
+    ``src = min(floor(dst * s), in_size - 1)`` where ``s`` is the explicit
+    reciprocal scale when provided, else ``in_size / out_size``.
+    """
+    s = (1.0 / scale) if scale is not None else (float(in_size) / float(out_size))
+    dst = torch.arange(out_size, dtype=torch.float32, device=device)
+    src = torch.floor(dst * s).to(torch.long)
+    return torch.clamp(src, 0, in_size - 1)
+
+
+@register_decomposition([aten.upsample_nearest2d_backward.default])
+def upsample_nearest2d_backward_decomposition(
+    grad_output, output_size, input_size, scales_h=None, scales_w=None
+):
+    """Decompose upsample_nearest2d backward into scatter-add gathers.
+
+    The backward of nearest-neighbor upsampling routes
+    each output gradient back to the single source pixel it was copied from, so
+    the gradient is a scatter-add over the nearest-index maps for H and W. We
+    accumulate over H first (smaller intermediate) then over W.
+    """
+    N, C, H, W = input_size
+    oh, ow = grad_output.shape[-2:]
+    dev = grad_output.device
+
+    ih = _nearest_src_index(oh, H, scales_h, dev)
+    iw = _nearest_src_index(ow, W, scales_w, dev)
+
+    go = grad_output.reshape(N, C, oh, ow)
+
+    tmp_h = torch.zeros(N, C, H, ow, dtype=grad_output.dtype, device=dev)
+    tmp_h = tmp_h.scatter_add(2, ih.view(1, 1, oh, 1).expand(N, C, oh, ow), go)
+
+    out = torch.zeros(N, C, H, W, dtype=grad_output.dtype, device=dev)
+    out = out.scatter_add(3, iw.view(1, 1, 1, ow).expand(N, C, H, ow), tmp_h)
+    return out
+
+
+def _linear_resample_matrix(in_size, out_size, scale, align_corners, antialias, device, dtype):
+    """Build a 1-D linear resampling weight matrix of shape ``(out_size, in_size)``.
+
+    Fully vectorized (no Python loops or in-place writes) so it traces cleanly
+    into the FX graph — an earlier scalar-loop version emitted per-element
+    ``copy_`` ops the backend rejected.
+
+    Each output row holds the normalized triangular-filter weights over the
+    input samples, matching aten's source-index mapping:
+
+    * ``align_corners=False``: ``center = s * (out_idx + 0.5)`` with
+      ``s = in/out`` (or ``1/scale``). When ``antialias`` and downsampling
+      (``s > 1``), the filter support widens by ``s`` — this produces the
+      anti-aliasing. Otherwise it is the plain triangular filter of radius 1.
+    * ``align_corners=True``: ``center = s * out_idx`` with
+      ``s = (in-1)/(out-1)`` and no anti-aliasing (matches aten, which ignores
+      AA in this mode).
+    """
+    if align_corners and not antialias:
+        # Plain linear align_corners path: endpoints map exactly, no AA.
+        if out_size == 1:
+            # Degenerate: every output maps to source index 0.
+            w = torch.zeros(1, in_size, dtype=torch.float64, device=device)
+            w[0, 0] = 1.0
+            return w.to(dtype)
+        s = (in_size - 1) / (out_size - 1)
+        i = torch.arange(out_size, dtype=torch.float64, device=device)
+        j = torch.arange(in_size, dtype=torch.float64, device=device)
+        center = s * i
+        w = torch.clamp(1.0 - torch.abs(j[None, :] - center[:, None]), min=0.0)
+        return (w / w.sum(-1, keepdim=True)).to(dtype)
+
+    # Anti-aliased path (and the plain align_corners=False linear path). aten's
+    # AA kernel uses the area-pixel center/offset/window regardless of
+    # align_corners; only the scale differs: (in-1)/(out-1) when align_corners
+    # else in/out (or 1/scale). NOTE: aten's AA + align_corners=True output is
+    # position-degenerate on downsampling shapes — this formula reproduces it
+    # bit-exactly, which is what the coverage correctness check compares against.
+    if align_corners:
+        s = (in_size - 1) / (out_size - 1) if out_size > 1 else 0.0
+    else:
+        s = (in_size / out_size) if scale is None else (1.0 / scale)
+    if antialias and s > 1.0:
+        support = s
+        invscale = 1.0 / s
+    else:
+        support = 1.0
+        invscale = 1.0
+
+    i = torch.arange(out_size, dtype=torch.float64, device=device)
+    j = torch.arange(in_size, dtype=torch.float64, device=device)
+    center = s * (i + 0.5)  # (out,)
+    t = (j[None, :] - center[:, None] + 0.5) * invscale  # (out, in)
+    w = torch.clamp(1.0 - torch.abs(t), min=0.0)
+
+    # Restrict to aten's clamped contribution window [xmin, xmax).
+    xmin = torch.clamp(torch.floor(center - support + 0.5), min=0)[:, None]
+    xmax = torch.clamp(torch.floor(center + support + 0.5), max=in_size)[:, None]
+    within = (j[None, :] >= xmin) & (j[None, :] < xmax)
+    w = torch.where(within, w, torch.zeros_like(w))
+
+    w = w / w.sum(-1, keepdim=True)
+    return w.to(dtype)
+
+
+def _resolve_vec_sizes(in_spatial, output_size, scale_factors):
+    """Resolve (output_sizes, scales) for a .vec overload.
+
+    Exactly one of ``output_size`` / ``scale_factors`` is provided. Returns a
+    tuple ``(sizes, scales)`` of equal length over the spatial dims.
+    """
+    if output_size is not None:
+        return list(output_size), [None] * len(in_spatial)
+    sizes = [int(d * s) for d, s in zip(in_spatial, scale_factors, strict=True)]
+    return sizes, list(scale_factors)
+
+
+@register_decomposition([aten.upsample_linear1d.default])
+def upsample_linear1d_decomposition(self, output_size, align_corners, scales=None):
+    """Decompose 1-D linear upsample as a single separable matmul."""
+    (ow,) = output_size
+    in_w = self.shape[-1]
+    ww = _linear_resample_matrix(in_w, ow, scales, align_corners, False, self.device, self.dtype)
+    return torch.einsum("oi,nci->nco", ww, self)
+
+
+@register_decomposition([aten.upsample_linear1d.vec])
+def upsample_linear1d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose the .vec overload by resolving sizes/scales then delegating."""
+    sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
+    return upsample_linear1d_decomposition(input, sizes, align_corners, scales[0])
+
+
+@register_decomposition([aten.upsample_bilinear2d.default])
+def upsample_bilinear2d_decomposition(
+    self, output_size, align_corners, scales_h=None, scales_w=None
+):
+    """Decompose 2-D bilinear upsample as two separable matmuls."""
+    oh, ow = output_size
+    in_h, in_w = self.shape[-2:]
+    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, False, self.device, self.dtype)
+    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, False, self.device, self.dtype)
+    return torch.einsum("oi,ncij,wj->ncow", wh, self, ww)
+
+
+@register_decomposition([aten.upsample_bilinear2d.vec])
+def upsample_bilinear2d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose the .vec overload by resolving sizes/scales then delegating."""
+    sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
+    return upsample_bilinear2d_decomposition(input, sizes, align_corners, scales[0], scales[1])
+
+
+@register_decomposition([aten.upsample_trilinear3d.default])
+def upsample_trilinear3d_decomposition(
+    self, output_size, align_corners, scales_d=None, scales_h=None, scales_w=None
+):
+    """Decompose 3-D trilinear upsample as three separable matmuls."""
+    od, oh, ow = output_size
+    in_d, in_h, in_w = self.shape[-3:]
+    wd = _linear_resample_matrix(in_d, od, scales_d, align_corners, False, self.device, self.dtype)
+    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, False, self.device, self.dtype)
+    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, False, self.device, self.dtype)
+    # input dims p,q,r -> output d,h,w; n,m are batch/channel
+    return torch.einsum("dp,hq,wr,nmpqr->nmdhw", wd, wh, ww, self)
+
+
+@register_decomposition([aten.upsample_trilinear3d.vec])
+def upsample_trilinear3d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose the .vec overload by resolving sizes/scales then delegating."""
+    sizes, scales = _resolve_vec_sizes(input.shape[-3:], output_size, scale_factors)
+    return upsample_trilinear3d_decomposition(input, sizes, align_corners, *scales)
+
+
+@register_decomposition([aten._upsample_bilinear2d_aa.default])
+def upsample_bilinear2d_aa_decomposition(
+    self, output_size, align_corners, scales_h=None, scales_w=None
+):
+    """Decompose anti-aliased bilinear upsample as two separable matmuls.
+
+    Identical to the plain bilinear decomposition but with the anti-aliasing
+    filter widening enabled in the weight matrix. Handles both align_corners
+    values (the matrix builder reproduces aten's degenerate AA+align_corners
+    behavior bit-exactly).
+    """
+    oh, ow = output_size
+    in_h, in_w = self.shape[-2:]
+    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, True, self.device, self.dtype)
+    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, True, self.device, self.dtype)
+    return torch.einsum("oi,ncij,wj->ncow", wh, self, ww)
+
+
+@register_decomposition([aten._upsample_bilinear2d_aa.vec])
+def upsample_bilinear2d_aa_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose the .vec overload by resolving output_size/scales then
+    delegating to the default AA decomposition."""
+    sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
+    return upsample_bilinear2d_aa_decomposition(input, sizes, align_corners, scales[0], scales[1])
+
+
+@register_decomposition([aten._upsample_bilinear2d_aa_backward.default])
+def upsample_bilinear2d_aa_backward_decomposition(
+    grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
+):
+    """Decompose AA bilinear backward as the transpose of the forward matmuls.
+
+    Forward is ``out = Wh @ x @ Ww^T``; the gradient wrt the input is therefore
+    ``Wh^T @ grad @ Ww``. Handles both align_corners values.
+    """
+    N, C, H, W = input_size
+    oh, ow = grad_output.shape[-2:]
+    wh = _linear_resample_matrix(
+        H, oh, scales_h, align_corners, True, grad_output.device, grad_output.dtype
+    )
+    ww = _linear_resample_matrix(
+        W, ow, scales_w, align_corners, True, grad_output.device, grad_output.dtype
+    )
+    return torch.einsum("oi,ncow,wj->ncij", wh, grad_output, ww)
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
