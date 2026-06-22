@@ -3457,7 +3457,14 @@ def register_all_defaults(r):
     # offsets=(num_bags,) monotonic, output=(num_bags, D).
     _eb_weight = (256, 128)
     _eb_indices = {"shape": (1024,), "dtype": "long", "low": 0, "high": 256}
-    _eb_offsets = {"shape": (32,), "dtype": "long", "low": 0, "high": 1024}
+    _eb_offsets = {
+        "shape": (32,),
+        "dtype": "long",
+        "low": 0,
+        "high": 1024,
+        "sorted": True,
+        "starts_at": 0,
+    }
     for _eb_op in ("aten::_embedding_bag", "aten::_embedding_bag_forward_only"):
         r(
             _eb_op,
@@ -3489,7 +3496,7 @@ def register_all_defaults(r):
                 "out0": (32, 128),  # output (num_bags, D)
                 "out1": {"shape": (1024,), "dtype": "long"},  # offset2bag
                 "out2": {"shape": (32,), "dtype": "long"},  # bag_size
-                "out3": (0,),  # max_indices (empty for mode=0)
+                "out3": {"shape": (0,), "dtype": "long"},  # max_indices (empty for mode=0)
             },
             source="builtin",
         )
