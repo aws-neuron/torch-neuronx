@@ -10,7 +10,7 @@
 | sliding_window_causal_bf16  | sliding_window_causal   | None             | PASS    | PASS    |
 | noop_fp32                   | noop_mask               | None             | PASS    | PASS    |
 | head_bias_bf16              | noop_mask               | head_bias_score  | PASS    | PASS    |
-| rel_bf16                    | causal                  | rel_score        | XFAIL   | XFAIL   |
+| rel_fp32                    | causal                  | rel_score        | PASS    | PASS    |
 | alibi_bf16                  | causal                  | alibi_score      | PASS    | PASS    |
 | prefix_lm_fp32              | prefix_lm_mask_512      | None             | PASS    | PASS    |
 | softcap_fp32                | causal                  | soft_cap         | PASS    | PASS    |
@@ -22,11 +22,12 @@
 | svg_temporal_bf16           | svg_temporal_mask       | None             | PASS    | PASS    |
 | natten_bf16                 | natten_mask             | None             | PASS    | PASS    |
 | sta_3d_bf16                 | sta_3d_mask             | None             | PASS    | PASS    |
-| document_mask_bf16          | document_mask           | None             | XFAIL   | XFAIL   |
+| document_mask_bf16          | document_mask           | None             | PASS    | PASS    |
 """
 
 import logging
 import math
+import os
 from unittest.mock import patch
 
 import pytest
@@ -44,6 +45,24 @@ from torch.nn.attention.flex_attention import (
 from tests.utils.neuron_test_utils import max_all_close
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def enable_nki_free_var():
+    """Enable NKI free-variable lowering for the suite.
+
+    Masks/scores that capture tensors (e.g. document_mask) only lower correctly
+    when TORCH_NEURONX_ENABLE_NKI_FREE_VAR is set; it is off by default.
+    """
+    prev = os.environ.get("TORCH_NEURONX_ENABLE_NKI_FREE_VAR")
+    os.environ["TORCH_NEURONX_ENABLE_NKI_FREE_VAR"] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("TORCH_NEURONX_ENABLE_NKI_FREE_VAR", None)
+        else:
+            os.environ["TORCH_NEURONX_ENABLE_NKI_FREE_VAR"] = prev
 
 
 @pytest.fixture(autouse=True)
@@ -369,9 +388,8 @@ class TestFlexAttentionE2E:
                 k_tile_size=128,
                 score_mod=rel_score,
                 mask_mod=causal,
-                dtype=torch.bfloat16,
-                id="rel_bf16",
-                marks=pytest.mark.xfail(reason="NKI accuracy mismatch", strict=False),
+                dtype=torch.float32,
+                id="rel_fp32",
             ),
             case(
                 seq_len=1024,
@@ -428,10 +446,6 @@ class TestFlexAttentionE2E:
                 mask_mod=document_mask,
                 dtype=torch.bfloat16,
                 id="document_mask_bf16",
-                marks=pytest.mark.xfail(
-                    reason="TBD",
-                    strict=False,
-                ),
             ),
         ],
     )
@@ -564,9 +578,8 @@ class TestFlexAttentionE2E:
                 k_tile_size=128,
                 score_mod=rel_score,
                 mask_mod=causal,
-                dtype=torch.bfloat16,
-                id="rel_bf16",
-                marks=pytest.mark.xfail(reason="NKI accuracy mismatch", strict=False),
+                dtype=torch.float32,
+                id="rel_fp32",
             ),
             case(
                 seq_len=1024,
@@ -623,10 +636,6 @@ class TestFlexAttentionE2E:
                 mask_mod=document_mask,
                 dtype=torch.bfloat16,
                 id="document_mask_bf16",
-                marks=pytest.mark.xfail(
-                    reason="mask_mod captures tensors; graph fallback LSE convention differs",
-                    strict=False,
-                ),
             ),
         ],
     )
