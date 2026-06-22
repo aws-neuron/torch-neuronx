@@ -302,10 +302,20 @@ class FlexAttentionLegalization(NeuronFXPass):
     ) -> tuple[fx.Node, fx.Node]:
         """Compute numerically stable softmax over the last dimension.
 
+        Computes in the wider of the scores' actual dtype and `dtype` (a score_mod
+        may promote, e.g. bf16 -> f32 for alibi), then casts attn_weights back to
+        `dtype` so the caller gets weights matching the original Q/K/V dtype.
+
         Returns:
-            (attn_weights, logsumexp) where logsumexp has shape [B, H, L].
+            (attn_weights, logsumexp) where attn_weights has the caller's `dtype`
+            and logsumexp is always float32 with shape [B, H, L].
         """
         from torch._subclasses.fake_tensor import FakeTensorMode
+
+        # Compute in the wider dtype so a promoting score_mod doesn't lose precision
+        # and the metadata matches the actual tensors.
+        scores_dtype = scores.meta["val"].dtype if "val" in scores.meta else dtype
+        compute_dtype = max((scores_dtype, dtype), key=lambda d: torch.finfo(d).bits)
 
         # max_scores = max(scores, dim=-1, keepdim=True)
         max_result = graph.call_function(torch.ops.aten.max.dim, args=(scores, -1, True))
@@ -314,7 +324,7 @@ class FlexAttentionLegalization(NeuronFXPass):
         # torch-mlir unpacks tuples and needs each element to be a FakeTensor
         max_result_shape = [shapes.B, shapes.H_q, shapes.L, 1]
         with FakeTensorMode():
-            fake_values = torch.empty(max_result_shape, dtype=dtype)
+            fake_values = torch.empty(max_result_shape, dtype=compute_dtype)
             fake_indices = torch.empty(max_result_shape, dtype=torch.int64)
 
         max_result_stride = fake_values.stride()
@@ -323,7 +333,7 @@ class FlexAttentionLegalization(NeuronFXPass):
         max_result.meta["tensor_meta"] = (
             TensorMetadata(
                 shape=torch.Size(max_result_shape),
-                dtype=dtype,
+                dtype=compute_dtype,
                 requires_grad=False,
                 stride=max_result_stride,
                 memory_format=torch.contiguous_format,
@@ -343,42 +353,53 @@ class FlexAttentionLegalization(NeuronFXPass):
 
         max_scores = graph.call_function(operator.getitem, args=(max_result, 0))
         self._add_metadata_to_node(
-            max_scores, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype
+            max_scores, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
         )
 
         # scores_centered = scores - max_scores
         scores_centered = graph.call_function(torch.ops.aten.sub.Tensor, args=(scores, max_scores))
         self._add_metadata_to_node(
-            scores_centered, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            scores_centered, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
 
         # exp_scores = exp(scores_centered)
         exp_scores = graph.call_function(torch.ops.aten.exp.default, args=(scores_centered,))
         self._add_metadata_to_node(
-            exp_scores, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            exp_scores, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
 
         # denom = sum(exp_scores, dim=-1, keepdim=True)
         denom = graph.call_function(torch.ops.aten.sum.dim_IntList, args=(exp_scores, [-1], True))
-        self._add_metadata_to_node(denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype)
+        self._add_metadata_to_node(
+            denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
+        )
 
         # attn_weights = exp_scores / denom
         attn_weights = graph.call_function(torch.ops.aten.div.Tensor, args=(exp_scores, denom))
         self._add_metadata_to_node(
-            attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
+
+        # Cast attn_weights back to caller dtype if we computed in a wider type
+        if compute_dtype != dtype:
+            attn_weights = graph.call_function(
+                torch.ops.aten._to_copy.default, args=(attn_weights,), kwargs={"dtype": dtype}
+            )
+            self._add_metadata_to_node(
+                attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            )
 
         # Compute real logsumexp = max + log(sum(exp(scores - max)))
         # log(denom) has shape [B, H, L, 1] (keepdim from sum)
         log_denom = graph.call_function(torch.ops.aten.log.default, args=(denom,))
         self._add_metadata_to_node(
-            log_denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype
+            log_denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
         )
 
         # lse_keepdim = max_scores + log_denom, shape [B, H, L, 1]
         lse_keepdim = graph.call_function(torch.ops.aten.add.Tensor, args=(max_scores, log_denom))
         self._add_metadata_to_node(
-            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype
+            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
         )
 
         # Cast to float32 before squeeze for backward compatibility
