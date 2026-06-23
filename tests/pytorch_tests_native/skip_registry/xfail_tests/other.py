@@ -249,7 +249,6 @@ OTHER = [
     "TestAfterAot::test_save_graph_repro",
     "TestAutograd::test_checkpoint_automatic_dynamic_lru_disabled_workaround",
     "TestAutograd::test_checkpoint_automatic_dynamic_mark_dynamic_workaround",
-    "TestAutograd::test_checkpointing_without_reentrant_dataparallel",
     "TestAutograd::test_checkpointing_without_reentrant_detached_tensor_use_reentrant_True",
     "TestAutograd::test_thread_shutdown",
     "TestBytecodeDebugger::test_return_value_printed",
