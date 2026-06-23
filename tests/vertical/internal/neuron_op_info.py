@@ -249,6 +249,17 @@ def _is_out_schema(schema) -> bool:
     return any(getattr(getattr(a, "alias_info", None), "is_write", False) for a in schema.arguments)
 
 
+def _is_placeholder_out(val) -> bool:
+    """True if ``val`` is a placeholder out buffer (a 0-element tensor, or a
+    list of them) rather than a correctly-shaped one. Registry entries use a
+    ``(0,)`` shape when the real out shape isn't known at authoring time."""
+    if isinstance(val, torch.Tensor):
+        return val.numel() == 0
+    if isinstance(val, list | tuple):
+        return bool(val) and all(isinstance(t, torch.Tensor) and t.numel() == 0 for t in val)
+    return False
+
+
 def _functional_probe_candidates(op, n_positional: int):
     """Functional (non-out) overloads of ``op``'s packet, best-match first."""
     schema = getattr(op, "_schema", None)
@@ -477,6 +488,13 @@ class NeuronOpInfo(OpInfo):
         """Return a new SampleInput with writable alias kwargs populated when missing.
 
         Uses a functional probe to learn expected shape/dtype instead of string heuristics.
+
+        Registry entries sometimes carry a placeholder out value (a 0-element
+        ``(0,)`` tensor) when the true out shape isn't known at authoring time.
+        Treat such placeholders the same as a missing kwarg so the FakeTensor
+        probe re-derives the correct shape. For data-dependent ops
+        (``masked_select.out``, ``nonzero.out``, ...) the probe raises and returns
+        None, so the placeholder is left untouched — exactly as before.
         """
         if self._resolved_op is None:
             return sample
@@ -488,13 +506,25 @@ class NeuronOpInfo(OpInfo):
             a
             for a in schema.arguments
             if a.kwarg_only
-            and a.name not in sample.kwargs
+            and (a.name not in sample.kwargs or _is_placeholder_out(sample.kwargs[a.name]))
             and getattr(getattr(a, "alias_info", None), "is_write", False)
         ]
         if not write_args:
             return sample
 
-        specs = _probe_out_specs(self._resolved_op, sample)
+        # Probe against a copy with placeholder out values dropped, so the
+        # functional probe sees a clean call and no stale (0,) buffer leaks in.
+        # Keep the original sample for the fallback paths below — if the probe
+        # can't derive a shape (e.g. data-dependent ops), the original (with its
+        # placeholder) is returned unchanged, exactly as before this change.
+        write_names = {a.name for a in write_args}
+        probe_sample = SampleInput(
+            sample.input,
+            args=sample.args,
+            kwargs={k: v for k, v in sample.kwargs.items() if k not in write_names},
+        )
+
+        specs = _probe_out_specs(self._resolved_op, probe_sample)
         if specs is None:
             return sample
 
