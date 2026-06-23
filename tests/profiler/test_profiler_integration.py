@@ -24,7 +24,7 @@ from torch._C._profiler import _ExperimentalConfig
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
-from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
+from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode, correlate_device_time
 
 
 @pytest.mark.skipif(
@@ -919,3 +919,124 @@ class TestNeuronConfig:
         """Test that NeuronConfig is an instance of _ExperimentalConfig."""
         config = NeuronConfig()
         assert isinstance(config, _ExperimentalConfig)
+
+
+class TestCorrelateDeviceTimeIntegration:
+    """Integration tests for correlate_device_time with NeuronProfiler."""
+
+    @pytest.fixture(autouse=True)
+    def _test_dir(self, tmp_path):
+        self.test_dir = str(tmp_path)
+
+    @pytest.fixture
+    def neuron_tensor(self):
+        x = torch.randn(4, 4, device="neuron")
+        for _ in range(3):
+            _ = x * 2 + 1
+            torch.neuron.synchronize()
+        return x
+
+    def test_auto_correlation_via_neuron_profiler(self, neuron_tensor):
+        """NeuronProfiler.export_trace() auto-correlates when config enabled."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=True,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            ka = p.key_averages()
+            results.append(sum(e.self_device_time_total for e in ka))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] > 0, "Expected non-zero NEURON time from auto-correlation"
+
+    def test_disabled_via_config(self, neuron_tensor):
+        """correlate_device_time=False should skip correlation."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=False,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            ka = p.key_averages()
+            results.append(sum(e.self_device_time_total for e in ka))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] == 0, "Expected zero NEURON time when correlation disabled"
+
+    def test_manual_correlate_without_schedule(self, neuron_tensor):
+        """correlate_device_time(prof) populates key_averages without schedule."""
+        nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=self.test_dir)
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+        ) as prof:
+            _ = neuron_tensor * 2 + 1
+            torch.neuron.synchronize()
+
+        correlate_device_time(prof)
+        ka = prof.key_averages()
+        total = sum(e.self_device_time_total for e in ka)
+        assert total > 0, "Expected non-zero NEURON time after correlate_device_time()"
+
+    def test_correlate_via_export_trace_with_schedule(self, neuron_tensor):
+        """NeuronProfiler.export_trace() correlates inside on_trace_ready with schedule."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=True,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            results.append(sum(e.self_device_time_total for e in p.key_averages()))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] > 0, "Expected non-zero NEURON time with schedule"
