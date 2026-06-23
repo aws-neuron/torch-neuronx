@@ -241,6 +241,49 @@ def _clamp_promoted_dtype(self_dtype, *bounds):
     return dt
 
 
+@register_decomposition([aten.special_erfcx.default])
+def special_erfcx_decomp(self):
+    """Lower erfcx piecewise (erfc + exp lower natively).
+
+    exp(x^2)*erfc(x) is exact for small x but overflows to inf for large +x (where
+    erfcx->0). For x>3 use the asymptotic series (1/(x*sqrt(pi)))*(1 - 1/2x^2 + ...);
+    clamp the exp arg so the unselected exact lane can't overflow (f16-safe). Bounded
+    across f32/bf16.
+    """
+    x2 = self * self
+    exact = torch.exp(torch.clamp(x2, max=10.0)) * torch.erfc(self)
+    inv = 1.0 / (self * math.sqrt(math.pi))
+    asymp = inv * (
+        1.0
+        - 1.0 / (2 * x2)
+        + 3.0 / (4 * x2 * x2)
+        - 15.0 / (8 * x2 * x2 * x2)
+        + 105.0 / (16 * x2 * x2 * x2 * x2)
+    )
+    return torch.where(self > 3.0, asymp, exact)
+
+
+@register_decomposition([aten.mvlgamma.default])
+def mvlgamma_decomp(self, p):
+    """Lower mvlgamma via an explicit lgamma sum."""
+    acc = sum(torch.lgamma(self - i * 0.5) for i in range(p))
+    return acc + (p * (p - 1) / 4.0) * math.log(math.pi)
+
+
+@register_decomposition([aten.special_zeta.self_scalar, aten.special_zeta.other_scalar])
+def special_zeta_scalar_decomp(self, other):
+    """Route zeta Scalar overloads to the tensor overload, which lowers.
+
+    The tensor lowering emits non-broadcast chlo.zeta, so expand the scalar to
+    the tensor operand's shape rather than passing a 0-d tensor.
+    """
+    if not isinstance(self, torch.Tensor):
+        self = torch.full_like(other, self)
+    else:
+        other = torch.full_like(self, other)
+    return aten.special_zeta.default(self, other)
+
+
 @register_decomposition([aten.clamp.default])
 def clamp_decomp(self, min=None, max=None):
     """Lower scalar-bounded clamp via maximum/minimum."""

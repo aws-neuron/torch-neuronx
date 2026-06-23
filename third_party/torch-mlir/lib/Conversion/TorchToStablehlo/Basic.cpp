@@ -1236,6 +1236,38 @@ LogicalResult ConvertAtenOp<AtenErfOp>::matchAndRewrite(
   return success();
 }
 
+// AtenNextafterOp -> chlo::NextAfterOp (non-broadcast)
+template <>
+LogicalResult ConvertAtenOp<AtenNextafterOp>::matchAndRewrite(
+    AtenNextafterOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto outTy = cast<TensorType>(getTypeConverter()->convertType(op.getType()));
+  Value lhs =
+      hlo::promoteType(rewriter, op.getLoc(), adaptor.getSelf(),
+                       outTy.getElementType());
+  Value rhs =
+      hlo::promoteType(rewriter, op.getLoc(), adaptor.getOther(),
+                       outTy.getElementType());
+  rewriter.replaceOpWithNewOp<chlo::NextAfterOp>(op, outTy, lhs, rhs);
+  return success();
+}
+
+// AtenSpecial_zetaOp -> chlo::ZetaOp (non-broadcast)
+template <>
+LogicalResult ConvertAtenOp<AtenSpecial_zetaOp>::matchAndRewrite(
+    AtenSpecial_zetaOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto outTy = cast<TensorType>(getTypeConverter()->convertType(op.getType()));
+  Value lhs =
+      hlo::promoteType(rewriter, op.getLoc(), adaptor.getSelf(),
+                       outTy.getElementType());
+  Value rhs =
+      hlo::promoteType(rewriter, op.getLoc(), adaptor.getOther(),
+                       outTy.getElementType());
+  rewriter.replaceOpWithNewOp<chlo::ZetaOp>(op, outTy, lhs, rhs);
+  return success();
+}
+
 // AtenBatchNormOp
 template <>
 LogicalResult ConvertAtenOp<AtenBatchNormOp>::matchAndRewrite(
@@ -2371,6 +2403,11 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
   INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenAsinhOp, chlo::AsinhOp);
   INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenAcoshOp, chlo::AcoshOp);
   INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenAtanhOp, chlo::AtanhOp);
+  INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenErfcOp, chlo::ErfcOp);
+  INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenErfinvOp, chlo::ErfInvOp);
+  INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenLgammaOp, chlo::LgammaOp);
+  INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenDigammaOp, chlo::DigammaOp);
+  INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenSpecial_i1eOp, chlo::BesselI1eOp);
 #undef INSERT_UNARY_PROMOTE_TO_FP_PATTERN
 
 #define INSERT_CONSTANT_FILL_PATTERN(AtenOp, fillVal)                          \
@@ -2459,6 +2496,8 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
 
   INSERT_ATENOP_PATTERN(AtenBroadcastToOp);
   INSERT_ATENOP_PATTERN(AtenPermuteOp);
+  INSERT_ATENOP_PATTERN(AtenNextafterOp);
+  INSERT_ATENOP_PATTERN(AtenSpecial_zetaOp);
 
   INSERT_ATENOP_PATTERN(ValueTensorLiteralOp);
   INSERT_ATENOP_PATTERN(AtenTensorIntOp);
