@@ -13,6 +13,7 @@ from enum import Enum
 from typing import ClassVar
 
 from torch._C._profiler import _ExperimentalConfig
+from torch.autograd.profiler_util import Kernel
 
 import torch_neuronx._C as _C
 
@@ -52,6 +53,9 @@ class NeuronConfig(_ExperimentalConfig):
         neff_cache_dir: Path to the NEFF cache directory. When set, the cached
             NEFFs will be copied into the profile artifact directory when stopping
             the profile instead of creating an additional copy on load.
+        correlate_device_time: When True, NeuronProfiler.export_trace()
+            automatically correlates device execution times into FunctionEvents
+            so key_averages() shows NEURON device time columns. Default: False.
     """
 
     _DEFAULT_MODES: ClassVar[list[ProfileMode]] = [ProfileMode.DEVICE, ProfileMode.RUNTIME]
@@ -64,6 +68,7 @@ class NeuronConfig(_ExperimentalConfig):
         profile_output_dir: str | None = None,
         precache_node_info: bool = True,
         neff_cache_dir: str | None = None,
+        correlate_device_time: bool = False,
     ):
         if modes is None:
             modes = self._DEFAULT_MODES
@@ -97,6 +102,7 @@ class NeuronConfig(_ExperimentalConfig):
         self.custom_profiler_config = config_str
         self.profile_output_dir = profile_output_dir
         self.neff_cache_dir = neff_cache_dir
+        self.correlate_device_time = correlate_device_time
 
         # Pre-cache profile node info during warmup iterations so that the
         # actively profiled iteration doesn't pay the cost of collecting
@@ -156,12 +162,83 @@ class NeuronProfiler:
     def export_trace(self, prof, filename: str = "trace.json"):
         """Export a PyTorch chrome trace into the current NRT session directory.
 
+        Automatically calls correlate_device_time() before export if enabled
+        on the NeuronConfig (correlate_device_time=True), so key_averages()
+        will show NEURON device time columns without any additional user action.
+
         Args:
             prof: The torch.profiler.profile instance.
             filename: Trace file name within the session directory.
         """
+        if self._config.correlate_device_time:
+            correlate_device_time(prof)
         session_dir = self._config.get_session_dir()
         prof.export_chrome_trace(os.path.join(session_dir, filename))
+
+
+_NON_COMPUTE_PREFIXES = ("neuron::alloc", "neuron::dealloc", "neuron::copy")
+
+
+def correlate_device_time(prof) -> None:
+    """Inject device execution time into profiler FunctionEvents.
+
+    Call after profiling to enable NEURON time columns in key_averages().
+    When using a schedule, call this inside on_trace_ready instead.
+    """
+    if getattr(prof, "_neuron_correlated", False):
+        return
+    kineto_results = prof.profiler.kineto_results
+    if kineto_results is None:
+        return
+    fe_list = prof.profiler.function_events
+    if fe_list is None:
+        return
+
+    host_pid = os.getpid()
+    corr_to_device_us: dict[int, float] = {}
+
+    for ev in kineto_results.events():
+        lcid = ev.linked_correlation_id()
+        if lcid <= 0:
+            continue
+        if ev.device_index() == host_pid:
+            continue
+        if ev.name().startswith(_NON_COMPUTE_PREFIXES):
+            continue
+        dur_ns = ev.duration_ns()
+        if dur_ns <= 0:
+            continue
+        corr_to_device_us[lcid] = corr_to_device_us.get(lcid, 0) + dur_ns / 1000
+
+    if not corr_to_device_us:
+        return
+
+    # is_legacy tells PyTorch to compute device_time_total from sum(kernels)
+    # rather than recursing into cpu_children.
+    seen_ids: set[int] = set()
+    for fe in fe_list:
+        # Async events are duplicates of their sync counterparts with no own duration.
+        if fe.is_async:
+            continue
+        # No matching device execution for this op (e.g. pure CPU op).
+        if fe.id not in corr_to_device_us:
+            continue
+        # Multiple FunctionEvents share the same correlation id
+        # (e.g. aten::mul and aten::mul.Tensor);
+        # attribute device time only to the first to avoid double-counting.
+        if fe.id in seen_ids:
+            continue
+        seen_ids.add(fe.id)
+        fe.kernels.append(
+            Kernel(
+                name=fe.name,
+                device=fe.device_index,
+                duration=corr_to_device_us[fe.id],
+            )
+        )
+        fe.is_legacy = True
+
+    prof._neuron_correlated = True
 
 
 class NRTProfilerError(Exception):
