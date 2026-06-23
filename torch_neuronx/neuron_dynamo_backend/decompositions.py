@@ -2955,6 +2955,171 @@ def argmax_decomposition(self, dim=-1, keepdim=False):
     return self.max(dim=dim, keepdim=keepdim).indices
 
 
+# ── Windowing functions ──────────────────────────────────────────
+# bartlett/blackman/hamming/hann/kaiser windows have no PyTorch decomposition
+# and fail to legalize in torch-mlir. They are pure analytic functions of an
+# arange, so we lower them to arange + cos/abs/sqrt/i0. Each follows PyTorch's
+# convention: window_length<=0 -> empty, ==1 -> [1.0], and `periodic` computes
+# the symmetric window of length M+1 and drops the last point.
+
+
+def _window_arange(window_length, periodic, dtype, device):
+    """Return (n, denom) for a window of M=window_length points.
+
+    ``n`` is arange(M) and ``denom`` is the symmetric-window length minus one
+    (``M`` for periodic, ``M-1`` for symmetric) used in the cosine argument.
+    """
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    n = torch.arange(window_length, dtype=dtype, device=device)
+    denom = window_length if periodic else window_length - 1
+    return n, dtype, denom
+
+
+def _window_trivial(window_length, dtype, device):
+    """Handle the shared window_length<=0 / ==1 edge cases.
+
+    Returns the result tensor, or None if window_length needs the full formula.
+    """
+    dtype = dtype if dtype is not None else torch.get_default_dtype()
+    if window_length <= 0:
+        return torch.empty(0, dtype=dtype, device=device)
+    if window_length == 1:
+        return torch.ones(1, dtype=dtype, device=device)
+    return None
+
+
+@register_decomposition([aten.hann_window.default, aten.hann_window.periodic])
+def hann_window_decomposition(
+    window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
+):
+    """Hann window: 0.5 - 0.5*cos(2*pi*n/denom)."""
+    trivial = _window_trivial(window_length, dtype, device)
+    if trivial is not None:
+        return trivial
+    n, _, denom = _window_arange(window_length, periodic, dtype, device)
+    return 0.5 - 0.5 * torch.cos(2 * math.pi * n / denom)
+
+
+@register_decomposition(
+    [
+        aten.hamming_window.default,
+        aten.hamming_window.periodic,
+        aten.hamming_window.periodic_alpha,
+        aten.hamming_window.periodic_alpha_beta,
+    ]
+)
+def hamming_window_decomposition(
+    window_length,
+    periodic=True,
+    alpha=0.54,
+    beta=0.46,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """Hamming window: alpha - beta*cos(2*pi*n/denom)."""
+    trivial = _window_trivial(window_length, dtype, device)
+    if trivial is not None:
+        return trivial
+    n, _, denom = _window_arange(window_length, periodic, dtype, device)
+    return alpha - beta * torch.cos(2 * math.pi * n / denom)
+
+
+@register_decomposition([aten.bartlett_window.default, aten.bartlett_window.periodic])
+def bartlett_window_decomposition(
+    window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
+):
+    """Bartlett (triangular) window: 1 - |2*n/denom - 1|."""
+    trivial = _window_trivial(window_length, dtype, device)
+    if trivial is not None:
+        return trivial
+    n, _, denom = _window_arange(window_length, periodic, dtype, device)
+    return 1.0 - torch.abs(2.0 * n / denom - 1.0)
+
+
+@register_decomposition([aten.blackman_window.default, aten.blackman_window.periodic])
+def blackman_window_decomposition(
+    window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
+):
+    """Blackman window: 0.42 - 0.5*cos(x) + 0.08*cos(2*x), x = 2*pi*n/denom."""
+    trivial = _window_trivial(window_length, dtype, device)
+    if trivial is not None:
+        return trivial
+    n, _, denom = _window_arange(window_length, periodic, dtype, device)
+    x = 2 * math.pi * n / denom
+    return 0.42 - 0.5 * torch.cos(x) + 0.08 * torch.cos(2 * x)
+
+
+def _i0_approx(x):
+    """Modified Bessel function I0 via the Abramowitz & Stegun polynomial
+    approximation (9.8.1 / 9.8.2).
+
+    aten lowers ``kaiser_window`` to ``aten.i0``, which torch-mlir cannot
+    legalize. This polynomial form uses only primitives the backend supports
+    and matches torch.special.i0 to <1e-6 over the kaiser-relevant range
+    (|x| up to ~12). Uses the |x|<3.75 series and the |x|>=3.75 asymptotic
+    form, selected with torch.where.
+    """
+    ax = torch.abs(x)
+    t = x / 3.75
+    t2 = t * t
+    small = 1.0 + t2 * (
+        3.5156229
+        + t2 * (3.0899424 + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813))))
+    )
+    u = 3.75 / ax
+    large = (torch.exp(ax) / torch.sqrt(ax)) * (
+        0.39894228
+        + u
+        * (
+            0.01328592
+            + u
+            * (
+                0.00225319
+                + u
+                * (
+                    -0.00157565
+                    + u
+                    * (
+                        0.00916281
+                        + u * (-0.02057706 + u * (0.02635537 + u * (-0.01647633 + u * 0.00392377)))
+                    )
+                )
+            )
+        )
+    )
+    return torch.where(ax < 3.75, small, large)
+
+
+@register_decomposition(
+    [aten.kaiser_window.default, aten.kaiser_window.periodic, aten.kaiser_window.beta]
+)
+def kaiser_window_decomposition(
+    window_length,
+    periodic=True,
+    beta=12.0,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """Kaiser window: I0(beta*sqrt(1-((n-a)/a)^2)) / I0(beta), a = (denom)/2."""
+    trivial = _window_trivial(window_length, dtype, device)
+    if trivial is not None:
+        return trivial
+    n, _, denom = _window_arange(window_length, periodic, dtype, device)
+    a = denom / 2.0
+    ratio = (n - a) / a
+    arg = beta * torch.sqrt(1.0 - ratio * ratio)
+    # Derive the I0(beta) normalizer tensor from n (matches dtype/device, and
+    # traces to new_full rather than a lift_fresh_copy of a tensor literal).
+    beta_t = n.new_full((), beta)
+    return _i0_approx(arg) / _i0_approx(beta_t)
+
+
 def _nearest_src_index(out_size, in_size, scale, device):
     """Map each output index to its nearest source index.
 

@@ -4923,6 +4923,156 @@ class TestSmoothL1LossDecompositionE2E:
         torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
 
 
+class TestWindowFunctionDecompositions:
+    """Tests for windowing-function decompositions.
+
+    bartlett/blackman/hamming/hann/kaiser have no PyTorch decomposition and
+    fail to legalize in torch-mlir. Each is lowered to arange + analytic ops;
+    these check the decompositions match aten across periodic/symmetric modes,
+    edge cases (length 0/1), and the parameterized overloads.
+    """
+
+    @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 10, 17])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_hann_matches_aten(self, window_length, periodic):
+        result = decompositions.hann_window_decomposition(window_length, periodic)
+        expected = torch.ops.aten.hann_window.periodic(window_length, periodic)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 10, 17])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_hamming_matches_aten(self, window_length, periodic):
+        result = decompositions.hamming_window_decomposition(window_length, periodic)
+        expected = torch.ops.aten.hamming_window.periodic(window_length, periodic)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("alpha,beta", [(0.54, 0.46), (0.6, 0.4), (0.5, 0.5)])
+    def test_hamming_alpha_beta_matches_aten(self, alpha, beta):
+        result = decompositions.hamming_window_decomposition(16, True, alpha, beta)
+        expected = torch.ops.aten.hamming_window.periodic_alpha_beta(16, True, alpha, beta)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 10, 17])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_bartlett_matches_aten(self, window_length, periodic):
+        result = decompositions.bartlett_window_decomposition(window_length, periodic)
+        expected = torch.ops.aten.bartlett_window.periodic(window_length, periodic)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 10, 17])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_blackman_matches_aten(self, window_length, periodic):
+        result = decompositions.blackman_window_decomposition(window_length, periodic)
+        expected = torch.ops.aten.blackman_window.periodic(window_length, periodic)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("window_length", [0, 1, 2, 5, 10, 17])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_kaiser_matches_aten(self, window_length, periodic):
+        result = decompositions.kaiser_window_decomposition(window_length, periodic)
+        expected = torch.ops.aten.kaiser_window.periodic(window_length, periodic)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("beta", [12.0, 8.0, 5.0, 0.5])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_kaiser_beta_matches_aten(self, beta, periodic):
+        result = decompositions.kaiser_window_decomposition(14, periodic, beta)
+        expected = torch.ops.aten.kaiser_window.beta(14, periodic, beta)
+        torch.testing.assert_close(result, expected)
+
+    def test_default_is_periodic(self):
+        """The base overload (no periodic arg) defaults to periodic=True."""
+        result = decompositions.hann_window_decomposition(10)
+        expected = torch.ops.aten.hann_window.default(10)
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.hann_window.default,
+            torch.ops.aten.hann_window.periodic,
+            torch.ops.aten.hamming_window.default,
+            torch.ops.aten.hamming_window.periodic_alpha,
+            torch.ops.aten.hamming_window.periodic_alpha_beta,
+            torch.ops.aten.bartlett_window.default,
+            torch.ops.aten.blackman_window.default,
+            torch.ops.aten.kaiser_window.default,
+            torch.ops.aten.kaiser_window.beta,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestWindowFunctionDecompositionsE2E:
+    """E2E tests driving the window functions through torch.compile(backend='neuron').
+
+    Exercises the full interception -> trace -> torch-mlir lowering -> execute
+    path on device (the direct-call tests above only check decomposition math),
+    and compares against the CPU aten reference. Windows are factory ops, so the
+    compiled fn constructs the window directly on the neuron device.
+    """
+
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_hann_e2e(self, periodic):
+        def fn():
+            return torch.ops.aten.hann_window.periodic(16, periodic, device="neuron")
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.hann_window.periodic(16, periodic)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_hamming_e2e(self, periodic):
+        def fn():
+            return torch.ops.aten.hamming_window.periodic(16, periodic, device="neuron")
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.hamming_window.periodic(16, periodic)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_hamming_alpha_beta_e2e(self):
+        def fn():
+            return torch.ops.aten.hamming_window.periodic_alpha_beta(
+                16, True, 0.6, 0.4, device="neuron"
+            )
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.hamming_window.periodic_alpha_beta(16, True, 0.6, 0.4)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_bartlett_e2e(self, periodic):
+        def fn():
+            return torch.ops.aten.bartlett_window.periodic(16, periodic, device="neuron")
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.bartlett_window.periodic(16, periodic)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_blackman_e2e(self, periodic):
+        def fn():
+            return torch.ops.aten.blackman_window.periodic(16, periodic, device="neuron")
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.blackman_window.periodic(16, periodic)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("beta", [12.0, 8.0, 5.0])
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_kaiser_e2e(self, periodic, beta):
+        def fn():
+            return torch.ops.aten.kaiser_window.beta(16, periodic, beta, device="neuron")
+
+        result = torch.compile(fn, backend="neuron")()
+        expected = torch.ops.aten.kaiser_window.beta(16, periodic, beta)
+        # Kaiser uses a polynomial I0 approximation (aten.i0 does not lower);
+        # accurate to ~1e-6, so a slightly looser tolerance than the others.
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSoftMarginLossDecompositionE2E:
     """E2E tests for soft_margin_loss decomposition"""
