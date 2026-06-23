@@ -356,6 +356,14 @@ ATEN_CONV_BACKWARD_NRT_CORRUPTION = [
 ]
 
 
+# PT2.12 - non-reentrant checkpoint(DataParallel) hits CUDA-only
+# torch._C._scatter. Skip (not xfail): its body leaks a recompute frame
+# into the worker, later crashing test_full_backward_hook_double_backward.
+ATEN_CHECKPOINT_DATAPARALLEL_LEAK = [
+    "test_autograd.py::TestAutograd::test_checkpointing_without_reentrant_dataparallel",
+]
+
+
 # test_dtypes variants that segfault in torch-mlir's context_init_hook
 # during convert_fx_to_stablehlo on the backward pass. Reproduces across
 # all nightly and PT 2.11 runs. Root cause not yet identified.

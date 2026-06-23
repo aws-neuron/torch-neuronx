@@ -185,6 +185,15 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "PT2.12 - non-reentrant checkpoint(DataParallel) hits CUDA-only"
+            " torch._C._scatter on Neuron. Must skip not xfail: running the body"
+            " leaks a recompute frame into the xdist worker, crashing the"
+            " subsequent test_full_backward_hook_double_backward"
+        ),
+        tests=s.ATEN_CHECKPOINT_DATAPARALLEL_LEAK,
+    ),
+    SkipGroup(
+        reason=(
             "Needs investigation: Skipping as these tests are hanging and the"
             " pytest timeout does not kill them"
         ),
