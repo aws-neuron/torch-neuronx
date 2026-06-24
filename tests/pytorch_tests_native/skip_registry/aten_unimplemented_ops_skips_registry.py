@@ -175,14 +175,14 @@ SKIP_GROUPS: list[SkipGroup] = [
         match_target="test_method",
     ),
     # ═══════════════════════════════════════════════════════════════
-    # NN ops not natively lowered on Neuron (42 ops).
+    # NN ops not natively lowered on Neuron (41 ops).
     # ═══════════════════════════════════════════════════════════════
     # Includes pooling variants (avg_pool1d/2d/3d + backward,
     # max_pool*_with_indices + backward, adaptive_max_pool2d/3d +
     # backward, fractional_max_pool2d/3d), fused RNN/LSTM cells
     # (_thnn_fused_gru_cell/backward, _thnn_fused_lstm_cell/backward_impl),
     # batch norm variants (_batch_norm_with_update,
-    # _native_batch_norm_legit[_functional], batch_norm_backward,
+    # _native_batch_norm_legit_functional, batch_norm_backward,
     # native_batch_norm), loss functions (binary_cross_entropy[_backward],
     # huber_loss, smooth_l1_loss, soft_margin_loss, multi_margin_loss,
     # nll_loss2d_forward/backward), upsample variants (upsample_bicubic2d,
@@ -199,7 +199,6 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         patterns=[
             "*__batch_norm_with_update_neuron*",
-            "*__native_batch_norm_legit_neuron*",
             "*__native_batch_norm_legit_functional_neuron*",
             "*__prelu_kernel_neuron*",
             "*__prelu_kernel_backward_neuron*",
