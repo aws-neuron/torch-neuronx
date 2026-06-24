@@ -47,10 +47,13 @@ def _validate_acos(x, out=None):
 
     Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
     dispatch path skips (it would otherwise silently cast the result into out).
+    acos promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
     """
-    if out is not None and out.dtype != x.dtype:
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
         raise RuntimeError(
-            f"Expected out tensor to have dtype {x.dtype}, but got {out.dtype} instead"
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
         )
 
 
