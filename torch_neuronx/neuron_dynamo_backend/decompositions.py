@@ -327,6 +327,38 @@ def unfold_decomp(self, dimension, size, step):
     return torch.stack(windows, dim=dimension)
 
 
+@register_decomposition([aten._adaptive_avg_pool2d_backward])
+def adaptive_avg_pool2d_backward_decomp(grad_output, self):
+    """Lower _adaptive_avg_pool2d_backward via two separable matmuls.
+
+    The native torch-mlir lowering only supports output sizes that divide
+    the input evenly; non-divisible sizes are marked illegal and hard-fail.
+    Adaptive avg-pool is separable over H and W, so the backward is
+    ``Wh @ grad_output @ Ww^T`` where each ``W`` maps an output index to the
+    input indices it averaged over, scaled by that pooling window's size.
+    This holds for divisible and non-divisible cases alike.
+    """
+    iH, iW = self.shape[-2], self.shape[-1]
+    oH, oW = grad_output.shape[-2], grad_output.shape[-1]
+    device, dtype = grad_output.device, grad_output.dtype
+
+    def _weight(o_size, i_size):
+        # W[i, o] = 1/window(o) if input index i fell in output o's window.
+        o_idx = torch.arange(o_size, device=device)
+        start = (o_idx * i_size) // o_size
+        end = ((o_idx + 1) * i_size + o_size - 1) // o_size  # ceil division
+        window = (end - start).to(dtype)
+        i_idx = torch.arange(i_size, device=device).unsqueeze(1)
+        mask = (i_idx >= start) & (i_idx < end)
+        return mask.to(dtype) / window
+
+    weight_h = _weight(oH, iH)  # (iH, oH)
+    weight_w = _weight(oW, iW)  # (iW, oW)
+    grad_input = torch.einsum("hq,...qw->...hw", weight_h, grad_output)
+    grad_input = torch.einsum("...hw,vw->...hv", grad_input, weight_w)
+    return grad_input
+
+
 @register_decomposition([aten.as_strided.default])
 def as_strided(input_tensor, size, stride, storage_offset=0):
     """
