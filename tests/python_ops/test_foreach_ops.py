@@ -1136,3 +1136,84 @@ def test_foreach_mul_promotes_0d_cpu_scalar():
     expected = [g.cpu() * s for g, s in zip(grads, minus_clr, strict=True)]
     for r, e in zip(result, expected, strict=True):
         torch.testing.assert_close(r.cpu(), e)
+
+
+# --- .out variant tests ---
+
+
+@pytest.mark.parametrize(
+    "op_name,variant,extra_args",
+    [
+        ("add", "Scalar_out", {"scalar": 1.0}),
+        ("sub", "Scalar_out", {"scalar": 1.0}),
+        ("mul", "Scalar_out", {"scalar": 2.0}),
+        ("div", "Scalar_out", {"scalar": 2.0}),
+        ("add", "ScalarList_out", {"scalars": [1.0, 2.0, 3.0]}),
+        ("sub", "ScalarList_out", {"scalars": [1.0, 2.0, 3.0]}),
+        ("mul", "ScalarList_out", {"scalars": [1.0, 2.0, 3.0]}),
+        ("div", "ScalarList_out", {"scalars": [1.0, 2.0, 3.0]}),
+        ("div", "List_out", {"tensors2": True}),
+        ("div", "Tensor_out", {"scalar_tensor": 2.0}),
+    ],
+)
+def test_foreach_out_variant(op_name, variant, extra_args):
+    """Test foreach .out variants produce same results as functional variant."""
+    tensors_cpu = [torch.randn(4, 8) for _ in range(3)]
+    tensors = [t.to("neuron") for t in tensors_cpu]
+    out = [torch.empty(4, 8, device="neuron") for _ in range(3)]
+
+    op = getattr(torch.ops.aten, f"_foreach_{op_name}")
+    overload = getattr(op, variant)
+    functional = getattr(op, variant.replace("_out", ""))
+
+    if "scalar" in extra_args:
+        ref = functional(tensors, extra_args["scalar"])
+        overload(tensors, extra_args["scalar"], out=out)
+    elif "scalars" in extra_args:
+        ref = functional(tensors, extra_args["scalars"])
+        overload(tensors, extra_args["scalars"], out=out)
+    elif "tensors2" in extra_args:
+        tensors2 = [torch.randn(4, 8, device="neuron") + 1.0 for _ in range(3)]
+        ref = functional(tensors, tensors2)
+        overload(tensors, tensors2, out=out)
+    elif "scalar_tensor" in extra_args:
+        scalar_tensor = torch.tensor(extra_args["scalar_tensor"], device="neuron")
+        ref = functional(tensors, scalar_tensor)
+        overload(tensors, scalar_tensor, out=out)
+
+    for i, t in enumerate(out):
+        assert t.shape == (4, 8)
+        torch.testing.assert_close(t.cpu(), ref[i].cpu())
+
+
+@pytest.mark.parametrize("op_name", ["addcdiv", "addcmul"])
+def test_foreach_addcop_scalarlist_out_variant(op_name):
+    """Test _foreach_addcdiv/addcmul.ScalarList_out produces same results as functional."""
+    self_tensors = [torch.randn(4, 8, device="neuron") for _ in range(3)]
+    tensor1 = [torch.randn(4, 8, device="neuron") for _ in range(3)]
+    tensor2 = [torch.randn(4, 8, device="neuron") + 1.0 for _ in range(3)]
+    scalars = [0.1, 0.2, 0.3]
+    out = [torch.empty(4, 8, device="neuron") for _ in range(3)]
+
+    op = getattr(torch.ops.aten, f"_foreach_{op_name}")
+    ref = op.ScalarList(self_tensors, tensor1, tensor2, scalars)
+    op.ScalarList_out(self_tensors, tensor1, tensor2, scalars, out=out)
+
+    for i, t in enumerate(out):
+        assert t.shape == (4, 8)
+        torch.testing.assert_close(t.cpu(), ref[i].cpu())
+
+
+def test_foreach_lerp_scalarlist_out_variant():
+    """Test _foreach_lerp.ScalarList_out produces same results as functional."""
+    self_tensors = [torch.randn(4, 8, device="neuron") for _ in range(3)]
+    end_tensors = [torch.randn(4, 8, device="neuron") for _ in range(3)]
+    weights = [0.1, 0.5, 0.9]
+    out = [torch.empty(4, 8, device="neuron") for _ in range(3)]
+
+    ref = torch.ops.aten._foreach_lerp.ScalarList(self_tensors, end_tensors, weights)
+    torch.ops.aten._foreach_lerp.ScalarList_out(self_tensors, end_tensors, weights, out=out)
+
+    for i, t in enumerate(out):
+        assert t.shape == (4, 8)
+        torch.testing.assert_close(t.cpu(), ref[i].cpu())
