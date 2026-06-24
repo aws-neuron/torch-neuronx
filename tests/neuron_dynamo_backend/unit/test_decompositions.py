@@ -6076,6 +6076,185 @@ class TestAllDimsDecompositionE2E:
         torch.testing.assert_close(result.cpu(), fn(x_cpu))
 
 
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestScatterReduceDecompositionE2E:
+    """E2E tests for scatter.reduce / scatter.value_reduce decompositions."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.scatter.reduce in decompositions.neuron_decompositions
+        assert torch.ops.aten.scatter.value_reduce in decompositions.neuron_decompositions
+
+    # torch.scatter(reduce=...) accepts "add" / "multiply". The decomposition
+    # routes "add" to scatter_reduce.two(sum); "multiply" falls back to PyTorch
+    # (prod semantics differ), so only "add" is exercised here -- and "add" is
+    # the only reduce the shape registry / vertical suite uses.
+    @pytest.mark.parametrize("reduce", ["add"])
+    @pytest.mark.parametrize("dim", [0, 1])
+    def test_scatter_src_reduce_e2e(self, reduce, dim):
+        """scatter(reduce=...) with a tensor src via torch.compile."""
+        torch.manual_seed(0)
+
+        def fn(x, index, src):
+            return torch.scatter(x, dim, index, src, reduce=reduce)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(8, 8)
+        index_cpu = torch.randint(0, 8, (8, 8))
+        src_cpu = torch.randn(8, 8)
+
+        expected = fn(x_cpu, index_cpu, src_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), index_cpu.to("neuron"), src_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("reduce", ["add"])
+    def test_scatter_value_reduce_e2e(self, reduce):
+        """scatter(reduce=...) with a scalar value via torch.compile."""
+        torch.manual_seed(0)
+
+        def fn(x, index):
+            return torch.scatter(x, 0, index, 2.5, reduce=reduce)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(8, 8)
+        index_cpu = torch.randint(0, 8, (8, 8))
+
+        expected = fn(x_cpu, index_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), index_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestIndexReduceDecompositionE2E:
+    """E2E tests for index_reduce decomposition."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.index_reduce.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("reduce", ["prod", "amax", "amin", "mean"])
+    @pytest.mark.parametrize("include_self", [True, False])
+    def test_index_reduce_e2e(self, reduce, include_self):
+        """index_reduce via torch.compile, including the sparse (untouched-row) case."""
+        torch.manual_seed(0)
+
+        def fn(x, index, source):
+            return torch.index_reduce(x, 0, index, source, reduce, include_self=include_self)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        # 64 indices into 256 rows -> many rows untouched, exercising the
+        # untouched-row handling.
+        x_cpu = torch.randn(256, 256)
+        index_cpu = torch.randint(0, 256, (64,))
+        source_cpu = torch.randn(64, 256)
+
+        expected = fn(x_cpu, index_cpu, source_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), index_cpu.to("neuron"), source_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestDiagonalScatterDecompositionE2E:
+    """E2E tests for diagonal_scatter decomposition."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.diagonal_scatter.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("offset", [0, 1, -1])
+    def test_diagonal_scatter_2d_e2e(self, offset):
+        """diagonal_scatter on a 2-D matrix with varying offsets."""
+        torch.manual_seed(0)
+
+        def fn(x, src):
+            return torch.diagonal_scatter(x, src, offset=offset)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(8, 8)
+        diag_len = x_cpu.diagonal(offset=offset).shape[0]
+        src_cpu = torch.randn(diag_len)
+
+        expected = fn(x_cpu, src_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), src_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    def test_diagonal_scatter_batched_e2e(self):
+        """diagonal_scatter on a batched (3-D) tensor over dims (1, 2)."""
+        torch.manual_seed(0)
+
+        def fn(x, src):
+            return torch.diagonal_scatter(x, src, offset=0, dim1=1, dim2=2)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(4, 6, 6)
+        src_cpu = torch.randn(4, 6)
+
+        expected = fn(x_cpu, src_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), src_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestSegmentReduceDecompositionE2E:
+    """E2E tests for segment_reduce decomposition (lengths-based, axis 0)."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.segment_reduce.default in decompositions.neuron_decompositions
+
+    # The decomposition handles sum/mean (the reductions the shape registry
+    # exercises); max/min/prod return NotImplemented and fall back to PyTorch.
+    @pytest.mark.parametrize("reduce", ["sum", "mean"])
+    def test_segment_reduce_lengths_e2e(self, reduce):
+        """segment_reduce with lengths= along axis 0 via torch.compile."""
+        torch.manual_seed(0)
+
+        lengths_cpu = torch.tensor([2, 3, 1, 2])  # sums to 8 = data.shape[0]
+
+        def fn(data, lengths):
+            return torch.segment_reduce(data, reduce, lengths=lengths, axis=0)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        data_cpu = torch.randn(8, 16)
+
+        expected = fn(data_cpu, lengths_cpu)
+        result = compiled_fn(data_cpu.to("neuron"), lengths_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestSegmentReduceBackwardDecompositionE2E:
+    """E2E tests for _segment_reduce_backward decomposition (sum/mean)."""
+
+    def test_registered_in_decomposition_table(self):
+        assert (
+            torch.ops.aten._segment_reduce_backward.default in decompositions.neuron_decompositions
+        )
+
+    @pytest.mark.parametrize("reduce", ["sum", "mean"])
+    def test_segment_reduce_backward_e2e(self, reduce):
+        """Gradient of segment_reduce flows back correctly through torch.compile."""
+        torch.manual_seed(0)
+
+        lengths_cpu = torch.tensor([2, 3, 1, 2])  # sums to 8
+
+        def fn(data, lengths):
+            out = torch.segment_reduce(data, reduce, lengths=lengths, axis=0)
+            return out.sum()
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        data_cpu = torch.randn(8, 16, requires_grad=True)
+        data_neuron = data_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        fn(data_cpu, lengths_cpu).backward()
+        compiled_fn(data_neuron, lengths_cpu.to("neuron")).backward()
+
+        torch.testing.assert_close(data_neuron.grad.cpu(), data_cpu.grad, rtol=1e-3, atol=1e-3)
+
+
 class TestUpsampleNearest2dBackwardDecomposition:
     """Tests for the custom upsample_nearest2d_backward decomposition."""
 
