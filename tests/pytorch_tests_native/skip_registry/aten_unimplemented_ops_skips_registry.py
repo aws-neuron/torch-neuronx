@@ -216,7 +216,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_adaptive_max_pool3d_neuron*",
             "*_adaptive_max_pool3d_backward_neuron*",
             "*_avg_pool1d_neuron*",
-            "*_avg_pool2d_neuron*",
+            "*nn_functional_avg_pool2d_neuron*",
             "*_avg_pool2d_backward_neuron*",
             "*_avg_pool3d_neuron*",
             "*_avg_pool3d_backward_neuron*",
