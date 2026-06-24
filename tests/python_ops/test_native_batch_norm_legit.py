@@ -215,10 +215,17 @@ class TestNativeBatchNormLegit:
         running_mean_neuron = running_mean_cpu.clone().to("neuron")
         running_var_neuron = running_var_cpu.clone().to("neuron")
 
+        # Backprop a non-constant gradient. A plain out.sum() makes grad_weight =
+        # sum(normalized_input), which is ~0 per channel (normalized input is mean-0),
+        # so low-precision roundoff dominates and relative error is meaningless. Using
+        # a fixed random upstream gradient gives a genuine non-zero weight grad.
+        torch.manual_seed(0)
+        grad = torch.randn(n, c, h, w, dtype=dtype)
+
         out_cpu = torch.ops.aten._native_batch_norm_legit_functional(
             x_cpu, weight_cpu, bias_cpu, running_mean_cpu, running_var_cpu, True, 0.1, 1e-5
         )
-        out_cpu[0].sum().backward()
+        out_cpu[0].backward(grad)
 
         with track_neuron_ops():
             out_neuron = torch.ops.aten._native_batch_norm_legit_functional(
@@ -231,7 +238,7 @@ class TestNativeBatchNormLegit:
                 0.1,
                 1e-5,
             )
-            out_neuron[0].sum().backward()
+            out_neuron[0].backward(grad.to("neuron"))
         assert_op_runs_on_neuron("aten::_native_batch_norm_legit_functional")
         assert_op_runs_on_neuron("aten::native_batch_norm_backward")
 
@@ -364,3 +371,64 @@ class TestNativeBatchNormLegit:
 
         rtol, atol = _TOLERANCES[torch.bfloat16]
         torch.testing.assert_close(neuron_out[0].float().cpu(), cpu_out[0], rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_native_batch_norm_legit_no_stats(self, dtype):
+        """_native_batch_norm_legit.no_stats: training, no running stats tracked."""
+        torch.manual_seed(42)
+        n, c, h, w = 4, 8, 4, 4
+        input = torch.randn(n, c, h, w, dtype=dtype)
+        weight = torch.ones(c, dtype=dtype)
+        bias = torch.zeros(c, dtype=dtype)
+
+        cpu_out = torch.ops.aten._native_batch_norm_legit.no_stats(
+            input, weight, bias, True, 0.1, 1e-5
+        )
+
+        with track_neuron_ops():
+            neuron_out = torch.ops.aten._native_batch_norm_legit.no_stats(
+                input.to("neuron"),
+                weight.to("neuron"),
+                bias.to("neuron"),
+                True,
+                0.1,
+                1e-5,
+            )
+        assert_op_runs_on_neuron("aten::_native_batch_norm_legit.no_stats")
+
+        rtol, atol = _TOLERANCES[dtype]
+        torch.testing.assert_close(neuron_out[0].cpu(), cpu_out[0], rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_native_batch_norm_legit_no_stats_out_variant(self, dtype):
+        """_native_batch_norm_legit.no_stats_out dispatches to Neuron and writes outputs."""
+        torch.manual_seed(42)
+        n, c, h, w = 4, 8, 4, 4
+        input = torch.randn(n, c, h, w, dtype=dtype, device="neuron")
+        weight = torch.ones(c, dtype=dtype, device="neuron")
+        bias = torch.zeros(c, dtype=dtype, device="neuron")
+
+        expected = torch.ops.aten._native_batch_norm_legit.no_stats(
+            input.cpu(), weight.cpu(), bias.cpu(), True, 0.1, 1e-5
+        )
+        out = torch.empty_like(expected[0], device="neuron")
+        save_mean = torch.empty_like(expected[1], device="neuron")
+        save_invstd = torch.empty_like(expected[2], device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten._native_batch_norm_legit.no_stats_out(
+                input,
+                weight,
+                bias,
+                True,
+                0.1,
+                1e-5,
+                out=out,
+                save_mean=save_mean,
+                save_invstd=save_invstd,
+            )
+        assert_op_runs_on_neuron("aten::_native_batch_norm_legit.no_stats_out")
+
+        rtol, atol = _TOLERANCES[dtype]
+        torch.testing.assert_close(result[0].cpu(), expected[0], rtol=rtol, atol=atol)
+        torch.testing.assert_close(out.cpu(), expected[0], rtol=rtol, atol=atol)

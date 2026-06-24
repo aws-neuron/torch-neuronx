@@ -266,10 +266,19 @@ def torch_native_batch_norm_legit_functional(
     )
 
 
+def _validate_batch_norm_out(input, *args, out=None, **kwargs):
+    """Reject an out tensor whose dtype doesn't match the input (unsafe cast)."""
+    if out is not None and out.dtype != input.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {input.dtype}, but got {out.dtype} instead"
+        )
+
+
 @register_aten(
     ["aten::_native_batch_norm_legit", "aten::_native_batch_norm_legit.out"],
     static_argnums=(5, 6, 7),
     output_params=("out", "save_mean", "save_invstd"),
+    validate_static_inputs=_validate_batch_norm_out,
 )
 def torch_native_batch_norm_legit(
     input,
@@ -286,6 +295,31 @@ def torch_native_batch_norm_legit(
 ):
     return torch.ops.aten._native_batch_norm_legit(
         input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+
+
+@register_aten(
+    [
+        "aten::_native_batch_norm_legit.no_stats",
+        "aten::_native_batch_norm_legit.no_stats_out",
+    ],
+    static_argnums=(3, 4, 5),
+    output_params=("out", "save_mean", "save_invstd"),
+    validate_static_inputs=_validate_batch_norm_out,
+)
+def torch_native_batch_norm_legit_no_stats(
+    input,
+    weight,
+    bias,
+    training,
+    momentum,
+    eps,
+    out=None,
+    save_mean=None,
+    save_invstd=None,
+):
+    return torch.ops.aten._native_batch_norm_legit.no_stats(
+        input, weight, bias, training, momentum, eps
     )
 
 
