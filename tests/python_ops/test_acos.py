@@ -54,6 +54,33 @@ class TestAcos:
             torch.testing.assert_close(out.cpu(), expected)
             assert_op_runs_on_neuron("aten::acos")
 
+    @pytest.mark.parametrize(
+        "dtype", [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8]
+    )
+    def test_acos_integer_input_promotes_out(self, device, dtype):
+        """acos promotes integer input to float; a float32 out= must be accepted.
+
+        Regression for the out= validate rejecting a correctly-typed (promoted)
+        out tensor when the input is integer, which surfaced as test_meta
+        "Original OpInfo is broken" failures.
+        """
+        with track_neuron_ops():
+            x = torch.ones(4, dtype=dtype, device=device)
+            out = torch.empty(4, dtype=torch.get_default_dtype(), device=device)
+            torch.acos(x, out=out)
+
+            expected = torch.acos(x.cpu())
+            assert out.dtype == torch.get_default_dtype()
+            torch.testing.assert_close(out.cpu(), expected)
+            assert_op_runs_on_neuron("aten::acos")
+
+    def test_acos_out_dtype_mismatch_raises(self, device):
+        """A genuinely wrong out= dtype must still raise (guard not over-relaxed)."""
+        x = torch.tensor([0.5], dtype=torch.float32, device=device)
+        out = torch.empty(1, dtype=torch.float16, device=device)
+        with pytest.raises(RuntimeError, match="dtype"):
+            torch.acos(x, out=out)
+
     def test_acos_empty_tensor(self, device):
         """Test acos with empty tensor (numel=0)."""
         with track_neuron_ops():
