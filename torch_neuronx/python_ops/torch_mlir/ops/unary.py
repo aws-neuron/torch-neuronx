@@ -42,6 +42,28 @@ def torch_sin(x, out=None):
     return torch.sin(x)
 
 
+def _validate_acos(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    """
+    if out is not None and out.dtype != x.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {x.dtype}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::acos", "aten::acos.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_acos,
+)
+def torch_acos(x, out=None):
+    """Inverse cosine (arccos) — elementwise transcendental."""
+    return torch.acos(x)
+
+
 @register_aten(["aten::exp", "aten::exp.out"])
 def torch_exp(x, out=None):
     return torch.exp(x)

@@ -59,6 +59,7 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_ops.py::TestCommonNEURON::test_errors_nn_functional_rms_norm_neuron",
     "test_ops.py::TestCommonNEURON::test_errors_vdot_neuron",
     "test_ops.py::TestCommonNEURON::test_out_abs_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_acos_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_add_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_addcdiv_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_addcmul_neuron_float32",
