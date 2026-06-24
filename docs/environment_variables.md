@@ -53,6 +53,8 @@ Compiled NEFFs and lowered HLO entries are cached on disk to avoid recompilation
 | `TORCH_NEURONX_NEFF_DISABLE_CACHE` | bool | `False` | When `1`, disables the persistent NEFF cache entirely. Every compile runs fresh. |
 | `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT` | int | `1200` | Seconds to wait for the per-key compile lock before giving up. |
 | `TORCH_NEURONX_NEFF_KEY_FROM_HLO` | bool | `False` | When `1`, the persistent NEFF key is derived from the lowered HLO bytes plus compiler config (instead of the in-memory base_key). Lets benign Python edits re-trace and re-lower without busting the on-disk cache. Off by default; opt in to enable. |
+| `TORCH_CACHING_PRECOMPILE` | bool | `False` | When `1`, enable the PyTorch Dynamo precompile cache, which caches the backend result of the dynamo trace of any torch.compile-ed modules or functions. These will be automatically saved at TORCHINDUCTOR_CACHE_DIR (which is by default /tmp/torchinductor_<username>/) split by subdirectories per rank if applicable. For the neuron backend the HLO result will be cached, separate from the HLO cache. The TORCHINDUCTOR_CACHE_DIR should be deleted to clear this cache. Off by default. |
+| `TORCHINDUCTOR_CACHE_DIR` | path | `/tmp/torchinductor_<username>/` | Directory for the torch inductor cache. Note that this is a PyTorch variable, and affects the location of other caches as well. Please refer to the PyTorch documentation for details on other caches. |
 
 ## General
 
