@@ -2264,6 +2264,349 @@ def select_scatter_decomposition(input, src, dim, index):
     return torch.ops.aten.select_scatter.default(input, src, dim, index)
 
 
+def _scatter_reduce_via_scatter_reduce_two(input, dim, index, src, reduce):
+    """Route aten.scatter(reduce="add") to aten.scatter_reduce.two(reduce="sum").
+
+    torch-mlir lowers `scatter_reduce.two` but not the reduce variants of
+    `scatter`. For "add" the two ops are equivalent (include_self=True keeps
+    the original input value in the sum).
+
+    "multiply" is intentionally NOT routed: scatter(reduce="multiply") and
+    scatter_reduce(reduce="prod") differ in how repeated indices and the self
+    value combine, which produced wrong results on Neuron. Return
+    NotImplemented for it so it falls back to PyTorch. The shape registry only
+    exercises reduce="add", so this covers the tested path.
+    """
+    if reduce != "add":
+        return NotImplemented
+    return torch.ops.aten.scatter_reduce.two(input, dim, index, src, "sum", include_self=True)
+
+
+@register_decomposition([aten.scatter.reduce])
+def scatter_reduce_tensor_decomposition(input, dim, index, src, reduce):
+    """Decompose scatter.reduce to scatter_reduce.two.
+
+    torch-mlir lacks a lowering for `aten.scatter.reduce`; route through
+    `aten.scatter_reduce.two`, which is supported.
+    """
+    if isinstance(src, torch.Tensor) and src.dim() == 0:
+        src = src.expand_as(index)
+    return _scatter_reduce_via_scatter_reduce_two(input, dim, index, src, reduce)
+
+
+@register_decomposition([aten.scatter.value_reduce])
+def scatter_value_reduce_decomposition(input, dim, index, value, reduce):
+    """Decompose scatter.value_reduce to scatter_reduce.two with a tensor src."""
+    src = torch.full_like(index, value, dtype=input.dtype)
+    return _scatter_reduce_via_scatter_reduce_two(input, dim, index, src, reduce)
+
+
+@register_decomposition([aten.index_reduce.default])
+def index_reduce_decomposition(input, dim, index, source, reduce, include_self=True):
+    """Decompose index_reduce by reducing each source row into the indexed
+    output position with the requested reduction.
+
+    `index_reduce(self, dim, index, source, reduce, include_self=True)` semantics:
+    - `index` is 1-D of length `source.shape[dim]`.
+    - For each `i`: out[..., index[i], ...] = reduce(out[..., index[i], ...],
+      source[..., i, ...]).
+    - `include_self=True` keeps the original `self` value as a participant in
+      the reduction; `include_self=False` first overwrites positions that any
+      index targets with the reduction identity.
+    - Indices may repeat — those source rows accumulate together.
+
+    We implement this via a Python loop over the source axis (size is small —
+    typically a few hundred rows), each step doing a functional `index_copy`-
+    like reduce. This avoids the `scatter_reduce.two` overload mismatch that
+    produced wrong results for untouched positions.
+    """
+    if dim < 0:
+        dim += input.ndim
+
+    n = source.shape[dim]
+
+    # Reduction identity for filling positions that any index targets when
+    # include_self=False.
+    identity_map = {
+        "prod": 1.0,
+        "amax": float("-inf"),
+        "amin": float("inf"),
+        "mean": 0.0,
+    }
+
+    out = input
+    if not include_self:
+        # Mask of touched positions along `dim`.
+        touched = torch.zeros(input.shape[dim], dtype=torch.bool, device=input.device)
+        touched = touched.index_fill(0, index.to(torch.long), True)
+        view_shape = [1] * input.ndim
+        view_shape[dim] = -1
+        ident = identity_map.get(reduce, 0.0)
+        out = torch.where(
+            touched.view(view_shape),
+            torch.full_like(input, ident),
+            input,
+        )
+
+    # For mean we need sums + counts; everything else is a one-shot reduction.
+    if reduce == "mean":
+        # Build per-row sums on top of `out` (which already has identity in touched
+        # rows when include_self=False, or original self when True).
+        # sum_view holds running sums; we add source rows into self[index[i]].
+        sum_view = out
+        # Build full broadcast index for scatter_add.
+        idx_shape = [1] * source.ndim
+        idx_shape[dim] = -1
+        idx_full = index.to(torch.long).view(idx_shape).expand_as(source)
+        sum_view = sum_view.scatter_add(dim, idx_full, source)
+
+        # Per-target counts; +1 if include_self=True at touched rows.
+        counts = torch.zeros(input.shape[dim], dtype=input.dtype, device=input.device)
+        counts = counts.scatter_add(
+            0, index.to(torch.long), torch.ones(n, dtype=input.dtype, device=input.device)
+        )
+        if include_self:
+            # +1 for self at every position that has at least one index targeting it.
+            touched = (counts > 0).to(input.dtype)
+            counts = counts + touched
+        # Avoid div-by-zero at untouched positions (they keep self anyway).
+        denom_view = [1] * input.ndim
+        denom_view[dim] = -1
+        denom = torch.clamp(counts, min=1.0).view(denom_view)
+        result = sum_view / denom
+
+        if include_self:
+            # Untouched positions: keep input as-is (we divided by 1, but the
+            # numerator at those rows is also just `input`, so no change needed).
+            return result
+        else:
+            # Untouched positions: should remain as original input (PyTorch
+            # leaves them alone when include_self=False).
+            count_full = counts.view(denom_view).expand_as(input)
+            return torch.where(count_full > 0, result, input)
+
+    # prod / amax / amin: iterate the source axis. Small n keeps this cheap.
+    src_chunks = torch.unbind(source, dim=dim)
+    for i in range(n):
+        # Slice source row along `dim`, then expand back via index_copy-style scatter.
+        src_row = src_chunks[i].unsqueeze(dim)  # shape with size 1 along `dim`
+        target_idx = index[i : i + 1].to(torch.long)
+        # Pull out the current value at the target row, reduce with src_row,
+        # write back via index_copy.
+        cur_row = out.index_select(dim, target_idx)
+        if reduce == "prod":
+            new_row = cur_row * src_row
+        elif reduce == "amax":
+            new_row = torch.maximum(cur_row, src_row)
+        elif reduce == "amin":
+            new_row = torch.minimum(cur_row, src_row)
+        else:
+            return NotImplemented
+        out = out.index_copy(dim, target_idx, new_row)
+
+    return out
+
+
+@register_decomposition([aten.diagonal_scatter.default])
+def diagonal_scatter_decomposition(input, src, offset=0, dim1=0, dim2=1):
+    """Decompose diagonal_scatter via flat-index scatter.
+
+    diagonal_scatter writes `src` into the diagonal of (a copy of) `input`
+    selected by (offset, dim1, dim2). We compute the flat positions in `input`
+    that the diagonal would occupy, then scatter `src` into those positions.
+    """
+    if dim1 < 0:
+        dim1 += input.ndim
+    if dim2 < 0:
+        dim2 += input.ndim
+
+    # Length of the diagonal along the (dim1, dim2) plane.
+    d1 = input.shape[dim1]
+    d2 = input.shape[dim2]
+    if offset >= 0:
+        diag_len = max(0, min(d1, d2 - offset))
+        i_start, j_start = 0, offset
+    else:
+        diag_len = max(0, min(d1 + offset, d2))
+        i_start, j_start = -offset, 0
+
+    if diag_len == 0:
+        return input.clone()
+
+    # Compute strides for `input` to map (multi-index) → flat index.
+    strides = []
+    s = 1
+    for size in reversed(input.shape):
+        strides.insert(0, s)
+        s *= size
+    stride1 = strides[dim1]
+    stride2 = strides[dim2]
+
+    diag_arange = torch.arange(diag_len, device=input.device, dtype=torch.long)
+    # Flat offset contributed by the (dim1, dim2) plane for each diagonal step.
+    diag_flat = (i_start + diag_arange) * stride1 + (j_start + diag_arange) * stride2
+
+    # Other dimensions form the "batch" axes that broadcast across the diagonal.
+    other_dims = [d for d in range(input.ndim) if d not in (dim1, dim2)]
+    other_shape = [input.shape[d] for d in other_dims]
+    other_strides = [strides[d] for d in other_dims]
+
+    if other_dims:
+        # Build a flat-index grid over the batch dims.
+        grids = []
+        for i, size in enumerate(other_shape):
+            view_shape = [1] * len(other_dims)
+            view_shape[i] = -1
+            grid = (
+                torch.arange(size, device=input.device, dtype=torch.long).view(view_shape)
+                * other_strides[i]
+            )
+            grids.append(grid)
+        batch_flat = grids[0]
+        for g in grids[1:]:
+            batch_flat = batch_flat + g
+        # Final shape: src has the batch dims followed by the diagonal length.
+        # Flat indices: batch_flat (broadcast) + diag_flat (last-dim).
+        full_indices = batch_flat.unsqueeze(-1) + diag_flat
+    else:
+        full_indices = diag_flat
+
+    # `src` from PyTorch is shaped [*other_dims, diag_len]; matches full_indices.
+    # Use functional torch.scatter (not scatter_) — aot_autograd requires
+    # an entirely functional graph.
+    flat_input = input.reshape(-1).contiguous()
+    flat_input = torch.scatter(flat_input, 0, full_indices.reshape(-1), src.reshape(-1))
+    return flat_input.reshape(input.shape)
+
+
+def _segment_reduce_offsets_decomposition(data, reduce, offsets, initial=None):
+    """Compute segment_reduce(data, reduce, offsets=offsets, initial=initial).
+
+    Reduces along dim 0 (PyTorch's segment_reduce always reduces axis 0).
+    Each segment i covers data[offsets[i]:offsets[i+1]]. Implemented via
+    a per-position segment id (cumsum of one-hot at each boundary), then
+    scatter_reduce into a result of shape [num_segments, *data.shape[1:]].
+    """
+    num_segments = offsets.numel() - 1
+    n = data.shape[0]
+
+    # segment_id[k] = number of boundaries <= k - 1 → 0..num_segments-1.
+    pos = torch.arange(n, device=data.device, dtype=offsets.dtype)
+    # Each row k: how many of offsets[1:] are ≤ k → that's its segment id.
+    segment_id = (pos.unsqueeze(1) >= offsets[1:].unsqueeze(0)).sum(dim=1)
+    segment_id = torch.clamp(segment_id, 0, num_segments - 1)
+
+    out_shape = (num_segments, *data.shape[1:])
+
+    if reduce == "sum":
+        init = 0.0 if initial is None else float(initial)
+        out = torch.full(out_shape, init, dtype=data.dtype, device=data.device)
+        idx = segment_id.view(-1, *([1] * (data.ndim - 1))).expand_as(data)
+        out = out.scatter_reduce(0, idx, data, "sum", include_self=(initial is not None))
+        return out
+
+    if reduce == "mean":
+        init = 0.0 if initial is None else float(initial)
+        sums = torch.full(out_shape, init, dtype=data.dtype, device=data.device)
+        idx = segment_id.view(-1, *([1] * (data.ndim - 1))).expand_as(data)
+        sums = sums.scatter_reduce(0, idx, data, "sum", include_self=(initial is not None))
+        counts = torch.zeros(num_segments, dtype=data.dtype, device=data.device)
+        counts = counts.scatter_add(0, segment_id, torch.ones_like(segment_id, dtype=data.dtype))
+        counts = counts.view(num_segments, *([1] * (data.ndim - 1)))
+        return sums / torch.clamp(counts, min=1.0)
+
+    # max/min/prod via scatter_reduce produced incorrect results on Neuron
+    # (identity-fill + include_self semantics did not match segment_reduce).
+    # Return NotImplemented so these fall back to PyTorch's kernel; sum/mean
+    # (the reductions exercised by the shape registry) are handled above.
+    return NotImplemented
+
+    return NotImplemented
+
+
+@register_decomposition([aten.segment_reduce.default])
+def segment_reduce_decomposition(
+    data,
+    reduce,
+    *,
+    lengths=None,
+    indices=None,
+    offsets=None,
+    axis=0,
+    unsafe=False,
+    initial=None,
+):
+    """Decompose segment_reduce for axis 0, lengths= or offsets= modes.
+
+    Lengths mode: convert lengths → offsets via cumsum, then handle as offsets.
+    Indices mode is not handled (returns NotImplemented) — uncommon and falls
+    back to PyTorch's kernel when CPU fallback is allowed.
+    """
+    if axis != 0 or indices is not None:
+        return NotImplemented
+    if offsets is None and lengths is None:
+        return NotImplemented
+
+    if offsets is None:
+        # Convert lengths → offsets: offsets[0] = 0, offsets[i] = sum(lengths[:i]).
+        zero = torch.zeros(1, dtype=lengths.dtype, device=lengths.device)
+        offsets = torch.cat([zero, torch.cumsum(lengths, dim=0)])
+
+    return _segment_reduce_offsets_decomposition(data, reduce, offsets, initial)
+
+
+@register_decomposition([aten._segment_reduce_backward.default])
+def _segment_reduce_backward_decomposition(
+    grad,
+    output,
+    data,
+    reduce,
+    *,
+    lengths=None,
+    offsets=None,
+    axis=0,
+    initial=None,
+):
+    """Decompose _segment_reduce_backward for axis 0, lengths= or offsets= modes.
+
+    For `sum`: grad flows uniformly to all positions in each segment.
+    For `mean`: grad / segment_length to every position in each segment.
+    Other reductions (max/min/prod) require argmax-style routing that we
+    skip for now and return NotImplemented (PyTorch handles those via
+    register_meta + the eager kernel when CPU fallback is allowed).
+    """
+    if axis != 0:
+        return NotImplemented
+    if offsets is None and lengths is None:
+        return NotImplemented
+    if reduce not in ("sum", "mean"):
+        return NotImplemented
+
+    if offsets is None:
+        zero = torch.zeros(1, dtype=lengths.dtype, device=lengths.device)
+        offsets = torch.cat([zero, torch.cumsum(lengths, dim=0)])
+
+    num_segments = offsets.numel() - 1
+    n = data.shape[0]
+    pos = torch.arange(n, device=data.device, dtype=offsets.dtype)
+    segment_id = (pos.unsqueeze(1) >= offsets[1:].unsqueeze(0)).sum(dim=1)
+    segment_id = torch.clamp(segment_id, 0, num_segments - 1)
+
+    # Pull the per-segment grad back into per-position gradients.
+    idx = segment_id.view(-1, *([1] * (data.ndim - 1))).expand_as(data)
+    grad_data = torch.gather(grad, 0, idx)
+
+    if reduce == "mean":
+        counts = torch.zeros(num_segments, dtype=data.dtype, device=data.device)
+        counts = counts.scatter_add(0, segment_id, torch.ones_like(segment_id, dtype=data.dtype))
+        counts = torch.clamp(counts, min=1.0)
+        per_pos_count = torch.gather(counts, 0, segment_id)
+        per_pos_count = per_pos_count.view(-1, *([1] * (data.ndim - 1)))
+        grad_data = grad_data / per_pos_count
+
+    return grad_data
+
+
 @register_decomposition([aten.argsort.default, aten.argsort.stable])
 def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     """Decompose argsort to sort"""
