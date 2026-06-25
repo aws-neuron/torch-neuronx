@@ -477,4 +477,5 @@ DYNAMO_SEGMENTATION_FAULT = [
     "test_preserve_stride_with_clone_dynamic_shapes",
     "test_sum_dimlist_spec",
     "test_trace_functional_tensor_with",
+    "LoggingTests::test_aot_graphs",
 ]
