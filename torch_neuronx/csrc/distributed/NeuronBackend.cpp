@@ -181,6 +181,19 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
   int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, working_outputs);
   auto [input_refs, input_contexts] =
       torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
+
+  // Swap each non-contiguous output for a contiguous temp the kernel can write into,
+  // tracking which we replaced, so result can be copied back into the caller's tensor.
+  std::vector<bool> output_made_contiguous(working_outputs.size(), false);
+  for (size_t i = 0; i < working_outputs.size(); ++i) {
+    auto& out = working_outputs[i];
+    if (out.defined() && !out.is_contiguous()) {
+      working_outputs[i] = torch::empty(out.sizes().vec(),
+                                        out.options().memory_format(c10::MemoryFormat::Contiguous));
+      output_made_contiguous[i] = true;
+    }
+  }
+
   auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(working_outputs);
 
   auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
@@ -195,16 +208,20 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
   auto stream = at::neuron::getCurrentNeuronStream();
   at::neuron::SubmitOperationContext(stream, std::move(context));
 
-  if (outputs_downcasted) {
-    for (size_t i = 0; i < original_outputs.size(); ++i) {
-      auto orig = original_outputs[i];
-      if (!orig.defined()) continue;
-      if (i >= working_outputs.size() || !working_outputs[i].defined()) continue;
-      if (orig.scalar_type() == working_outputs[i].scalar_type()) continue;
-      dispatch::CopyBackToOriginal(
-          orig, working_outputs[i],
-          std::string("SubmitInNeffCollective upcast idx=") + std::to_string(i));
-    }
+  // Copy results back into the caller's tensor for any output we replaced:
+  // restore original dtype (undo downcast) and/or write the contiguous temp
+  // into the original non-contiguous dst. No-op otherwise.
+  for (size_t i = 0; i < original_outputs.size(); ++i) {
+    auto orig = original_outputs[i];
+    if (!orig.defined()) continue;
+    if (i >= working_outputs.size() || !working_outputs[i].defined()) continue;
+    const bool dtype_changed =
+        outputs_downcasted && orig.scalar_type() != working_outputs[i].scalar_type();
+    const bool layout_changed = output_made_contiguous[i];
+    if (!dtype_changed && !layout_changed) continue;
+    dispatch::CopyBackToOriginal(
+        orig, working_outputs[i],
+        std::string("SubmitInNeffCollective copy-back idx=") + std::to_string(i));
   }
 }
 

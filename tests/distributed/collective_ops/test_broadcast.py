@@ -330,6 +330,51 @@ def run_requires_grad_tensor_test(rank: int, world_size: int, kwargs: dict[str, 
     assert tensor_neuron.requires_grad, "requires_grad should still be True after broadcast"
 
 
+def run_channels_last_test(rank: int, world_size: int, kwargs: dict[str, Any]):
+    """Test broadcast on a non-contiguous (channels_last) tensor.
+
+    channels_last tensor reaches the collective backend as a non-contiguous input/output.
+    Prologue/epilogue should handle it, and preserves the channels_last layout in result.
+    """
+    shape: tuple = kwargs["shape"]
+    src: int = 0
+    tensor: torch.Tensor = (torch.ones(shape) * -1).to(memory_format=torch.channels_last)
+    if rank == src:
+        tensor = (torch.ones(shape) * 42).to(memory_format=torch.channels_last)
+
+    tensor_neuron: torch.Tensor = tensor.to("neuron")
+    assert not tensor_neuron.is_contiguous()
+
+    dist.broadcast(tensor_neuron, src=src)
+
+    expected: torch.Tensor = torch.ones(shape) * 42
+    assert torch.equal(tensor_neuron.cpu(), expected)
+    # Layout must be preserved: the result still views as channels_last.
+    assert tensor_neuron.is_contiguous(memory_format=torch.channels_last)
+
+
+def run_transposed_view_test(rank: int, world_size: int, kwargs: dict[str, Any]):
+    """Test broadcast through a transposed (non-contiguous) view."""
+    base_shape: tuple = kwargs["base_shape"]
+    src: int = 0
+    numel: int = 1
+    for d in base_shape:
+        numel *= d
+
+    if rank == src:
+        base = torch.arange(numel, dtype=torch.float32).reshape(base_shape)
+    else:
+        base = torch.zeros(numel, dtype=torch.float32).reshape(base_shape)
+
+    expected = torch.arange(numel, dtype=torch.float32).reshape(base_shape).t().contiguous()
+
+    view = base.to("neuron").t()
+    assert not view.is_contiguous()
+
+    dist.broadcast(view, src=src)
+    assert torch.equal(view.cpu(), expected), f"Rank {rank}: {view.cpu()} != {expected}"
+
+
 class TestBroadcast(BaseCollectiveOpTest):
     """Test cases for torch.distributed.broadcast."""
 
@@ -344,6 +389,20 @@ class TestBroadcast(BaseCollectiveOpTest):
         int32, int64, bfloat16).
         """
         self.distributed_tester.run_test(run_different_dtype_test, dtype=dtype)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(2, 16, 8, 12), (1, 4, 4, 4), (2, 3, 4, 5)],
+        ids=["c10d_repro", "small", "generic"],
+    )
+    def test_channels_last(self, shape: tuple):
+        """Broadcast a non-contiguous channels_last tensor."""
+        self.distributed_tester.run_test(run_channels_last_test, shape=shape)
+
+    @pytest.mark.parametrize("base_shape", [(4, 6), (8, 3), (5, 5)], ids=["4x6", "8x3", "square"])
+    def test_transposed_view(self, base_shape: tuple):
+        """Broadcast through a transposed (non-contiguous) view."""
+        self.distributed_tester.run_test(run_transposed_view_test, base_shape=base_shape)
 
     @pytest.mark.parametrize("shape", [(10,), (10, 20), (5, 5, 5), (2, 3, 4, 5)])
     def test_different_shapes(self, shape: tuple):
