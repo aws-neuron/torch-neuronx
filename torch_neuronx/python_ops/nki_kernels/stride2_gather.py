@@ -9,7 +9,7 @@ Balanced flat tiling
 --------------------
 Gather/scatter is purely element-wise over a flat contiguous int32 pair-stream,
 so the logical tensor shape is irrelevant to correctness. We exploit that to
-flatten the stream to ``numel`` pairs and tile it as balanced ``[P_MAX, F]``
+flatten the stream to ``numel`` pairs and tile it as balanced ``[P_MAX, F_SIZE]``
 blocks via NKI access patterns (``.ap``), regardless of the logical shape. This
 keeps the partition dimension full (128) for the bulk of any tensor, fixing the
 shape-dependent under-utilization of a logical-shape factorization (e.g. a
@@ -19,22 +19,38 @@ balanced ``(1024, 1024)``). A ``<P_MAX`` remainder is handled by a separate tail
 tile (the standard fused_adam pattern). Performance is now shape-independent for
 a given element count.
 
-Per tile (gather):
+Per tile:
   1. burst-load the contiguous packed block ``[P_MAX, 2F]`` HBM -> SBUF via
      ``.ap`` (free stride 1, so HBM reads coalesce into bursts),
-  2. select the parity lane on chip via an SBUF -> SBUF ``nisa.dma_copy``
-     (pure data movement; bit-exact for int32),
-  3. burst-store the contiguous result ``[P_MAX, F]`` SBUF -> HBM via ``.ap``.
+  2. select the parity lane on chip (SBUF -> SBUF), then
+  3. burst-store the contiguous result ``[P_MAX, F_SIZE]`` SBUF -> HBM via ``.ap``.
 
-Two constraints, learned empirically:
-  - The on-chip lane select must use ``nisa.dma_copy``, NOT ``nl.copy``.
-    ``nl.copy`` routes through a compute engine that rounds int32 through an fp32
-    path and corrupts the low bits.
+On-chip lane select engine:
+  - The gather selects the lane with ``nisa.tensor_copy`` on the **Vector
+    Engine** (reading the strided source ``pk[:, parity::2]``). On the Vector
+    Engine tensor_copy is a bit-accurate copy when src/dst dtypes match
+    (int32==int32). It is the fastest option measured (~2x faster than a GpSimd
+    ``nc_n_gather`` select, ~4x faster than a strided ``dma_copy`` select),
+    because the Vector Engine does the select while the DMA engines overlap the
+    HBM bursts.
+  - The scatter writes the lane with ``nisa.dma_copy`` (SBUF -> SBUF strided
+    store into the packed block, preserving the other lane).
+
+Constraints, learned empirically:
+  - The on-chip select must NOT use ``nl.copy``: it routes through the Scalar
+    Engine, which casts int32 through fp32 and corrupts the low bits. Use
+    ``nisa.tensor_copy(engine=vector)`` (or ``dma_copy``), which are bit-exact
+    for matching int32 dtypes.
   - The lane select is done on chip (SBUF), never as a strided HBM read. A
     strided HBM read of every-other int32 cannot coalesce into bursts (~0.5 GB/s).
+  - ``nc_n_gather`` (GpSimd) also works and is bit-exact, but it decomposes into
+    ceil(elems_per_partition / 512) ISA groups and corrupts later tiles when two
+    or more multi-group calls are chained (ticket V2245128914), forcing a
+    F<=512 cap. ``tensor_copy(vector)`` has no such limit and is faster, so it is
+    preferred.
 
 Naming follows the NKI partition/free convention: ``P_MAX`` is the partition
-dimension (hardware-parallel, == 128) and ``F`` is the free-dimension tile width.
+dimension (hardware-parallel, == 128) and ``F_SIZE`` is the free-dimension tile width.
 """
 
 from __future__ import annotations
@@ -48,18 +64,9 @@ from torch_neuronx.utils import get_logical_neuron_cores
 # Partition dimension: the hardware partition count.
 P_MAX = 128
 # Free-dimension tile width, in *pairs*, for the SCATTER kernel (dma_copy-based
-# lane write). Bounds the SBUF staging buffer to P_MAX * 2 * F int32 elements.
+# lane write). Bounds the SBUF staging buffer to P_MAX * 2 * F_SIZE int32 elements.
 # Performance is insensitive above ~512; 2048 keeps the launch count low.
-F = 2048
-# Free-dimension tile width for the GATHER kernel, which selects the lane on
-# chip with nisa.nc_n_gather (GpSimd) — ~3.4-4.5x faster than the dma_copy select.
-#
-# Must stay <= 512. nc_n_gather decomposes into n = ceil(elems_per_partition / 512)
-# ISA groups. On Trn2 there is a GpSimd bug: when a kernel chains two or more
-# nc_n_gather calls, the second-and-later call only produces its first ISA group
-# correctly and zeros the rest. F <= 512 forces n == 1 (always correct, any number
-# of chained tiles). Ticket V2245128914
-F_GATHER = 512
+F_SIZE = 2048
 
 LNC = int(get_logical_neuron_cores())
 
@@ -83,15 +90,23 @@ def stride2_flat_gather_kernel(packed_in, out, parity):
         out (written in place; also returned per NKI convention).
 
     Notes:
-        Balanced flat tiling: the stream is tiled as [P_MAX, F_GATHER] pair-blocks
+        Balanced flat tiling: the stream is tiled as [P_MAX, F_SIZE] pair-blocks
         independent of logical shape, so the partition dim is always full for
         the bulk. A <P_MAX remainder is handled by a separate tail tile.
 
-        Lane select uses nisa.nc_n_gather (GpSimd) rather than a strided
-        dma_copy: it is ~3.4-4.5x faster (GpSimd does the on-chip select, so the
-        DMA engines are free to overlap the HBM bursts) and bit-exact (no dtype
-        conversion). The per-partition indices [parity, parity+2, ...] are built
-        with nisa.iota.
+        Lane select uses nisa.tensor_copy on the Vector Engine, reading the
+        strided SBUF source ``pk[:, parity::2]`` and writing a contiguous tile.
+        On the Vector Engine tensor_copy is a bit-accurate copy when src/dst
+        dtypes match (int32==int32), so unlike nl.copy (Scalar Engine, which
+        casts through fp32 and corrupts int32) it preserves all 32 bits. The
+        Vector Engine does the on-chip select while the DMA engines overlap the
+        HBM bursts, and it is ~2x faster than the GpSimd nc_n_gather select and
+        ~4x faster than a strided dma_copy select.
+
+        (Vector tensor_copy has no multi-tile size limit — it is correct at
+        F=2048 across the full shape sweep. This is unlike nc_n_gather, which
+        decomposes into ceil(elems/512) ISA groups and corrupts later tiles when
+        chained at >1 group; ticket V2245128914.)
 
         SPMD: when launched with LNC2 the stream is split across the two
         programs (P_MAX-aligned per-program slice). With LNC1 there is a single
@@ -110,21 +125,20 @@ def stride2_flat_gather_kernel(packed_in, out, parity):
     core_n = max(core_n, 0)
 
     n_aligned = (core_n // P_MAX) * P_MAX
-    tile_pairs = P_MAX * F_GATHER
+    tile_pairs = P_MAX * F_SIZE
     num_tiles = div_ceil(n_aligned, tile_pairs) if n_aligned > 0 else 0
     tail = core_n - n_aligned
 
     for i in nl.affine_range(num_tiles):
         t0 = core_base + i * tile_pairs  # first pair index in this tile
-        masked_f = min(F_GATHER, (n_aligned - i * tile_pairs) // P_MAX)
+        masked_f = min(F_SIZE, (n_aligned - i * tile_pairs) // P_MAX)
         # 1. contiguous burst-load [P_MAX, 2*masked_f] packed pairs (free stride 1)
         pk = nl.ndarray((P_MAX, 2 * masked_f), dtype=packed_in.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=pk, src=packed_in.ap([[2 * masked_f, P_MAX], [1, 2 * masked_f]], 2 * t0))
-        # 2. on-chip lane select via GpSimd gather: indices [parity, parity+2, ...]
-        idx = nl.ndarray((P_MAX, masked_f), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.iota(idx, pattern=[[2, masked_f]], offset=parity)
+        # 2. on-chip lane select on the Vector Engine: read strided src[:, parity::2]
+        #    (bit-accurate int32 copy), write contiguous result.
         sel = nl.ndarray((P_MAX, masked_f), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.nc_n_gather(dst=sel, data=pk, indices=idx)
+        nisa.tensor_copy(dst=sel, src=pk[:, parity : 2 * masked_f : 2], engine=nisa.engine.vector)
         # 3. contiguous burst-store [P_MAX, masked_f] -> HBM
         nisa.dma_copy(dst=out.ap([[masked_f, P_MAX], [1, masked_f]], t0), src=sel)
 
@@ -132,10 +146,8 @@ def stride2_flat_gather_kernel(packed_in, out, parity):
         t0 = core_base + n_aligned
         pk = nl.ndarray((tail, 2), dtype=packed_in.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=pk, src=packed_in.ap([[2, tail], [1, 2]], 2 * t0))
-        idx = nl.ndarray((tail, 1), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.iota(idx, pattern=[[2, 1]], offset=parity)
         sel = nl.ndarray((tail, 1), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.nc_n_gather(dst=sel, data=pk, indices=idx)
+        nisa.tensor_copy(dst=sel, src=pk[:, parity : parity + 1], engine=nisa.engine.vector)
         nisa.dma_copy(dst=out.ap([[1, tail], [1, 1]], t0), src=sel)
 
     return out
@@ -175,13 +187,13 @@ def stride2_flat_scatter_kernel(packed_io, vals, parity):
     core_n = max(core_n, 0)
 
     n_aligned = (core_n // P_MAX) * P_MAX
-    tile_pairs = P_MAX * F
+    tile_pairs = P_MAX * F_SIZE
     num_tiles = div_ceil(n_aligned, tile_pairs) if n_aligned > 0 else 0
     tail = core_n - n_aligned
 
     for i in nl.affine_range(num_tiles):
         t0 = core_base + i * tile_pairs
-        masked_f = min(F, (n_aligned - i * tile_pairs) // P_MAX)
+        masked_f = min(F_SIZE, (n_aligned - i * tile_pairs) // P_MAX)
         # 1. burst-load the packed block (preserves the other lane)
         pk = nl.ndarray((P_MAX, 2 * masked_f), dtype=packed_io.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=pk, src=packed_io.ap([[2 * masked_f, P_MAX], [1, 2 * masked_f]], 2 * t0))
