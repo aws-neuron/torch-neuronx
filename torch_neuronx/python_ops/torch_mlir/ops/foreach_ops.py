@@ -203,11 +203,16 @@ NKI_LIST_FNS = {
 HAS_ALPHA = {"add", "sub"}
 
 
+def _void_postprocess(results):
+    """Postprocess for .out/inplace variants — dispatch expects None return."""
+    return None
+
+
 # --- Generic factory functions ---
 
 
 def _make_scalar_op(op):
-    """Create a non-inplace foreach scalar op."""
+    """Create a non-inplace foreach scalar op (also handles .out variant)."""
     nki_fn = NKI_SCALAR_FNS[op]
 
     def fn(tensors, scalar, out=None):
@@ -220,6 +225,8 @@ def _make_scalar_op(op):
         def compute_fn(tensors, scalar):
             return _cast_results(op, nki_fn(tensors, scalar))
 
+        if out is not None:
+            return compute_fn, (tensors, scalar), {"out": out}, _void_postprocess
         return compute_fn, (tensors, scalar), {}, None
 
     return fn
@@ -238,18 +245,15 @@ def _make_scalar_inplace_op(op):
         def compute_fn(tensors, scalar):
             return nki_fn(tensors, scalar)
 
-        def postprocess_fn(results):
-            return None
-
         if not non_empty:
-            return compute_fn, (), {}, postprocess_fn
-        return compute_fn, (non_empty, scalar), {"out": tuple(non_empty)}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
+        return compute_fn, (non_empty, scalar), {"out": tuple(non_empty)}, _void_postprocess
 
     return fn
 
 
 def _make_list_op(op):
-    """Create a non-inplace foreach list op."""
+    """Create a non-inplace foreach list op (also handles .out variant)."""
     nki_fn = NKI_LIST_FNS[op]
     has_alpha = op in HAS_ALPHA
 
@@ -265,9 +269,14 @@ def _make_list_op(op):
             return _cast_results(op, results)
 
         if all(t.numel() == 0 for t in tensors1):
+            if out is not None:
+                return compute_fn, (), {}, _void_postprocess
             return compute_fn, (), {}, None
 
         kwargs = {"alpha": alpha} if has_alpha else {}
+        if out is not None:
+            kwargs["out"] = out
+            return compute_fn, (tensors1, tensors2), kwargs, _void_postprocess
         return compute_fn, (tensors1, tensors2), kwargs, None
 
     return fn
@@ -289,22 +298,19 @@ def _make_list_inplace_op(op):
                 return nki_fn(tensors1, tensors2, kwargs.get("alpha", 1))
             return nki_fn(tensors1, tensors2)
 
-        def postprocess_fn(results):
-            return None
-
         if not non_empty_t1:
-            return compute_fn, (), {}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
 
         kwargs = {"out": tuple(non_empty_t1)}
         if has_alpha:
             kwargs["alpha"] = alpha
-        return compute_fn, (non_empty_t1, non_empty_t2), kwargs, postprocess_fn
+        return compute_fn, (non_empty_t1, non_empty_t2), kwargs, _void_postprocess
 
     return fn
 
 
 def _make_scalarlist_op(op):
-    """Create a non-inplace foreach scalarlist op."""
+    """Create a non-inplace foreach scalarlist op (also handles .out variant)."""
     nki_fn = NKI_SCALARLIST_FNS[op]
 
     def fn(tensors, scalars, out=None):
@@ -317,6 +323,8 @@ def _make_scalarlist_op(op):
         def compute_fn(tensors, scalars):
             return _cast_results(op, nki_fn(tensors, scalars))
 
+        if out is not None:
+            return compute_fn, (tensors, scalars), {"out": out}, _void_postprocess
         return compute_fn, (tensors, scalars), {}, None
 
     return fn
@@ -337,19 +345,21 @@ def _make_scalarlist_inplace_op(op):
         def compute_fn(tensors, scalars):
             return nki_fn(tensors, scalars)
 
-        def postprocess_fn(results):
-            return None
-
         if not non_empty_t:
-            return compute_fn, (), {}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
 
-        return compute_fn, (non_empty_t, non_empty_s), {"out": tuple(non_empty_t)}, postprocess_fn
+        return (
+            compute_fn,
+            (non_empty_t, non_empty_s),
+            {"out": tuple(non_empty_t)},
+            _void_postprocess,
+        )
 
     return fn
 
 
 def _make_tensor_op(op):
-    """Create a non-inplace foreach tensor (0-dim) op."""
+    """Create a non-inplace foreach tensor (0-dim) op (also handles .out variant)."""
     nki_fn = NKI_SCALAR_FNS[op]
     has_alpha = op in HAS_ALPHA
 
@@ -362,6 +372,8 @@ def _make_tensor_op(op):
         def compute_fn(tensors, tensor):
             return _cast_results(op, nki_fn(tensors, tensor))
 
+        if out is not None:
+            return compute_fn, (tensors, effective_tensor), {"out": out}, _void_postprocess
         return compute_fn, (tensors, effective_tensor), {}, None
 
     return fn
@@ -382,16 +394,13 @@ def _make_tensor_inplace_op(op):
         def compute_fn(tensors, tensor):
             return nki_fn(tensors, tensor)
 
-        def postprocess_fn(results):
-            return None
-
         if not non_empty:
-            return compute_fn, (), {}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
             (non_empty, effective_tensor),
             {"out": tuple(non_empty)},
-            postprocess_fn,
+            _void_postprocess,
         )
 
     return fn
@@ -439,12 +448,9 @@ def torch_foreach_sqrt_inplace(tensors, out=None):
     _check_tensors(tensors)
     non_empty = [t for t in tensors if t.numel() > 0]
 
-    def postprocess_fn(results):
-        return None
-
     if not non_empty:
-        return foreach_sqrt_nki, (), {}, postprocess_fn
-    return foreach_sqrt_nki, (non_empty,), {"out": tuple(non_empty)}, postprocess_fn
+        return foreach_sqrt_nki, (), {}, _void_postprocess
+    return foreach_sqrt_nki, (non_empty,), {"out": tuple(non_empty)}, _void_postprocess
 
 
 # --- foreach_addcdiv / foreach_addcmul (ternary) ---
@@ -496,6 +502,8 @@ def _make_addcop_scalar(nki_fn):
         def compute_fn(self, tensor1, tensor2, value):
             return nki_fn(self, tensor1, tensor2, value)
 
+        if out is not None:
+            return compute_fn, (self, tensor1, tensor2, value), {"out": out}, _void_postprocess
         return compute_fn, (self, tensor1, tensor2, value), {}, None
 
     return fn
@@ -515,12 +523,14 @@ def _make_addcop_scalar_inplace(nki_fn):
         def compute_fn(self, tensor1, tensor2, value):
             return nki_fn(self, tensor1, tensor2, value)
 
-        def postprocess_fn(results):
-            return None
-
         if not ne_self:
-            return compute_fn, (), {}, postprocess_fn
-        return compute_fn, (ne_self, ne_t1, ne_t2, value), {"out": tuple(ne_self)}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
+        return (
+            compute_fn,
+            (ne_self, ne_t1, ne_t2, value),
+            {"out": tuple(ne_self)},
+            _void_postprocess,
+        )
 
     return fn
 
@@ -541,6 +551,8 @@ def _make_addcop_scalarlist(nki_fn):
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_fn(self, tensor1, tensor2, scalars)
 
+        if out is not None:
+            return compute_fn, (self, tensor1, tensor2, scalars), {"out": out}, _void_postprocess
         return compute_fn, (self, tensor1, tensor2, scalars), {}, None
 
     return fn
@@ -562,12 +574,9 @@ def _make_addcop_scalarlist_inplace(nki_fn):
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_fn(self, tensor1, tensor2, scalars)
 
-        def postprocess_fn(results):
-            return None
-
         if not ne_self:
-            return compute_fn, (), {}, postprocess_fn
-        return compute_fn, (ne_self, ne_t1, ne_t2, ne_s), {"out": tuple(ne_self)}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
+        return compute_fn, (ne_self, ne_t1, ne_t2, ne_s), {"out": tuple(ne_self)}, _void_postprocess
 
     return fn
 
@@ -586,6 +595,13 @@ def _make_addcop_tensor(nki_scalarlist_fn):
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
 
+        if out is not None:
+            return (
+                compute_fn,
+                (self, tensor1, tensor2, scalar_list),
+                {"out": out},
+                _void_postprocess,
+            )
         return compute_fn, (self, tensor1, tensor2, scalar_list), {}, None
 
     return fn
@@ -607,16 +623,13 @@ def _make_addcop_tensor_inplace(nki_scalarlist_fn):
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
 
-        def postprocess_fn(results):
-            return None
-
         if not ne_self:
-            return compute_fn, (), {}, postprocess_fn
+            return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
             (ne_self, ne_t1, ne_t2, ne_s),
             {"out": tuple(ne_self)},
-            postprocess_fn,
+            _void_postprocess,
         )
 
     return fn
@@ -673,6 +686,8 @@ def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalar_nki(self, tensors1, weight)
 
+    if out is not None:
+        return compute_fn, (self, tensors1, weight), {"out": out}, _void_postprocess
     return compute_fn, (self, tensors1, weight), {}, None
 
 
@@ -685,16 +700,13 @@ def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalar_nki(self, tensors1, weight)
 
-    def postprocess_fn(results):
-        return None
-
     if not non_empty_s:
-        return compute_fn, (), {}, postprocess_fn
+        return compute_fn, (), {}, _void_postprocess
     return (
         compute_fn,
         (non_empty_s, non_empty_t, weight),
         {"out": tuple(non_empty_s)},
-        postprocess_fn,
+        _void_postprocess,
     )
 
 
@@ -710,6 +722,8 @@ def torch_foreach_lerp_list(self, tensors1, weights, out=None):
     def compute_fn(self, tensors1, weights):
         return foreach_lerp_list_nki(self, tensors1, weights)
 
+    if out is not None:
+        return compute_fn, (self, tensors1, weights), {"out": out}, _void_postprocess
     return compute_fn, (self, tensors1, weights), {}, None
 
 
@@ -725,12 +739,9 @@ def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
     def compute_fn(self, tensors1, weights):
         return foreach_lerp_list_nki(self, tensors1, weights)
 
-    def postprocess_fn(results):
-        return None
-
     if not ne_s:
-        return compute_fn, (), {}, postprocess_fn
-    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, postprocess_fn
+        return compute_fn, (), {}, _void_postprocess
+    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, _void_postprocess
 
 
 @register_aten(
@@ -745,6 +756,8 @@ def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalarlist_nki(self, tensors1, weight)
 
+    if out is not None:
+        return compute_fn, (self, tensors1, weight), {"out": out}, _void_postprocess
     return compute_fn, (self, tensors1, weight), {}, None
 
 
@@ -760,12 +773,9 @@ def torch_foreach_lerp_scalarlist_inplace(self, tensors1, weight, out=None):
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalarlist_nki(self, tensors1, weight)
 
-    def postprocess_fn(results):
-        return None
-
     if not ne_s:
-        return compute_fn, (), {}, postprocess_fn
-    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, postprocess_fn
+        return compute_fn, (), {}, _void_postprocess
+    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, _void_postprocess
 
 
 # --- Register all binary elementwise foreach ops ---
