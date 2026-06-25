@@ -15,7 +15,11 @@ def torch_cat(tensors, dim=0, out=None):
     return torch.cat(non_empty, dim)
 
 
-@register_aten(["aten::stack", "aten::stack.out"], static_argnums=(1,))
+@register_aten(
+    ["aten::stack", "aten::stack.out", "aten::_stack", "aten::_stack.out"],
+    static_argnums=(1,),
+    output_params=("out",),
+)
 def torch_stack(tensors, dim=0, out=None):
     return torch.stack(tensors, dim)
 
