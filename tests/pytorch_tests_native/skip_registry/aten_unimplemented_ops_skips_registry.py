@@ -48,7 +48,6 @@ SKIP_GROUPS: list[SkipGroup] = [
         patterns=[
             "*___rshift___neuron*",
             "*__rshift___neuron*",
-            "*_acosh_neuron*",
             "*_addbmm_neuron*",
             "*_addbmm__neuron*",
             "*_angle_neuron*",
