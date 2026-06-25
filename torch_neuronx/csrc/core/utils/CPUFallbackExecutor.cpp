@@ -12,6 +12,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 // Include Neuron Runtime headers
@@ -233,9 +234,20 @@ void CPUFallbackExecutor::LoadConfiguration() {
 void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
   const auto& fallback_ctx = operation->cpu_fallback_context;
 
+  // Resolve each input's NRT tensor handle. This runs on the runtime
+  // worker after upstream kAlloc ops have completed, so the backing
+  // nrt_tensor_t is now registered with the allocator.
+  TORCH_CHECK(fallback_ctx.tensor_data_ptrs.size() == fallback_ctx.tensor_storage_ptrs.size(),
+              "CPU fallback context: tensor_data_ptrs/tensor_storage_ptrs size mismatch (",
+              fallback_ctx.tensor_data_ptrs.size(), " vs ", fallback_ctx.tensor_storage_ptrs.size(),
+              ")");
   std::vector<nrt_tensor_t*> src_ptrs;
   src_ptrs.reserve(fallback_ctx.tensor_data_ptrs.size());
-  for (nrt_tensor_t* nrt_ptr : fallback_ctx.tensor_data_ptrs) {
+  for (size_t i = 0; i < fallback_ctx.tensor_data_ptrs.size(); ++i) {
+    nrt_tensor_t* nrt_ptr = fallback_ctx.tensor_data_ptrs[i];
+    if (!nrt_ptr) {
+      nrt_ptr = c10_neuron::NeuronCachingAllocator::findTensor(fallback_ctx.tensor_storage_ptrs[i]);
+    }
     TORCH_CHECK(nrt_ptr, "Invalid input data tensor pointer for CPU fallback");
     src_ptrs.push_back(nrt_ptr);
   }

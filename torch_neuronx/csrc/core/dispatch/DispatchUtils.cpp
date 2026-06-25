@@ -331,11 +331,15 @@ bool HasExplicitDtypeKwarg(const c10::FunctionSchema& schema,
 }
 
 static void ExtractTensorInfoForFallback(const at::Tensor& tensor,
-                                         std::vector<at::neuron::TensorContext>& tensor_metadata,
-                                         std::vector<nrt_tensor_t*>& tensor_data_ptrs) {
-  tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
-  tensor_data_ptrs.push_back(
-      c10_neuron::NeuronCachingAllocator::findTensor(const_cast<void*>(tensor.storage().data())));
+                                         at::neuron::CPUFallbackContext& ctx) {
+  void* storage_va = const_cast<void*>(tensor.storage().data());
+  ctx.tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
+  // findTensor may return nullptr if the underlying lazy allocation has not
+  // yet been bound on the runtime worker (kAlloc has been queued but not
+  // scheduled). We capture the storage VA so the fallback executor can
+  // re-resolve at execute time, after kAlloc binds.
+  ctx.tensor_data_ptrs.push_back(c10_neuron::NeuronCachingAllocator::findTensor(storage_va));
+  ctx.tensor_storage_ptrs.push_back(storage_va);
 }
 
 // GIL deadlock prevention: CPU tensors from Python dispatch may hold PyObject*
@@ -371,7 +375,7 @@ at::neuron::CPUFallbackContext BuildCPUFallbackContext(const std::vector<c10::IV
         if (is_kwarg) {
           ctx.tensor_kwarg_names.push_back(arg_info.name());
         }
-        ExtractTensorInfoForFallback(tensor, ctx.tensor_metadata, ctx.tensor_data_ptrs);
+        ExtractTensorInfoForFallback(tensor, ctx);
         ctx.input_metadata.push_back(TensorMarker{});
       } else if (tensor.defined()) {
         // CPU tensor: detach().clone() to sever Python object references
@@ -386,7 +390,7 @@ at::neuron::CPUFallbackContext BuildCPUFallbackContext(const std::vector<c10::IV
     } else if (val.isTensorList()) {
       auto tl = val.toTensorVector();
       for (const auto& t : tl) {
-        ExtractTensorInfoForFallback(t, ctx.tensor_metadata, ctx.tensor_data_ptrs);
+        ExtractTensorInfoForFallback(t, ctx);
       }
       ctx.input_metadata.push_back(TensorListMarker(tl.size()));
     } else if (val.isList()) {
@@ -399,7 +403,7 @@ at::neuron::CPUFallbackContext BuildCPUFallbackContext(const std::vector<c10::IV
         if (elem.isTensor()) {
           auto t = elem.toTensor();
           if (t.defined() && t.device().type() == c10::DeviceType::PrivateUse1) {
-            ExtractTensorInfoForFallback(t, ctx.tensor_metadata, ctx.tensor_data_ptrs);
+            ExtractTensorInfoForFallback(t, ctx);
             ++tensor_count;
           }
         }

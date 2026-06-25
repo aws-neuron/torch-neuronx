@@ -18,33 +18,32 @@ namespace at::neuron::utils {
 /**
  * @brief Extracts tensor metadata and data pointers from a tensor.
  *
- * Helper function to populate tensor_metadata and tensor_data_ptrs vectors.
+ * Populates tensor_metadata, tensor_data_ptrs, and tensor_storage_ptrs on
+ * the supplied CPUFallbackContext. tensor_data_ptrs may contain nullptr
+ * entries for tensors whose lazy allocation has not yet been bound; the
+ * fallback executor re-resolves these from tensor_storage_ptrs at execute
+ * time.
  */
-inline void ExtractTensorInfo(const at::Tensor& tensor,
-                              std::vector<at::neuron::TensorContext>& tensor_metadata,
-                              std::vector<nrt_tensor_t*>& tensor_data_ptrs) {
-  tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
-  tensor_data_ptrs.push_back(
-      c10_neuron::NeuronCachingAllocator::findTensor(const_cast<void*>(tensor.storage().data())));
+inline void ExtractTensorInfo(const at::Tensor& tensor, at::neuron::CPUFallbackContext& ctx) {
+  void* storage_va = const_cast<void*>(tensor.storage().data());
+  ctx.tensor_metadata.push_back(at::neuron::TensorContext::FromTensor(tensor));
+  ctx.tensor_data_ptrs.push_back(c10_neuron::NeuronCachingAllocator::findTensor(storage_va));
+  ctx.tensor_storage_ptrs.push_back(storage_va);
 }
 
 /**
  * @brief Converts a Python object to InputMetadata and extracts tensor info if applicable.
  *
  * This function inspects a Python object and returns:
- * - TensorMarker: for single tensors (metadata extracted to output vectors)
- * - TensorListMarker: for tensor lists (metadata extracted to output vectors)
+ * - TensorMarker: for single tensors (metadata extracted onto ctx)
+ * - TensorListMarker: for tensor lists (metadata extracted onto ctx)
  * - ScalarValue: for all non-tensor values (None, int, double, bool, string, lists, etc.)
  *
  * @param obj The Python object to convert
- * @param tensor_metadata Output vector for tensor metadata (populated for tensor types)
- * @param tensor_data_ptrs Output vector for resolved NRT tensor pointers (populated for tensor
- * types)
+ * @param ctx CPUFallbackContext receiving extracted tensor metadata/pointers
  * @return InputMetadata describing the input
  */
-inline InputMetadata ConvertToInputMetadata(py::object obj,
-                                            std::vector<at::neuron::TensorContext>& tensor_metadata,
-                                            std::vector<nrt_tensor_t*>& tensor_data_ptrs) {
+inline InputMetadata ConvertToInputMetadata(py::object obj, at::neuron::CPUFallbackContext& ctx) {
   // Handle None type
   if (obj.is_none()) {
     return ScalarValue(c10::IValue());
@@ -53,7 +52,7 @@ inline InputMetadata ConvertToInputMetadata(py::object obj,
   // Handle PyTorch Tensor - extract metadata but DON'T store the tensor IValue
   if (THPVariable_Check(obj.ptr())) {
     at::Tensor tensor = THPVariable_Unpack(obj.ptr());
-    ExtractTensorInfo(tensor, tensor_metadata, tensor_data_ptrs);
+    ExtractTensorInfo(tensor, ctx);
     return TensorMarker{};
   }
 
@@ -111,7 +110,7 @@ inline InputMetadata ConvertToInputMetadata(py::object obj,
       // TensorList - extract metadata for each tensor
       for (size_t i = 0; i < seq_size; ++i) {
         at::Tensor tensor = THPVariable_Unpack(seq[i].ptr());
-        ExtractTensorInfo(tensor, tensor_metadata, tensor_data_ptrs);
+        ExtractTensorInfo(tensor, ctx);
       }
       return TensorListMarker(seq_size);
     }
@@ -218,7 +217,7 @@ inline CPUFallbackContext ConvertToCPUFallbackContext(const py::object& context)
 
       for (size_t i = 0; i < inputs_list.size(); ++i) {
         py::object obj = inputs_list[i];
-        InputMetadata meta = ConvertToInputMetadata(obj, ctx.tensor_metadata, ctx.tensor_data_ptrs);
+        InputMetadata meta = ConvertToInputMetadata(obj, ctx);
         ctx.input_metadata.push_back(std::move(meta));
       }
     }
@@ -240,7 +239,7 @@ inline CPUFallbackContext ConvertToCPUFallbackContext(const py::object& context)
         } else if (THPVariable_Check(value.ptr())) {
           // Tensor in kwargs - extract metadata and track the kwarg name
           at::Tensor tensor = THPVariable_Unpack(value.ptr());
-          ExtractTensorInfo(tensor, ctx.tensor_metadata, ctx.tensor_data_ptrs);
+          ExtractTensorInfo(tensor, ctx);
           // Track this kwarg name so we can map it to cpu_inputs later
           ctx.tensor_kwarg_names.push_back(key);
           // Store None as placeholder - actual tensor comes from cpu_inputs
