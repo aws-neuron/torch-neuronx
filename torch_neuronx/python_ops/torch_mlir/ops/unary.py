@@ -67,6 +67,31 @@ def torch_acos(x, out=None):
     return torch.acos(x)
 
 
+def _validate_acosh(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    acosh promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::acosh", "aten::acosh.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_acosh,
+)
+def torch_acosh(x, out=None):
+    """Inverse hyperbolic cosine — elementwise transcendental."""
+    return torch.acosh(x)
+
+
 @register_aten(["aten::exp", "aten::exp.out"])
 def torch_exp(x, out=None):
     return torch.exp(x)
