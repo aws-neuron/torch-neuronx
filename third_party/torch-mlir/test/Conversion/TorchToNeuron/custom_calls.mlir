@@ -156,6 +156,34 @@ func.func @test_aten.sort$other_dim(%arg0: !torch.vtensor<[10,20,30],f32>) -> (!
 
 // -----
 
+// CHECK-LABEL:   func.func @test_aten.sort$scalar_asc(
+// CHECK-SAME:                                         %[[VAL_0:.*]]: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+// CHECK:           %[[VAL_1:.*]] = torch.vtensor.literal(dense<0> : tensor<si64>) : !torch.vtensor<[],si64>
+// CHECK:           return %[[VAL_0]], %[[VAL_1]] : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+// CHECK:         }
+func.func @test_aten.sort$scalar_asc(%arg0: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+    %int-1 = torch.constant.int -1
+    %false = torch.constant.bool false
+    %values, %indices = torch.aten.sort %arg0, %int-1, %false : !torch.vtensor<[],f32>, !torch.int, !torch.bool -> !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+    return %values, %indices : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @test_aten.sort$scalar_desc(
+// CHECK-SAME:                                          %[[VAL_0:.*]]: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+// CHECK:           %[[VAL_1:.*]] = torch.vtensor.literal(dense<0> : tensor<si64>) : !torch.vtensor<[],si64>
+// CHECK:           return %[[VAL_0]], %[[VAL_1]] : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+// CHECK:         }
+func.func @test_aten.sort$scalar_desc(%arg0: !torch.vtensor<[],f32>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],si64>) {
+    %int0 = torch.constant.int 0
+    %true = torch.constant.bool true
+    %values, %indices = torch.aten.sort %arg0, %int0, %true : !torch.vtensor<[],f32>, !torch.int, !torch.bool -> !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+    return %values, %indices : !torch.vtensor<[],f32>, !torch.vtensor<[],si64>
+}
+
+// -----
+
 // CHECK-LABEL:   func.func @test_quantize_mx_e5m2_last_dim(
 // CHECK-SAME:                                              %[[VAL_0:.*]]: !torch.vtensor<[890,128],bf16>) -> (!torch.vtensor<[890,128],f8E5M2>, !torch.vtensor<[890,4],f8E8M0FNU>) {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[890,128],bf16> -> tensor<890x128xbf16>
