@@ -631,7 +631,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_reshape_alias", &torch_neuronx::_reshape_alias_neuron);
   m.impl("view_as_real", &torch_neuronx::view_as_real_neuron);
   m.impl("view_as_complex", &torch_neuronx::view_as_complex_neuron);
-  m.impl("select_backward", &torch_neuronx::select_backward_neuron);
   m.impl("argsort.stable", &torch_neuronx::argsort_stable_neuron);
   // Set Operations
   // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml#L8031-L8078
