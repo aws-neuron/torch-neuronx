@@ -2349,6 +2349,200 @@ class TestSliceBackwardDecompositionE2E:
         torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
 
 
+class TestAvgPool3dBackwardDecomposition:
+    """Tests for avg_pool3d_backward decomposition.
+
+    Matches aten's avg_pool3d_backward for the count_include_pad=True / no-pad
+    cases the decomposition supports.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,kernel,stride,padding",
+        [
+            ((1, 2, 4, 4, 4), 2, 2, 0),  # non-overlapping
+            ((2, 3, 6, 6, 6), 3, 1, 0),  # overlapping windows
+            ((1, 1, 5, 5, 5), 2, 1, 0),  # odd input, unit stride
+            ((1, 2, 4, 4, 4), 2, 2, 1),  # with padding
+        ],
+    )
+    def test_matches_aten(self, shape, kernel, stride, padding):
+        F = torch.nn.functional
+        x = torch.randn(*shape, dtype=torch.float64)
+        k, s, p = [kernel] * 3, [stride] * 3, [padding] * 3
+        out = F.avg_pool3d(x, k, s, p)
+        grad_output = torch.randn_like(out)
+
+        result = decompositions.avg_pool3d_backward_decomposition(
+            grad_output, x, k, s, p, False, True, None
+        )
+        expected = torch.ops.aten.avg_pool3d_backward.default(
+            grad_output, x, k, s, p, False, True, None
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_divisor_override(self):
+        """divisor_override replaces the window-size divisor."""
+        F = torch.nn.functional
+        x = torch.randn(1, 2, 4, 4, 4, dtype=torch.float64)
+        k, s, p = [2, 2, 2], [2, 2, 2], [0, 0, 0]
+        out = F.avg_pool3d(x, k, s, p, divisor_override=5)
+        grad_output = torch.randn_like(out)
+
+        result = decompositions.avg_pool3d_backward_decomposition(
+            grad_output, x, k, s, p, False, True, 5
+        )
+        expected = torch.ops.aten.avg_pool3d_backward.default(
+            grad_output, x, k, s, p, False, True, 5
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_registered(self):
+        assert torch.ops.aten.avg_pool3d_backward.default in decompositions.neuron_decompositions
+
+
+class TestMaxPool3dWithIndicesDecomposition:
+    """Tests for max_pool3d_with_indices forward + backward decompositions."""
+
+    @pytest.mark.parametrize(
+        "shape,kernel,stride,padding",
+        [
+            ((1, 2, 4, 4, 4), 2, 2, 0),  # non-overlapping
+            ((2, 3, 6, 6, 6), 3, 1, 0),  # overlapping windows
+            ((1, 1, 5, 5, 5), 2, 1, 1),  # with padding
+        ],
+    )
+    def test_forward_matches_aten(self, shape, kernel, stride, padding):
+        """Forward returns values and flat (D*H*W) indices matching aten."""
+        x = torch.randn(*shape, dtype=torch.float64)
+        k, s, p, d = [kernel] * 3, [stride] * 3, [padding] * 3, [1, 1, 1]
+
+        values, indices = decompositions.max_pool3d_with_indices_decomposition(x, k, s, p, d, False)
+        exp_values, exp_indices = torch.ops.aten.max_pool3d_with_indices.default(
+            x, k, s, p, d, False
+        )
+        torch.testing.assert_close(values, exp_values)
+        assert torch.equal(indices, exp_indices)
+
+    @pytest.mark.parametrize(
+        "shape,kernel,stride,padding",
+        [
+            ((1, 2, 4, 4, 4), 2, 2, 0),
+            ((2, 3, 6, 6, 6), 3, 1, 0),
+        ],
+    )
+    def test_backward_matches_aten(self, shape, kernel, stride, padding):
+        """Backward scatter-adds gradients to the winning positions."""
+        x = torch.randn(*shape, dtype=torch.float64)
+        k, s, p, d = [kernel] * 3, [stride] * 3, [padding] * 3, [1, 1, 1]
+        _, indices = torch.ops.aten.max_pool3d_with_indices.default(x, k, s, p, d, False)
+        grad_output = torch.randn(*indices.shape, dtype=torch.float64)
+
+        result = decompositions.max_pool3d_with_indices_backward_decomposition(
+            grad_output, x, k, s, p, d, False, indices
+        )
+        expected = torch.ops.aten.max_pool3d_with_indices_backward.default(
+            grad_output, x, k, s, p, d, False, indices
+        )
+        torch.testing.assert_close(result, expected)
+
+    def test_dilation_falls_through(self):
+        """dilation != 1 is unsupported; decomposition returns NotImplemented."""
+        x = torch.randn(1, 2, 4, 4, 4, dtype=torch.float64)
+        result = decompositions.max_pool3d_with_indices_decomposition(
+            x, [2, 2, 2], [2, 2, 2], [0, 0, 0], [2, 2, 2], False
+        )
+        assert result is NotImplemented
+
+    def test_ceil_mode_falls_through(self):
+        """ceil_mode=True is unsupported; decomposition returns NotImplemented."""
+        x = torch.randn(1, 2, 5, 5, 5, dtype=torch.float64)
+        result = decompositions.max_pool3d_with_indices_decomposition(
+            x, [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], True
+        )
+        assert result is NotImplemented
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.max_pool3d_with_indices.default,
+            torch.ops.aten.max_pool3d_with_indices_backward.default,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestPool3dDecompositionsE2E:
+    """End-to-end tests for the 3d pooling decompositions via torch.compile
+
+    The forward pass exercises ``max_pool3d_with_indices`` and ``avg_pool3d``;
+    the backward pass fires ``max_pool3d_with_indices_backward`` and
+    ``avg_pool3d_backward`` through autograd. Grads are compared against the
+    eager CPU reference.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape,kernel,stride,padding",
+        [
+            ((1, 2, 4, 4, 4), 2, 2, 0),  # non-overlapping
+            ((1, 2, 4, 4, 4), 2, 2, 1),  # with padding
+        ],
+    )
+    def test_avg_pool3d_backward_e2e(self, shape, kernel, stride, padding, dtype):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.nn.functional.avg_pool3d(x, kernel, stride, padding).sum()
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        # CPU avg_pool3d has no bfloat16 kernel, so the reference is always fp32;
+        # the Neuron path runs in the target dtype and is compared against it.
+        x_cpu = torch.randn(*shape, dtype=torch.float32, requires_grad=True)
+        x_neuron = x_cpu.detach().clone().to(dtype).to("neuron").requires_grad_(True)
+
+        loss_cpu = fn(x_cpu)
+        loss_neuron = compiled_fn(x_neuron)
+
+        loss_cpu.backward()
+        loss_neuron.backward()
+
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(loss_neuron.cpu().float(), loss_cpu, rtol=tol, atol=tol)
+        torch.testing.assert_close(x_neuron.grad.cpu().float(), x_cpu.grad, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape,kernel,stride,padding",
+        [
+            ((1, 2, 4, 4, 4), 2, 2, 0),  # non-overlapping
+            ((2, 3, 6, 6, 6), 3, 1, 0),  # overlapping windows
+        ],
+    )
+    def test_max_pool3d_backward_e2e(self, shape, kernel, stride, padding, dtype):
+        torch.manual_seed(42)
+
+        def fn(x):
+            return torch.nn.functional.max_pool3d(x, kernel, stride, padding).sum()
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.randn(*shape, dtype=dtype, requires_grad=True)
+        x_neuron = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        loss_cpu = fn(x_cpu)
+        loss_neuron = compiled_fn(x_neuron)
+
+        loss_cpu.backward()
+        loss_neuron.backward()
+
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(loss_neuron.cpu(), loss_cpu, rtol=tol, atol=tol)
+        torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=tol, atol=tol)
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestEluDecompositionE2E:
     """End-to-end tests for elu decomposition using torch.compile with neuron backend"""
