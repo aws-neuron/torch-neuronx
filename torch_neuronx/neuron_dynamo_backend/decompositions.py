@@ -2639,6 +2639,179 @@ def _segment_reduce_backward_decomposition(
     return grad_data
 
 
+@register_decomposition([aten.avg_pool3d_backward.default])
+def avg_pool3d_backward_decomposition(
+    grad_output,
+    input,
+    kernel_size,
+    stride,
+    padding,
+    ceil_mode,
+    count_include_pad,
+    divisor_override=None,
+):
+    """avg_pool3d_backward via conv_transpose3d with an all-ones depthwise kernel.
+
+    Each output gradient is divided by the pooling window size, then 'spread'
+    back to the input positions it summed over. Matches PyTorch's behavior
+    when count_include_pad=True (the default) or there is no padding.
+
+    For count_include_pad=False with padding>0, edge windows have a smaller
+    real divisor; that variant is uncommon and not handled here. Add per-position
+    divisor correction if a model needs it.
+    """
+    kT, kH, kW = _tuple(kernel_size, 3)
+    sT, sH, sW = _tuple(stride, 3) if stride else (kT, kH, kW)
+    pT, pH, pW = _tuple(padding, 3) if padding else (0, 0, 0)
+
+    divisor = float(divisor_override) if divisor_override is not None else float(kT * kH * kW)
+    grad_scaled = grad_output / divisor
+
+    C = input.shape[1]
+    weight = torch.ones(
+        (C, 1, kT, kH, kW),
+        dtype=grad_output.dtype,
+        device=grad_output.device,
+    )
+
+    # conv_transpose3d output formula:
+    #   out = (in - 1) * stride - 2 * padding + kernel + output_padding
+    # We need out == input spatial size; solve for output_padding.
+    in_T, in_H, in_W = input.shape[-3:]
+    out_T, out_H, out_W = grad_output.shape[-3:]
+    output_padding = (
+        max(0, in_T - ((out_T - 1) * sT - 2 * pT + kT)),
+        max(0, in_H - ((out_H - 1) * sH - 2 * pH + kH)),
+        max(0, in_W - ((out_W - 1) * sW - 2 * pW + kW)),
+    )
+
+    return F.conv_transpose3d(
+        grad_scaled,
+        weight,
+        bias=None,
+        stride=(sT, sH, sW),
+        padding=(pT, pH, pW),
+        output_padding=output_padding,
+        groups=C,
+    )
+
+
+@register_decomposition([aten.max_pool3d_with_indices.default])
+def max_pool3d_with_indices_decomposition(
+    input,
+    kernel_size,
+    stride=None,
+    padding=0,
+    dilation=1,
+    ceil_mode=False,
+):
+    """Decompose max_pool3d_with_indices via per-kernel slicing + max.
+
+    Returns (values, indices). indices[..., t', h', w'] is the flat position in
+    the input's per-channel spatial volume (D*H*W) of the element that won max.
+
+    Handles dilation=1, ceil_mode=False — common case.
+    """
+    kT, kH, kW = _tuple(kernel_size, 3)
+    sT, sH, sW = _tuple(stride, 3) if stride else (kT, kH, kW)
+    pT, pH, pW = _tuple(padding, 3) if padding else (0, 0, 0)
+    dT, dH, dW = _tuple(dilation, 3) if dilation else (1, 1, 1)
+
+    if (dT, dH, dW) != (1, 1, 1) or ceil_mode:
+        return NotImplemented
+
+    # Pad spatial dims with -inf so padded positions never win argmax.
+    x = F.pad(input, (pW, pW, pH, pH, pT, pT), value=float("-inf")) if (pT or pH or pW) else input
+
+    in_T, in_H, in_W = x.shape[-3:]
+    oT = (in_T - kT) // sT + 1
+    oH = (in_H - kH) // sH + 1
+    oW = (in_W - kW) // sW + 1
+
+    # Build kT*kH*kW slices, each [..., oT, oH, oW]; stack as a new last dim.
+    val_tiles = []
+    for kt in range(kT):
+        for kh in range(kH):
+            for kw in range(kW):
+                val_tiles.append(
+                    x[
+                        ...,
+                        kt : kt + (oT - 1) * sT + 1 : sT,
+                        kh : kh + (oH - 1) * sH + 1 : sH,
+                        kw : kw + (oW - 1) * sW + 1 : sW,
+                    ]
+                )
+    stacked = torch.stack(val_tiles, dim=-1)
+    values, local_argmax = torch.max(stacked, dim=-1)
+
+    # Map kernel-local argmax (range [0, kT*kH*kW)) → absolute position in the
+    # original (un-padded) input, then to a flat T*H*W index.
+    H_orig = input.shape[-2]
+    W_orig = input.shape[-1]
+
+    kt_idx = local_argmax // (kH * kW)
+    kh_idx = (local_argmax // kW) % kH
+    kw_idx = local_argmax % kW
+
+    prefix_shape = (1,) * (local_argmax.ndim - 3)
+    t_grid = (
+        torch.arange(oT, device=input.device, dtype=torch.long).reshape(*prefix_shape, oT, 1, 1)
+        * sT
+        - pT
+    )
+    h_grid = (
+        torch.arange(oH, device=input.device, dtype=torch.long).reshape(*prefix_shape, 1, oH, 1)
+        * sH
+        - pH
+    )
+    w_grid = (
+        torch.arange(oW, device=input.device, dtype=torch.long).reshape(*prefix_shape, 1, 1, oW)
+        * sW
+        - pW
+    )
+
+    indices = (t_grid + kt_idx) * (H_orig * W_orig) + (h_grid + kh_idx) * W_orig + (w_grid + kw_idx)
+
+    return values, indices
+
+
+@register_decomposition([aten.max_pool3d_with_indices_backward.default])
+def max_pool3d_with_indices_backward_decomposition(
+    grad_output,
+    input,
+    kernel_size,
+    stride,
+    padding,
+    dilation,
+    ceil_mode,
+    indices,
+):
+    """Decompose max_pool3d_with_indices_backward via scatter_add over flat T*H*W.
+
+    `indices` from the forward pass holds, for each output position, the flat
+    position in the input's per-channel spatial volume (D*H*W) of the winning
+    element. We flatten the last 3 input dims, scatter-add the upstream
+    gradients into those positions, and reshape back.
+    """
+    # Unused — kept to match the op signature.
+    del kernel_size, stride, padding, dilation, ceil_mode
+
+    spatial_in = input.shape[-3:]
+    flat_size = spatial_in[0] * spatial_in[1] * spatial_in[2]
+    leading = input.shape[:-3]
+
+    grad_in_flat = torch.zeros(
+        (*leading, flat_size),
+        dtype=grad_output.dtype,
+        device=grad_output.device,
+    )
+    idx_flat = indices.reshape(*leading, -1).to(torch.long)
+    grad_out_flat = grad_output.reshape(*leading, -1)
+
+    grad_in_flat = grad_in_flat.scatter_add(-1, idx_flat, grad_out_flat)
+    return grad_in_flat.reshape(input.shape)
+
+
 @register_decomposition([aten.argsort.default, aten.argsort.stable])
 def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     """Decompose argsort to sort"""
