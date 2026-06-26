@@ -90,13 +90,13 @@ def torch_clamp_min(x, min, out=None):
     return torch.clamp_min(x, min)
 
 
-@register_aten(["aten::isnan"])
-def torch_isnan(x):
+@register_aten(["aten::isnan", "aten::isnan.out"], output_params=("out",))
+def torch_isnan(x, out=None):
     return torch.isnan(x)
 
 
-@register_aten(["aten::isinf"])
-def torch_isinf(x):
+@register_aten(["aten::isinf", "aten::isinf.out"], output_params=("out",))
+def torch_isinf(x, out=None):
     """Integer dtype cannot be inf and should always return False.
 
     Bypassing the operation here to avoid running stablehlo.abs with unsupported dtypes.

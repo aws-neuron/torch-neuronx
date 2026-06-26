@@ -63,9 +63,10 @@ def _reduce_with_promotion(op_fn, target_dtype, caller_dtype, *args, **kwargs):
 
 
 @register_aten(
-    ["aten::sum", "aten::sum.dim_IntList", "aten::sum.IntList_out"],
+    ["aten::sum", "aten::sum.dim_IntList", "aten::sum.IntList_out", "aten::sum.out"],
     static_argnums=(1, 2),
     static_argnames=("dtype",),
+    output_params=("out",),
 )
 def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
     target_dtype = _infer_int64_promotion(dtype, self)
@@ -174,7 +175,11 @@ def _bool_reduction(op, x, dim=None, keepdim=False):
     return result.to(torch.uint8) if input_dtype == torch.uint8 else result
 
 
-@register_aten(["aten::all", "aten::all.out", "aten::all.all_out"], static_argnums=(1, 2))
+@register_aten(
+    ["aten::all", "aten::all.out", "aten::all.all_out", "aten::all.dims_out"],
+    static_argnums=(1, 2),
+    output_params=("out",),
+)
 def torch_all(x, dim=None, keepdim=False, out=None):
     return _bool_reduction(torch.all, x, dim, keepdim)
 

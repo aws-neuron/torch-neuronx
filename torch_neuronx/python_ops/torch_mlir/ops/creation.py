@@ -27,8 +27,10 @@ def torch_ones(size, dtype=None, out=None, **kwargs):
     return torch.ones(size, dtype=dtype, **kwargs)
 
 
-@register_aten(["aten::ones_like"], static_argnames=("dtype",))
-def torch_ones_like(x, dtype=None, **kwargs):
+@register_aten(
+    ["aten::ones_like", "aten::ones_like.out"], static_argnames=("dtype",), output_params=("out",)
+)
+def torch_ones_like(x, dtype=None, out=None, **kwargs):
     return torch.ones_like(x, dtype=dtype, **kwargs)
 
 
@@ -78,8 +80,12 @@ def torch_zero(x, out=None):
     return torch.zeros_like(x)
 
 
-@register_aten(["aten::scalar_tensor"], static_argnames=("dtype",))
-def torch_scalar_tensor(x, dtype=None):
+@register_aten(
+    ["aten::scalar_tensor", "aten::scalar_tensor.out"],
+    static_argnames=("dtype",),
+    output_params=("out",),
+)
+def torch_scalar_tensor(x, dtype=None, out=None):
     """
     torch.scalar_tensor is supposed to create a scalar tensor from scalar value
     but to avoid scalar value get baked into HLO and symInt/symFloat
@@ -92,3 +98,29 @@ def torch_scalar_tensor(x, dtype=None):
         return x.to(dtype)
     else:
         return torch.tensor(x, dtype=dtype)
+
+
+# kaiser_window functional variants (aten::kaiser_window, .periodic, .beta) work
+# via CompositeImplicitAutograd decomposition into primitive ops. Only the .out
+# variants need explicit registration because the .out dispatch path bypasses
+# composite decomposition and hits DispatchStub directly.
+#
+# Note: the lowering currently falls back to CPU because torch.i0 (used
+# internally by kaiser_window) is not supported in Torch-MLIR. The registration
+# still resolves the DispatchStub assertion crash — moving the op from
+# failed_lowering to cpu_fallback with correct results.
+
+
+@register_aten(["aten::kaiser_window.out"], static_argnums=(0,), output_params=("out",))
+def torch_kaiser_window_out(window_length, out=None):
+    return torch.kaiser_window(window_length)
+
+
+@register_aten(["aten::kaiser_window.periodic_out"], static_argnums=(0, 1), output_params=("out",))
+def torch_kaiser_window_periodic_out(window_length, periodic, out=None):
+    return torch.kaiser_window(window_length, periodic=periodic)
+
+
+@register_aten(["aten::kaiser_window.beta_out"], static_argnums=(0, 1, 2), output_params=("out",))
+def torch_kaiser_window_beta_out(window_length, periodic, beta, out=None):
+    return torch.kaiser_window(window_length, periodic=periodic, beta=beta)

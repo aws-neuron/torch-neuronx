@@ -143,3 +143,19 @@ class TestOnesLike:
         assert (
             result.dtype == expected.dtype
         ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"
+
+    @pytest.mark.parametrize("shape", [(3, 4), (2, 3, 4)])
+    def test_ones_like_out_variant(self, shape):
+        """Test aten::ones_like.out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.randn(shape)
+        expected = torch.ones_like(x_cpu)
+
+        x_neuron = x_cpu.to("neuron")
+        out = torch.empty(shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.ones_like.out(x_neuron, out=out)
+            assert_op_runs_on_neuron("aten::ones_like")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)

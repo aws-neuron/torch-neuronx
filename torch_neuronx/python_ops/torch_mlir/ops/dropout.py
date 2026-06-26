@@ -7,8 +7,12 @@ from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 from ..operation_registry import register_aten
 
 
-@register_aten(["aten::native_dropout"], static_argnums=(1, 2))
-def torch_native_dropout(input, p: float, train: bool = True, **kwargs):
+@register_aten(
+    ["aten::native_dropout", "aten::native_dropout.out"],
+    static_argnums=(1, 2),
+    output_params=("out0", "out1"),
+)
+def torch_native_dropout(input, p: float, train: bool = True, out0=None, out1=None, **kwargs):
     """Decompose native_dropout using on-device RNG."""
     if train and not (0.0 <= float(p) <= 1.0):
         raise RuntimeError(f"dropout probability has to be between 0 and 1, but got {p}")
