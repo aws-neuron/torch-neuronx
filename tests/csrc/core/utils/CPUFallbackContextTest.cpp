@@ -14,6 +14,7 @@ TEST_F(CPUFallbackContextTest, DefaultConstructorCreatesEmptyContext) {
   EXPECT_TRUE(ctx.input_metadata.empty());
   EXPECT_TRUE(ctx.tensor_metadata.empty());
   EXPECT_TRUE(ctx.tensor_data_ptrs.empty());
+  EXPECT_TRUE(ctx.tensor_storage_ptrs.empty());
   EXPECT_TRUE(ctx.tensor_kwarg_names.empty());
   EXPECT_TRUE(ctx.IsEmpty());
 }

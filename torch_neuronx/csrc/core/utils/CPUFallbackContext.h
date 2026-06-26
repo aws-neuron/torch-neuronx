@@ -108,7 +108,17 @@ struct CPUFallbackContext {
   std::vector<TensorContext> tensor_metadata;
 
   // Data tensor pointers for tensor inputs, in the same order as tensor_metadata.
+  // May contain nullptr entries for tensors backed by a lazy allocation that
+  // had not been bound by the runtime worker at submit time. Such entries are
+  // re-resolved from `tensor_storage_ptrs` inside the fallback executor (which
+  // runs on the worker thread, after upstream kAlloc ops have completed).
   std::vector<nrt_tensor_t*> tensor_data_ptrs;
+
+  // Storage virtual addresses (tensor.storage().data()), in the same order as
+  // tensor_data_ptrs. Used by the fallback executor to re-resolve any null
+  // tensor_data_ptrs entry via NeuronCachingAllocator::findTensor() once the
+  // owning kAlloc has bound the lazy allocation.
+  std::vector<void*> tensor_storage_ptrs;
 
   // Default constructor creates empty context
   CPUFallbackContext()
