@@ -99,37 +99,6 @@ at::Tensor _reshape_alias_neuron(const at::Tensor& self, at::IntArrayRef sizes,
   return view_neuron(self, sizes);
 }
 
-at::Tensor select_backward_neuron(const at::Tensor& grad, c10::SymIntArrayRef input_sizes,
-                                  int64_t dim, c10::SymInt index) {
-  auto sizes_vec = utils::symint_to_sizes(input_sizes);
-  auto index_i = index.expect_int();
-
-  auto options = grad.options();
-
-  auto cpu_options = options.device(at::kCPU);
-  auto grad_cpu = grad.to(at::kCPU);
-  auto grad_input_cpu = at::zeros(sizes_vec, cpu_options);
-  grad_input_cpu.select(dim, index_i).copy_(grad_cpu);
-  return grad_input_cpu.to(grad.device(), grad.scalar_type());
-}
-
-at::Tensor slice_backward_neuron(const at::Tensor& grad, c10::SymIntArrayRef input_sizes,
-                                 int64_t dim, c10::SymInt start, c10::SymInt end,
-                                 c10::SymInt step) {
-  auto sizes_vec = utils::symint_to_sizes(input_sizes);
-  auto start_i = start.expect_int();
-  auto end_i = end.expect_int();
-  auto step_i = step.expect_int();
-
-  auto options = grad.options();
-
-  auto cpu_options = options.device(at::kCPU);
-  auto grad_cpu = grad.to(at::kCPU);
-  auto grad_input_cpu = at::zeros(sizes_vec, cpu_options);
-  grad_input_cpu.slice(dim, start_i, end_i, step_i).copy_(grad_cpu);
-  return grad_input_cpu.to(grad.device(), grad.scalar_type());
-}
-
 // argsort.stable to workaround limitation on writing to non-contiguous destination on device
 at::Tensor argsort_stable_neuron(const at::Tensor& self, bool stable, int64_t dim,
                                  bool descending) {

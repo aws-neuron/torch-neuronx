@@ -512,6 +512,27 @@ def torch_slice_backward(grad_output, input_sizes, dim, start, end, step):
     return grad_input
 
 
+@register_aten(["aten::select_backward"], static_argnums=(1, 2, 3))
+def torch_select_backward(grad_output, input_sizes, dim, index):
+    # Backward of select: place grad_output at position `index` along `dim` in a
+    # zero tensor of shape input_sizes, zeros everywhere else. Decompose to
+    # unsqueeze + pad so it lowers to stablehlo.pad rather than stablehlo.scatter
+    # (which also carries an i64 index tensor).
+    ndim = len(input_sizes)
+    dim = dim % ndim
+    size = input_sizes[dim]
+    index = index % size
+    grad = grad_output.unsqueeze(dim)  # restore the dim that select dropped (size 1)
+
+    # F.pad reads (low, high) pairs from the last dim backward, so the slot for
+    # `dim` is mirrored: index zero-slices before, size-index-1 zero-slices after.
+    pad = [0, 0] * ndim
+    pos = 2 * (ndim - 1 - dim)
+    pad[pos] = index
+    pad[pos + 1] = size - index - 1
+    return torch.nn.functional.pad(grad, pad)
+
+
 @register_aten(
     [
         "aten::searchsorted.Tensor",

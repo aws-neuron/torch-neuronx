@@ -131,14 +131,6 @@ at::Tensor _reshape_alias_neuron(const at::Tensor& self, at::IntArrayRef sizes,
 // Copy from and resize operation
 at::Tensor _copy_from_and_resize_neuron(const at::Tensor& self, const at::Tensor& dst);
 
-// Select backward
-at::Tensor select_backward_neuron(const at::Tensor& grad, c10::SymIntArrayRef input_sizes,
-                                  int64_t dim, c10::SymInt index);
-
-// Slice backward
-at::Tensor slice_backward_neuron(const at::Tensor& grad_output, c10::SymIntArrayRef input_sizes,
-                                 int64_t dim, c10::SymInt start, c10::SymInt end, c10::SymInt step);
-
 // argsort.stable
 at::Tensor argsort_stable_neuron(const at::Tensor& self, bool stable, int64_t dim, bool descending);
 
