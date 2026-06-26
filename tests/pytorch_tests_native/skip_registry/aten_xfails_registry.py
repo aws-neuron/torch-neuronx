@@ -48,8 +48,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[accuracy.jacobian_mismatch] Jacobian mismatch"
-            " due to float64→float32 precision loss"
+            "[accuracy.jacobian_mismatch] Jacobian mismatch due to float64→float32 precision loss"
         ),
         tests=x.ACCURACY_JACOBIAN_MISMATCH,
     ),
@@ -59,7 +58,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[accuracy.scalar_not_equal] Scalar values differ" " due to reduced precision on Neuron"
+            "[accuracy.scalar_not_equal] Scalar values differ due to reduced precision on Neuron"
         ),
         tests=x.ACCURACY_SCALAR_NOT_EQUAL,
     ),
@@ -72,7 +71,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[accuracy.tensor_not_equal] Tensor values differ" " due to reduced precision on Neuron"
+            "[accuracy.tensor_not_equal] Tensor values differ due to reduced precision on Neuron"
         ),
         tests=x.ACCURACY_TENSOR_NOT_EQUAL,
     ),
@@ -167,8 +166,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[unsupported_op.cpu_fallback_disabled]"
-            " CPU fallback disabled and op failed on Neuron"
+            "[unsupported_op.cpu_fallback_disabled] CPU fallback disabled and op failed on Neuron"
         ),
         tests=x.UNSUPPORTED_OP_CPU_FALLBACK_DISABLED,
     ),
@@ -437,6 +435,39 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_autograd.py::TestAutograd::test_checkpoint_automatic_dynamic_graph_shadowing",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "An Aten op (e.g. torch.empty) on a CPU tensor executed inside a TorchDispatchMode"
+            " wrapper internally triggers make_variable -> TensorImpl::shallow_copy_and_detach,"
+            " only when a prior test runs TorchDispatchMode on the same worker. This re-entry"
+            " creates this extra detach op, which is captured and appended to the returned log"
+            " list by the LoggingTensor handler. The test then fails the exact match check in"
+            " assertExpectedInline. The same test passes under --forked (process isolation)."
+            " xfail (not skip) so that a future upstream fix, or an infra change (e.g. --forked)"
+            " run, xpasses and flags the change."
+        ),
+        tests=[
+            "test_python_dispatch.py::TestPythonDispatch::test_torch_dispatch_mode_basic",
+            "test_python_dispatch.py::TestPythonDispatch::test_nested_push_logging_tensor_mode",
+            "test_python_dispatch.py::TestPythonDispatch::test_nesting_same_mode",
+            "test_python_dispatch.py::TestPythonDispatch::test_capture_logs_with_torch_dispatch_mode",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "A prior test that uses saved_tensors_hooks leaves a hook pushed on the thread-state"
+            " hooks stack without a proper pop/cleanup. A later test then enters"
+            " disable_saved_tensors_hooks('outer'); _saved_tensors_hooks_disable"
+            " first flips the process-global to disabled, then sees a hook still on the"
+            " stack (it expects empty stack), so raises RuntimeError('outer')."
+            " The individual test passes in isolation and under --forked, and only fails after"
+            " a hook-leaking test ran earlier in the same worker. xfail (not skip) so a future"
+            " upstream fix or a --forked run xpasses and flags it."
+        ),
+        tests=[
+            "test_autograd.py::TestAutograd::test_disabling_saved_tensor_hooks_nested",
         ],
     ),
 ]
