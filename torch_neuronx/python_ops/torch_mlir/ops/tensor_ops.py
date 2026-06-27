@@ -98,8 +98,8 @@ def torch_replication_pad3d(input, padding, out=None):
 # preserves grad_fn=<CopySlices>.
 
 
-@register_aten(["aten::repeat"], static_argnums=(1,))
-def torch_repeat(x, repeats):
+@register_aten(["aten::repeat", "aten::repeat.out"], static_argnums=(1,), output_params=("out",))
+def torch_repeat(x, repeats, out=None):
     return x.repeat(repeats)
 
 

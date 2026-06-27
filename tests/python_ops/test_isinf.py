@@ -371,3 +371,19 @@ class TestIsInf:
             assert torch.all(torch.logical_or(y_is_inf, y_is_finite).cpu() == expected_or)
 
             assert_op_runs_on_neuron("aten::isinf")
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_isinf_out_variant(self, dtype):
+        """Test aten::isinf.out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.tensor([1.0, float("inf"), -float("inf"), 0.0], dtype=dtype)
+        expected = torch.isinf(x_cpu)
+
+        x_neuron = x_cpu.to("neuron")
+        out = torch.empty(4, dtype=torch.bool, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.isinf.out(x_neuron, out=out)
+            assert_op_runs_on_neuron("aten::isinf")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)

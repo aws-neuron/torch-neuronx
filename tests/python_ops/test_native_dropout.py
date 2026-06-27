@@ -324,3 +324,19 @@ class TestNativeDropout:
             )
 
             assert_op_runs_on_neuron("aten::native_dropout")
+
+    @pytest.mark.parametrize("shape", [(4, 8), (2, 3, 4)])
+    def test_native_dropout_out_variant(self, shape):
+        """Test aten::native_dropout.out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.randn(shape)
+        x_neuron = x_cpu.to("neuron")
+        out0 = torch.empty(shape, device="neuron")
+        out1 = torch.empty(shape, dtype=torch.bool, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.native_dropout.out(x_neuron, 0.0, True, out0=out0, out1=out1)
+            assert_op_runs_on_neuron("aten::native_dropout")
+
+        # p=0.0 means no dropout — output equals input, mask all True
+        torch.testing.assert_close(out0.cpu(), x_cpu)
+        assert torch.all(out1.cpu())

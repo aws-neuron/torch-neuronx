@@ -196,3 +196,20 @@ class TestSum:
         result = torch.sum(x, dim=0)
         expected = torch.sum(x.cpu(), dim=0)
         assert result.dtype == expected.dtype
+
+    @pytest.mark.parametrize("shape", [(4, 8), (32, 64), (3, 4, 5)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_sum_out_variant(self, device, shape, dtype):
+        """Test aten::sum.out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.randn(shape, dtype=dtype)
+        expected = torch.sum(x_cpu)
+
+        x_neuron = x_cpu.to(device)
+        out = torch.empty((), dtype=expected.dtype, device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.sum.out(x_neuron, out=out)
+            assert_op_runs_on_neuron("aten::sum")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)

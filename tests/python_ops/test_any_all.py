@@ -176,3 +176,27 @@ class TestAnyAllRegistration:
 
         expected = op_func(x, dim=0, keepdim=keepdim)
         torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize(
+        "shape,dim",
+        [
+            ((32, 64), [0]),
+            ((3, 4, 5), [0]),
+            ((3, 4, 5), [0, 1]),
+            ((2, 3, 4, 5), [1, 3]),
+        ],
+    )
+    def test_all_dims_out_variant(self, shape, dim):
+        """Test aten::all.dims_out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.randint(0, 2, shape, dtype=torch.bool)
+        expected = torch.all(x_cpu, dim=dim)
+
+        x_neuron = x_cpu.to("neuron")
+        out = torch.empty(expected.shape, dtype=torch.bool, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.all.dims_out(x_neuron, dim=dim, out=out)
+            assert_op_runs_on_neuron("aten::all")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)

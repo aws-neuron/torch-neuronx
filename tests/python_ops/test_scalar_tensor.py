@@ -137,3 +137,17 @@ class TestScalarTensor:
             assert result.device.type == "neuron"
             assert result.item() == 1.0
             assert_op_runs_on_neuron("aten::scalar_tensor")
+
+    @pytest.mark.parametrize("value", [3.14, 0.0, -1.5])
+    def test_scalar_tensor_out_variant(self, device, value):
+        """Test aten::scalar_tensor.out writes correct result to pre-allocated tensor."""
+        expected = torch.scalar_tensor(value)
+
+        out = torch.empty((), device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.scalar_tensor.out(value, out=out)
+            assert_op_runs_on_neuron("aten::scalar_tensor")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)
