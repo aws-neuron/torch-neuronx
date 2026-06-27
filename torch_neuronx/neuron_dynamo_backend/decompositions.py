@@ -162,6 +162,7 @@ neuron_decompositions = get_decompositions(
         aten.hardtanh_backward,
         aten.binary_cross_entropy_backward,
         aten.nll_loss2d_forward,
+        aten.nll_loss2d_backward,
         aten.max_unpool2d,
         aten.split_with_sizes_copy,
         aten._adaptive_avg_pool2d,
@@ -3501,6 +3502,28 @@ def _foreach_norm_decomp(self, ord=2):
 @register_decomposition([aten.argmax.default])
 def argmax_decomposition(self, dim=-1, keepdim=False):
     return self.max(dim=dim, keepdim=keepdim).indices
+
+
+@register_decomposition([aten.hardshrink_backward.default])
+def hardshrink_backward_decomposition(grad_out, self, lambd):
+    """Decompose hardshrink_backward.
+
+    hardshrink zeros values in [-lambd, lambd], so the gradient passes through
+    only where |self| > lambd and is zero elsewhere.
+    """
+    mask = (self > lambd) | (self < -lambd)
+    return grad_out * mask.to(grad_out.dtype)
+
+
+@register_decomposition([aten.softshrink_backward.default])
+def softshrink_backward_decomposition(grad_output, self, lambd):
+    """Decompose softshrink_backward.
+
+    softshrink is linear (slope 1) outside [-lambd, lambd] and zero inside, so
+    its gradient is the indicator |self| > lambd.
+    """
+    mask = (self > lambd) | (self < -lambd)
+    return grad_output * mask.to(grad_output.dtype)
 
 
 # ── Windowing functions ──────────────────────────────────────────

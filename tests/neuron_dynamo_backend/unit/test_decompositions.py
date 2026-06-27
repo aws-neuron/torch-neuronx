@@ -6271,6 +6271,139 @@ class TestAllDimsDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestShrinkBackwardDecompositionsE2E:
+    """E2E tests for hardshrink/softshrink backward via torch.compile(backend='neuron').
+
+    Each op is driven through the full interception -> trace -> torch-mlir
+    lowering -> execute path on device and compared against a CPU reference.
+    Backward ops are run under torch.no_grad(), matching how autograd invokes them.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("lambd", [0.5, 1.0, 0.0, 2.0])
+    def test_hardshrink_backward_e2e(self, lambd, dtype):
+        torch.manual_seed(0)
+
+        def fn(grad, x):
+            return torch.ops.aten.hardshrink_backward.default(grad, x, lambd)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        grad = torch.randn(64, dtype=dtype)
+        x = torch.randn(64, dtype=dtype)
+        with torch.no_grad():
+            result = compiled_fn(grad.to("neuron"), x.to("neuron"))
+            expected = fn(grad, x)
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("lambd", [0.5, 1.0, 0.0, 2.0])
+    def test_softshrink_backward_e2e(self, lambd, dtype):
+        torch.manual_seed(0)
+
+        def fn(grad, x):
+            return torch.ops.aten.softshrink_backward.default(grad, x, lambd)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        grad = torch.randn(64, dtype=dtype)
+        x = torch.randn(64, dtype=dtype)
+        with torch.no_grad():
+            result = compiled_fn(grad.to("neuron"), x.to("neuron"))
+            expected = fn(grad, x)
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_shrink_backward_boundary_values(self, dtype):
+        """Values exactly at +/-lambd are zeroed (strict inequality)."""
+
+        def fn(grad, x):
+            return torch.ops.aten.hardshrink_backward.default(grad, x, 0.5)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x = torch.tensor([-0.5, 0.5, 0.0, 1.0], dtype=dtype)
+        grad = torch.ones_like(x)
+        with torch.no_grad():
+            result = compiled_fn(grad.to("neuron"), x.to("neuron"))
+            expected = fn(grad, x)
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("op_name", ["hardshrink_backward", "softshrink_backward"])
+    def test_shrink_backward_grad_input_overload_e2e(self, op_name, dtype):
+        """The .grad_input out-variant reaches the registered .default decomp via
+        functionalization (it is intentionally not in neuron_decompositions, so a
+        registration assert can't cover it — only an e2e run can)."""
+        torch.manual_seed(0)
+        op = getattr(torch.ops.aten, op_name).grad_input
+
+        def fn(grad, x):
+            out = torch.empty_like(x)
+            return op(grad, x, 0.5, grad_input=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        grad = torch.randn(64, dtype=dtype)
+        x = torch.randn(64, dtype=dtype)
+        with torch.no_grad():
+            result = compiled_fn(grad.to("neuron"), x.to("neuron"))
+            expected = fn(grad, x)
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.hardshrink_backward.default,
+            torch.ops.aten.softshrink_backward.default,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestNllLoss2dBackwardDecompositionE2E:
+    """E2E test for nll_loss2d_backward via torch.compile(backend='neuron')."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_nll_loss2d_backward_e2e(self, dtype):
+        torch.manual_seed(0)
+        n, c, h, w = 2, 4, 3, 3
+        x = torch.randn(n, c, h, w, dtype=dtype)
+        target = torch.randint(0, c, (n, h, w))
+        out, total_weight = torch.ops.aten.nll_loss2d_forward.default(x, target, None, 1, -100)
+        grad_output = torch.randn_like(out)
+
+        def fn(grad_output, x, target, total_weight):
+            return torch.ops.aten.nll_loss2d_backward.default(
+                grad_output, x, target, None, 1, -100, total_weight
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        with torch.no_grad():
+            result = compiled_fn(
+                grad_output.to("neuron"),
+                x.to("neuron"),
+                target.to("neuron"),
+                total_weight.to("neuron"),
+            )
+            expected = fn(grad_output, x, target, total_weight)
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.nll_loss2d_backward.default,
+            torch.ops.aten.nll_loss2d_backward.grad_input,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestScatterReduceDecompositionE2E:
     """E2E tests for scatter.reduce / scatter.value_reduce decompositions."""
 
