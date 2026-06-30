@@ -9,12 +9,12 @@ PythonVersion = struct(
 
 DEFAULT_PYTHON_VERSION = PythonVersion.PY310
 
-# SHA256 for PyTorch 2.11.0 CPU wheels (manylinux_2_28_x86_64)
+# SHA256 for PyTorch 2.12.0 CPU wheels (manylinux_2_28_x86_64)
 TORCH_SHA256 = {
-    PythonVersion.PY310: "f378df648bf7fb94bbc820dfec37d3d346bd1703c692a2215edebf6edcef8b75",
-    PythonVersion.PY311: "8a56a8c95531ef0e454510ba8bbd9d11dc7a9000337265210b10f6bfeacdd485",
-    PythonVersion.PY312: "f82e2ae20c1545bb03997d1cc3143d94e14b800038669ee1aca45808a9acc338",
-    PythonVersion.PY313: "45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86",
+    PythonVersion.PY310: "5d8513a19dcf28c5dc338f3c8ee5a692b07699e8dbd01dbabce6c74a75474f70",
+    PythonVersion.PY311: "d85bdbc271bf22ef1931375a81b0366ab11081509728c58df730cf194a090818",
+    PythonVersion.PY312: "5e3dc83725581fa38b7b2e45c58692e30b2a3cde19191af54b675ffcac3840a6",
+    PythonVersion.PY313: "ada78018bdfa30d1c766596cd32d910dbf5b03424cd859231b6d2a00533de922",
 }
 
 def format_python_wheel_tag(python_version):
