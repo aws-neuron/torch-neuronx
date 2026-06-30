@@ -175,11 +175,7 @@ def _bool_reduction(op, x, dim=None, keepdim=False):
     return result.to(torch.uint8) if input_dtype == torch.uint8 else result
 
 
-@register_aten(
-    ["aten::all", "aten::all.out", "aten::all.all_out", "aten::all.dims_out"],
-    static_argnums=(1, 2),
-    output_params=("out",),
-)
+@register_aten(["aten::all", "aten::all.out", "aten::all.all_out"], static_argnums=(1, 2))
 def torch_all(x, dim=None, keepdim=False, out=None):
     return _bool_reduction(torch.all, x, dim, keepdim)
 
