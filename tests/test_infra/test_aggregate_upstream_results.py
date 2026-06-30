@@ -20,6 +20,7 @@ from aggregate_panel import (
     write_github_summary,
 )
 from aggregate_upstream_results import (
+    _classify_workflow_type,
     _get_run_metadata,
     _group_from_file,
     aggregate_summary,
@@ -572,25 +573,47 @@ def test_get_run_metadata_reads_env_vars(monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "abc123def456")
     monkeypatch.setenv("GITHUB_REF_NAME", "feature/x")
     monkeypatch.setenv("GITHUB_RUN_ID", "987654")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Merge Queue Checks")
     md = _get_run_metadata()
     assert md == {
         "commit_sha": "abc123def456",
         "branch": "feature/x",
         "run_id": "987654",
+        "workflow_type": "pre_merge",
     }
 
 
 def test_get_run_metadata_defaults_to_unknown_outside_ci(monkeypatch):
-    # Outside CI all three env vars are unset — the helper returns
-    # "unknown" for each so dashboards can distinguish "no metadata"
-    # from "missing column."
-    for var in ("GITHUB_SHA", "GITHUB_REF_NAME", "GITHUB_REF", "GITHUB_RUN_ID"):
+    # Outside CI all env vars are unset — the helper returns "unknown"
+    # for each so dashboards can distinguish "no metadata" from "missing
+    # column."
+    for var in ("GITHUB_SHA", "GITHUB_REF_NAME", "GITHUB_REF", "GITHUB_RUN_ID", "GITHUB_WORKFLOW"):
         monkeypatch.delenv(var, raising=False)
     assert _get_run_metadata() == {
         "commit_sha": "unknown",
         "branch": "unknown",
         "run_id": "unknown",
+        "workflow_type": "unknown",
     }
+
+
+def test_classify_workflow_type():
+    """Each known GitHub workflow name maps to its dashboard enum (by what the
+    workflow DOES); unknown names slugify; empty/symbol-only names → 'unknown'."""
+    # Known callers — note pre/post-merge map by behavior, not by literal name:
+    assert _classify_workflow_type("Nightly Wheel Build") == "nightly"
+    assert _classify_workflow_type("Dependency Guard") == "dependency_guard"
+    assert _classify_workflow_type("Merge Queue Checks") == "pre_merge"
+    assert _classify_workflow_type("Post-Merge Tests") == "post_merge"
+    assert _classify_workflow_type("Release Wheel Vetting") == "release_vetting"
+    # Unknown caller → slug fallback (collapse non-alphanumerics, trim):
+    assert _classify_workflow_type("Some New Flow!") == "some_new_flow"
+    assert _classify_workflow_type("Foo / Bar (v2)!") == "foo_bar_v2"
+    assert _classify_workflow_type("A---B") == "a_b"
+    # Missing / empty / all-symbol → 'unknown':
+    assert _classify_workflow_type("") == "unknown"
+    assert _classify_workflow_type("unknown") == "unknown"
+    assert _classify_workflow_type("!!!") == "unknown"
 
 
 def test_get_run_metadata_falls_back_to_github_ref_when_ref_name_unset(monkeypatch):
@@ -649,6 +672,31 @@ def test_run_metadata_csv_unknown_when_outside_ci(tmp_path, monkeypatch):
     assert row["commit_sha"] == "unknown"
     assert row["branch"] == "unknown"
     assert row["run_id"] == "unknown"
+
+
+def test_run_metadata_csv_includes_workflow_type(tmp_path, monkeypatch):
+    """workflow_type (from GITHUB_WORKFLOW) is exported to the sidecar CSV so
+    it stays consistent with _get_run_metadata() and the parquet schemas."""
+    monkeypatch.setenv("GITHUB_SHA", "abc123def")
+    monkeypatch.setenv("GITHUB_REF_NAME", "feature/x")
+    monkeypatch.setenv("GITHUB_RUN_ID", "9876")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Merge Queue Checks")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260512_104500")
+
+    result = _summary_result({"TestRan": {"passed": 8, "failed": 2}})
+    out = tmp_path / "run_metadata.csv"
+    write_run_metadata_csv(result, out)
+
+    rows = list(csv.DictReader(out.open()))
+    assert len(rows) == 1
+    row = rows[0]
+    assert "workflow_type" in row
+    # "Merge Queue Checks" (PR/merge-queue gate) maps to pre_merge.
+    assert row["workflow_type"] == "pre_merge"
+    # The status counts must still be intact (regression guard: workflow_type
+    # is excluded from the per-status fill so it isn't overwritten with 0).
+    assert row["passed"] == "8"
+    assert row["failed"] == "2"
 
 
 def test_run_metadata_csv_includes_all_status_counts(tmp_path, monkeypatch):

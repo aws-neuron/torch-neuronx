@@ -19,6 +19,7 @@ import csv
 import glob
 import logging
 import os
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -48,16 +49,57 @@ FAILURE_STATUSES = ("failed", "error")
 SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
 
 
+# Maps the GitHub workflow ``name:`` (``GITHUB_WORKFLOW`` — the *caller* of the shared
+# ``_upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
+# which kind of run produced it without a cross-table join. Add a new entry when a new
+# caller workflow is onboarded. Keys mirror ``job_metrics.github_workflow`` verbatim.
+#
+# Enum is by what each workflow DOES, not its GitHub name:
+#   - "Merge Queue Checks" (merge-queue.yml, pull_request/merge_group) gates PRs
+#     BEFORE merge -> "pre_merge".
+#   - "Post-Merge Tests" (merge.yml, push to main) runs AFTER merge -> "post_merge".
+# Both run today on purpose: post-merge is a safety net kept until the upstream suite
+# stabilizes (<5% error), after which it is deprecated and PRs gate on pre-merge only.
+_WORKFLOW_TYPE_BY_NAME = {
+    "Nightly Wheel Build": "nightly",
+    "Dependency Guard": "dependency_guard",
+    "Merge Queue Checks": "pre_merge",
+    "Post-Merge Tests": "post_merge",
+    "Release Wheel Vetting": "release_vetting",
+}
+
+
+def _classify_workflow_type(workflow_name: str) -> str:
+    """Normalize a GitHub workflow ``name:`` into a stable dashboard enum.
+
+    Known callers map via ``_WORKFLOW_TYPE_BY_NAME``; an unknown caller falls back to
+    a slug of its name. The slug regex ``[^a-z0-9]+`` matches each run of one-or-more
+    non-alphanumeric chars and replaces it with a single "_"; ``.strip("_")`` trims
+    leading/trailing underscores.  "Release Wheel Vetting" -> "release_wheel_vetting".
+    """
+    if not workflow_name or workflow_name == "unknown":
+        return "unknown"
+    if workflow_name in _WORKFLOW_TYPE_BY_NAME:
+        return _WORKFLOW_TYPE_BY_NAME[workflow_name]
+    return re.sub(r"[^a-z0-9]+", "_", workflow_name.lower()).strip("_") or "unknown"
+
+
 def _get_run_metadata() -> dict:
-    """Pull commit/branch/run-id from GH Actions env vars.
+    """Pull commit/branch/run-id/workflow from GH Actions env vars.
 
     Defaults to ``"unknown"`` outside CI so dashboards can still distinguish
     "no metadata available" from "missing column."
+
+    ``workflow_type`` is derived from ``GITHUB_WORKFLOW`` (the caller workflow's
+    ``name:``) so the upstream parquet is self-describing — dashboards can filter
+    nightly vs pre-merge vs dependency-guard directly, without joining to
+    ``job_metrics`` on ``run_id``. See ``_classify_workflow_type``.
     """
     return {
         "commit_sha": os.environ.get("GITHUB_SHA", "unknown"),
         "branch": (os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "unknown")),
         "run_id": os.environ.get("GITHUB_RUN_ID", "unknown"),
+        "workflow_type": _classify_workflow_type(os.environ.get("GITHUB_WORKFLOW", "unknown")),
     }
 
 
@@ -79,6 +121,7 @@ def write_run_metadata_csv(result: dict, output_csv: Path) -> None:
         "commit_sha",
         "branch",
         "run_id",
+        "workflow_type",
         "run_timestamp",
         "total",
         "passed",
@@ -111,6 +154,7 @@ def write_run_metadata_csv(result: dict, output_csv: Path) -> None:
                 "commit_sha",
                 "branch",
                 "run_id",
+                "workflow_type",
                 "run_timestamp",
                 "total",
                 "pass_rate(%)",

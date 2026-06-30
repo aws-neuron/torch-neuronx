@@ -134,6 +134,7 @@ def _stats_to_dict(stats: dict, component: str, metadata: dict, run_timestamp: s
         "commit_sha": metadata["commit_sha"],
         "branch": metadata["branch"],
         "run_id": metadata["run_id"],
+        "workflow_type": metadata["workflow_type"],
         "run_timestamp": run_timestamp,
         "component": component,
     }
@@ -218,6 +219,7 @@ def _make_run_metrics_table(
             ("commit_sha", pa.string()),
             ("branch", pa.string()),
             ("run_id", pa.string()),
+            ("workflow_type", pa.string()),
             ("run_timestamp", pa.timestamp("us")),
             ("component", pa.string()),
             *((field, pa.int64()) for field in _STATUS_FIELDS),
@@ -262,6 +264,7 @@ def _make_test_failures_table(
             ("commit_sha", pa.string()),
             ("branch", pa.string()),
             ("run_id", pa.string()),
+            ("workflow_type", pa.string()),
             ("run_timestamp", pa.timestamp("us")),
             ("component", pa.string()),
             ("test_id", pa.string()),
@@ -285,6 +288,7 @@ def _make_test_failures_table(
         columnar["commit_sha"].append(metadata["commit_sha"])
         columnar["branch"].append(metadata["branch"])
         columnar["run_id"].append(metadata["run_id"])
+        columnar["workflow_type"].append(metadata["workflow_type"])
         columnar["run_timestamp"].append(run_timestamp)
         # ``component`` IS NOT derivable from test_id without re-running
         # the file→component mapping, so we keep it as its own column.
@@ -357,6 +361,7 @@ def _make_test_aggregated_table(
             ("commit_sha", pa.string()),
             ("branch", pa.string()),
             ("run_id", pa.string()),
+            ("workflow_type", pa.string()),
             ("run_timestamp", pa.timestamp("us")),
             ("component", pa.string()),
             ("test_id", pa.string()),
@@ -385,6 +390,7 @@ def _make_test_aggregated_table(
         columnar["commit_sha"].append(metadata["commit_sha"])
         columnar["branch"].append(metadata["branch"])
         columnar["run_id"].append(metadata["run_id"])
+        columnar["workflow_type"].append(metadata["workflow_type"])
         columnar["run_timestamp"].append(run_timestamp)
         columnar["component"].append(_component_for(_file_from_row(row)))
         columnar["test_id"].append(row.get("test_id") or row.get("nodeid") or "")

@@ -195,6 +195,7 @@ def test_run_metrics_metadata_columns_propagate(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "deadbeef")
     monkeypatch.setenv("GITHUB_REF_NAME", "release/2.11")
     monkeypatch.setenv("GITHUB_RUN_ID", "9876")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Nightly Wheel Build")
     monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
 
     rows = [_row("test_ops.py::T::a", "passed")]
@@ -205,6 +206,8 @@ def test_run_metrics_metadata_columns_propagate(tmp_path, monkeypatch):
         assert row["commit_sha"] == "deadbeef"
         assert row["branch"] == "release/2.11"
         assert row["run_id"] == "9876"
+        # GITHUB_WORKFLOW name is normalized to a stable dashboard enum.
+        assert row["workflow_type"] == "nightly"
 
 
 def test_run_metrics_subtests_passed_normalized(tmp_path, monkeypatch):
@@ -330,10 +333,38 @@ def test_test_failures_attaches_component(tmp_path, monkeypatch):
     assert by_test["test_ops.py::T::c"]["component"] == "aten_ops"
 
 
+def test_test_failures_schema_matches_expected_columns(tmp_path, monkeypatch):
+    """Schema-drift guard for the test_failures Athena-facing column set."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::TestOps::test_foo", "failed", reason="boom")]
+    out = tmp_path / "tf.parquet"
+    write_test_failures_parquet(rows, out)
+
+    schema = pq.read_table(out).schema
+    expected = {
+        "commit_sha",
+        "branch",
+        "run_id",
+        "workflow_type",
+        "run_timestamp",
+        "component",
+        "test_id",
+        "status",
+        "failure_reason",
+        "duration_sec",
+    }
+    assert set(schema.names) == expected
+
+
 def test_test_failures_metadata_columns_propagate(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "deadbeef")
     monkeypatch.setenv("GITHUB_REF_NAME", "release/2.11")
     monkeypatch.setenv("GITHUB_RUN_ID", "9876")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Dependency Guard")
     monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
 
     rows = [_row("test_ops.py::T::a", "failed", reason="boom")]
@@ -344,6 +375,8 @@ def test_test_failures_metadata_columns_propagate(tmp_path, monkeypatch):
     assert row["commit_sha"] == "deadbeef"
     assert row["branch"] == "release/2.11"
     assert row["run_id"] == "9876"
+    # workflow_type is stamped on every failure row (mapped from GITHUB_WORKFLOW).
+    assert row["workflow_type"] == "dependency_guard"
 
 
 def test_test_failures_rows_sorted_by_component_then_test_id(tmp_path, monkeypatch):
@@ -473,6 +506,7 @@ def test_test_aggregated_schema_matches_expected_columns(tmp_path, monkeypatch):
         "commit_sha",
         "branch",
         "run_id",
+        "workflow_type",
         "run_timestamp",
         "component",
         "test_id",
@@ -543,6 +577,7 @@ def test_test_aggregated_metadata_columns_propagate(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "deadbeef")
     monkeypatch.setenv("GITHUB_REF_NAME", "release/2.11")
     monkeypatch.setenv("GITHUB_RUN_ID", "9876")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Post-Merge Tests")
     monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
 
     rows = [_row("test_ops.py::T::a", "passed")]
@@ -553,6 +588,9 @@ def test_test_aggregated_metadata_columns_propagate(tmp_path, monkeypatch):
     assert row["commit_sha"] == "deadbeef"
     assert row["branch"] == "release/2.11"
     assert row["run_id"] == "9876"
+    # workflow_type is stamped on every aggregated row (mapped from GITHUB_WORKFLOW).
+    # "Post-Merge Tests" (push to main) maps to post_merge.
+    assert row["workflow_type"] == "post_merge"
 
 
 def test_test_aggregated_rows_sorted_by_component_then_test_id(tmp_path, monkeypatch):
