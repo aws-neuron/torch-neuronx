@@ -268,14 +268,17 @@ class TestNeuronProfilerIntegration:
         )
 
     def test_no_activities(self):
-        """Case 1: profile(activities=[]) falls back to supported_activities() defaults.
+        """Case 1: profile(activities=None) uses supported_activities() defaults.
 
-        In PyTorch, an empty activities list is falsy, so the profile() constructor
-        treats it the same as activities=None and uses supported_activities() defaults.
-        This means CPU is included and framework traces are captured.
+        torch 2.12 changed the profile() constructor to check ``activities is not
+        None`` instead of truthiness, so an empty list is now taken literally (an
+        empty activity set raises ``AssertionError: No valid profiler activities
+        found``) rather than falling back to defaults. Passing ``activities=None``
+        selects supported_activities() defaults, which include CPU, so framework
+        traces are captured.
         """
-        # activities=[] is falsy in Python, so profile() uses supported_activities()
-        with profile(activities=[]) as prof, record_function("model_inference"):
+        # activities=None -> profile() uses supported_activities() defaults
+        with profile(activities=None) as prof, record_function("model_inference"):
             x = torch.randn(10, 5)
             _ = x + x
 
