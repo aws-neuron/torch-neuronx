@@ -540,7 +540,7 @@ TEST_F(SessionTest, ConcurrentStartCalls) {
 // Minimal no-op ActivityLogger for processTrace tests
 class NoOpLogger : public libkineto::ActivityLogger {
  public:
-  void handleDeviceInfo(const libkineto::DeviceInfo&, uint64_t) override {}
+  void handleDeviceInfo(const libkineto::DeviceInfo&, int64_t) override {}
   void handleResourceInfo(const libkineto::ResourceInfo&, int64_t) override {}
   void handleOverheadInfo(const OverheadInfo&, int64_t) override {}
   void handleTraceSpan(const libkineto::TraceSpan&) override {}
