@@ -54,57 +54,110 @@ def _is_tuple_return(module: Module) -> bool:
     return False
 
 
+def _detect_passthrough_aliases_from_module(module: Module) -> dict[int, int]:
+    """Find pass-through aliases directly on the lowered StableHLO module.
+
+    A function result that is *exactly* a block argument is an input returned
+    unchanged (a pass-through). Detecting this on the final module — rather than
+    trusting FX-graph placeholder/output indices — keeps the indices in the same
+    space as the emitted function signature.
+
+    This matters because lowering can drop or reorder graph inputs/outputs. For
+    example, PT2.12 dynamo lifts module ``forward_pre_hook`` closure cells as
+    extra FX placeholders; those are constant-folded out of the MLIR, so FX
+    placeholder/output indices no longer line up with the MLIR function IO and
+    the pre-computed (FX-space) alias indices land out of bounds.
+
+    Returns:
+        dict[int, int]: mapping of MLIR output index -> MLIR input (arg) index.
+    """
+    output_to_input: dict[int, int] = {}
+    for op in module.body.operations:
+        if op.operation.name != "func.func":
+            continue
+        block = op.regions[0].blocks[0]
+        for inner in block.operations:
+            if inner.operation.name in ("func.return", "return"):
+                for out_idx, operand in enumerate(inner.operands):
+                    if mlir_ir.BlockArgument.isinstance(operand):
+                        output_to_input[out_idx] = mlir_ir.BlockArgument(operand).arg_number
+        break
+    return output_to_input
+
+
 def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
     """Set aliasing attributes on the MLIR module for input-output tensor aliasing.
 
     Attaches mhlo.input_output_alias attributes to the module operation,
     informing the compiler which output tensors should alias input tensors.
 
+    Aliases are always resolved against the ACTUAL lowered StableHLO IO:
+      1. Pass-through aliases are read straight off the module (a result that is
+         a block argument), which is inherently in the correct MLIR index space.
+      2. Any explicitly-provided aliases (in-place mutation / NKI / pre-AOT
+         analysis, expressed in FX-graph index space) are applied only when they
+         still map validly onto the real MLIR IO. A stale / out-of-range hint is
+         skipped instead of applied at the wrong index — an aliasing hint is a
+         buffer-donation optimization, so a mis-indexed alias would be incorrect
+         while a missing one is merely a lost optimization.
+
     Args:
         module (Module): MLIR Module to modify.
         aliasing_info (AliasingInfo): Aliasing relationships to apply.
-
-    Raises:
-        IndexError: If parameter_number or output_index is out of bounds.
     """
-    if aliasing_info is None:
-        return
-
     is_tuple_output = _is_tuple_return(module)
-    alias_dicts = []
 
     with module.context:
         function_io = parse_module_io(module)
         inputs = function_io.inputs
         outputs = function_io.outputs
 
-        for alias in aliasing_info:
-            param_num = alias.parameter_number
-            param_idx = alias.parameter_index
-            output_idx = alias.output_index
+        # MLIR output index -> (input param_num, parameter_index) to alias.
+        output_to_alias: dict[int, tuple[int, list[int]]] = {}
 
-            if param_num < 0 or param_num >= len(inputs):
-                raise IndexError(
-                    f"param_num {param_num} is out of bounds for inputs array "
-                    f"of length {len(inputs)}"
-                )
-            input_shape = inputs[param_num]
+        # (1) Ground-truth pass-throughs from the lowered module.
+        for output_idx, param_num in _detect_passthrough_aliases_from_module(module).items():
+            if 0 <= param_num < len(inputs) and 0 <= output_idx < len(outputs):
+                output_to_alias[output_idx] = (param_num, [])
 
-            # Bounds check for outputs
-            if output_idx < 0 or output_idx >= len(outputs):
-                raise IndexError(
-                    f"output_idx {output_idx} is out of bounds for outputs array "
-                    f"of length {len(outputs)}"
-                )
-            output_shape = outputs[output_idx]
+        # (2) Merge explicitly-provided aliases, validated against the real IO.
+        if aliasing_info is not None:
+            for alias in aliasing_info:
+                param_num = alias.parameter_number
+                param_idx = alias.parameter_index or []
+                output_idx = alias.output_index
+                if not isinstance(output_idx, int):
+                    output_idx = output_idx[0] if output_idx else -1
 
-            # If there's a shape mismatch, skip this alias
-            # StableHLO does not recognize mismatch-shaped
-            # alias relationship.
-            if not shapes_match(input_shape, output_shape):
+                if not (0 <= param_num < len(inputs)) or not (0 <= output_idx < len(outputs)):
+                    logger.debug(
+                        "Skipping alias with indices outside the lowered MLIR IO: "
+                        "param_num=%s output_idx=%s (inputs=%d, outputs=%d)",
+                        param_num,
+                        output_idx,
+                        len(inputs),
+                        len(outputs),
+                    )
+                    continue
+                if output_idx in output_to_alias:
+                    # Already covered by a ground-truth pass-through.
+                    continue
+                if not shapes_match(inputs[param_num], outputs[output_idx]):
+                    continue
+                output_to_alias[output_idx] = (param_num, param_idx)
+
+        if not output_to_alias:
+            return
+
+        # (3) Emit mhlo.input_output_alias from the validated map.
+        alias_dicts = []
+        for output_idx in sorted(output_to_alias):
+            param_num, param_idx = output_to_alias[output_idx]
+
+            # StableHLO does not recognize mismatch-shaped alias relationships.
+            if not shapes_match(inputs[param_num], outputs[output_idx]):
                 continue
 
-            # Build inner alias dict
             param_index_attr = mlir_ir.DenseI64ArrayAttr.get(param_idx if param_idx else [])
             param_number_attr = mlir_ir.IntegerAttr.get(
                 mlir_ir.IntegerType.get_signed(64), param_num
@@ -121,11 +174,7 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 
             # Build output_index based on return type
             if is_tuple_output:
-                # Tuple output: index into the tuple
-                # output_idx could be int or list
-                output_index_attr = mlir_ir.DenseI64ArrayAttr.get(
-                    [output_idx] if isinstance(output_idx, int) else output_idx
-                )
+                output_index_attr = mlir_ir.DenseI64ArrayAttr.get([output_idx])
             else:
                 # Single tensor output: must use empty index
                 output_index_attr = mlir_ir.DenseI64ArrayAttr.get([])
