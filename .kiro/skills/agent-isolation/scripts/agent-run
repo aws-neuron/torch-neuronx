@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# agent-run: launch a command in an isolated agent context on Neuron hardware.
+#
+# Pins NeuronCores to the agent's slice, scopes HLO/NEFF/temp directories,
+# allocates a disjoint TCP port range for distributed tests, and ensures
+# spawned ranks inside multi-core tests land on the right physical cores.
+#
+# Usage:
+#   .kiro/skills/agent-isolation/scripts/agent-run BASE_CORE NUM_CORES -- COMMAND...
+#
+# Examples:
+#   # 4 cores, single-core suite
+#   .kiro/skills/agent-isolation/scripts/agent-run 0 4 -- pytest tests/python_ops/test_add.py
+#
+#   # 8 cores, repo distributed test
+#   .kiro/skills/agent-isolation/scripts/agent-run 8 8 -- pytest tests/distributed/cache/...
+#
+#   # 16 cores, upstream distributed
+#   .kiro/skills/agent-isolation/scripts/agent-run 16 16 -- pytest tests/pytorch_tests_native/...
+#
+# Run multiple agents in parallel with disjoint slices:
+#   .kiro/skills/agent-isolation/scripts/agent-run 0  4  -- pytest <suite_a> &
+#   .kiro/skills/agent-isolation/scripts/agent-run 4  8  -- pytest <suite_b> &
+#   .kiro/skills/agent-isolation/scripts/agent-run 12 16 -- pytest <suite_c> &
+#   wait
+#
+# See ../SKILL.md for the full model, constraints, and the three-tier
+# dispatch policy that wraps this script.
+
+set -euo pipefail
+
+if [[ $# -lt 3 ]]; then
+  echo "usage: $0 BASE_CORE NUM_CORES -- COMMAND..." >&2
+  exit 2
+fi
+
+BASE="$1"
+SIZE="$2"
+shift 2
+[[ "${1:-}" == "--" ]] && shift
+
+if [[ $# -lt 1 ]]; then
+  echo "error: no command given" >&2
+  exit 2
+fi
+
+END=$((BASE + SIZE - 1))
+PORT_OFFSET=$((1000 + BASE * 32))   # 32 ports per core, clear of 29500 base
+
+AGENT_ROOT="${AGENT_CACHE_ROOT:-/tmp/agent}/c${BASE}"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
+
+# --- Core scoping ------------------------------------------------------------
+# NEURON_RT_VISIBLE_CORES gives the master pytest process the agent's slice.
+# The three PYTEST_*/TOTAL_DEVICE_COUNT vars make get_core_start_index() in
+# tests/utils/neuron_test_utils.py return BASE, so distributed tests' spawned
+# ranks pin themselves to BASE+rank inside their mp.spawn child processes.
+export NEURON_RT_VISIBLE_CORES="${BASE}-${END}"
+export PYTEST_XDIST_WORKER="gw${BASE}"
+export PYTEST_XDIST_WORKER_COUNT=64
+export TOTAL_DEVICE_COUNT=64
+
+# --- Cache + temp scoping ----------------------------------------------------
+# Per-agent HLO/NEFF cache dirs prevent cache write races. TMPDIR catches
+# anything that goes through tempfile.gettempdir() — torchinductor, NKI temp
+# dirs, filelocks, scratch artifacts.
+export TORCH_NEURONX_HLO_CACHE_DIR="${AGENT_ROOT}/hlo"
+export TORCH_NEURONX_NEFF_CACHE_DIR="${AGENT_ROOT}/neff"
+export TMPDIR="${AGENT_ROOT}/tmp"
+
+# --- Port scoping ------------------------------------------------------------
+# AGENT_PORT_OFFSET is read by the pytest plugin (lib/agent_port_isolation.py)
+# which patches the repo's _BASE_MASTER_PORT and sets MASTER_PORT for upstream
+# tests. The plugin is loaded via PYTEST_PLUGINS and lives on PYTHONPATH.
+export AGENT_PORT_OFFSET="${PORT_OFFSET}"
+export PYTHONPATH="${PLUGIN_DIR}:${PYTHONPATH:-}"
+export PYTEST_PLUGINS="${PYTEST_PLUGINS:+${PYTEST_PLUGINS},}agent_port_isolation"
+
+mkdir -p "${AGENT_ROOT}/hlo" "${AGENT_ROOT}/neff" "${TMPDIR}"
+
+# --- Cancel-cascade safety --------------------------------------------------
+# When a parent agent is cancelled, the harness sends SIGTERM. Without a
+# trap, our own bash exits but pytest descendants keep running and hold
+# /dev/neuron0 — the next agent on the same slice fails with
+# "Failed to initialize Neuron Runtime: status code 1" until the zombies
+# are fuser-killed by hand. We can't `exec "$@"` and have a trap fire (exec
+# replaces this shell), so we run the command in its own process group and
+# forward signals to the whole group on cancel.
+set -m                              # job control on; $! gets its own pgid
+"$@" &
+child_pid=$!
+cleanup() {
+    [[ -n "${child_pid:-}" ]] && kill -TERM -"${child_pid}" 2>/dev/null
+    wait "${child_pid}" 2>/dev/null
+    exit 130
+}
+trap cleanup INT TERM
+wait "${child_pid}"
+exit $?

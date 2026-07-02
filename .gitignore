@@ -1,3 +1,6 @@
+# CodeGraph local index (per-machine; built via `codegraph init .`)
+.codegraph/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -62,6 +65,14 @@ global_metric_store.json
 file.neff
 .torch_neuronx/
 
+# Agent scratch directory — pytorch-upstream-test-debugger skill writes
+# per-bug RCA workspaces (notes, baseline/verify reports, PR body drafts,
+# verify_failing.sh, completion.json) under agent_artifacts/<slug>/.
+# Must never be committed — see
+# .kiro/skills/pytorch-upstream-test-debugger/SKILL.md under
+# "Artifacts and file I/O".
+agent_artifacts/
+
 # Ignore python files generated from proto
 torch_neuronx/protos/*.py
 torch_neuronx/protos/xla/*.py
@@ -76,3 +87,8 @@ MODULE.bazel.lock
 uv.lock
 .clangd
 build
+
+# Claude Code local config — the .claude/skills and .claude/agents
+# symlinks are intentionally tracked, but per-user settings are not.
+.claude/settings.json
+.claude/settings.local.json
