@@ -250,6 +250,20 @@ class Executor:
         if i in mutated_output_to_input:
             return neuron_inputs[mutated_output_to_input[i]]
 
+        # Script-object (e.g. DeviceMesh) pass-through outputs are folded out of the
+        # NEFF and rebuilt from inputs by _process_outputs (_script_object_output_to_input).
+        # Don't reuse the script-object input buffer here: execute_compiled_graph accepts
+        # only tensors, so a DeviceMesh in neuron_outputs raises TypeError. Use a
+        # placeholder tensor; its NEFF slot is unused and overwritten downstream.
+        # TODO: this is a downstream workaround. The root fix belongs in the
+        # ReplaceDeviceMeshPlaceholders pass, which today only drops DeviceMesh *inputs*
+        # and leaves the pass-through *outputs* dangling, forcing every consumer
+        # (here and _process_outputs) to special-case them. When that pass is
+        # refactored, have it resolve DeviceMesh pass-throughs at the source and remove
+        # these runtime guards.
+        if i in self._script_object_output_to_input():
+            return torch.empty(out.shape, dtype=out.dtype, device=device_str)
+
         # Reuse input buffer for pass-through outputs (inputs returned unchanged).
         # Unlike mutations, pass-throughs are NOT filtered in _process_outputs
         # because AOTAutograd expects them in the return tuple for backward.
