@@ -1,5 +1,6 @@
 """Neuron distributed backend — registration, factory, and runtime setup."""
 
+import contextlib
 import os
 import socket
 import time
@@ -50,11 +51,41 @@ def rendezvous_handler():
     pass
 
 
+def _graph_break_object_collectives():
+    """Force ``torch.compile`` to graph-break on Python object-collectives.
+
+    Collectives such as ``all_gather_object`` pickle arbitrary Python objects and
+    operate on the ProcessGroup script object, so they are inherently untraceable.
+    Under PT2.12, dynamo otherwise traces into ``_get_object_coll_device`` and
+    hard-errors while accessing the ProcessGroup opaque member ``_device_types``
+    (``UnsafeScriptObjectError``) instead of breaking cleanly.
+
+    Wrapping them with ``torch._dynamo.disable`` makes dynamo graph-break at the
+    call site (running the collective eagerly); eager (non-compiled) behavior is
+    unchanged. Mirrors how the untraceable Neuron C extensions are wrapped in
+    ``torch_neuronx.__init__``.
+    """
+    import torch
+
+    for _name in (
+        "all_gather_object",
+        "gather_object",
+        "broadcast_object_list",
+        "scatter_object_list",
+    ):
+        _fn = getattr(dist, _name, None)
+        if _fn is not None:
+            with contextlib.suppress(TypeError, AttributeError):
+                setattr(dist, _name, torch._dynamo.disable(_fn))
+
+
 _register_neuron_backend()
 
 dist.register_rendezvous_handler("neuron", rendezvous_handler)
 
 register_neuron_collectives()
+
+_graph_break_object_collectives()
 
 
 # ─────────────────────────────────────────────────────────────────────────

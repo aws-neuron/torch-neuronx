@@ -137,23 +137,46 @@ class Executor:
                 tensor = tensor.to(torch.float32)
             yield tensor
 
-    def _process_outputs(self, outputs):
+    def _script_object_output_to_input(self):
+        """Map output index -> original input index for script-object pass-throughs.
+
+        A graph input that is a script object (e.g. a ``DeviceMesh``) and is
+        returned unchanged is a pass-through, but it is NOT a NEFF tensor output:
+        its source input is removed from the NEFF (``removed_device_mesh_indices``)
+        and the output is folded out during lowering. AOTAutograd still expects
+        the forward to return it (it is saved for backward), so it must be
+        re-inserted at runtime straight from the original input.
+
+        Returns:
+            dict[int, int]: folded pass-through output index -> original input index.
+        """
+        removed_inputs = set(self.removed_device_mesh_indices or [])
+        mapping: dict[int, int] = {}
+        if self.passthrough_info is not None and removed_inputs:
+            for alias in self.passthrough_info.aliases:
+                if alias.parameter_number in removed_inputs:
+                    mapping[alias.output_index] = alias.parameter_number
+        return mapping
+
+    def _process_outputs(self, outputs, original_inputs=None):
         """Process execution outputs with dtype upcasting and alias filtering.
 
         Neuron hardware operates on 32-bit dtypes, so this method restores
         original 64-bit dtypes where needed. Aliased outputs are skipped since
         they were written directly to input buffers during execution.
 
+        Script-object pass-through outputs (e.g. a ``DeviceMesh`` returned
+        unchanged and saved for backward) are folded out of the NEFF, so they are
+        re-inserted here directly from ``original_inputs`` -- a reference
+        pass-through, adding no compute and no device memory.
+
         Args:
             outputs (list[torch.Tensor]): Output tensors from graph execution.
+            original_inputs (Sequence | None): The raw inputs to __call__, used to
+                recover folded script-object pass-through outputs.
 
         Yields:
             torch.Tensor: Processed tensors with dtypes matching cast_spec.
-                - int32/uint32 tensors are reinterpreted as int64/uint64 via view()
-                - float32 tensors are converted to float64 via to()
-                - Aliased outputs are excluded from the results.
-                  Combination of AOTAutograd and Compiler handle mapping of
-                  outputs to inputs.
         """
         # Apply casting
         tensors = []
@@ -164,17 +187,31 @@ class Executor:
                 tensor = tensor.to(cast_spec.dtype)
             tensors.append(tensor)
 
-        # Re-insert None outputs into list of outputs
+        # Re-insert None outputs (and folded script-object pass-throughs) into the
+        # full output tuple that AOTAutograd expects.
         if self.none_output_info:
-            assert len(tensors) == len(
-                self.none_output_info.non_none_positions
-            ), "Length of outputs does not match non_none_positions:"
-            f"{len(tensors)=} {len(self.none_output_info.non_none_positions)=}"
-            tensors_with_nones = [None for _ in range(self.none_output_info.original_output_count)]
-            for i in range(len(tensors)):
-                index = self.none_output_info.non_none_positions[i]
-                tensors_with_nones[index] = tensors[i]
-            tensors = tensors_with_nones
+            original_output_count = self.none_output_info.original_output_count
+            non_none_positions = self.none_output_info.non_none_positions
+
+            scriptobj_output_to_input = self._script_object_output_to_input()
+            if original_inputs is None:
+                scriptobj_output_to_input = {}
+
+            # NEFF tensor outputs fill the non-None positions that are NOT folded
+            # script-object pass-throughs.
+            tensor_positions = [p for p in non_none_positions if p not in scriptobj_output_to_input]
+            assert len(tensors) == len(tensor_positions), (
+                f"NEFF tensor output count {len(tensors)} does not match expected "
+                f"{len(tensor_positions)} (non_none_positions={non_none_positions}, "
+                f"script_object_outputs={sorted(scriptobj_output_to_input)})"
+            )
+
+            reconstructed = [None for _ in range(original_output_count)]
+            for output_idx, input_idx in scriptobj_output_to_input.items():
+                reconstructed[output_idx] = original_inputs[input_idx]
+            for i, output_idx in enumerate(tensor_positions):
+                reconstructed[output_idx] = tensors[i]
+            tensors = reconstructed
 
         # Filter aliased outputs
         if self.mutation_info:
@@ -347,7 +384,7 @@ class Executor:
             self.has_collectives,
         )
 
-        outputs = tuple(self._process_outputs(neuron_outputs))
+        outputs = tuple(self._process_outputs(neuron_outputs, inputs))
 
         if self.retain_device:
             return tuple(self._cast_output_device(inputs, outputs))

@@ -120,5 +120,5 @@ class DistributedTester:
             import traceback
 
             tb = traceback.format_exc()
-            error_queue.put((rank, e, tb))
+            error_queue.put((rank, f"{type(e).__name__}: {e}", tb))
             raise
