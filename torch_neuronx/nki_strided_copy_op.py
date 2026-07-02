@@ -14,6 +14,7 @@ _LIB_DEF.define("nki_strided_copy_(Tensor src, Tensor(a!) dst) -> Tensor(a!)")
 _LIB_IMPL = torch.library.Library("neuron", "IMPL", "PrivateUse1")
 
 
+@torch._dynamo.disable
 def _nki_stride2_copy_impl(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     """NKI-based stride-2 copy between Neuron tensors.
 
