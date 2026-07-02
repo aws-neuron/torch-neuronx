@@ -10,10 +10,10 @@ Run: WORLD_SIZE=8 ./tools/run-test \
 """
 
 import pytest
-import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from tests.distributed.collective_ops.base_collective_op import BaseCollectiveOpTest
+from tests.distributed.utils import broadcast_object_from_rank0
 from torch_neuronx.distributed.mesh_registry import (
     _MESH_REGISTRY,
     clear_mesh_registry,
@@ -83,8 +83,7 @@ def run_spmd_identity(rank, world_size, kwargs):
         pg_name = mesh._dim_group_names[dim_idx]
         my_groups = _MESH_REGISTRY[pg_name]
 
-        rank0_groups = [my_groups] if rank == 0 else [None]
-        dist.broadcast_object_list(rank0_groups, src=0)
+        rank0_groups = [broadcast_object_from_rank0(my_groups, rank, world_size, tag=f"reg_{name}")]
 
         assert (
             my_groups == rank0_groups[0]

@@ -16,6 +16,7 @@ import torch.nn as nn
 
 import torch_neuronx
 from tests.distributed.collective_ops.base_collective_op import BaseCollectiveOpTest
+from tests.distributed.utils import broadcast_object_from_rank0
 from torch_neuronx.neuron_dynamo_backend.compile import (
     ArtifactType,
     clear_compiled_cache_keys,
@@ -59,9 +60,8 @@ def run_in_memory_cache_key_test(rank, world_size, kwargs):
     assert len(cache_keys) == 1, f"Expected 1 cache key, got {len(cache_keys)}"
     local_key = next(iter(cache_keys))
 
-    # Broadcast rank 0's key and verify all ranks match
-    rank0_key = [local_key] if rank == 0 else [None]
-    dist.broadcast_object_list(rank0_key, src=0)
+    # Broadcast rank 0's key and verify all ranks match (host-side; see helper)
+    rank0_key = [broadcast_object_from_rank0(local_key, rank, world_size, tag="cache_key")]
 
     assert (
         local_key == rank0_key[0]
