@@ -2,7 +2,87 @@
 
 import os
 import shutil
+import sys
 from pathlib import Path
+
+# Env var the xdist controller uses to hand the per-worker core count to its
+# workers. The controller knows the test selection (via ``sys.argv``) but has no
+# worker index; each worker knows its index but not the selection (an xdist
+# worker's ``sys.argv`` is just ``['-c']``). The controller resolves the count
+# and exports it here at conftest module load — before workers are spawned, so
+# they inherit it.
+_CORES_PER_WORKER_ENV = "NEURON_CORES_PER_WORKER"
+
+
+def _setup_neuron_cores_for_xdist() -> None:
+    """Partition visible cores across xdist workers, BEFORE ``import torch``.
+
+    ``torch.get_device_module(...).device_count()`` (and
+    ``torch.accelerator.device_count()``) memoize the Neuron device count on
+    their first call. If that first call happens before ``NEURON_RT_VISIBLE_CORES``
+    is set, every later reader sees the full physical count (e.g. 64) instead of
+    this worker's core allocation (e.g. 8). MultiProcContinuousTest classes whose
+    ``world_size`` is unset then resolve world_size from that stale count and
+    spawn 64 rank processes onto 8 usable cores — every rank dies in
+    ``_init_pg`` and the dispatcher hangs draining the dead queues. Setting
+    NEURON_RT_VISIBLE_CORES at module load, before the first torch import,
+    guarantees it precedes all the workers' device_count call.
+
+    Distributed tests get WORLD_SIZE cores per worker (default 8); other tests
+    get 1. The controller resolves the per-worker count (NEURON_CORES_PER_WORKER);
+    Each worker use it plus its own index to configure NEURON_RT_VISIBLE_CORES.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+
+    if worker is None:
+        # Controller: it has the test selection in sys.argv, worker index is None.
+        # Resolve cores-per-worker and export it for the workers to inherit.
+        if not any("pytorch_tests_native" in a for a in sys.argv):
+            return
+        # PYTEST_XDIST_WORKER_COUNT is mostly available on worker, not controller.
+        # This falls back to "_argv_worker_count()" parsing "-n" in pytest cmd
+        worker_count = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "0")) or _argv_worker_count()
+        if worker_count <= 1:
+            return
+        is_distributed = any("distributed" in a for a in sys.argv)
+        cores_per_worker = int(os.environ.get("WORLD_SIZE", "8")) if is_distributed else 1
+        os.environ[_CORES_PER_WORKER_ENV] = str(cores_per_worker)
+        return
+
+    # Worker: sees _CORES_PER_WORKER_ENV since controller already set it in os.environ
+    cores_per_worker = int(os.environ.get(_CORES_PER_WORKER_ENV, "0"))
+    if cores_per_worker <= 0:
+        return
+
+    from tests.utils.neuron_test_utils import (
+        get_core_start_index,
+        get_pytest_worker_count,
+        get_total_core_count,
+    )
+
+    if get_pytest_worker_count() <= 1:
+        return
+    _core_start = get_core_start_index()
+    _core_end = min(_core_start + cores_per_worker - 1, get_total_core_count() - 1)
+    if _core_start > _core_end:
+        return
+    os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_end}"
+
+
+def _argv_worker_count() -> int:
+    """Parse ``-n <N>`` / ``-nN`` from the controller's argv (xdist worker count)."""
+    for i, a in enumerate(sys.argv):
+        if a == "-n" and i + 1 < len(sys.argv):
+            try:
+                return int(sys.argv[i + 1])
+            except ValueError:
+                return 0
+        if a.startswith("-n") and len(a) > 2:
+            try:
+                return int(a[2:])
+            except ValueError:
+                return 0
+    return 0
 
 
 def _overlay_torch_internal() -> None:
@@ -44,6 +124,10 @@ def _overlay_torch_internal() -> None:
 # Run the overlay BEFORE any torch import. Order matters.
 _overlay_torch_internal()
 
+# Partition Neuron cores per xdist worker BEFORE importing torch, so the device
+# count is memoized against this worker's window (see the function docstring).
+_setup_neuron_cores_for_xdist()
+
 import pytest  # noqa: E402
 import torch  # noqa: E402
 import torch.testing._comparison as _torch_cmp  # noqa: E402
@@ -79,35 +163,6 @@ def _to_glob(e):
 collect_ignore_glob = [_to_glob(entry) for group in BLOCKLIST for entry in group.tests]
 
 
-def _setup_neuron_cores_for_xdist(config):
-    """Partition visible cores across xdist workers.
-
-    Distributed tests get WORLD_SIZE cores per worker (default 8).
-    All other tests get 1 core per worker.
-    Without xdist, no core partitioning is applied.
-    """
-    test_paths = [str(a) for a in getattr(config, "args", [])]
-    if not any("pytorch_tests_native" in p for p in test_paths):
-        return
-
-    from tests.utils.neuron_test_utils import (
-        get_core_start_index,
-        get_pytest_worker_count,
-        get_total_core_count,
-    )
-
-    if get_pytest_worker_count() <= 1:
-        return
-
-    is_distributed = any("distributed" in p for p in test_paths)
-    cores_per_worker = int(os.environ.get("WORLD_SIZE", "8")) if is_distributed else 1
-    _core_start = get_core_start_index()
-    _core_end = min(_core_start + cores_per_worker - 1, get_total_core_count() - 1)
-    if _core_start > _core_end:
-        return
-    os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_start}-{_core_end}"
-
-
 @pytest.fixture(autouse=True)
 def _reset_fx_tracing_flag():
     yield
@@ -121,15 +176,12 @@ def pytest_configure(config):
     module load time (see :func:`_overlay_torch_internal`) — before any
     ``import torch`` so that subsequent imports pick up the new files.
     This hook only applies runtime Neuron patches (compile redirect,
-    cross-device comparison, OpInfo sample filter) and xdist setup.
+    cross-device comparison, OpInfo sample filter).
     """
     # Apply Neuron test patches (compile redirect, cross-device comparison)
     from tests.pytorch_tests_native.neuron_overrides import apply_patches
 
     apply_patches()
-
-    # Set up neuron core allocation for xdist workers
-    _setup_neuron_cores_for_xdist(config)
 
 
 # ---------------------------------------------------------------------------
