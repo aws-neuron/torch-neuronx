@@ -483,6 +483,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output_dir,
     )
 
+    # Capture the environment versions this node ran against (torch, neuronx-cc,
+    # dkms, collectives, runtime-lib, ...) into a sidecar the aggregator folds
+    # into the job_metadata table. This is the only place these packages are
+    # installed (the aggregator runs on a plain runner). Non-fatal: a probe
+    # failure must never mask the real test exit code.
+    try:
+        from job_metadata import write_versions_sidecar
+
+        write_versions_sidecar(args.output_dir, node_label=os.environ.get("NODE_LABEL"))
+    except Exception as exc:
+        print(f"WARNING: version sidecar capture failed (non-fatal): {exc}")
+
     return exit_code
 
 

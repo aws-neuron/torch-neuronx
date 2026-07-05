@@ -684,6 +684,13 @@ def main(argv: list | None = None) -> int:
         / f"dt={run_date}"
         / f"run_{run_id}.parquet"
     )
+    job_metadata_parquet = (
+        parquet_root
+        / "job_metadata"
+        / f"branch={branch}"
+        / f"dt={run_date}"
+        / f"run_{run_id}.parquet"
+    )
 
     if not results_dir.exists():
         logger.error(f"Results directory not found: {results_dir}")
@@ -716,6 +723,7 @@ def main(argv: list | None = None) -> int:
     # a circular dependency at module load.
     from aggregate_panel import write_github_summary
     from write_parquet import (
+        _resolve_run_timestamp,
         write_run_metrics_parquet,
         write_test_aggregated_parquet,
         write_test_failures_parquet,
@@ -725,6 +733,21 @@ def main(argv: list | None = None) -> int:
     write_test_failures_parquet(result["test_rows"], test_failures_parquet)
     write_test_aggregated_parquet(result["test_rows"], test_aggregated_parquet)
     write_github_summary(result)
+
+    # job_metadata: one row per run with the environment versions the run ran
+    # against (torch, neuronx-cc, dkms, collectives, runtime-lib, ...). Collected
+    # from the per-node env_versions.json sidecars written by run_upstream_tests.
+    # Skips gracefully (writes nothing) if no sidecars are present — e.g. an
+    # older test image without the collector — so history degrades to NULL the
+    # same way workflow_type did.
+    from job_metadata import write_job_metadata_parquet
+
+    write_job_metadata_parquet(
+        results_dir,
+        _get_run_metadata(),
+        _resolve_run_timestamp(),
+        job_metadata_parquet,
+    )
 
     flatten_reports(results_dir)
 
