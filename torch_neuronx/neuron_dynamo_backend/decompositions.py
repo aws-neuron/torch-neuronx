@@ -1708,6 +1708,10 @@ def linear_backward_decomposition(input_, grad_output_, weight_, output_mask):
     grad_input = None
     grad_weight = None
     grad_bias = None
+    # Cast the weight to the grad dtype (the backward matmul runs in the low-precision
+    # dtype anyway; the fp32 master is only used by the optimizer, outside this graph).
+    if weight_ is not None and weight_.dtype != grad_output_.dtype:
+        weight_ = weight_.to(grad_output_.dtype)
     if output_mask[0]:
         grad_input = torch.matmul(grad_output_, weight_)
     if output_mask[1] or output_mask[2]:

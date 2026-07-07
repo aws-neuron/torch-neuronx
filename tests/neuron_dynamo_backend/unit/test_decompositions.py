@@ -795,6 +795,55 @@ class TestLinearBackwardDecomposition:
                         arg.meta["val"].ndim == 2
                     ), f"mm operand should be 2D, got shape {arg.meta['val'].shape}"
 
+    @pytest.mark.parametrize(
+        "input_shape,weight_shape,grad_output_shape",
+        [
+            ((3, 4), (5, 4), (3, 5)),  # 2D
+            ((2, 3, 4), (5, 4), (2, 3, 5)),  # 3D (FSDP transformer activation shape)
+        ],
+    )
+    def test_linear_backward_mixed_precision(self, input_shape, weight_shape, grad_output_shape):
+        """FSDP2 mixed precision: fp32 (master) weight with bf16 grad_output/input.
+
+        PT2.12's bmm/baddbmm meta enforces matching operand dtypes, so a bf16
+        grad x fp32 weight matmul fails during compile-mode sharding propagation.
+        The decomposition casts the weight to the grad dtype; verify it (a) does
+        not raise on the mixed-dtype inputs and (b) matches an eager mixed-precision
+        reference. Guards the compile-mode mixed-precision fix.
+        """
+        torch.manual_seed(1)
+        input_ = torch.randn(input_shape, dtype=torch.bfloat16)
+        weight_ = torch.randn(weight_shape, dtype=torch.float32)  # fp32 master weight
+        grad_output_ = torch.randn(grad_output_shape, dtype=torch.bfloat16)
+        output_mask = [True, True, True]
+
+        result_grad_input, result_grad_weight, result_grad_bias = (
+            decompositions.linear_backward_decomposition(input_, grad_output_, weight_, output_mask)
+        )
+
+        # Reference: eager backward with the weight cast to the compute (bf16) dtype,
+        # matching what the decomposition (and eager mixed precision) does.
+        ref_grad_input, ref_grad_weight, ref_grad_bias = self._compute_reference_gradients(
+            input_.to(torch.float32),
+            weight_.to(torch.bfloat16).to(torch.float32),
+            grad_output_.to(torch.float32),
+            output_mask,
+        )
+
+        assert result_grad_input.shape == input_shape
+        assert result_grad_weight.shape == weight_shape
+        assert result_grad_bias.shape == (grad_output_shape[-1],)
+        # grad_input follows grad_output/weight-compute dtype (bf16); others follow inputs
+        torch.testing.assert_close(
+            result_grad_input.to(torch.float32), ref_grad_input, rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            result_grad_weight.to(torch.float32), ref_grad_weight, rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            result_grad_bias.to(torch.float32), ref_grad_bias, rtol=1e-2, atol=1e-2
+        )
+
 
 class TestBmmDtypeDecomposition:
     """Test the bmm.dtype decomposition (cast + plain bmm)."""
