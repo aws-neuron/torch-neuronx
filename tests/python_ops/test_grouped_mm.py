@@ -95,8 +95,16 @@ class TestGroupedMM:
         dtype = torch.bfloat16
         a, b, offs = get_inputs_2d_3d(t, d1, d2, g, dtype)
 
-        # CPU reference
-        result_cpu = torch._grouped_mm(a, b, offs)
+        # High-precision reference: run the grouped matmul in fp32 rather than
+        # comparing against a second bf16 matmul on CPU. Neuron accumulates the
+        # matmul in fp32 and rounds the result to bf16 (the correctly-rounded
+        # value); a CPU bf16 matmul with a different summation order can round
+        # an element the other way, so requiring bit-agreement between two
+        # bf16 matmuls at atol=1e-3 (< 1 bf16 ULP) is an ill-posed oracle.
+        # Validating against the true fp32 result at bf16-scale tolerance tests
+        # the real contract and still catches a genuine accumulation regression
+        # (bf16 accumulation would drift ~sqrt(d1) * 2^-8, i.e. several %).
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
 
         # Neuron
         a_neuron = a.to("neuron")
@@ -107,7 +115,7 @@ class TestGroupedMM:
             result_neuron = torch._grouped_mm(a_neuron, b_neuron, offs_neuron)
             assert_op_runs_on_neuron("aten::_grouped_mm")
 
-        torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(result_neuron.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
 
     @pytest.mark.skipif(not _HAS_NKI_GROUPED_MM, reason="NKI grouped_mm_2d_2d not available")
     @pytest.mark.parametrize("t, d1, d2, g", TEST_CASES[:3])
