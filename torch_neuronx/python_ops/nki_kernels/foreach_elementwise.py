@@ -361,6 +361,9 @@ def _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, nki_fn, torc
         orig_dtype = s.dtype
         compute_dtype = torch.result_type(s, v)
 
+        if compute_dtype in (torch.float16, torch.bfloat16):
+            compute_dtype = torch.float32
+
         if s.numel() == 0:
             result.append(s)
         elif (
