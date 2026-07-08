@@ -116,9 +116,20 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
         output_to_alias: dict[int, tuple[int, list[int]]] = {}
 
         # (1) Ground-truth pass-throughs from the lowered module.
-        for output_idx, param_num in _detect_passthrough_aliases_from_module(module).items():
-            if 0 <= param_num < len(inputs) and 0 <= output_idx < len(outputs):
-                output_to_alias[output_idx] = (param_num, [])
+        # Gate to the AOT/compile context (aliasing_info present) only. In pure
+        # eager per-op lowering (aliasing_info is None) an output that is a bare
+        # pass-through/identity of an input uses a SEPARATE output buffer at
+        # runtime, so emitting mhlo.input_output_alias donates the input buffer but
+        # the graph never writes the output -> it reads uninitialized memory and the
+        # op returns zeros/garbage. This hit integer ceil/trunc (and other int
+        # no-ops that lower to identity); float ops are unaffected because they
+        # compute a new value (not a bare block-arg pass-through). The compile/AOT
+        # path reuses the input buffer for pass-throughs, so the alias is required
+        # there and this detection stays active for it.
+        if aliasing_info is not None:
+            for output_idx, param_num in _detect_passthrough_aliases_from_module(module).items():
+                if 0 <= param_num < len(inputs) and 0 <= output_idx < len(outputs):
+                    output_to_alias[output_idx] = (param_num, [])
 
         # (2) Merge explicitly-provided aliases, validated against the real IO.
         if aliasing_info is not None:
