@@ -370,19 +370,23 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
     return op.get();
   }
 
-  if (IsSameStreamWaitBypass(op.get(), stream_id) && IsRunAheadMemorySafe(device_index)) {
+  if (IsSameStreamWaitBypass(op.get(), this) && IsRunAheadMemorySafe(device_index)) {
     return op.get();
   }
   return nullptr;
 }
 
-bool StreamImpl::IsSameStreamWaitBypass(OperationContext* op, c10::StreamId stream_id) {
+bool StreamImpl::IsSameStreamWaitBypass(OperationContext* op, const StreamImpl* consumer) {
   if (op->GetKernelType() != KernelTypeEnum::kEvent) {
     return false;
   }
   auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-  return event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
-         event_kernel.GetSignalStreamId() == stream_id;
+  if (event_kernel.GetEventAction() != EventDirectKernelExecution::EventAction::kWait) {
+    return false;
+  }
+  // StreamImpl* identity, not c10::StreamId — the latter is counter-encoded
+  // by MakeStreamId so multiple ids can share a pool-slot StreamImpl.
+  return event_kernel.GetSignalStreamImpl() == consumer;
 }
 
 bool StreamImpl::IsRunAheadMemorySafe(c10::DeviceIndex device_index) {

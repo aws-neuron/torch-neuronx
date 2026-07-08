@@ -1150,8 +1150,9 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
         op->GetKernel<KernelTypeEnum::kEvent>().GetEventAction() ==
             EventDirectKernelExecution::EventAction::kWait &&
         stream->HasPendingAsyncOperations()) {
-      auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-      if (event_kernel.GetEvent().recorded_stream_id() != stream->GetStreamId()) {
+      // Same identity check as IsSameStreamWaitBypass (StreamImpl* compare,
+      // not raw c10::StreamId — the latter is counter-encoded).
+      if (!StreamImpl::IsSameStreamWaitBypass(op, stream)) {
         return false;
       }
     }
