@@ -67,6 +67,7 @@ COVERAGE_FIELDS = [
     "neuron_primitive_ops",
     "fallback_primitive_ops",
     "time_to_first_ms",
+    "ttf_slowest_ms",
     "exec_avg_ms",
     "exec_min_ms",
     "exec_max_ms",

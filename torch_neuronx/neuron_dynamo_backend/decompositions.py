@@ -28,6 +28,7 @@ from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
 )
+from torch_neuronx.python_ops.nki_kernels.foreach_norm import _has_nki_norm_kernels
 from torch_neuronx.python_ops.nki_kernels.nonzero import _has_nki_nonzero
 from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 
@@ -51,6 +52,13 @@ if _has_nki_foreach:
         _sqrt_kernel,
         _sub_scalar_kernel,
         _sub_tensor_kernel,
+    )
+
+if _has_nki_norm_kernels:
+    from torch_neuronx.python_ops.nki_kernels.foreach_norm import (
+        _l1_norm_kernel,
+        _l2_norm_kernel,
+        _linf_norm_kernel,
     )
 
 _T = TypeVar("_T")
@@ -3498,9 +3506,36 @@ def _foreach_copy_inplace_decomp(self, other):
 
 
 # norm
+_FOREACH_NORM_KERNELS = {}
+if _has_nki_norm_kernels:
+    _FOREACH_NORM_KERNELS = {
+        1: _l1_norm_kernel,
+        2: _l2_norm_kernel,
+        float("inf"): _linf_norm_kernel,
+    }
+
+
 @register_decomposition([aten._foreach_norm.Scalar])
 def _foreach_norm_decomp(self, ord=2):
-    return [torch.linalg.vector_norm(t.flatten(), ord=ord) for t in self]
+    nki_kernel = _FOREACH_NORM_KERNELS.get(ord)
+    result = []
+    for t in self:
+        if t.numel() == 0:
+            result.append(torch.zeros((), dtype=t.dtype, device=t.device))
+            continue
+        # numel==1: NKI kernels need ndim>=1; a 0-d scalar's norm is just |x|.
+        if nki_kernel is None or t.numel() == 1:
+            result.append(torch.linalg.vector_norm(t.flatten(), ord=ord))
+            continue
+        try:
+            data = t.float() if t.dtype == torch.float64 else t
+            out = nki_kernel[(2,)](data, data.numel())[0, 0]
+            result.append(out.to(torch.float64) if t.dtype == torch.float64 else out)
+        except Exception:
+            # Fall back to the torch op if the NKI kernel fails
+            logger.debug("NKI foreach_norm kernel failed; falling back to torch op", exc_info=True)
+            result.append(torch.linalg.vector_norm(t.flatten(), ord=ord))
+    return result
 
 
 @register_decomposition([aten.argmax.default])

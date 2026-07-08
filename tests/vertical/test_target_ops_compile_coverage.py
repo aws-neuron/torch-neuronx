@@ -74,6 +74,72 @@ _OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
     "aten::_softmax_backward_data",
 )
 
+# Above this many input elements, the float32 CPU oracle's own reduction loses
+# enough precision (a float32 sum drops small terms once the partial exceeds
+# 2**24 ~= 16.7M) that an accurate device result reads as a mismatch. Only above
+# this threshold do we bother recomputing a float64 reference.
+_FLOAT64_ORACLE_MIN_ELEMS = 10_000_000
+
+
+def _input_elem_count(args, kwargs) -> int:
+    """Largest single tensor element count across args/kwargs (incl. tensor lists)."""
+    biggest = 0
+    for v in (*args, *kwargs.values()):
+        items = v if isinstance(v, tuple | list) else (v,)
+        for t in items:
+            if torch.is_tensor(t):
+                biggest = max(biggest, t.numel())
+    return biggest
+
+
+def _matches_float64_oracle(op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol) -> bool:
+    """Re-check a failed correctness comparison against a float64 CPU oracle."""
+
+    def _to_f64(x):
+        if torch.is_tensor(x) and x.dtype in (torch.float32, torch.float16, torch.bfloat16):
+            return x.double()
+        if isinstance(x, tuple | list):
+            return type(x)(_to_f64(e) for e in x)
+        return x
+
+    def _close(a, b):
+        try:
+            torch.testing.assert_close(
+                a, b, rtol=rtol, atol=atol, equal_nan=True, check_dtype=False
+            )
+            return True
+        except AssertionError:
+            return False
+
+    try:
+        f64_args = tuple(_to_f64(a) for a in cpu_args)
+        f64_kwargs = {k: _to_f64(v) for k, v in cpu_kwargs.items()}
+        with torch.no_grad():
+            cpu_f32 = op(*cpu_args, **cpu_kwargs)
+            cpu_f64 = op(*f64_args, **f64_kwargs)
+
+        flat32 = list(cpu_f32) if isinstance(cpu_f32, tuple | list) else [cpu_f32]
+        flat64 = list(cpu_f64) if isinstance(cpu_f64, tuple | list) else [cpu_f64]
+        nflat = list(neuron_cpu) if isinstance(neuron_cpu, tuple | list) else [neuron_cpu]
+
+        # Is the float32 oracle itself unreliable here? Compare it to float64.
+        # If they agree, the oracle is fine -> do not rescue (return False).
+        oracle_reliable = all(
+            _close(a.double() if torch.is_tensor(a) else a, b)
+            for a, b in zip(flat32, flat64, strict=False)
+        )
+        if oracle_reliable:
+            return False
+
+        # Oracle is the inaccurate side: accept the device iff it matches float64.
+        return all(
+            _close(n.double() if torch.is_tensor(n) else n, b)
+            for n, b in zip(nflat, flat64, strict=False)
+        )
+    except Exception:
+        return False
+
+
 if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:
     os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -259,14 +325,23 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                 with torch.no_grad():
                     cpu_out = op(*cpu_args, **cpu_kwargs)
                     neuron_out = compiled_fn(*fresh_neuron_args, **fresh_neuron_kwargs)
-                torch.testing.assert_close(
-                    _allocate_to_device(neuron_out, "cpu"),
-                    cpu_out,
-                    rtol=1e-2,
-                    atol=1e-3,
-                    equal_nan=True,
-                )
-                out["correctness"] = "pass"
+                neuron_cpu = _allocate_to_device(neuron_out, "cpu")
+                try:
+                    torch.testing.assert_close(
+                        neuron_cpu, cpu_out, rtol=1e-2, atol=1e-3, equal_nan=True
+                    )
+                    out["correctness"] = "pass"
+                except AssertionError:
+                    # For large reductions the float32 CPU oracle is inaccurate
+                    # Recheck against a float64 oracle
+                    if _input_elem_count(
+                        cpu_args, cpu_kwargs
+                    ) >= _FLOAT64_ORACLE_MIN_ELEMS and _matches_float64_oracle(
+                        op, cpu_args, cpu_kwargs, neuron_cpu, rtol=1e-2, atol=1e-3
+                    ):
+                        out["correctness"] = "pass"
+                    else:
+                        raise
             except Exception as e:
                 exc_str = str(e)
                 # CPU-side limitation (not a Neuron bug) — mark skip_no_cpu.
@@ -305,6 +380,7 @@ def _aggregate_compile_results(result: dict, per_shape: list[dict], classificati
     ttfs = [r["ttf_ms"] for r in per_shape if r["ttf_ms"] is not None]
     if ttfs:
         result["time_to_first_ms"] = f"{min(ttfs):.2f}"
+        result["ttf_slowest_ms"] = f"{max(ttfs):.2f}"
 
     all_times = [t for r in per_shape for t in r["exec_times"]]
     if all_times:
@@ -370,6 +446,7 @@ class TestTargetOpsCompileCoverage:
             "neuron_primitive_ops": "",
             "fallback_primitive_ops": "",
             "time_to_first_ms": "",
+            "ttf_slowest_ms": "",
             "exec_avg_ms": "",
             "exec_min_ms": "",
             "exec_max_ms": "",
