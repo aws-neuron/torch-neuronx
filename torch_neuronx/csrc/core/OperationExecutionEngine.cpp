@@ -671,14 +671,19 @@ void OperationExecutionEngine::SubmitOperation(
     return;
   }
 
-  // Concat-OFF fast path: shared_ptr lands directly in stream->runtime_queue_.
+  // Two invariants: capture RequiresCompilation() before the move (op_ptr
+  // becomes UAF-prone for kEvent kWait via the same-stream bypass), and
+  // sequence every eventfd write strictly AFTER EmitToRuntimeQueue (else the
+  // worker can drain the wake-up and re-park before the op is visible).
   OperationContext* op_ptr = operation_context.get();
+  const bool requires_compilation = op_ptr->RequiresCompilation();
+  if (!requires_compilation) {
+    op_ptr->MarkExecutionReady();
+  }
   EmitToRuntimeQueue(std::move(operation_context));
-
-  if (op_ptr->RequiresCompilation()) {
+  if (requires_compilation) {
     SubmitCompilationTask(op_ptr);
   } else {
-    op_ptr->MarkExecutionReady();
     NotifyExecutionReady();
   }
 }

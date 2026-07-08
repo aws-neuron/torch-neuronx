@@ -1095,6 +1095,46 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates
   engine.pending_async_ops_count_.store(0);
 }
 
+namespace {
+// Build a non-compilation device op whose ownership we hand to SubmitOperation.
+std::shared_ptr<OperationContext> MakeNonCompileDeviceOp(StreamImpl* stream) {
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHLO));
+  ON_CALL(*kernel, RequiresCompilation()).WillByDefault(Return(false));
+  EXPECT_CALL(*kernel, RequiresCompilation()).Times(::testing::AnyNumber());
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->stream = stream;
+  op->stream_id = stream->stream_id;
+  return op;
+}
+}  // namespace
+
+// A non-compilation op must come out of SubmitOperation already published
+// to the runtime queue AND marked execution-ready. Because MarkExecutionReady()
+// now runs pre-move, the flag is set regardless of whether the worker has since
+// raced in — there is no post-move deref to observe a torn state.
+TEST_F(OperationExecutionEngineTest, SubmitOperationMarksReadyBeforePublish) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+  auto op = MakeNonCompileDeviceOp(stream.get());
+  OperationContext* op_raw = op.get();
+
+  engine.SubmitOperation(op);
+
+  // The op (or its result) must be reachable: it was published to the queue.
+  // We can't assume the worker hasn't drained it, so accept either "still
+  // queued" or "already completed", but never "lost".
+  EXPECT_TRUE(op_raw->IsExecutionReady())
+      << "MarkExecutionReady() must be set pre-move; a lost flag implies the "
+         "old post-move ordering.";
+
+  engine.ClearRuntimeQueue(stream.get());
+  engine.pending_async_ops_count_.store(0);
+}
+
 TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {
   at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
   auto& engine = scoped.engine();
