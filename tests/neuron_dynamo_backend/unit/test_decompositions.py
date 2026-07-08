@@ -4905,6 +4905,59 @@ class TestForeachDecompositionCompileE2E:
         assert loss.device.type == "neuron"
         assert loss.numel() == 1
 
+    @pytest.mark.parametrize("ord", [1, 2, float("inf")])
+    def test_foreach_norm(self, ord):
+        """Test foreach norm routes to the NKI norm kernels and matches CPU."""
+
+        def fn(tensors):
+            return torch.ops.aten._foreach_norm.Scalar(tensors, ord)
+
+        tensors = [torch.randn(64, 128, device="neuron") for _ in range(3)]
+        expected = torch.ops.aten._foreach_norm.Scalar([t.cpu() for t in tensors], ord)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    def test_foreach_norm_mixed_shapes_and_empty(self):
+        """foreach norm over ragged shapes incl. empty + scalar tensors (edge cases)."""
+
+        def fn(tensors):
+            return torch.ops.aten._foreach_norm.Scalar(tensors, 2)
+
+        tensors = [
+            torch.randn(64, 128, device="neuron"),
+            torch.empty(0, device="neuron"),
+            torch.randn(1, device="neuron"),
+            torch.randn(7, 3, 5, device="neuron"),
+        ]
+        expected = torch.ops.aten._foreach_norm.Scalar([t.cpu() for t in tensors], 2)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("ord", [0.5, 3.0])
+    def test_foreach_norm_unsupported_ord_falls_back(self, ord):
+        """ord not in {1, 2, inf} has no NKI kernel -> decomp must fall back to
+        torch.linalg.vector_norm and still match CPU."""
+
+        def fn(tensors):
+            return torch.ops.aten._foreach_norm.Scalar(tensors, ord)
+
+        tensors = [torch.randn(64, 128, device="neuron").abs() + 0.1 for _ in range(3)]
+        expected = torch.ops.aten._foreach_norm.Scalar([t.cpu() for t in tensors], ord)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(tensors)
+
+        for r, e in zip(result, expected, strict=False):
+            torch.testing.assert_close(r.cpu(), e, rtol=1e-2, atol=1e-2)
+
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestClampDecompositionE2E:
