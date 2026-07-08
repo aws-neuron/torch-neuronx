@@ -60,7 +60,7 @@ build --action_env=NRT_LOCAL_PATH=/opt/aws/neuron
 
 test --test_env=LD_LIBRARY_PATH
 
-# avoid hitting CPU related alarms in CI
+# cap CPU usage to avoid hitting CPU-related alarms on shared EKS workload
 build --local_cpu_resources=HOST_CPUS*0.8
 
 # Disk cache — avoids recompiling LLVM/MLIR on every build.

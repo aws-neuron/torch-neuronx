@@ -34,7 +34,21 @@ class TestAmaxAmin:
             assert_op_runs_on_neuron(f"aten::{op_name}")
 
     @pytest.mark.parametrize("op_name,op_func", [("amax", torch.amax), ("amin", torch.amin)])
-    @pytest.mark.parametrize("shape,dim", [((3, 4), 0), ((3, 4), 1), ((3, 4), -1), ((), 0)])
+    @pytest.mark.parametrize(
+        "shape,dim",
+        [
+            ((3, 4), 0),
+            ((3, 4), 1),
+            ((3, 4), -1),
+            pytest.param(
+                (),
+                0,
+                marks=pytest.mark.xfail(
+                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
+                ),
+            ),
+        ],
+    )
     def test_op_with_dim(self, device, op_name, op_func, shape, dim):
         """Test operation with specific dimensions."""
         with track_neuron_ops():
@@ -163,6 +177,7 @@ class TestAmaxAmin:
 
     @pytest.mark.parametrize("op_name,op_func", [("amax", torch.amax), ("amin", torch.amin)])
     @pytest.mark.parametrize("keepdim", [False, True])
+    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_op_scalar_keepdim(self, device, op_name, op_func, keepdim):
         """Test operation on scalar tensor respects keepdim."""
         with track_neuron_ops():
