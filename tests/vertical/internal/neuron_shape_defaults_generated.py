@@ -773,8 +773,10 @@ def register_all_defaults(r):
     r(
         "aten::lcm",
         {
-            "self": {"shape": (256, 1024), "dtype": "int"},
-            "other": {"shape": (256, 1024), "dtype": "int"},
+            # Bound the range so the LCM (a*b/gcd) stays within int32; full-range
+            # random ints overflow int32.
+            "self": {"shape": (256, 1024), "dtype": "int", "low": 1, "high": 1024},
+            "other": {"shape": (256, 1024), "dtype": "int", "low": 1, "high": 1024},
         },
         source="builtin",
     )

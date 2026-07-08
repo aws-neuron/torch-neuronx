@@ -305,6 +305,46 @@ def clamp_decomp(self, min=None, max=None):
     return out
 
 
+# gcd's Euclidean recurrence is iterative; torch-mlir can't lower a data-dependent
+# loop. For fixed-width ints the worst case (consecutive Fibonacci inputs) terminates
+# in a bounded number of steps, so unroll a fixed count of elementwise ops. Step counts
+# are the Fibonacci-overflow depth per width, rounded up.
+_GCD_ITERS = {torch.int8: 16, torch.int16: 32, torch.int32: 64, torch.int64: 96}
+
+
+def _gcd_unrolled(a, b, n_iter):
+    a = torch.abs(a)
+    b = torch.abs(b)
+    for _ in range(n_iter):
+        nz = b != 0
+        safe = torch.where(nz, b, torch.ones_like(b))
+        r = torch.where(nz, torch.remainder(a, safe), torch.zeros_like(b))
+        a = torch.where(nz, b, a)
+        b = r
+    return a
+
+
+@register_decomposition([aten.gcd.default])
+def gcd_decomp(self, other):
+    """Lower gcd via a fixed-count unrolled Euclidean algorithm (no data-dependent loop)."""
+    n_iter = _GCD_ITERS.get(self.dtype, 64)
+    return _gcd_unrolled(self, other, n_iter)
+
+
+@register_decomposition([aten.lcm.default])
+def lcm_decomp(self, other):
+    """Lower lcm as |a // gcd(a,b) * b|. Compute in int32 for narrow dtypes (matching
+    eager's internal promotion), then cast back."""
+    orig = self.dtype
+    compute = torch.int32 if orig in (torch.int8, torch.int16) else orig
+    a = self.to(compute)
+    b = other.to(compute)
+    g = _gcd_unrolled(a, b, _GCD_ITERS.get(compute, 64))
+    g_safe = torch.where(g == 0, torch.ones_like(g), g)
+    out = torch.abs(torch.div(a, g_safe, rounding_mode="trunc") * b)
+    return out.to(orig)
+
+
 @register_decomposition([aten.cumprod.default])
 def cumprod_decomp(self, dim, *, dtype=None):
     """Lower cumprod via a masked product."""
