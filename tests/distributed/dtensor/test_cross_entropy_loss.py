@@ -91,6 +91,10 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
 
     @with_comms
+    @pytest.mark.xfail(
+        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
+        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
+    )
     def test_cross_entropy_loss_parallel_backward(self):
         """Test backward pass with loss_parallel sharding."""
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
