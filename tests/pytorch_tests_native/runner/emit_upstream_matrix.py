@@ -155,6 +155,7 @@ def main():
             "num_workers": node.get("num_workers") or 64,
             "shard_args": "",
             "ignore_args": "",
+            "soft_fail": bool(node.get("soft_fail", False)),
         }
 
         if node.get("shard_id") is not None:

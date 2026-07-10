@@ -123,6 +123,16 @@ def retry_paths(paths: dict[str, Path]) -> dict[str, Path]:
     }
 
 
+def _final_exit_code(exit_code: int, soft_fail: bool) -> int:
+    """Final process exit code.
+
+    Advisory (``--soft-fail``) suites always return 0 regardless of test outcome:
+    they still run and upload results for the dashboard/aggregator, but must never
+    fail the CI job. Non-soft_fail suites keep their real exit code.
+    """
+    return 0 if soft_fail else exit_code
+
+
 def should_retry(exit_code: int) -> bool:
     """Decide whether to run the --last-failed retry pass.
 
@@ -289,6 +299,12 @@ Examples:
     parser.add_argument("--num-shards", type=int, default=None)
     parser.add_argument("--ignore", action="append", default=[])
     parser.add_argument("--pytorch-fork-branch", default="main")
+    parser.add_argument(
+        "--soft-fail",
+        action="store_true",
+        help="Advisory suite: run and upload results, but always exit 0 so a "
+        "failure does not block CI (run-but-don't-block).",
+    )
     parser.add_argument("items", nargs="+")
     args = parser.parse_args(argv)
 
@@ -495,7 +511,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(f"WARNING: version sidecar capture failed (non-fatal): {exc}")
 
-    return exit_code
+    if args.soft_fail and exit_code != 0:
+        print(
+            f"\n=== SOFT-FAIL suite: results captured/uploaded; overriding exit "
+            f"{exit_code} -> 0 so this advisory suite does not block CI. ==="
+        )
+    return _final_exit_code(exit_code, args.soft_fail)
 
 
 if __name__ == "__main__":
