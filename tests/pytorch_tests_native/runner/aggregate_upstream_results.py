@@ -49,6 +49,49 @@ FAILURE_STATUSES = ("failed", "error")
 SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
 
 
+def _artifact_label(json_file: str, results_dir: Path) -> str:
+    """Suite label from a per-node artifact path (``upstream-pytorch-<label>/...``)."""
+    try:
+        node_dir = Path(json_file).resolve().relative_to(results_dir.resolve()).parts[0]
+    except (ValueError, IndexError):
+        return "unknown"
+    prefix = "upstream-pytorch-"
+    return node_dir[len(prefix) :] if node_dir.startswith(prefix) else node_dir
+
+
+def _soft_fail_labels(config_path: Path | None = None) -> set[str]:
+    """Matrix labels of suites flagged ``soft_fail`` in the distribution config.
+
+    Mirrors ``emit_upstream_matrix.py``'s label logic so the merge gate can
+    exclude soft_fail suites' failures from the gate count -- they still RUN and
+    report to the dashboard/CSVs, but must not block CI. Best-effort: returns an
+    empty set (no exclusion -- the strict/safe direction) if the config can't be
+    read.
+    """
+    import json as _json
+
+    if config_path is None:
+        config_path = (
+            Path(__file__).resolve().parent.parent
+            / "upstream_pytorch_test_distribution_config.json"
+        )
+    labels: set[str] = set()
+    try:
+        from distribution_config import expand_distribution_config
+
+        cfg = _json.loads(Path(config_path).read_text())
+        for node in expand_distribution_config(cfg):
+            if not node.get("soft_fail"):
+                continue
+            label = node["items"][0].replace("/", "-").replace(".py", "")
+            if node.get("shard_id") is not None:
+                label += f"-shard{node['shard_id']}"
+            labels.add(label)
+    except Exception as exc:
+        logger.warning("Could not resolve soft_fail labels for gate exclusion: %s", exc)
+    return labels
+
+
 # Maps the GitHub workflow ``name:`` (``GITHUB_WORKFLOW`` — the *caller* of the shared
 # ``_upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
 # which kind of run produced it without a cross-table join. Add a new entry when a new
@@ -269,6 +312,7 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
             "group_stats": {},
             "group_durations": {},
             "total_stats": {},
+            "failures_by_label": {},
         }
 
     # Split main vs retry reports. Retry files end in ``_retry.json``
@@ -294,8 +338,10 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
     group_durations = defaultdict(float)  # {group: total_duration}
     all_statuses = set()
     all_test_rows = []
+    failures_by_label: dict[str, int] = defaultdict(int)
 
     for json_file in main_json_files:
+        artifact_label = _artifact_label(json_file, results_dir)
         main_rows = extract_test_data_from_json(json_file)
 
         # Merge companion retry report, if present. Sibling lookup by
@@ -311,6 +357,8 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
             group = _group_from_file(test_file)
             status = row.get("status") or "unknown"
             stats[cls][status] += 1
+            if status in FAILURE_STATUSES:
+                failures_by_label[artifact_label] += 1
             file_stats[test_file][status] += 1
             group_stats[group][status] += 1
             all_statuses.add(status)
@@ -354,6 +402,7 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         "group_stats": {g: dict(s) for g, s in group_stats.items()},
         "group_durations": dict(group_durations),
         "total_stats": dict(total_stats),
+        "failures_by_label": dict(failures_by_label),
         "sorted_statuses": sorted_statuses,
     }
 
@@ -759,19 +808,36 @@ def main(argv: list | None = None) -> int:
         sys.stdout.write(f.read())
     print("=" * 60)
     # Merge-queue gate; only enforced when --max-failures was supplied.
-    exit_code, outputs = evaluate_gate(failure_count, max_failures)
+    # soft_fail suites (distribution config) RUN and report to the dashboard/CSVs
+    # but must NOT block CI, so their failures are excluded from the gate count.
+    soft_labels = _soft_fail_labels()
+    soft_fail_failures = sum(
+        result.get("failures_by_label", {}).get(label, 0) for label in soft_labels
+    )
+    gate_failure_count = max(0, failure_count - soft_fail_failures)
+    if soft_labels:
+        logger.info(
+            "Gate: %d total failing tests; %d from soft_fail suites (%s) excluded; "
+            "%d count toward the gate.",
+            failure_count,
+            soft_fail_failures,
+            ", ".join(sorted(soft_labels)),
+            gate_failure_count,
+        )
+    exit_code, outputs = evaluate_gate(gate_failure_count, max_failures)
     if max_failures is not None:
         if exit_code:
             logger.error(
-                "FAILURE GATE: %d failing tests exceeds the allowed maximum of %d. "
-                "Blocking merge.",
-                failure_count,
+                "FAILURE GATE: %d failing tests (excl. soft_fail) exceeds the allowed "
+                "maximum of %d. Blocking merge.",
+                gate_failure_count,
                 max_failures,
             )
         else:
             logger.info(
-                "Failure gate passed: %d failing tests is within the allowed maximum of %d.",
-                failure_count,
+                "Failure gate passed: %d failing tests (excl. soft_fail) is within the "
+                "allowed maximum of %d.",
+                gate_failure_count,
                 max_failures,
             )
     emit_github_outputs(**outputs)

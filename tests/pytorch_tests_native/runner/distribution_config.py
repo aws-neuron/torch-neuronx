@@ -31,6 +31,7 @@ def expand_distribution_config(dist: dict) -> list[dict]:
         num_shards = entry.get("num_shards", 1)
         num_workers = entry.get("num_workers")
         ignore = entry.get("ignore", [])
+        soft_fail = entry.get("soft_fail", False)
 
         if num_shards <= 1:
             expanded.append(
@@ -40,6 +41,7 @@ def expand_distribution_config(dist: dict) -> list[dict]:
                     "num_shards": None,
                     "num_workers": num_workers,
                     "ignore": ignore,
+                    "soft_fail": soft_fail,
                 }
             )
         else:
@@ -51,6 +53,7 @@ def expand_distribution_config(dist: dict) -> list[dict]:
                         "num_shards": num_shards,
                         "num_workers": num_workers,
                         "ignore": ignore,
+                        "soft_fail": soft_fail,
                     }
                 )
 

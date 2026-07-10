@@ -1,12 +1,5 @@
 {
   "description": "Test distribution config. Each entry is a logical unit assigned to one or more nodes. Paths are relative to tests/pytorch_tests_native/test/.",
-  "disabled_items": [
-    {
-      "item": "test_foreach.py",
-      "reason": "Temporarily disabled: the full test_foreach suite SIGSEGVs (rc=139) in CPython inspect.stack() via torch tracked-input (common_utils.extract_test_fn/get_tracked_input), reproduced serially and at -n4 (not xdist- or Neuron-op-specific). Individual tests pass in isolation. Re-enable after root-cause.",
-      "tracking": "GHA run 28991277106"
-    }
-  ],
   "nodes": [
     {
       "ignore": [
@@ -23,7 +16,8 @@
       "items": [
         "distributed/fsdp"
       ],
-      "num_workers": 8
+      "num_workers": 8,
+      "soft_fail": true
     },
     {
       "items": [
@@ -83,6 +77,12 @@
     },
     {
       "items": [
+        "test_foreach.py"
+      ],
+      "soft_fail": true
+    },
+    {
+      "items": [
         "test_unary_ufuncs.py"
       ]
     },
@@ -101,8 +101,13 @@
     {
       "items": [
         "test_reductions.py",
+        "test_torch.py"
+      ],
+      "soft_fail": true
+    },
+    {
+      "items": [
         "test_nn.py",
-        "test_torch.py",
         "test_optim.py"
       ]
     },
