@@ -152,8 +152,6 @@ Outputs consumed by the gate:
 
 ## Related
 
-- [`.github/workflows/merge.yml`](../.github/workflows/merge.yml) — post-merge
-  (push to `main`) suite.
 - [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) — nightly
   full upstream suite.
 - `tests/pytorch_tests_native/runner/` — the matrix emitter, test runner, and
