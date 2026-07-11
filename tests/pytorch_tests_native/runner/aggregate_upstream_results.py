@@ -48,6 +48,20 @@ FAILURE_STATUSES = ("failed", "error")
 # skipped rows into their own CSV in the aggregator.
 SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
 
+# The ``upstream-pytorch-all`` artifact is a convenience re-bundle of the whole
+# results dir, uploaded by the aggregate job itself for debugging — it is NOT an
+# aggregation input. On a workflow *re-run*, ``actions/download-artifact`` fetches
+# it back into ``results_dir`` (its name matches the ``upstream-pytorch-*``
+# download pattern), so its nested copy of every suite's reports would be counted
+# a SECOND time — under the bogus suite label ``all``. That duplicate is not in
+# the soft_fail label set, so it bypasses the merge-gate soft_fail exclusion and
+# can block a merge on a flaky failure that already ran (and was excluded) in its
+# real per-suite artifact. Skip this dir entirely: the per-suite artifacts are the
+# single source of truth. (New runs also rename the bundle so it no longer matches
+# the download pattern — see ``_upstream-tests.yml`` — but we still skip the old
+# name defensively for runs whose artifacts predate that change.)
+BUNDLE_ARTIFACT_DIR = "upstream-pytorch-all"
+
 
 def _artifact_label(json_file: str, results_dir: Path) -> str:
     """Suite label from a per-node artifact path (``upstream-pytorch-<label>/...``)."""
@@ -294,6 +308,10 @@ def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
         try:
             node_dir = p.relative_to(results_dir).parts[0]
         except ValueError:
+            continue
+        if node_dir == BUNDLE_ARTIFACT_DIR:
+            # Redundant re-bundle of every suite (see BUNDLE_ARTIFACT_DIR) —
+            # counting it would double-count each test under the "all" label.
             continue
         key = (node_dir, p.name)
         existing = by_node_and_name.get(key)

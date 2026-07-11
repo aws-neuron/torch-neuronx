@@ -138,6 +138,55 @@ def test_dedupe_outputs_and_test_results_mirror(tmp_path: Path) -> None:
     assert result["total_stats"]["passed"] == 1
 
 
+def test_bundle_artifact_not_double_counted(tmp_path: Path) -> None:
+    """The ``upstream-pytorch-all`` convenience bundle must not be aggregated.
+
+    It is a re-copy of every suite's reports, uploaded by the aggregate job for
+    debugging. On a workflow *re-run*, ``actions/download-artifact`` fetches it
+    back into results_dir (its old name matched the ``upstream-pytorch-*``
+    download pattern), so its nested copy of a suite's report would be counted a
+    SECOND time — under the bogus ``all`` label, which is not in the soft_fail
+    set and therefore bypasses the merge-gate soft_fail exclusion. That is how a
+    flaky ``test_foreach`` SIGSEGV blocked the merge queue in run 29132121866
+    (PR #1102) even though ``test_foreach`` is a soft_fail suite.
+    """
+    # Real per-suite artifact: one failing foreach test.
+    _write_pytest_json(
+        _node_json(tmp_path, "upstream-pytorch-test_foreach", "test_results_test_foreach.json"),
+        test_class="TestForeachNEURON",
+        test_methods=[("test_crashes_flaky", "failed")],
+    )
+    # The re-downloaded bundle re-includes that same suite's report, nested
+    # under the bundle dir (so its top-level dir is ``upstream-pytorch-all``).
+    _write_pytest_json(
+        tmp_path
+        / "upstream-pytorch-all"
+        / "upstream-pytorch-test_foreach"
+        / "test_results_test_foreach.json",
+        test_class="TestForeachNEURON",
+        test_methods=[("test_crashes_flaky", "failed")],
+    )
+
+    result = aggregate_summary(tmp_path, tmp_path / "summary.csv")
+
+    # Counted once, and ONLY under the real suite label — never under "all".
+    assert result["failures_by_label"] == {"test_foreach": 1}
+    assert result["stats"]["TestForeachNEURON"]["failed"] == 1
+    assert result["total_stats"]["failed"] == 1
+
+    # End-to-end: the merge-gate soft_fail arithmetic (see ``main``) now nets
+    # zero. soft_fail excludes ``failures_by_label[<soft label>]``; with the
+    # bundle ignored, the single foreach failure is fully attributed to the
+    # soft_fail ``test_foreach`` label, so nothing counts toward the gate.
+    failure_count = result["total_stats"].get("failed", 0)
+    soft_labels = {"test_foreach"}
+    soft_fail_failures = sum(result["failures_by_label"].get(lbl, 0) for lbl in soft_labels)
+    gate_failure_count = max(0, failure_count - soft_fail_failures)
+    assert gate_failure_count == 0
+    # The gate verdict itself passes (exit 0) at the strictest max-failures=0.
+    assert evaluate_gate(gate_failure_count, max_failures=0)[0] == 0
+
+
 def test_pass_rate_correct(tmp_path: Path) -> None:
     """Summary CSV pass rate is computed correctly."""
     artifact = "upstream-pytorch-test_example"
