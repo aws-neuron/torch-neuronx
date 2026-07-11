@@ -73,6 +73,10 @@ class AliasingAnalysis(NeuronFXPass):
         "select",
         "unflatten",
         "flatten",
+        "movedim",
+        "swapaxes",
+        "swapdims",
+        "broadcast_to",
     }
 
     ALIASING_ATEN_OPS: ClassVar[set[str]] = {
@@ -98,27 +102,29 @@ class AliasingAnalysis(NeuronFXPass):
         "view_as",
         "reshape_as",
         "expand_as",
+        "movedim",
+        "broadcast_to",
     }
 
-    INPLACE_METHODS: ClassVar[set[str]] = {
-        "add_",
-        "sub_",
-        "mul_",
-        "div_",
-        "copy_",
-        "fill_",
-        "zero_",
-        "scatter_",
-        "index_copy_",
-        "index_fill_",
-        "index_put_",
-        "masked_fill_",
-        "masked_scatter_",
-        "clamp_",
-        "relu_",
-        "pow_",
-        "abs_",
-    }
+    # In-place operator functions (x += y -> operator.iadd(x, y), etc.).
+    # Dynamo traces augmented assignment to these call_function targets.
+    INPLACE_OPERATORS: ClassVar[frozenset] = frozenset(
+        {
+            operator.iadd,
+            operator.isub,
+            operator.imul,
+            operator.itruediv,
+            operator.ifloordiv,
+            operator.imod,
+            operator.ipow,
+            operator.imatmul,
+            operator.iand,
+            operator.ior,
+            operator.ixor,
+            operator.ilshift,
+            operator.irshift,
+        }
+    )
 
     # =========================================================================
     # Operation Detection Methods
@@ -140,6 +146,15 @@ class AliasingAnalysis(NeuronFXPass):
         """Check if a node is a setitem operation (in-place mutation)."""
         return node.op == "call_function" and node.target == operator.setitem
 
+    def _is_inplace_operator(self, node: Node) -> bool:
+        """Check if a node is an in-place operator call (e.g. operator.iadd).
+
+        Augmented assignment on a tensor (x += y, x -= y, ...) is traced by
+        Dynamo as a call_function targeting operator.iadd / isub / imul / etc.
+        which mutates args[0] in place.
+        """
+        return node.op == "call_function" and node.target in self.INPLACE_OPERATORS
+
     def _is_inplace_method(self, node: Node) -> bool:
         """Check if a node is an in-place method call."""
         if node.op != "call_method":
@@ -147,7 +162,7 @@ class AliasingAnalysis(NeuronFXPass):
         target = node.target
         if not isinstance(target, str):
             return False
-        return target.endswith("_") or target in self.INPLACE_METHODS
+        return target.endswith("_") and not target.startswith("__")
 
     def _is_aten_aliasing_op(self, node: Node) -> bool:
         """
@@ -193,7 +208,11 @@ class AliasingAnalysis(NeuronFXPass):
 
     def is_mutating_op(self, node: Node) -> bool:
         """Determine if a node mutates a tensor in-place."""
-        return self._is_setitem_operation(node) or self._is_inplace_method(node)
+        return (
+            self._is_setitem_operation(node)
+            or self._is_inplace_method(node)
+            or self._is_inplace_operator(node)
+        )
 
     def _is_custom_op_with_mutations(self, node: Node) -> bool:
         """Check if node is a custom op with mutable arguments."""
@@ -263,6 +282,55 @@ class AliasingAnalysis(NeuronFXPass):
 
         return mutated
 
+    def _is_nki_call_with_mutations(self, node: Node) -> bool:
+        """Check if a node is an NKI HOP with write-aliased operands."""
+        if node.op != "call_function":
+            return False
+        from torch_neuronx.nki_hop import NKIKernelWrapper
+
+        if not isinstance(node.target, NKIKernelWrapper):
+            return False
+        return bool(node.kwargs.get("operand_output_aliases", {}))
+
+    def _get_nki_kernel_mutated_inputs(
+        self,
+        node: Node,
+        alias_chain: dict[Node, Node],
+        input_nodes: set[Node],
+        input_nodes_list: list[Node],
+        input_names_list: list[str],
+    ) -> list[int]:
+        """Return input placeholder indices mutated by an NKI kernel HOP.
+
+        Reads node.kwargs["operand_output_aliases"] — a dict of the form
+        {kernel_operand_idx: kernel_output_idx} — and traces each aliased
+        operand back through the alias chain to the root input placeholder.
+        """
+        operand_output_aliases: dict[int, int] = node.kwargs.get("operand_output_aliases", {})
+        if "args" not in node.kwargs:
+            logger.warning("NKI HOP %s: no 'args' kwarg, skipping", node.name)
+            return []
+        kernel_args = node.kwargs["args"]
+        mutated: list[int] = []
+
+        for input_tensor_idx in operand_output_aliases:
+            if input_tensor_idx >= len(kernel_args):
+                continue
+            kernel_arg_node = kernel_args[input_tensor_idx]
+            if not isinstance(kernel_arg_node, Node):
+                continue
+            root_input = self._find_root_input(kernel_arg_node, alias_chain, input_nodes)
+            if root_input is not None and root_input in input_nodes:
+                placeholder_idx = input_nodes_list.index(root_input)
+                if placeholder_idx not in mutated:
+                    mutated.append(placeholder_idx)
+                    logger.debug(
+                        f"NKI HOP mutation detected: input[{placeholder_idx}] "
+                        f"({input_names_list[placeholder_idx]}) via "
+                        f"operand_output_aliases[{input_tensor_idx}]"
+                    )
+        return mutated
+
     def _extract_placeholder_name(self, node: Node) -> str | None:
         """
         Convert Dynamo's mangled placeholder target names to human-readable names.
@@ -310,10 +378,11 @@ class AliasingAnalysis(NeuronFXPass):
         if not node.args:
             return None
 
-        if self._is_setitem_operation(node):
-            return node.args[0] if isinstance(node.args[0], Node) else None
-
-        if self._is_inplace_method(node):
+        if (
+            self._is_setitem_operation(node)
+            or self._is_inplace_method(node)
+            or self._is_inplace_operator(node)
+        ):
             return node.args[0] if isinstance(node.args[0], Node) else None
 
         return None
@@ -572,6 +641,21 @@ class AliasingAnalysis(NeuronFXPass):
                         alias_chain[node] = source_node
                         logger.debug(f"Alias: {node.name} -> {source_node.name}")
 
+                # Handle NKI HOP mutations — declared via operand_output_aliases
+                # kwarg, not via schema is_write=True.
+                elif self._is_nki_call_with_mutations(node):
+                    logger.debug(f"NKI HOP with mutations detected: {node.name}")
+                    nki_mutated = self._get_nki_kernel_mutated_inputs(
+                        node,
+                        alias_chain,
+                        input_nodes,
+                        input_nodes_list,
+                        input_names_list,
+                    )
+                    for idx in nki_mutated:
+                        if idx not in mutated_input_indices:
+                            mutated_input_indices.append(idx)
+
                 # Handle custom ops with mutable arguments (pre-AOT - NKI)
                 elif self._is_custom_op_with_mutations(node):
                     logger.debug(f"Custom op with mutations detected: {node.name}")
@@ -621,8 +705,18 @@ class AliasingAnalysis(NeuronFXPass):
                     continue
 
                 # Traces back to input through alias chain
+                # Skip getitem-slice nodes: they return a subset of the buffer
+                # and cannot alias the full input in HLO even when shapes match.
+                # Other shape mismatches are caught downstream by _set_module_alias.
                 root = self._find_root_input(output_item, alias_chain, input_nodes)
                 if root is not None and root in input_nodes:
+                    if self._is_slice_operation(output_item):
+                        logger.debug(
+                            f"Pre-AOT output[{output_index}] derives from "
+                            f"input[{input_nodes_list.index(root)}] "
+                            f"but is a slice — skipping alias"
+                        )
+                        continue
                     input_index = input_nodes_list.index(root)
                     explicit_output_to_input[output_index] = input_index
                     logger.debug(

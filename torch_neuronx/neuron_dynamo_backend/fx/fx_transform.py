@@ -158,6 +158,14 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
                     # Already covered by a ground-truth pass-through.
                     continue
                 if not shapes_match(inputs[param_num], outputs[output_idx]):
+                    logger.warning(
+                        "Dropping alias: output[%d] -> input[%d] shape mismatch "
+                        "(output_shape=%s, input_shape=%s)",
+                        output_idx,
+                        param_num,
+                        outputs[output_idx],
+                        inputs[param_num],
+                    )
                     continue
                 output_to_alias[output_idx] = (param_num, param_idx)
                 mutation_output_indices.add(output_idx)
