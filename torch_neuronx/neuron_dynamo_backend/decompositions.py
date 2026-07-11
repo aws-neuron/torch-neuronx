@@ -240,6 +240,53 @@ def bmm_dtype(self, mat2, out_dtype):
     return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
 
 
+# ``aten::_stack`` is the internal variant of ``stack`` (it assumes all inputs
+# already share a shape). Unlike ``aten::stack`` it ships no meta kernel, so
+# Dynamo can't trace it and it reaches the backend as an opaque ``torch.operator``
+# that fails to legalize. Give it (and its .out overload) a fake impl and a
+# decomposition to plain ``torch.stack``, which lowers natively.
+@_register_fake("aten::_stack")
+def _stack_fake(tensors, dim=0):
+    return torch.stack([torch.empty_like(t) for t in tensors], dim)
+
+
+@_register_fake("aten::_stack.out")
+def _stack_out_fake(tensors, dim=0, *, out):
+    return out
+
+
+@register_decomposition([aten._stack.default])
+def stack_decomposition(tensors, dim=0):
+    """Decompose the internal _stack into plain torch.stack (which lowers)."""
+    return torch.stack(tensors, dim)
+
+
+@register_decomposition([aten.range.default, aten.range.step])
+def range_decomposition(
+    start,
+    end,
+    step=1,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """Decompose torch.range into an arange-based formula.
+
+    ``aten::range`` reaches the backend as an opaque ``torch.operator`` that
+    fails to legalize, while ``arange`` lowers natively. Unlike ``arange``,
+    ``range`` is *inclusive* of ``end``, so it has ``floor((end - start) / step)
+    + 1`` elements (matching PyTorch's range_out).
+    """
+    n = int((end - start) / step) + 1
+    idx = torch.arange(n, device=device, dtype=torch.float32)
+    out = start + idx * step
+    if dtype is not None:
+        out = out.to(dtype)
+    return out
+
+
 def _clamp_promoted_dtype(self_dtype, *bounds):
     """PyTorch clamp type promotion: a float scalar bound promotes an integer
     input to the default float dtype, but leaves a float input unchanged."""
