@@ -63,7 +63,7 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "compilable_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("cache_key_123") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("cache_key_123") == 0);
   EXPECT_FALSE(kernel.HasCachedNeff());
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
@@ -116,7 +116,7 @@ TEST_F(KernelExecutionTest, XLAKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "xla_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("xla_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("xla_cache_key") == 0);
   EXPECT_EQ(kernel.GetHloBytes(), hlo_bytes);
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
@@ -283,7 +283,7 @@ TEST_F(KernelExecutionTest, CacheKeyIsBaseKey) {
                                       hlo_bytes, false, 0);
 
   // In-memory cache key is just the base key (compiler config is only in persistent key)
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
@@ -321,7 +321,7 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
 
   // Cache key is just the base key (compiler config is in persistent key only)
-  EXPECT_EQ(kernel.GetCacheKey(), "key");
+  EXPECT_EQ(kernel.GetCompileKey(), "key");
 
   // Clean up
   unsetenv("NEURON_CC_FLAGS");
@@ -342,8 +342,8 @@ TEST_F(KernelExecutionTest, SameBaseKeyDifferentArgsEqualInMemoryKey) {
                                        hlo_bytes, false, 0);
 
   // In-memory keys are equal (both just "same_base")
-  EXPECT_EQ(kernel1.GetCacheKey(), kernel2.GetCacheKey());
-  EXPECT_EQ(kernel1.GetCacheKey(), "same_base");
+  EXPECT_EQ(kernel1.GetCompileKey(), kernel2.GetCompileKey());
+  EXPECT_EQ(kernel1.GetCompileKey(), "same_base");
 
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
@@ -526,7 +526,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
   EXPECT_TRUE(kernel.RequiresCompilation());
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
-  EXPECT_TRUE(kernel.GetCacheKey().find("base_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("base_cache_key") == 0);
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithCollectives) {
@@ -550,7 +550,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelCacheKey) {
   CompileOnlyKernelExecution kernel("base_key", stablehlo_bytes, false);
 
   // In-memory cache key is just the base key
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
@@ -593,7 +593,7 @@ TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
                                    create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   EXPECT_EQ(kernel.GetOpName(), "graph_name");
-  EXPECT_EQ(kernel.GetCacheKey(), "cache_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "cache_key");
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
 }

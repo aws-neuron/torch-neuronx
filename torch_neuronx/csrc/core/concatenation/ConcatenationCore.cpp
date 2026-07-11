@@ -598,7 +598,7 @@ std::unique_ptr<at::neuron::OperationContext> ConcatenationCore::CreateOpContext
   // Override cache key back to base key (without compiler extension) to ensure
   // consistency between IrNodeManager cache and CompilationCache
   // This allows invalidation to work correctly across both caches
-  kernel->UpdateCacheKey(ir_node->cache_key);
+  kernel->UpdateCompileKey(ir_node->cache_key);
 
   return std::make_unique<at::neuron::OperationContext>(std::move(kernel));
 }

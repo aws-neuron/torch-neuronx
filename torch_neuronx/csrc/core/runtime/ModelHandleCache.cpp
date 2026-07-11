@@ -1,8 +1,5 @@
 #include "ModelHandleCache.h"
 
-#include <iomanip>
-#include <sstream>
-
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 
 namespace at::neuron {
@@ -14,13 +11,8 @@ ModelHandleCache::~ModelHandleCache() {
   cache_.clear();
 }
 
-std::string ModelHandleCache::GenerateCacheKey(const std::vector<uint8_t>& neff_bytes,
-                                               int device_index) const {
-  std::size_t hash_value = std::hash<std::string_view>{}(
-      std::string_view(reinterpret_cast<const char*>(neff_bytes.data()), neff_bytes.size()));
-  std::ostringstream oss;
-  oss << "dev" << device_index << "_" << std::hex << hash_value;
-  return oss.str();
+std::string ModelHandleCache::MakeCacheKey(const std::string& compile_key, int device_index) const {
+  return "dev" + std::to_string(device_index) + "_" + compile_key;
 }
 
 std::shared_ptr<nrt::ModelHandle> ModelHandleCache::GetModel(const std::string& cache_key) const {

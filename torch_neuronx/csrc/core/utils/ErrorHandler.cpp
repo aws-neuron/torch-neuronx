@@ -67,7 +67,7 @@ std::string ErrorHandler::HandleCompilationError(OperationContext* op,
     complete_message += "\npython stack trace=\n" + op->python_stack_trace;
   }
 
-  complete_message += "\nneff cache key=" + op->GetCompilableKernel().GetCacheKey();
+  complete_message += "\nneff cache key=" + op->GetCompilableKernel().GetCompileKey();
 
   complete_message += GetAsyncErrorSuffix();
 

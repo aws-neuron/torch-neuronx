@@ -112,7 +112,7 @@ std::shared_ptr<nrt::ModelHandle> NRTHandler::GetOrLoadModel(
 
   auto& cache = NeuronResourceManager::Instance().GetModelHandleCache();
   const auto& neff_bytes = compilable_kernel.GetCachedNeff();
-  std::string cache_key = cache.GenerateCacheKey(neff_bytes, config.device_id);
+  std::string cache_key = cache.MakeCacheKey(compilable_kernel.GetCompileKey(), config.device_id);
 
   // Try cache first
   auto model = cache.GetModel(cache_key);

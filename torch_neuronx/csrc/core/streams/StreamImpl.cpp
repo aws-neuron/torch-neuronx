@@ -287,7 +287,7 @@ void StreamImpl::CompleteOperation(OperationContext* operation) {
     snapshot.hierarchy_string = operation->hierarchy_string;
     if (operation->RequiresCompilation()) {
       auto& compilable_kernel = operation->GetCompilableKernel();
-      snapshot.neff_cache_key = compilable_kernel.GetCacheKey();
+      snapshot.neff_cache_key = compilable_kernel.GetCompileKey();
       if (const auto* pk = compilable_kernel.GetCompilationCacheKey().GetPersistentKey()) {
         snapshot.persistent_cache_key = *pk;
       }

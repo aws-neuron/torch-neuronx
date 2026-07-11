@@ -314,10 +314,10 @@ class CompilableKernelExecution {
   // Cache management methods
   const std::vector<uint8_t>& GetCachedNeff() const { return *cached_neff_ptr_; }
   void SetCachedNeff(NeffBytesPtr neff_ptr) const { cached_neff_ptr_ = std::move(neff_ptr); }
-  const std::string& GetCacheKey() const { return cache_key_.GetKey(); }
-  const CompilationCacheKey& GetCompilationCacheKey() const { return cache_key_; }
-  void SetCompilationCacheKey(CompilationCacheKey key) { cache_key_ = std::move(key); }
-  void UpdateCacheKey(const std::string& new_key) { cache_key_.SetKey(new_key); }
+  const std::string& GetCompileKey() const { return compile_key_.GetKey(); }
+  const CompilationCacheKey& GetCompilationCacheKey() const { return compile_key_; }
+  void SetCompilationCacheKey(CompilationCacheKey key) { compile_key_ = std::move(key); }
+  void UpdateCompileKey(const std::string& new_key) { compile_key_.SetKey(new_key); }
   bool HasCachedNeff() const { return cached_neff_ptr_ != nullptr; }
   bool HasCollectives() const { return has_collectives_; }
 
@@ -361,21 +361,21 @@ class CompilableKernelExecution {
   // Construct with a pre-computed CompilationCacheKey.
   CompilableKernelExecution(CompilationCacheKey key, const std::string& additional_args,
                             const std::string& optimization_level, bool has_collectives)
-      : cache_key_(std::move(key)),
+      : compile_key_(std::move(key)),
         additional_args_(additional_args),
         optimization_level_(optimization_level),
         has_collectives_(has_collectives) {}
 
   // Construct from a key string
-  CompilableKernelExecution(const std::string& cache_key_str, const std::string& additional_args,
+  CompilableKernelExecution(const std::string& compile_key_str, const std::string& additional_args,
                             const std::string& optimization_level, bool has_collectives)
-      : cache_key_(CompilationCacheKey(cache_key_str, additional_args, optimization_level)),
+      : compile_key_(CompilationCacheKey(compile_key_str, additional_args, optimization_level)),
         additional_args_(additional_args),
         optimization_level_(optimization_level),
         has_collectives_(has_collectives) {}
 
  private:
-  CompilationCacheKey cache_key_;
+  CompilationCacheKey compile_key_;
   std::string additional_args_;
   std::string optimization_level_;
   mutable NeffBytesPtr cached_neff_ptr_;

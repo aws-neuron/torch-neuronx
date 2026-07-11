@@ -41,7 +41,7 @@ void ApplyCachedMlirToKernel(at::neuron::XLACompilableKernelExecution* kernel,
 
   // Update kernel's cache key since MLIR has changed
   // Operations with different prologues must have different kernel cache keys
-  kernel->UpdateCacheKey(merged_operation_cache_key);
+  kernel->UpdateCompileKey(merged_operation_cache_key);
 }
 
 // Helper to apply input deduplication to kernel src data
@@ -107,7 +107,7 @@ std::vector<uint8_t> LazyTransformationManager::ProcessPrologueWithMlirMerge(
 
   // Generate cache key for the merged result (for kernel naming)
   std::string merged_operation_cache_key =
-      prologue_result.prologue_cache_key + "_" + compilable_kernel->GetCacheKey();
+      prologue_result.prologue_cache_key + "_" + compilable_kernel->GetCompileKey();
 
   TORCH_NEURONX_DEBUG("ProcessPrologueWithMlirMerge: Merging prologue with operation",
                       "op=", op_name);
@@ -238,7 +238,7 @@ void LazyTransformationManager::ProcessOperationInputs(
 
   // Generate merged operation cache key (prologue + dedup + operation)
   std::string merged_operation_cache_key =
-      prologue_cache_key + dedup_suffix + "_" + xla_compilable->GetCacheKey();
+      prologue_cache_key + dedup_suffix + "_" + xla_compilable->GetCompileKey();
 
   // Check MergedOperationCache FIRST - avoid prologue generation if cached result exists
   {
@@ -349,7 +349,8 @@ void LazyTransformationManager::ProcessOperationOutputs(
       output_ptrs, output_contexts, op_name, kernel_transforms);
 
   // Generate epilogue cache key for merged result
-  std::string merged_epilogue_cache_key = epilogue_cache_key + "_" + xla_compilable->GetCacheKey();
+  std::string merged_epilogue_cache_key =
+      epilogue_cache_key + "_" + xla_compilable->GetCompileKey();
 
   // Check MergedOperationCache for cached epilogue result
   {

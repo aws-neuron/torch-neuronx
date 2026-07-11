@@ -354,7 +354,7 @@ std::unique_ptr<IrNode> IrNodeManager::CreateNodeFromOperationContext(
         "create_node_from_operation_context requires XLACompilableKernelExecution");
   }
 
-  const std::string& cache_key = xla_kernel->GetCacheKey();
+  const std::string& cache_key = xla_kernel->GetCompileKey();
 
   TORCH_NEURONX_DEBUG("Creating IrNode from validated OperationContext",
                       "op_name:", xla_kernel->GetOpName(), "cache_key:", cache_key,

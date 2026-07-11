@@ -63,7 +63,7 @@ TEST_F(NeuronBindingsTest, CompileGraphReturnsCacheKey) {
   std::vector<uint8_t> stablehlo_bytes = {0x01, 0x02, 0x03};
 
   CompileOnlyKernelExecution kernel(base_cache_key, stablehlo_bytes, false);
-  std::string cache_key = kernel.GetCacheKey();
+  std::string cache_key = kernel.GetCompileKey();
 
   // Cache key (in-memory) is the base key
   EXPECT_EQ(cache_key, base_cache_key);
@@ -91,7 +91,7 @@ TEST_F(NeuronBindingsTest, ExecuteCompiledGraphCreatesValidKernel) {
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_EQ(kernel.GetOpName(), graph_name);
-  EXPECT_EQ(kernel.GetCacheKey(), cache_key);
+  EXPECT_EQ(kernel.GetCompileKey(), cache_key);
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
 }
 
