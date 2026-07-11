@@ -2605,8 +2605,26 @@ class GraphNodeImporter:
             # level result tuples, we will need to create a tuple-boxed version of this and
             # redirect to it for generic object access.
             result_types = []
-            for v in node.meta["val"]:
-                result_types.append(self._cc.value_info_to_type(v))
+            tensor_meta = node.meta.get("tensor_meta")
+            node_val = node.meta["val"]
+            # Per-element tensor_meta is a tuple/list/immutable_list of TensorMetadata.
+            # Exclude a bare TensorMetadata: it is itself a NamedTuple (a tuple subclass),
+            # so it would otherwise be mistaken for a sequence of its own 7 fields. A
+            # single TensorMetadata cannot describe multiple results, so treat it (and
+            # None, and anything else non-sequence) as absent and fall back to val.
+            if isinstance(tensor_meta, (tuple, list)) and not isinstance(
+                tensor_meta, TensorMetadata
+            ):
+                if len(tensor_meta) != len(node_val):
+                    raise NotImplementedError(
+                        f"Mismatched multi-return metadata: len(tensor_meta)="
+                        f"{len(tensor_meta)} != len(val)={len(node_val)} for node {node}"
+                    )
+                per_elem_meta = tensor_meta
+            else:
+                per_elem_meta = [None] * len(node_val)
+            for v, tm in zip(node_val, per_elem_meta):
+                result_types.append(self._cc.value_info_to_type(v, tensor_meta=tm))
         return result_types
 
 
