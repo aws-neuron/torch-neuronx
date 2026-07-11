@@ -171,6 +171,16 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
 
   // For async execution worker (operation scheduling)
   OperationContext* GetNextOperationToSchedule();
+
+  // Single source of truth for the four cross-kind / cross-XU / cross-stream
+  // sync gates that decide whether `op` may be scheduled now or must wait for a
+  // prior op on this stream to retire. Returns true iff `op` is gated (must
+  // park / not-ready).
+  // Reads last_scheduled_info_ / xu_completed_seqs_ / host_completion_state_,
+  // all written only on the runtime-worker thread (also the only caller of this
+  // method), so those reads need no extra synchronization.
+  bool IsScheduleGatedByPriorOp(OperationContext* op, KernelTypeEnum kernel_type,
+                                bool prior_ops_in_flight, bool refresh_completion);
   // True iff `op` is a same-stream kWait eligible for run-ahead bypass; the
   // free-HBM headroom check lives in IsRunAheadMemorySafe.
   static bool IsSameStreamWaitBypass(OperationContext* op, c10::StreamId stream_id);
@@ -217,6 +227,13 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // True iff no scheduled / pending-signal ops remain (Deferred kAllocs are
   // ignored). Caller must hold runtime_queue_mutex_.
   bool IsStreamDrainedWithLockHeld() const;
+
+  // True iff the front-of-queue op is in flight (scheduled / pending-signal /
+  // host-inflight, or its concat op scheduled). Lock-held analogue of
+  // HasPendingAsyncOperations() for callers that already hold
+  // runtime_queue_mutex_ (e.g. GetNextOperationToSchedule's gate pre-check),
+  // avoiding the self-deadlock of re-locking. Caller must hold the mutex.
+  bool FrontOpInFlightWithLockHeld() const;
 
   // Flip parked kAllocs from Deferred to RetryReady when the stream is
   // drained. Caller must hold runtime_queue_mutex_.

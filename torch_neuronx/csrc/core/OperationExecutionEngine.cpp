@@ -1097,15 +1097,15 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   // already preserves ordering for kHost→kHost on the same stream.
   if (kernel_type == KernelTypeEnum::kHost) {
     auto& info = stream->GetLastScheduledInfo();
-    if (info.valid && info.kind == LastKind::kDeviceXU) {
-      stream->UpdateCompletionState();
-      int queue = nrt::GetHardwareQueue(info.xu, stream->GetStreamId());
-      nrt::SequenceId completed_seq = stream->xu_completed_seqs_.Get(info.xu, queue);
-      if (NRTA_SEQ_GET_SEQ_NUM(info.sequence_id) > NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
-        // Prior device op not retired; runtime worker will retry on next pass
-        // (woken by NRT completion eventfd).
-        return false;
-      }
+    // Authoritative gate (a): kHost waits for a prior device-XU op to retire.
+    // Same predicate the runtime worker pre-checks in GetNextOperationToSchedule
+    // (single source of truth); refresh_completion=true reads the freshest NRT
+    // completion seqs. prior_ops_in_flight is irrelevant for kHost (only the
+    // kEvent gate (d) consumes it), so pass false. On gate → runtime worker
+    // retries next pass (woken by the NRT completion eventfd).
+    if (stream->IsScheduleGatedByPriorOp(op, kernel_type, /*prior_ops_in_flight=*/false,
+                                         /*refresh_completion=*/true)) {
+      return false;
     }
 
     EnsureHostWorkerPool();
@@ -1144,16 +1144,17 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
-    // Same-stream kWait is redundant with FIFO ordering; only gate on
-    // cross-stream where the producer's completion is not implied here.
-    if (kernel_type == KernelTypeEnum::kEvent &&
-        op->GetKernel<KernelTypeEnum::kEvent>().GetEventAction() ==
-            EventDirectKernelExecution::EventAction::kWait &&
-        stream->HasPendingAsyncOperations()) {
-      auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-      if (event_kernel.GetEvent().recorded_stream_id() != stream->GetStreamId()) {
-        return false;
-      }
+    // Authoritative gate (d): a cross-stream event_wait must not run ahead of a
+    // still-in-flight prior op on this stream. Same predicate the runtime worker
+    // pre-checks (single source of truth). Same-stream kWait is redundant with
+    // FIFO ordering and never gates. prior_ops_in_flight uses the front-op
+    // in-flight check (HasPendingAsyncOperations); refresh_completion is
+    // irrelevant for the kEvent gate (no seq compare), pass false.
+    if (stream->IsScheduleGatedByPriorOp(
+            op, kernel_type,
+            /*prior_ops_in_flight=*/stream->HasPendingAsyncOperations(),
+            /*refresh_completion=*/false)) {
+      return false;
     }
     op->nrt_async_state_.is_pending_signal = true;
     pending_async_ops_count_.fetch_add(1);

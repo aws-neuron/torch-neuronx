@@ -290,6 +290,134 @@ TEST_F(StreamImplTest, GetNextOperationToScheduleKSignalNotBypassed) {
   EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
 }
 
+namespace {
+
+// A minimal device op of the given kernel type, execution-ready.
+std::shared_ptr<OperationContext> MakeDeviceOp(KernelTypeEnum kt) {
+  auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
+  ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(kt));
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->MarkExecutionReady();
+  return op;
+}
+
+}  // namespace
+
+// (a) kHost following an unretired device-XU op must gate; once the prior op's
+//     seq retires, it must not.
+TEST_F(StreamImplTest, GateA_HostAfterUnretiredDeviceXU) {
+  auto host_op = MakeDeviceOp(KernelTypeEnum::kHost);
+
+  auto& info = stream_->GetLastScheduledInfo();
+  info.kind = LastKind::kDeviceXU;
+  info.xu = NRTA_XU_COMPUTE;
+  info.sequence_id = 10;
+  info.valid = true;
+
+  // Prior device op (seq 10) NOT yet retired (completed watermark 5) → gated.
+  int queue = nrt::GetHardwareQueue(NRTA_XU_COMPUTE, stream_->stream_id);
+  stream_->xu_completed_seqs_.Set(NRTA_XU_COMPUTE, queue, 5);
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(host_op.get(), KernelTypeEnum::kHost,
+                                                /*prior_ops_in_flight=*/false,
+                                                /*refresh_completion=*/false));
+
+  // Prior device op retired (watermark 10) → not gated.
+  stream_->xu_completed_seqs_.Set(NRTA_XU_COMPUTE, queue, 10);
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(host_op.get(), KernelTypeEnum::kHost,
+                                                 /*prior_ops_in_flight=*/false,
+                                                 /*refresh_completion=*/false));
+}
+
+// (b) A device op following an incomplete kHost op must gate until the host
+//     completion seq catches up.
+TEST_F(StreamImplTest, GateB_DeviceAfterIncompleteHost) {
+  auto dev_op = MakeDeviceOp(KernelTypeEnum::kHLO);
+
+  auto& info = stream_->GetLastScheduledInfo();
+  info.kind = LastKind::kHost;
+  info.host_completion_seq = 7;
+  info.valid = true;
+
+  // Host not yet complete past seq 7 → gated.
+  stream_->host_completion_state_.completed_seq_id.store(3, std::memory_order_release);
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO,
+                                                /*prior_ops_in_flight=*/false,
+                                                /*refresh_completion=*/false));
+
+  // Host completed through seq 7 → not gated.
+  stream_->host_completion_state_.completed_seq_id.store(7, std::memory_order_release);
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO,
+                                                 /*prior_ops_in_flight=*/false,
+                                                 /*refresh_completion=*/false));
+}
+
+// (c) A device op on a different XU than the prior device op must gate until
+//     that prior op retires; same-XU never gates here.
+TEST_F(StreamImplTest, GateC_CrossXUSync) {
+  auto dev_op = MakeDeviceOp(KernelTypeEnum::kHLO);  // kHLO → COMPUTE XU
+  const auto current_xu = static_cast<nrta_xu_t>(GetXUIndex(KernelTypeEnum::kHLO));
+
+  auto& info = stream_->GetLastScheduledInfo();
+  info.kind = LastKind::kDeviceXU;
+  // Prior op on a *different* XU.
+  info.xu = (current_xu == NRTA_XU_COMPUTE) ? NRTA_XU_TENSOR_OP : NRTA_XU_COMPUTE;
+  info.sequence_id = 20;
+  info.valid = true;
+
+  int prior_queue = nrt::GetHardwareQueue(info.xu, stream_->stream_id);
+  stream_->xu_completed_seqs_.Set(info.xu, prior_queue, 15);  // not retired
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO,
+                                                /*prior_ops_in_flight=*/false,
+                                                /*refresh_completion=*/false));
+
+  stream_->xu_completed_seqs_.Set(info.xu, prior_queue, 20);  // retired
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO,
+                                                 /*prior_ops_in_flight=*/false,
+                                                 /*refresh_completion=*/false));
+
+  // Same XU as prior → gate (c) does not apply.
+  info.xu = current_xu;
+  info.sequence_id = 99;
+  stream_->xu_completed_seqs_.Set(current_xu, nrt::GetHardwareQueue(current_xu, stream_->stream_id),
+                                  0);
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO,
+                                                 /*prior_ops_in_flight=*/false,
+                                                 /*refresh_completion=*/false));
+}
+
+// (d) A cross-stream event_wait gates only while a prior op is in flight;
+//     a same-stream wait never gates, and neither does a wait with no prior
+//     in-flight op.
+TEST_F(StreamImplTest, GateD_CrossStreamEventWait) {
+  // Cross-stream wait, prior op in flight → gated.
+  auto other_stream = std::make_shared<StreamImpl>(0, 2);
+  auto cross = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, other_stream.get());
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(cross.get(), KernelTypeEnum::kEvent,
+                                                /*prior_ops_in_flight=*/true,
+                                                /*refresh_completion=*/false));
+
+  // Cross-stream wait but nothing in flight → not gated.
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(cross.get(), KernelTypeEnum::kEvent,
+                                                 /*prior_ops_in_flight=*/false,
+                                                 /*refresh_completion=*/false));
+
+  // Same-stream wait, even with prior in flight → not gated (FIFO implies order).
+  auto same = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_.get());
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(same.get(), KernelTypeEnum::kEvent,
+                                                 /*prior_ops_in_flight=*/true,
+                                                 /*refresh_completion=*/false));
+}
+
+// No prior op (last_scheduled_info_ invalid) → never gated, regardless of type.
+TEST_F(StreamImplTest, NoPriorOpNeverGates) {
+  ASSERT_FALSE(stream_->GetLastScheduledInfo().valid);
+  auto host_op = MakeDeviceOp(KernelTypeEnum::kHost);
+  auto dev_op = MakeDeviceOp(KernelTypeEnum::kHLO);
+  EXPECT_FALSE(
+      stream_->IsScheduleGatedByPriorOp(host_op.get(), KernelTypeEnum::kHost, false, false));
+  EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO, false, false));
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

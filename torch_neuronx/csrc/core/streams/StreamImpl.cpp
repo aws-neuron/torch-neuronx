@@ -355,6 +355,63 @@ void StreamImpl::HandleErrorWithExceptionPtr(OperationContext* operation, std::e
   RemoveActiveOperation(operation);
 }
 
+bool StreamImpl::IsScheduleGatedByPriorOp(OperationContext* op, KernelTypeEnum kernel_type,
+                                          bool prior_ops_in_flight, bool refresh_completion) {
+  // (a) kHost gated on a prior device-XU op retiring on this stream: the kHost's
+  //     CPU reads depend on the device op's output.
+  if (kernel_type == KernelTypeEnum::kHost && last_scheduled_info_.valid &&
+      last_scheduled_info_.kind == LastKind::kDeviceXU) {
+    if (refresh_completion) {
+      UpdateCompletionState();
+    }
+    int queue = nrt::GetHardwareQueue(last_scheduled_info_.xu, stream_id);
+    nrt::SequenceId completed_seq = xu_completed_seqs_.Get(last_scheduled_info_.xu, queue);
+    if (NRTA_SEQ_GET_SEQ_NUM(last_scheduled_info_.sequence_id) >
+        NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
+      return true;
+    }
+  }
+  // (b) Device-XU gated on a prior kHost op completing on this stream: RunHost()
+  //     must finish so its CPU output buffer is visible to the device op.
+  if (IsDeviceKernelType(kernel_type) && kernel_type != KernelTypeEnum::kAlloc &&
+      last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kHost) {
+    HostCompletionSeq completed =
+        host_completion_state_.completed_seq_id.load(std::memory_order_acquire);
+    if (last_scheduled_info_.host_completion_seq > completed) {
+      return true;
+    }
+  }
+  // (c) Cross-XU sync: a device-XU op on a different XU than the prior device op
+  //     must wait for that prior op to retire.
+  if (IsDeviceKernelType(kernel_type) && kernel_type != KernelTypeEnum::kAlloc &&
+      last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kDeviceXU) {
+    auto current_xu = static_cast<nrta_xu_t>(GetXUIndex(kernel_type));
+    if (last_scheduled_info_.xu != current_xu) {
+      if (refresh_completion) {
+        UpdateCompletionState();
+      }
+      int queue = nrt::GetHardwareQueue(last_scheduled_info_.xu, stream_id);
+      nrt::SequenceId completed_seq = xu_completed_seqs_.Get(last_scheduled_info_.xu, queue);
+      if (NRTA_SEQ_GET_SEQ_NUM(last_scheduled_info_.sequence_id) >
+          NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
+        return true;
+      }
+    }
+  }
+  // (d) Cross-stream event_wait while a prior op on this stream is still in
+  //     flight: the wait must not run ahead of the producer ordering. Same-
+  //     stream waits are implied by FIFO and never gate here.
+  if (kernel_type == KernelTypeEnum::kEvent && prior_ops_in_flight) {
+    auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+    if (event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
+        event_kernel.GetEvent().recorded_stream_impl() != this) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 OperationContext* StreamImpl::GetNextOperationToSchedule() {
   std::lock_guard<std::mutex> lock(runtime_queue_mutex_);
 
@@ -366,14 +423,29 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
   // in-band synchronize — preceding ops drain it (via ReleaseDeferredAllocGates)
   // and subsequent ops wait for the retry to resolve.
   auto& op = *next_to_schedule_;
-  if (op->IsSchedulable()) {
-    return op.get();
+  if (!op->IsSchedulable()) {
+    // Same-stream kWait can run ahead if memory-safe.
+    if (IsSameStreamWaitBypass(op.get(), this) && IsRunAheadMemorySafe(device_index)) {
+      return op.get();
+    }
+    return nullptr;
   }
 
-  if (IsSameStreamWaitBypass(op.get(), stream_id) && IsRunAheadMemorySafe(device_index)) {
-    return op.get();
+  // Pre-check the same sync gates ScheduleOperation will apply. Returning null
+  // here lets the worker sleep on completion_efd_ instead of busy-retrying an op
+  // that ScheduleOperation would only reject. This is the *same* predicate the
+  // authoritative path uses (single source of truth) — passed
+  // refresh_completion=false because the loop-top CheckCompletions() already
+  // refreshed completion state this pass, and prior_ops_in_flight computed under
+  // the lock we already hold.
+  KernelTypeEnum kernel_type = op->GetKernelType();
+  if (IsScheduleGatedByPriorOp(op.get(), kernel_type,
+                               /*prior_ops_in_flight=*/FrontOpInFlightWithLockHeld(),
+                               /*refresh_completion=*/false)) {
+    return nullptr;
   }
-  return nullptr;
+
+  return op.get();
 }
 
 bool StreamImpl::IsSameStreamWaitBypass(OperationContext* op, c10::StreamId stream_id) {
@@ -445,9 +517,7 @@ void StreamImpl::AdvanceToNextOperation(OperationContext* just_scheduled) {
   ++next_to_schedule_;
 }
 
-bool StreamImpl::HasPendingAsyncOperations() const {
-  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(runtime_queue_mutex_));
-
+bool StreamImpl::FrontOpInFlightWithLockHeld() const {
   if (runtime_queue_.empty()) {
     return false;
   }
@@ -463,6 +533,11 @@ bool StreamImpl::HasPendingAsyncOperations() const {
     return concat_op->nrt_async_state_.is_scheduled;
   }
   return false;
+}
+
+bool StreamImpl::HasPendingAsyncOperations() const {
+  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(runtime_queue_mutex_));
+  return FrontOpInFlightWithLockHeld();
 }
 
 OperationContext* StreamImpl::FindOperationBySeq(nrt::SequenceId sequence_id) {
@@ -529,30 +604,16 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
     }
   }
 
-  // Cross-kind sync (device-after-kHost): a device op following a kHost must
-  // wait for RunHost() to complete, else its data deps through the kHost's CPU
-  // output buffer aren't satisfied.
-  if (last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kHost) {
-    HostCompletionSeq completed =
-        host_completion_state_.completed_seq_id.load(std::memory_order_acquire);
-    if (last_scheduled_info_.host_completion_seq > completed) {
-      return ScheduleResult::kNotReady;
-    }
-    // Host done; we're crossing back to device. Fall through to schedule.
-  }
-
-  // Cross-XU synchronization (device-after-device, different XU): ensure
-  // prior XU operation completes before switching XUs.
+  // Authoritative cross-kind / cross-XU sync gate. Same predicate the runtime
+  // worker pre-checks in GetNextOperationToSchedule (single source of truth),
+  // but here with refresh_completion=true so the freshest NRT completion seqs
+  // are read before we commit to scheduling. For a device op only gates (b)
+  // device-after-kHost and (c) cross-XU can fire; (a)/(d) are kHost/kEvent-only,
+  // so prior_ops_in_flight is irrelevant and passed false.
   auto current_xu = static_cast<nrta_xu_t>(GetXUIndex(kernel_type));
-  if (last_scheduled_info_.valid && last_scheduled_info_.kind == LastKind::kDeviceXU &&
-      last_scheduled_info_.xu != current_xu) {
-    UpdateCompletionState();
-    int queue = nrt::GetHardwareQueue(last_scheduled_info_.xu, stream_id);
-    nrt::SequenceId completed_seq = xu_completed_seqs_.Get(last_scheduled_info_.xu, queue);
-    if (NRTA_SEQ_GET_SEQ_NUM(last_scheduled_info_.sequence_id) >
-        NRTA_SEQ_GET_SEQ_NUM(completed_seq)) {
-      return ScheduleResult::kNotReady;
-    }
+  if (IsScheduleGatedByPriorOp(op, kernel_type, /*prior_ops_in_flight=*/false,
+                               /*refresh_completion=*/true)) {
+    return ScheduleResult::kNotReady;
   }
 
   op->execute_start = std::chrono::steady_clock::now();
