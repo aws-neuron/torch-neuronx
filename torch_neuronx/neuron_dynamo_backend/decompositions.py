@@ -172,6 +172,7 @@ neuron_decompositions = get_decompositions(
         aten.nll_loss2d_forward,
         aten.nll_loss2d_backward,
         aten.max_unpool2d,
+        aten.max_unpool3d,
         aten.split_with_sizes_copy,
         aten._adaptive_avg_pool2d,
         # Upsample/interpolate forward ops. PyTorch's built-in
@@ -423,36 +424,71 @@ def unfold_decomp(self, dimension, size, step):
     return torch.stack(windows, dim=dimension)
 
 
+def _adaptive_avg_pool_backward_weight(o_size, i_size, device, dtype):
+    """Per-dim backward weight matrix for adaptive avg pooling.
+
+    Returns a ``(i_size, o_size)`` matrix where ``W[i, o] = 1/window(o)`` if
+    input index ``i`` fell in output ``o``'s pooling window, else 0. Adaptive
+    avg-pool is separable, so the backward contracts grad_output against this
+    matrix per spatial dim. Handles divisible and non-divisible output sizes
+    (the native torch-mlir lowering rejects non-divisible).
+    """
+    o_idx = torch.arange(o_size, device=device)
+    start = (o_idx * i_size) // o_size
+    end = ((o_idx + 1) * i_size + o_size - 1) // o_size  # ceil division
+    window = (end - start).to(dtype)
+    i_idx = torch.arange(i_size, device=device).unsqueeze(1)
+    mask = (i_idx >= start) & (i_idx < end)
+    return mask.to(dtype) / window
+
+
 @register_decomposition([aten._adaptive_avg_pool2d_backward])
 def adaptive_avg_pool2d_backward_decomp(grad_output, self):
     """Lower _adaptive_avg_pool2d_backward via two separable matmuls.
 
-    The native torch-mlir lowering only supports output sizes that divide
-    the input evenly; non-divisible sizes are marked illegal and hard-fail.
     Adaptive avg-pool is separable over H and W, so the backward is
-    ``Wh @ grad_output @ Ww^T`` where each ``W`` maps an output index to the
-    input indices it averaged over, scaled by that pooling window's size.
-    This holds for divisible and non-divisible cases alike.
+    ``Wh @ grad_output @ Ww^T`` where each ``W`` (see
+    _adaptive_avg_pool_backward_weight) maps an output index to the input
+    indices it averaged over, scaled by that pooling window's size.
     """
     iH, iW = self.shape[-2], self.shape[-1]
     oH, oW = grad_output.shape[-2], grad_output.shape[-1]
     device, dtype = grad_output.device, grad_output.dtype
 
-    def _weight(o_size, i_size):
-        # W[i, o] = 1/window(o) if input index i fell in output o's window.
-        o_idx = torch.arange(o_size, device=device)
-        start = (o_idx * i_size) // o_size
-        end = ((o_idx + 1) * i_size + o_size - 1) // o_size  # ceil division
-        window = (end - start).to(dtype)
-        i_idx = torch.arange(i_size, device=device).unsqueeze(1)
-        mask = (i_idx >= start) & (i_idx < end)
-        return mask.to(dtype) / window
-
-    weight_h = _weight(oH, iH)  # (iH, oH)
-    weight_w = _weight(oW, iW)  # (iW, oW)
+    weight_h = _adaptive_avg_pool_backward_weight(oH, iH, device, dtype)  # (iH, oH)
+    weight_w = _adaptive_avg_pool_backward_weight(oW, iW, device, dtype)  # (iW, oW)
     grad_input = torch.einsum("hq,...qw->...hw", weight_h, grad_output)
     grad_input = torch.einsum("...hw,vw->...hv", grad_input, weight_w)
     return grad_input
+
+
+def _adaptive_avg_pool3d_backward_impl(grad_output, self):
+    """Shared math for _adaptive_avg_pool3d_backward (separable per-dim matmuls).
+
+    3d analog of adaptive_avg_pool2d_backward: contracts grad_output against the
+    per-dim backward weight matrix over D, H and W.
+    """
+    iD, iH, iW = self.shape[-3], self.shape[-2], self.shape[-1]
+    oD, oH, oW = grad_output.shape[-3], grad_output.shape[-2], grad_output.shape[-1]
+    device, dtype = grad_output.device, grad_output.dtype
+
+    weight_d = _adaptive_avg_pool_backward_weight(oD, iD, device, dtype)  # (iD, oD)
+    weight_h = _adaptive_avg_pool_backward_weight(oH, iH, device, dtype)  # (iH, oH)
+    weight_w = _adaptive_avg_pool_backward_weight(oW, iW, device, dtype)  # (iW, oW)
+    grad_input = torch.einsum("dq,...qhw->...dhw", weight_d, grad_output)
+    grad_input = torch.einsum("hq,...dqw->...dhw", weight_h, grad_input)
+    grad_input = torch.einsum("...dhw,vw->...dhv", grad_input, weight_w)
+    return grad_input
+
+
+@register_decomposition([aten._adaptive_avg_pool3d_backward])
+def adaptive_avg_pool3d_backward_decomp(grad_output, self):
+    """Lower _adaptive_avg_pool3d_backward via three separable matmuls.
+
+    Registering the functional packet also covers the .out overload, so no
+    separate .out registration is needed (and adding one is a duplicate).
+    """
+    return _adaptive_avg_pool3d_backward_impl(grad_output, self)
 
 
 @register_decomposition([aten.as_strided.default])
@@ -2910,6 +2946,277 @@ def max_pool3d_with_indices_backward_decomposition(
 
     grad_in_flat = grad_in_flat.scatter_add(-1, idx_flat, grad_out_flat)
     return grad_in_flat.reshape(input.shape)
+
+
+def _adaptive_window_index(o_size, i_size, device):
+    """Per-output-index window map for adaptive pooling along one dim.
+
+    Output index ``o`` pools the input range ``[floor(o*I/O), ceil((o+1)*I/O))``.
+    Windows are non-uniform in length (differ by at most 1), so we build a
+    fixed-width ``(O, max_w)`` index grid padded to the largest window and a
+    boolean ``valid`` mask marking the real members. ``max_w`` is computed in
+    pure Python from the static sizes (no tensor ``.item()``, which would force
+    a data-dependent guard).
+    """
+    o = torch.arange(o_size, device=device)
+    start = (o * i_size) // o_size
+    end = ((o + 1) * i_size + (o_size - 1)) // o_size  # ceil division
+    max_w = max(
+        ((oo + 1) * i_size + (o_size - 1)) // o_size - (oo * i_size) // o_size
+        for oo in range(o_size)
+    )
+    offs = torch.arange(max_w, device=device)
+    idx = start.unsqueeze(1) + offs.unsqueeze(0)  # (O, max_w)
+    valid = idx < end.unsqueeze(1)  # (O, max_w); padded positions are False
+    idx = torch.minimum(idx, idx.new_full((), i_size - 1))  # clamp OOB to last
+    return idx, valid, max_w
+
+
+def _neg_fill(x):
+    """A scalar 'lose-the-max' sentinel matching x's dtype."""
+    neg = float("-inf") if x.dtype.is_floating_point else torch.iinfo(x.dtype).min
+    return torch.full_like(x, neg)
+
+
+@register_decomposition([aten.adaptive_max_pool2d.default])
+def adaptive_max_pool2d_decomposition(self, output_size):
+    """adaptive_max_pool2d via per-output window gather + masked max.
+
+    Returns (values, indices) where indices are flat positions in the input's
+    per-channel H*W plane (matching aten). Adaptive windows are non-uniform, so
+    we gather a fixed max-width window per dim, mask the padding to -inf, and max
+    over the (wH, wW) window. Ties pick the first element in row-major (H, then
+    W) order, matching aten.
+    """
+    iH, iW = self.shape[-2], self.shape[-1]
+    oH, oW = int(output_size[0]), int(output_size[1])
+    device = self.device
+
+    idxH, validH, wH = _adaptive_window_index(oH, iH, device)
+    idxW, validW, wW = _adaptive_window_index(oW, iW, device)
+
+    # Gather windows: (..., iH, iW) -> (..., oH, wH, iW) -> (..., oH, wH, oW, wW)
+    xH = self.index_select(-2, idxH.reshape(-1)).reshape(*self.shape[:-2], oH, wH, iW)
+    xHW = xH.index_select(-1, idxW.reshape(-1)).reshape(*xH.shape[:-1], oW, wW)
+    xHW = xHW.movedim(-3, -2)  # (..., oH, oW, wH, wW)
+
+    mask = validH.reshape(oH, 1, wH, 1) & validW.reshape(1, oW, 1, wW)
+    xHW = torch.where(mask, xHW, _neg_fill(xHW))
+
+    win = xHW.reshape(*xHW.shape[:-2], wH * wW)  # (..., oH, oW, wH*wW)
+    values, win_argmax = win.max(-1)  # (..., oH, oW)
+
+    # Absolute flat (iH*iW) index per window slot, then select the argmax slot.
+    flat_idx = (idxH.reshape(oH, 1, wH, 1) * iW + idxW.reshape(1, oW, 1, wW)).reshape(
+        oH, oW, wH * wW
+    )
+    lead = values.ndim - 2
+    flat_idx = flat_idx.reshape((1,) * lead + (oH, oW, wH * wW)).expand(*values.shape, wH * wW)
+    indices = torch.gather(flat_idx, -1, win_argmax.unsqueeze(-1)).squeeze(-1)
+    return values, indices
+
+
+@register_decomposition([aten.adaptive_max_pool2d_backward.default])
+def adaptive_max_pool2d_backward_decomposition(grad_output, self, indices):
+    """adaptive_max_pool2d_backward via scatter_add over flat H*W."""
+    iH, iW = self.shape[-2], self.shape[-1]
+    leading = self.shape[:-2]
+    grad_in = torch.zeros((*leading, iH * iW), dtype=grad_output.dtype, device=grad_output.device)
+    idx_flat = indices.reshape(*leading, -1).to(torch.long)
+    go_flat = grad_output.reshape(*leading, -1)
+    grad_in = grad_in.scatter_add(-1, idx_flat, go_flat)
+    return grad_in.reshape(self.shape)
+
+
+@register_decomposition([aten.adaptive_max_pool3d.default])
+def adaptive_max_pool3d_decomposition(self, output_size):
+    """adaptive_max_pool3d via per-output window gather + masked max (3d analog
+    of adaptive_max_pool2d). Indices are flat positions in the input's per-channel
+    D*H*W volume.
+    """
+    iD, iH, iW = self.shape[-3], self.shape[-2], self.shape[-1]
+    oD, oH, oW = int(output_size[0]), int(output_size[1]), int(output_size[2])
+    device = self.device
+
+    idxD, validD, wD = _adaptive_window_index(oD, iD, device)
+    idxH, validH, wH = _adaptive_window_index(oH, iH, device)
+    idxW, validW, wW = _adaptive_window_index(oW, iW, device)
+
+    # Gather each spatial dim's window in turn.
+    xD = self.index_select(-3, idxD.reshape(-1)).reshape(*self.shape[:-3], oD, wD, iH, iW)
+    xDH = xD.index_select(-2, idxH.reshape(-1)).reshape(*xD.shape[:-2], oH, wH, iW)
+    xDHW = xDH.index_select(-1, idxW.reshape(-1)).reshape(*xDH.shape[:-1], oW, wW)
+    # xDHW: (..., oD, wD, oH, wH, oW, wW) -> (..., oD, oH, oW, wD, wH, wW).
+    # Move the window dims (wD,wH,wW = -5,-3,-1) to the trailing 3 positions in
+    # one shot; a chained movedim interleaves them and maxes over wrong axes.
+    xDHW = xDHW.movedim((-5, -3, -1), (-3, -2, -1))
+
+    mask = (
+        validD.reshape(oD, 1, 1, wD, 1, 1)
+        & validH.reshape(1, oH, 1, 1, wH, 1)
+        & validW.reshape(1, 1, oW, 1, 1, wW)
+    )
+    xDHW = torch.where(mask, xDHW, _neg_fill(xDHW))
+
+    win = xDHW.reshape(*xDHW.shape[:-3], wD * wH * wW)  # (..., oD, oH, oW, wD*wH*wW)
+    values, win_argmax = win.max(-1)
+
+    flat_idx = (
+        idxD.reshape(oD, 1, 1, wD, 1, 1) * (iH * iW)
+        + idxH.reshape(1, oH, 1, 1, wH, 1) * iW
+        + idxW.reshape(1, 1, oW, 1, 1, wW)
+    ).reshape(oD, oH, oW, wD * wH * wW)
+    lead = values.ndim - 3
+    flat_idx = flat_idx.reshape((1,) * lead + (oD, oH, oW, wD * wH * wW)).expand(
+        *values.shape, wD * wH * wW
+    )
+    indices = torch.gather(flat_idx, -1, win_argmax.unsqueeze(-1)).squeeze(-1)
+    return values, indices
+
+
+@register_decomposition([aten.adaptive_max_pool3d_backward.default])
+def adaptive_max_pool3d_backward_decomposition(grad_output, self, indices):
+    """adaptive_max_pool3d_backward via scatter_add over flat D*H*W."""
+    iD, iH, iW = self.shape[-3], self.shape[-2], self.shape[-1]
+    leading = self.shape[:-3]
+    grad_in = torch.zeros(
+        (*leading, iD * iH * iW), dtype=grad_output.dtype, device=grad_output.device
+    )
+    idx_flat = indices.reshape(*leading, -1).to(torch.long)
+    go_flat = grad_output.reshape(*leading, -1)
+    grad_in = grad_in.scatter_add(-1, idx_flat, go_flat)
+    return grad_in.reshape(self.shape)
+
+
+@register_decomposition([aten.max_pool2d_with_indices_backward.default])
+def max_pool2d_with_indices_backward_decomposition(
+    grad_output,
+    self,
+    kernel_size,
+    stride,
+    padding,
+    dilation,
+    ceil_mode,
+    indices,
+):
+    """max_pool2d_with_indices_backward via scatter_add over flat H*W."""
+    del kernel_size, stride, padding, dilation, ceil_mode
+
+    iH, iW = self.shape[-2], self.shape[-1]
+    leading = self.shape[:-2]
+    grad_in = torch.zeros((*leading, iH * iW), dtype=grad_output.dtype, device=grad_output.device)
+    idx_flat = indices.reshape(*leading, -1).to(torch.long)
+    go_flat = grad_output.reshape(*leading, -1)
+    grad_in = grad_in.scatter_add(-1, idx_flat, go_flat)
+    return grad_in.reshape(self.shape)
+
+
+def _fractional_starts(samples, i_size, o_size, pool_size):
+    """Per-output window start indices for fractional max pooling along one dim.
+
+    Faithful port of aten's generate_intervals (FractionalMaxPooling.h): with
+    ``alpha = (I - pool) / (O - 1)``, output ``i < O-1`` starts at
+    ``int((i + u) * alpha) - int(u * alpha)`` (truncation toward zero); the last
+    start is pinned to ``I - pool``. ``samples`` is the per-(N,C) random value
+    tensor of shape ``(N, C)``; returns ``(N, C, O)`` long start indices.
+    Windows are fixed size (= pool_size); only the starts vary.
+    """
+    if o_size == 1:
+        return samples.new_full((*samples.shape, 1), i_size - pool_size).to(torch.long)
+    alpha = float(i_size - pool_size) / float(o_size - 1)
+    i = torch.arange(o_size, device=samples.device, dtype=samples.dtype)  # (O,)
+    u = samples.unsqueeze(-1)  # (N, C, 1)
+    # truncation toward zero (positive operands) == trunc; matches static_cast<int>
+    seq = torch.trunc((i + u) * alpha) - torch.trunc(u * alpha)  # (N, C, O)
+    last = samples.new_full((*samples.shape, 1), i_size - pool_size)
+    seq = torch.cat([seq[..., :-1], last], dim=-1)
+    return seq.to(torch.long)
+
+
+@register_decomposition([aten.fractional_max_pool2d.default])
+def fractional_max_pool2d_decomposition(self, kernel_size, output_size, random_samples):
+    """fractional_max_pool2d via per-(N,C) start-index gather + windowed max.
+
+    Per aten, random_samples[..., 0] is the W sample and [..., 1] is the H sample.
+    """
+    if self.ndim != 4:
+        return NotImplemented
+    N, C, iH, iW = self.shape
+    kH, kW = _tuple(kernel_size, 2)
+    oH, oW = int(output_size[0]), int(output_size[1])
+
+    sW = random_samples[..., 0]  # (N, C) — index 0 is width
+    sH = random_samples[..., 1]  # index 1 is height
+    start_h = _fractional_starts(sH, iH, oH, kH)  # (N, C, oH)
+    start_w = _fractional_starts(sW, iW, oW, kW)  # (N, C, oW)
+
+    ar_h = torch.arange(kH, device=self.device)
+    ar_w = torch.arange(kW, device=self.device)
+    idx_h = (start_h.unsqueeze(-1) + ar_h).reshape(N, C, oH * kH)
+    idx_w = (start_w.unsqueeze(-1) + ar_w).reshape(N, C, oW * kW)
+
+    gh = torch.gather(self, 2, idx_h.unsqueeze(-1).expand(N, C, oH * kH, iW))
+    gh = gh.reshape(N, C, oH, kH, iW)
+    gw = torch.gather(gh, 4, idx_w.reshape(N, C, 1, 1, oW * kW).expand(N, C, oH, kH, oW * kW))
+    win = gw.reshape(N, C, oH, kH, oW, kW).movedim(3, 4)  # (N,C,oH,oW,kH,kW)
+
+    flat = win.reshape(N, C, oH, oW, kH * kW)
+    values, argmax = flat.max(-1)
+
+    abs_h = start_h.reshape(N, C, oH, 1, 1, 1) + ar_h.reshape(1, 1, 1, 1, kH, 1)
+    abs_w = start_w.reshape(N, C, 1, oW, 1, 1) + ar_w.reshape(1, 1, 1, 1, 1, kW)
+    flat_pos = (abs_h * iW + abs_w).reshape(N, C, oH, oW, kH * kW)
+    indices = torch.gather(flat_pos, -1, argmax.unsqueeze(-1)).squeeze(-1)
+    return values, indices
+
+
+@register_decomposition([aten.fractional_max_pool3d.default])
+def fractional_max_pool3d_decomposition(self, kernel_size, output_size, random_samples):
+    """fractional_max_pool3d via per-(N,C) start-index gather + windowed max.
+
+    Per aten, random_samples[..., 0/1/2] are the T(=D)/H/W samples respectively.
+    """
+    if self.ndim != 5:
+        return NotImplemented
+    N, C, iD, iH, iW = self.shape
+    kD, kH, kW = _tuple(kernel_size, 3)
+    oD, oH, oW = int(output_size[0]), int(output_size[1]), int(output_size[2])
+
+    start_d = _fractional_starts(random_samples[..., 0], iD, oD, kD)  # (N,C,oD)
+    start_h = _fractional_starts(random_samples[..., 1], iH, oH, kH)
+    start_w = _fractional_starts(random_samples[..., 2], iW, oW, kW)
+
+    ar_d = torch.arange(kD, device=self.device)
+    ar_h = torch.arange(kH, device=self.device)
+    ar_w = torch.arange(kW, device=self.device)
+    idx_d = (start_d.unsqueeze(-1) + ar_d).reshape(N, C, oD * kD)
+    idx_h = (start_h.unsqueeze(-1) + ar_h).reshape(N, C, oH * kH)
+    idx_w = (start_w.unsqueeze(-1) + ar_w).reshape(N, C, oW * kW)
+
+    gd = torch.gather(self, 2, idx_d.reshape(N, C, oD * kD, 1, 1).expand(N, C, oD * kD, iH, iW))
+    gd = gd.reshape(N, C, oD, kD, iH, iW)
+    gh = torch.gather(
+        gd, 4, idx_h.reshape(N, C, 1, 1, oH * kH, 1).expand(N, C, oD, kD, oH * kH, iW)
+    )
+    gh = gh.reshape(N, C, oD, kD, oH, kH, iW)
+    gw = torch.gather(
+        gh,
+        6,
+        idx_w.reshape(N, C, 1, 1, 1, 1, oW * kW).expand(N, C, oD, kD, oH, kH, oW * kW),
+    )
+    win = gw.reshape(N, C, oD, kD, oH, kH, oW, kW)
+    # (N,C,oD,kD,oH,kH,oW,kW) -> (N,C,oD,oH,oW,kD,kH,kW)
+    win = win.movedim((3, 5, 7), (5, 6, 7))
+    flat = win.reshape(N, C, oD, oH, oW, kD * kH * kW)
+    values, argmax = flat.max(-1)
+
+    # start_* has no kernel axis; reshape with kD/kH/kW=1 and let ar_* broadcast.
+    abs_d = start_d.reshape(N, C, oD, 1, 1, 1, 1, 1) + ar_d.reshape(1, 1, 1, 1, 1, kD, 1, 1)
+    abs_h = start_h.reshape(N, C, 1, oH, 1, 1, 1, 1) + ar_h.reshape(1, 1, 1, 1, 1, 1, kH, 1)
+    abs_w = start_w.reshape(N, C, 1, 1, oW, 1, 1, 1) + ar_w.reshape(1, 1, 1, 1, 1, 1, 1, kW)
+    flat_pos = (abs_d * (iH * iW) + abs_h * iW + abs_w).reshape(N, C, oD, oH, oW, kD * kH * kW)
+    indices = torch.gather(flat_pos, -1, argmax.unsqueeze(-1)).squeeze(-1)
+    return values, indices
 
 
 @register_decomposition([aten.argsort.default, aten.argsort.stable])
