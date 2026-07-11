@@ -114,6 +114,10 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 
         # MLIR output index -> (input param_num, parameter_index) to alias.
         output_to_alias: dict[int, tuple[int, list[int]]] = {}
+        # Output indices whose alias came from an explicit in-place mutation
+        # (aliasing_info), as opposed to a detected pass-through. Used to prefer
+        # the mutation alias when one input parameter is claimed by both.
+        mutation_output_indices: set[int] = set()
 
         # (1) Ground-truth pass-throughs from the lowered module.
         # Gate to the AOT/compile context (aliasing_info present) only. In pure
@@ -156,18 +160,40 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
                 if not shapes_match(inputs[param_num], outputs[output_idx]):
                     continue
                 output_to_alias[output_idx] = (param_num, param_idx)
+                mutation_output_indices.add(output_idx)
 
         if not output_to_alias:
             return
 
         # (3) Emit mhlo.input_output_alias from the validated map.
+        #
+        # GATED FIX: an input buffer may be donated to at most ONE output. XLA's
+        # HLO verifier rejects a second alias on the same parameter (RET_CHECK
+        # param_has_seen[parameter_number] == false, at
+        # hlo_input_output_alias_config.cc). This happens when one input feeds two
+        # aliased outputs -- e.g. an in-place-mutated input that AOTAutograd also
+        # returns as a bare pass-through (saved for backward) at a different output.
+        #
+        # When a parameter is claimed by both a mutation and a pass-through, the
+        # MUTATION alias must win: donating the input buffer to the pass-through
+        # output while the mutation's copy-back overwrites that same input would
+        # corrupt the pass-through (e.g. a saved-for-backward tensor). We therefore
+        # emit mutation-sourced outputs first, then skip any later alias on an
+        # already-donated parameter.
         alias_dicts = []
-        for output_idx in sorted(output_to_alias):
+        seen_params: set[int] = set()
+        emit_order = sorted(output_to_alias, key=lambda o: (o not in mutation_output_indices, o))
+        for output_idx in emit_order:
             param_num, param_idx = output_to_alias[output_idx]
+
+            if param_num in seen_params:
+                continue
 
             # StableHLO does not recognize mismatch-shaped alias relationships.
             if not shapes_match(inputs[param_num], outputs[output_idx]):
                 continue
+
+            seen_params.add(param_num)
 
             param_index_attr = mlir_ir.DenseI64ArrayAttr.get(param_idx if param_idx else [])
             param_number_attr = mlir_ir.IntegerAttr.get(

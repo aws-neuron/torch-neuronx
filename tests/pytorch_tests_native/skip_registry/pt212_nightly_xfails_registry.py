@@ -13,51 +13,6 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "[PT2.12] dynamo test_inplace_ops_propagate_requires_grad_metadata: "
-            "gradient-metadata propagation for inplace ops (clamp/clamp_min/clamp_max/"
-            "div/mul/pow/remainder/scatter/scatter_reduce/true_divide) differs from the "
-            "CPU reference on Neuron across bf16/fp16/fp32/fp64."
-        ),
-        tests=[
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_max_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_max_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_max_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_max_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_min_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_min_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_min_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_min_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_clamp_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_remainder_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_remainder_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float64",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "[PT2.12] dynamo autograd-function / tensor-subclass / repro failures on "
             "the Neuron backend."
         ),
