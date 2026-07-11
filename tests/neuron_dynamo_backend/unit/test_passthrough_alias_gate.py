@@ -94,3 +94,83 @@ class TestPassthroughAliasDetectionAndGate:
         stale.add(parameter_number=99, parameter_index=[], output_index=99)
         fxt._set_module_alias(mod, stale)  # must not raise
         assert not _has_alias_attr(mod), "out-of-range alias must be skipped, not emitted"
+
+
+# Same input (arg0) claimed by BOTH a bare pass-through (arg0 returned unchanged
+# at output 0) AND an in-place mutation (its computed value at output 2). The
+# pass-through is deliberately at the LOWER output index so that a naive
+# lowest-index dedup would keep the wrong (pass-through) alias; the mutation must
+# win regardless of output order.
+_MUTATION_VS_PASSTHROUGH_MLIR = """
+module {
+  func.func @main(
+      %arg0: tensor<4xf32>, %arg1: tensor<4xf32>
+  ) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+    return %arg0, %arg1, %0 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+}
+"""
+
+# The same input (arg0) returned as a bare pass-through at TWO outputs (0 and 1).
+_DOUBLE_PASSTHROUGH_MLIR = """
+module {
+  func.func @main(
+      %arg0: tensor<4xf32>, %arg1: tensor<4xf32>
+  ) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %0 = stablehlo.add %arg1, %arg1 : tensor<4xf32>
+    return %arg0, %arg0, %0 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+}
+"""
+
+
+def _emitted_aliases(module):
+    """Return the emitted aliases as a list of (parameter_number, output_index).
+
+    output_index is an int for tuple outputs, or None for the empty (single
+    tensor output) form.
+    """
+    import re
+
+    txt = str(module)
+    pairs = re.findall(
+        r"parameter_number = (\d+) : si64\}, output_index = array<i64:?\s*(\d*)>", txt
+    )
+    return [(int(p), (int(o) if o else None)) for p, o in pairs]
+
+
+class TestAliasParameterDedup:
+    """An input parameter may be donated to at most ONE output (XLA
+    param_has_seen RET_CHECK). These lock the dedup and the mutation-preference."""
+
+    def test_duplicate_passthrough_param_deduped_to_single_alias(self):
+        """One input returned bare at two outputs -> exactly one alias emitted
+        for it (pre-fix emits two -> XLA param_has_seen failure)."""
+        mod = _parse_module(_DOUBLE_PASSTHROUGH_MLIR)
+        fxt._set_module_alias(mod, AliasingInfo())
+        aliases = _emitted_aliases(mod)
+        params = [p for p, _ in aliases]
+        assert params.count(0) == 1, f"input 0 must be donated exactly once, got {aliases}"
+
+    def test_mutation_preferred_over_passthrough_for_same_param(self):
+        """When an input is claimed by both a mutation and a pass-through, the
+        MUTATION alias must survive (donating the input to the pass-through while
+        the mutation copy-back overwrites it would corrupt the pass-through).
+
+        The pass-through is at output 0 and the mutation at output 2, so a naive
+        lowest-index dedup would keep the pass-through -- this asserts the
+        mutation wins regardless of output order."""
+        mod = _parse_module(_MUTATION_VS_PASSTHROUGH_MLIR)
+        info = AliasingInfo()
+        info.add(parameter_number=0, parameter_index=[], output_index=2)  # mutation -> out 2
+        fxt._set_module_alias(mod, info)
+
+        aliases = _emitted_aliases(mod)
+        params = [p for p, _ in aliases]
+        assert params.count(0) == 1, f"input 0 must be donated exactly once, got {aliases}"
+        out_for_param0 = dict(aliases)[0]
+        assert out_for_param0 == 2, (
+            "the mutation alias (output 2) must win over the pass-through (output 0); "
+            f"got {aliases}"
+        )
