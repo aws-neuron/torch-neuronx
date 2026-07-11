@@ -155,7 +155,7 @@ static at::Tensor MakeContiguousViaCPU(const at::Tensor& input) {
 
 InputTransformationResult ProcessInputTransformations(const std::string& op_name,
                                                       const std::vector<torch::Tensor>& inputs,
-                                                      bool has_collectives) {
+                                                      bool fuse_transforms) {
   InputTransformationResult result;
   result.final_inputs.reserve(inputs.size());
   result.kernel_transforms.resize(inputs.size());
@@ -167,12 +167,14 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
     if (!input.is_contiguous()) {
       // TODO: Add timing counter here for prologue perf measurement
       TORCH_NEURONX_DEBUG("Detected non-contiguous input", "op=", op_name, "input_index=", i,
-                          "input_shape=", input.sizes(), "has_collectives=", has_collectives);
+                          "input_shape=", input.sizes(), "fuse_transforms=", fuse_transforms);
 
-      // TODO(apoorvgu): enable prologues for collectives when they lower to StableHLO
-      if (has_collectives) {
-        TORCH_NEURONX_DEBUG("Collective operation: using CPU roundtrip for non-contiguous input",
-                            "op=", op_name, "input_index=", i);
+      if (!fuse_transforms) {
+        // Kernel cannot absorb a prologue merge (e.g. direct-NRT host-CC
+        // collective): materialize a contiguous copy via CPU roundtrip.
+        TORCH_NEURONX_DEBUG(
+            "Prologue fusion disabled: using CPU roundtrip for non-contiguous input",
+            "op=", op_name, "input_index=", i);
 
         auto contiguous_tensor = MakeContiguousViaCPU(input);
         result.final_inputs.push_back(contiguous_tensor);
@@ -217,7 +219,7 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
 // ProcessOutputTransformations — implementation of the function declared in NeuronOpsApi.h
 OutputTransformationResult ProcessOutputTransformations(const std::string& op_name,
                                                         const std::vector<torch::Tensor>& outputs,
-                                                        bool has_collectives) {
+                                                        bool fuse_transforms) {
   OutputTransformationResult result;
   result.final_outputs.reserve(outputs.size());
   result.kernel_transforms.resize(outputs.size());
@@ -225,10 +227,10 @@ OutputTransformationResult ProcessOutputTransformations(const std::string& op_na
   for (size_t i = 0; i < outputs.size(); ++i) {
     const auto& output = outputs[i];
 
-    // Check if output tensor is non-contiguous and epilogue is enabled
-    if (!output.is_contiguous() && IsEpilogueEnabled() && !has_collectives) {
+    // Check if output tensor is non-contiguous and epilogue fusion is allowed
+    if (!output.is_contiguous() && IsEpilogueEnabled() && fuse_transforms) {
       TORCH_NEURONX_DEBUG("Detected non-contiguous output", "op=", op_name, "output_index=", i,
-                          "output_shape=", output.sizes(), "has_collectives=", has_collectives);
+                          "output_shape=", output.sizes(), "fuse_transforms=", fuse_transforms);
 
       // Try to create epilogue (inverse) transformations
       auto epilogue_result = c10_neuron::lazy::Creators::TryCreateEpilogue(output, op_name, i);
@@ -1803,8 +1805,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          py::object stream_obj, const std::string& cache_key, const std::string& python_stack_trace,
          const bool has_collectives, const py::object& cpu_fallback_context = py::none(),
          const std::string& hierarchy_string = "") {
+        // Eager ATen path (collectives never reach it): always fuse. The
+        // has_collectives arg only tags the kernel below; it does not gate fusion.
         auto transform_result =
-            torch_neuronx::ProcessInputTransformations(op_name, inputs, has_collectives);
+            torch_neuronx::ProcessInputTransformations(op_name, inputs, /*fuse_transforms*/ true);
 
         at::neuron::NeuronStream stream;
         if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
@@ -1845,65 +1849,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("inputs"), py::arg("outputs"), py::arg("lowered_ir_bytes"), py::arg("stream"),
       py::arg("cache_key"), py::arg("python_stack_trace"), py::arg("has_collectives"),
       py::arg("cpu_fallback_context") = py::none(), py::arg("hierarchy_string") = "");
-
-  // Submit collective operation for asynchronous execution
-  m.def(
-      "_submit_collective_task_to_pipeline",
-      [](const std::string& op_name, const std::vector<torch::Tensor>& inputs,
-         const std::vector<torch::Tensor>& outputs, int64_t op_type, int64_t reduce_op,
-         const std::vector<std::vector<int>>& replica_groups, py::object stream_obj,
-         const std::string& python_stack_trace,
-         const py::object& cpu_fallback_context = py::none()) {
-        // Process input transformations (has_collectives=true makes non-contiguous inputs
-        // contiguous)
-        auto transform_result =
-            torch_neuronx::ProcessInputTransformations(op_name, inputs, /*has_collectives=*/true);
-
-        // Resolve stream
-        at::neuron::NeuronStream stream;
-        if (!stream_obj.is_none() && THNPStream_Check(stream_obj.ptr())) {
-          stream = THNPStream_Unpack(stream_obj.ptr());
-        } else {
-          stream = at::neuron::getCurrentNeuronStream();
-        }
-
-        // Convert Python CPU fallback context to C++ struct
-        at::neuron::CPUFallbackContext fallback_ctx =
-            at::neuron::utils::ConvertToCPUFallbackContext(cpu_fallback_context);
-
-        int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, outputs);
-
-        // Extract tensor data with contiguity validation
-        auto [input_refs, input_contexts] =
-            torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
-        auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(outputs);
-
-        // Convert c10d::OpType to CollectiveType
-        auto collective_type =
-            torch_neuronx::ConvertOpTypeToCollectiveType(static_cast<c10d::OpType>(op_type));
-
-        // Extract dtype from input tensors
-        TORCH_CHECK(!transform_result.final_inputs.empty(),
-                    "Collective operation requires at least one input tensor");
-        c10::ScalarType dtype = transform_result.final_inputs[0].scalar_type();
-
-        // Create CollectiveDirectKernelExecution with v3 constructor signature
-        auto collective_kernel = std::make_unique<at::neuron::CollectiveDirectKernelExecution>(
-            op_name, collective_type, std::move(input_refs), std::move(output_refs), input_contexts,
-            output_contexts, dtype,
-            c10d::ReduceOp(static_cast<c10d::ReduceOp::RedOpType>(reduce_op)), replica_groups,
-            device_id);
-
-        // Create and submit OperationContext
-        auto context = std::make_unique<at::neuron::OperationContext>(
-            std::move(collective_kernel), python_stack_trace, std::move(fallback_ctx));
-
-        at::neuron::SubmitOperationContext(stream, std::move(context));
-      },
-      "Submit collective operation for asynchronous execution", py::arg("op_name"),
-      py::arg("inputs"), py::arg("outputs"), py::arg("op_type"), py::arg("reduce_op"),
-      py::arg("replica_groups"), py::arg("stream"), py::arg("python_stack_trace"),
-      py::arg("cpu_fallback_context") = py::none());
 
   // torch.compile: compile MLIR to NEFF and store in cache.
   m.def(

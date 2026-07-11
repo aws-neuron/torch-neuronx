@@ -176,25 +176,36 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
       cache_key, lower_callback_, op_type, working_inputs, working_outputs, replica_groups,
       reduce_op, slice_output);
 
-  auto transform_result = torch_neuronx::ProcessInputTransformations(op_str, working_inputs,
-                                                                     /*has_collectives=*/true);
-  int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, working_outputs);
-  auto [input_refs, input_contexts] =
-      torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
+  const bool fuse_input_transforms = torch_neuronx::IsPrologueEnabled();
+  auto transform_result =
+      torch_neuronx::ProcessInputTransformations(op_str, working_inputs, fuse_input_transforms);
 
-  // Swap each non-contiguous output for a contiguous temp the kernel can write into,
-  // tracking which we replaced, so result can be copied back into the caller's tensor.
-  std::vector<bool> output_made_contiguous(working_outputs.size(), false);
-  for (size_t i = 0; i < working_outputs.size(); ++i) {
-    auto& out = working_outputs[i];
-    if (out.defined() && !out.is_contiguous()) {
-      working_outputs[i] = torch::empty(out.sizes().vec(),
-                                        out.options().memory_format(c10::MemoryFormat::Contiguous));
-      output_made_contiguous[i] = true;
+  auto output_transform_result = torch_neuronx::ProcessOutputTransformations(
+      op_str, working_outputs, /*fuse_transforms=*/true);
+
+  // Unlike the eager ATen path, collectives have no AllocateExecutionOutputs
+  // staging buffer — the kernel writes directly into the caller's tensors. When
+  // epilogue is disabled (kill switch), ProcessOutputTransformations passes a
+  // non-contiguous output straight through, which PrepareKernelTensors rejects.
+  // Stage a contiguous temp for any non-epilogue-handled non-contiguous output;
+  // the copy-back loop after submit scatters it into the original tensor.
+  for (size_t i = 0; i < output_transform_result.final_outputs.size(); ++i) {
+    const bool epilogue_handled = (i < output_transform_result.kernel_transforms.size() &&
+                                   !output_transform_result.kernel_transforms[i].empty());
+    auto& final_output = output_transform_result.final_outputs[i];
+    if (!epilogue_handled && final_output.defined() && !final_output.is_contiguous()) {
+      final_output =
+          torch::empty(final_output.sizes().vec(),
+                       final_output.options().memory_format(c10::MemoryFormat::Contiguous));
     }
   }
 
-  auto [output_refs, output_contexts] = torch_neuronx::PrepareKernelTensors(working_outputs);
+  int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs,
+                                                output_transform_result.final_outputs);
+  auto [input_refs, input_contexts] =
+      torch_neuronx::PrepareKernelTensors(transform_result.final_inputs);
+  auto [output_refs, output_contexts] =
+      torch_neuronx::PrepareKernelTensors(output_transform_result.final_outputs);
 
   auto xla_kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
       op_str, std::move(input_refs), std::move(output_refs), input_contexts, output_contexts,
@@ -203,25 +214,43 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
   if (transform_result.has_input_transforms) {
     xla_kernel->SetInputTransformations(std::move(transform_result.kernel_transforms));
   }
+  if (output_transform_result.has_output_transforms) {
+    xla_kernel->SetOutputTransformations(std::move(output_transform_result.kernel_transforms));
+  }
 
   auto context = std::make_unique<at::neuron::OperationContext>(std::move(xla_kernel), "");
   auto stream = at::neuron::getCurrentNeuronStream();
   at::neuron::SubmitOperationContext(stream, std::move(context));
 
-  // Copy results back into the caller's tensor for any output we replaced:
-  // restore original dtype (undo downcast) and/or write the contiguous temp
-  // into the original non-contiguous dst. No-op otherwise.
-  for (size_t i = 0; i < original_outputs.size(); ++i) {
-    auto orig = original_outputs[i];
-    if (!orig.defined()) continue;
-    if (i >= working_outputs.size() || !working_outputs[i].defined()) continue;
-    const bool dtype_changed =
-        outputs_downcasted && orig.scalar_type() != working_outputs[i].scalar_type();
-    const bool layout_changed = output_made_contiguous[i];
-    if (!dtype_changed && !layout_changed) continue;
+  // Epilogue-unsupported / kill-switch fallback: scatter the staged contiguous
+  // output back into the caller's original (non-contiguous) tensor. Skipped when
+  // epilogue fused the inverse transform (kernel writes the base storage the
+  // caller's view aliases) or when the output was already contiguous (data_ptr
+  // identity short-circuits inside CopyBackToOriginal anyway).
+  for (size_t i = 0; i < working_outputs.size() && i < output_transform_result.final_outputs.size();
+       ++i) {
+    const bool epilogue_handled = (i < output_transform_result.kernel_transforms.size() &&
+                                   !output_transform_result.kernel_transforms[i].empty());
+    if (epilogue_handled) continue;
+    if (!working_outputs[i].defined() || !output_transform_result.final_outputs[i].defined())
+      continue;
+    if (output_transform_result.final_outputs[i].data_ptr() == working_outputs[i].data_ptr())
+      continue;
     dispatch::CopyBackToOriginal(
-        orig, working_outputs[i],
-        std::string("SubmitInNeffCollective copy-back idx=") + std::to_string(i));
+        working_outputs[i], output_transform_result.final_outputs[i],
+        std::string("SubmitInNeffCollective epilogue fallback idx=") + std::to_string(i));
+  }
+
+  if (outputs_downcasted) {
+    for (size_t i = 0; i < original_outputs.size(); ++i) {
+      auto orig = original_outputs[i];
+      if (!orig.defined()) continue;
+      if (i >= working_outputs.size() || !working_outputs[i].defined()) continue;
+      if (orig.scalar_type() == working_outputs[i].scalar_type()) continue;
+      dispatch::CopyBackToOriginal(
+          orig, working_outputs[i],
+          std::string("SubmitInNeffCollective upcast idx=") + std::to_string(i));
+    }
   }
 }
 
@@ -239,7 +268,7 @@ void NeuronBackend::SubmitHostCCCollective(c10d::OpType op_type,
 
   const auto& op_str = OpTypeToString(op_type);
   auto transform_result =
-      torch_neuronx::ProcessInputTransformations(op_str, working_inputs, /*has_collectives=*/true);
+      torch_neuronx::ProcessInputTransformations(op_str, working_inputs, /*fuse_transforms=*/false);
   TORCH_CHECK(!transform_result.final_inputs.empty(),
               "Collective operation requires at least one input tensor");
   int device_id = c10_neuron::GetTargetDeviceId(transform_result.final_inputs, working_outputs);

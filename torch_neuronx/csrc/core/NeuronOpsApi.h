@@ -37,20 +37,46 @@ struct InputTransformationResult {
 };
 
 // ═══════════════════════════════════════════════════════════════
+//  IsPrologueEnabled
+//
+//  Check if the prologue optimization is enabled via environment variable.
+//  Cached on first call — env var is read once at startup.
+//  Prologue is enabled by default; only disabled if explicitly set to
+//  "0"/"false". When enabled, non-contiguous input tensors are handled by
+//  fusing a transformation (transpose/slice/...) into the operation MLIR
+//  instead of materializing a contiguous copy via a CPU roundtrip.
+// ═══════════════════════════════════════════════════════════════
+
+inline bool IsPrologueEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_ENABLE_PROLOGUE");
+    return env == nullptr || (std::string(env) != "0" && std::string(env) != "false");
+  }();
+  return enabled;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  ProcessInputTransformations
 //
 //  Walks each input tensor:
 //    - If contiguous → pass through.
-//    - If non-contiguous + collective → make contiguous via NRT strided copy.
-//    - If non-contiguous + non-collective → try lazy transformation; fallback
-//      to NRT strided copy if unsupported.
+//    - If non-contiguous + !fuse_transforms → make contiguous via CPU roundtrip.
+//    - If non-contiguous + fuse_transforms → try lazy transformation; fallback
+//      to CPU roundtrip if unsupported.
+//
+//  `fuse_transforms` gates whether non-contiguous inputs are absorbed into the
+//  operation's MLIR (prologue merge) rather than materialized eagerly. It is
+//  true only for ops whose kernel is an XLACompilableKernelExecution that flows
+//  through the prologue/epilogue merge pass (eager ATen ops and in-NEFF
+//  collectives). Direct-NRT kernels (host-CC collectives) must pass false —
+//  they have no MLIR to merge into.
 //
 //  Defined in NeuronBindings.cpp.
 // ═══════════════════════════════════════════════════════════════
 
 InputTransformationResult ProcessInputTransformations(const std::string& op_name,
                                                       const std::vector<torch::Tensor>& inputs,
-                                                      bool has_collectives);
+                                                      bool fuse_transforms);
 
 // ═══════════════════════════════════════════════════════════════
 //  IsEpilogueEnabled
@@ -89,16 +115,19 @@ struct OutputTransformationResult {
 //  ProcessOutputTransformations
 //
 //  Walks each output tensor:
-//    - If contiguous or epilogue disabled → pass through.
-//    - If non-contiguous + epilogue enabled → try epilogue transformation;
-//      fallback to contiguous temp if unsupported.
+//    - If contiguous, epilogue disabled, or !fuse_transforms → pass through.
+//    - If non-contiguous + epilogue enabled + fuse_transforms → try epilogue
+//      transformation; fallback to contiguous temp if unsupported.
+//
+//  `fuse_transforms` has the same meaning as in ProcessInputTransformations:
+//  true only for kernels that flow through the MLIR epilogue merge pass.
 //
 //  Defined in NeuronBindings.cpp.
 // ═══════════════════════════════════════════════════════════════
 
 OutputTransformationResult ProcessOutputTransformations(const std::string& op_name,
                                                         const std::vector<torch::Tensor>& outputs,
-                                                        bool has_collectives);
+                                                        bool fuse_transforms);
 
 // ═══════════════════════════════════════════════════════════════
 //  PrepareKernelTensors
