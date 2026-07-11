@@ -2,6 +2,7 @@
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 
 namespace torch_neuronx {
@@ -98,12 +99,7 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
   // When prologue is enabled, non-contiguous inputs are handled later by
   // ProcessInputTransformations. When the caller sets skip_contiguous (e.g.
   // aten::contiguous), the kernel handles it itself. Either way, skip here.
-  static const bool prologue_enabled = []() {
-    const char* env = std::getenv("TORCH_NEURONX_ENABLE_PROLOGUE");
-    // Prologue is enabled by default; only disabled if explicitly set to "0"/"false".
-    return env == nullptr || (std::string(env) != "0" && std::string(env) != "false");
-  }();
-  skip_contiguous = skip_contiguous || prologue_enabled;
+  skip_contiguous = skip_contiguous || torch_neuronx::IsPrologueEnabled();
 
   const auto& schema_args = schema.arguments();
 

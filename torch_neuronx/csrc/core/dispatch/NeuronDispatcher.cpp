@@ -2485,15 +2485,20 @@ void NeuronDispatcher::EnqueueXlaOperation(
                                " outputs=", outputs.size(), " neff_key=", neff_cache_key,
                                " has_collectives=", has_collectives, " device_id=", device_id);
 
+  // Eager ATen ops flow through the prologue/epilogue merge pass, so fuse iff
+  // not a collective. has_collectives is effectively always false here (c10d
+  // collectives do not take the ATen dispatch path), so !has_collectives
+  // preserves the pre-existing eager fusion behavior.
+  const bool fuse_transforms = true;
   auto transform_result =
-      torch_neuronx::ProcessInputTransformations(op_name, inputs, has_collectives);
+      torch_neuronx::ProcessInputTransformations(op_name, inputs, fuse_transforms);
 
   // ── Output transformations (epilogue) ──
   // Detects non-contiguous outputs and either:
   //   - Fuses a transpose/scatter into the NEFF (epilogue supported)
   //   - Falls back to a contiguous temp (epilogue unsupported)
   auto output_transform_result =
-      torch_neuronx::ProcessOutputTransformations(op_name, outputs, has_collectives);
+      torch_neuronx::ProcessOutputTransformations(op_name, outputs, fuse_transforms);
 
   // Update caller's outputs for the epilogue-UNSUPPORTED fallback case only.
   // When epilogue is supported (kernel_transforms[i] non-empty): the NEFF writes into the
