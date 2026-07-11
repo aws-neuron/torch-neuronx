@@ -6902,3 +6902,73 @@ class TestUpsampleBilinear2dAADecomposition:
     )
     def test_registered(self, op):
         assert op in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestStackDecompositionE2E:
+    """E2E tests for the internal _stack via torch.compile(backend='neuron').
+
+    aten::_stack ships no meta kernel and reaches the backend as an opaque
+    torch.operator that fails to legalize; it is decomposed to plain
+    torch.stack (which lowers natively). Run through the full interception ->
+    trace -> torch-mlir lowering -> execute path and compared against CPU.
+    """
+
+    def test_registered(self):
+        assert torch.ops.aten._stack.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("dim", [0, 1, -1])
+    def test_stack_e2e(self, dim, dtype):
+        torch.manual_seed(0)
+
+        def fn(a, b, c):
+            return torch.ops.aten._stack.default([a, b, c], dim)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        tensors = [torch.randn(3, 4, dtype=dtype) for _ in range(3)]
+        expected = fn(*tensors)
+        result = compiled_fn(*(t.to("neuron") for t in tensors))
+        torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestRangeDecompositionE2E:
+    """E2E tests for torch.range via torch.compile(backend='neuron').
+
+    aten::range reaches the backend as an opaque torch.operator that fails to
+    legalize, while arange lowers natively. range is *inclusive* of end, so it
+    is decomposed to an arange-based formula with floor((end-start)/step)+1
+    elements. The .out overload routes here via functionalization.
+    """
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.range.default,
+            torch.ops.aten.range.step,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "start,end,step",
+        [
+            (0, 127, 1),  # registry default
+            (1, 5, 1),  # inclusive end
+            (0, 10, 2),  # non-unit step
+            (5, 0, -1),  # negative step
+        ],
+    )
+    def test_range_e2e(self, start, end, step, dtype):
+        # Pass the scalar bounds as args to the compiled fn (mirrors the coverage
+        # harness); range builds its output on the same device as the trace.
+        def fn(s, e, st):
+            return torch.range(s, e, st, dtype=dtype)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        expected = fn(start, end, step)
+        result = compiled_fn(start, end, step)
+        torch.testing.assert_close(result.cpu(), expected)
