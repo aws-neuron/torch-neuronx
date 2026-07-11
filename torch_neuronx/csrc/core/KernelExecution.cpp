@@ -23,7 +23,7 @@ namespace at::neuron {
 
 // CompilableKernelExecution implementation
 
-bool CompilableKernelExecution::ValidateImpl() const { return !cache_key_.IsEmpty(); }
+bool CompilableKernelExecution::ValidateImpl() const { return !compile_key_.IsEmpty(); }
 
 // XLACompilableKernelExecution implementation
 
@@ -100,8 +100,8 @@ std::vector<uint8_t> XLACompilableKernelExecution::CompileToNeff() const {
                              .logical_neuron_cores = utils::GetLogicalNeuronCores(),
                              .optimization_level = GetOptimizationLevel(),
                              .additional_args = GetAdditionalArgs()};
-    return NeuronCompiler::CompileHloToNeff(hlo_bytes_, config, ir_type, GetOpName(), GetCacheKey(),
-                                            "XLACompilableKernelExecution");
+    return NeuronCompiler::CompileHloToNeff(hlo_bytes_, config, ir_type, GetOpName(),
+                                            GetCompileKey(), "XLACompilableKernelExecution");
   } catch (const std::exception& e) {
     throw std::runtime_error("HLO to NEFF compilation failed for op '" + GetOpName() +
                              "': " + e.what());
@@ -158,7 +158,7 @@ std::vector<uint8_t> CompileOnlyKernelExecution::CompileToNeff() const {
                              .optimization_level = GetOptimizationLevel(),
                              .additional_args = GetAdditionalArgs()};
     return NeuronCompiler::CompileHloToNeff(mlir_bytes_, config, "StableHLO", "torch_compile",
-                                            GetCacheKey(), "CompileOnlyKernelExecution");
+                                            GetCompileKey(), "CompileOnlyKernelExecution");
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string(use_tensorizer_ ? "Linalg" : "StableHLO") +
                              " to NEFF compilation failed: " + std::string(e.what()));

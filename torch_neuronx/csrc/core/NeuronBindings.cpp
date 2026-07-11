@@ -1915,7 +1915,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
         auto compile_kernel = std::make_unique<at::neuron::CompileOnlyKernelExecution>(
             base_cache_key, mlir_vec, has_collectives, use_tensorizer);
-        std::string cache_key = compile_kernel->GetCacheKey();
+        std::string cache_key = compile_kernel->GetCompileKey();
 
         auto context =
             std::make_unique<at::neuron::OperationContext>(std::move(compile_kernel), "");

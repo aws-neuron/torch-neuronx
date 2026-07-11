@@ -49,7 +49,7 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     // Return dummy NEFF data based on cache key for uniqueness
     std::vector<uint8_t> neff_data;
-    std::string neff_content = "NEFF_" + GetCacheKey() + "_" + GetAdditionalArgs();
+    std::string neff_content = "NEFF_" + GetCompileKey() + "_" + GetAdditionalArgs();
     neff_data.assign(neff_content.begin(), neff_content.end());
     return neff_data;
   }
@@ -1705,7 +1705,7 @@ TEST_F(CompilationCacheTest, FileLockWithSlowCompilation) {
       // Simulate long compilation (200ms)
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       std::vector<uint8_t> neff_data;
-      std::string content = "SLOW_NEFF_" + GetCacheKey();
+      std::string content = "SLOW_NEFF_" + GetCompileKey();
       neff_data.assign(content.begin(), content.end());
       return neff_data;
     }
@@ -1812,7 +1812,7 @@ TEST_F(CompilationCacheTest, FileLocksReadFromCacheAfterFirstCompile) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       done_flag_ = true;
       std::vector<uint8_t> neff_data;
-      std::string content = "FIRST_COMPILE_" + GetCacheKey();
+      std::string content = "FIRST_COMPILE_" + GetCompileKey();
       neff_data.assign(content.begin(), content.end());
       return neff_data;
     }
@@ -2331,7 +2331,7 @@ class NoHloKernelExecution : public CompilableKernelExecution {
 
   std::vector<uint8_t> CompileToNeff() const override {
     GetCompileCounter()++;
-    std::string neff_content = "NEFF_NO_HLO_" + GetCacheKey();
+    std::string neff_content = "NEFF_NO_HLO_" + GetCompileKey();
     return std::vector<uint8_t>(neff_content.begin(), neff_content.end());
   }
 
