@@ -54,6 +54,8 @@ from internal.roofline import compute_roofline
 
 logger = logging.getLogger(__name__)
 
+_USE_DYNAMIC = os.environ.get("NEURON_COMPILE_COVERAGE_DYNAMIC") == "1"
+
 NUM_EXEC_ITERATIONS = 3
 METRICS_DIR = (
     Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
@@ -242,7 +244,7 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         return op(*args, **kwargs)
 
     try:
-        compiled_fn = torch.compile(op_fn, backend="neuron", fullgraph=True)
+        compiled_fn = torch.compile(op_fn, backend="neuron", fullgraph=True, dynamic=_USE_DYNAMIC)
     except Exception as e:
         out["error"] = f"compile failed: {str(e)[:ERROR_MAXLEN]}"
         out["status"] = "failed_lowering"

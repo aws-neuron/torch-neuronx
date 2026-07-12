@@ -104,6 +104,30 @@ def pytest_addoption(parser):
             "tractable. Pass 0 (or a negative value) to disable the cap."
         ),
     )
+    parser.addoption(
+        "--dynamic",
+        action="store_true",
+        default=False,
+        help="Enable dynamic shapes (pass dynamic=True to torch.compile)",
+    )
+    parser.addoption(
+        "--stablehlo-executor",
+        action="store_true",
+        default=False,
+        help="Use the StableHLO executor backend for torch.compile",
+    )
+    parser.addoption(
+        "--hilo-infergoldens",
+        action="store_true",
+        default=False,
+        help="Use the hilo frontend + XLAInferGoldens executor (requires neuronx-cc)",
+    )
+    parser.addoption(
+        "--preserve-hilo-workdir",
+        action="store_true",
+        default=False,
+        help="Preserve the neuronx-cc working directory for hilo/XLAInferGoldens runs",
+    )
 
 
 def pytest_configure(config):
@@ -115,6 +139,19 @@ def pytest_configure(config):
     os.environ["NEURON_MAX_SHAPES_PER_OP"] = str(
         config.getoption("--max-shapes-per-op", default=10)
     )
+    if config.getoption("--hilo-infergoldens", default=False):
+        os.environ["TORCH_NEURONX_DYNAMO_HILO_INFERGOLDENS"] = "1"
+        os.environ.pop("TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR", None)
+    elif config.getoption("--stablehlo-executor", default=False):
+        os.environ["TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR"] = "1"
+        os.environ.pop("TORCH_NEURONX_DYNAMO_HILO_INFERGOLDENS", None)
+    else:
+        os.environ.pop("TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR", None)
+        os.environ.pop("TORCH_NEURONX_DYNAMO_HILO_INFERGOLDENS", None)
+    if config.getoption("--preserve-hilo-workdir", default=False):
+        os.environ["TORCH_NEURONX_PRESERVE_HILO_WORKDIR"] = "1"
+    if config.getoption("--dynamic", default=False):
+        os.environ["NEURON_COMPILE_COVERAGE_DYNAMIC"] = "1"
 
 
 def pytest_sessionstart(session):
