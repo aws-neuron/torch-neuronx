@@ -27,11 +27,13 @@ from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeli
     post_aot_processing,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.preprocessing_pipeline import preprocess_graph
+from torch_neuronx.neuron_dynamo_backend.hilo_infergoldens_executor import HiloInferGoldensExecutor
 from torch_neuronx.neuron_dynamo_backend.metrics import (
     NeuronCompilationMetrics,
     record_compilation,
 )
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+from torch_neuronx.neuron_dynamo_backend.stablehlo_executor import StableHLOInterpreterExecutor
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     ShardInputInfo,
@@ -255,6 +257,27 @@ def neuron_backend_fx_compiler(
                 return _make_fallback_fn(
                     gm, shard_input_info, removed_device_mesh_indices, none_output_info
                 )
+
+            if os.environ.get("TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR") == "1":
+                logger.debug("Bypassing compilation -> returning stablehlo executor")
+                executor = StableHLOInterpreterExecutor(stablehlo_mlir, io_spec, cast_spec)
+
+                def interp_wrapper(inputs):
+                    return executor(inputs)
+
+                interp_wrapper._boxed_call = True
+                return interp_wrapper
+
+            if os.environ.get("TORCH_NEURONX_DYNAMO_HILO_INFERGOLDENS") == "1":
+                logger.debug("Bypassing compilation -> returning hilo infergoldens executor")
+                executor = HiloInferGoldensExecutor(stablehlo_mlir, io_spec, cast_spec)
+
+                def hilo_ig_wrapper(inputs):
+                    return executor(inputs)
+
+                hilo_ig_wrapper._boxed_call = True
+                return hilo_ig_wrapper
+
             use_tensorizer_backend = (
                 options.get("use_tensorizer_backend", False) if options else False
             )
