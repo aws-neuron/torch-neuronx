@@ -816,6 +816,87 @@ class TestNKIMutationDetection:
 
         assert_alias_count(aliasing_info.aliases, 0)
 
+    def test_nki_alias_with_interleaved_scalar_args(self, run_aliasing_analysis):
+        """operand_output_aliases keys index the TENSOR-ONLY operand list.
+
+        Uses the real decode signature: operand_output_aliases = {6: 1, 7: 2}.
+        The decode attention kernel aliases tensor operands 6 and 7 (K, V cache).
+        nki_hop may populate kwargs["args"] with non-tensor constants interleaved
+        (the raw arg tuple, on cached dispatches), so the two KV tensors sit at
+        raw positions 9 and 10 but tensor positions 6 and 7. Indexing the raw
+        tuple by 6/7 would land on the wrong (non-KV) operands and miss the KV
+        mutation -- the OOM bug. Resolving against the tensor-filtered operands
+        must recover exactly the two KV placeholders.
+
+        Note operand_output_aliases *values* (1, 2) are the kernel's internal
+        output ids; the pass renumbers post-AOT outputs from the sorted mutated
+        input indices, so the aliases are (param=6, out=0) and (param=7, out=1).
+        """
+        from torch_neuronx.nki_hop import nki_kernel_wrapper
+
+        graph = torch.fx.Graph()
+        # 8 tensor placeholders; the last two are the K/V caches (operands 6, 7).
+        tensors = []
+        for i in range(6):
+            t = graph.placeholder(f"t{i}")
+            t.meta["example_value"] = torch.empty(4, 8, dtype=torch.bfloat16)
+            tensors.append(t)
+        k_cache = graph.placeholder("L_self_buffers_k_cache_")
+        k_cache.meta["example_value"] = torch.empty(4, 8, dtype=torch.bfloat16)
+        v_cache = graph.placeholder("L_self_buffers_v_cache_")
+        v_cache.meta["example_value"] = torch.empty(4, 8, dtype=torch.bfloat16)
+
+        kernel = graph.call_function(
+            nki_kernel_wrapper,
+            args=(),
+            kwargs={
+                "kernel_idx": 0,
+                "grid": (1,),
+                "backend_config": "",
+                "operand_output_aliases": {6: 1, 7: 2},
+                # scalars interleaved so raw index != tensor index; K/V are the
+                # 7th and 8th *tensor* operands but sit later in the raw tuple.
+                "args": (
+                    1.0,
+                    tensors[0],
+                    tensors[1],
+                    8,
+                    tensors[2],
+                    tensors[3],
+                    tensors[4],
+                    tensors[5],
+                    0.5,
+                    k_cache,
+                    v_cache,
+                ),
+                "arg_names": [
+                    "scale",
+                    "t0",
+                    "t1",
+                    "block_size",
+                    "t2",
+                    "t3",
+                    "t4",
+                    "t5",
+                    "softmax_scale",
+                    "k_cache",
+                    "v_cache",
+                ],
+                "constant_args_key": -1,
+            },
+        )
+        kernel.meta["example_value"] = torch.empty(4, 8, dtype=torch.bfloat16)
+        graph.output((kernel,))
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        aliasing_info = run_aliasing_analysis(gm)
+
+        # Exactly the two KV placeholders (indices 6, 7), renumbered to outputs
+        # 0, 1 in mutated-input order.
+        assert_alias_count(aliasing_info, 2)
+        assert_alias_exists(aliasing_info.aliases[0], param_num=6, param_idx=[], output_idx=0)
+        assert_alias_exists(aliasing_info.aliases[1], param_num=7, param_idx=[], output_idx=1)
+
 
 class TestDunderMethodDetection:
     """Tests that dunder methods are not classified as in-place mutations.
