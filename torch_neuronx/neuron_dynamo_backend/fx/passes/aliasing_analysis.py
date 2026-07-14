@@ -302,23 +302,24 @@ class AliasingAnalysis(NeuronFXPass):
     ) -> list[int]:
         """Return input placeholder indices mutated by an NKI kernel HOP.
 
-        Reads node.kwargs["operand_output_aliases"] — a dict of the form
-        {kernel_operand_idx: kernel_output_idx} — and traces each aliased
-        operand back through the alias chain to the root input placeholder.
+        Reads node.kwargs["operand_output_aliases"] {tensor_operand_idx:
+        output_idx} and traces each aliased operand back to its root placeholder.
+        The keys index the tensor-only operand list, so filter kwargs["args"] to
+        tensors before indexing (kwargs["args"] may carry interleaved non-tensor
+        constants on cached dispatches).
         """
         operand_output_aliases: dict[int, int] = node.kwargs.get("operand_output_aliases", {})
         if "args" not in node.kwargs:
             logger.warning("NKI HOP %s: no 'args' kwarg, skipping", node.name)
             return []
         kernel_args = node.kwargs["args"]
+        kernel_tensor_args = [arg for arg in kernel_args if isinstance(arg, Node)]
         mutated: list[int] = []
 
         for input_tensor_idx in operand_output_aliases:
-            if input_tensor_idx >= len(kernel_args):
+            if input_tensor_idx >= len(kernel_tensor_args):
                 continue
-            kernel_arg_node = kernel_args[input_tensor_idx]
-            if not isinstance(kernel_arg_node, Node):
-                continue
+            kernel_arg_node = kernel_tensor_args[input_tensor_idx]
             root_input = self._find_root_input(kernel_arg_node, alias_chain, input_nodes)
             if root_input is not None and root_input in input_nodes:
                 placeholder_idx = input_nodes_list.index(root_input)
