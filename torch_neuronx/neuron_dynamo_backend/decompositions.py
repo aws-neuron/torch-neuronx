@@ -185,6 +185,7 @@ neuron_decompositions = get_decompositions(
         # instead of being registered here.
         aten.upsample_nearest2d,
         aten.upsample_bicubic2d,
+        aten._upsample_nearest_exact2d,
     ]
 )
 

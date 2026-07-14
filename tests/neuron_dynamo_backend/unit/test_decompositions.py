@@ -113,6 +113,8 @@ class TestDecompositionTable:
             torch.ops.aten.upsample_nearest2d.default,
             torch.ops.aten.upsample_nearest2d.vec,
             torch.ops.aten.upsample_bicubic2d.default,
+            torch.ops.aten._upsample_nearest_exact2d.default,
+            torch.ops.aten._upsample_nearest_exact2d.vec,
         ],
     )
     def test_pytorch_builtin_decompositions_registered(self, op):
@@ -6766,6 +6768,33 @@ class TestUpsampleNearest2dBackwardDecomposition:
             torch.ops.aten.upsample_nearest2d_backward.default
             in decompositions.neuron_decompositions
         )
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestUpsampleNearestExact2dDecompositionE2E:
+    """E2E tests for _upsample_nearest_exact2d decomposition via torch.compile."""
+
+    @pytest.mark.parametrize(
+        "input_size,output_size",
+        [
+            ([2, 3, 4, 4], [8, 8]),
+            ([1, 2, 5, 3], [10, 9]),
+            ([2, 3, 8, 8], [4, 4]),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_e2e(self, input_size, output_size, dtype):
+        torch.manual_seed(42)
+        torch._dynamo.reset()
+        x_cpu = torch.randn(*input_size, dtype=dtype)
+
+        def fn(x):
+            return torch.ops.aten._upsample_nearest_exact2d.default(x, output_size, None, None)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled_fn(x_cpu.to("neuron"))
+        expected = fn(x_cpu)
+        torch.testing.assert_close(result.cpu(), expected)
 
 
 class TestUpsampleLinearFamilyDecomposition:
