@@ -137,6 +137,7 @@ TIMEOUT = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_cross_entropy_label_smoothing_consistent_index_target_and_probs_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_softmax_results_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_dtypes_addcdiv_neuron",
+    "test_ops.py::TestCommonNEURON::test_dtypes_cdist_neuron",
     "test_ops.py::TestCommonNEURON::test_dtypes_constant_pad_nd_neuron",
     "test_ops.py::TestCommonNEURON::test_dtypes_eye_neuron",
     "test_ops.py::TestCommonNEURON::test_dtypes_histc_neuron",

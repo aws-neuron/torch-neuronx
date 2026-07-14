@@ -284,3 +284,41 @@ def torch_std_mean_correction(
 @register_aten("aten::value_selecting_reduction_backward", static_argnums=(1, 3, 4))
 def torch_value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
     return torch.ops.aten.value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim)
+
+
+def _cdist_decompose(x1, x2, p):
+    """Compute cdist by an explicit pairwise reduction, shape (*batch, P, R).
+
+    x1 is (*batch1, P, M), x2 is (*batch2, R, M); batch dims broadcast. Batch
+    shapes are static at trace time, so torch broadcasting resolves differing
+    ranks / size-1 batch dims here -- this deliberately avoids torch-mlir's
+    _cdist_forward lowering, which marks differing-rank or broadcast batch dims
+    illegal, and also fixes p=0 / p=inf, whose generic ^(1/p) path degenerates
+    to wrong results.
+    """
+    ad = (x1.unsqueeze(-2) - x2.unsqueeze(-3)).abs()  # (*batch, P, R, M)
+    if p == 0:
+        return (ad != 0).to(x1.dtype).sum(-1)
+    if p == float("inf"):
+        return ad.amax(-1)
+    if p == 1:
+        return ad.sum(-1)
+    if p == 2:
+        return (ad * ad).sum(-1).sqrt()
+    return ad.pow(p).sum(-1).pow(1.0 / p)
+
+
+@register_aten(
+    ["aten::_cdist_forward", "aten::_cdist_forward.out"],
+    output_params=("out",),
+    static_argnums=(2, 3),
+)
+def torch_cdist_forward(x1, x2, p, compute_mode=None, out=None):
+    # torch-mlir marks differing-rank / broadcast batch dims illegal, and the
+    # generic path degenerates for p=0 (^inf) and p=inf (^0 == 1) -> wrong
+    # results. Decompose those cases explicitly; otherwise use the native op
+    # (which has a fast matmul path for p=2 via compute_mode). Shapes/p static.
+    needs_broadcast = x1.shape[:-2] != x2.shape[:-2]
+    if p == 0 or p == float("inf") or needs_broadcast:
+        return _cdist_decompose(x1, x2, p)
+    return torch.ops.aten._cdist_forward(x1, x2, p, compute_mode)
