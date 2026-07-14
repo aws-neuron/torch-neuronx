@@ -7001,3 +7001,72 @@ class TestRangeDecompositionE2E:
         expected = fn(start, end, step)
         result = compiled_fn(start, end, step)
         torch.testing.assert_close(result.cpu(), expected)
+
+
+class TestNativeDropoutDecompositionRNGRouting:
+    """native_dropout decomposition (torch.compile path) RNG routing.
+
+    Device-independent: patches the module-level RNG hook so we can assert the
+    stochastic path routes to the on-device RNG kernel (rand) while the
+    p=0/p=1/eval paths never touch RNG.
+    """
+
+    def test_stochastic_path_uses_rand(self):
+        """train + 0<p<1 must call the on-device RNG (rand)."""
+        x = torch.ones(4, 8)
+        # rand returns uniform [0,1); return >keep_prob so mask is all False.
+        fake_rand = MagicMock(return_value=torch.full((4, 8), 0.99))
+        with (
+            patch.object(decompositions, "_has_nki_rng", True),
+            patch.object(decompositions, "rand", fake_rand),
+        ):
+            y, mask = decompositions.native_dropout_decomposition(x, p=0.5, train=True)
+        fake_rand.assert_called_once()
+        # Called with (input, list(shape)).
+        args = fake_rand.call_args.args
+        assert args[0] is x
+        assert list(args[1]) == [4, 8]
+        assert mask.shape == x.shape and mask.dtype == torch.bool
+
+    def test_no_rng_when_not_training(self):
+        """eval mode: mask all True, no RNG call."""
+        x = torch.randn(4, 8)
+        fake_rand = MagicMock()
+        with (
+            patch.object(decompositions, "_has_nki_rng", True),
+            patch.object(decompositions, "rand", fake_rand),
+        ):
+            y, mask = decompositions.native_dropout_decomposition(x, p=0.5, train=False)
+        fake_rand.assert_not_called()
+        assert torch.all(mask)
+        torch.testing.assert_close(y, x)
+
+    @pytest.mark.parametrize("p", [0.0, 1.0])
+    def test_no_rng_for_degenerate_p(self, p):
+        """p=0 (keep all) and p=1 (drop all) short-circuit without RNG."""
+        x = torch.randn(4, 8)
+        fake_rand = MagicMock()
+        with (
+            patch.object(decompositions, "_has_nki_rng", True),
+            patch.object(decompositions, "rand", fake_rand),
+        ):
+            y, mask = decompositions.native_dropout_decomposition(x, p=p, train=True)
+        fake_rand.assert_not_called()
+        if p == 0.0:
+            assert torch.all(mask)
+            torch.testing.assert_close(y, x)
+        else:
+            assert not torch.any(mask)
+            torch.testing.assert_close(y, torch.zeros_like(x))
+
+    def test_cpu_fallback_when_no_nki_rng(self):
+        """Without NKI RNG, uses torch.rand and never calls the on-device rand."""
+        x = torch.ones(4, 8)
+        fake_rand = MagicMock()
+        with (
+            patch.object(decompositions, "_has_nki_rng", False),
+            patch.object(decompositions, "rand", fake_rand),
+        ):
+            _, mask = decompositions.native_dropout_decomposition(x, p=0.5, train=True)
+        fake_rand.assert_not_called()
+        assert mask.shape == x.shape and mask.dtype == torch.bool

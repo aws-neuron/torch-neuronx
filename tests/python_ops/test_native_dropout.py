@@ -265,65 +265,41 @@ class TestNativeDropout:
 
         assert_op_runs_on_neuron("aten::native_dropout")
 
-    def test_native_dropout_stream_consistency(self):
-        """Test consistency for native_dropout between different call patterns."""
+    def test_native_dropout_same_seed_same_shape_reproducible(self):
+        """Same seed + same shape reproduces the same dropout mask.
+
+        The fast multi-lane RNG kernel does not guarantee a layout-independent
+        stream (the value->position mapping depends on shape/tiling), but it is
+        deterministic for a fixed shape+seed. Dropout only requires a correct
+        random distribution, so this is the reproducibility guarantee that
+        actually matters: re-seeding and repeating the identical call yields the
+        identical result.
+        """
         device = "neuron"
         p = 0.5
         train = True
+        base_input = torch.ones((5, 10), device=device)
 
-        # Create deterministic input tensors
-        input_shape = (5, 10)
-        base_input = torch.ones(input_shape, device=device)
-
-        # Experiment 1: Three separate native_dropout calls with 5x10 tensors each
         torch.manual_seed(42)
         with track_neuron_ops():
-            # Make three separate calls
-            result1_a = functional.dropout(base_input.clone(), p, train)
-            result1_b = functional.dropout(base_input.clone(), p, train)
-            result1_c = functional.dropout(base_input.clone(), p, train)
-
-            # Concatenate masks from experiment 1
-            experiment1_results = torch.cat(
-                [result1_a.flatten(), result1_b.flatten(), result1_c.flatten()]
-            )
-
-            # Experiment 2: Two native_dropout calls - one with 10x10, one with 5x10
-            torch.manual_seed(42)
-
-            # First call with double-sized tensor (10x10)
-            double_input = torch.ones((10, 10), device=device)
-            result2_a = functional.dropout(double_input, p, train)
-
-            # Second call with normal-sized tensor (5x10)
-            result2_b = functional.dropout(base_input.clone(), p, train)
-
-            # Concatenate masks from experiment 2
-            experiment2_results = torch.cat([result2_a.flatten(), result2_b.flatten()])
-
-            # Verify both experiments have same total number of elements
-            assert (
-                experiment1_results.numel() == experiment2_results.numel()
-            ), f"count mismatch: {experiment1_results.numel()} vs {experiment2_results.numel()}"
-
-            # Count differences in dropout patterns
-            differences = (experiment1_results != experiment2_results).sum().item()
-            assert not differences, f"differences: {differences} found in dropout patterns"
-
-            total_elements = experiment1_results.numel()
-            assert (
-                total_elements == 150
-            ), f"total elements: {total_elements} does not match expected"
-
-            are_identical = torch.equal(experiment1_results, experiment2_results)
-            assert are_identical, (
-                f"PRNG behavior inconsistency detected! "
-                f"The same seed produced different random sequences when calls were batched"
-                f" differently. Found {differences} differences out of {total_elements} elements "
-                f"({100 * differences / total_elements:.2f}%)."
-            )
-
+            first = functional.dropout(base_input.clone(), p, train)
             assert_op_runs_on_neuron("aten::native_dropout")
+
+        torch.manual_seed(42)
+        with track_neuron_ops():
+            second = functional.dropout(base_input.clone(), p, train)
+
+        # Identical seed + identical shape -> identical mask.
+        assert torch.equal(first, second), (
+            "Same seed + same shape must reproduce the same dropout result "
+            "(fast kernel is deterministic for a fixed layout)."
+        )
+
+        # And the distribution is correct: keep-rate ~ (1 - p).
+        keep_frac = (first.cpu() != 0).float().mean().item()
+        assert (
+            abs(keep_frac - (1.0 - p)) < 0.15
+        ), f"keep fraction {keep_frac:.3f} too far from {1.0 - p} on a small tensor"
 
     @pytest.mark.parametrize("shape", [(4, 8), (2, 3, 4)])
     def test_native_dropout_out_variant(self, shape):
@@ -340,3 +316,36 @@ class TestNativeDropout:
         # p=0.0 means no dropout — output equals input, mask all True
         torch.testing.assert_close(out0.cpu(), x_cpu)
         assert torch.all(out1.cpu())
+
+    def test_fast_rng_lanes_are_independent(self):
+        """Fast multi-lane RNG must seed each of the 128 GPSIMD lanes distinctly.
+
+        Regression guard for the per-lane seeding in generate_random_fast: if all
+        lanes shared one seed they would emit identical streams, producing a
+        period-128 repeating dropout mask. We check that elements 128 apart agree
+        only at chance level (~p^2+(1-p)^2), not ~1.0 (which would indicate
+        identical lanes).
+        """
+        device = "neuron"
+        p = 0.5
+        # Large, flat tensor so lane interleaving spans many 128-element groups.
+        x = torch.ones(1, 4096, 1024, device=device)
+
+        torch.manual_seed(0)
+        with track_neuron_ops():
+            mask = functional.dropout(x, p, training=True)
+            assert_op_runs_on_neuron("aten::native_dropout")
+
+        kept = (mask.cpu().flatten() != 0).float()
+        # Agreement between lane i and lane i+1 across the partition stride.
+        agree = (kept[0::128] == kept[1::128]).float().mean().item()
+        chance = p * p + (1.0 - p) * (1.0 - p)  # ~0.5 for p=0.5
+        assert abs(agree - chance) < 0.05, (
+            f"lane0 vs lane1 agreement {agree:.3f} should be ~{chance:.3f} (chance level). "
+            f"A value near 1.0 means the 128 lanes are NOT independently seeded."
+        )
+        # Overall keep fraction should still match (1 - p).
+        keep_frac = kept.mean().item()
+        assert (
+            abs(keep_frac - (1.0 - p)) < 0.02
+        ), f"keep fraction {keep_frac:.3f} too far from {1.0 - p}"
