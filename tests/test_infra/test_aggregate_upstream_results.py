@@ -649,11 +649,10 @@ def test_get_run_metadata_defaults_to_unknown_outside_ci(monkeypatch):
 def test_classify_workflow_type():
     """Each known GitHub workflow name maps to its dashboard enum (by what the
     workflow DOES); unknown names slugify; empty/symbol-only names → 'unknown'."""
-    # Known callers — note pre/post-merge map by behavior, not by literal name:
+    # Known callers — note pre-merge maps by behavior, not by literal name:
     assert _classify_workflow_type("Nightly Wheel Build") == "nightly"
     assert _classify_workflow_type("Dependency Guard") == "dependency_guard"
     assert _classify_workflow_type("Merge Queue Checks") == "pre_merge"
-    assert _classify_workflow_type("Post-Merge Tests") == "post_merge"
     assert _classify_workflow_type("Release Wheel Vetting") == "release_vetting"
     # Unknown caller → slug fallback (collapse non-alphanumerics, trim):
     assert _classify_workflow_type("Some New Flow!") == "some_new_flow"

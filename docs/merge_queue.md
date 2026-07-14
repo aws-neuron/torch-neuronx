@@ -109,7 +109,7 @@ groups never batch multiple PRs. Only non-failing PRs are merged.
 
 ## The reusable suite (`_upstream-tests.yml`)
 
-The smoke run reuses the same workflow that nightly / post-merge use, just with
+The smoke run reuses the same workflow that nightly uses, just with
 a smaller dist-config and a failure-count gate. Its internal job graph:
 
 ```

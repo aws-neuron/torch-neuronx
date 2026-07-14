@@ -114,14 +114,10 @@ def _soft_fail_labels(config_path: Path | None = None) -> set[str]:
 # Enum is by what each workflow DOES, not its GitHub name:
 #   - "Merge Queue Checks" (merge-queue.yml, pull_request/merge_group) gates PRs
 #     BEFORE merge -> "pre_merge".
-#   - "Post-Merge Tests" (merge.yml, push to main) runs AFTER merge -> "post_merge".
-# Both run today on purpose: post-merge is a safety net kept until the upstream suite
-# stabilizes (<5% error), after which it is deprecated and PRs gate on pre-merge only.
 _WORKFLOW_TYPE_BY_NAME = {
     "Nightly Wheel Build": "nightly",
     "Dependency Guard": "dependency_guard",
     "Merge Queue Checks": "pre_merge",
-    "Post-Merge Tests": "post_merge",
     "Release Wheel Vetting": "release_vetting",
 }
 
