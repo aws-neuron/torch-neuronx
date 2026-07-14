@@ -95,7 +95,7 @@ though `from torch_mlir import fx` works.
   → torch layer → wheel → promote to stable.
 - `_block-perf.yml`: reusable block + collective perf; **MFU golden thresholds
   enforced on PRs (baseline × 0.9), not nightly.**
-- Adding a CI job: add to `pull.yml`/`merge.yml`, use the
+- Adding a CI job: add to `pull.yml`, use the
   `./.github/actions/run-test-suite` composite action; runner labels include
   `neuron.internal_compute:trn2.48xlarge`.
 

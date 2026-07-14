@@ -577,7 +577,7 @@ def test_test_aggregated_metadata_columns_propagate(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_SHA", "deadbeef")
     monkeypatch.setenv("GITHUB_REF_NAME", "release/2.11")
     monkeypatch.setenv("GITHUB_RUN_ID", "9876")
-    monkeypatch.setenv("GITHUB_WORKFLOW", "Post-Merge Tests")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Merge Queue Checks")
     monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
 
     rows = [_row("test_ops.py::T::a", "passed")]
@@ -589,8 +589,8 @@ def test_test_aggregated_metadata_columns_propagate(tmp_path, monkeypatch):
     assert row["branch"] == "release/2.11"
     assert row["run_id"] == "9876"
     # workflow_type is stamped on every aggregated row (mapped from GITHUB_WORKFLOW).
-    # "Post-Merge Tests" (push to main) maps to post_merge.
-    assert row["workflow_type"] == "post_merge"
+    # "Merge Queue Checks" (PR gating) maps to pre_merge.
+    assert row["workflow_type"] == "pre_merge"
 
 
 def test_test_aggregated_rows_sorted_by_component_then_test_id(tmp_path, monkeypatch):
