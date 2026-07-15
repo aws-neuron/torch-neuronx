@@ -1,6 +1,7 @@
 """
 Converts PyTorch's _c10d_functional collective operations
-(all_reduce, all_gather, reduce_scatter, all_to_all) to a format compatible with StableHLO.
+(all_reduce, all_gather, reduce_scatter, all_to_all, broadcast) to a format
+compatible with StableHLO.
 By re-writing "group name" argument from the process group identifier (e.g '1') to
 explicit list of participating ranks (e.g '[[0, 1], [2, 3]]').
 
@@ -25,12 +26,14 @@ logger = logging.getLogger(__name__)
 # e.g:
 #   all_reduce(tensor, reduce_op, group) -> 2
 #   reduce_scatter_tensor(tensor, reduce_op, scatter_dim, group) -> 3
+#   broadcast(tensor, src, group) -> 2
 _COLLECTIVE_OPS_GROUP_INDEX = {
     "_c10d_functional.all_reduce.default": 2,
     "_c10d_functional.all_gather_into_tensor.default": 2,
     "_c10d_functional.reduce_scatter_tensor.default": 3,
     "_c10d_functional.all_to_all_single.default": 3,
     "_dtensor.shard_dim_alltoall.default": 3,
+    "_c10d_functional.broadcast.default": 2,
 }
 
 
@@ -81,9 +84,8 @@ class CollectiveLegalization(NeuronFXPass):
         opcode         name         target                                args
         -------------  -----------  ------------------------------------  ---------------------------
         call_function  all_reduce   _c10d_functional.all_reduce.default   (arg0_1, 'sum', '[[0, 1]]')
-    """  # noqa: E501
 
-    # TODO: Support `broadcast`.
+    """  # noqa: E501
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
         modified = False
