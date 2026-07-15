@@ -36,7 +36,7 @@ if _has_nki_nonzero:
     from torch_neuronx.python_ops.nki_kernels.nonzero import _wrapped_nonzero
 
 if _has_nki_rng:
-    from torch_neuronx.python_ops.nki_kernels.rng_state import rand
+    from torch_neuronx.python_ops.nki_kernels.rng_state import _generate_raw, rand
 
 if _has_nki_foreach:
     from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
@@ -3250,6 +3250,256 @@ def native_dropout_decomposition(input, p: float, train: bool = True):
 
     y = input * mask.to(input.dtype) * scale
     return y, mask
+
+
+# ── on-device sampling from continuous / discrete distributions ────────────
+# All ops in this block reuse the on-device uniform RNG that native_dropout
+# uses (nkilib.experimental.rng, exposed via ``rand`` and ``_generate_raw``).
+# Normal samples are produced by the inverse-CDF (probit) transform of the
+# uniform samples: for U ~ Uniform[0, 1), Z = sqrt(2) * erfinv(2*U - 1) is
+# N(0, 1). ``erfinv`` is itself decomposed above via a rational-polynomial
+# approximation, so the whole chain lowers with primitives the backend
+# already supports.
+#
+# Correctness note: the coverage suite compares against a CPU oracle, which
+# uses PyTorch's own (Mersenne Twister) RNG — so bit-for-bit agreement is
+# impossible for these stochastic ops regardless of what we produce. The
+# suite reports ``status='supported'`` iff compilation + execution succeed,
+# and marks ``correctness='fail'`` when the values diverge; the ``fail``
+# on these ops is expected and documents the divergence, not a bug.
+
+
+def _standard_normal(ref: torch.Tensor, shape, dtype: torch.dtype = torch.float32):
+    """Generate N(0, 1) samples on-device via probit(uniform).
+
+    Args:
+        ref: reference tensor (only ``ref.device`` is used).
+        shape: output shape (iterable of ints).
+        dtype: output dtype.
+
+    Returns:
+        Tensor of shape ``shape`` with iid N(0, 1) samples cast to ``dtype``.
+    """
+    shape_list = list(shape)
+    if _has_nki_rng:
+        u = rand(ref, shape_list, torch.float32)
+    else:
+        u = torch.rand(shape_list, dtype=torch.float32, device=ref.device)
+    # ``rand`` returns [0, 1). ``2*u - 1`` therefore lands in [-1, 1) and
+    # ``erfinv(-1)`` is -inf, so clamp the input away from ±1 by one
+    # float32 ulp on each end.
+    u = torch.clamp(u, 2**-24, 1.0 - 2**-24)
+    z = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+    return z.to(dtype)
+
+
+def _normal_from_std(mean, std, shape, ref, dtype):
+    """Return ``mean + std * z`` where ``z ~ N(0, 1)`` has the given shape.
+
+    ``mean`` and ``std`` may be tensors or Python scalars; broadcasting is
+    handled by the arithmetic on ``z``. ``ref`` supplies the device.
+    """
+    z = _standard_normal(ref, shape, dtype)
+    return mean + std * z
+
+
+@register_decomposition([aten.normal.Tensor_Tensor])
+def normal_tensor_tensor(mean, std, *, generator=None):
+    """``normal(mean, std)`` with per-element mean/std tensors.
+
+    Output shape is the broadcast of ``mean.shape`` and ``std.shape``.
+    A user-supplied ``generator`` would need an on-device seeded RNG that
+    the coverage suite doesn't exercise; fall through with ``NotImplemented``
+    so PyTorch handles it if that path is ever hit.
+    """
+    if generator is not None:
+        return NotImplemented
+    shape = torch.broadcast_shapes(mean.shape, std.shape)
+    return _normal_from_std(mean, std, shape, mean, mean.dtype)
+
+
+@register_decomposition([aten.normal.Tensor_Tensor_out])
+def normal_tensor_tensor_out(mean, std, *, generator=None, out):
+    """``.out`` variant: compute functional result, copy_ into ``out``."""
+    if generator is not None:
+        return NotImplemented
+    result = normal_tensor_tensor(mean, std)
+    out.copy_(result)
+    return out
+
+
+@register_decomposition([aten.normal.Tensor_float])
+def normal_tensor_float(mean, std=1.0, *, generator=None):
+    """``normal(mean, std=1.0)`` with tensor mean and scalar std.
+
+    Output shape equals ``mean.shape``.
+    """
+    if generator is not None:
+        return NotImplemented
+    return _normal_from_std(mean, std, mean.shape, mean, mean.dtype)
+
+
+@register_decomposition([aten.normal.Tensor_float_out])
+def normal_tensor_float_out(mean, std=1.0, *, generator=None, out):
+    if generator is not None:
+        return NotImplemented
+    result = normal_tensor_float(mean, std)
+    out.copy_(result)
+    return out
+
+
+@register_decomposition([aten.normal.float_Tensor])
+def normal_float_tensor(mean, std, *, generator=None):
+    """``normal(mean=0, std)`` with scalar mean and tensor std.
+
+    Output shape equals ``std.shape``.
+    """
+    if generator is not None:
+        return NotImplemented
+    return _normal_from_std(mean, std, std.shape, std, std.dtype)
+
+
+@register_decomposition([aten.normal.float_float])
+def normal_float_float(
+    mean,
+    std,
+    size,
+    *,
+    generator=None,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """``normal(mean, std, size)`` with both scalars and an explicit size.
+
+    Reached via ``torch.normal(mean, std, size, device=...)``. When
+    ``device`` is None we let PyTorch's default device drive the ref
+    tensor (matches non-compile semantics).
+    """
+    if generator is not None:
+        return NotImplemented
+    out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    ref = torch.empty((), device=device, dtype=out_dtype)
+    return _normal_from_std(mean, std, size, ref, out_dtype)
+
+
+@register_decomposition([aten.normal.float_float_out])
+def normal_float_float_out(mean, std, size, *, generator=None, out):
+    if generator is not None:
+        return NotImplemented
+    z = _standard_normal(out, size, out.dtype)
+    out.copy_(mean + std * z)
+    return out
+
+
+# ── in-place ``random_`` (fill self with random values) ─────────────────────
+# ``random_(self)`` (no args) fills with values uniformly over the dtype's
+# representable range; ``random_.to(self, to)`` fills with integers in
+# [0, to). Both are in-place and preserve the aliasing on ``self``. The
+# coverage suite's correctness comparison against CPU will report ``fail``
+# for the same stochastic-divergence reason described above.
+
+
+def _random_int32_raw(self):
+    """Return an int32 tensor shaped like ``self`` with raw random bits."""
+    if _has_nki_rng:
+        return _generate_raw(self, list(self.shape))
+    # trn1 fallback — CPU RNG is fine here since the graph is not compiled
+    # on trn1 (dropout takes the same fallback).
+    info = torch.iinfo(torch.int32)
+    return torch.randint(
+        info.min, info.max, list(self.shape), device=self.device, dtype=torch.int32
+    )
+
+
+def _random_functional_full_range(self):
+    """Return a fresh tensor shaped like ``self`` filled with random values.
+
+    Semantics mirror ``torch.Tensor.random_(from=0, to=None)``: each element
+    is drawn uniformly from the dtype's representable range (or the
+    ``[0, 2**mantissa_bits)`` window for float dtypes, per PyTorch).
+
+    Implementation notes:
+
+    * The Neuron backend rejects 64-bit constants outside the int32 range,
+      so we never build a modulus larger than ``2**31``. For int32 and
+      float dtypes that means using the raw int32 bits directly (int32 is
+      already the natural width; floats sample in ``[0, 2**24)`` which
+      fits). For int8/int16/uint8/bool we mod down to fit the dtype.
+    * Neuron's compile pipeline casts int64 to int32 internally, so int64
+      ``random_`` produces values in the int32 range then cast — matches
+      the "some random tensor" contract without needing 64-bit constants.
+    """
+    raw = _random_int32_raw(self)  # int32, uniformly distributed
+    if self.dtype == torch.bool:
+        return (raw & 1).to(torch.bool)
+    if self.dtype in (torch.int32, torch.int64):
+        # int32: raw is already the right dtype and range.
+        # int64: Neuron casts to int32 internally, so the natural width is
+        # int32; cast raw directly.
+        return raw.to(self.dtype)
+    if self.dtype.is_floating_point:
+        # Sample in [0, 2**24) so every integer is exactly representable in
+        # every float dtype we care about (float32 mantissa = 23 bits, bf16
+        # mantissa = 7 bits — the cast rounds gracefully). No 64-bit
+        # arithmetic needed.
+        return ((raw & ((1 << 24) - 1)).to(torch.float32)).to(self.dtype)
+    # int8 / int16 / uint8: mod the raw down to the dtype range.
+    iinfo = torch.iinfo(self.dtype)
+    span = iinfo.max - iinfo.min + 1  # 256 / 65536 / 256 — all fit in int32
+    return (raw % int(span) + iinfo.min).to(self.dtype)
+
+
+@register_decomposition([aten.random_.default])
+def random_inplace(self, *, generator=None):
+    """Fill ``self`` in place with random values covering its dtype range."""
+    if generator is not None:
+        return NotImplemented
+    self.copy_(_random_functional_full_range(self))
+    return self
+
+
+@register_decomposition([aten.random_.to])
+def random_inplace_to(self, to, *, generator=None):
+    """Fill ``self`` in place with integers uniformly in ``[0, to)``.
+
+    Matches ``torch.Tensor.random_(0, to)``. ``to`` is a Python int and
+    must fit in int32 for the ``raw % to`` modulus (this is enforced by
+    the coverage suite's sample generator, which uses small bounds).
+    """
+    if generator is not None:
+        return NotImplemented
+    raw = _random_int32_raw(self)
+    # Take absolute value via bit mask (drops the sign bit) then mod.
+    # This avoids int64 arithmetic on Neuron.
+    vals = ((raw & 0x7FFFFFFF) % int(to)).to(self.dtype)
+    self.copy_(vals)
+    return self
+
+
+# The functional counterparts of ``random_`` / ``random_.to`` are what AOT
+# autograd's functionalization pass rewrites the in-place ops into inside the
+# compiled FX graph — same math, no mutation on ``self``, returns a fresh
+# tensor. Without these entries the graph reaches torch-mlir with a raw
+# ``torch.aten.random`` op and fails to legalize.
+
+
+@register_decomposition([aten.random.default])
+def random_functional(self, *, generator=None):
+    """Functional ``random(self)`` — same semantics as ``random_`` without mutation."""
+    if generator is not None:
+        return NotImplemented
+    return _random_functional_full_range(self)
+
+
+@register_decomposition([aten.random.to])
+def random_functional_to(self, to, *, generator=None):
+    """Functional ``random.to(self, to)`` — non-mutating counterpart of ``random_.to``."""
+    if generator is not None:
+        return NotImplemented
+    raw = _random_int32_raw(self)
+    return ((raw & 0x7FFFFFFF) % int(to)).to(self.dtype)
 
 
 @register_decomposition([aten.addbmm.default])
