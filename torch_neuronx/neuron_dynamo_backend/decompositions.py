@@ -3656,6 +3656,134 @@ def erfinv_decomposition(y):
     return result
 
 
+@register_decomposition([aten.argmin.default])
+def argmin_decomposition(self, dim=None, keepdim=False):
+    """Decompose argmin into argmax of the negated input.
+
+    argmin has no Neuron lowering (leaves an unlegalized ``torch.constant.bool``)
+    while argmax does. Negation preserves the first-occurrence tie-break, so
+    ``argmin(x) == argmax(-x)``.
+    """
+    if dim is None:
+        return torch.argmax(self.reshape(-1).neg(), dim=0)
+    return torch.argmax(self.neg(), dim=dim, keepdim=keepdim)
+
+
+@register_decomposition([aten.kthvalue.default])
+def kthvalue_decomposition(self, k, dim=-1, keepdim=False):
+    """Decompose kthvalue into topk(largest=False).
+
+    The k smallest values (sorted ascending) are the first k of an ascending
+    topk; the k-th value/index is the last of those. topk already has a
+    Neuron-friendly decomposition above, whereas kthvalue leaves an
+    unlegalized ``torch.constant.bool``.
+    """
+    # 0-d input: only k==1 is valid; the result is the scalar itself at index 0.
+    if self.dim() == 0:
+        return self.clone(), torch.zeros((), dtype=torch.long, device=self.device)
+    if dim < 0:
+        dim += self.dim()
+    vals, idxs = torch.topk(self, k, dim=dim, largest=False, sorted=True)
+    values = vals.select(dim, k - 1)
+    indices = idxs.select(dim, k - 1)
+    if keepdim:
+        values = values.unsqueeze(dim)
+        indices = indices.unsqueeze(dim)
+    return values, indices
+
+
+def _diagonal_flat_indices(rows, cols, offset, num_cols, device):
+    """Flat (row-major) indices of the ``offset`` diagonal of a rows x cols block."""
+    if offset >= 0:
+        n = max(min(rows, num_cols - offset), 0)
+        r = torch.arange(n, device=device)
+        c = r + offset
+    else:
+        n = max(min(rows + offset, num_cols), 0)
+        c = torch.arange(n, device=device)
+        r = c - offset
+    return r * num_cols + c, n
+
+
+@register_decomposition([aten.diagonal_copy.default])
+def diagonal_copy_decomposition(self, offset=0, dim1=0, dim2=1):
+    """Decompose diagonal extraction via a flattened index_select.
+
+    ``aten::diag`` (2-D), ``aten::diagonal`` and ``aten::diagonal_copy`` all
+    extract a diagonal. ``diag`` and ``diagonal`` are CompositeImplicitAutograd,
+    so PyTorch lowers them to ``aten.diagonal_copy.default`` *before* the Neuron
+    decomposition table is consulted — registering on ``aten.diag``/
+    ``aten.diagonal`` would never fire. The direct ``diagonal_copy`` lowering
+    leaves an unlegalized ``torch.constant.int`` (its dim/offset args), so we
+    instead move the two diagonal dims to the end, gather the diagonal from the
+    flattened (rows x cols) plane, and keep the remaining (batch) dims.
+
+    The 1-D ``diag`` case (build a matrix from a vector) decomposes to
+    ``diag_embed`` — already in the table — and never reaches this op.
+    """
+    nd = self.dim()
+    dim1 %= nd
+    dim2 %= nd
+    perm = [d for d in range(nd) if d not in (dim1, dim2)] + [dim1, dim2]
+    x = self.permute(perm)
+    rows, cols = x.shape[-2], x.shape[-1]
+    flat_idx, n = _diagonal_flat_indices(rows, cols, offset, cols, self.device)
+    x2 = x.reshape(-1, rows * cols)
+    out = x2.index_select(1, flat_idx)
+    return out.reshape(*x.shape[:-2], n)
+
+
+def _prefix_sum(x, dim):
+    """Cumulative sum along ``dim`` via an upper-triangular matmul.
+
+    The Neuron pipeline explicitly marks ``aten.cumsum`` illegal, so we express
+    the prefix sum as ``x @ triu(ones(n, n))`` (matmul always lowers). For the
+    moved-to-last axis of length n, ``out[..., i] = sum_{j<=i} x[..., j]``.
+    """
+    xm = x.movedim(dim, -1)
+    n = xm.shape[-1]
+    tri = torch.ones(n, n, dtype=xm.dtype, device=xm.device).triu()
+    return torch.matmul(xm, tri).movedim(-1, dim)
+
+
+# ``aten::_logcumsumexp`` (the private op ``logcumsumexp`` calls into) ships no
+# meta/fake kernel, so Dynamo can't propagate fake tensors through it and graph-
+# breaks ("Could not deduce type from value info") *before* AOTAutograd ever
+# applies the decomposition below. Give it (and its .out overload) a fake impl —
+# logcumsumexp is shape/dtype-preserving — so tracing reaches the decomposition.
+@_register_fake("aten::_logcumsumexp")
+def _logcumsumexp_fake(self, dim):
+    return torch.empty_like(self)
+
+
+@_register_fake("aten::_logcumsumexp.out")
+def _logcumsumexp_out_fake(self, dim, *, out):
+    return out
+
+
+@register_decomposition([aten.logcumsumexp.default, aten._logcumsumexp.default])
+def logcumsumexp_decomposition(self, dim):
+    """Decompose (_)logcumsumexp into log(prefix_sum(exp(x))).
+
+    The direct lowering leaves a dangling ``torch.constant.int`` that fails to
+    legalize, and ``cumsum`` itself is banned in the Neuron pipeline, so the
+    prefix sum is computed via a triangular matmul (see ``_prefix_sum``).
+
+    Numerically stabilized by factoring out the per-``dim`` max:
+    ``log(sum_j<=i exp(x_j)) = m + log(sum_j<=i exp(x_j - m))`` for any m.
+    The all-(-inf) slice is guarded by zeroing an infinite max so we don't
+    compute ``-inf - (-inf) = nan``.
+    """
+    # logcumsumexp over a 0-d tensor is identity (single element); _prefix_sum
+    # would index a nonexistent last axis (IndexError).
+    if self.dim() == 0:
+        return self.clone()
+    m = torch.amax(self, dim=dim, keepdim=True)
+    m = torch.where(torch.isinf(m), torch.zeros_like(m), m)
+    e = torch.exp(self - m)
+    return torch.log(_prefix_sum(e, dim)) + m
+
+
 # ── foreach decompositions ───────────────────────────────────────────────────
 # Decompose foreach ops into per-tensor NKI kernel calls with elementwise op
 # fallback for small/empty/mismatched tensors.
