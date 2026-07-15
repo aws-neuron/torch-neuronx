@@ -1,6 +1,7 @@
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
@@ -51,6 +52,7 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     TORCH_NEURONX_DISPATCH_DEBUG("[NeuronSafeCast] CPU round-trip via NRT",
                                  " from=", t.scalar_type(), " to=", target_dtype,
                                  " device=", orig_device.str());
+    torch_neuronx::markFallbackLogged("aten::_to_copy");
 
     // Use NRT helpers directly instead of .to() to avoid re-dispatching
     // through aten::_to_copy.  Matches Python convert_for_neuron() which

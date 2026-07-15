@@ -179,6 +179,11 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
         auto contiguous_tensor = MakeContiguousViaCPU(input);
         result.final_inputs.push_back(contiguous_tensor);
         // kernel_transforms[i] remains empty for this input
+        // Not a whole-op CPU fallback: the op still runs on device — only the
+        // non-contiguous input is materialized via a host round-trip. Report
+        // under a distinct name so it does not shadow the bare op name in the
+        // executed-ops list.
+        torch_neuronx::markFallbackLogged(op_name + "[prologue_cpu_roundtrip]");
       } else {
         // For non-collective operations, try to create a transformation
         auto& registry = c10_neuron::lazy::TransformationRegistry::Get();
@@ -205,6 +210,9 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
           auto contiguous_tensor = MakeContiguousViaCPU(input);
           result.final_inputs.push_back(contiguous_tensor);
           // kernel_transforms[i] remains empty for this input
+          // Partial (input-restride) host round-trip, not a whole-op fallback —
+          // reported under a distinct name (see collective branch above).
+          torch_neuronx::markFallbackLogged(op_name + "[prologue_cpu_roundtrip]");
         }
       }
     } else {
@@ -254,6 +262,11 @@ OutputTransformationResult ProcessOutputTransformations(const std::string& op_na
         auto contiguous_temp = torch::empty(
             output.sizes().vec(), output.options().memory_format(c10::MemoryFormat::Contiguous));
         result.final_outputs.push_back(contiguous_temp);
+        // Not a whole-op CPU fallback: the op still runs on device — only the
+        // scatter of its result back into the non-contiguous output round-trips
+        // through the host. Report under a distinct name so it does not shadow
+        // the bare op name in the executed-ops list.
+        torch_neuronx::markFallbackLogged(op_name + "[epilogue_cpu_roundtrip]");
       }
     } else {
       // Contiguous output or epilogue disabled — pass through

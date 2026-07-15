@@ -8,6 +8,7 @@
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
@@ -275,6 +276,14 @@ void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src) {
   // CPU bounce: read dst's full storage, scatter-write src on CPU, write back.
   // Uses flat 1D view of dst's storage to satisfy contiguity preconditions
   // of the existing copy APIs (avoids manual kernel construction).
+  //
+  // NOTE: this is NOT a whole-op CPU fallback — the copy_ still runs on device;
+  // only the scatter into the non-contiguous destination round-trips through the
+  // host. It is reported under a distinct name so it does not shadow the bare
+  // "aten::copy_" that legitimately appears in the executed-ops list (which
+  // tests such as test_pad_decomposition_to_correct_ops key on).
+  torch_neuronx::markFallbackLogged("aten::copy_[noncontiguous_scatter_cpu_bounce]");
+
   size_t storage_bytes = dst.storage().nbytes();
   int64_t storage_elems = static_cast<int64_t>(storage_bytes / dst.element_size());
 
