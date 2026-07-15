@@ -40,6 +40,8 @@ if hasattr(torch, "float8_e4m3fnuz"):
     _TORCH_TO_NKI_DTYPE[torch.float8_e4m3fnuz] = "float8_e4m3fn"
 if hasattr(torch, "float8_e5m2fnuz"):
     _TORCH_TO_NKI_DTYPE[torch.float8_e5m2fnuz] = "float8_e5m2"
+if hasattr(torch, "float8_e8m0fnu"):
+    _TORCH_TO_NKI_DTYPE[torch.float8_e8m0fnu] = "float8_e8m0fnu"
 
 
 def _torch_to_nki_dtype(dtype: torch.dtype) -> str:
