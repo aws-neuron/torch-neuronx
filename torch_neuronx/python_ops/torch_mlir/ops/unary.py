@@ -152,6 +152,55 @@ def torch_ceil(self, out=None):
     return torch.ceil(self)
 
 
+def _aten_scalar_type_name(dtype):
+    """ATen ScalarType spelling of a dtype (e.g. 'Long', not 'torch.int64').
+
+    Derived from Tensor.type() ('torch.LongTensor') rather than hardcoded so it
+    tracks any future torch rename automatically.
+    """
+    return torch.empty((), dtype=dtype).type().rsplit(".", 1)[-1].removesuffix("Tensor")
+
+
+def _validate_floor(self, out=None):
+    """Reject an out= tensor whose dtype doesn't match the input.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    floor preserves the input dtype (unlike acos et al., which promote to float),
+    so out must have the same dtype as the input. The message is spelled like
+    CPU (e.g. 'Long', not 'torch.int64').
+    """
+    if out is not None and out.dtype != self.dtype:
+        raise RuntimeError(
+            f"Found dtype {_aten_scalar_type_name(out.dtype)} but expected "
+            f"{_aten_scalar_type_name(self.dtype)}"
+        )
+
+
+@register_aten(
+    ["aten::floor", "aten::floor.out", "aten::floor_"],
+    output_params=("out",),
+    validate_static_inputs=_validate_floor,
+)
+def torch_floor(self, out=None):
+    """Floor — elementwise, identity on non-floating-point dtypes.
+
+    Two input classes bypass the HLO floor and pass through unchanged (floor is
+    the identity on both):
+      - |x| >= 2^23: float32 has no fractional bits, so the value is already an
+        integer; the HLO lowering otherwise loses precision (clamps to int32).
+      - nan: neuronx-cc's floor returns 2^31 for nan instead of nan. floor(nan)
+        is nan, so we restore it with an isnan mask. (inf/-inf are already handled
+        correctly by the 2^23 branch, since |inf| >= 2^23.)
+    """
+    if not self.is_floating_point():
+        return self
+    result = torch.floor(self)
+    large = torch.abs(self) >= 8388608.0  # 2^23
+    result = torch.where(large, self, result)
+    return torch.where(torch.isnan(self), self, result)
+
+
 @register_aten(["aten::trunc", "aten::trunc.out"])
 def torch_trunc(x, out=None):
     return torch.trunc(x)

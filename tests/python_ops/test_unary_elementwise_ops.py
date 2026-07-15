@@ -14,6 +14,7 @@ UNARY_OPS_LIST = [
     torch.abs,
     f.silu,
     torch.ceil,
+    torch.floor,
     torch.trunc,
     torch.sqrt,
     torch.rsqrt,
@@ -29,6 +30,7 @@ UNARY_OPS_OUT_LIST = [
     torch.exp,
     torch.abs,
     torch.ceil,
+    torch.floor,
     torch.trunc,
     torch.sqrt,
     torch.rsqrt,
@@ -44,6 +46,7 @@ UNARY_INPLACE_OPS_LIST = [
     "exp_",
     "abs_",
     "ceil_",
+    "floor_",
     "trunc_",
     "logical_not_",
 ]
@@ -58,6 +61,10 @@ UNARY_ZERO_XFAIL_LIST = {
 UNARY_SPECIAL_VALUE_XFAIL_LIST = {
     torch.ceil: pytest.param(
         torch.ceil,
+        marks=pytest.mark.xfail(reason="-2.1475e+09 is returned when input is inf, -inf or nan"),
+    ),
+    torch.floor: pytest.param(
+        torch.floor,
         marks=pytest.mark.xfail(reason="-2.1475e+09 is returned when input is inf, -inf or nan"),
     ),
     torch.trunc: pytest.param(
@@ -317,6 +324,23 @@ class TestUnaryElementwiseOp:
 
         assert result.device.type == "neuron"
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-3, equal_nan=True)
+
+    def test_floor_large_float_values(self, device):
+        """Test floor with float32 values outside int32 range.
+
+        Regression test for neuronx-cc stablehlo.floor bug where values
+        outside int32 range get clamped to ±2.1475e+09. The workaround
+        bypasses floor for |x| >= 2^23 (where floats are already integers).
+        """
+        with track_neuron_ops():
+            input_cpu = torch.tensor([2.5e9, -2.5e9, 1e10, -1e10, 8388608.0, -8388608.0])
+            input_neuron = input_cpu.to(device)
+
+            result = torch.floor(input_neuron)
+            assert_op_runs_on_neuron("aten::floor")
+
+        expected = torch.floor(input_cpu)
+        torch.testing.assert_close(result.cpu(), expected)
 
     # Specific tests for torch.exp
     def test_exp_specific(self, device):
