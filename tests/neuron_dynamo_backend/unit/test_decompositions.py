@@ -975,20 +975,8 @@ class TestAminmaxDecompositionE2E:
             ((4, 8), None),
             ((4, 8), 0),
             ((3, 4, 5), 2),
-            pytest.param(
-                (),
-                None,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
-            pytest.param(
-                (),
-                0,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            ((), None),
+            ((), 0),
         ],
     )
     def test_aminmax_e2e(self, shape, dim):
@@ -1015,13 +1003,7 @@ class TestCumprodDecompositionE2E:
             ((6,), 0),
             ((4, 8), 1),
             ((3, 4, 5), -1),
-            pytest.param(
-                (),
-                0,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            ((), 0),
         ],
     )
     def test_cumprod_e2e(self, shape, dim):

@@ -54,57 +54,26 @@ def _is_tuple_return(module: Module) -> bool:
     return False
 
 
-def _detect_passthrough_aliases_from_module(module: Module) -> dict[int, int]:
-    """Find pass-through aliases directly on the lowered StableHLO module.
-
-    A function result that is *exactly* a block argument is an input returned
-    unchanged (a pass-through). Detecting this on the final module — rather than
-    trusting FX-graph placeholder/output indices — keeps the indices in the same
-    space as the emitted function signature.
-
-    This matters because lowering can drop or reorder graph inputs/outputs. For
-    example, PT2.12 dynamo lifts module ``forward_pre_hook`` closure cells as
-    extra FX placeholders; those are constant-folded out of the MLIR, so FX
-    placeholder/output indices no longer line up with the MLIR function IO and
-    the pre-computed (FX-space) alias indices land out of bounds.
-
-    Returns:
-        dict[int, int]: mapping of MLIR output index -> MLIR input (arg) index.
-    """
-    output_to_input: dict[int, int] = {}
-    for op in module.body.operations:
-        if op.operation.name != "func.func":
-            continue
-        block = op.regions[0].blocks[0]
-        for inner in block.operations:
-            if inner.operation.name in ("func.return", "return"):
-                for out_idx, operand in enumerate(inner.operands):
-                    if mlir_ir.BlockArgument.isinstance(operand):
-                        output_to_input[out_idx] = mlir_ir.BlockArgument(operand).arg_number
-        break
-    return output_to_input
-
-
 def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
     """Set aliasing attributes on the MLIR module for input-output tensor aliasing.
 
     Attaches mhlo.input_output_alias attributes to the module operation,
     informing the compiler which output tensors should alias input tensors.
 
-    Aliases are always resolved against the ACTUAL lowered StableHLO IO:
-      1. Pass-through aliases are read straight off the module (a result that is
-         a block argument), which is inherently in the correct MLIR index space.
-      2. Any explicitly-provided aliases (in-place mutation / NKI / pre-AOT
-         analysis, expressed in FX-graph index space) are applied only when they
-         still map validly onto the real MLIR IO. A stale / out-of-range hint is
-         skipped instead of applied at the wrong index — an aliasing hint is a
-         buffer-donation optimization, so a mis-indexed alias would be incorrect
-         while a missing one is merely a lost optimization.
+    Emits an alias for each entry in ``aliasing_info``, validated against the
+    lowered StableHLO IO and skipped on out-of-range indices or shape mismatch.
+    ``aliasing_info`` carries both in-place mutation aliases and genuine
+    pass-through aliases (inputs returned unchanged); the pass-through entries
+    are added by ``FunctionalizeCopyInplacePass`` and merged into
+    ``aliasing_info`` in ``backend.py`` before this call.
 
     Args:
         module (Module): MLIR Module to modify.
         aliasing_info (AliasingInfo): Aliasing relationships to apply.
     """
+    if aliasing_info is None:
+        return
+
     is_tuple_output = _is_tuple_return(module)
 
     with module.context:
@@ -114,93 +83,53 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 
         # MLIR output index -> (input param_num, parameter_index) to alias.
         output_to_alias: dict[int, tuple[int, list[int]]] = {}
-        # Output indices whose alias came from an explicit in-place mutation
-        # (aliasing_info), as opposed to a detected pass-through. Used to prefer
-        # the mutation alias when one input parameter is claimed by both.
-        mutation_output_indices: set[int] = set()
 
-        # (1) Ground-truth pass-throughs from the lowered module.
-        # Gate to the AOT/compile context (aliasing_info present) only. In pure
-        # eager per-op lowering (aliasing_info is None) an output that is a bare
-        # pass-through/identity of an input uses a SEPARATE output buffer at
-        # runtime, so emitting mhlo.input_output_alias donates the input buffer but
-        # the graph never writes the output -> it reads uninitialized memory and the
-        # op returns zeros/garbage. This hit integer ceil/trunc (and other int
-        # no-ops that lower to identity); float ops are unaffected because they
-        # compute a new value (not a bare block-arg pass-through). The compile/AOT
-        # path reuses the input buffer for pass-throughs, so the alias is required
-        # there and this detection stays active for it.
-        if aliasing_info is not None:
-            for output_idx, param_num in _detect_passthrough_aliases_from_module(module).items():
-                if 0 <= param_num < len(inputs) and 0 <= output_idx < len(outputs):
-                    output_to_alias[output_idx] = (param_num, [])
+        # Apply explicitly-provided aliases, validated against the real IO.
+        for alias in aliasing_info:
+            param_num = alias.parameter_number
+            param_idx = alias.parameter_index or []
+            output_idx = alias.output_index
+            if not isinstance(output_idx, int):
+                output_idx = output_idx[0] if output_idx else -1
 
-        # (2) Merge explicitly-provided aliases, validated against the real IO.
-        if aliasing_info is not None:
-            for alias in aliasing_info:
-                param_num = alias.parameter_number
-                param_idx = alias.parameter_index or []
-                output_idx = alias.output_index
-                if not isinstance(output_idx, int):
-                    output_idx = output_idx[0] if output_idx else -1
-
-                if not (0 <= param_num < len(inputs)) or not (0 <= output_idx < len(outputs)):
-                    logger.debug(
-                        "Skipping alias with indices outside the lowered MLIR IO: "
-                        "param_num=%s output_idx=%s (inputs=%d, outputs=%d)",
-                        param_num,
-                        output_idx,
-                        len(inputs),
-                        len(outputs),
-                    )
-                    continue
-                if output_idx in output_to_alias:
-                    # Already covered by a ground-truth pass-through.
-                    continue
-                if not shapes_match(inputs[param_num], outputs[output_idx]):
-                    logger.warning(
-                        "Dropping alias: output[%d] -> input[%d] shape mismatch "
-                        "(output_shape=%s, input_shape=%s)",
-                        output_idx,
-                        param_num,
-                        outputs[output_idx],
-                        inputs[param_num],
-                    )
-                    continue
-                output_to_alias[output_idx] = (param_num, param_idx)
-                mutation_output_indices.add(output_idx)
+            if not (0 <= param_num < len(inputs)) or not (0 <= output_idx < len(outputs)):
+                logger.debug(
+                    "Skipping alias with indices outside the lowered MLIR IO: "
+                    "param_num=%s output_idx=%s (inputs=%d, outputs=%d)",
+                    param_num,
+                    output_idx,
+                    len(inputs),
+                    len(outputs),
+                )
+                continue
+            if output_idx in output_to_alias:
+                continue
+            if not shapes_match(inputs[param_num], outputs[output_idx]):
+                logger.warning(
+                    "Dropping alias: output[%d] -> input[%d] shape mismatch "
+                    "(output_shape=%s, input_shape=%s)",
+                    output_idx,
+                    param_num,
+                    outputs[output_idx],
+                    inputs[param_num],
+                )
+                continue
+            output_to_alias[output_idx] = (param_num, param_idx)
 
         if not output_to_alias:
             return
 
-        # (3) Emit mhlo.input_output_alias from the validated map.
-        #
-        # GATED FIX: an input buffer may be donated to at most ONE output. XLA's
-        # HLO verifier rejects a second alias on the same parameter (RET_CHECK
-        # param_has_seen[parameter_number] == false, at
-        # hlo_input_output_alias_config.cc). This happens when one input feeds two
-        # aliased outputs -- e.g. an in-place-mutated input that AOTAutograd also
-        # returns as a bare pass-through (saved for backward) at a different output.
-        #
-        # When a parameter is claimed by both a mutation and a pass-through, the
-        # MUTATION alias must win: donating the input buffer to the pass-through
-        # output while the mutation's copy-back overwrites that same input would
-        # corrupt the pass-through (e.g. a saved-for-backward tensor). We therefore
-        # emit mutation-sourced outputs first, then skip any later alias on an
-        # already-donated parameter.
+        # Emit mhlo.input_output_alias from the validated map. An input buffer
+        # may be donated to at most one output (XLA's HLO verifier rejects a
+        # second alias on the same parameter: RET_CHECK param_has_seen == false),
+        # so skip a param already emitted -- aliasing_info can hold two entries
+        # for one param (e.g. an input returned at two outputs).
         alias_dicts = []
         seen_params: set[int] = set()
-        emit_order = sorted(output_to_alias, key=lambda o: (o not in mutation_output_indices, o))
-        for output_idx in emit_order:
+        for output_idx in sorted(output_to_alias):
             param_num, param_idx = output_to_alias[output_idx]
-
             if param_num in seen_params:
                 continue
-
-            # StableHLO does not recognize mismatch-shaped alias relationships.
-            if not shapes_match(inputs[param_num], outputs[output_idx]):
-                continue
-
             seen_params.add(param_num)
 
             param_index_attr = mlir_ir.DenseI64ArrayAttr.get(param_idx if param_idx else [])
