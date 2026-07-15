@@ -4,6 +4,7 @@ Verifies that only one process traces/lowers HLO on a cache miss,
 while other processes wait and read from disk after the lock is released.
 """
 
+import os
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -17,7 +18,21 @@ from torch_neuronx.python_ops.compilation.hlo_cache import put as _hlo_cache_put
 
 
 @pytest.fixture(autouse=True)
-def _enable_hlo_cache():
+def _enable_hlo_cache(tmp_path, monkeypatch):
+    # Point the on-disk HLO cache at a fresh, per-test directory. The disk
+    # cache (C++-backed, keyed on cache_key) persists across processes at the
+    # default /tmp/hlo_cache, so without isolation a cache_key written by one
+    # test — or one earlier run in a reused CI runner — turns a later run into
+    # a disk hit, and _generate_hlo is never called (generate_count == 0). The
+    # C++ backend re-reads TORCH_NEURONX_HLO_CACHE_DIR on every call, so setting
+    # it here guarantees a cold cache; CACHE_DIR (captured at import for the
+    # lock-file path) is repointed to match.
+    cache_dir = str(tmp_path / "hlo_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    monkeypatch.setenv("TORCH_NEURONX_HLO_CACHE_DIR", cache_dir)
+    monkeypatch.setattr(_hlo_cache_mod, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr("torch_neuronx.python_ops.torch_mlir.kernel.CACHE_DIR", cache_dir)
+
     original = _hlo_cache_mod._enabled
     _hlo_cache_mod._enabled = True
     yield
@@ -61,14 +76,6 @@ def _make_kernel():
 class TestHloFileLockSingleGeneration:
     """Only one thread should call _generate_hlo on concurrent cache misses."""
 
-    @pytest.mark.xfail(
-        reason="Flaky: 5 threads share one kernel and each patch.object()s the same "
-        "instance; a thread's patch __exit__ delattr's the method while another thread "
-        "is still calling it -> transient AttributeError on _generate_unified_cache_key/"
-        "_generate_hlo. Test-side race, not a source bug. Passes on retry. Tracked for a "
-        "real fix (patch once before starting threads).",
-        strict=False,
-    )
     def test_only_one_thread_generates_hlo(self):
         kernel = _make_kernel()
         generate_count = 0
@@ -84,11 +91,7 @@ class TestHloFileLockSingleGeneration:
             return generate_result
 
         def run_get_or_compile():
-            with (
-                patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
-                patch.object(kernel, "_generate_hlo", side_effect=slow_generate_hlo),
-            ):
-                return kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
+            return kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
 
         num_threads = 5
         results = [None] * num_threads
@@ -109,10 +112,21 @@ class TestHloFileLockSingleGeneration:
             t = threading.Thread(target=target)
             threads.append(t)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
+        # Patch the shared kernel ONCE, around the whole thread lifecycle. Doing this
+        # inside each thread's own `with` block races: one thread's patch.object __exit__
+        # delattr's the method off the shared instance while another thread is still
+        # calling it, giving a transient AttributeError. A single __enter__/__exit__ pair
+        # on the shared instance — entered before any thread starts, exited only after all
+        # have joined — removes that race while preserving the shared-kernel/shared-cache
+        # intent this test checks.
+        with (
+            patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
+            patch.object(kernel, "_generate_hlo", side_effect=slow_generate_hlo),
+        ):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
 
         # No errors
         for i, err in enumerate(errors):
