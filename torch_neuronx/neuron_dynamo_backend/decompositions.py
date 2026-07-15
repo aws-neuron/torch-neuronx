@@ -3611,6 +3611,275 @@ def batch_norm_backward_reduce_decomposition(
     return sum_dy, sum_dy_xmu, grad_weight, grad_bias
 
 
+@register_decomposition([aten.batch_norm_gather_stats_with_counts.default])
+def batch_norm_gather_stats_with_counts_decomposition(
+    input, mean, invstd, running_mean, running_var, momentum, eps, counts
+):
+    """Decompose batch_norm_gather_stats_with_counts.
+
+    Aggregates per-worker (mean, invstd) into a single global (mean, invstd)
+    weighted by per-worker element counts. Mirrors the CUDA reference
+    (``aten/src/ATen/native/cuda/Normalization.cuh``).
+
+    Shapes (typical SyncBatchNorm use):
+      mean       : (num_workers, num_channels)
+      invstd     : (num_workers, num_channels)
+      counts     : (num_workers,) — element count per worker, or a scalar
+                   when every worker contributed the same number of elements
+      running_mean/running_var: (num_channels,) or None
+
+    Combined-mean/variance formula (Welford-style pooling):
+      N_total  = sum(counts)
+      mean_g   = sum(counts * mean) / N_total                    (over workers)
+      var_i    = 1/invstd_i^2 - eps
+      var_g    = sum(counts * (var_i + (mean_i - mean_g)^2)) / N_total
+      invstd_g = 1 / sqrt(var_g + eps)
+
+    Running stats (when provided) are updated with the unbiased variance
+    (``var_g * N_total / (N_total - 1)``) using the standard momentum rule;
+    when ``N_total <= 1`` the unbiased correction is skipped (matches CUDA).
+
+    Only the ``(mean_g, invstd_g)`` pair is returned — the running-stats
+    aliases are updated in-place. Under torch.compile, functionalization
+    lifts the in-place update to a functional copy on the SSA graph.
+    """
+    dtype = mean.dtype
+    counts_f = counts.to(dtype)
+
+    # Broadcast counts to per-channel shape (num_workers, 1). When callers
+    # pass a per-channel-per-worker counts tensor we accept it as-is.
+    if counts_f.ndim == 0:
+        counts_bc = counts_f.reshape(1, 1).expand_as(mean)
+    elif counts_f.ndim == 1:
+        counts_bc = counts_f.unsqueeze(-1)
+    else:
+        counts_bc = counts_f
+
+    n_total = counts_bc.sum(dim=0)  # (num_channels,) or scalar
+    # Guard against divide-by-zero when every worker had an empty batch.
+    n_safe = torch.where(n_total > 0, n_total, torch.ones_like(n_total))
+
+    mean_g = (counts_bc * mean).sum(dim=0) / n_safe
+    var_per_worker = invstd.to(dtype).reciprocal().square() - eps
+    diff = mean - mean_g.unsqueeze(0)
+    var_g = (counts_bc * (var_per_worker + diff * diff)).sum(dim=0) / n_safe
+    invstd_g = torch.rsqrt(var_g + eps)
+
+    if running_mean is not None:
+        new_running_mean = (1.0 - momentum) * running_mean + momentum * mean_g.to(
+            running_mean.dtype
+        )
+        running_mean.copy_(new_running_mean)
+    if running_var is not None:
+        denom = torch.where(n_total > 1, n_total - 1, torch.ones_like(n_total))
+        unbiased_var = var_g * n_total / denom
+        new_running_var = (1.0 - momentum) * running_var + momentum * unbiased_var.to(
+            running_var.dtype
+        )
+        running_var.copy_(new_running_var)
+
+    return mean_g, invstd_g
+
+
+@register_decomposition([aten._batch_norm_with_update.default])
+def _batch_norm_with_update_decomposition(
+    input, weight, bias, running_mean, running_var, momentum, eps
+):
+    """Decompose ``_batch_norm_with_update`` in training mode.
+
+    Rationale: PyTorch's built-in decomposition for this op calls
+    ``_get_batch_norm_reserve_tensor`` -> ``_select_batch_norm_backend``,
+    which does not accept ``None`` for ``weight``/``bias`` and raises
+    ``TypeError`` under fake-tensor tracing. Neuron never dispatches to
+    cudnn, so the reserve tensor is always empty (uint8) and we can bypass
+    that helper entirely.
+
+    We compute the batch stats, apply the momentum update to running
+    ``mean``/``var`` in-place, then normalize the input. Delegating to
+    ``native_batch_norm`` would double-mutate the running-stat buffers
+    (both the wrapper and the callee mark them as ``Tensor(a!)``), which
+    trips ``assert_functional_graph`` in AOT autograd; doing the math
+    explicitly leaves exactly one mutation on each buffer.
+
+    Returns ``(output, save_mean, save_invstd, reserve)``. Running stats
+    are updated in-place; functionalization lifts the mutation on the
+    compile path.
+    """
+    # Reduction axes: all except channel dim (index 1).
+    reduction_axes = tuple(i for i in range(input.ndim) if i != 1)
+    input_f = input.to(torch.float32) if input.dtype != torch.float32 else input
+    batch_mean = torch.mean(input_f, dim=reduction_axes)
+    batch_var_biased = torch.var(input_f, dim=reduction_axes, unbiased=False)
+    save_invstd = torch.rsqrt(batch_var_biased + eps)
+
+    # Running-stats update (in-place). Unbiased-variance correction to match
+    # native_batch_norm's behaviour.
+    n = input.numel() // input.size(1)
+    batch_var_unbiased = batch_var_biased * n / (n - 1) if n > 1 else batch_var_biased
+    running_mean.copy_(
+        (1.0 - momentum) * running_mean + momentum * batch_mean.to(running_mean.dtype)
+    )
+    running_var.copy_(
+        (1.0 - momentum) * running_var + momentum * batch_var_unbiased.to(running_var.dtype)
+    )
+
+    # Broadcasting shape for per-channel affine params: (1, C, 1, 1, ...).
+    view_shape = [1] * input.ndim
+    view_shape[1] = -1
+    normalized = (input_f - batch_mean.view(view_shape)) * save_invstd.view(view_shape)
+    if weight is not None:
+        normalized = normalized * weight.to(torch.float32).view(view_shape)
+    if bias is not None:
+        normalized = normalized + bias.to(torch.float32).view(view_shape)
+    output = normalized.to(input.dtype)
+
+    save_mean = batch_mean.to(input.dtype if input.is_floating_point() else torch.float32)
+    save_invstd_out = save_invstd.to(input.dtype if input.is_floating_point() else torch.float32)
+    reserve = torch.empty(0, dtype=torch.uint8, device=input.device)
+    return output, save_mean, save_invstd_out, reserve
+
+
+@register_decomposition([aten._batch_norm_with_update_functional.default])
+def _batch_norm_with_update_functional_decomposition(
+    input, weight, bias, running_mean, running_var, momentum, eps
+):
+    """Functionalized variant of ``_batch_norm_with_update``.
+
+    Returns ``(output, save_mean, save_invstd, reserve,
+    running_mean_out, running_var_out)`` — the running-stats updates are
+    surfaced as SSA outputs rather than in-place mutations. Math mirrors
+    ``_batch_norm_with_update_decomposition``.
+    """
+    reduction_axes = tuple(i for i in range(input.ndim) if i != 1)
+    input_f = input.to(torch.float32) if input.dtype != torch.float32 else input
+    batch_mean = torch.mean(input_f, dim=reduction_axes)
+    batch_var_biased = torch.var(input_f, dim=reduction_axes, unbiased=False)
+    save_invstd = torch.rsqrt(batch_var_biased + eps)
+
+    n = input.numel() // input.size(1)
+    batch_var_unbiased = batch_var_biased * n / (n - 1) if n > 1 else batch_var_biased
+    new_running_mean = (1.0 - momentum) * running_mean + momentum * batch_mean.to(
+        running_mean.dtype
+    )
+    new_running_var = (1.0 - momentum) * running_var + momentum * batch_var_unbiased.to(
+        running_var.dtype
+    )
+
+    view_shape = [1] * input.ndim
+    view_shape[1] = -1
+    normalized = (input_f - batch_mean.view(view_shape)) * save_invstd.view(view_shape)
+    if weight is not None:
+        normalized = normalized * weight.to(torch.float32).view(view_shape)
+    if bias is not None:
+        normalized = normalized + bias.to(torch.float32).view(view_shape)
+    output = normalized.to(input.dtype)
+
+    save_mean = batch_mean.to(input.dtype if input.is_floating_point() else torch.float32)
+    save_invstd_out = save_invstd.to(input.dtype if input.is_floating_point() else torch.float32)
+    reserve = torch.empty(0, dtype=torch.uint8, device=input.device)
+    return (
+        output,
+        save_mean,
+        save_invstd_out,
+        reserve,
+        new_running_mean,
+        new_running_var,
+    )
+
+
+def _replace_builtin_decomposition(op, fn):
+    """Replace PyTorch's built-in decomposition for ``op`` with ``fn``.
+
+    Dynamo/AOT autograd runs fake-tensor tracing BEFORE our per-backend
+    ``neuron_decompositions`` table is applied, and ``FakeTensorMode.dispatch``
+    consults two globals that PyTorch's ``@register_decomposition`` decorator
+    populates in tandem:
+
+    1. ``torch._decomp.decomposition_table`` (the global dict), checked before
+       falling through to a Meta kernel.
+    2. ``op.py_kernels[Meta]``, hit by the ``func(*args, **kwargs)`` call at
+       the end of the dispatch when (1) doesn't short-circuit.
+
+    Both entries have to be replaced or fake-tensor tracing still routes
+    through PyTorch's version. ``py_impl(Meta)`` refuses to overwrite an
+    existing registration, so we poke ``py_kernels`` directly and invalidate
+    the dispatch cache; this is only safe because we're replacing an entry
+    PyTorch itself owns.
+
+    Currently used for a small set of ``_batch_norm_*`` "with-update" ops
+    whose built-in decomps call
+    ``_get_batch_norm_reserve_tensor`` → ``_select_batch_norm_backend(input,
+    weight, bias, ...)``. The C++ binding for ``_select_batch_norm_backend``
+    rejects ``None`` weight/bias with a ``TypeError``, which is a common case
+    for ``affine=False`` BatchNorm layers. Neuron never dispatches to cuDNN so
+    the reserve tensor is always empty and the backend-selection call is
+    unnecessary work for us anyway.
+
+    Broader architectural context on the ``_batch_norm_with_update`` dispatch
+    stack (dead-code path in ``Normalization.cpp``, schema-vs-``None``
+    mismatch, optional in-place tensor problem) is discussed in
+    https://dev-discuss.pytorch.org/t/rfc-adding-a-batch-norm-backend-revisiting-dispatch-stack-issues/3327
+    -- if that migration lands upstream, these replacements can be dropped.
+    """
+    from torch._C import DispatchKey
+
+    decomp.decomposition_table[op] = fn
+    op.py_kernels[DispatchKey.Meta] = fn
+    op._dispatch_cache.clear()
+
+
+_replace_builtin_decomposition(
+    aten._batch_norm_with_update.default, _batch_norm_with_update_decomposition
+)
+_replace_builtin_decomposition(
+    aten._batch_norm_with_update_functional.default,
+    _batch_norm_with_update_functional_decomposition,
+)
+
+
+@register_decomposition([aten.frexp.Tensor])
+def frexp_decomposition(self):
+    """Decompose ``frexp`` into ``(mantissa, exponent)`` via ``log2 + floor``.
+
+    ``frexp(x)`` returns ``(m, e)`` such that ``x = m * 2**e`` and
+    ``|m| in [0.5, 1)`` for finite non-zero ``x``. For ``x in {0, +inf, -inf,
+    NaN}`` PyTorch returns ``m = x`` and ``e = 0``.
+
+    Implementation:
+      exponent = floor(log2(|x|)) + 1
+      mantissa = x / 2**exponent
+    The specials are handled with a mask so ``log2(0)``/``log2(inf)`` don't
+    propagate into the finite-nonzero path (we substitute 1.0 there via
+    ``torch.where`` before taking the log).
+
+    Mantissa keeps the input dtype; exponent is ``int32`` (matches CPU).
+    """
+    is_finite_nonzero = torch.isfinite(self) & (self != 0)
+    abs_self = torch.abs(self)
+    # Substitute 1.0 in the "special" lanes so log2 doesn't produce -inf/inf/NaN
+    # that could poison the finite lane through subsequent arithmetic even
+    # though we mask it out at the end.
+    safe_abs = torch.where(is_finite_nonzero, abs_self, torch.ones_like(abs_self))
+    log2_abs = torch.log2(safe_abs)
+    exponent_f = torch.floor(log2_abs) + 1.0
+    # 2**exponent for the finite lane; 1.0 otherwise (so the division below
+    # is a no-op and mantissa = self for specials).
+    scale = torch.where(
+        is_finite_nonzero,
+        torch.exp2(exponent_f),
+        torch.ones_like(exponent_f),
+    )
+    mantissa = self / scale
+    # Specials: mantissa = self, exponent = 0.
+    mantissa = torch.where(is_finite_nonzero, mantissa, self)
+    exponent = torch.where(
+        is_finite_nonzero,
+        exponent_f.to(torch.int32),
+        torch.zeros_like(exponent_f, dtype=torch.int32),
+    )
+    return mantissa, exponent
+
+
 @register_decomposition([aten.addcmul.default])
 def addcmul_decomposition(input, tensor1, tensor2, value=1):
     """Decompose addcmul: input + value * tensor1 * tensor2."""
