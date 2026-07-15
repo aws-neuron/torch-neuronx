@@ -112,9 +112,9 @@ class TestDecompositionTable:
             # custom decompositions (see TestUpsampleLinearFamilyDecomposition).
             torch.ops.aten.upsample_nearest2d.default,
             torch.ops.aten.upsample_nearest2d.vec,
-            torch.ops.aten.upsample_bicubic2d.default,
             torch.ops.aten._upsample_nearest_exact2d.default,
             torch.ops.aten._upsample_nearest_exact2d.vec,
+            torch.ops.aten.upsample_bicubic2d.default,
         ],
     )
     def test_pytorch_builtin_decompositions_registered(self, op):

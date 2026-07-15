@@ -186,6 +186,18 @@ neuron_decompositions = get_decompositions(
         aten.upsample_nearest2d,
         aten.upsample_bicubic2d,
         aten._upsample_nearest_exact2d,
+        # count_nonzero, multi_margin_loss, and multilabel_margin_loss_forward
+        # all have correct built-in decompositions wrapped with ``@out_wrapper``,
+        # so pulling in the packet covers both the ``.default`` and the
+        # ``.out``/``.output`` overloads without any custom code on our side.
+        # The ``.default`` overloads already lowered fine on Neuron; the
+        # ``.out``/``.output`` overloads fail to legalize without a decomp.
+        aten.count_nonzero,
+        aten.multi_margin_loss,
+        # ``multilabel_margin_loss_forward.default`` uses PyTorch's built-in
+        # decomp; the ``.output`` variant is registered below with a fix for
+        # the ``is_target`` dtype mismatch that PyTorch's decomp introduces.
+        aten.multilabel_margin_loss_forward.default,
     ]
 )
 
@@ -4894,6 +4906,428 @@ def upsample_bilinear2d_aa_backward_decomposition(
         W, ow, scales_w, align_corners, True, grad_output.device, grad_output.dtype
     )
     return torch.einsum("oi,ncow,wj->ncij", wh, grad_output, ww)
+
+
+# ── _trilinear — 3-input tensor contraction used by nn.Bilinear ──────────
+@register_decomposition([aten._trilinear.default])
+def _trilinear_decomp(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim=1):
+    """Decompose ``_trilinear`` into unsqueeze + broadcast multiply + sum + squeeze.
+
+    ``_trilinear`` (used internally by ``torch.nn.Bilinear`` with three inputs)
+    inserts size-1 dims at each ``expand{1,2,3}`` position of the
+    corresponding input, then computes the elementwise product ``i1 * i2 * i3``
+    and reduces over the ``sumdim`` axes. See ``aten/src/ATen/native/Linear.cpp``.
+
+    ``unroll_dim`` is a CUDA-kernel-only optimization hint and has no effect
+    on the mathematical output; ignored here.
+    """
+    del unroll_dim
+    # aten's reference iterates ``expand`` lists in ascending order because
+    # each unsqueeze shifts higher dim indices right.
+    for d in sorted(expand1):
+        i1 = i1.unsqueeze(d)
+    for d in sorted(expand2):
+        i2 = i2.unsqueeze(d)
+    for d in sorted(expand3):
+        i3 = i3.unsqueeze(d)
+    out = i1 * i2 * i3
+    # Sum with keepdim so ``sumdim`` indices remain valid across iterations,
+    # then squeeze from largest to smallest to keep indices consistent.
+    for d in sumdim:
+        out = out.sum(d, keepdim=True)
+    for d in sorted(sumdim, reverse=True):
+        out = out.squeeze(d)
+    return out
+
+
+@register_decomposition([aten._trilinear.out])
+def _trilinear_out_decomp(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim=1, *, out):
+    """``.out`` variant — compute functional result, copy into ``out``."""
+    result = _trilinear_decomp(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim)
+    out.copy_(result)
+    return out
+
+
+# ── grid_sampler_3d — 3D variant of grid_sample ─────────────────────────
+def _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_corners):
+    """Decompose 3D grid sampling.
+
+    Mirrors PyTorch's built-in 2D decomposition (``_decomp/decompositions.py``
+    ``_grid_sampler_2d``) with an extra spatial axis. Supports
+    ``interpolation_mode=0`` (trilinear) and ``=1`` (nearest); bicubic (=2)
+    is not defined for 3D input by aten itself, so we return ``NotImplemented``
+    and let the caller fall back.
+
+    Args:
+        input: (N, C, D, H, W)
+        grid : (N, oD, oH, oW, 3) — normalized (x, y, z) coords in [-1, 1]
+        interpolation_mode: 0 = trilinear, 1 = nearest
+        padding_mode:       0 = zeros, 1 = border, 2 = reflection
+        align_corners: whether ±1 maps to voxel corners or centers
+
+    Returns:
+        (N, C, oD, oH, oW) resampled tensor.
+    """
+    if interpolation_mode not in (0, 1):
+        return NotImplemented
+    if padding_mode not in (0, 1, 2):
+        return NotImplemented
+
+    def unnormalize(coords, size):
+        mul = (size * 0.5 - 0.5) if align_corners else (size * 0.5)
+        ofs = size * 0.5 - 0.5
+        return coords * mul + ofs
+
+    def reflect(coords, twice_low, twice_high):
+        if twice_low == twice_high:
+            return torch.zeros_like(coords)
+        coords_min = twice_low / 2
+        coords_span = (twice_high - twice_low) / 2
+        coords2 = (coords - coords_min).abs()
+        extra = torch.fmod(coords2, coords_span)
+        flips = (coords2 / coords_span).floor().to(dtype=torch.int8)
+        return torch.where(flips & 1 == 0, extra + coords_min, coords_span + coords_min - extra)
+
+    def compute_coordinates(coords, size):
+        if padding_mode == 0:
+            return coords
+        if padding_mode == 1:
+            return torch.clamp(coords, 0, size - 1)
+        # Reflection
+        if align_corners:
+            coords_reflected = reflect(coords, 0, 2 * (size - 1))
+        else:
+            coords_reflected = reflect(coords, -1, 2 * size - 1)
+        return torch.clamp(coords_reflected, 0, size - 1)
+
+    def compute_source_index(coords, size):
+        return compute_coordinates(unnormalize(coords, size), size)
+
+    N, C, iD, iH, iW = input.shape
+    _, oD, oH, oW, three = grid.shape
+    if three != 3:
+        raise AssertionError(f"grid last dimension must be 3 (x, y, z) for 3D, got {three}")
+
+    # Broadcast grid across the channel axis so a single indexed gather can
+    # emit one output tensor instead of gather-per-channel.
+    grid = grid.view(N, 1, oD, oH, oW, three).expand(N, C, oD, oH, oW, 3)
+
+    N_idx = torch.arange(N, device=input.device).view(N, 1, 1, 1, 1)
+    C_idx = torch.arange(C, device=input.device).view(1, C, 1, 1, 1)
+
+    def in_bounds(xs, ys, zs):
+        return (xs >= 0) & (xs < iW) & (ys >= 0) & (ys < iH) & (zs >= 0) & (zs < iD)
+
+    def clip(xs, ys, zs, ws):
+        cond = in_bounds(xs, ys, zs)
+        return tuple(
+            torch.where(cond, t, 0).view(N, C, oD, oH, oW)
+            for t in (
+                xs.to(dtype=torch.int64),
+                ys.to(dtype=torch.int64),
+                zs.to(dtype=torch.int64),
+                ws,
+            )
+        )
+
+    def summand(ix, iy, iz, w):
+        idx_x, idx_y, idx_z, w_ = clip(ix, iy, iz, w)
+        return input[N_idx, C_idx, idx_z, idx_y, idx_x] * w_
+
+    x = grid[..., 0]
+    y = grid[..., 1]
+    z = grid[..., 2]
+
+    if interpolation_mode == 0:  # Trilinear
+        ix = compute_source_index(x, iW)
+        iy = compute_source_index(y, iH)
+        iz = compute_source_index(z, iD)
+
+        ix0, iy0, iz0 = ix.floor(), iy.floor(), iz.floor()
+        ix1, iy1, iz1 = ix0 + 1, iy0 + 1, iz0 + 1
+
+        # Per-corner weights (trilinear interpolation).
+        wx0, wx1 = ix1 - ix, ix - ix0
+        wy0, wy1 = iy1 - iy, iy - iy0
+        wz0, wz1 = iz1 - iz, iz - iz0
+
+        # 8 corners
+        corners = [
+            (ix0, iy0, iz0, wx0 * wy0 * wz0),
+            (ix1, iy0, iz0, wx1 * wy0 * wz0),
+            (ix0, iy1, iz0, wx0 * wy1 * wz0),
+            (ix1, iy1, iz0, wx1 * wy1 * wz0),
+            (ix0, iy0, iz1, wx0 * wy0 * wz1),
+            (ix1, iy0, iz1, wx1 * wy0 * wz1),
+            (ix0, iy1, iz1, wx0 * wy1 * wz1),
+            (ix1, iy1, iz1, wx1 * wy1 * wz1),
+        ]
+        result = summand(*corners[0])
+        for c in corners[1:]:
+            result = result + summand(*c)
+        return result
+
+    # interpolation_mode == 1, Nearest
+    ix = compute_source_index(x, iW).round()
+    iy = compute_source_index(y, iH).round()
+    iz = compute_source_index(z, iD).round()
+    return summand(ix, iy, iz, torch.ones_like(ix))
+
+
+@register_decomposition([aten.grid_sampler_3d.default])
+def grid_sampler_3d_decomp(input, grid, interpolation_mode, padding_mode, align_corners):
+    return _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_corners)
+
+
+@register_decomposition([aten.grid_sampler_3d.out])
+def grid_sampler_3d_out_decomp(
+    input, grid, interpolation_mode, padding_mode, align_corners, *, out
+):
+    result = _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_corners)
+    if result is NotImplemented:
+        return NotImplemented
+    out.copy_(result)
+    return out
+
+
+# ── _embedding_bag — bag-reduce embeddings by offsets ──────────────────
+def _compute_offset2bag(offsets, num_bags, indices_len, device):
+    """For each input index position, return which bag it belongs to.
+
+    ``bag[i] = j`` such that ``offsets[j] <= i < offsets[j + 1]`` (with the
+    virtual sentinel ``offsets[num_bags] = indices_len``). Implemented as
+    ``count(offsets[:num_bags] <= i) - 1`` via broadcast + sum.
+    """
+    positions = torch.arange(indices_len, device=device, dtype=offsets.dtype)
+    # (num_bags, indices_len) comparison.
+    leading_offsets = offsets[:num_bags]
+    mask = leading_offsets.unsqueeze(-1) <= positions.unsqueeze(0)
+    bag = mask.sum(dim=0) - 1
+    return torch.clamp(bag, 0, num_bags - 1)
+
+
+def _embedding_bag_impl(
+    weight,
+    indices,
+    offsets,
+    scale_grad_by_freq=False,
+    mode=0,
+    sparse=False,
+    per_sample_weights=None,
+    include_last_offset=False,
+    padding_idx=-1,
+):
+    """Shared body for the ``_embedding_bag.default`` / ``.out`` decompositions.
+
+    Supports ``mode=0`` (sum) and ``mode=1`` (mean); ``mode=2`` (max) returns
+    ``NotImplemented`` so PyTorch falls through to its built-in decomp.
+
+    Returns ``(output, offset2bag, bag_size, max_indices)``:
+      * ``output``: (num_bags, embedding_dim)
+      * ``offset2bag``: (indices_len,) — bag index for each input position
+      * ``bag_size``: (num_bags,) — count of non-padded indices per bag
+      * ``max_indices``: empty (only populated by mode=2, which we don't handle)
+
+    Implementation note: several idioms below avoid Python-literal casts /
+    redundant ``.to(...)`` calls. Dynamo captures those as ``_to_copy`` +
+    ``detach_`` nodes, which AOT autograd's functionalization check rejects.
+    """
+    if mode not in (0, 1):
+        return NotImplemented
+    _ = scale_grad_by_freq  # only affects backward
+    _ = sparse  # sparse-gradient mode unused during forward
+
+    embed_dim = weight.shape[1]
+    indices_len = indices.shape[0]
+    num_bags = offsets.shape[0] - (1 if include_last_offset else 0)
+
+    if include_last_offset:
+        offsets_full = offsets
+    else:
+        # Append a sentinel so bag-size uses one uniform expression below.
+        # ``new_full`` (not ``torch.tensor([literal])``) keeps the graph
+        # functional — see impl note in the docstring.
+        sentinel = offsets.new_full((1,), indices_len)
+        offsets_full = torch.cat([offsets, sentinel])
+
+    offset2bag = _compute_offset2bag(offsets_full, num_bags, indices_len, indices.device)
+
+    # Raw count of positions per bag; overwritten below when padding_idx>=0.
+    bag_size = offsets_full[1 : num_bags + 1] - offsets_full[:num_bags]
+
+    # Use ``torch.embedding`` (already has a built-in decomp) rather than
+    # ``weight[indices]``; the advanced-indexing path inserts an implicit
+    # ``.long()`` cast on ``indices`` that turns into ``aten.detach_`` under
+    # tracing. ``padding_idx=-1`` disables built-in masking — we handle it
+    # ourselves below to also fix up ``bag_size``.
+    emb = torch.embedding(weight, indices, padding_idx=-1)
+
+    if padding_idx >= 0:
+        # Zero out padded rows and recount bag_size as non-padding entries only.
+        pad_mask = (indices != padding_idx).to(emb.dtype).unsqueeze(-1)
+        emb = emb * pad_mask
+        bag_size = torch.zeros(num_bags, dtype=offsets.dtype, device=offsets.device)
+        bag_size = bag_size.scatter_add(
+            0,
+            offset2bag,
+            (indices != padding_idx).to(offsets.dtype),
+        )
+
+    # per_sample_weights is mode=0 only per the op schema.
+    if per_sample_weights is not None:
+        emb = emb * per_sample_weights.unsqueeze(-1).to(emb.dtype)
+
+    # ``offset2bag`` is already int64 (bool.sum promotes to int64), so no
+    # explicit ``.to(torch.int64)`` is inserted here.
+    output = torch.zeros((num_bags, embed_dim), dtype=weight.dtype, device=weight.device)
+    idx_2d = offset2bag.unsqueeze(-1).expand(indices_len, embed_dim)
+    output = output.scatter_add(0, idx_2d, emb)
+
+    if mode == 1:  # mean
+        denom = torch.clamp(bag_size, min=1).to(output.dtype).unsqueeze(-1)
+        output = output / denom
+
+    # max_indices is only populated for mode=2 (max); emit an empty tensor.
+    max_indices = indices.new_empty(0)
+
+    # Match ``indices`` integer width, but only cast when actually different
+    # to avoid emitting a no-op ``_to_copy`` into the graph.
+    if offset2bag.dtype != indices.dtype:
+        offset2bag = offset2bag.to(indices.dtype)
+    if bag_size.dtype != indices.dtype:
+        bag_size = bag_size.to(indices.dtype)
+
+    return output, offset2bag, bag_size, max_indices
+
+
+@register_decomposition([aten._embedding_bag.default])
+def _embedding_bag_decomp(
+    weight,
+    indices,
+    offsets,
+    scale_grad_by_freq=False,
+    mode=0,
+    sparse=False,
+    per_sample_weights=None,
+    include_last_offset=False,
+    padding_idx=-1,
+):
+    return _embedding_bag_impl(
+        weight,
+        indices,
+        offsets,
+        scale_grad_by_freq,
+        mode,
+        sparse,
+        per_sample_weights,
+        include_last_offset,
+        padding_idx,
+    )
+
+
+@register_decomposition([aten._embedding_bag.out])
+def _embedding_bag_out_decomp(
+    weight,
+    indices,
+    offsets,
+    scale_grad_by_freq=False,
+    mode=0,
+    sparse=False,
+    per_sample_weights=None,
+    include_last_offset=False,
+    padding_idx=-1,
+    *,
+    out0,
+    out1,
+    out2,
+    out3,
+):
+    result = _embedding_bag_impl(
+        weight,
+        indices,
+        offsets,
+        scale_grad_by_freq,
+        mode,
+        sparse,
+        per_sample_weights,
+        include_last_offset,
+        padding_idx,
+    )
+    if result is NotImplemented:
+        return NotImplemented
+    output, offset2bag, bag_size, max_indices = result
+    out0.copy_(output)
+    out1.copy_(offset2bag)
+    out2.copy_(bag_size)
+    # max_indices may be empty; only copy if the out buffer has matching numel.
+    if out3.numel() == max_indices.numel():
+        out3.copy_(max_indices)
+    return out0, out1, out2, out3
+
+
+# ── multilabel_margin_loss_forward.output — cast is_target to correct dtype ─
+# PyTorch's built-in decomposition for ``multilabel_margin_loss_forward``
+# returns ``is_target`` cast to ``input.dtype`` (float), but the ``.output``
+# out-variant expects it in ``target.dtype`` (typically ``int64``). Under
+# fake-tensor tracing the safety check ("Attempting to cast from float to
+# int64 ... not safe") fires. Overriding the ``.output`` overload with a
+# decomp that runs the default and re-casts fixes the ``.output`` path
+# without touching the ``.default`` path (which is already supported).
+@register_decomposition([aten.multilabel_margin_loss_forward.output])
+def multilabel_margin_loss_forward_output_decomp(input, target, reduction, *, output, is_target):
+    z, ist = aten.multilabel_margin_loss_forward.default(input, target, reduction)
+    output.copy_(z)
+    is_target.copy_(ist.to(is_target.dtype))
+    return output, is_target
+
+
+# Fake-tensor tracing consults ``torch._decomp.decomposition_table`` and
+# ``py_kernels[Meta]`` BEFORE our per-backend table is applied, so registering
+# on ``neuron_decompositions`` alone isn't enough — the buggy PyTorch decomp
+# still fires during shape inference. Replace both entries here so fake-
+# tensor dispatch also takes the corrected path.
+decomp.decomposition_table[aten.multilabel_margin_loss_forward.output] = (
+    multilabel_margin_loss_forward_output_decomp
+)
+aten.multilabel_margin_loss_forward.output.py_kernels[torch._C.DispatchKey.Meta] = (
+    multilabel_margin_loss_forward_output_decomp
+)
+aten.multilabel_margin_loss_forward.output._dispatch_cache.clear()
+
+
+# ── put / put_ — write source values at flat-indexed positions ──────────
+
+
+def _put_impl(self, index, source, accumulate=False):
+    """Functional core: return a copy of ``self`` with ``source`` written at
+    the flat positions specified by ``index``.
+
+    ``put`` treats ``self`` as flat and writes ``source[i]`` at
+    ``self.flatten()[index[i]]``. With ``accumulate=True`` it uses += instead
+    of assignment (undefined behaviour on repeated indices otherwise, per
+    PyTorch docs).
+    """
+    flat_self = self.contiguous().reshape(-1)
+    flat_index = index.reshape(-1).to(torch.int64)
+    flat_source = source.reshape(-1).to(flat_self.dtype)
+    if accumulate:
+        result = flat_self.scatter_add(0, flat_index, flat_source)
+    else:
+        result = flat_self.scatter(0, flat_index, flat_source)
+    return result.reshape(self.shape)
+
+
+@register_decomposition([aten.put.default])
+def put_decomp(self, index, source, accumulate=False):
+    """Functional ``put`` — write source into a flat-indexed copy of self."""
+    return _put_impl(self, index, source, accumulate)
+
+
+@register_decomposition([aten.put_.default])
+def put_inplace_decomp(self, index, source, accumulate=False):
+    """In-place ``put_`` — same math, then copy_ back onto self."""
+    self.copy_(_put_impl(self, index, source, accumulate))
+    return self
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
