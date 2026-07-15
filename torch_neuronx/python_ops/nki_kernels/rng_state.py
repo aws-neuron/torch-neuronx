@@ -13,12 +13,15 @@ logger = logging.getLogger(__name__)
 try:
     from nkilib.experimental.rng.rng import (
         NUM_RNG_SEEDS,
-        generate_random,
+        generate_random_fast,
         get_rng_state_gpsimd,
         set_rng_state_gpsimd,
     )
 
-    wrapped_rand = wrap_nki(generate_random)
+    # Fast multi-lane kernel (all 128 GPSIMD lanes, per-lane seeded). This is the
+    # only RNG path: dropout (the sole consumer) only needs a correct independent
+    # random distribution, for which the value->position mapping is irrelevant.
+    wrapped_rand = wrap_nki(generate_random_fast)
     # Set has_side_effect as an attribute to avoid modifying wrap_nki,
     # which may be deprecated
     wrapped_rand.has_side_effect = True
