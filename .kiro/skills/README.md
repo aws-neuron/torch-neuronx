@@ -63,6 +63,35 @@ Cross-references `docs/AI-*.md` for subsystem
 context; evaluates BC per `bc-guidelines.md`; walks the diff against
 `review-checklist.md`.
 
+### `accuracy/` — Neuron-vs-GPU accuracy skill suite
+
+A nested **suite** (a master `accuracy` index/router + 25 sub-skills) for
+validating and debugging that a model computes the same thing on Neuron (TRN) as
+on a GPU/CPU reference — from a single module up to a 10k-step training run. The
+master `accuracy/SKILL.md` routes to the right sub-skill; **each sub-skill is also
+usable directly**. Covers dense and MoE models (DeepSeek-V3, Qwen3, Llama4,
+GPT-OSS, Llama3). Grouped:
+
+- **Level router** — `moduscope-accuracy-levels` (module → op/NKI → 5/50/10k-step → activation compare).
+- **Debugging** — `moduscope-op-bisect` (per-op fwd/bwd localization: eager
+  `torch.save`, compiled return-intermediates, NKI `nl.device_print` via
+  `wrap_nki` + `NEURON_RT_DEBUG_OUTPUT_DIR`), `moduscope-accuracy-debug`,
+  `activation-compare` (per-layer FrobRatio/CosSim across steps + loss-spike
+  X-1 param-norm workflow), `moduscope-result-triage`, `moduscope-test-roadblocks`.
+- **Standards / knowledge** — `neuron-accuracy-issues` (9 known causes, precision
+  RCs, CRs, exit criteria, prevention rules), `large-model-accuracy-bounds`
+  (bf16-ULP perturbation envelope + grad-norm-diff, accept without fp32),
+  `moduscope-reference-fidelity`.
+- **Component suite (`test_00..16`)** — `moduscope-component-tests`, `-run-test`,
+  `-dist-sweep`, `-add-test-module`, `-model-profile`, `-register-model`,
+  `-statedict-mapping`, `-gpu-baselines`, `-trn-compare`, `-env-bootstrap`,
+  `-node-select`, `-parallel-orchestration`, `-newmodel`, `-autopilot`.
+- **Full-model runs** — `titan-accuracy` (GPU H200 vs TRN2 e2e), `apples-10k-trn-vs-gpu`.
+
+Personal paths are parameterized (`$SHARED`, `$VENV`, `$LOGIN_HOST`, `$SSH_KEY`,
+`$USER`, …) — see the placeholder table in `accuracy/SKILL.md`. Portable
+self-tests (torch only) ship under several sub-skills' `scripts/`.
+
 ## Layout
 
 ```
@@ -95,13 +124,24 @@ context; evaluates BC per `bc-guidelines.md`; walks the diff against
 │   ├── SKILL.md                            PR / branch review workflow
 │   ├── review-checklist.md                 per-subsystem review items
 │   └── bc-guidelines.md                    backward-compat rules for torch_neuronx
-└── agent-isolation/
-    ├── SKILL.md                            kit + three-tier dispatch policy
-    └── scripts/
-        ├── agent-run                       per-agent core/port/cache scoping
-        ├── provision-worktree              per-agent isolated checkout
-        ├── with-hw-lock                    serialize hardware commands
-        └── lib/agent_port_isolation.py     pytest plugin for port windows
+├── agent-isolation/
+│   ├── SKILL.md                            kit + three-tier dispatch policy
+│   └── scripts/
+│       ├── agent-run                       per-agent core/port/cache scoping
+│       ├── provision-worktree              per-agent isolated checkout
+│       ├── with-hw-lock                    serialize hardware commands
+│       └── lib/agent_port_isolation.py     pytest plugin for port windows
+└── accuracy/                               Neuron-vs-GPU accuracy suite (25 skills)
+    ├── SKILL.md                            master index + router + placeholders
+    ├── moduscope-accuracy-levels/          testing-level ladder (module→op→run→activation)
+    ├── moduscope-op-bisect/                per-op fwd/bwd localization (+ portable self-tests)
+    ├── moduscope-accuracy-debug/           triage→attribute→localize→characterize loop
+    ├── activation-compare/                 per-layer FrobRatio/CosSim across steps (+ loss-spike)
+    ├── neuron-accuracy-issues/             9 causes, precision RCs, CRs, exit criteria (+ assets/)
+    ├── large-model-accuracy-bounds/        bf16-ULP envelope + grad-norm-diff (no fp32)
+    ├── moduscope-component-tests/ … +13 more   build & run test_00..16
+    ├── titan-accuracy/ · apples-10k-trn-vs-gpu/   full-model 5/50/10k-step runs
+    └── … (each sub-dir = one skill: SKILL.md [+ scripts/ / assets/])
 ```
 
 ## How to use
@@ -120,10 +160,18 @@ context; evaluates BC per `bc-guidelines.md`; walks the diff against
   `scripts/` for the kit (`agent-run`, `provision-worktree`,
   `with-hw-lock`). Used by the orchestrator at
   `.kiro/agents/upstream-debugger-orchestrator.md`.
+- **Validating or debugging model numerical accuracy on Neuron** → `accuracy/`.
+  Start with `accuracy/SKILL.md` (the master router) to pick the level/skill, or
+  load a sub-skill directly (e.g. `moduscope-op-bisect` to localize a divergent
+  op, `neuron-accuracy-issues` to recognize a known cause). Set the placeholders
+  from `accuracy/SKILL.md` before running any script.
 
 ## Conventions
 
 - One directory per skill, exactly one `SKILL.md` at its root.
+- A **suite** (like `accuracy/`) may nest sub-skill directories under a folder
+  that also has its own master `SKILL.md`; recursive `skill://.kiro/skills/**/SKILL.md`
+  discovery finds them all, and each sub-skill stays independently usable.
 - Skill names are lowercase with hyphens and match their directory name.
 - `description` in frontmatter says both what the skill covers and when
   to use it, so the skill matcher picks it up.
