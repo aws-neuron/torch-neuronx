@@ -4375,6 +4375,307 @@ def kaiser_window_decomposition(
     return _i0_approx(arg) / _i0_approx(beta_t)
 
 
+# ── Special function decompositions ─────────────────────────────────────────
+# Bessel / modified-Bessel / normal-CDF / Laguerre / polygamma ops all fail
+# torch-mlir lowering natively. Each here reduces to primitives Neuron
+# supports (elementary math, erf/erfc/erfinv, special_zeta). Bessel-family
+# lowerings use the Abramowitz & Stegun polynomial approximations (same style
+# as _i0_approx); bf16/fp16 upcast to fp32 internally for accuracy.
+
+
+def _i0e_approx(x):
+    """exp(-|x|) * I0(x) via A&S 9.8.1/9.8.2. Large-|x| branch drops exp(|x|)
+    so I0e stays finite where I0 itself would overflow."""
+    ax = torch.abs(x)
+    t = x / 3.75
+    t2 = t * t
+    small = torch.exp(-ax) * (
+        1.0
+        + t2
+        * (
+            3.5156229
+            + t2
+            * (3.0899424 + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813))))
+        )
+    )
+    u = 3.75 / ax
+    large = (1.0 / torch.sqrt(ax)) * (
+        0.39894228
+        + u
+        * (
+            0.01328592
+            + u
+            * (
+                0.00225319
+                + u
+                * (
+                    -0.00157565
+                    + u
+                    * (
+                        0.00916281
+                        + u * (-0.02057706 + u * (0.02635537 + u * (-0.01647633 + u * 0.00392377)))
+                    )
+                )
+            )
+        )
+    )
+    return torch.where(ax < 3.75, small, large)
+
+
+def _i1_approx(x):
+    """I1(x) via A&S 9.8.3/9.8.4. Odd function."""
+    ax = torch.abs(x)
+    t = x / 3.75
+    t2 = t * t
+    small = x * (
+        0.5
+        + t2
+        * (
+            0.87890594
+            + t2
+            * (
+                0.51498869
+                + t2 * (0.15084934 + t2 * (0.02658733 + t2 * (0.00301532 + t2 * 0.00032411)))
+            )
+        )
+    )
+    u = 3.75 / ax
+    large_mag = (torch.exp(ax) / torch.sqrt(ax)) * (
+        0.39894228
+        + u
+        * (
+            -0.03988024
+            + u
+            * (
+                -0.00362018
+                + u
+                * (
+                    0.00163801
+                    + u
+                    * (
+                        -0.01031555
+                        + u * (0.02282967 + u * (-0.02895312 + u * (0.01787654 + u * -0.00420059)))
+                    )
+                )
+            )
+        )
+    )
+    large = torch.sign(x) * large_mag
+    return torch.where(ax < 3.75, small, large)
+
+
+def _bessel_j0_approx(x):
+    """J0(x) via A&S 9.4.1/9.4.3. Even function."""
+    ax = torch.abs(x)
+    y = (ax / 3.0) * (ax / 3.0)
+    small = 1.0 + y * (
+        -2.2499997
+        + y * (1.2656208 + y * (-0.3163866 + y * (0.0444479 + y * (-0.0039444 + y * 0.00021))))
+    )
+    u = 3.0 / ax
+    f0 = 0.79788456 + u * (
+        -0.00000077
+        + u
+        * (-0.00552740 + u * (-0.00009512 + u * (0.00137237 + u * (-0.00072805 + u * 0.00014476))))
+    )
+    theta0 = (
+        ax
+        - 0.78539816
+        + u
+        * (
+            -0.04166397
+            + u
+            * (
+                -0.00003954
+                + u * (0.00262573 + u * (-0.00054125 + u * (-0.00029333 + u * 0.00013558)))
+            )
+        )
+    )
+    large = f0 * torch.cos(theta0) / torch.sqrt(ax)
+    return torch.where(ax <= 3.0, small, large)
+
+
+def _bessel_j1_approx(x):
+    """J1(x) via A&S 9.4.4/9.4.6. Odd function."""
+    ax = torch.abs(x)
+    y = (ax / 3.0) * (ax / 3.0)
+    small = x * (
+        0.5
+        + y
+        * (
+            -0.56249985
+            + y
+            * (
+                0.21093573
+                + y * (-0.03954289 + y * (0.00443319 + y * (-0.00031761 + y * 0.00001109)))
+            )
+        )
+    )
+    u = 3.0 / ax
+    f1 = 0.79788456 + u * (
+        0.00000156
+        + u
+        * (0.01659667 + u * (0.00017105 + u * (-0.00249511 + u * (0.00113653 + u * -0.00020033))))
+    )
+    theta1 = (
+        ax
+        - 2.35619449
+        + u
+        * (
+            0.12499612
+            + u
+            * (
+                0.00005650
+                + u * (-0.00637879 + u * (0.00074348 + u * (0.00079824 + u * -0.00029166)))
+            )
+        )
+    )
+    large = torch.sign(x) * f1 * torch.cos(theta1) / torch.sqrt(ax)
+    return torch.where(ax <= 3.0, small, large)
+
+
+def _special_upcast(fn):
+    """Upcast bf16/fp16 to fp32 for A&S polynomial evaluation, cast back at the end."""
+
+    def wrapper(x, *args, **kwargs):
+        orig = x.dtype
+        if orig in (torch.float16, torch.bfloat16):
+            return fn(x.to(torch.float32), *args, **kwargs).to(orig)
+        return fn(x, *args, **kwargs)
+
+    return wrapper
+
+
+@register_decomposition([aten.i0.default])
+def i0_decomp(x):
+    return _special_upcast(_i0_approx)(x)
+
+
+@register_decomposition([aten.special_i0e.default])
+def special_i0e_decomp(x):
+    return _special_upcast(_i0e_approx)(x)
+
+
+@register_decomposition([aten.special_i1.default])
+def special_i1_decomp(x):
+    return _special_upcast(_i1_approx)(x)
+
+
+@register_decomposition([aten.special_bessel_j0.default])
+def special_bessel_j0_decomp(x):
+    return _special_upcast(_bessel_j0_approx)(x)
+
+
+@register_decomposition([aten.special_bessel_j1.default])
+def special_bessel_j1_decomp(x):
+    return _special_upcast(_bessel_j1_approx)(x)
+
+
+def _spherical_bessel_j0_impl(x):
+    """sinc(x) = sin(x)/x with Taylor series near x=0 to avoid the 0/0."""
+    ax = torch.abs(x)
+    x2 = x * x
+    near_zero = 1.0 - x2 / 6.0 + x2 * x2 / 120.0
+    safe_x = torch.where(ax < 1e-4, torch.ones_like(x), x)
+    away = torch.sin(x) / safe_x
+    return torch.where(ax < 1e-4, near_zero, away)
+
+
+@register_decomposition([aten.special_spherical_bessel_j0.default])
+def special_spherical_bessel_j0_decomp(x):
+    return _special_upcast(_spherical_bessel_j0_impl)(x)
+
+
+@register_decomposition([aten.special_ndtri.default])
+def special_ndtri_decomp(p):
+    """ndtri(p) = sqrt(2) * erfinv(2p - 1)."""
+    return math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)
+
+
+def _log_ndtr_impl(x):
+    """log(Phi(x)) via erfc for x > -8; Mills-ratio asymptotic tail below where
+    erfc underflows in fp32."""
+    main = torch.log(0.5 * torch.erfc(-x * (1.0 / math.sqrt(2.0))))
+    z = 1.0 / (x * x)
+    tail = torch.log1p(-z + 3.0 * z * z - 15.0 * z * z * z)
+    asymp = -0.5 * x * x - torch.log(torch.abs(x)) - 0.5 * math.log(2 * math.pi) + tail
+    return torch.where(x > -8.0, main, asymp)
+
+
+@register_decomposition([aten.special_log_ndtr.default])
+def special_log_ndtr_decomp(x):
+    return _special_upcast(_log_ndtr_impl)(x)
+
+
+def _laguerre_impl(x, n):
+    """L_n(x) via the 3-term recurrence, unrolled since n is compile-time."""
+    if n == 0:
+        return torch.ones_like(x)
+    if n == 1:
+        return 1.0 - x
+    Lm1, L = torch.ones_like(x), 1.0 - x
+    for k in range(1, n):
+        Lm1, L = L, ((2.0 * k + 1.0 - x) * L - k * Lm1) / (k + 1.0)
+    return L
+
+
+def _extract_int_scalar(n):
+    """Return n as a Python int only if it's already a Python scalar; else None.
+
+    Tensor n (including 0-d) returns None so the caller bails to NotImplemented.
+    .item() on a FakeTensor during trace raises DataDependentOutputException;
+    keeping decomp behavior explicit is cleaner than relying on that exception.
+    """
+    if isinstance(n, int | float):
+        return int(n)
+    return None
+
+
+@register_decomposition([aten.special_laguerre_polynomial_l.default])
+def laguerre_polynomial_l_default_decomp(x, n):
+    n_int = _extract_int_scalar(n)
+    if n_int is None or n_int < 0:
+        # n must be a compile-time int to unroll the recurrence; tensor n
+        # (incl. 0-d) can't be extracted during FakeTensor tracing, and
+        # negative n is outside the Laguerre polynomial domain.
+        return NotImplemented
+    return _special_upcast(_laguerre_impl)(x, n_int)
+
+
+@register_decomposition([aten.special_laguerre_polynomial_l.n_scalar])
+def laguerre_polynomial_l_n_scalar_decomp(x, n):
+    return _special_upcast(_laguerre_impl)(x, int(n))
+
+
+@register_decomposition([aten.special_laguerre_polynomial_l.x_scalar])
+def laguerre_polynomial_l_x_scalar_decomp(x, n):
+    n_int = _extract_int_scalar(n)
+    if n_int is None or n_int < 0:
+        # Same as .default: tensor n can't be unrolled, negative n is invalid.
+        return NotImplemented
+    x_t = torch.tensor(float(x), dtype=torch.get_default_dtype())
+    return _special_upcast(_laguerre_impl)(x_t, n_int)
+
+
+@register_decomposition([aten.polygamma.default])
+def polygamma_decomp(n, x):
+    """polygamma(n, x) = (-1)^(n+1) * n! * zeta(n+1, x) for n >= 1.
+
+    n == 0 (digamma) diverges under this identity — bail so aten.digamma runs.
+    """
+    if not isinstance(n, int | float):
+        # n must be a Python scalar to compute factorial and the sign at trace time.
+        return NotImplemented
+    n = int(n)
+    if n == 0:
+        # digamma (n=0) has no closed-form via zeta; let aten.digamma handle it.
+        return NotImplemented
+    sign = 1.0 if (n + 1) % 2 == 0 else -1.0
+    factor = float(math.factorial(n))
+    s_tensor = torch.full_like(x, float(n + 1))
+    return sign * factor * aten.special_zeta.default(s_tensor, x)
+
+
 def _nearest_src_index(out_size, in_size, scale, device):
     """Map each output index to its nearest source index.
 
