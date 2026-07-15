@@ -201,6 +201,26 @@ class TestCollectiveLegalization:
         assert node.args[3] == "[[0, 1]]"
 
     @patch.object(collective_legalization, "_get_process_group_ranks")
+    def test_broadcast_legalization(self, mock_get_ranks):
+        """broadcast legalizes its group arg like any other collective; src is untouched."""
+        mock_get_ranks.return_value = [[0, 1], [2, 3]]
+
+        # broadcast(tensor, src, group): group is at index 2, src at index 1
+        node = self.create_mock_fx_node(
+            "_c10d_functional.broadcast.default", ("tensor", 1, "broadcast_group")
+        )
+
+        gm = self.create_mock_graph_module([node])
+
+        pass_instance = CollectiveLegalization()
+        result = pass_instance(gm)
+
+        assert node.args[1] == 1  # src unchanged
+        assert node.args[2] == "[[0, 1], [2, 3]]"
+        gm.recompile.assert_called_once()
+        assert result.modified is True
+
+    @patch.object(collective_legalization, "_get_process_group_ranks")
     def test_shard_dim_alltoall_legalization(self, mock_get_ranks):
         """Test shard_dim_alltoall operation legalization"""
         mock_get_ranks.return_value = [[0, 1]]
@@ -398,6 +418,7 @@ class TestCollectiveOpsMapping:
             ("_c10d_functional.reduce_scatter_tensor.default", 3),
             ("_c10d_functional.all_to_all_single.default", 3),
             ("_dtensor.shard_dim_alltoall.default", 3),
+            ("_c10d_functional.broadcast.default", 2),
         ]
 
         for op_name, group_index in supported_ops:
@@ -417,3 +438,43 @@ class TestCollectiveOpsMapping:
 
             assert node.args[group_index] == "[[0, 1]]", f"Failed for {op_name}"
             assert result.modified is True
+
+
+class TestBroadcastLowering:
+    """End-to-end FX -> StableHLO lowering of broadcast.
+
+    Confirms the group arg controls the emitted replica_groups: an
+    un-legalized name falls back to the whole world, while a legalized
+    subgroup lowers to that subgroup.
+    """
+
+    def _broadcast_stablehlo(self, group_str, src, world_size=4):
+        import torch.distributed._functional_collectives
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
+            convert_fx_to_stablehlo,
+        )
+
+        def fn(x):
+            y = torch.ops._c10d_functional.broadcast.default(x, src, group_str)
+            return torch.ops._c10d_functional.wait_tensor.default(y)
+
+        example = torch.randn(8, dtype=torch.float32)
+        gm = make_fx(fn, tracing_mode="fake")(example)
+
+        with patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
+            stablehlo, _, _ = convert_fx_to_stablehlo(gm, [example])
+        return stablehlo.operation.get_asm()
+
+    def test_unlegalized_group_falls_back_to_world(self):
+        """A raw group name has no brackets, so lowering invents the world group."""
+        asm = self._broadcast_stablehlo("1", src=2, world_size=4)
+        assert "stablehlo.collective_broadcast" in asm
+        assert "replica_groups = dense<[[0, 1, 2, 3]]>" in asm
+
+    def test_legalized_subgroup_lowers_to_subgroup(self):
+        """The legalized replica_groups string is what reaches the HLO."""
+        asm = self._broadcast_stablehlo("[[2, 3]]", src=2, world_size=4)
+        assert "stablehlo.collective_broadcast" in asm
+        assert "replica_groups = dense<[[2, 3]]>" in asm
