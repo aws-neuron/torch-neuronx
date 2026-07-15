@@ -233,9 +233,16 @@ run_and_record() {
         echo ""
         echo "=== Retrying failed tests for $test_name ($num_workers_retry workers, timeout ${retry_timeout}s) ==="
 
-        # Build retry command: replace worker count and append --last-failed flags
+        # Build retry command: replace worker count and append --last-failed flags.
+        # Redirect the retry's HTML/JSON reports to distinct "-retry" filenames —
+        # otherwise the retry run (which only collects the previously-failed
+        # tests) overwrites the full-suite reports and only the retried tests
+        # show up in the uploaded artifacts.
         local retry_cmd
         retry_cmd=$(echo "$cmd" | sed -E "s/-n [0-9]+/-n $num_workers_retry/")
+        retry_cmd=$(echo "$retry_cmd" | sed -E \
+            -e 's#--html=([^ ]+)\.html#--html=\1-retry.html#' \
+            -e 's#--json-report-file=([^ ]+)\.json#--json-report-file=\1-retry.json#')
         retry_cmd="$retry_cmd --last-failed --last-failed-no-failures=none"
 
         local retry_exit=0
