@@ -76,6 +76,9 @@ MLIR_TO_TORCH_DTYPE = {
     "f8E4M3FN": torch.float8_e4m3fn,
 }
 
+if hasattr(torch, "float8_e8m0fnu"):
+    MLIR_TO_TORCH_DTYPE["f8E8M0FNU"] = torch.float8_e8m0fnu
+
 
 @dataclass(frozen=True)
 class TensorSpec:
