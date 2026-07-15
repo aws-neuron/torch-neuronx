@@ -21,7 +21,12 @@ class TestPad:
             ("constant", "aten::constant_pad_nd"),
             ("reflect", "aten::reflection_pad2d"),  # For 4D tensors
             ("replicate", "aten::replication_pad2d"),  # For 4D tensors
-            ("circular", "aten::copy_"),  # dispatched to new_empty and copy_
+            # dispatched to new_empty + copy_; the copy_ runs on device.
+            # NOTE: the copy_ writes into a non-contiguous slice of the padded
+            # output, whose CPU-bounce path is reported as
+            # "aten::copy_[noncontiguous_scatter_cpu_bounce]" (a distinct name),
+            # so bare "aten::copy_" stays in executed_ops and this assertion holds.
+            ("circular", "aten::copy_"),
         ],
     )
     def test_pad_decomposition_to_correct_ops(self, mode, expected_op):

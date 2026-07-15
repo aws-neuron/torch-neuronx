@@ -22,6 +22,10 @@ def contiguous_generic_kernel(
         dst_strides: Destination strides (should be contiguous)
         src_storage_offset: Storage offset for the source tensor
     """
+    # Report this as a CPU fallback — the contiguous op was supposed to run on
+    # device but no NKI kernel could handle this stride pattern.
+    _C._log_offloaded_op("aten::contiguous")
+
     # Allocate CPU buffer for the entire storage
     storage_size = src.untyped_storage().size() // src.element_size()
     cpu_buffer = torch.empty(storage_size, dtype=src.dtype, device="cpu")
