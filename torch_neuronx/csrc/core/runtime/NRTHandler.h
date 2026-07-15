@@ -64,13 +64,12 @@ class NRTHandler {
    * @param sequence_id Output sequence number for nrt-async mode (nullptr for nrt-sync)
    * @param stream_id Stream ID for queue selection in nrt-async mode
    */
-  static void DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>& model,
-                                     const std::vector<nrt_tensor_t*>& inputs,
-                                     const std::vector<nrt_tensor_t*>& outputs,
-                                     const ExecutionConfig& config,
-                                     NRT_STATUS* nrt_status = nullptr,
-                                     nrt::SequenceId* sequence_id = nullptr,
-                                     c10::StreamId stream_id = 0);
+  static void DispatchModelExecution(
+      const std::shared_ptr<nrt::ModelHandle>& model, const std::vector<nrt_tensor_t*>& inputs,
+      const std::vector<nrt_tensor_t*>& outputs, const ExecutionConfig& config,
+      NRT_STATUS* nrt_status = nullptr, nrt::SequenceId* sequence_id = nullptr,
+      c10::StreamId stream_id = 0, const std::vector<std::string>& input_names = {},
+      const std::vector<std::string>& output_names = {});
 
   /**
    * Get or load model from cache
@@ -114,16 +113,22 @@ class NRTHandler {
 
  private:
   /**
-   * Prepare input tensor set from compilable kernel
+   * Prepare input tensor set from compilable kernel.
+   * ``names`` overrides the default ``input{i}`` port names when non-empty;
+   * its size must equal ``inputs.size()`` in that case.
    */
   static void PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
-                                    nrt::TensorSetPtr& input_set);
+                                    nrt::TensorSetPtr& input_set,
+                                    const std::vector<std::string>& names = {});
 
   /**
-   * Prepare output tensor set from compilable kernel
+   * Prepare output tensor set from compilable kernel.
+   * ``names`` overrides the default ``output{i}`` port names when non-empty;
+   * its size must equal ``outputs.size()`` in that case.
    */
   static void PrepareOutputTensorSet(const std::vector<nrt_tensor_t*>& outputs,
-                                     nrt::TensorSetPtr& output_set);
+                                     nrt::TensorSetPtr& output_set,
+                                     const std::vector<std::string>& names = {});
 };
 
 }  // namespace at::neuron

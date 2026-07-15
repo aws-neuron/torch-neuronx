@@ -81,7 +81,7 @@ bool XLACompilableKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::Sequenc
   const auto dst_data_ptrs = HandleContiguousSlicing(GetDstDataPtrs(), dst_tensor_ctxs_);
 
   NRTHandler::DispatchModelExecution(model, src_data_ptrs, dst_data_ptrs, config, nrt_status,
-                                     sequence_id, stream_id);
+                                     sequence_id, stream_id, GetInputNames(), GetOutputNames());
 
   TORCH_NEURONX_DEBUG("NRT execution completed", "operation=", operation_name);
   return true;
@@ -197,7 +197,7 @@ bool NeffDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
   NRTHandler::ExecutionConfig config(device_id, 1);
   auto model = NRTHandler::GetOrLoadModel(compilable_kernel, config);
   NRTHandler::DispatchModelExecution(model, src_data_ptrs, dst_data_ptrs, config, nrt_status,
-                                     sequence_id, stream_id);
+                                     sequence_id, stream_id, GetInputNames(), GetOutputNames());
   return true;
 }
 

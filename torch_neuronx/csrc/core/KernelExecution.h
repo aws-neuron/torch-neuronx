@@ -355,6 +355,22 @@ class CompilableKernelExecution {
 
   bool HasOutputTransformations() const { return !per_output_transformations_.empty(); }
 
+  // Optional per-tensor NEFF I/O port names. When empty (the default), the
+  // runtime falls back to positional ``input{i}`` / ``output{i}`` names —
+  // the convention used by NEFFs produced through the torch.compile /
+  // StableHLO flow. Callers that supply a NEFF with arbitrary port names
+  // (e.g. a hand-authored artifact, an NKI kernel-builder NEFF with
+  // ``must_alias_input`` slots) can set these to have the runtime bind
+  // tensors by name.
+  //
+  // Precondition when non-empty: sizes must match the kernel's input /
+  // output tensor counts. Ordering must be the same as the tensor
+  // ordering passed to the kernel.
+  void SetInputNames(std::vector<std::string> names) { input_names_ = std::move(names); }
+  void SetOutputNames(std::vector<std::string> names) { output_names_ = std::move(names); }
+  const std::vector<std::string>& GetInputNames() const { return input_names_; }
+  const std::vector<std::string>& GetOutputNames() const { return output_names_; }
+
  protected:
   virtual bool ValidateImpl() const;
 
@@ -385,6 +401,9 @@ class CompilableKernelExecution {
   std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> per_input_transformations_;
   // Per-output transformation metadata (optional, for epilogue — inverse transformations)
   std::vector<std::vector<c10_neuron::lazy::TensorTransformation>> per_output_transformations_;
+  // Optional NEFF I/O port names — see SetInputNames / SetOutputNames.
+  std::vector<std::string> input_names_;
+  std::vector<std::string> output_names_;
 };
 
 // XLA-based kernels (StableHLO compilation path).

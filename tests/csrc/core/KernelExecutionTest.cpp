@@ -371,6 +371,50 @@ TEST_F(KernelExecutionTest, CachedNeffManagement) {
   EXPECT_EQ(kernel.GetCachedNeff(), expected_data);
 }
 
+TEST_F(KernelExecutionTest, IoNamesDefaultEmpty) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  // By default a compilable kernel carries no I/O names — NRTHandler will
+  // fall back to ``input{i}`` / ``output{i}`` when scheduling.
+  EXPECT_TRUE(kernel.GetInputNames().empty());
+  EXPECT_TRUE(kernel.GetOutputNames().empty());
+}
+
+TEST_F(KernelExecutionTest, IoNamesSetAndGet) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  std::vector<std::string> in_names = {"q", "k", "v"};
+  std::vector<std::string> out_names = {"attn_out"};
+  kernel.SetInputNames(in_names);
+  kernel.SetOutputNames(out_names);
+
+  EXPECT_EQ(kernel.GetInputNames(), in_names);
+  EXPECT_EQ(kernel.GetOutputNames(), out_names);
+}
+
+TEST_F(KernelExecutionTest, IoNamesAcceptAliasSlots) {
+  // NKI kernel-builder produces aliased input ports named
+  // ``<output>.must_alias_input`` — verify those round-trip without any
+  // special handling in the base class.
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  kernel.SetInputNames({"a", "b", "out.must_alias_input"});
+  kernel.SetOutputNames({"out"});
+
+  const auto& ins = kernel.GetInputNames();
+  ASSERT_EQ(ins.size(), 3u);
+  EXPECT_EQ(ins[2], "out.must_alias_input");
+}
+
 TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
 

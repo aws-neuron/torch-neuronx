@@ -36,15 +36,17 @@ void NRTHandler::DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>&
                                         const std::vector<nrt_tensor_t*>& src_data_ptrs,
                                         const std::vector<nrt_tensor_t*>& dst_data_ptrs,
                                         const ExecutionConfig& config, NRT_STATUS* nrt_status,
-                                        nrt::SequenceId* sequence_id, c10::StreamId stream_id) {
+                                        nrt::SequenceId* sequence_id, c10::StreamId stream_id,
+                                        const std::vector<std::string>& input_names,
+                                        const std::vector<std::string>& output_names) {
   TORCH_NEURONX_DEBUG("NRTHandler dispatching model execution", "device_id=", config.device_id,
                       "num_cores=", config.num_cores);
   // Prepare tensor sets for NRT execution
   auto input_set = nrt::CreateTensorSet();
   auto output_set = nrt::CreateTensorSet();
 
-  PrepareInputTensorSet(src_data_ptrs, input_set);
-  PrepareOutputTensorSet(dst_data_ptrs, output_set);
+  PrepareInputTensorSet(src_data_ptrs, input_set, input_names);
+  PrepareOutputTensorSet(dst_data_ptrs, output_set, output_names);
 
   int queue = nrt::GetHardwareQueue(NRTA_XU_COMPUTE, stream_id);
   NRT_CHECK_STATUS(nrt::DispatchExecution(model.get(), input_set.get(), output_set.get(), queue,
@@ -80,12 +82,17 @@ nrt_tensor_t* NRTHandler::AllocateTensor(nrt_tensor_placement_t placement, int v
 }
 
 void NRTHandler::PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
-                                       nrt::TensorSetPtr& input_set) {
+                                       nrt::TensorSetPtr& input_set,
+                                       const std::vector<std::string>& names) {
   TORCH_NEURONX_DEBUG("NRTHandler preparing input tensor set");
+  const bool use_custom_names = !names.empty();
+  TORCH_CHECK(!use_custom_names || names.size() == inputs.size(),
+              "NRTHandler::PrepareInputTensorSet: input_names size (", names.size(),
+              ") does not match inputs size (", inputs.size(), ")");
   for (size_t i = 0; i < inputs.size(); ++i) {
     TORCH_NEURONX_DEBUG("Processing input tensor", "index=", i);
     nrt_tensor_t* data_ptr = inputs[i];
-    std::string name = "input" + std::to_string(i);
+    std::string name = use_custom_names ? names[i] : ("input" + std::to_string(i));
     NRT_CHECK_STATUS(nrt::AddTensorToSet(input_set, name, data_ptr),
                      "Failed to add input tensor to tensor set");
     TORCH_NEURONX_DEBUG("Added input tensor to tensor set", "name=", name);
@@ -93,12 +100,17 @@ void NRTHandler::PrepareInputTensorSet(const std::vector<nrt_tensor_t*>& inputs,
 }
 
 void NRTHandler::PrepareOutputTensorSet(const std::vector<nrt_tensor_t*>& outputs,
-                                        nrt::TensorSetPtr& output_set) {
+                                        nrt::TensorSetPtr& output_set,
+                                        const std::vector<std::string>& names) {
   TORCH_NEURONX_DEBUG("NRTHandler preparing output tensor set");
+  const bool use_custom_names = !names.empty();
+  TORCH_CHECK(!use_custom_names || names.size() == outputs.size(),
+              "NRTHandler::PrepareOutputTensorSet: output_names size (", names.size(),
+              ") does not match outputs size (", outputs.size(), ")");
   for (size_t i = 0; i < outputs.size(); ++i) {
     TORCH_NEURONX_DEBUG("Processing output tensor", "index=", i);
     nrt_tensor_t* data_ptr = outputs[i];
-    std::string name = "output" + std::to_string(i);
+    std::string name = use_custom_names ? names[i] : ("output" + std::to_string(i));
     NRT_CHECK_STATUS(nrt::AddTensorToSet(output_set, name, data_ptr),
                      "Failed to add output tensor to tensor set");
     TORCH_NEURONX_DEBUG("Added output tensor to tensor set", "name=", name);
