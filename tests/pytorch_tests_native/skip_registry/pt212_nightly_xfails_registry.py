@@ -1,27 +1,14 @@
 """XFAIL groups for PT2.12 nightly upstream failures.
 
-Observed on the PT2.12 nightly (GitHub Actions run 28958874830) in the ``dynamo``
-and ``test_foreach`` upstream suites. These are pre-existing PT2.12 Neuron gaps
-(inplace-op grad-metadata propagation, dynamo subclass/repro, foreach parity /
-cross-device / dtype handling), unrelated to the eager pass-through-alias fix.
-xfail (strict=False) to keep the nightly green; delete a group when its root
-cause is fixed.
+Observed on the PT2.12 nightly (GitHub Actions run 28958874830) in the
+``test_foreach`` upstream suite. These are pre-existing PT2.12 Neuron gaps
+(foreach parity / cross-device / dtype handling). xfail (strict=False) to keep
+the nightly green; delete a group when its root cause is fixed.
 """
 
 from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 
 XFAIL_GROUPS: list[SkipGroup] = [
-    SkipGroup(
-        reason=(
-            "[PT2.12] dynamo autograd-function / tensor-subclass / repro failures on "
-            "the Neuron backend."
-        ),
-        tests=[
-            "AutogradFunctionTests::test_materialize_grad",
-            "ReproTests::test_subclass_graph_output_repro",
-            "SubclassTests::test_tensor_subclass_attr_codegen_tos",
-        ],
-    ),
     SkipGroup(
         reason=(
             "[PT2.12] test_foreach parity / cross-device / dtype failures on Neuron "
