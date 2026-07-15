@@ -156,6 +156,20 @@ def use_mlir_aten_ops():
     return os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
 
 
+def use_dynamic_nki_kernels():
+    """Check if dynamic-shape NKI kernels are preferred over MLIR lowerings.
+
+    When True, ops registered in
+    ``torch_neuronx/python_ops/torch_mlir/ops/dynamic_kernels`` are used in
+    place of their default MLIR/PyTorch lowering when the input shape meets
+    the kernel's compile-time constraints.
+
+    Returns:
+        bool: True if TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS is set to "1"
+    """
+    return os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS", "0") == "1"
+
+
 def is_sync_mode_enabled():
     """Check if legacy launch blocking is enabled via environment variable.
 

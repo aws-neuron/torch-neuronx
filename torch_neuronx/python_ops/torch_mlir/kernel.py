@@ -35,7 +35,7 @@ from torch_neuronx.python_ops.shared import (
     IndexOps,
     ReductionOps,
 )
-from torch_neuronx.utils import global_version_hash
+from torch_neuronx.utils import global_version_hash, use_dynamic_nki_kernels
 
 from ..handlers.output import BaseOutputHandler
 from ..processors import ArgumentProcessor
@@ -1314,6 +1314,16 @@ class TorchMlirKernel(BaseNeuronKernel):
         if not args and not kwargs:
             return None
 
+        # Dynamic NKI: look up the registry when the feature is enabled
+        _dyn_entry = None
+        if use_dynamic_nki_kernels():
+            from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import (
+                get_dynamic_nki_entry,
+            )
+
+            _dyn_short_name = self.op_name.replace("aten::", "").split(".")[0]
+            _dyn_entry = get_dynamic_nki_entry(_dyn_short_name)
+
         self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
 
         from torch_neuronx.utils import is_native_int64_enabled
@@ -1333,6 +1343,15 @@ class TorchMlirKernel(BaseNeuronKernel):
                 target_device = processed_kwargs.pop("device")
 
         device = self.arg_processor.extract_device(processed_inputs, processed_kwargs)
+
+        # Dynamic NKI fallback: if a registered dynamic kernel can handle this
+        # op, compile once and execute directly — skip FX trace + HLO compilation.
+        dynamic_result = self._try_dynamic_nki_fallback(args, device, _dyn_entry, kwargs)
+        if dynamic_result is not None:
+            _C._log_executed_op(self.op_name)
+            if target_device is not None:
+                dynamic_result = self._transfer_to_device(dynamic_result, target_device)
+            return dynamic_result
 
         # Check for empty tensors first to avoid lowering
         if self._should_handle_empty(processed_inputs):
@@ -1477,6 +1496,71 @@ class TorchMlirKernel(BaseNeuronKernel):
             result = self._transfer_to_device(result, target_device)
 
         return result
+
+    def _try_dynamic_nki_fallback(
+        self, original_args, device, entry=None, kwargs=None
+    ) -> torch.Tensor | None:
+        """Try to execute via a pre-compiled dynamic NKI NEFF.
+
+        Phase 1 (first call): Compile the NKI kernel at min tile size via
+        _submit_xla_task_to_pipeline (which validates IO sizes — fine because
+        we use min-tile-sized tensors for the compile run).
+
+        Phase 2 (all subsequent calls): Execute via execute_compiled_graph
+        which bypasses IO size validation and passes actual-sized tensor
+        data pointers directly to the NEFF.
+
+        Returns the result tensor if handled, None otherwise.
+        """
+        if entry is None:
+            return None
+
+        if not entry.can_handle(*original_args):
+            return None
+
+        dest = None
+        if kwargs is not None:
+            dest = kwargs.pop("out", None)
+            if dest is None:
+                dest = kwargs.pop("grad_input", None)
+
+        # Compile once per compile_key (dims baked into NEFF, e.g. H).
+        compile_key_fn = getattr(entry, "compile_key_fn", None)
+        compile_key = compile_key_fn(*original_args) if compile_key_fn is not None else None
+        hlo_bytes, cache_key = entry.get_compiled(compile_key)
+
+        # Prepare actual-sized IO. `dest` is the caller-provided output buffer
+        # (out=/grad_input=) when present; prepare_io writes the NEFF result
+        # directly into it when it is a usable contiguous buffer, otherwise it
+        # allocates a fresh output.
+        short_name = self.op_name.replace("aten::", "").split(".")[0]
+        inputs, outputs, _actual_m = entry.prepare_io(*original_args, dest=dest)
+
+        logger.debug(
+            "dynamic NKI execute op=%s cache_key=%s... in=%s out=%s",
+            short_name,
+            cache_key[:48],
+            [tuple(t.shape) for t in inputs],
+            [tuple(t.shape) for t in outputs],
+        )
+
+        # Use execute_compiled_graph which bypasses IO size validation
+        _C.execute_compiled_graph(
+            short_name,
+            cache_key,
+            list(inputs),
+            list(outputs),
+            False,  # has_collectives
+        )
+
+        # Map the kernel output to the op's expected result shape. Elementwise
+        # ops reshape to the first input's shape; ops like embedding provide a
+        # custom reshape_output (output shape differs from inputs).
+        reshape_output = getattr(entry, "reshape_output", None)
+        if reshape_output is not None:
+            return reshape_output(outputs, original_args)
+        x = original_args[0]
+        return outputs[0].reshape(x.shape)
 
     def _execute(
         self,
