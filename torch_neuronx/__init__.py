@@ -92,12 +92,13 @@ os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
 if os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") == "1":
     from torch_neuronx.utils import get_platform_target
 
-    if get_platform_target() == "trn2":
+    platform_target = get_platform_target()
+    if platform_target in ("trn2", "trn3"):
         if os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "false":
             raise RuntimeError(
                 "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false is incompatible with "
-                "TORCH_NEURONX_ENABLE_HOST_CC=1 on trn2. This combination will "
-                "cause device deadlock. Remove the "
+                f"TORCH_NEURONX_ENABLE_HOST_CC=1 on {platform_target}. This "
+                "combination can lead to a hang. Remove the "
                 "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or disable host-cc."
             )
         os.environ.setdefault("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "true")
