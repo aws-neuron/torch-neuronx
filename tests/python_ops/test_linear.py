@@ -244,15 +244,9 @@ class TestLinearBackward:
         ],
     )
     def test_linear_backward_basic(
-        self, request, input_shape, weight_shape, bias_shape, dtype, rtol, atol, requires_grads
+        self, input_shape, weight_shape, bias_shape, dtype, rtol, atol, requires_grads
     ):
         """Test basic linear backward functionality with various tensor shapes"""
-        if input_shape == (4,) and bias_shape is not None and requires_grads[2]:
-            # Marker-based (not pytest.xfail()) so the test body still runs and
-            # surfaces as XPASS once the underlying bug is fixed.
-            request.applymarker(
-                pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
-            )
         # Create input tensors
         input_tensor = torch.randn(*input_shape, requires_grad=requires_grads[0], dtype=dtype)
         weight_tensor = torch.randn(*weight_shape, requires_grad=requires_grads[1], dtype=dtype)

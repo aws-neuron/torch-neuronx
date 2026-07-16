@@ -308,7 +308,6 @@ class TestScatterGatherRegistration:
             res.backward(weight)
             torch.testing.assert_close(src.grad, grad, atol=0, rtol=0)
 
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_scatter_value_rank0_input(self):
         """Test torch_scatter_value with a 0-dim input tensor."""
         x = torch.tensor(5.0, device="neuron")
@@ -317,7 +316,6 @@ class TestScatterGatherRegistration:
         expected = torch.scatter(torch.tensor(5.0), 0, torch.tensor(0, dtype=torch.int64), 1.0)
         torch.testing.assert_close(result.cpu(), expected)
 
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_scatter_src_rank0_input(self):
         """Test torch_scatter_src with a 0-dim input tensor."""
         x = torch.tensor(5.0, device="neuron")

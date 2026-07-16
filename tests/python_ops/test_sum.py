@@ -38,13 +38,7 @@ class TestSum:
             ((4, 5, 6), 0),
             ((4, 5, 6), 1),
             ((4, 5, 6), -1),
-            pytest.param(
-                (),
-                0,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            ((), 0),
         ],
     )
     def test_sum_with_dim(self, device, shape, dim):
@@ -162,12 +156,7 @@ class TestSum:
     @pytest.mark.parametrize(
         "dtype",
         [
-            pytest.param(
-                None,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            None,
             torch.float32,
         ],
     )
@@ -193,7 +182,6 @@ class TestSum:
             torch.sum(x, dim=invalid_dim)
 
     @pytest.mark.parametrize("keepdim", [False, True])
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_sum_scalar_keepdim(self, device, keepdim):
         """Test sum on scalar tensor respects keepdim."""
         with track_neuron_ops():
