@@ -36,6 +36,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
 )
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.nki_hop import kernel_registry, nki_kernel_wrapper, wrap_nki
+from torch_neuronx.nki_kernel import backend_config_str, get_config, return_types_of
 from torch_neuronx.utils import get_logical_neuron_cores, map_external_dtype_to_torch
 
 logger = logging.getLogger(__name__)
@@ -394,9 +395,14 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
         positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
     meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
 
-    dconfig = kernel[lnc].dump_config(**meta_args)
-    logger.debug(f"FWD Kernel return types: {dconfig.return_types}")
-    return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types, lnc
+    dconfig = get_config(kernel[lnc], **meta_args)
+    logger.debug(f"FWD Kernel return types: {return_types_of(dconfig)}")
+    return (
+        backend_config_str(dconfig),
+        dconfig.operand_output_aliases,
+        return_types_of(dconfig),
+        lnc,
+    )
 
 
 def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=None):
@@ -426,9 +432,14 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=
     if "softmax_scale" in arg_names:
         meta_args["softmax_scale"] = scale
 
-    dconfig = kernel[lnc].dump_config(**meta_args)
-    logger.debug(f"BWD Kernel return types: {dconfig.return_types}")
-    return str(dconfig.dumped_config), dconfig.operand_output_aliases, dconfig.return_types, lnc
+    dconfig = get_config(kernel[lnc], **meta_args)
+    logger.debug(f"BWD Kernel return types: {return_types_of(dconfig)}")
+    return (
+        backend_config_str(dconfig),
+        dconfig.operand_output_aliases,
+        return_types_of(dconfig),
+        lnc,
+    )
 
 
 class FlexAttentionNKILowering(NeuronFXPass):

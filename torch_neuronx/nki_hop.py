@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 import torch.utils._pytree as pytree
+from nki.framework.torch_native import TorchNativeKernel
 from torch._C import DispatchKey
 from torch._dynamo import allow_in_graph
 from torch._library.custom_ops import custom_op
@@ -21,7 +22,7 @@ from torch.fx.experimental.proxy_tensor import (
     track_tensor_tree,
 )
 
-from .nki_kernel import DumpedConfig, TorchNeuronNKIKernelV3
+from .nki_kernel import backend_config_str, get_config, return_types_of
 from .utils import get_platform_target, map_external_dtype_to_torch
 
 if TYPE_CHECKING:
@@ -52,8 +53,8 @@ def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
 
 
 class NKIRegistry:
-    id_to_kernel: ClassVar[dict[int, TorchNeuronNKIKernelV3]] = {}
-    kernel_to_id: ClassVar[dict[TorchNeuronNKIKernelV3, int]] = {}
+    id_to_kernel: ClassVar[dict[int, TorchNativeKernel]] = {}
+    kernel_to_id: ClassVar[dict[TorchNativeKernel, int]] = {}
     kernel_arg_names: ClassVar[dict[int, list[str]]] = {}
     kernel_default_args: ClassVar[dict[int, dict[str, Any]]] = {}
     """
@@ -67,7 +68,7 @@ class NKIRegistry:
 
     def add_kernel(
         self,
-        kernel: TorchNeuronNKIKernelV3,
+        kernel: TorchNativeKernel,
         kernel_arg_names: list[str],
         kernel_default_args: dict[str, Any] | None = None,
     ) -> int:
@@ -85,7 +86,7 @@ class NKIRegistry:
         self.kernel_default_args[idx] = kernel_default_args
         return idx
 
-    def get_kernel(self, idx: int) -> TorchNeuronNKIKernelV3:
+    def get_kernel(self, idx: int) -> TorchNativeKernel:
         # Returns the NKI kernel at the given index
         assert idx in self.id_to_kernel, f"{idx} not in kernel registry"
         return self.id_to_kernel[idx]
@@ -172,13 +173,13 @@ nki_kernel_wrapper = NKIKernelWrapper()
 nki_kernel_wrapper = allow_in_graph(nki_kernel_wrapper)
 
 
-def get_dumped_config(
+def get_kernel_config(
     kernel_idx: int,
     grid: NKIGridType,
     args: Sequence[Any],
     arg_names: Sequence[str],
     constant_args_key: int,
-) -> DumpedConfig:
+):
     kernel = kernel_registry.get_kernel(kernel_idx)
     if constant_args_key == -1:
         merged_args = merge_names_and_args(arg_names, args)
@@ -195,7 +196,7 @@ def get_dumped_config(
             else:
                 meta_args[k] = arg
         lnc = grid[0] if grid else 1
-        dconfig = kernel[lnc].dump_config(**meta_args)
+        dconfig = get_config(kernel[lnc], **meta_args)
     return dconfig
 
 
@@ -211,8 +212,8 @@ def nki_kernel_wrapper_meta(
     constant_args_key: int,
     has_side_effect: bool = False,
 ):
-    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
-    return_types = dconfig.return_types
+    dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
+    return_types = return_types_of(dconfig)
 
     if len(return_types) == 1:
         shape, dtype = return_types[0][1], return_types[0][0]
@@ -241,7 +242,7 @@ def get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args
     else:
         tensor_args = args
         tensor_arg_names = arg_names
-    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
+    dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return dconfig, tensor_args, tensor_arg_names, constant_args_key
 
 
@@ -264,9 +265,9 @@ def nki_kernel_wrapper_dense(
         constant_args_key,
     ) = get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key)
 
-    backend_config = str(dconfig.dumped_config)
+    backend_config = backend_config_str(dconfig)
     operand_output_aliases = dconfig.operand_output_aliases
-    return_types = dconfig.return_types
+    return_types = return_types_of(dconfig)
 
     # torch.compile path: use torch-mlir backend for graph capture.
     # Eager mode is handled by NKIHOPCaller.__call__ → _C._nki_dispatch_eager
@@ -300,8 +301,8 @@ def nki_kernel_wrapper_fake_tensor_mode(
     constant_args_key: int,
     has_side_effect: bool = False,
 ) -> Any:
-    dconfig = get_dumped_config(kernel_idx, grid, args, arg_names, constant_args_key)
-    return_types = dconfig.return_types
+    dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
+    return_types = return_types_of(dconfig)
     # Match device of input tensors — default to neuron
     device = "neuron"
     for a in args:
@@ -351,7 +352,7 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
         "has_side_effect": has_side_effect,
     }
 
-    node_args["backend_config"] = str(dconfig.dumped_config)
+    node_args["backend_config"] = backend_config_str(dconfig)
     node_args["operand_output_aliases"] = dconfig.operand_output_aliases
     with disable_proxy_modes_tracing():
         out = nki_kernel_wrapper(**node_args)
@@ -386,8 +387,8 @@ def nki_kernel_wrapper_functionalize(
     unwrapped_args = [
         ctx.unwrap_tensors(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
     ]
-    dconfig = get_dumped_config(kernel_idx, grid, unwrapped_args, arg_names, constant_args_key)
-    backend_config = str(dconfig.dumped_config)
+    dconfig = get_kernel_config(kernel_idx, grid, unwrapped_args, arg_names, constant_args_key)
+    backend_config = backend_config_str(dconfig)
     with ctx.redispatch_to_next():
         unwrapped_outputs = nki_kernel_wrapper(
             kernel_idx=kernel_idx,
@@ -510,8 +511,8 @@ class NKIHOPCaller:
             kernel_registry.add_constant_args(constant_args, constant_args_key)
 
             # C++ handles execution + post-processing (alias copy-back, output
-            # slicing) using cached DumpedConfig from DispatchCacheEntry.
-            # On cache miss, C++ calls Python lower_func which attaches DumpedConfig.
+            # slicing) using cached config from DispatchCacheEntry.
+            # On cache miss, C++ calls Python lower_func which attaches config.
             return _C._nki_dispatch_eager(
                 tensor_args,
                 self.kernel_idx,
@@ -538,8 +539,8 @@ class NKIHOPCaller:
 # and fold it to the constant kernel idx.
 @torch._dynamo.assume_constant_result
 def register_kernel_to_torch(nki_func, k_fields, arg_names, kernel_default_args, **kwargs):
-    kernel_v3 = TorchNeuronNKIKernelV3(nki_func, **k_fields, target=get_platform_target(), **kwargs)
-    return kernel_registry.add_kernel(kernel_v3, arg_names, kernel_default_args)
+    kernel = TorchNativeKernel(nki_func, **k_fields, target=get_platform_target(), **kwargs)
+    return kernel_registry.add_kernel(kernel, arg_names, kernel_default_args)
 
 
 def wrap_nki(nki_kernel, **kwargs) -> Any:

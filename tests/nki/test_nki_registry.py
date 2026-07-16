@@ -3,9 +3,9 @@
 from unittest.mock import MagicMock
 
 import pytest
+from nki.framework.torch_native import TorchNativeKernel
 
 from torch_neuronx.nki_hop import NKIRegistry
-from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV3
 
 
 @pytest.fixture
@@ -16,7 +16,7 @@ def registry():
 
 
 def _make_mock_kernel():
-    return MagicMock(spec=TorchNeuronNKIKernelV3)
+    return MagicMock(spec=TorchNativeKernel)
 
 
 class TestNKIRegistryAddKernel:

@@ -1,6 +1,5 @@
 """Tests for nki kernel integration."""
 
-import os
 from unittest.mock import MagicMock
 
 import nki
@@ -138,119 +137,145 @@ class TestBasicExecution:
             assert torch.equal(result, x)
 
 
-class TestDumpConfigCache:
-    """Test DumpedConfig caching in dump_config."""
-
-    def setup_method(self):
-        import tempfile
-
-        self._tmpdir = tempfile.mkdtemp()
-        os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] = self._tmpdir
-
-    def teardown_method(self):
-        import shutil
-
-        shutil.rmtree(self._tmpdir, ignore_errors=True)
-        os.environ.pop("TORCH_NEURONX_HLO_CACHE_DIR", None)
+class TestGetConfigCache:
+    """Test in-memory FrameworkConfig caching in get_config."""
 
     def _make_kernel(self):
-        """Create a TorchNeuronNKIKernelV3 with mocked internals."""
-        from torch_neuronx.nki_kernel import DumpedConfig, TorchNeuronNKIKernelV3
+        """Create a mock TorchNativeKernel with mocked compile() and get_cache_key()."""
+        from nki.framework.torch_native import TorchNativeKernel
 
-        kernel = MagicMock(spec=TorchNeuronNKIKernelV3)
-        kernel.func = MagicMock()
-        kernel.func.__qualname__ = "mock_nki_kernel"
-        kernel.func.__code__ = MagicMock(co_filename="mock_nki_kernel.py", co_code=b"mock_bytecode")
-        # Ensure _dump_config_cache doesn't exist yet
-        if hasattr(kernel.func, "_dump_config_cache"):
-            del kernel.func._dump_config_cache
+        kernel = MagicMock(spec=TorchNativeKernel)
+        # Use a plain object for func so hasattr/_config_cache behaves like a real attribute.
+        kernel.func = type("FakeFunc", (), {})()
 
-        expected = DumpedConfig(
-            return_types=[("float32", (1, 128))],
-            dumped_config="dGVzdA==",
-            operand_output_aliases={},
-        )
-        return kernel, expected
+        mock_config = MagicMock()
+        mock_config.output_specs = [MagicMock(dtype="float32", shape=(1, 128))]
+        mock_config.backend_config_b64 = b"dGVzdA=="
+        mock_config.operand_output_aliases = {}
+        kernel.compile = MagicMock(return_value=(mock_config, "key1"))
+        kernel.get_cache_key = MagicMock(return_value="key1")
+        kernel._get_compile_cache = MagicMock(return_value={})
 
-    def _setup_compile_mocks(self, kernel, expected):
-        """Wire up the mocked compile pipeline to return expected DumpedConfig fields."""
-        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV3
-
-        kernel._compile_dump_config = MagicMock(return_value=expected)
-        kernel.lnc = 1
-        kernel._enable_simulation = False
-        kernel._enable_device_dump = False
-
-        # Bind the real methods
-        kernel._get_dump_config_cache = TorchNeuronNKIKernelV3._get_dump_config_cache.__get__(
-            kernel
-        )
-        kernel.dump_config = TorchNeuronNKIKernelV3.dump_config.__get__(kernel)
+        return kernel
 
     def test_cache_hit_skips_recompilation(self):
         """Second call with same key returns cached result without recompiling."""
-        kernel, expected = self._make_kernel()
-        self._setup_compile_mocks(kernel, expected)
+        from torch_neuronx.nki_kernel import get_config
 
-        kernel._get_compile_cache.return_value = {}
-        kernel._generate_cache_key.return_value = "key1"
+        kernel = self._make_kernel()
 
-        result1 = kernel.dump_config(x=torch.randn(1, 128))
-        result2 = kernel.dump_config(x=torch.randn(1, 128))
+        result1 = get_config(kernel, x=torch.randn(1, 128))
+        result2 = get_config(kernel, x=torch.randn(1, 128))
 
         assert result1 is result2
-        assert kernel._compile_dump_config.call_count == 1
+        assert kernel.compile.call_count == 1
 
     def test_cache_miss_on_different_key(self):
-        """Different cache keys trigger separate compilations."""
-        kernel, expected = self._make_kernel()
-        self._setup_compile_mocks(kernel, expected)
+        """Different cache key triggers a new compile despite existing cache entry."""
+        from torch_neuronx.nki_kernel import get_config
 
-        kernel._get_compile_cache.return_value = {}
-        kernel._generate_cache_key.side_effect = ["key1", "key2"]
+        kernel = self._make_kernel()
 
-        kernel.dump_config(x=torch.randn(1, 128))
-        kernel.dump_config(x=torch.randn(2, 128))
+        # Populate cache for key1
+        get_config(kernel, x=torch.randn(1, 128))
+        kernel.compile.reset_mock()
 
-        assert kernel._compile_dump_config.call_count == 2
+        # Same key → cache hit, no compile
+        get_config(kernel, x=torch.randn(1, 128))
+        kernel.compile.assert_not_called()
+
+        # Different key → cache miss, must compile
+        kernel.get_cache_key.return_value = "key2"
+        get_config(kernel, x=torch.randn(2, 128))
+        kernel.compile.assert_called_once()
 
     def test_no_cache_when_compile_cache_disabled(self):
         """When _get_compile_cache returns None, every call compiles."""
-        kernel, expected = self._make_kernel()
-        self._setup_compile_mocks(kernel, expected)
+        from torch_neuronx.nki_kernel import get_config
 
+        kernel = self._make_kernel()
         kernel._get_compile_cache.return_value = None
 
-        kernel.dump_config(x=torch.randn(1, 128))
-        kernel.dump_config(x=torch.randn(1, 128))
+        get_config(kernel, x=torch.randn(1, 128))
+        get_config(kernel, x=torch.randn(1, 128))
 
-        assert kernel._compile_dump_config.call_count == 2
-
-    def test_no_cache_when_key_is_none(self):
-        """When _generate_cache_key returns None (unhashable inputs), every call compiles."""
-        kernel, expected = self._make_kernel()
-        self._setup_compile_mocks(kernel, expected)
-
-        kernel._get_compile_cache.return_value = {}
-        kernel._generate_cache_key.return_value = None
-
-        kernel.dump_config(x=torch.randn(1, 128))
-        kernel.dump_config(x=torch.randn(1, 128))
-
-        assert kernel._compile_dump_config.call_count == 2
+        assert kernel.compile.call_count == 2
 
     def test_cache_stored_on_func(self):
-        """Cache dict is stored as self.func._dump_config_cache."""
-        kernel, expected = self._make_kernel()
-        self._setup_compile_mocks(kernel, expected)
+        """Cache dict is stored as kernel.func._config_cache."""
+        from torch_neuronx.nki_kernel import get_config
 
-        kernel._get_compile_cache.return_value = {}
-        kernel._generate_cache_key.return_value = "key1"
+        kernel = self._make_kernel()
 
-        result = kernel.dump_config(x=torch.randn(1, 128))
+        result = get_config(kernel, x=torch.randn(1, 128))
 
-        assert hasattr(kernel.func, "_dump_config_cache")
-        assert kernel.func._dump_config_cache["key1"] is result
+        assert hasattr(kernel.func, "_config_cache")
+        assert kernel.func._config_cache["key1"] is result
+
+    def test_none_cache_key_bypasses_cache(self):
+        """When get_cache_key returns None, cache is bypassed and compile runs every time."""
+        from torch_neuronx.nki_kernel import get_config
+
+        kernel = self._make_kernel()
+        kernel.get_cache_key.return_value = None
+
+        get_config(kernel, x=torch.randn(1, 128))
+        get_config(kernel, x=torch.randn(1, 128))
+
+        assert kernel.compile.call_count == 2
+        assert not hasattr(kernel.func, "_config_cache") or None not in kernel.func._config_cache
+
+
+class TestCacheKeyInvalidation:
+    """Test that get_cache_key changes when kernel source is modified."""
+
+    _KERNEL_SOURCE = """\
+import nki
+import nki.isa as nisa
+import nki.language as nl
+
+@nki.jit
+def scale_kernel(x):
+    x_sbuf = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x_sbuf, src=x)
+    y_sbuf = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=y_sbuf, data=x_sbuf, op0=nl.multiply, operand0={operand})
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=out, src=y_sbuf)
+    return out
+"""
+
+    def _load_kernel(self, tmp_path, operand):
+        """Write kernel source to file, import it, return the @nki.jit kernel."""
+        import importlib.util
+
+        source = self._KERNEL_SOURCE.format(operand=operand)
+        module_file = tmp_path / "scale_kernel_mod.py"
+        module_file.write_text(source)
+
+        spec = importlib.util.spec_from_file_location("scale_kernel_mod", str(module_file))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.scale_kernel
+
+    def test_cache_key_changes_on_source_modification(self, tmp_path):
+        """Editing a kernel source file and reloading produces a different cache key."""
+        from nki.framework.torch_native import TorchNativeKernel
+
+        inp = torch.randn(1, 128, device="neuron")
+
+        # Write kernel with operand0=2.0, import, get cache key
+        kernel_jit = self._load_kernel(tmp_path, "2.0")
+        key_v1 = TorchNativeKernel(kernel_jit.func).get_cache_key(x=inp)
+
+        # Overwrite same file with operand0=3.0, reimport, get cache key
+        kernel_jit = self._load_kernel(tmp_path, "3.0")
+        key_v2 = TorchNativeKernel(kernel_jit.func).get_cache_key(x=inp)
+
+        assert key_v1 != key_v2, (
+            "get_cache_key must differ when kernel source is modified "
+            f"(operand0=2.0 vs 3.0). Both produced: {key_v1}"
+        )
 
 
 class TestNkiHloCacheSourceInvalidation:
@@ -263,13 +288,13 @@ class TestNkiHloCacheSourceInvalidation:
         backend_config changes when the kernel source changes, so including it
         in the cache key ensures stale HLO is not reused.
         """
-        from unittest.mock import MagicMock
+
+        from nki.framework.torch_native import TorchNativeKernel
 
         from torch_neuronx.nki_hop import kernel_registry
-        from torch_neuronx.nki_kernel import TorchNeuronNKIKernelV3
         from torch_neuronx.python_ops.torch_mlir.nki_op_impl import NkiKernel
 
-        mock_k = MagicMock(spec=TorchNeuronNKIKernelV3)
+        mock_k = MagicMock(spec=TorchNativeKernel)
         mock_k.func = MagicMock()
         mock_k.func.__qualname__ = "scale_kernel"
         idx = kernel_registry.add_kernel(mock_k, ["x"])
