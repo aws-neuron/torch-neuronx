@@ -9,21 +9,18 @@ import torch
     reason="torch.float8_e8m0fnu not available in this PyTorch build",
 )
 class TestE8M0DtypeSupport:
-    """Tests for e8m0 dtype registration across torch_neuronx mapping layers."""
+    """Tests for e8m0 dtype registration across torch_neuronx mapping layers.
 
-    def test_nki_kernel_dtype_mapping(self):
-        """e8m0 is registered in _TORCH_TO_NKI_DTYPE."""
-        from torch_neuronx.nki_kernel import _TORCH_TO_NKI_DTYPE
-
-        assert torch.float8_e8m0fnu in _TORCH_TO_NKI_DTYPE
-        assert _TORCH_TO_NKI_DTYPE[torch.float8_e8m0fnu] == "float8_e8m0fnu"
-
-    def test_nki_kernel_dtype_conversion(self):
-        """_torch_to_nki_dtype converts e8m0 without error."""
-        from torch_neuronx.nki_kernel import _torch_to_nki_dtype
-
-        result = _torch_to_nki_dtype(torch.float8_e8m0fnu)
-        assert result == "float8_e8m0fnu"
+    Note: the previous ``test_nki_kernel_dtype_mapping`` and
+    ``test_nki_kernel_dtype_conversion`` cases were removed when torch_neuronx
+    switched to invoking NKI kernels through the ``nki.framework.Kernel``
+    object. NKI now owns the dtype universe end-to-end (``nl.float8_e8m0fnu``
+    lives in ``nki.compiler._dtypes`` and is threaded through the ISA, MLIR
+    and BIR pipeline), so torch_neuronx no longer maintains a torch→NKI dtype
+    translation table. Coverage for e8m0 on the NKI side lives in
+    ``private-nki-staging`` (see e.g. ``test/python/nki_frontends/test_memset.py``
+    and ``integration-tests/tests/kernel/nki/test_e8m0_data_move_ops.py``).
+    """
 
     def test_stablehlo_utils_dtype_mapping(self):
         """e8m0 is registered in stablehlo_utils MLIR_TO_TORCH_DTYPE."""

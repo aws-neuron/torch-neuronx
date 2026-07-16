@@ -43,15 +43,16 @@ def _lower_custom_nki(
     grid,
 ):
     """Lower a custom NKI kernel via NKIRegistry + NkiKernel."""
-    from torch_neuronx.nki_hop import get_dumped_config, kernel_registry
+    from torch_neuronx.nki_hop import get_kernel_config, kernel_registry
+    from torch_neuronx.nki_kernel import backend_config_str, return_types_of
     from torch_neuronx.python_ops.torch_mlir.nki_op_impl import _global_nki_op
 
     arg_names = kernel_registry.get_kernel_arg_names(kernel_idx)
     constant_args = kernel_registry.get_constant_args(constant_args_key)
     tensor_arg_names = [name for name in arg_names if name not in constant_args]
 
-    dconfig = get_dumped_config(kernel_idx, grid, tensor_args, tensor_arg_names, constant_args_key)
-    backend_config = str(dconfig.dumped_config)
+    dconfig = get_kernel_config(kernel_idx, grid, tensor_args, tensor_arg_names, constant_args_key)
+    backend_config = backend_config_str(dconfig)
     aliases = dconfig.operand_output_aliases
 
     nki_params = {
@@ -66,8 +67,8 @@ def _lower_custom_nki(
     _global_nki_op.kernel.operand_output_aliases = aliases
     result = _global_nki_op.kernel.lower(*tensor_args, **nki_params)
 
-    # Attach DumpedConfig so C++ can cache it in DispatchCacheEntry
-    result.nki_return_types = dconfig.return_types
+    # Attach config so C++ can cache it in DispatchCacheEntry
+    result.nki_return_types = return_types_of(dconfig)
     result.nki_operand_output_aliases = dconfig.operand_output_aliases
 
     return result
