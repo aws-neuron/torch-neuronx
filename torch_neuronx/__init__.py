@@ -278,6 +278,11 @@ from .distributed.mesh_registry import _apply_mesh_registry_patch
 
 _apply_mesh_registry_patch()
 
+# Make torch.random.fork_rng infer device_type from devices (no-op on torch >=2.13)
+from .random import _apply_fork_rng_patch
+
+_apply_fork_rng_patch()
+
 
 def is_neuron_runtime_initialized():
     return _C._is_neuron_runtime_initialized()
