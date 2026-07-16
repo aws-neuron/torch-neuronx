@@ -71,7 +71,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_exp2_neuron*",
             "*_exp2__neuron*",
             "*_expm1_neuron*",
-            "*_floor_neuron*",
             "*_floor_divide__neuron*",
             "*_fmax_neuron*",
             "*_fmin_neuron*",

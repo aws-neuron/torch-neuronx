@@ -434,4 +434,6 @@ OPINFO_BROKEN = [
     "test_meta.py::TestMetaNEURON::test_meta_outplace_nonzero_static_neuron_int64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace_nonzero_static_neuron_int8",
     "test_meta.py::TestMetaNEURON::test_meta_outplace_nonzero_static_neuron_uint8",
+    # aten::floor — Neuron supports bool dtype but OpInfo doesn't list it
+    "test_ops.py::TestCommonNEURON::test_dtypes_floor_neuron",
 ]
