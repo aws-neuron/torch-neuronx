@@ -6916,6 +6916,49 @@ class TestUpsampleBilinear2dAADecomposition:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestArgminDecompositionE2E:
+    """E2E tests for argmin via torch.compile(backend='neuron').
+
+    argmin has no Neuron lowering (leaves an unlegalized ``torch.constant.bool``)
+    and is decomposed to ``argmax(-x)``. Each case is run through the full
+    interception -> trace -> torch-mlir lowering -> execute path on device and
+    compared against a CPU reference (indices must match exactly).
+    """
+
+    def test_registered(self):
+        assert torch.ops.aten.argmin.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("keepdim", [False, True])
+    @pytest.mark.parametrize("dim", [0, 1, -1])
+    def test_argmin_dim_e2e(self, dim, keepdim, dtype):
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.argmin(x, dim=dim, keepdim=keepdim)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(4, 5, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_argmin_flatten_e2e(self, dtype):
+        """dim=None reduces over the flattened tensor."""
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.argmin(x)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(4, 5, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestStackDecompositionE2E:
     """E2E tests for the internal _stack via torch.compile(backend='neuron').
 
@@ -6941,6 +6984,182 @@ class TestStackDecompositionE2E:
         expected = fn(*tensors)
         result = compiled_fn(*(t.to("neuron") for t in tensors))
         torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestKthvalueDecompositionE2E:
+    """E2E tests for kthvalue via torch.compile(backend='neuron').
+
+    kthvalue leaves an unlegalized ``torch.constant.bool``; it is decomposed to
+    ``topk(largest=False)``. Returns (values, indices) — values compared with a
+    tolerance, indices exactly.
+    """
+
+    def test_registered(self):
+        assert torch.ops.aten.kthvalue.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("keepdim", [False, True])
+    @pytest.mark.parametrize("dim", [0, 1, -1])
+    @pytest.mark.parametrize("k", [1, 3])
+    def test_kthvalue_e2e(self, k, dim, keepdim, dtype):
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.kthvalue(x, k, dim=dim, keepdim=keepdim)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        # Distinct values per slice so the k-th value (and its index) is unambiguous.
+        x_cpu = torch.randperm(6 * 7).reshape(6, 7).to(dtype)
+        exp_vals, exp_idx = fn(x_cpu)
+        res_vals, res_idx = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(res_vals.cpu(), exp_vals, rtol=tol, atol=tol)
+        torch.testing.assert_close(res_idx.cpu(), exp_idx)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_kthvalue_scalar_e2e(self, dtype):
+        """0-d input: only k==1 is valid; result is the scalar at index 0."""
+
+        def fn(x):
+            return torch.kthvalue(x, 1)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.tensor(3.5, dtype=dtype)
+        exp_vals, exp_idx = fn(x_cpu)
+        res_vals, res_idx = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(res_vals.cpu(), exp_vals, rtol=tol, atol=tol)
+        torch.testing.assert_close(res_idx.cpu(), exp_idx)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestDiagDecompositionE2E:
+    """E2E tests for diag / diagonal via torch.compile(backend='neuron').
+
+    ``aten::diag`` (2-D) and ``aten::diagonal`` are CompositeImplicitAutograd, so
+    PyTorch lowers them to ``aten.diagonal_copy.default`` before the Neuron
+    decomposition table is consulted — the decomposition is therefore keyed on
+    ``diagonal_copy`` (which otherwise leaves an unlegalized ``torch.constant.int``).
+    The 1-D ``diag`` (build a matrix) goes through ``diag_embed`` instead.
+    """
+
+    def test_registered(self):
+        assert torch.ops.aten.diagonal_copy.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("offset", [0, 2, -3])
+    def test_diag_2d_e2e(self, offset, dtype):
+        """2-D diag extracts the (offset) diagonal as a vector."""
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.diag(x, offset)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(7, 9, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("offset", [0, 1, -1])
+    def test_diag_1d_e2e(self, offset, dtype):
+        """1-D diag builds a matrix with the input on the (offset) diagonal."""
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.diag(x, offset)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(6, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_diagonal_nd_e2e(self, dtype):
+        """N-D diagonal over a non-default (dim1, dim2) plane."""
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.diagonal(x, offset=1, dim1=0, dim2=2)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(4, 3, 5, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestLogcumsumexpDecompositionE2E:
+    """E2E tests for (_)logcumsumexp via torch.compile(backend='neuron').
+
+    The direct lowering leaves a dangling ``torch.constant.int`` and ``cumsum``
+    is banned in the Neuron pipeline, so the op is decomposed to
+    ``log(prefix_sum(exp(x)))`` with a triangular-matmul prefix sum. The private
+    ``aten::_logcumsumexp`` also ships no meta kernel, so a fake impl is
+    registered to let Dynamo trace it.
+    """
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            torch.ops.aten.logcumsumexp.default,
+            torch.ops.aten._logcumsumexp.default,
+        ],
+    )
+    def test_registered(self, op):
+        assert op in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("dim", [0, 1, 2])
+    def test_logcumsumexp_e2e(self, dim, dtype):
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.logcumsumexp(x, dim)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(5, 5, 5, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_logcumsumexp_scalar_e2e(self, dtype):
+        """logcumsumexp over a 0-d tensor is identity (single element)."""
+
+        def fn(x):
+            return torch.logcumsumexp(x, 0)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.tensor(1.25, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_private_logcumsumexp_e2e(self, dtype):
+        """The private aten::_logcumsumexp reaches the decomposition only because
+        a fake impl is registered (otherwise Dynamo graph-breaks on it)."""
+        torch.manual_seed(0)
+
+        def fn(x):
+            return torch.ops.aten._logcumsumexp.default(x, 0)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+        x_cpu = torch.randn(8, 16, dtype=dtype)
+        expected = fn(x_cpu)
+        result = compiled_fn(x_cpu.to("neuron"))
+        tol = 1e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected, rtol=tol, atol=tol)
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
