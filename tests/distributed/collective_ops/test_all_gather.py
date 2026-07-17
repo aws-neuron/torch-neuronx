@@ -288,10 +288,6 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test asynchronous all_gather operation."""
         self.distributed_tester.run_test(run_async_operations)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_future_index_by_rank(self):
         """Test accessing results via future.value()[0][rank] pattern used by DDP hooks."""
         self.distributed_tester.run_test(run_future_index_by_rank_test)
