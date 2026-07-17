@@ -301,6 +301,46 @@ def range_decomposition(
     return out
 
 
+@_register_fake("aten::mm.dtype_out")
+def _mm_dtype_out_fake(self, mat2, out_dtype, *, out):
+    return out
+
+
+@register_decomposition([aten.mm.dtype])
+def mm_dtype(self, mat2, out_dtype):
+    """Decompose mm.dtype into a cast + plain mm (2d analog of bmm.dtype)."""
+    return torch.mm(self.to(out_dtype), mat2.to(out_dtype))
+
+
+def _norm_to_vector_norm(self, p, dim, keepdim, dtype=None):
+    """Shared math for torch.norm overloads, forwarding to vector_norm.
+
+    torch.norm with a scalar p (or p=None → 2-norm / Frobenius) is the vector
+    p-norm over the given dims; we reuse linalg_vector_norm, which already has a
+    Neuron-lowering decomposition. p="fro" → 2-norm; "nuc" is unsupported here.
+    """
+    if isinstance(p, str):
+        if p == "fro":
+            ord_val = 2.0
+        else:  # "nuc" needs SVD — not supported
+            return NotImplemented
+    else:
+        ord_val = 2.0 if p is None else float(p)
+    return torch.linalg.vector_norm(self, ord=ord_val, dim=dim, keepdim=keepdim, dtype=dtype)
+
+
+@register_decomposition([aten.norm.ScalarOpt_dim])
+def norm_scalaropt_dim(self, p, dim, keepdim=False):
+    """Decompose norm.ScalarOpt_dim (the functional form norm.out lowers to)."""
+    return _norm_to_vector_norm(self, p, dim, keepdim)
+
+
+@register_decomposition([aten.norm.ScalarOpt_dim_dtype])
+def norm_scalaropt_dim_dtype(self, p, dim, keepdim, dtype):
+    """Decompose norm.ScalarOpt_dim_dtype (functional form of norm.dtype_out)."""
+    return _norm_to_vector_norm(self, p, dim, keepdim, dtype=dtype)
+
+
 def _clamp_promoted_dtype(self_dtype, *bounds):
     """PyTorch clamp type promotion: a float scalar bound promotes an integer
     input to the default float dtype, but leaves a float input unchanged."""
@@ -5758,6 +5798,106 @@ def _cross_entropy_loss_decomp(
         return NotImplemented
     log_softmax = torch.log_softmax(input, dim=1)
     return torch.ops.aten.nll_loss_forward(log_softmax, target, weight, reduction, ignore_index)[0]
+
+
+# ── Linalg ops ────────────────────────────────────────────────────
+# _linalg_det / _linalg_slogdet fail torch-mlir legalization. These are LAPACK
+# kernels with no PyTorch reference decomposition, so we implement LU with
+# partial pivoting with every loop bound fixed to a compile-time constant (from
+# the static matrix size) and written fully functionally — no in-place slice
+# assignment, which traces to copy_ ops the backend rejects.
+
+
+def _lu_factor_unrolled(a):
+    """LU with partial pivoting, fixed N-step unrolled loop, fully functional.
+
+    Returns (lu, sign, pivots) matching aten's getrf convention:
+    * ``lu`` packs unit-diagonal L below the diagonal and U on/above, on the
+      row-pivoted matrix.
+    * ``sign`` is (-1)**(num row swaps) per batch element (for det).
+    * ``pivots`` is the 1-indexed LAPACK pivot vector: ``pivots[k] = j+1`` where
+      ``j`` is the row swapped with row k at step k.
+    Each step selects a pivot via argmax over a column (a value reduction, not a
+    data-dependent shape), swaps rows by gathering a permuted index vector, and
+    eliminates the rows below using torch.where (no in-place writes).
+    """
+    *batch, n, _ = a.shape
+    dev, dt = a.device, a.dtype
+    lu = a
+    sign = (
+        torch.ones(batch, dtype=dt, device=dev) if batch else torch.ones((), dtype=dt, device=dev)
+    )
+    rows = torch.arange(n, device=dev)  # (n,) row indices for masks
+    pivot_steps = []  # per-step pivot row (0-indexed), collected then stacked
+
+    for k in range(n):
+        # Partial pivot: row (>= k) with the largest |lu[..., :, k]| at/below k.
+        col_k = lu[..., k]  # (*batch, n)
+        masked = torch.where(rows >= k, torch.abs(col_k), torch.full_like(col_k, -1.0))
+        piv = torch.argmax(masked, dim=-1)  # (*batch,)
+        pivot_steps.append(piv)
+
+        # Build a row permutation that swaps row k <-> row piv, then gather.
+        perm = rows.expand(*batch, n)  # (*batch, n)
+        is_k = perm == k
+        is_piv = perm == piv.unsqueeze(-1)
+        perm = torch.where(is_k, piv.unsqueeze(-1), perm)
+        perm = torch.where(is_piv, torch.full_like(perm, k), perm)
+        lu = torch.gather(lu, -2, perm.unsqueeze(-1).expand(*batch, n, n))
+        sign = torch.where(piv == k, sign, -sign)
+
+        # Eliminate rows below k: row_i -= (lu[i,k]/lu[k,k]) * row_k, for i > k.
+        pivot_val = lu[..., k, k].unsqueeze(-1)  # (*batch, 1)
+        col_below = lu[..., k]  # (*batch, n) current column k
+        mult = col_below / pivot_val  # multipliers per row (*batch, n)
+        mult = torch.where(rows > k, mult, torch.zeros_like(mult))  # only rows > k
+        row_k = lu[..., k, :]  # (*batch, n)
+        # update[i, j] = mult[i] * row_k[j], applied only to rows > k
+        update = mult.unsqueeze(-1) * row_k.unsqueeze(-2)  # (*batch, n, n)
+        lu = lu - update
+        # Below the diagonal in column k we store the multiplier, not 0.
+        col_mask = (rows > k).unsqueeze(-1) & (rows == k)  # (n, n): rows>k, col==k
+        lu = torch.where(col_mask, mult.unsqueeze(-1).expand(*batch, n, n), lu)
+
+    # Stack per-step pivots into the (*batch, n) LAPACK 1-indexed pivot vector.
+    pivots = torch.stack(pivot_steps, dim=-1).to(torch.int32) + 1  # (*batch, n)
+    return lu, sign, pivots
+
+
+def _lu_diagonal(lu):
+    n = lu.shape[-1]
+    idx = torch.arange(n, device=lu.device)
+    return lu[..., idx, idx]  # (*batch, n)
+
+
+@register_decomposition([aten._linalg_det.default, aten._linalg_det.result])
+def linalg_det_decomposition(a):
+    """_linalg_det via LU: det = sign(pivots) * prod(diag(U)).
+
+    aten._linalg_det returns (result, LU, pivots). We return det plus the LU
+    factors and a placeholder pivots tensor (the det value is what consumers
+    use; downstream rarely reads the synthetic pivots).
+    """
+    lu, sign, pivots = _lu_factor_unrolled(a)
+    diag = _lu_diagonal(lu)
+    # Compute det in the log domain to avoid fp32 overflow/underflow: the naive
+    # product of N diagonal entries blows up for large N. Mirrors the stable
+    # slogdet path: det = sign * prod(sign(diag)) * exp(sum log|diag|).
+    diag_sign = torch.prod(torch.sign(diag), dim=-1)
+    logabs = torch.sum(torch.log(torch.abs(diag)), dim=-1)
+    det = sign * diag_sign * torch.exp(logabs)
+    return det, lu, pivots
+
+
+@register_decomposition([aten._linalg_slogdet.default, aten._linalg_slogdet.sign])
+def linalg_slogdet_decomposition(a):
+    """_linalg_slogdet via LU: sign = sign(pivots)*prod(sign(diag(U))),
+    logabsdet = sum(log|diag(U)|). Returns (sign, logabsdet, LU, pivots)."""
+    lu, sign, pivots = _lu_factor_unrolled(a)
+    diag = _lu_diagonal(lu)
+    sign_out = sign * torch.prod(torch.sign(diag), dim=-1)
+    logabsdet = torch.sum(torch.log(torch.abs(diag)), dim=-1)
+    return sign_out, logabsdet, lu, pivots
 
 
 def get_compile_decomposition_table() -> dict:
