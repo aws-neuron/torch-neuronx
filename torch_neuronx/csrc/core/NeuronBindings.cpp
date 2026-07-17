@@ -1891,7 +1891,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "execute_compiled_graph",
       [](const std::string& graph_name, const std::string& cache_key,
          const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& outputs,
-         bool has_collectives) {
+         bool has_collectives, const std::vector<std::string>& input_names,
+         const std::vector<std::string>& output_names) {
         TORCH_NEURONX_DEBUG("execute_compiled_graph invoked.", "graph_name=", graph_name,
                             "cache_key=", cache_key);
 
@@ -1908,13 +1909,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto kernel = std::make_unique<at::neuron::NeffDirectKernelExecution>(
             graph_name, cache_key, std::move(input_refs), std::move(output_refs), input_contexts,
             output_contexts, target_device_id, has_collectives);
+        if (!input_names.empty()) {
+          TORCH_CHECK(input_names.size() == inputs.size(), "input_names has ", input_names.size(),
+                      " entries but inputs has ", inputs.size());
+          kernel->SetInputNames(input_names);
+        }
+        if (!output_names.empty()) {
+          TORCH_CHECK(output_names.size() == outputs.size(), "output_names has ",
+                      output_names.size(), " entries but outputs has ", outputs.size());
+          kernel->SetOutputNames(output_names);
+        }
 
         // Create and submit operation context
         auto context = std::make_unique<at::neuron::OperationContext>(std::move(kernel), "");
         at::neuron::SubmitOperationContext(stream, std::move(context));
       },
-      "Execute compiled graph using cache key", py::arg("graph_name"), py::arg("cache_key"),
-      py::arg("inputs"), py::arg("outputs"), py::arg("has_collectives"));
+      "Execute compiled graph using cache key. See docstring for input_names / output_names "
+      "semantics.",
+      py::arg("graph_name"), py::arg("cache_key"), py::arg("inputs"), py::arg("outputs"),
+      py::arg("has_collectives"), py::arg("input_names") = std::vector<std::string>{},
+      py::arg("output_names") = std::vector<std::string>{});
 
   // torch.compile MegaCache: write NEFF to persistent cache
   m.def(
@@ -1929,6 +1943,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return cache.Put(key, neff_vec);
       },
       "Write NEFF to persistent cache", py::arg("key"), py::arg("neff_bytes"));
+
+  // Compute the persistent-cache key for a base ``cache_key``
+  m.def(
+      "_get_neff_persistent_key",
+      [](const std::string& cache_key) -> std::string {
+        at::neuron::CompilationCacheKey key(cache_key, at::neuron::CacheKeySource::TORCH_COMPILE);
+        const std::string* pk = key.GetPersistentKey();
+        TORCH_CHECK(pk != nullptr, "Failed to derive persistent key from cache_key='", cache_key,
+                    "'");
+        return *pk;
+      },
+      "Persistent-cache key derived from a NeffDirectKernelExecution cache_key. Use this "
+      "as the key argument to put_neff_cache before calling _execute_neff.",
+      py::arg("cache_key"));
 
   // torch.compile MegaCache: read NEFF from persistent cache
   m.def(
