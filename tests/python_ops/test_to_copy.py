@@ -1,4 +1,5 @@
 import os
+import time
 
 import pytest
 import torch
@@ -377,3 +378,100 @@ def test_to_copy_float_to_int64_beyond_int32_range(src_dtype):
     assert torch.equal(
         dst.cpu(), expected
     ), f"{src_dtype}→int64 mismatch: got {dst.cpu().tolist()} exp {expected.tolist()}"
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.parametrize("trigger", ["n2n_preserve", "n2n_contiguous_format", "cpu_to_neuron"])
+def test_to_copy_noncontiguous_strided_cast_is_fast(trigger):
+    """_to_copy of a non-contiguous (transposed) view must stay fast."""
+    shape = (1, 24, 2048, 256)  # transposed to [1,24,256,2048] like an attention key
+
+    def do_cast():
+        if trigger == "n2n_preserve":
+            # Neuron->Neuron cross-dtype cast, MemoryFormat::Preserve (autocast path).
+            src = torch.randn(*shape, dtype=torch.float32, device="neuron").transpose(-1, -2)
+            return src, src.to(torch.bfloat16)
+        elif trigger == "n2n_contiguous_format":
+            # Same-dtype + contiguous_format materialize. High-level .to() no-ops
+            # same-dtype, so drive the dispatcher directly (as functionalization does).
+            src = torch.randn(*shape, dtype=torch.float32, device="neuron").transpose(-1, -2)
+            out = torch.ops.aten._to_copy(
+                src, dtype=torch.float32, memory_format=torch.contiguous_format
+            )
+            return src, out
+        else:  # cpu_to_neuron
+            # CPU non-contiguous source -> Neuron with dtype change (Preserve strides).
+            src = torch.randn(*shape, dtype=torch.float32).transpose(-1, -2)
+            return src, src.to(device="neuron", dtype=torch.bfloat16)
+
+    # Warm up one-time compilation; the per-element regression is NOT
+    # compile-cacheable, so it stays ~90s even when warm.
+    _, _ = do_cast()
+    torch_neuronx.synchronize()
+
+    t0 = time.time()
+    src, dst = do_cast()
+    torch_neuronx.synchronize()
+    elapsed = time.time() - t0
+
+    assert dst.shape == src.shape
+    expected = src.cpu().to(dst.dtype)
+    torch.testing.assert_close(dst.cpu(), expected)
+    assert elapsed < 1.0, (
+        f"[{trigger}] strided cast took {elapsed:.2f}s "
+        f"(regressed to per-element nrt copies?); expected ~60ms"
+    )
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.parametrize("path", ["cpu_to_neuron", "n2n_same_dtype", "n2n_cross_dtype"])
+def test_to_copy_expand_zero_stride_is_correct(path):
+    """_to_copy of an expanded (stride-0 / overlapping) view must be correct."""
+    # [1,1,512,512] -> expand to [2,1,512,512]: dim 0 stride 0 (overlapping).
+    if path == "cpu_to_neuron":
+        base = torch.randn(1, 1, 8, 8, dtype=torch.float32)
+        src = base.expand(2, 1, 8, 8)
+        dst = src.to("neuron")  # CPU -> Neuron, same dtype, Preserve
+        expected = src  # value/stride reference on CPU
+    elif path == "n2n_same_dtype":
+        base = torch.randn(1, 1, 8, 8, dtype=torch.float32, device="neuron")
+        src = base.expand(2, 1, 8, 8)
+        dst = torch.ops.aten._to_copy(src, dtype=torch.float32)  # same dtype, Preserve
+        expected = src.cpu()
+    else:  # n2n_cross_dtype
+        base = torch.randn(1, 1, 8, 8, dtype=torch.float32, device="neuron")
+        src = base.expand(2, 1, 8, 8)
+        dst = src.to(torch.bfloat16)  # cross dtype, Preserve
+        expected = src.cpu().to(torch.bfloat16)
+
+    torch_neuronx.synchronize()
+    assert dst.device.type == "neuron"
+    assert dst.shape == expected.shape
+    torch.testing.assert_close(dst.cpu(), expected)
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+def test_to_copy_complex_strided_does_not_redispatch():
+    """Strided complex _to_copy must use the byte-wise path, not aten::copy_.
+
+    Fence for the linalg_eig regression: redispatching a complex strided copy
+    hits aten::contiguous (unsupported for complex; hard error under
+    TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1, silent CPU fallback
+    otherwise — hence the op-tracking check).
+    """
+    # F-contiguous complex source, like LAPACK eigenvector output: strides (1, 5).
+    src = torch.randn(5, 5, dtype=torch.complex64).t()
+
+    with track_neuron_ops():
+        dst = src.to("neuron")
+        torch_neuronx.synchronize()
+        executed = torch_neuronx.get_executed_ops()
+        fallback = torch_neuronx.get_fallback_ops()
+
+    assert "aten::contiguous" not in executed and "aten::contiguous" not in fallback, (
+        "complex strided _to_copy redispatched into aten::contiguous "
+        f"(executed={executed}, fallback={fallback})"
+    )
+    assert dst.device.type == "neuron"
+    assert dst.stride() == src.stride()
+    torch.testing.assert_close(dst.cpu(), src)
