@@ -42,10 +42,6 @@ class TestDispatchTracing:
         with open(trace_file) as f:
             return json.load(f)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_dispatch_events_present(self):
         """Verify DISPATCH events appear on RuntimeWorker thread."""
         exp_config = NeuronConfig(
@@ -77,10 +73,6 @@ class TestDispatchTracing:
             f"got {len(runtime_tids)}: {runtime_tids}"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_dispatch_encapsulates_driver(self):
         """Verify DISPATCH fully contains its DRIVER event."""
         exp_config = NeuronConfig(
@@ -135,10 +127,6 @@ class TestDispatchTracing:
                     driver["ts"] >= dispatch_start
                 ), f"DRIVER start ({driver['ts']}) < DISPATCH start ({dispatch_start})"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_per_xu_type_driver_rows(self):
         """Verify device DRIVER events use per-XU type resource IDs."""
         exp_config = NeuronConfig(
@@ -174,10 +162,6 @@ class TestDispatchTracing:
                 "TensorOp",
             ), f"Unexpected xu_type: {args['xu_type']}"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_dispatch_flow_arrows(self):
         """Verify flow arrows connect DISPATCH → DRIVER."""
         exp_config = NeuronConfig(
@@ -205,10 +189,6 @@ class TestDispatchTracing:
         matched = start_ids & end_ids
         assert len(matched) > 0, "No matching flow IDs between start/end"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_pytorch_sequence_nr_metadata(self):
         """Verify pytorch_seq_nr metadata is present in events."""
         exp_config = NeuronConfig(
@@ -231,10 +211,6 @@ class TestDispatchTracing:
             args = evt.get("args", {})
             assert "pytorch_seq_nr" in args, f"DRIVER event '{evt['name']}' missing pytorch_seq_nr"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_dispatch_slot_resource_labels(self):
         """Verify dispatch slot rows get proper labels (Stream X / Compute Slot N)."""
         exp_config = NeuronConfig(
@@ -264,10 +240,6 @@ class TestDispatchTracing:
             "Expected labels like 'Stream 0 / Compute Slot 0'."
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_xu_type_resource_labels(self):
         """Verify per-XU type rows get proper labels (Stream X / Compute, etc.)."""
         exp_config = NeuronConfig(
@@ -297,10 +269,6 @@ class TestDispatchTracing:
             len(thread_labels) > 0
         ), "No per-XU type resource labels found (expected 'Stream X / Compute' etc.)"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_concurrent_ops_get_distinct_slots(self):
         """Verify multiple inflight ops get distinct dispatch_slot values (parallel rows)."""
         exp_config = NeuronConfig(
@@ -337,10 +305,6 @@ class TestDispatchTracing:
             f"got {len(dispatch_tids)}: {dispatch_tids}"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_slot_recycling_after_completion(self):
         """Verify slots are reused: many sequential ops reuse the same slots."""
         exp_config = NeuronConfig(
@@ -378,10 +342,6 @@ class TestDispatchTracing:
         # If all 20 ops ran, but at most 8 distinct slots, recycling is working
         assert len(slots) <= 8, f"More than 8 distinct slots used: {slots}"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_host_ops_excluded_from_dispatch(self):
         """Verify alloc/dealloc ops do NOT produce DISPATCH events."""
         exp_config = NeuronConfig(
@@ -413,10 +373,6 @@ class TestDispatchTracing:
             f"found {len(dispatch_evts)}: {[e['name'] for e in dispatch_evts[:5]]}"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_flow_arrows_one_to_one(self):
         """Verify flow IDs have exact 1:1 matching between starts and ends."""
         exp_config = NeuronConfig(
@@ -450,10 +406,6 @@ class TestDispatchTracing:
             f"{len(set(end_ids) - set(start_ids))} ends without starts"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_dispatch_events_non_overlapping_per_slot(self):
         """Verify events on the same dispatch slot tid do not overlap in time."""
         exp_config = NeuronConfig(

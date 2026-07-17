@@ -267,10 +267,6 @@ class TestNeuronProfilerIntegration:
             f"Metadata names: {meta_names}"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_no_activities(self):
         """Case 1: profile(activities=None) uses supported_activities() defaults.
 
@@ -290,10 +286,6 @@ class TestNeuronProfilerIntegration:
         self._assert_has_framework_traces(prof)
         self._assert_no_nrt_output(self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_cpu_only(self):
         """Case 2: activities=[CPU], no NeuronConfig -> framework traces only."""
         with (
@@ -306,10 +298,6 @@ class TestNeuronProfilerIntegration:
         self._assert_has_framework_traces(prof)
         self._assert_no_nrt_output(self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_privateuse1_no_config(self):
         """Case 3: activities=[PrivateUse1], no NeuronConfig -> no traces.
 
@@ -327,10 +315,6 @@ class TestNeuronProfilerIntegration:
         self._assert_no_framework_traces(prof)
         self._assert_no_nrt_output(self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_cpu_privateuse1_no_config(self):
         """Case 4: activities=[CPU, PrivateUse1], no NeuronConfig -> framework traces only.
 
@@ -347,10 +331,6 @@ class TestNeuronProfilerIntegration:
         self._assert_has_framework_traces(prof)
         self._assert_no_nrt_output(self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_runtime_only(self):
         """Per-mode test: RUNTIME only with PrivateUse1 activity.
 
@@ -378,10 +358,6 @@ class TestNeuronProfilerIntegration:
         )
         self._validate_chrome_trace_basics(prof, self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_device_only(self):
         """Per-mode test: DEVICE only with PrivateUse1 activity.
 
@@ -409,10 +385,6 @@ class TestNeuronProfilerIntegration:
         )
         self._validate_chrome_trace_basics(prof, self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_cpu_and_runtime_no_device(self):
         """Per-mode test: CPU + PrivateUse1 with RUNTIME mode only.
 
@@ -441,10 +413,6 @@ class TestNeuronProfilerIntegration:
         )
         self._validate_chrome_trace_basics(prof, self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_device_and_runtime(self):
         """Per-mode test: DEVICE + RUNTIME (NeuronConfig defaults) without CPU.
 
@@ -473,10 +441,6 @@ class TestNeuronProfilerIntegration:
         )
         self._validate_chrome_trace_basics(prof, self.test_dir)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_neuron_profiling(self):
         """Comprehensive hardware profiling test.
 
@@ -589,10 +553,6 @@ class TestNeuronProfilerIntegration:
             assert evt.get("ts", 0) > 0, f"Zero ts: {evt['name']}"
             assert evt.get("dur", -1) >= 0, f"Negative dur: {evt['name']}"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_schedule(self):
         """Schedule-driven profiling with two cycles.
 
@@ -690,10 +650,6 @@ class TestNeuronProfilerIntegration:
             "cycle2_step3_wait" not in all_names
         ), "Wait-phase label 'cycle2_step3_wait' should not appear in any trace"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_neuron_profiler_export_trace(self):
         """Test that NeuronProfiler.export_trace writes the trace into
         the NRT instance directory."""
@@ -723,8 +679,11 @@ class TestNeuronProfilerIntegration:
         ), f"trace.json should not be in root directory. Root files: {root_files}"
 
     @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
+        reason="NRT neff_cache_dir copy contract changed (libnrt 2.x.56678 -> 2.x.61770): "
+        "NEFFs are now copied into the profile output only when actually executed during the "
+        "session and matched by cache key, not for arbitrary files seeded in the directory. "
+        "Test needs to be updated to profile a real executed-workload NEFF.",
+        strict=False,
     )
     def test_neuron_profiler_with_neff_cache_configured(self):
         """Test that NEFFs from a configured neff_cache_dir are copied to a shared
@@ -770,10 +729,6 @@ class TestNeuronProfilerIntegration:
         finally:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_neuron_profiler_on_trace_ready(self):
         """Test NeuronProfiler.export_trace used as on_trace_ready callback."""
         exp_config = NeuronConfig(
@@ -795,8 +750,13 @@ class TestNeuronProfilerIntegration:
         assert os.path.getsize(trace_path) > 0, "trace.json is empty"
 
     @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
+        reason="Upstream kineto bug (fixed upstream, not yet in our pinned PyTorch): "
+        "ChromeTraceLogger did not JSON-escape double quotes in event names. With with_stack=True "
+        "+ torch.compile, dynamo-generated frames carry co_filename strings containing double "
+        'quotes (e.g. {"device": "cpu", "dtype": "float32"}), corrupting the exported chrome trace '
+        "so json.load raises JSONDecodeError. Fixed by pytorch/kineto#1459 (fixes "
+        "pytorch/pytorch#146900); not present in the torch version currently pinned here.",
+        strict=False,
     )
     def test_compile_profile(self):
         """Profile a torch.compile MLP workload on Neuron.
@@ -995,10 +955,6 @@ class TestCorrelateDeviceTimeIntegration:
             torch.neuron.synchronize()
         return x
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_auto_correlation_via_neuron_profiler(self, neuron_tensor):
         """NeuronProfiler.export_trace() auto-correlates when config enabled."""
         nc = NeuronConfig(
@@ -1029,10 +985,6 @@ class TestCorrelateDeviceTimeIntegration:
         assert len(results) > 0, "on_trace_ready was never called"
         assert results[0] > 0, "Expected non-zero NEURON time from auto-correlation"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_disabled_via_config(self, neuron_tensor):
         """correlate_device_time=False should skip correlation."""
         nc = NeuronConfig(
@@ -1063,10 +1015,6 @@ class TestCorrelateDeviceTimeIntegration:
         assert len(results) > 0, "on_trace_ready was never called"
         assert results[0] == 0, "Expected zero NEURON time when correlation disabled"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_manual_correlate_without_schedule(self, neuron_tensor):
         """correlate_device_time(prof) populates key_averages without schedule."""
         nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=self.test_dir)
@@ -1083,10 +1031,6 @@ class TestCorrelateDeviceTimeIntegration:
         total = sum(e.self_device_time_total for e in ka)
         assert total > 0, "Expected non-zero NEURON time after correlate_device_time()"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_correlate_via_export_trace_with_schedule(self, neuron_tensor):
         """NeuronProfiler.export_trace() correlates inside on_trace_ready with schedule."""
         nc = NeuronConfig(
