@@ -3278,6 +3278,74 @@ def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     return torch.sort(input, dim=dim, descending=descending, stable=stable)[1]
 
 
+@register_decomposition([aten.median.dim, aten.median.dim_values])
+def median_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
+    """Decompose median.dim into topk (smallest k elements) + select last."""
+    if input.ndim == 0:
+        return input.clone(), torch.zeros((), dtype=torch.int64, device=input.device)
+    if dim < 0:
+        dim = input.ndim + dim
+    n = input.shape[dim]
+    k = (n - 1) // 2 + 1
+    # topk with largest=False gives the k smallest elements in sorted order;
+    # the last one (index k-1) is the median.
+    topk_vals, topk_indices = torch.topk(input, k, dim=dim, largest=False, sorted=True)
+    values = topk_vals.select(dim, k - 1)
+    indices = topk_indices.select(dim, k - 1)
+    if keepdim:
+        values = values.unsqueeze(dim)
+        indices = indices.unsqueeze(dim)
+    return values, indices
+
+
+@register_decomposition([aten.median.default])
+def median_decomposition(input):
+    """Decompose scalar median into topk of flattened tensor."""
+    flat = input.flatten()
+    n = flat.shape[0]
+    k = (n - 1) // 2 + 1
+    topk_vals = torch.topk(flat, k, dim=0, largest=False, sorted=True)[0]
+    return topk_vals[k - 1]
+
+
+@register_decomposition([aten.nanmedian.dim, aten.nanmedian.dim_values])
+def nanmedian_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
+    """Decompose nanmedian.dim by replacing NaN with +inf then using topk."""
+    if input.ndim == 0:
+        return input.clone(), torch.zeros((), dtype=torch.int64, device=input.device)
+    if dim < 0:
+        dim = input.ndim + dim
+    filled = torch.where(torch.isnan(input), torch.full_like(input, float("inf")), input)
+    n = input.shape[dim]
+    non_nan_count = (~torch.isnan(input)).to(torch.int64).sum(dim=dim, keepdim=True)
+    all_nan_mask = non_nan_count == 0
+    # Clamp to 0 so gather index is valid even when all elements are NaN
+    k_idx = torch.clamp((non_nan_count - 1) // 2, min=0).to(torch.int64)
+    topk_vals, topk_indices = torch.topk(filled, n, dim=dim, largest=False, sorted=True)
+    values = torch.gather(topk_vals, dim, k_idx)
+    indices = torch.gather(topk_indices, dim, k_idx)
+    # Return NaN (and index 0) for all-NaN slices to match PyTorch semantics
+    values = torch.where(all_nan_mask, torch.full_like(values, float("nan")), values)
+    indices = torch.where(all_nan_mask, torch.zeros_like(indices), indices)
+    if not keepdim:
+        values = values.squeeze(dim)
+        indices = indices.squeeze(dim)
+    return values, indices
+
+
+@register_decomposition([aten.nanmedian.default])
+def nanmedian_decomposition(input):
+    """Decompose scalar nanmedian by replacing NaN with +inf then using topk."""
+    flat = input.flatten()
+    filled = torch.where(torch.isnan(flat), torch.full_like(flat, float("inf")), flat)
+    n = flat.shape[0]
+    non_nan_count = (~torch.isnan(flat)).to(torch.int64).sum()
+    k_idx = torch.clamp((non_nan_count - 1) // 2, min=0).reshape(1)
+    topk_vals = torch.topk(filled, n, dim=0, largest=False, sorted=True)[0]
+    result = torch.gather(topk_vals, 0, k_idx).squeeze(0)
+    return torch.where(non_nan_count == 0, torch.full_like(result, float("nan")), result)
+
+
 @register_decomposition([aten.native_dropout.default])
 def native_dropout_decomposition(input, p: float, train: bool = True):
     """Decompose native_dropout using on-device RNG."""

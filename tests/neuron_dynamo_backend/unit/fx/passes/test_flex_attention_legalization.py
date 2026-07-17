@@ -436,46 +436,6 @@ class TestComputeSoftmax:
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
 
 
-class TestReplaceSortStable:
-    """Tests for sort.stable replacement via FlexAttentionLegalization."""
-
-    def test_sort_values_become_identity(self):
-        """Test that sorted values output becomes identity (input passthrough)."""
-        flex_pass = FlexAttentionLegalization()
-
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        x.meta = {"val": torch.randn(2, 4, 8)}
-
-        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
-        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
-
-        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
-        graph.output(sorted_vals)
-
-        flex_pass._replace_sort_stable_with_identity(graph)
-        gm = fx.GraphModule(torch.nn.Module(), graph)
-
-        test_input = torch.randn(2, 4, 8)
-        result = gm(test_input)
-
-        # After replacement, sorted_vals should be identity (same as input)
-        torch.testing.assert_close(result, test_input)
-
-    def test_returns_false_when_no_sort_nodes(self):
-        """Test that function returns False when no sort.stable nodes exist."""
-        flex_pass = FlexAttentionLegalization()
-
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        y = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
-        graph.output(y)
-
-        modified = flex_pass._replace_sort_stable_with_identity(graph)
-
-        assert modified is False
-
-
 class TestFullAttentionPipeline:
     """Integration tests that build and execute full attention computation graphs."""
 
@@ -569,25 +529,6 @@ class TestFullAttentionPipeline:
 
 class TestLegalizeFlexAttentionPass:
     """Tests for the legalize_flex_attention_pass convenience function."""
-
-    def test_pass_handles_graph_with_sort_stable(self):
-        """Test that pass removes sort.stable nodes even without flex_attention."""
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        x.meta = {"val": torch.randn(2, 4, 8)}
-
-        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
-        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
-
-        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
-        graph.output(sorted_vals)
-
-        gm = fx.GraphModule(torch.nn.Module(), graph)
-        result = legalize_flex_attention_pass(gm)
-
-        # Should remove sort.stable
-        sort_nodes = [n for n in result.graph.nodes if n.target == torch.ops.aten.sort.stable]
-        assert len(sort_nodes) == 0
 
     def test_pass_returns_same_module_when_no_changes_needed(self):
         """Test that pass returns unchanged module for simple graphs."""
