@@ -32,9 +32,11 @@ import argparse
 import contextlib
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -206,9 +208,66 @@ def build_pytest_argv(
 
 
 # ---------------------------------------------------------------------------
+# env-lock LD_PRELOAD shim
+# ---------------------------------------------------------------------------
+# glibc < 2.41 getenv() walks the global environ array unlocked, while
+# setenv()/unsetenv() mutate it. libnrt calls getenv() during nrt_load on
+# torch-neuronx's background RuntimeWorker thread; upstream logging tests
+# restore os.environ (→ unsetenv) in teardown on the main thread. When the
+# two overlap, the worker process segfaults — observed as flaky
+# "[gwNN] node down" worker crashes in test_logging.py under xdist.
+# env_lock.c interposes getenv/setenv/unsetenv/putenv behind a process-wide
+# read-write lock; preloading it into the pytest process (workers inherit
+# LD_PRELOAD) closes the race. Verified: 12/12 repro-loop iterations clean
+# on glibc 2.35 with the shim vs a crash by iteration 2 without it.
+ENV_LOCK_SOURCE = Path(__file__).resolve().parent / "env_lock.c"
+
+
+def build_env_lock_shim(build_dir: Path | None = None) -> Path:
+    """Compile env_lock.c to the shared object required by upstream tests."""
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        raise RuntimeError("env-lock shim requires a C compiler (cc or gcc)")
+    if build_dir is None:
+        build_dir = Path(tempfile.mkdtemp(prefix="env_lock_"))
+    shim = build_dir / "env_lock.so"
+    cmd = [
+        cc,
+        "-O2",
+        "-g",
+        "-fPIC",
+        "-shared",
+        "-o",
+        str(shim),
+        str(ENV_LOCK_SOURCE),
+        "-lpthread",
+        "-ldl",
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        raise RuntimeError(f"env-lock shim compile failed: {detail}") from exc
+    print(f"env-lock shim: {shim} (preloaded into pytest)")
+    return shim
+
+
+def preload_env(shim: Path) -> dict[str, str]:
+    """Return a subprocess environment that preloads the env-lock shim."""
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = f"{shim} {env.get('LD_PRELOAD', '')}".strip()
+    return env
+
+
+# ---------------------------------------------------------------------------
 # Subprocess execution
 # ---------------------------------------------------------------------------
-def run_with_timeout(cmd: list[str], log_path: Path, wall_timeout: int) -> int:
+def run_with_timeout(
+    cmd: list[str],
+    log_path: Path,
+    wall_timeout: int,
+    env: dict[str, str] | None = None,
+) -> int:
     """Run ``cmd``, tee output to ``log_path``, kill after ``wall_timeout`` seconds.
 
     Mirrors the prior ``timeout --signal=SIGINT --kill-after=300`` behavior:
@@ -235,6 +294,7 @@ def run_with_timeout(cmd: list[str], log_path: Path, wall_timeout: int) -> int:
             text=True,
             bufsize=1,
             start_new_session=True,
+            env=env,
         )
         deadline = time.monotonic() + wall_timeout
         kill_deadline: float | None = None
@@ -446,10 +506,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     clone_upstream_tests(args.pytorch_fork_branch)
     print_run_summary(args)
 
+    # Build the env-lock LD_PRELOAD shim once; both the main pass and the
+    # retry pass preload it. See the "env-lock LD_PRELOAD shim" section.
+    pytest_env = preload_env(build_env_lock_shim())
+
     paths = derive_report_paths(args.output_dir, args.items, args.shard_id)
     print(f"=== Running: {' '.join(args.items)} ===")
     main_cmd = build_pytest_argv(args, paths, num_workers=args.num_workers)
-    exit_code = run_with_timeout(main_cmd, paths["log"], args.class_timeout)
+    exit_code = run_with_timeout(main_cmd, paths["log"], args.class_timeout, env=pytest_env)
 
     if exit_code in TIMEOUT_EXIT_CODES:
         print(f"WARNING: Hit timeout after {args.class_timeout}s (exit code: {exit_code})")
@@ -465,7 +529,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_workers=args.num_workers_retry,
             extra=["--last-failed", "--last-failed-no-failures=none"],
         )
-        retry_exit = run_with_timeout(retry_cmd, rpaths["log"], args.retry_timeout)
+        retry_exit = run_with_timeout(retry_cmd, rpaths["log"], args.retry_timeout, env=pytest_env)
         if retry_exit in (0, PYTEST_EXIT_NO_COLLECT):
             # All previously-failing tests now pass — flip overall result to
             # success. The aggregator surfaces passed_on_retry as a separate

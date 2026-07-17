@@ -8,6 +8,8 @@ exercised here; those are covered by CI smoke runs.
 
 from __future__ import annotations
 
+import ctypes
+import shutil
 import sys
 from pathlib import Path
 
@@ -19,11 +21,13 @@ from run_upstream_tests import (
     PYTEST_EXIT_NO_COLLECT,
     TIMEOUT_EXIT_CODES,
     WORKSPACE_ROOT,
+    build_env_lock_shim,
     build_pytest_argv,
     derive_report_paths,
     derive_safe_name,
     needs_process_isolation_flag,
     parse_args,
+    preload_env,
     retry_paths,
     should_retry,
 )
@@ -409,3 +413,100 @@ def test_main_chdir_lands_in_workspace_root(tmp_path, monkeypatch):
         import shutil
 
         shutil.rmtree(output_dir.resolve(), ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# env-lock LD_PRELOAD shim
+# ---------------------------------------------------------------------------
+def test_build_env_lock_shim_compiles(tmp_path):
+    shim = build_env_lock_shim(tmp_path)
+    assert shim.exists()
+    lib = ctypes.CDLL(str(shim))
+    for sym in ("getenv", "setenv", "unsetenv", "putenv"):
+        assert hasattr(lib, sym)
+
+
+def test_build_env_lock_shim_requires_compiler(monkeypatch, tmp_path):
+    monkeypatch.setattr("run_upstream_tests.shutil.which", lambda _: None)
+    with pytest.raises(RuntimeError, match="requires a C compiler"):
+        build_env_lock_shim(tmp_path)
+
+
+def test_preload_env_prepends_shim(monkeypatch, tmp_path):
+    shim = tmp_path / "env_lock.so"
+    shim.touch()
+    monkeypatch.setenv("LD_PRELOAD", "existing.so")
+    assert preload_env(shim)["LD_PRELOAD"] == f"{shim} existing.so"
+
+
+def test_preload_env_without_prior_ld_preload(monkeypatch, tmp_path):
+    shim = tmp_path / "env_lock.so"
+    shim.touch()
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    assert preload_env(shim)["LD_PRELOAD"] == str(shim)
+
+
+def test_preloaded_env_lock_makes_writer_progress_and_resets_after_fork(tmp_path, monkeypatch):
+    import subprocess
+
+    cc = shutil.which("cc") or shutil.which("gcc")
+    assert cc is not None
+    source = tmp_path / "env_lock_stress.c"
+    binary = tmp_path / "env_lock_stress"
+    source.write_text(
+        r"""
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define READERS 128
+#define WRITES 10000
+
+static atomic_bool stop = false;
+static const char *volatile sink;
+
+static void *read_env(void *unused) {
+  (void)unused;
+  while (!atomic_load_explicit(&stop, memory_order_relaxed))
+    sink = getenv("PATH");
+  return NULL;
+}
+
+int main(void) {
+  pthread_t readers[READERS];
+  for (int i = 0; i < READERS; ++i)
+    if (pthread_create(&readers[i], NULL, read_env, NULL) != 0)
+      return 2;
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    if (setenv("ENV_LOCK_FORK", "1", 1) != 0 || unsetenv("ENV_LOCK_FORK") != 0)
+      _exit(3);
+    _exit(0);
+  }
+  int status;
+  if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0)
+    return 4;
+
+  for (int i = 0; i < WRITES; ++i) {
+    if (setenv("ENV_LOCK_STRESS", "1", 1) != 0 || unsetenv("ENV_LOCK_STRESS") != 0)
+      return 5;
+  }
+
+  atomic_store_explicit(&stop, true, memory_order_relaxed);
+  for (int i = 0; i < READERS; ++i)
+    if (pthread_join(readers[i], NULL) != 0)
+      return 6;
+  return 0;
+}
+"""
+    )
+    subprocess.run([cc, "-O2", "-pthread", str(source), "-o", str(binary)], check=True)
+    shim = build_env_lock_shim(tmp_path)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    subprocess.run([str(binary)], env=preload_env(shim), check=True, timeout=15)
