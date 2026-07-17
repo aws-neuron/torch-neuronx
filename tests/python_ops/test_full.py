@@ -28,13 +28,7 @@ class TestFull:
         "shape, fill_value",
         [
             # Scalar tensor
-            pytest.param(
-                (),
-                42.0,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            ((), 42.0),
             # 1D tensor case
             ((5,), 3.14),
             # 2D tensor case

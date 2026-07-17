@@ -145,7 +145,6 @@ class TestContiguousRank3Transformer:
             expected = x_cpu[:, ::2, :].contiguous()
             assert torch.allclose(z.cpu().float(), expected.float(), rtol=1e-3, atol=1e-3)
 
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_large_scale_rank3(self):
         """Test RANK3 with larger tensors typical in transformers."""
         # Large-scale dimensions

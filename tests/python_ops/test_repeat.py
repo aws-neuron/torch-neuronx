@@ -112,7 +112,6 @@ class TestRepeat:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::repeat")
 
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_repeat_no_repeat(self, device):
         """Test repeat with all ones (no actual repetition)."""
         with track_neuron_ops():

@@ -89,7 +89,6 @@ def test_split_with_sizes_copy_empty_input():
     assert out[1].shape == (0, 5)
 
 
-@pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
 def test_split_with_sizes_copy_single_split():
     """Test split into single output (edge case)."""
     input_tensor = torch.randn(4, 10, dtype=torch.float32, device="neuron")

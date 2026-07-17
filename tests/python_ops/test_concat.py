@@ -27,7 +27,6 @@ class TestConcat:
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
 
-    @pytest.mark.xfail(reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix")
     def test_concat_with_mixed_empty_tensor(self):
         """Test concat empty 1D tensor with 2D tensor"""
 

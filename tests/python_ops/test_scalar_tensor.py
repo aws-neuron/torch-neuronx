@@ -141,19 +141,9 @@ class TestScalarTensor:
     @pytest.mark.parametrize(
         "value",
         [
-            pytest.param(
-                3.14,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            3.14,
             0.0,
-            pytest.param(
-                -1.5,
-                marks=pytest.mark.xfail(
-                    reason="pre-existing PT 2.11->2.12 bump failure; tracked for fix"
-                ),
-            ),
+            -1.5,
         ],
     )
     def test_scalar_tensor_out_variant(self, device, value):
