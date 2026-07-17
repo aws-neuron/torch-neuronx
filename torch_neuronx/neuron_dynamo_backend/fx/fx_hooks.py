@@ -57,13 +57,8 @@ class CustomFxImporterHooks(fx.FxImporterHooks):
                 assert (
                     npy_dtype is not None
                 ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
+                np_tensor = np.array(tensor.cpu().tolist()).astype(npy_dtype)
 
-                np_tensor = np.array(tensor.tolist()).astype(npy_dtype)
-
-                npy_dtype = TORCH_DTYPE_TO_NPY_TYPE.get(tensor.dtype)
-                assert npy_dtype is not None, f"Unsupported datatype: {tensor.dtype}"
-
-                np_tensor = np.array(tensor.tolist()).astype(npy_dtype)
                 element_type = TORCH_DTYPE_TO_MLIR_TYPE[tensor.dtype]()
 
                 elements_attr = mlir_ir.DenseElementsAttr.get(
