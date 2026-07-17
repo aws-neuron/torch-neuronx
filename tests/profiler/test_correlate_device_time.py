@@ -36,10 +36,6 @@ def neuron_tensor():
 class TestCorrelateDeviceTime:
     """Tests for the correlate_device_time function."""
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_basic_device_time_columns(self, profile_dir, neuron_tensor):
         """key_averages() shows non-zero NEURON time after correlation."""
         nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=profile_dir)
@@ -56,10 +52,6 @@ class TestCorrelateDeviceTime:
         total_neuron = sum(e.self_device_time_total for e in ka)
         assert total_neuron > 0, "Expected non-zero Self NEURON time"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_non_compute_ops_excluded(self, profile_dir, neuron_tensor):
         """alloc/dealloc/copy ops should not have device time attributed."""
         nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=profile_dir)
@@ -79,10 +71,6 @@ class TestCorrelateDeviceTime:
                     e.self_device_time_total == 0
                 ), f"{e.key} should not have device time, got {e.self_device_time_total}"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_compute_ops_have_device_time(self, profile_dir, neuron_tensor):
         """aten::mul and aten::add should have non-zero device time."""
         nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=profile_dir)
@@ -101,10 +89,6 @@ class TestCorrelateDeviceTime:
         for e in compute_ops:
             assert e.self_device_time_total > 0, f"{e.key} should have device time"
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_accuracy_vs_kineto_events(self, profile_dir, neuron_tensor):
         """Total NEURON time should match raw KinetoEvent device durations."""
         nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=profile_dir)
@@ -141,10 +125,6 @@ class TestCorrelateDeviceTime:
             f"({raw_device_us:.1f}us), ratio={ratio:.2f}"
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_chrome_trace_unaffected(self, profile_dir, neuron_tensor):
         """correlate_device_time does not mutate the kineto events backing export_chrome_trace."""
         nc = NeuronConfig(
