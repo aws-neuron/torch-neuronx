@@ -56,10 +56,6 @@ class TestNeuronAutocast(TestAutocast):
                 continue
             self._run_autocast_outofplace(op, args, torch.bfloat16, device="neuron")
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_autocast_torch_fp32(self):
         for op_with_args in self.autocast_lists.torch_fp32:
             op, args, maybe_kwargs = self.args_maybe_kwargs(op_with_args)

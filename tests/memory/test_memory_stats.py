@@ -484,10 +484,6 @@ class TestLazyAllocDeferRetry:
     ``tests.utils.defer_retry_helpers``."""
 
     @_requires_lazy_alloc
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron aten/wheel nightly failure (run 28991277106): likely profiler "
-        "regression (profiler/memory/autocast). Xfailing to unblock nightly pending root-cause."
-    )
     def test_defer_retry_silent_recovery(self):
         """A pressure kAlloc with kDeallocs queued behind compute defers,
         recovers silently via stage-2 drain-retry or stage-3 cache-drain,
