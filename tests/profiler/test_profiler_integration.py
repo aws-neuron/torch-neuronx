@@ -16,7 +16,6 @@ Tests are split into three groups:
 import json
 import os
 import shutil
-import tempfile
 
 import pytest
 import torch
@@ -24,6 +23,7 @@ from torch._C._profiler import _ExperimentalConfig
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
+from torch_neuronx.kernels.cache_utils import get_nfs_cache_dir
 from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode, correlate_device_time
 
 
@@ -678,28 +678,43 @@ class TestNeuronProfilerIntegration:
             "trace.json" not in root_files
         ), f"trace.json should not be in root directory. Root files: {root_files}"
 
-    @pytest.mark.xfail(
-        reason="NRT neff_cache_dir copy contract changed (libnrt 2.x.56678 -> 2.x.61770): "
-        "NEFFs are now copied into the profile output only when actually executed during the "
-        "session and matched by cache key, not for arbitrary files seeded in the directory. "
-        "Test needs to be updated to profile a real executed-workload NEFF.",
-        strict=False,
-    )
     def test_neuron_profiler_with_neff_cache_configured(self):
         """Test that NEFFs from a configured neff_cache_dir are copied to a shared
         neffs/ directory in the profile output at profile close.
-        """
 
-        # use a different cache_dir than the fixture to not pollute other tests
-        cache_dir = tempfile.mkdtemp(prefix="profiler_neff_cache")
+        NRT's neff_cache_dir copy path (nrt_inspect_copy_neffs_from_cache) copies
+        only NEFFs that are *actually executed* during the profiled session AND
+        found in the cache directory under their real 2-level-sharded cache-key
+        path. It does not blindly copy arbitrary files placed in the directory.
+
+        This test asserts both halves of that contract:
+        - positive: warm-compile the workload (writing its real NEFF into the
+          effective NFS cache dir), profile a re-run, and assert the executed
+          NEFF was copied into neffs/.
+        - negative: seed a fake NEFF into the same cache dir that is never
+          executed, and assert it was NOT copied.
+        """
+        # Use the effective NFS cache dir so eager's compile-cache writes and
+        # NRT's copy source are the same directory. The persistent cache binds
+        # TORCH_NEURONX_NEFF_CACHE_DIR at first compile, so it cannot be
+        # repointed from inside the test.
+        cache_dir = get_nfs_cache_dir()
+
+        # Seed a fake NEFF (never executed) into the 2-level shard layout. NRT
+        # must NOT copy it, since it is not executed during the session. Track
+        # it for cleanup so it does not leak into the shared NFS cache dir.
+        fake_key = "abcd" + "0" * 28
+        fake_shard = os.path.join(cache_dir, fake_key[:2], fake_key[2:4])
+        os.makedirs(fake_shard, exist_ok=True)
+        fake_neff_name = fake_key + ".neff"
+        fake_neff_path = os.path.join(fake_shard, fake_neff_name)
+        with open(fake_neff_path, "wb") as f:
+            f.write(b"\x00" * 12)
+
         try:
-            # Create a fake cache with a dummy NEFF in the 2-level shard layout
-            shard_dir = os.path.join(cache_dir, "ab", "cd")
-            os.makedirs(shard_dir)
-            dummy_neff_name = "abcd" + "0" * 28 + ".neff"
-            dummy_neff_path = os.path.join(shard_dir, dummy_neff_name)
-            with open(dummy_neff_path, "wb") as f:
-                f.write(b"\x00" * 12)
+            # Warm up: run the workload OUTSIDE profiling so its NEFF is compiled
+            # and written into cache_dir under its real cache-key shard path.
+            self._run_neuron_workload()
 
             exp_config = NeuronConfig(
                 modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME],
@@ -711,6 +726,8 @@ class TestNeuronProfilerIntegration:
                 activities=[ProfilerActivity.PrivateUse1],
                 experimental_config=exp_config,
             ):
+                # Re-run the SAME workload so its cached NEFF executes; NRT then
+                # matches the executed NEFF against cache_dir and copies it.
                 self._run_neuron_workload()
 
             shared_neffs_dir = os.path.join(self.test_dir, "neffs")
@@ -718,16 +735,25 @@ class TestNeuronProfilerIntegration:
                 f"Expected shared neffs/ directory at {shared_neffs_dir}. "
                 f"Output contents: {os.listdir(self.test_dir)}"
             )
-            neff_files = [f for f in os.listdir(shared_neffs_dir) if f.endswith(".neff")]
-            assert (
-                len(neff_files) > 0
-            ), f"No .neff files in shared neffs/. Contents: {os.listdir(shared_neffs_dir)}"
-            assert (
-                dummy_neff_name in neff_files
-            ), f"Dummy NEFF {dummy_neff_name} not found in shared neffs/. Found: {neff_files}"
-
+            copied_names = {f for _root, _dirs, files in os.walk(shared_neffs_dir) for f in files}
+            # Positive: NRT also emits a barrier_*.neff via a separate path
+            # (save_barrier_neff) unrelated to the cache copy, so require a
+            # non-barrier NEFF that can only have come from copying the executed
+            # workload out of cache_dir.
+            copied_workload_neffs = [
+                f for f in copied_names if f.endswith(".neff") and not f.startswith("barrier_")
+            ]
+            assert copied_workload_neffs, (
+                "No cached workload NEFF was copied into shared neffs/. "
+                f"Directory tree: {os.listdir(shared_neffs_dir)}"
+            )
+            # Negative: the fake NEFF was never executed, so it must not be copied.
+            assert fake_neff_name not in copied_names, (
+                f"Unexecuted NEFF {fake_neff_name} should not be copied from the cache dir; "
+                f"found copied files: {sorted(copied_names)}"
+            )
         finally:
-            shutil.rmtree(cache_dir, ignore_errors=True)
+            shutil.rmtree(os.path.join(cache_dir, fake_key[:2]), ignore_errors=True)
 
     def test_neuron_profiler_on_trace_ready(self):
         """Test NeuronProfiler.export_trace used as on_trace_ready callback."""
