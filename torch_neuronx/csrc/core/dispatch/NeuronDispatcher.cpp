@@ -759,7 +759,28 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       auto strided =
           torch::empty_strided(self_tensor.sizes(), src_strides,
                                torch::TensorOptions().dtype(target_dtype).device(target_device));
-      torch_neuronx::utils::copy_strided_neuron_to_neuron(dst, strided);
+      if (self_tensor.is_non_overlapping_and_dense() && IsCopyMlirDtypeSupported(target_dtype)) {
+        // Dense permutation (transpose/permute/gappy-but-dense): the strided
+        // dst has no aliasing, so aten::copy_ (fast device strided copy) is
+        // safe. Avoids copy_strided_neuron_to_neuron's per-element fallback,
+        // which is extremely slow.
+        strided.copy_(dst);
+      } else {
+        // Overlapping strides (e.g. expand's stride-0): `strided` aliases the
+        // same storage across the broadcast dim, so aten::copy_ rejects it
+        // ("more than one element ... refers to a single memory location").
+        // Fall back to the byte-wise per-element copy, which writes the
+        // (identical) broadcast values into the aliased slots correctly.
+        //
+        // Dtypes the MLIR copy can't handle also take this path: redispatching
+        // aten::copy_ detours them through CopyToNonContiguous's on-device
+        // transpose, which calls aten::contiguous — a hard error for complex
+        // under TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 (e.g.
+        // linalg_eig's CPU-fallback results copied back F-contiguous), and a
+        // 32-bit downcast risk for 8-byte dtypes. The byte-wise copy never
+        // redispatches and is exact for whole elements.
+        torch_neuronx::utils::copy_strided_neuron_to_neuron(dst, strided);
+      }
       dst = strided;
     }
     logOperationExecuted("aten::_to_copy");
@@ -923,13 +944,26 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       // change — a same-dtype Preserve is a no-op handled at the top.
       result =
           torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), converted.options());
-      torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+      if (IsCopyMlirDtypeSupported(result.scalar_type())) {
+        result.copy_(converted);
+      } else {
+        // Unsupported dtype (complex, 8-byte): byte-wise copy — the aten::copy_
+        // redispatch would detour through CopyToNonContiguous / aten::contiguous
+        // (hard error for complex when fallback is restricted; downcast risk
+        // for 8-byte dtypes). See the CPU→Neuron strided branch above.
+        torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+      }
     } else if (!converted_contiguous) {
       // contiguous_format requested but `converted` is the non-contiguous
       // same-dtype passthrough → materialize contiguous.
       result = at::empty(self_tensor.sizes(),
                          at::TensorOptions().dtype(target_dtype).device(target_device));
-      torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+      if (IsCopyMlirDtypeSupported(result.scalar_type())) {
+        result.copy_(converted);
+      } else {
+        // Unsupported dtype: byte-wise copy — see above.
+        torch_neuronx::utils::copy_strided_neuron_to_neuron(converted, result);
+      }
     } else {
       result = converted;
     }
