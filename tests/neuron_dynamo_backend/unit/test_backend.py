@@ -18,6 +18,8 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.dynamic_shape_analysis import
     DynamicShapeAnalysis,
 )
 
+_MOCK_GLOBAL_MODEL_NAME = "global_model"
+
 
 class TestCompileFxToStablehlo:
     """Test _compile_fx_to_stablehlo helper function"""
@@ -1108,3 +1110,44 @@ class TestMakeFallbackFn:
         assert result[0] is None
         assert torch.equal(result[1], out_tensor)
         assert result[2] is None
+
+
+@pytest.fixture
+def mock_get_model_name():
+    with patch(
+        "torch_neuronx.neuron_dynamo_backend.backend.get_model_name",
+        return_value=_MOCK_GLOBAL_MODEL_NAME,
+    ) as mock_get:
+        yield mock_get
+
+
+class TestResolveModelName:
+    """Test _resolve_model_name helper logic."""
+
+    _MODEL_NAME_KEY = "model_name"
+
+    def test_options_model_name_takes_precedence(self, mock_get_model_name):
+        """options['model_name'] is used when present, get_model_name() is not called."""
+        options_model_name = "options_model"
+        assert options_model_name != _MOCK_GLOBAL_MODEL_NAME
+        result = backend._resolve_model_name({self._MODEL_NAME_KEY: options_model_name})
+        assert result == options_model_name
+        mock_get_model_name.assert_not_called()
+
+    def test_falls_back_to_get_model_name_when_options_empty(self, mock_get_model_name):
+        """get_model_name() is called when options has no model_name key."""
+        result = backend._resolve_model_name({})
+        assert result == _MOCK_GLOBAL_MODEL_NAME
+        mock_get_model_name.assert_called_once()
+
+    def test_falls_back_to_get_model_name_when_options_none(self, mock_get_model_name):
+        """get_model_name() is called when options is None."""
+        result = backend._resolve_model_name(None)
+        assert result == _MOCK_GLOBAL_MODEL_NAME
+        mock_get_model_name.assert_called_once()
+
+    def test_ignores_empty_string_in_options(self, mock_get_model_name):
+        """Empty string in options is treated as unset, falls back to get_model_name()."""
+        result = backend._resolve_model_name({self._MODEL_NAME_KEY: ""})
+        assert result == _MOCK_GLOBAL_MODEL_NAME
+        mock_get_model_name.assert_called_once()

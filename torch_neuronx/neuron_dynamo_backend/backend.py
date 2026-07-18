@@ -16,6 +16,8 @@ from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompil
 
 from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
+
+# Do not call get_model_name() directly in this file; use _resolve_model_name(options) instead.
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_model_name,
 )
@@ -40,6 +42,17 @@ from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_model_name(options):
+    """Resolve the model name from options dict, falling back to get_model_name().
+
+    Priority: options["model_name"] > get_model_name() <-- returns global/default
+    """
+    model_name = options.get("model_name") if options else None
+    if not model_name:
+        model_name = get_model_name()
+    return model_name
 
 
 def _compile_fx_to_stablehlo(
@@ -178,8 +191,7 @@ def neuron_backend_fx_compiler(
         logger.debug("Trivial graph detected (graph break artifact), using passthrough")
         return make_boxed_func(gm.forward)
 
-    # Get model name from global variable (needed before compilation_job creation)
-    model_name = get_model_name() if options is None else options.get("model_name", "model_default")
+    model_name = _resolve_model_name(options)
 
     # Create a CompilationJob for this compilation using context manager for automatic cleanup
     with compilation_job(op_name=model_name) as job:
