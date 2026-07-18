@@ -69,6 +69,16 @@ ERROR_MAXLEN = int(os.environ.get("NEURON_COVERAGE_ERROR_MAXLEN", "1000"))
 # run on CPU.
 _OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
 
+# Ops that return multiple outputs where only a subset is mathematically unique;
+# the rest are valid-but-implementation-defined intermediates (e.g. an LU
+# factorization's L/U/pivots are non-unique — many valid pivotings give the same
+# determinant). For these, correctness is checked only on the listed output
+# indices. Keyed by aten op name (without overload), matched by substring.
+_OPS_CORRECTNESS_OUTPUT_INDICES: dict[str, tuple[int, ...]] = {
+    # _linalg_det returns (det, LU, pivots); only the determinant is unique.
+    "_linalg_det": (0,),
+}
+
 # Ops that hang torch.compile due to 0d tensor inputs; skip entirely.
 _OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
     "linspace",
@@ -94,7 +104,24 @@ def _input_elem_count(args, kwargs) -> int:
     return biggest
 
 
-def _matches_float64_oracle(op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol) -> bool:
+def _filter_outputs(out, indices: tuple[int, ...] | None):
+    """Select only the given output indices from a tuple/list output, or pass through."""
+    if indices is not None and isinstance(out, tuple | list):
+        return tuple(out[i] for i in indices)
+    return out
+
+
+def _correctness_output_indices(op_name: str) -> tuple[int, ...] | None:
+    """Return the output indices to compare for correctness, or None for all."""
+    for pat, idxs in _OPS_CORRECTNESS_OUTPUT_INDICES.items():
+        if pat in op_name:
+            return idxs
+    return None
+
+
+def _matches_float64_oracle(
+    op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol, output_indices=None
+) -> bool:
     """Re-check a failed correctness comparison against a float64 CPU oracle."""
 
     def _to_f64(x):
@@ -119,6 +146,10 @@ def _matches_float64_oracle(op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol)
         with torch.no_grad():
             cpu_f32 = op(*cpu_args, **cpu_kwargs)
             cpu_f64 = op(*f64_args, **f64_kwargs)
+
+        cpu_f32 = _filter_outputs(cpu_f32, output_indices)
+        cpu_f64 = _filter_outputs(cpu_f64, output_indices)
+        neuron_cpu = _filter_outputs(neuron_cpu, output_indices)
 
         flat32 = list(cpu_f32) if isinstance(cpu_f32, tuple | list) else [cpu_f32]
         flat64 = list(cpu_f64) if isinstance(cpu_f64, tuple | list) else [cpu_f64]
@@ -328,9 +359,12 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                     cpu_out = op(*cpu_args, **cpu_kwargs)
                     neuron_out = compiled_fn(*fresh_neuron_args, **fresh_neuron_kwargs)
                 neuron_cpu = _allocate_to_device(neuron_out, "cpu")
+                output_indices = _correctness_output_indices(op_name)
+                cpu_cmp = _filter_outputs(neuron_cpu, output_indices)
+                ref_cmp = _filter_outputs(cpu_out, output_indices)
                 try:
                     torch.testing.assert_close(
-                        neuron_cpu, cpu_out, rtol=1e-2, atol=1e-3, equal_nan=True
+                        cpu_cmp, ref_cmp, rtol=1e-2, atol=1e-3, equal_nan=True
                     )
                     out["correctness"] = "pass"
                 except AssertionError:
@@ -339,7 +373,13 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                     if _input_elem_count(
                         cpu_args, cpu_kwargs
                     ) >= _FLOAT64_ORACLE_MIN_ELEMS and _matches_float64_oracle(
-                        op, cpu_args, cpu_kwargs, neuron_cpu, rtol=1e-2, atol=1e-3
+                        op,
+                        cpu_args,
+                        cpu_kwargs,
+                        neuron_cpu,
+                        rtol=1e-2,
+                        atol=1e-3,
+                        output_indices=output_indices,
                     ):
                         out["correctness"] = "pass"
                     else:
