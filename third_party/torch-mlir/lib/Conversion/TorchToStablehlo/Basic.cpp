@@ -456,6 +456,12 @@ public:
             ? tensorOp.getRoundingMode()
             : cast<AtenDivScalarModeOp>(op.getOperation()).getRoundingMode();
 
+    // rounding_mode=None means plain division with no rounding applied.
+    if (isa<Torch::NoneType>(opRoundingMode.getType())) {
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
     std::string roundingMode;
     if (!matchPattern(opRoundingMode, m_TorchConstantStr(roundingMode))) {
       return rewriter.notifyMatchFailure(
