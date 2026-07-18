@@ -456,6 +456,62 @@ func.func @torch.aten.fmod.Scalar(%arg0: !torch.vtensor<[4,3,2],f32>) -> !torch.
 
 // -----
 
+// CHECK-LABEL:   func.func @torch.aten.div.Tensor_mode$none_rounding(
+// CHECK-SAME:                                                         %[[VAL_0:.*]]: !torch.vtensor<[4,4],f32>,
+// CHECK-SAME:                                                         %[[VAL_1:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[4,4],f32> {
+// CHECK-DAG:       %[[VAL_2:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[],f32> -> tensor<f32>
+// CHECK-DAG:       %[[VAL_3:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
+// CHECK:           %[[VAL_4:.*]] = chlo.broadcast_divide %[[VAL_3]], %[[VAL_2]] : (tensor<4x4xf32>, tensor<f32>) -> tensor<4x4xf32>
+// CHECK:           %[[VAL_5:.*]] = torch_c.from_builtin_tensor %[[VAL_4]] : tensor<4x4xf32> -> !torch.vtensor<[4,4],f32>
+// CHECK:           return %[[VAL_5]] : !torch.vtensor<[4,4],f32>
+// CHECK:         }
+func.func @torch.aten.div.Tensor_mode$none_rounding(%arg0: !torch.vtensor<[4,4],f32>, %arg1: !torch.vtensor<[],f32>) -> !torch.vtensor<[4,4],f32> {
+  %none = torch.constant.none
+  %0 = torch.aten.div.Tensor_mode %arg0, %arg1, %none : !torch.vtensor<[4,4],f32>, !torch.vtensor<[],f32>, !torch.none -> !torch.vtensor<[4,4],f32>
+  return %0 : !torch.vtensor<[4,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.div.Tensor_mode$trunc_rounding(
+// CHECK-SAME:                                                          %[[VAL_0:.*]]: !torch.vtensor<[4,4],f32>,
+// CHECK-SAME:                                                          %[[VAL_1:.*]]: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
+// CHECK-DAG:       %[[VAL_2:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
+// CHECK-DAG:       %[[VAL_3:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
+// CHECK:           %[[VAL_4:.*]] = chlo.broadcast_divide %[[VAL_2]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+// CHECK:           %[[VAL_5:.*]] = stablehlo.sign %[[VAL_4]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_6:.*]] = stablehlo.abs %[[VAL_4]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_7:.*]] = stablehlo.floor %[[VAL_6]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_8:.*]] = stablehlo.multiply %[[VAL_5]], %[[VAL_7]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_9:.*]] = torch_c.from_builtin_tensor %[[VAL_8]] : tensor<4x4xf32> -> !torch.vtensor<[4,4],f32>
+// CHECK:           return %[[VAL_9]] : !torch.vtensor<[4,4],f32>
+// CHECK:         }
+func.func @torch.aten.div.Tensor_mode$trunc_rounding(%arg0: !torch.vtensor<[4,4],f32>, %arg1: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
+  %str = torch.constant.str "trunc"
+  %0 = torch.aten.div.Tensor_mode %arg0, %arg1, %str : !torch.vtensor<[4,4],f32>, !torch.vtensor<[4,4],f32>, !torch.str -> !torch.vtensor<[4,4],f32>
+  return %0 : !torch.vtensor<[4,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.div.Tensor_mode$floor_rounding(
+// CHECK-SAME:                                                          %[[VAL_0:.*]]: !torch.vtensor<[4,4],f32>,
+// CHECK-SAME:                                                          %[[VAL_1:.*]]: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
+// CHECK-DAG:       %[[VAL_2:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
+// CHECK-DAG:       %[[VAL_3:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
+// CHECK:           %[[VAL_4:.*]] = chlo.broadcast_divide %[[VAL_2]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+// CHECK:           %[[VAL_5:.*]] = stablehlo.floor %[[VAL_4]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_6:.*]] = torch_c.from_builtin_tensor %[[VAL_5]] : tensor<4x4xf32> -> !torch.vtensor<[4,4],f32>
+// CHECK:           return %[[VAL_6]] : !torch.vtensor<[4,4],f32>
+// CHECK:         }
+func.func @torch.aten.div.Tensor_mode$floor_rounding(%arg0: !torch.vtensor<[4,4],f32>, %arg1: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
+  %str = torch.constant.str "floor"
+  %0 = torch.aten.div.Tensor_mode %arg0, %arg1, %str : !torch.vtensor<[4,4],f32>, !torch.vtensor<[4,4],f32>, !torch.str -> !torch.vtensor<[4,4],f32>
+  return %0 : !torch.vtensor<[4,4],f32>
+}
+
+// -----
+
 // CHECK-LABEL:   func.func @aten.fill.tensor(
 // CHECK-SAME:                                %[[VAL_0:.*]]: !torch.vtensor<[2,2],f32>,
 // CHECK-SAME:                                %[[VAL_1:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[2,2],f32> {
