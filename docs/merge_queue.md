@@ -31,6 +31,23 @@ To break this, the required status check (`Merge Queue Gate Status`) runs on
 > deadlock, so the gate job is written to always **run** and explicitly
 > `exit 0` on the PR event rather than being skipped.
 
+## Run names and PR links
+
+The workflow gives each event a distinct run name so the Actions list shows
+whether a run is informational or is gating a merge:
+
+- `pull_request`: `[IGNORE NO-OP GATE] PR #<number>: <title>` identifies the
+  required no-op check that only allows the PR to enter the queue.
+- `merge_group`: `Merge Queue: <queue-ref>` identifies the real queue gate and
+  exposes the queued PR token directly in the run list.
+
+For `merge_group` events, the required gate also writes a job summary containing
+the queue token, commit subject, links to every PR number found in the queue ref,
+and the full queue ref. The summary is available whether the gate passes or
+fails, providing a direct path from a queue run to the affected PRs. Summary
+generation is informational (`continue-on-error: true`) and cannot change the
+gate result.
+
 ## Job graph
 
 ```
