@@ -579,10 +579,6 @@ class TestAllGatherCoalesced(BaseCollectiveOpTest):
         """Test all_gather_coalesced with empty tensors."""
         self.distributed_tester.run_test(run_empty_tensor_test)
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_async_operation(self):
         """Test asynchronous all_gather_coalesced operation."""
         self.distributed_tester.run_test(run_async_operation_test)

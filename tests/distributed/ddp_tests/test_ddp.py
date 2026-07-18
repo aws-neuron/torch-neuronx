@@ -150,10 +150,6 @@ class TestDDPSimple(BaseCollectiveOpTest):
         self.orchestrator = DDPTestOrchestrator(world_size=2)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_ddp_different_dtypes(self, dtype: torch.dtype):
         """Tests DDP functionality with different data types (float32 and bfloat16).
 
@@ -168,10 +164,6 @@ class TestDDPSimple(BaseCollectiveOpTest):
             test_name=f"ddp_dtype_{dtype}",
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_ddp_with_no_bias(self):
         """Tests DDP functionality with a model where linear layers have no bias."""
         self.orchestrator.run_comparison_test(
@@ -181,10 +173,6 @@ class TestDDPSimple(BaseCollectiveOpTest):
             test_name="ddp_no_bias",
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_ddp_with_no_init_sync(self):
         """Tests DDP functionality with `init_sync` set to False."""
         self.orchestrator.run_comparison_test(
@@ -195,10 +183,6 @@ class TestDDPSimple(BaseCollectiveOpTest):
             test_name="ddp_no_init_sync",
         )
 
-    @pytest.mark.xfail(
-        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
-        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
-    )
     def test_ddp_gradient_accumulation(self):
         """Tests DDP functionality with gradient accumulation over multiple steps."""
         self.orchestrator.run_comparison_test(
