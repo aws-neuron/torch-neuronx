@@ -2232,6 +2232,22 @@ LogicalResult ConvertAtenOp<AtenBitwiseRightShiftTensorOp>::matchAndRewrite(
   return success();
 }
 
+// Aten__Rshift__TensorOp — same semantics as bitwise_right_shift.Tensor
+template <>
+LogicalResult ConvertAtenOp<Aten__Rshift__TensorOp>::matchAndRewrite(
+    Aten__Rshift__TensorOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Value lhs = adaptor.getSelf();
+  Value rhs = adaptor.getOther();
+
+  auto resultType =
+      cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  lhs = hlo::promoteAndBroadcast(rewriter, lhs, resultType, std::nullopt);
+  rhs = hlo::promoteAndBroadcast(rewriter, rhs, resultType, std::nullopt);
+  rewriter.replaceOpWithNewOp<stablehlo::ShiftRightArithmeticOp>(op, lhs, rhs);
+  return success();
+}
+
 template <>
 LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
     AtenTrilOp op, OpAdaptor adaptor,
@@ -2537,6 +2553,7 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
   INSERT_ATENOP_PATTERN(AtenFmodScalarOp);
   INSERT_ATENOP_PATTERN(AtenBitwiseLeftShiftTensorOp);
   INSERT_ATENOP_PATTERN(AtenBitwiseRightShiftTensorOp);
+  INSERT_ATENOP_PATTERN(Aten__Rshift__TensorOp);
 
   INSERT_ATENOP_PATTERN(AtenTrilOp);
   INSERT_ATENOP_PATTERN(AtenIsfiniteOp);

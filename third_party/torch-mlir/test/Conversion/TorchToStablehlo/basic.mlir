@@ -336,6 +336,37 @@ func.func @torch.aten.bitwise_right_shift.Tensor(%arg0: !torch.vtensor<[3,4],si6
 
 // -----
 
+// CHECK-LABEL:   func.func @torch.aten.__rshift__.Tensor(
+// CHECK-SAME:                              %[[ARG_0:.*]]: !torch.vtensor<[3,4],si32>,
+// CHECK-SAME:                              %[[ARG_1:.*]]: !torch.vtensor<[3,4],si32>) -> !torch.vtensor<[3,4],si32> {
+// CHECK-DAG:       %[[VAL_0:.*]] = torch_c.to_builtin_tensor %[[ARG_0:.*]] : !torch.vtensor<[3,4],si32> -> tensor<3x4xi32>
+// CHECK-DAG:       %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[ARG_1:.*]] : !torch.vtensor<[3,4],si32> -> tensor<3x4xi32>
+// CHECK:           %[[VAL_2:.*]] = stablehlo.shift_right_arithmetic %[[VAL_0:.*]], %[[VAL_1:.*]] : tensor<3x4xi32>
+// CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2:.*]] : tensor<3x4xi32> -> !torch.vtensor<[3,4],si32>
+// CHECK:           return %[[VAL_3:.*]] : !torch.vtensor<[3,4],si32>
+func.func @torch.aten.__rshift__.Tensor(%arg0: !torch.vtensor<[3,4],si32>, %arg1: !torch.vtensor<[3,4],si32>) -> !torch.vtensor<[3,4],si32> {
+  %0 = torch.aten.__rshift__.Tensor %arg0, %arg1 : !torch.vtensor<[3,4],si32>, !torch.vtensor<[3,4],si32> -> !torch.vtensor<[3,4],si32>
+  return %0 : !torch.vtensor<[3,4],si32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.__rshift__.Tensor$broadcast(
+// CHECK-SAME:                              %[[ARG_0:.*]]: !torch.vtensor<[3,4],si64>,
+// CHECK-SAME:                              %[[ARG_1:.*]]: !torch.vtensor<[3,1],si64>) -> !torch.vtensor<[3,4],si64> {
+// CHECK-DAG:       %[[VAL_0:.*]] = torch_c.to_builtin_tensor %[[ARG_1:.*]] : !torch.vtensor<[3,1],si64> -> tensor<3x1xi64>
+// CHECK-DAG:       %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[ARG_0:.*]] : !torch.vtensor<[3,4],si64> -> tensor<3x4xi64>
+// CHECK:           %[[VAL_2:.*]] = stablehlo.broadcast_in_dim %[[VAL_0:.*]], dims = [0, 1] : (tensor<3x1xi64>) -> tensor<3x4xi64>
+// CHECK:           %[[VAL_3:.*]] = stablehlo.shift_right_arithmetic %[[VAL_1:.*]], %[[VAL_2:.*]] : tensor<3x4xi64>
+// CHECK:           %[[VAL_4:.*]] = torch_c.from_builtin_tensor %[[VAL_3:.*]] : tensor<3x4xi64> -> !torch.vtensor<[3,4],si64>
+// CHECK:           return %[[VAL_4:.*]] : !torch.vtensor<[3,4],si64>
+func.func @torch.aten.__rshift__.Tensor$broadcast(%arg0: !torch.vtensor<[3,4],si64>, %arg1: !torch.vtensor<[3,1],si64>) -> !torch.vtensor<[3,4],si64> {
+  %0 = torch.aten.__rshift__.Tensor %arg0, %arg1 : !torch.vtensor<[3,4],si64>, !torch.vtensor<[3,1],si64> -> !torch.vtensor<[3,4],si64>
+  return %0 : !torch.vtensor<[3,4],si64>
+}
+
+// -----
+
 // CHECK-LABEL:   func.func @torch.aten.tril(
 // CHECK-SAME:                   %[[ARG_0:.*]]: !torch.vtensor<[2,3,5],f32>,
 // CHECK-SAME:                   %[[ARG_1:.*]]: !torch.int) -> !torch.vtensor<[2,3,5],f32>
