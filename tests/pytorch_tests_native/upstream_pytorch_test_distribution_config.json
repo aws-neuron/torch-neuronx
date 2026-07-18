@@ -77,8 +77,7 @@
     {
       "items": [
         "test_foreach.py"
-      ],
-      "soft_fail": true
+      ]
     },
     {
       "items": [
