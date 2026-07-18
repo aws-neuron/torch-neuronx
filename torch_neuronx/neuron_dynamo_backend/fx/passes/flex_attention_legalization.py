@@ -717,72 +717,6 @@ class FlexAttentionLegalization(NeuronFXPass):
         return scores
 
     # =========================================================================
-    # Sort Replacement
-    # =========================================================================
-
-    def _replace_sort_stable_with_identity(self, graph: fx.Graph) -> bool:
-        """Replace sort.stable with identity (input passthrough + dummy indices)."""
-        modified = False
-
-        for node in list(graph.nodes):
-            if node.op == "call_function" and node.target == torch.ops.aten.sort.stable:
-                input_node = node.args[0]
-                dim = node.kwargs.get("dim", node.args[2] if len(node.args) > 2 else -1)
-
-                if "val" not in input_node.meta:
-                    logger.warning(f"No metadata for {input_node.name}, skipping sort replacement")
-                    continue
-
-                input_val = input_node.meta["val"]
-                shape = list(input_val.shape)
-                ndim = len(shape)
-                actual_dim = dim if dim >= 0 else ndim + dim
-                dim_size = shape[actual_dim]
-
-                with graph.inserting_before(node):
-                    # Create indices: arange -> view -> expand
-                    indices = graph.call_function(
-                        torch.ops.aten.arange.default,
-                        args=(dim_size,),
-                        kwargs={"dtype": torch.int64},
-                    )
-                    self._add_metadata_to_node(indices, shape=[dim_size], dtype=torch.int64)
-
-                    view_shape = [1] * ndim
-                    view_shape[actual_dim] = dim_size
-                    indices_viewed = graph.call_function(
-                        torch.ops.aten.view.default, args=(indices, view_shape)
-                    )
-                    self._add_metadata_to_node(indices_viewed, shape=view_shape, dtype=torch.int64)
-
-                    indices_expanded = graph.call_function(
-                        torch.ops.aten.expand.default, args=(indices_viewed, shape)
-                    )
-                    self._add_metadata_to_node(indices_expanded, shape=shape, dtype=torch.int64)
-
-                # Replace getitem users
-                for user in list(node.users):
-                    if user.op == "call_function" and user.target == operator.getitem:
-                        idx = user.args[1]
-                        if idx == 0:  # sorted values -> use input (identity)
-                            user.replace_all_uses_with(input_node)
-                        else:  # indices -> use dummy arange indices
-                            user.replace_all_uses_with(indices_expanded)
-                        graph.erase_node(user)
-
-                if len(node.users) == 0:
-                    graph.erase_node(node)
-                else:
-                    logger.warning(f"sort.stable {node.name} still has users after replacement")
-
-                modified = True
-
-        if not modified:
-            logger.debug("No sort.stable operations found")
-
-        return modified
-
-    # =========================================================================
     # Forward Pass Legalization
     # =========================================================================
 
@@ -1203,8 +1137,6 @@ class FlexAttentionLegalization(NeuronFXPass):
         """Finalize the legalization by cleaning up and running shape propagation."""
         graph = gm.graph
 
-        self._replace_sort_stable_with_identity(graph)
-
         # Remove aten.detach nodes (identity ops from autograd)
         for node in list(graph.nodes):
             if node.op == "call_function" and node.target == torch.ops.aten.detach.default:
@@ -1262,19 +1194,12 @@ class FlexAttentionLegalization(NeuronFXPass):
         modified = False
 
         has_flex = False
-        has_sort_stable = False
 
         for node in graph.nodes:
             if self._is_flex_attention_forward(node) or self._is_flex_attention_backward(node):
                 has_flex = True
-            if node.op == "call_function" and node.target == torch.ops.aten.sort.stable:
-                has_sort_stable = True
 
         if not has_flex:
-            if has_sort_stable:
-                self._replace_sort_stable_with_identity(graph)
-                graph.eliminate_dead_code()
-                gm.recompile()
             return PassResult(gm, modified=False)
 
         for node in list(graph.nodes):
