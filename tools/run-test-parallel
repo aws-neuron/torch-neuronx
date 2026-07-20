@@ -338,7 +338,7 @@ run_additional_tests() {
     CUSTOM_N=true
     pytest_opts=$(build_pytest_options "host-cc-multi-stream")
     CUSTOM_N="$saved_custom_n"
-    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_HOST_CC=1 NEURON_RT_DISABLE_EXECUTION_BARRIER=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
+    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_HOST_CC=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
 
     if [[ "$SKIP_VERTICAL" == "false" ]]; then
         local pytest_opts
