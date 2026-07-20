@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "tests/csrc/mocks/MockCopyUtils.h"
 #include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockNRT.h"
+#include "tests/csrc/mocks/MockNeuronDevice.h"
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
@@ -18,6 +20,7 @@
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
+#include "torch_neuronx/csrc/core/utils/TempDirectory.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
@@ -416,6 +419,186 @@ TEST_F(StreamImplTest, NoPriorOpNeverGates) {
   EXPECT_FALSE(
       stream_->IsScheduleGatedByPriorOp(host_op.get(), KernelTypeEnum::kHost, false, false));
   EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(dev_op.get(), KernelTypeEnum::kHLO, false, false));
+}
+
+namespace {
+
+// Stand-in for an eager kernel (carries HLO bytes, returns dummy NEFF bytes so
+// the cache can be seeded without the real neuronx-cc backend).
+class FakeEagerKernel
+    : public CompilableKernelExecution,
+      public NeuronKernelExecutionTyped<KernelTypeEnum::kHLO, c10::DeviceType::PrivateUse1,
+                                        c10::DeviceType::PrivateUse1> {
+ public:
+  explicit FakeEagerKernel(const std::string& cache_key)
+      : CompilableKernelExecution(CompilationCacheKey(cache_key, "", ""), "", "", false),
+        NeuronKernelExecutionTyped<KernelTypeEnum::kHLO, c10::DeviceType::PrivateUse1,
+                                   c10::DeviceType::PrivateUse1>("fake_eager_op", {}, {}, 0),
+        hlo_bytes_({'H', 'L', 'O', '_'}) {
+    hlo_bytes_.insert(hlo_bytes_.end(), cache_key.begin(), cache_key.end());
+    GetCompilationCacheKey().SetHloBytesPtr(&hlo_bytes_);
+  }
+
+  std::vector<uint8_t> CompileToNeff() const override {
+    std::string neff = "NEFF_" + GetCompileKey();
+    return std::vector<uint8_t>(neff.begin(), neff.end());
+  }
+
+  const std::vector<uint8_t>& GetHloBytes() const override { return hlo_bytes_; }
+
+  // Required (pure virtual); never invoked in these tests.
+  bool Schedule(NRT_STATUS* /*nrt_status*/, nrt::SequenceId* /*sequence_id*/,
+                c10::StreamId /*stream_id*/) const override {
+    return true;
+  }
+
+ protected:
+  bool ValidateImpl() const override { return true; }
+
+ private:
+  std::vector<uint8_t> hlo_bytes_;
+};
+
+}  // namespace
+
+// Real CompilationCache backed by temp dirs + mocked NRT, mirroring
+// CompilationCacheTest.
+class ResolvePersistentCacheKeyTest : public ::testing::Test {
+ protected:
+  MockNRTSession mock_session_;
+  MockNRT* mock_nrt_ = MockNRT::GetInstance();
+
+  void SetUp() override {
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
+    SaveEnvVar("TORCH_NEURONX_NEFF_CACHE_DIR");
+    SaveEnvVar("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR");
+    SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+    SaveEnvVar("NEURON_COMPILE_SERVICE");
+    SaveEnvVar("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+
+    // Force local backend so seeding the cache never calls real neuronx-cc.
+    setenv("NEURON_COMPILE_SERVICE", "0", 1);
+
+    temp_dir_ = std::make_unique<TempDirectory>("resolve_pk_test_");
+    local_cache_dir_ = std::make_unique<TempDirectory>("resolve_pk_local_test_");
+    setenv("TORCH_NEURONX_NEFF_CACHE_DIR", temp_dir_->path().c_str(), 1);
+    setenv("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR", local_cache_dir_->path().c_str(), 1);
+    unsetenv("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+
+    torch_neuronx::SetMockInstanceType("trn1");
+  }
+
+  void TearDown() override {
+    if (cache_) cache_->Clear();
+    cache_.reset();
+    temp_dir_.reset();
+    local_cache_dir_.reset();
+    RestoreEnvVars();
+  }
+
+  // Construct the cache after selecting the keying mode so it sees the env var.
+  void InitCache(bool hlo_content_key) {
+    setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", hlo_content_key ? "1" : "0", 1);
+    cache_ = std::make_unique<CompilationCache>();
+  }
+
+  void SaveEnvVar(const char* name) {
+    const char* value = std::getenv(name);
+    if (value) saved_env_vars_[name] = value;
+  }
+
+  void RestoreEnvVars() {
+    for (const char* name : {"TORCH_NEURONX_NEFF_CACHE_DIR", "TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR",
+                             "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE",
+                             "TORCH_NEURONX_NEFF_KEY_FROM_HLO"}) {
+      auto it = saved_env_vars_.find(name);
+      if (it != saved_env_vars_.end()) {
+        setenv(name, it->second.c_str(), 1);
+      } else {
+        unsetenv(name);
+      }
+    }
+  }
+
+  std::unique_ptr<TempDirectory> temp_dir_;
+  std::unique_ptr<TempDirectory> local_cache_dir_;
+  std::unique_ptr<CompilationCache> cache_;
+  std::map<std::string, std::string> saved_env_vars_;
+};
+
+// Kernel with HLO bytes recomputes its key directly; empty cache is not
+// consulted.
+TEST_F(ResolvePersistentCacheKeyTest, KernelWithHloComputesKeyWithoutCacheEntry) {
+  InitCache(/*hlo_content_key=*/true);
+
+  FakeEagerKernel kernel("eager_graph");
+  const std::string* expected = kernel.GetCompilationCacheKey().GetPersistentKey();
+  ASSERT_NE(expected, nullptr);
+  ASSERT_FALSE(expected->empty());
+
+  std::string resolved = ResolvePersistentCacheKey(kernel, *cache_);
+  EXPECT_EQ(resolved, *expected);
+}
+
+// HLO-key mode: a NeffDirect kernel can't compute its own key (nullptr), so the
+// helper recovers it from the CacheEntry the compile step stored.
+TEST_F(ResolvePersistentCacheKeyTest, NeffDirectKernelReadsKeyFromCacheEntry) {
+  InitCache(/*hlo_content_key=*/true);
+
+  const std::string base_key = "shared_graph_key";
+
+  // Seed the cache as the compile step would.
+  FakeEagerKernel compile_kernel(base_key);
+  cache_->GetOrCompileNeff(compile_kernel, /*stream_id=*/1);
+  const std::string* compiled_pk = compile_kernel.GetCompilationCacheKey().GetPersistentKey();
+  ASSERT_NE(compiled_pk, nullptr);
+  ASSERT_FALSE(compiled_pk->empty());
+
+  NeffDirectKernelExecution exec_kernel("shared_graph_key", base_key, {}, {}, {}, {}, 0, false);
+  ASSERT_TRUE(exec_kernel.GetHloBytes().empty());
+  EXPECT_EQ(exec_kernel.GetCompilationCacheKey().GetPersistentKey(), nullptr);
+
+  std::string resolved = ResolvePersistentCacheKey(exec_kernel, *cache_);
+  EXPECT_EQ(resolved, *compiled_pk);
+}
+
+// Legacy mode: a NeffDirect kernel's own key is non-null but WRONG (empty
+// compiler config), so the helper must prefer the matching CacheEntry key.
+TEST_F(ResolvePersistentCacheKeyTest, NeffDirectKernelLegacyModePrefersCacheEntry) {
+  InitCache(/*hlo_content_key=*/false);
+
+  const std::string base_key = "legacy_graph_key";
+
+  FakeEagerKernel compile_kernel(base_key);
+  cache_->GetOrCompileNeff(compile_kernel, /*stream_id=*/1);
+  const std::string* compiled_pk = compile_kernel.GetCompilationCacheKey().GetPersistentKey();
+  ASSERT_NE(compiled_pk, nullptr);
+  ASSERT_FALSE(compiled_pk->empty());
+
+  NeffDirectKernelExecution exec_kernel("legacy_graph_key", base_key, {}, {}, {}, {}, 0, false);
+
+  const std::string* exec_own_pk = exec_kernel.GetCompilationCacheKey().GetPersistentKey();
+  ASSERT_NE(exec_own_pk, nullptr);
+  EXPECT_NE(*exec_own_pk, *compiled_pk);
+
+  std::string resolved = ResolvePersistentCacheKey(exec_kernel, *cache_);
+  EXPECT_EQ(resolved, *compiled_pk);
+  EXPECT_NE(resolved, *exec_own_pk);
+}
+
+// No cache entry (e.g. evicted) → returns empty, not a bogus value.
+TEST_F(ResolvePersistentCacheKeyTest, NeffDirectKernelCacheMissReturnsEmpty) {
+  InitCache(/*hlo_content_key=*/true);
+
+  NeffDirectKernelExecution exec_kernel("missing_graph", "missing_key", {}, {}, {}, {}, 0, false);
+
+  std::string resolved = ResolvePersistentCacheKey(exec_kernel, *cache_);
+  EXPECT_TRUE(resolved.empty());
 }
 
 int main(int argc, char** argv) {

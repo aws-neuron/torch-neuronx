@@ -259,4 +259,13 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   std::list<std::shared_ptr<OperationContext>>::iterator next_to_schedule_;
 };
 
+// Resolve the persistent cache key (under which the NEFF lives on disk) for a
+// profiler event. Kernels carrying HLO bytes (eager) recompute it directly;
+// kernels without (torch.compile execution, NeffDirectKernelExecution) — whose
+// CompilationCacheKey lacks the bytes/config to recompute it correctly — read
+// it from the CacheEntry the compile step stored. Returns "" if unresolvable
+// (e.g. the cache entry was evicted).
+std::string ResolvePersistentCacheKey(const CompilableKernelExecution& kernel,
+                                      CompilationCache& compilation_cache);
+
 }  // namespace at::neuron

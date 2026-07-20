@@ -15,6 +15,7 @@
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
@@ -58,6 +59,23 @@ namespace at::neuron {
 
 // Definition of ProfilerMappingCollector's static atomic unique event id
 std::atomic<uint64_t> ProfilerMappingCollector::next_event_id_{1};
+
+std::string ResolvePersistentCacheKey(const CompilableKernelExecution& kernel,
+                                      CompilationCache& compilation_cache) {
+  // Kernels without source IR (NeffDirectKernelExecution) can't recompute their
+  // key, so read it from the CacheEntry the compile step stored.
+  if (kernel.GetHloBytes().empty()) {
+    if (auto entry = compilation_cache.GetEntry(kernel.GetCompileKey())) {
+      return entry->persistent_cache_key;
+    }
+    return {};
+  }
+  // Kernels with HLO bytes recompute the key directly (no cache lookup).
+  if (const auto* pk = kernel.GetCompilationCacheKey().GetPersistentKey()) {
+    return *pk;
+  }
+  return {};
+}
 
 StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
     : device_index(device_idx),
@@ -288,9 +306,8 @@ void StreamImpl::CompleteOperation(OperationContext* operation) {
     if (operation->RequiresCompilation()) {
       auto& compilable_kernel = operation->GetCompilableKernel();
       snapshot.neff_cache_key = compilable_kernel.GetCompileKey();
-      if (const auto* pk = compilable_kernel.GetCompilationCacheKey().GetPersistentKey()) {
-        snapshot.persistent_cache_key = *pk;
-      }
+      snapshot.persistent_cache_key = ResolvePersistentCacheKey(
+          compilable_kernel, NeuronResourceManager::Instance().GetCompilationCache());
     }
     buffer->record(std::move(snapshot));
   }
