@@ -838,6 +838,87 @@ class TestNeuronProfilerIntegration:
         # Verify chrome trace
         self._validate_chrome_trace_basics(prof, self.test_dir)
 
+    def test_compile_profile_persistent_cache_key(self):
+        """Verify profiler events carry the correct persistent_cache_key for torch.compile NEFFs.
+
+        The execute op (NeffDirectKernelExecution) carries only a cache-key string, so
+        without the fix GetPersistentKey() returns nullptr or a mismatched hash. This
+        test profiles 3 inference iterations and asserts that persistent_cache_key in
+        each RUNTIME/DRIVER event matches get_neff_info for the same base key — both
+        read from the same CacheEntry, so they must agree.
+        """
+
+        class MLP(torch.nn.Module):
+            def __init__(self, hidden: int = 256):
+                super().__init__()
+                self.fc1 = torch.nn.Linear(hidden, hidden * 4, bias=False)
+                self.fc2 = torch.nn.Linear(hidden * 4, hidden, bias=False)
+
+            def forward(self, x):
+                return self.fc2(torch.relu(self.fc1(x)))
+
+        device = torch.device("neuron")
+        model = MLP(hidden=256).to(device, dtype=torch.bfloat16)
+        compiled_model = torch.compile(model, backend="neuron", dynamic=False)
+        x = torch.randn(4, 256, device=device, dtype=torch.bfloat16)
+
+        # Warmup: ensures the NEFF is in the C++ in-memory cache before profiling.
+        compiled_model(x)
+        torch_neuronx.synchronize()
+
+        exp_config = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+        )
+
+        with (
+            profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+            ) as prof,
+            torch.inference_mode(),
+        ):
+            for _ in range(3):
+                compiled_model(x)
+            torch_neuronx.synchronize()
+
+        trace_file = os.path.join(self.test_dir, "neuron_trace.json")
+        prof.export_chrome_trace(trace_file)
+        with open(trace_file) as f:
+            trace = json.load(f)
+
+        trace_events = [e for e in trace["traceEvents"] if e.get("ph") == "X"]
+        runtime_evts = [e for e in trace_events if e.get("cat") == "privateuse1_runtime"]
+        driver_evts = [e for e in trace_events if e.get("cat") == "privateuse1_driver"]
+
+        neff_events = [
+            e
+            for e in runtime_evts + driver_evts
+            if "persistent_cache_key" in e.get("args", {}) and e["args"].get("neff_cache_key")
+        ]
+
+        assert (
+            len(neff_events) > 0
+        ), "No NEFF execution events with persistent_cache_key found in trace."
+
+        for evt in neff_events:
+            base_key = evt["args"]["neff_cache_key"]
+            key_in_trace = evt["args"]["persistent_cache_key"]
+
+            assert key_in_trace, f"persistent_cache_key is empty for event {evt['name']!r}"
+            assert (
+                len(key_in_trace) == 32
+            ), f"persistent_cache_key {key_in_trace!r} is not a 32-char XXH3_128 hex string"
+
+            # Both ResolvePersistentCacheKey and get_neff_info read from the same
+            # CacheEntry keyed by the base compile key, so they must agree.
+            result = torch_neuronx._C.get_neff_info(base_key)
+            assert result is not None, f"get_neff_info returned None for base key {base_key!r}"
+            assert key_in_trace == result[0], (
+                f"persistent_cache_key in trace {key_in_trace!r} does not match "
+                f"get_neff_info result {result[0]!r} for base key {base_key!r}"
+            )
+
 
 class TestProfileMode:
     """Test cases for ProfileMode enum."""
