@@ -103,9 +103,6 @@ if os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") == "1":
             )
         os.environ.setdefault("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "true")
     os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
-    os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "1")
-else:
-    os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
 
 # Default to C++ NeuronBackend process group
 os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
