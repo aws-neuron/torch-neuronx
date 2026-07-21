@@ -85,8 +85,8 @@ def _register_common_ops():
             "_scaled_dot_product_fused_attention_overrideable",
             scaled_dot_product_fused_attention_overrideable_neuron,
             make_composite_lower(_fused_sdpa_op),
-            static_argnums=[],
-            static_argnames=["dropout_p", "is_causal", "return_debug_mask", "scale"],
+            static_argnums=[4, 5, 6],
+            static_argnames=["scale"],
         )
 
         # ── SDPA Backward (NKI) — C++ dispatch handler ──
