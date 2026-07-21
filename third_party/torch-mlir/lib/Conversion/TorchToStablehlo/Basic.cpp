@@ -575,8 +575,14 @@ public:
       compareTypeAttr = chlo::ComparisonTypeAttr::get(
           op->getContext(), chlo::ComparisonType::FLOAT);
     } else if (isa<mlir::IntegerType>(lhsElemTy)) {
-      compareTypeAttr = chlo::ComparisonTypeAttr::get(
-          op->getContext(), chlo::ComparisonType::SIGNED);
+      auto intType = cast<mlir::IntegerType>(lhsElemTy);
+      if (intType.getWidth() == 1 || intType.isUnsigned()) {
+        compareTypeAttr = chlo::ComparisonTypeAttr::get(
+            op->getContext(), chlo::ComparisonType::UNSIGNED);
+      } else {
+        compareTypeAttr = chlo::ComparisonTypeAttr::get(
+            op->getContext(), chlo::ComparisonType::SIGNED);
+      }
     }
 
     if constexpr (std::is_same<AtenOpT, AtenLtTensorOp>() ||
