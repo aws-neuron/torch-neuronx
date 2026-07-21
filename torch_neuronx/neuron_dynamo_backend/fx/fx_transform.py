@@ -16,13 +16,10 @@ from torch_neuronx.neuron_dynamo_backend.config import get_model_name
 from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
-    ShardInputInfo,
     TensorSpec,
     parse_module_io,
-    shapes_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,24 +51,20 @@ def _is_tuple_return(module: Module) -> bool:
     return False
 
 
-def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
+def _set_module_alias(module: Module, alias_buffer_map: dict[int, int] | None) -> None:
     """Set aliasing attributes on the MLIR module for input-output tensor aliasing.
 
     Attaches mhlo.input_output_alias attributes to the module operation,
     informing the compiler which output tensors should alias input tensors.
 
-    Emits an alias for each entry in ``aliasing_info``, validated against the
-    lowered StableHLO IO and skipped on out-of-range indices or shape mismatch.
-    ``aliasing_info`` carries both in-place mutation aliases and genuine
-    pass-through aliases (inputs returned unchanged); the pass-through entries
-    are added by ``FunctionalizeCopyInplacePass`` and merged into
-    ``aliasing_info`` in ``backend.py`` before this call.
+    Takes a pre-computed {neff_output_index: neff_input_index} map from
+    get_alias_output_buffer_map().
 
     Args:
         module (Module): MLIR Module to modify.
-        aliasing_info (AliasingInfo): Aliasing relationships to apply.
+        alias_buffer_map (dict[int, int]): NEFF output→input index pairs to alias.
     """
-    if aliasing_info is None:
+    if not alias_buffer_map:
         return
 
     is_tuple_output = _is_tuple_return(module)
@@ -83,55 +76,21 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 
         # MLIR output index -> (input param_num, parameter_index) to alias.
         output_to_alias: dict[int, tuple[int, list[int]]] = {}
-
-        # Apply explicitly-provided aliases, validated against the real IO.
-        for alias in aliasing_info:
-            param_num = alias.parameter_number
-            param_idx = alias.parameter_index or []
-            output_idx = alias.output_index
-            if not isinstance(output_idx, int):
-                output_idx = output_idx[0] if output_idx else -1
-
-            if not (0 <= param_num < len(inputs)) or not (0 <= output_idx < len(outputs)):
-                logger.debug(
-                    "Skipping alias with indices outside the lowered MLIR IO: "
-                    "param_num=%s output_idx=%s (inputs=%d, outputs=%d)",
-                    param_num,
-                    output_idx,
-                    len(inputs),
-                    len(outputs),
-                )
-                continue
-            if output_idx in output_to_alias:
-                continue
-            if not shapes_match(inputs[param_num], outputs[output_idx]):
-                logger.warning(
-                    "Dropping alias: output[%d] -> input[%d] shape mismatch "
-                    "(output_shape=%s, input_shape=%s)",
-                    output_idx,
-                    param_num,
-                    outputs[output_idx],
-                    inputs[param_num],
-                )
-                continue
-            output_to_alias[output_idx] = (param_num, param_idx)
+        for output_idx, param_num in alias_buffer_map.items():
+            assert (0 <= param_num < len(inputs)) and (0 <= output_idx < len(outputs)), (
+                f"Alias index out of range for lowered MLIR IO: "
+                f"param_num={param_num} output_idx={output_idx} "
+                f"(inputs={len(inputs)}, outputs={len(outputs)})"
+            )
+            output_to_alias[output_idx] = (param_num, [])
 
         if not output_to_alias:
             return
 
-        # Emit mhlo.input_output_alias from the validated map. An input buffer
-        # may be donated to at most one output (XLA's HLO verifier rejects a
-        # second alias on the same parameter: RET_CHECK param_has_seen == false),
-        # so skip a param already emitted -- aliasing_info can hold two entries
-        # for one param (e.g. an input returned at two outputs).
+        # Emit mhlo.input_output_alias from the validated map.
         alias_dicts = []
-        seen_params: set[int] = set()
         for output_idx in sorted(output_to_alias):
             param_num, param_idx = output_to_alias[output_idx]
-            if param_num in seen_params:
-                continue
-            seen_params.add(param_num)
-
             param_index_attr = mlir_ir.DenseI64ArrayAttr.get(param_idx if param_idx else [])
             param_number_attr = mlir_ir.IntegerAttr.get(
                 mlir_ir.IntegerType.get_signed(64), param_num
@@ -167,10 +126,9 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 def convert_fx_to_stablehlo(
     gm: torch.fx.GraphModule,
     example_inputs,
-    aliasing_info: AliasingInfo = None,
+    aliasing_info: dict[int, int] | None = None,
     *,
     job: CompilationJob | None = None,
-    shard_input_info: ShardInputInfo | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
     """
     Convert FX GraphModule to StableHLO using torch-mlir with collective support
@@ -257,7 +215,7 @@ def convert_fx_to_stablehlo(
         raw_module = dtype_conversion_pass(raw_module)
 
     # Spec for executor.
-    io_spec = parse_module_io(raw_module, shard_input_info=shard_input_info)
+    io_spec = parse_module_io(raw_module)
     # Module should have at least one output
     if len(io_spec.outputs) == 0:
         raise ValueError(

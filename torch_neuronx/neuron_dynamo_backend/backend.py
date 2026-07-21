@@ -25,6 +25,12 @@ from torch_neuronx.neuron_dynamo_backend.decompositions import get_compile_decom
 from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
     convert_fx_to_stablehlo,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    PassMutations,
+    apply_input_mutations,
+    apply_output_mutations,
+    get_alias_output_buffer_map,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
     post_aot_processing,
 )
@@ -36,10 +42,6 @@ from torch_neuronx.neuron_dynamo_backend.metrics import (
 )
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.stablehlo_executor import StableHLOInterpreterExecutor
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
-    ShardInputInfo,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +63,7 @@ def _compile_fx_to_stablehlo(
     model_name: str,
     segment_id: str,
     job: CompilationJob,
-    aliasing_info: AliasingInfo = None,
-    shard_input_info: ShardInputInfo | None = None,
+    alias_buffer_map: dict[int, int] | None = None,
 ):
     """Convert an FX GraphModule to StableHLO MLIR.
 
@@ -72,7 +73,7 @@ def _compile_fx_to_stablehlo(
         model_name (str): Model name for logging and artifact naming.
         segment_id (str): Segment ID for statistics tracking.
         job (CompilationJob): Compilation job for artifact management.
-        aliasing_info (AliasingInfo): Input-output aliasing information.
+        alias_buffer_map (dict[int, int] | None): NEFF output→input aliasing hints.
 
     Returns:
         tuple: (stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec)
@@ -86,9 +87,8 @@ def _compile_fx_to_stablehlo(
     stablehlo_mlir, io_spec, cast_spec = convert_fx_to_stablehlo(
         gm,
         example_inputs,
-        aliasing_info,
+        alias_buffer_map,
         job=job,
-        shard_input_info=shard_input_info,
     )
     logger.debug("FX Graph to StableHLO conversion completed")
 
@@ -133,29 +133,17 @@ def _is_trivial_graph(gm: torch.fx.GraphModule) -> bool:
 
 
 def _make_fallback_fn(
-    gm, shard_input_info, removed_device_mesh_indices=None, none_output_info=None
+    gm,
+    pass_mutations: list[PassMutations],
 ):
     """Create a boxed fallback function that runs the original GraphModule."""
 
     def fallback_fn(inputs):
-        fallback_inputs = list(inputs)
-        if removed_device_mesh_indices:
-            fallback_inputs = [
-                inp for i, inp in enumerate(fallback_inputs) if i not in removed_device_mesh_indices
-            ]
-        if (
-            shard_input_info
-            and shard_input_info.new_input_count > shard_input_info.original_input_count
-        ):
-            fallback_inputs.append(torch.tensor(shard_input_info.shard_index, dtype=torch.int32))
-        result = gm.forward(*fallback_inputs)
-        if none_output_info:
-            outputs = list(result) if isinstance(result, tuple) else [result]
-            result_with_nones = [None] * none_output_info.original_output_count
-            for i, pos in enumerate(none_output_info.non_none_positions):
-                result_with_nones[pos] = outputs[i]
-            result = tuple(result_with_nones)
-        return result
+        mutated_inputs = apply_input_mutations(list(inputs), pass_mutations, "cpu")
+        result = gm.forward(*mutated_inputs)
+        outputs = list(result) if isinstance(result, tuple) else [result]
+        outputs = apply_output_mutations(outputs, pass_mutations, "cpu", list(inputs))
+        return tuple(outputs)
 
     fallback_fn._boxed_call = True
     return fallback_fn
@@ -192,6 +180,9 @@ def neuron_backend_fx_compiler(
         return make_boxed_func(gm.forward)
 
     model_name = _resolve_model_name(options)
+    pre_processing_analysis_info = (
+        pre_processing_analysis_info if pre_processing_analysis_info else {}
+    )
 
     # Create a CompilationJob for this compilation using context manager for automatic cleanup
     with compilation_job(op_name=model_name) as job:
@@ -199,31 +190,17 @@ def neuron_backend_fx_compiler(
         job.save_fx_graph(model_name, gm)
 
         logger.debug("Applying FX graph transformations...")
+        pre_aot_pass_mutations = pre_processing_analysis_info.get("pre_aot_pass_mutations")
         with dynamo_timed("torch_neuronx_fx_passes"):
-            post_aot_processing_result = post_aot_processing(gm, job=job, model_name=model_name)
+            post_aot_processing_result = post_aot_processing(
+                gm,
+                job=job,
+                model_name=model_name,
+                pre_aot_pass_mutations=pre_aot_pass_mutations,
+            )
         gm = post_aot_processing_result.graph_module
-        mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
-        none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
-        shard_input_info = post_aot_processing_result.analysis.get("shard_input_info", None)
-        removed_device_mesh_indices = post_aot_processing_result.analysis.get(
-            "removed_device_mesh_indices", None
-        )
-        passthrough_info = post_aot_processing_result.analysis.get("passthrough_info", None)
-        aliasing_info = (
-            None
-            if pre_processing_analysis_info is None
-            else pre_processing_analysis_info.get("aliasing_analysis", None)
-        )
-
-        # Merge pass-through aliasing into aliasing_info for StableHLO input_output_alias.
-        # Pass-throughs are inputs returned unchanged — the compiler treats these as no-op
-        # when input_output_alias is set. Mutations are not merged here because they
-        # require the compiler to execute the computation and write into the aliased buffer.
-        if passthrough_info is not None and len(passthrough_info) > 0:
-            if aliasing_info is None:
-                aliasing_info = AliasingInfo()
-            for alias in passthrough_info.aliases:
-                aliasing_info.add(alias.parameter_number, alias.parameter_index, alias.output_index)
+        pass_mutations = post_aot_processing_result.analysis.get("pass_mutations", [])
+        alias_buffer_map = get_alias_output_buffer_map(pass_mutations)
 
         logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
         logger.debug(
@@ -258,17 +235,14 @@ def neuron_backend_fx_compiler(
                     model_name,
                     segment_id,
                     job,
-                    aliasing_info,
-                    shard_input_info,
+                    alias_buffer_map,
                 )
             except Exception as stablehlo_err:
                 if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
                     raise
                 logger.error(f"StableHLO conversion failed: {stablehlo_err}")
                 logger.warning("Falling back to original GraphModule execution")
-                return _make_fallback_fn(
-                    gm, shard_input_info, removed_device_mesh_indices, none_output_info
-                )
+                return _make_fallback_fn(gm, pass_mutations)
 
             if os.environ.get("TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR") == "1":
                 logger.debug("Bypassing compilation -> returning stablehlo executor")
@@ -332,10 +306,8 @@ def neuron_backend_fx_compiler(
                 cast_spec=cast_spec,
                 has_collectives=has_collectives,
                 retain_device=retain_device,
-                mutation_info=mutation_info,
-                none_output_info=none_output_info,
-                removed_device_mesh_indices=removed_device_mesh_indices,
-                passthrough_info=passthrough_info,
+                pass_mutations=pass_mutations,
+                alias_buffer_map=alias_buffer_map,
             )
 
             # Wrap with CPU fallback for cold path debugging.
@@ -349,9 +321,7 @@ def neuron_backend_fx_compiler(
                         raise
                     logger.error(f"Execution failed: {e}")
                     logger.warning("Falling back to original GraphModule execution")
-                    return _make_fallback_fn(
-                        gm, shard_input_info, removed_device_mesh_indices, none_output_info
-                    )(inputs)
+                    return _make_fallback_fn(gm, pass_mutations)(inputs)
 
             fallback_wrapper._boxed_call = True
             fallback_wrapper.__wrapped__ = output_code

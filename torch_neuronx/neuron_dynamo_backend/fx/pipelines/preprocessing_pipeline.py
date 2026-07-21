@@ -47,7 +47,7 @@ def preprocess_graph(gm: torch.fx.GraphModule) -> PreprocessResult:
     pass_result = pm(gm)
 
     analysis_results = {
-        "aliasing_analysis": aliasing_analysis.result,
+        "pre_aot_pass_mutations": aliasing_analysis._pass_mutations,
     }
 
     return PreprocessResult(pass_result.graph_module, analysis_results)

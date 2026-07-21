@@ -6,13 +6,16 @@ import logging
 from typing import Final
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 
 import torch_neuronx
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
-from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    PassMutations,
+    apply_input_mutations,
+    apply_output_mutations,
+    get_mutation_copy_back_inputs,
+)
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
     TensorSpec,
@@ -41,10 +44,8 @@ class Executor:
         cast_spec: list[TensorSpec],
         has_collectives: bool = False,
         retain_device: bool = False,
-        mutation_info: AliasingInfo | None = None,
-        none_output_info: NoneOutputInfo | None = None,
-        removed_device_mesh_indices: list[int] | None = None,
-        passthrough_info: AliasingInfo | None = None,
+        pass_mutations: list[PassMutations] | None = None,
+        alias_buffer_map: dict[int, int] | None = None,
     ):
         """Initialize executor with cache key and I/O specifications.
 
@@ -55,21 +56,17 @@ class Executor:
             cast_spec (list[TensorSpec]): Output specifications for final dtype casting.
             has_collectives (bool): Whether graph contains collective operations.
             retain_device (bool): Whether to cast results back to the input device (default: False)
-            mutation_info (AliasingInfo | None): Input-output mutation relationships.
-            none_output_info (NoneOutputInfo | None): Metadata for None output restoration.
-            passthrough_info (AliasingInfo | None): Input-output pass-through relationships.
-                Used for buffer reuse in _allocate_output but NOT filtered in _process_outputs,
-                since AOTAutograd expects pass-through outputs in the return tuple.
+            pass_mutations (list[PassMutations] | None): Per-pass input/output mutations.
+            alias_buffer_map (dict[int, int] | None): NEFF output→input index map for buffer reuse.
         """
         self.graph_name = graph_name
         self.cache_key = cache_key
         self.io_spec = io_spec
         self.cast_spec = cast_spec
         self.has_collectives = has_collectives
-        self.mutation_info = mutation_info
-        self.none_output_info = none_output_info
-        self.removed_device_mesh_indices = removed_device_mesh_indices
-        self.passthrough_info = passthrough_info
+        self.pass_mutations = pass_mutations or []
+        self.alias_buffer_map = alias_buffer_map
+        self.copy_back_map = get_mutation_copy_back_inputs(self.pass_mutations)
 
         self.retain_device = retain_device
 
@@ -105,12 +102,8 @@ class Executor:
         disable_cpu_autocopy = _getenv_bool("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", False)
 
         for i, inp in enumerate(inputs):
-            # Leave DeviceMesh inputs unchanged - they will get removed later
-            if isinstance(inp, DeviceMesh):
-                yield inp
-                continue
             # Convert Python scalars to scalar tensors
-            elif not isinstance(inp, torch.Tensor):
+            if not isinstance(inp, torch.Tensor):
                 tensor = torch.tensor(inp, device=device_str)
             elif inp.device.type == "cpu":
                 if disable_cpu_autocopy:
@@ -137,48 +130,19 @@ class Executor:
                 tensor = tensor.to(torch.float32)
             yield tensor
 
-    def _script_object_output_to_input(self):
-        """Map output index -> original input index for script-object pass-throughs.
-
-        A graph input that is a script object (e.g. a ``DeviceMesh``) and is
-        returned unchanged is a pass-through, but it is NOT a NEFF tensor output:
-        its source input is removed from the NEFF (``removed_device_mesh_indices``)
-        and the output is folded out during lowering. AOTAutograd still expects
-        the forward to return it (it is saved for backward), so it must be
-        re-inserted at runtime straight from the original input.
-
-        Returns:
-            dict[int, int]: folded pass-through output index -> original input index.
-        """
-        removed_inputs = set(self.removed_device_mesh_indices or [])
-        mapping: dict[int, int] = {}
-        if self.passthrough_info is not None and removed_inputs:
-            for alias in self.passthrough_info.aliases:
-                if alias.parameter_number in removed_inputs:
-                    mapping[alias.output_index] = alias.parameter_number
-        return mapping
-
-    def _process_outputs(self, outputs, original_inputs=None):
-        """Process execution outputs with dtype upcasting and alias filtering.
+    def _process_outputs(self, outputs):
+        """Process execution outputs with dtype upcasting and shape correction.
 
         Neuron hardware operates on 32-bit dtypes, so this method restores
-        original 64-bit dtypes where needed. Aliased outputs are skipped since
-        they were written directly to input buffers during execution.
-
-        Script-object pass-through outputs (e.g. a ``DeviceMesh`` returned
-        unchanged and saved for backward) are folded out of the NEFF, so they are
-        re-inserted here directly from ``original_inputs`` -- a reference
-        pass-through, adding no compute and no device memory.
+        original 64-bit dtypes where needed. For aliased passthrough outputs
+        that reuse an input buffer, inserts view ops to match expected shapes.
 
         Args:
             outputs (list[torch.Tensor]): Output tensors from graph execution.
-            original_inputs (Sequence | None): The raw inputs to __call__, used to
-                recover folded script-object pass-through outputs.
 
-        Yields:
-            torch.Tensor: Processed tensors with dtypes matching cast_spec.
+        Returns:
+            list[torch.Tensor]: Tensors with dtypes matching cast_spec.
         """
-        # Apply casting
         tensors = []
         for tensor, cast_spec in zip(outputs, self.cast_spec, strict=False):
             if cast_spec.dtype in self.INT_64_TO_32:
@@ -187,39 +151,7 @@ class Executor:
                 tensor = tensor.to(cast_spec.dtype)
             tensors.append(tensor)
 
-        # Re-insert None outputs (and folded script-object pass-throughs) into the
-        # full output tuple that AOTAutograd expects.
-        if self.none_output_info:
-            original_output_count = self.none_output_info.original_output_count
-            non_none_positions = self.none_output_info.non_none_positions
-
-            scriptobj_output_to_input = self._script_object_output_to_input()
-            if original_inputs is None:
-                scriptobj_output_to_input = {}
-
-            # NEFF tensor outputs fill the non-None positions that are NOT folded
-            # script-object pass-throughs.
-            tensor_positions = [p for p in non_none_positions if p not in scriptobj_output_to_input]
-            assert len(tensors) == len(tensor_positions), (
-                f"NEFF tensor output count {len(tensors)} does not match expected "
-                f"{len(tensor_positions)} (non_none_positions={non_none_positions}, "
-                f"script_object_outputs={sorted(scriptobj_output_to_input)})"
-            )
-
-            reconstructed = [None for _ in range(original_output_count)]
-            for output_idx, input_idx in scriptobj_output_to_input.items():
-                reconstructed[output_idx] = original_inputs[input_idx]
-            for i, output_idx in enumerate(tensor_positions):
-                reconstructed[output_idx] = tensors[i]
-            tensors = reconstructed
-
-        # Filter aliased outputs
-        if self.mutation_info:
-            aliased_output_indices = {alias.output_index for alias in self.mutation_info.aliases}
-            tensors = (
-                tensor for i, tensor in enumerate(tensors) if i not in aliased_output_indices
-            )
-        yield from tensors
+        return tensors
 
     def _allocate_output(self, i, out, neuron_inputs, device_str):
         """Allocate a single output buffer for graph execution.
@@ -237,43 +169,13 @@ class Executor:
         Returns:
             torch.Tensor: Reused input buffer or newly allocated empty tensor.
         """
-        if self.mutation_info is not None:
-            mutated_output_to_input = dict(
-                sorted(
-                    (alias.output_index, alias.parameter_number)
-                    for alias in self.mutation_info.aliases
-                )
+        if self.alias_buffer_map and i in self.alias_buffer_map:
+            in_idx = self.alias_buffer_map[i]
+            assert in_idx < len(neuron_inputs), (
+                f"alias_buffer_map[{i}]={in_idx} is out of range for neuron_inputs "
+                f"(len={len(neuron_inputs)})"
             )
-        else:
-            mutated_output_to_input = {}
-
-        if i in mutated_output_to_input:
-            return neuron_inputs[mutated_output_to_input[i]]
-
-        # Script-object (e.g. DeviceMesh) pass-through outputs are folded out of the
-        # NEFF and rebuilt from inputs by _process_outputs (_script_object_output_to_input).
-        # Don't reuse the script-object input buffer here: execute_compiled_graph accepts
-        # only tensors, so a DeviceMesh in neuron_outputs raises TypeError. Use a
-        # placeholder tensor; its NEFF slot is unused and overwritten downstream.
-        # TODO: this is a downstream workaround. The root fix belongs in the
-        # ReplaceDeviceMeshPlaceholders pass, which today only drops DeviceMesh *inputs*
-        # and leaves the pass-through *outputs* dangling, forcing every consumer
-        # (here and _process_outputs) to special-case them. When that pass is
-        # refactored, have it resolve DeviceMesh pass-throughs at the source and remove
-        # these runtime guards.
-        if i in self._script_object_output_to_input():
-            return torch.empty(out.shape, dtype=out.dtype, device=device_str)
-
-        # Reuse input buffer for pass-through outputs (inputs returned unchanged).
-        # Unlike mutations, pass-throughs are NOT filtered in _process_outputs
-        # because AOTAutograd expects them in the return tuple for backward.
-        if self.passthrough_info is not None:
-            passthrough_output_to_input = {
-                alias.output_index: alias.parameter_number
-                for alias in self.passthrough_info.aliases
-            }
-            if i in passthrough_output_to_input:
-                return neuron_inputs[passthrough_output_to_input[i]]
+            return neuron_inputs[in_idx]
 
         return torch.empty(out.shape, dtype=out.dtype, device=device_str)
 
@@ -309,16 +211,11 @@ class Executor:
                 and output_device is not None
                 and output.device.type != output_device
             ):
-                if self.mutation_info:
-                    # mutations need to be propagated back to cpu inputs
-                    # that were automatically cast to neuron
-                    # SEE: test_retain_device_copies_mutated_output_to_original_input in
-                    # test_aliasing_executor.py
-                    input_idx = self.mutation_info.get_input_index(i)
-                    if input_idx is not None:
-                        original_input = original_inputs[input_idx]
-                        yield original_input.copy_(output.to(original_input.device))
-                        continue
+                if i in self.copy_back_map:
+                    # Mutation result: copy back into the original caller input tensor
+                    original_input = original_inputs[self.copy_back_map[i]]
+                    yield original_input.copy_(output.to(original_input.device))
+                    continue
                 yield output.to(output_device)
             else:
                 yield output
@@ -327,67 +224,43 @@ class Executor:
         """Execute the compiled graph using cache-based execution.
 
         Workflow:
-        1. Validate input count matches io_spec.inputs
-        2. Prepare inputs (device transfer + dtype downcast)
-        3. Allocate output buffers with 32-bit dtypes
-        4. Execute compiled graph via C++ runtime
-        5. Process outputs (dtype upcast to match specs)
+        1. Apply input mutations (remove/add inputs as specified by FX passes)
+        2. Validate input count matches io_spec.inputs
+        3. Prepare inputs (device transfer + dtype downcast)
+        4. Allocate output buffers with 32-bit dtypes
+        5. Execute compiled graph via C++ runtime
+        6. Process outputs (dtype upcast to match specs)
+        7. Apply output mutations (restore original signature)
 
         Args:
-            *inputs: Input tensors matching io_spec.inputs.
+            *inputs: Input tensors matching the original graph signature.
 
         Returns:
-            tuple[torch.Tensor, ...]: Output tensors on Neuron device with dtypes
-                matching cast_spec.
+            tuple[torch.Tensor, ...]: Output tensors matching the original graph signature.
 
         Raises:
-            NEFFExecutionError: If input count doesn't match expected count.
+            NEFFExecutionError: If input count doesn't match expected count after mutations.
         """
         logger.debug(f"Executor invoked: cache_key={self.cache_key}")
 
-        shard_input_count = 0
-        if self.io_spec.shard_input_info:
-            shard_input_count = (
-                self.io_spec.shard_input_info.new_input_count
-                - self.io_spec.shard_input_info.original_input_count
-            )
-        device_mesh_input_count = 0
-        if self.removed_device_mesh_indices:
-            device_mesh_input_count = len(self.removed_device_mesh_indices)
-        removed_input_count = device_mesh_input_count
-
-        if len(inputs) != (len(self.io_spec.inputs) - shard_input_count + removed_input_count):
-            raise NEFFExecutionError(
-                f"Expected {len(self.io_spec.inputs) - shard_input_count + removed_input_count} "
-                f"inputs, got {len(inputs)}"
-            )
-
         device_id = torch.neuron.current_device()
         device_str = f"neuron:{device_id}"
-        neuron_inputs = list(self._prepare_inputs(inputs, device_id))
+
+        # Apply input mutations to transform caller inputs into NEFF inputs
+        mutated_inputs = apply_input_mutations(list(inputs), self.pass_mutations, device_str)
+
+        if len(mutated_inputs) != len(self.io_spec.inputs):
+            raise NEFFExecutionError(
+                f"Expected {len(self.io_spec.inputs)} inputs after mutations, "
+                f"got {len(mutated_inputs)}"
+            )
+
+        neuron_inputs = list(self._prepare_inputs(mutated_inputs, device_id))
 
         neuron_outputs = [
             self._allocate_output(i, out, neuron_inputs, device_str)
             for i, out in enumerate(self.io_spec.outputs)
         ]
-
-        # Input processing: inputs are added/removed in the
-        # order of the passes which mutate the graph signature:
-        # - ReplaceDeviceMeshPlaceholders
-        # - ShardIndexInjection
-
-        # Remove DeviceMesh inputs
-        if self.removed_device_mesh_indices:
-            neuron_inputs = [
-                inp
-                for i, inp in enumerate(neuron_inputs)
-                if i not in self.removed_device_mesh_indices
-            ]
-
-        # Append TP shard index for SPMD vocab sharding
-        if self.io_spec.shard_input_info and shard_input_count > 0:
-            shard_index = self.io_spec.shard_input_info.shard_index
-            neuron_inputs.append(torch.tensor(shard_index, dtype=torch.int64, device=device_str))
 
         logger.debug(f"Calling execute_compiled_graph: cache_key={self.cache_key}")
         torch_neuronx._C.execute_compiled_graph(
@@ -398,9 +271,13 @@ class Executor:
             self.has_collectives,
         )
 
-        outputs = tuple(self._process_outputs(neuron_outputs, inputs))
+        tensors = self._process_outputs(neuron_outputs)
 
         if self.retain_device:
-            return tuple(self._cast_output_device(inputs, outputs))
-        else:
-            return outputs
+            # Apply copy-back from NEFF outputs directly back to caller inputs
+            tensors = list(self._cast_output_device(inputs, tensors))
+
+        # Apply output mutations to restore original graph signature
+        tensors = apply_output_mutations(tensors, self.pass_mutations, device_str, list(inputs))
+
+        return tuple(tensors)

@@ -1,12 +1,20 @@
+import logging
+
 import torch
 from torch.fx import GraphModule, Node
 from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
     NeuronFXPass,
     NeuronFXPassState,
 )
 from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+logger = logging.getLogger(__name__)
 
 # Operations that MUTATE data in-place (scatter, copy, etc.)
 MUTATION_OPS = {
@@ -87,6 +95,62 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
         if modified:
             graph.lint()
             gm.recompile()
+
+        # Collect all mutations to emit atomically as one PassMutations entry
+        out_muts = []
+        aliased_output_indices = [alias.output_index for alias in self.mutation_info.aliases]
+        if aliased_output_indices:
+            out_muts.append(
+                IOMutation(
+                    kind=MutationKind.ADD,
+                    indices=aliased_output_indices,
+                    pass_name="FunctionalizeCopyInplacePass",
+                )
+            )
+
+        # Emit passthrough ALIAS mutations for outputs that are direct
+        # pass-throughs of input placeholders (buffer reuse, no copy-back).
+        if self.passthrough_info and self.passthrough_info.aliases:
+            out_muts.append(
+                IOMutation(
+                    kind=MutationKind.ALIAS,
+                    indices=[a.output_index for a in self.passthrough_info.aliases],
+                    alias_input_indices=[a.parameter_number for a in self.passthrough_info.aliases],
+                    is_mutation=False,
+                    pass_name="FunctionalizeCopyInplacePass",
+                )
+            )
+
+        # Emit mutation ALIAS for outputs that are mutation results of inputs
+        # (buffer reuse + copy-back needed).
+        if self.mutation_info and self.mutation_info.aliases:
+            out_muts.append(
+                IOMutation(
+                    kind=MutationKind.ALIAS,
+                    indices=[a.output_index for a in self.mutation_info.aliases],
+                    alias_input_indices=[a.parameter_number for a in self.mutation_info.aliases],
+                    is_mutation=True,
+                    pass_name="FunctionalizeCopyInplacePass",
+                )
+            )
+
+        if self.state is not None:
+            pre_functionalize_pass_mutations = self.state.pass_mutations[:]  # noqa: F841
+            if out_muts:
+                self.state.add_pass_mutations(
+                    pass_name="FunctionalizeCopyInplacePass",
+                    output_mutations=out_muts,
+                )
+
+            # TODO: Rebase and insert pre-AOT AliasingAnalysis mutations once
+            # the executor consumes them. Currently main ignores pre-AOT info
+            # at execution time, so inserting them here has no effect.
+            # if self.state.pre_aot_pass_mutations is not None:
+            #     rebased = rebase_pre_aot_pass_mutations(
+            #         self.state.pre_aot_pass_mutations, pre_functionalize_pass_mutations
+            #     )
+            #     if rebased is not None:
+            #         self.state.pass_mutations.append(rebased)
 
         return PassResult(gm, modified=modified)
 
@@ -182,6 +246,10 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
 
         final_outputs = mutation_outputs + outputs
         output_node.args = (tuple(final_outputs),)
+        logger.debug(
+            f"Prepended {len(mutation_outputs)} to outputs, increased from "
+            f"{len(outputs)}->{len(final_outputs)}: {output_node.args}"
+        )
 
         return True
 
@@ -220,46 +288,6 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
                     parameter_index=[],
                     output_index=output_idx,
                 )
-
-    def _detect_mutation_lineage(
-        self, graph: torch.fx.Graph, placeholders: list[Node], outputs: list[Node]
-    ) -> bool:
-        """
-        Detect outputs that derive from mutating an input.
-
-        Traces each output backward through the graph. If the trace passes
-        through a mutation operation (scatter, copy, etc.) and reaches an
-        input placeholder, records this relationship.
-
-        Note: This detects mutation *lineage*, not strict aliasing. An output
-        may be a clone of a mutated input (no aliasing) but we still track
-        the relationship for buffer optimization. Only the FIRST output deriving
-        from each input is recorded as that is the only kind we care about.
-
-        Returns:
-            True if any mutation lineage was detected, False otherwise.
-        """
-        seen_inputs: set[int] = set()
-
-        for output_idx, output_node in enumerate(outputs):
-            if not isinstance(output_node, Node):
-                continue
-
-            result = self._trace_to_input(output_node, placeholders)
-
-            if result is not None:
-                input_idx, went_through_mutation = result
-
-                # Only record if the path included a mutation operation
-                if went_through_mutation and input_idx not in seen_inputs:
-                    seen_inputs.add(input_idx)
-                    self.mutation_info.add(
-                        parameter_number=input_idx,
-                        parameter_index=None,
-                        output_index=output_idx,
-                    )
-
-        return len(self.mutation_info) > 0
 
     def _trace_to_input(self, node: Node, placeholders: list[Node]) -> tuple[int, bool] | None:
         """Trace a node backward to find its source input placeholder.

@@ -1845,6 +1845,147 @@ class TestPassthroughDetection:
 
 
 # ============================================================================
+# Pre-AOT alias rebase hook
+# ============================================================================
+
+
+def _make_state_with_pre_aot(pre_aot_pm, preceding_pass_mutations=None):
+    from unittest.mock import MagicMock
+
+    from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
+
+    state = NeuronFXPassState(
+        job=MagicMock(),
+        model_name="test",
+        dumping_enabled=False,
+        pre_aot_pass_mutations=pre_aot_pm,
+    )
+    for pm_entry in preceding_pass_mutations or []:
+        state.pass_mutations.append(pm_entry)
+    return state
+
+
+def _make_alias_pm(out_indices, in_indices, is_mutation=False):
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+        IOMutation,
+        MutationKind,
+        PassMutations,
+    )
+
+    return PassMutations(
+        pass_name="AliasingAnalysis",
+        output_mutations=[
+            IOMutation(
+                kind=MutationKind.ALIAS,
+                indices=out_indices,
+                alias_input_indices=in_indices,
+                is_mutation=is_mutation,
+                pass_name="AliasingAnalysis",
+            )
+        ],
+    )
+
+
+def _make_preceding_pm(pass_name, in_remove=None, in_add=None, out_add=None, out_remove=None):
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+        IOMutation,
+        MutationKind,
+        PassMutations,
+    )
+
+    in_muts, out_muts = [], []
+    if in_remove:
+        in_muts.append(IOMutation(kind=MutationKind.REMOVE, indices=in_remove, pass_name=pass_name))
+    if in_add:
+        in_muts.append(
+            IOMutation(
+                kind=MutationKind.ADD,
+                indices=in_add,
+                transform_key="shard_index",
+                transform_params={"shard_index": 0},
+                pass_name=pass_name,
+            )
+        )
+    if out_add:
+        out_muts.append(IOMutation(kind=MutationKind.ADD, indices=out_add, pass_name=pass_name))
+    if out_remove:
+        out_muts.append(
+            IOMutation(
+                kind=MutationKind.REMOVE,
+                indices=out_remove,
+                transform_key="none",
+                pass_name=pass_name,
+            )
+        )
+    return PassMutations(pass_name=pass_name, input_mutations=in_muts, output_mutations=out_muts)
+
+
+@pytest.mark.xfail(reason="Pre-AOT rebase temporarily disabled")
+@pytest.mark.parametrize(
+    "pre_aot_pm,preceding,exp_buffer_map",
+    [
+        # None pre_aot → nothing appended, buffer map empty
+        (None, [], {}),
+        # No preceding passes: indices unchanged
+        (_make_alias_pm([1], [0]), [], {1: 0}),
+        # Preceding input REMOVE [0]: alias input[1] → 0
+        (_make_alias_pm([1], [1]), [_make_preceding_pm("Flex", in_remove=[0])], {1: 0}),
+        # Preceding output ADD [0]: alias output[1] → 2
+        (_make_alias_pm([1], [0]), [_make_preceding_pm("Flex", out_add=[0])], {2: 0}),
+        # Preceding input ADD [0]: alias input[1] → 2
+        (_make_alias_pm([0], [1]), [_make_preceding_pm("Flex", in_add=[0])], {0: 2}),
+        # Preceding output REMOVE eliminates alias output → empty
+        (_make_alias_pm([0], [0]), [_make_preceding_pm("Flex", out_remove=[0])], {}),
+        # is_mutation=True also rebased correctly
+        (
+            _make_alias_pm([0], [1], is_mutation=True),
+            [_make_preceding_pm("Flex", in_remove=[0])],
+            {0: 0},
+        ),
+        # Multiple preceding passes chain
+        (
+            _make_alias_pm([1], [2]),
+            [
+                _make_preceding_pm("Flex1", in_remove=[0]),  # input[2] → 1
+                _make_preceding_pm("Flex2", out_add=[0]),  # output[1] → 2
+            ],
+            {2: 1},
+        ),
+    ],
+)
+def test_pre_aot_rebase_hook(pre_aot_pm, preceding, exp_buffer_map):
+    """FunctionalizeCopyInplacePass rebases pre-AOT ALIAS mutations through preceding passes."""
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+        MutationKind,
+        get_alias_output_buffer_map,
+    )
+
+    state = _make_state_with_pre_aot(pre_aot_pm, preceding)
+    pass_instance = FunctionalizeCopyInplacePass(state)
+
+    graph = fx.Graph()
+    p = graph.placeholder("x")
+    graph.output(p)
+    gm = fx.GraphModule(torch.nn.Module(), graph)
+    pass_instance(gm)
+
+    # Verify buffer map from all pass_mutations matches expected
+    assert get_alias_output_buffer_map(state.pass_mutations) == exp_buffer_map
+
+    # If pre_aot_pm is not None, verify AliasingAnalysis entry exists with correct indices
+    if pre_aot_pm is not None and exp_buffer_map:
+        aa_entries = [p for p in state.pass_mutations if p.pass_name == "AliasingAnalysis"]
+        assert len(aa_entries) == 1
+        aa = aa_entries[0]
+        alias_muts = [m for m in aa.output_mutations if m.kind == MutationKind.ALIAS]
+        assert alias_muts
+        actual_map = {
+            o: i for m in alias_muts for o, i in zip(m.indices, m.alias_input_indices, strict=False)
+        }
+        assert actual_map == exp_buffer_map
+
+
+# ============================================================================
 # RUN TESTS
 # ============================================================================
 

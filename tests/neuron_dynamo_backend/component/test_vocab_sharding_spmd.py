@@ -31,10 +31,13 @@ ShardIndexInjection infers the vocab shard index from these constants
 VocabShardingSPMD rewrites the constants to expressions of that placeholder.
 """
 
+from unittest.mock import MagicMock
+
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph, GraphModule, Node
 
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
 from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
     BackwardSlice,
     FlatOffsetAdd,
@@ -45,6 +48,16 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
     find_flat_offset_adds,
     find_vocab_triads,
 )
+
+# ============================================================
+# Helpers
+# ============================================================
+
+
+def _make_state():
+    """Create a NeuronFXPassState for testing mutation recording."""
+    return NeuronFXPassState(job=MagicMock(), model_name="test", dumping_enabled=False)
+
 
 # ============================================================
 # Graph builders
@@ -505,12 +518,14 @@ class TestShardIndexInjection:
     def test_injects_rank_for_vocab_graph(self):
         gm = _build_single_triad(rank=0)
         assert _count_placeholders(gm) == 2
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         result = rpass(gm)
         assert result.modified
         assert _count_placeholders(result.graph_module) == 3
-        assert rpass.result.original_input_count == 2
-        assert rpass.result.new_input_count == 3
+        assert len(state.pass_mutations[0].input_mutations) == 1
+        assert state.pass_mutations[0].input_mutations[0].indices[0] == 2  # original_input_count
+        assert state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == 0
 
     def test_rank_is_last_placeholder(self):
         gm = _build_single_triad(rank=0)
@@ -523,11 +538,12 @@ class TestShardIndexInjection:
     def test_no_injection_for_no_vocab_graph(self):
         """Graphs without vocab patterns are left untouched."""
         gm = _build_no_vocab_graph()
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         result = rpass(gm)
         assert not result.modified
         assert _count_placeholders(result.graph_module) == 2  # unchanged
-        assert rpass.result.shard_index == 0
+        assert len(state.pass_mutations) == 0
 
     def test_no_injection_for_negative_index_wrapping(self):
         """Negative index wrapping graph has no vocab patterns — no injection."""
@@ -729,17 +745,22 @@ class TestTPPlusDPShardIndex:
         """Ranks 0 and 4 (both TP shard 0) get shard_index=0."""
         for _ in range(2):  # simulate global rank 0 and 4
             gm = _build_single_triad(rank=0)
-            inj = ShardIndexInjection()
+            state = _make_state()
+            inj = ShardIndexInjection(state)
             inj(gm)
-            assert inj.result.shard_index == 0
+            assert state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == 0
 
     def test_all_tp_shards_correct(self):
         """Each TP shard index is correctly inferred from the triad constants."""
         for tp_shard in range(4):
             gm = _build_single_triad(rank=tp_shard)
-            inj = ShardIndexInjection()
+            state = _make_state()
+            inj = ShardIndexInjection(state)
             inj(gm)
-            assert inj.result.shard_index == tp_shard
+            assert (
+                state.pass_mutations[0].input_mutations[0].transform_params["shard_index"]
+                == tp_shard
+            )
 
     def test_tp_plus_dp_graphs_identical_within_shard(self):
         """Ranks in the same TP shard produce identical rewritten graphs."""
@@ -758,9 +779,10 @@ class TestTPPlusDPShardIndex:
         indices = set()
         for tp_shard in range(4):
             gm = _build_single_triad(rank=tp_shard)
-            inj = ShardIndexInjection()
+            state = _make_state()
+            inj = ShardIndexInjection(state)
             inj(gm)
-            indices.add(inj.result.shard_index)
+            indices.add(state.pass_mutations[0].input_mutations[0].transform_params["shard_index"])
         assert indices == {0, 1, 2, 3}
 
 
@@ -777,12 +799,15 @@ class TestMixedPatterns:
         assert len(set(readables)) == 1
 
     def test_mixed_shard_index_consistent(self):
-        """ShardInputInfo.shard_index matches the vocab shard index for mixed graphs."""
+        """IOMutation shard_index matches the vocab shard index for mixed graphs."""
         for rank in range(4):
             gm = _build_mixed_triad_and_flat(rank=rank)
-            injection = ShardIndexInjection()
+            state = _make_state()
+            injection = ShardIndexInjection(state)
             injection(gm)
-            assert injection.result.shard_index == rank
+            assert (
+                state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == rank
+            )
 
     def test_mixed_numerical_correctness(self):
         """Rewritten mixed graph produces same output as original."""
@@ -868,11 +893,12 @@ class TestShardIndexInjectionFlatOffset:
     def test_injects_rank_for_flat_offset(self):
         gm = _build_flat_offset_backward(rank=1)
         assert _count_placeholders(gm) == 3  # flat_indices, src, grad_weight
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         result = rpass(gm)
         assert result.modified
         assert _count_placeholders(result.graph_module) == 4
-        assert rpass.result.new_input_count == 4
+        assert state.pass_mutations[0].input_mutations[0].indices[0] == 3  # original_input_count
 
     def test_rank_is_last_placeholder(self):
         gm = _build_flat_offset_backward(rank=1)
@@ -1063,17 +1089,21 @@ class TestShardIndexInjectionBackwardSlice:
 
     def test_injects_for_backward_slice(self):
         gm = _build_backward_slice(rank=0)
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         result = rpass(gm)
         assert result.modified
-        assert rpass.result.shard_index == 0
+        assert state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == 0
 
     def test_shard_index_from_backward_slice(self):
         for rank in range(4):
             gm = _build_backward_slice(rank=rank)
-            rpass = ShardIndexInjection()
+            state = _make_state()
+            rpass = ShardIndexInjection(state)
             rpass(gm)
-            assert rpass.result.shard_index == rank
+            assert (
+                state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == rank
+            )
 
 
 class TestVocabShardingSPMDBackwardSlice:
@@ -1151,9 +1181,12 @@ class TestBackwardSliceMixedPatterns:
             g.lint()
             gm = GraphModule(torch.nn.Module(), g)
 
-            rpass = ShardIndexInjection()
+            state = _make_state()
+            rpass = ShardIndexInjection(state)
             rpass(gm)
-            assert rpass.result.shard_index == rank
+            assert (
+                state.pass_mutations[0].input_mutations[0].transform_params["shard_index"] == rank
+            )
 
         # All ranks identical after rewrite
         hashes = set()
@@ -1219,41 +1252,44 @@ class TestInjectionRobustness:
     tensor subclass inputs).
     """
 
-    def _forward_with_shard(self, gm, rpass, *inputs):
+    def _forward_with_shard(self, gm, state, *inputs):
         """Call gm.forward with shard tensor appended if injection occurred."""
-        shard_info = rpass.result
         args = list(inputs)
-        if shard_info.new_input_count > shard_info.original_input_count:
-            args.append(torch.tensor(shard_info.shard_index, dtype=torch.int32))
+        if state.pass_mutations and len(state.pass_mutations[0].input_mutations) > 0:
+            shard_index = state.pass_mutations[0].input_mutations[0].transform_params["shard_index"]
+            args.append(torch.tensor(shard_index, dtype=torch.int32))
         return gm.forward(*args)
 
     def test_no_vocab_graph_with_shard_input(self):
         """No-vocab graph works when shard tensor is appended."""
         gm = _build_no_vocab_graph()
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         rpass(gm)
-        result = self._forward_with_shard(gm, rpass, torch.randn(4, 4), torch.randn(4, 4))
+        result = self._forward_with_shard(gm, state, torch.randn(4, 4), torch.randn(4, 4))
         assert result is not None
 
     def test_output_shape_preserved(self):
         """Output shape is unchanged by the extra shard placeholder."""
         gm = _build_no_vocab_graph()
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         rpass(gm)
-        result = self._forward_with_shard(gm, rpass, torch.randn(4, 4), torch.randn(4, 4))
+        result = self._forward_with_shard(gm, state, torch.randn(4, 4), torch.randn(4, 4))
         assert result.shape == (4, 4)
 
     def test_subclass_input(self):
         """Tensor subclass inputs work with injected shard placeholder."""
         gm = _build_no_vocab_graph()
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         rpass(gm)
 
         class MySubclass(torch.Tensor):
             pass
 
         x = torch.randn(4, 4).as_subclass(MySubclass)
-        result = self._forward_with_shard(gm, rpass, x, torch.randn(4, 4))
+        result = self._forward_with_shard(gm, state, x, torch.randn(4, 4))
         assert result is not None
 
     def test_backward_graph(self):
@@ -1269,9 +1305,10 @@ class TestInjectionRobustness:
         g.lint()
         gm = GraphModule(torch.nn.Module(), g)
 
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         rpass(gm)
-        result = self._forward_with_shard(gm, rpass, torch.randn(4, 4), torch.randn(4, 4))
+        result = self._forward_with_shard(gm, state, torch.randn(4, 4), torch.randn(4, 4))
         assert result.shape == (4, 4)
 
 
@@ -1283,15 +1320,16 @@ class TestFallbackWithInjectedInputs:
     def test_vocab_graph_fallback(self):
         """Vocab graph forward works when shard tensor is appended."""
         gm = _build_single_triad(rank=0)
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         result = rpass(gm)
         assert result.modified
-        shard_info = rpass.result
 
         original_inputs = [torch.arange(16384, dtype=torch.int64), torch.randn(16384, 64)]
         fallback_inputs = list(original_inputs)
-        if shard_info.new_input_count > shard_info.original_input_count:
-            fallback_inputs.append(torch.tensor(shard_info.shard_index, dtype=torch.int32))
+        if len(state.pass_mutations[0].input_mutations) > 0:
+            shard_index = state.pass_mutations[0].input_mutations[0].transform_params["shard_index"]
+            fallback_inputs.append(torch.tensor(shard_index, dtype=torch.int32))
 
         result = gm.forward(*fallback_inputs)
         assert result is not None
@@ -1299,14 +1337,15 @@ class TestFallbackWithInjectedInputs:
     def test_no_vocab_graph_no_extra_inputs(self):
         """No-vocab graph needs no extra inputs when injection is skipped."""
         gm = _build_no_vocab_graph()
-        rpass = ShardIndexInjection()
+        state = _make_state()
+        rpass = ShardIndexInjection(state)
         rpass(gm)
-        shard_info = rpass.result
 
         original_inputs = [torch.randn(4, 4), torch.randn(4, 4)]
         fallback_inputs = list(original_inputs)
-        if shard_info.new_input_count > shard_info.original_input_count:
-            fallback_inputs.append(torch.tensor(shard_info.shard_index, dtype=torch.int32))
+        if state.pass_mutations and len(state.pass_mutations[0].input_mutations) > 0:
+            shard_index = state.pass_mutations[0].input_mutations[0].transform_params["shard_index"]
+            fallback_inputs.append(torch.tensor(shard_index, dtype=torch.int32))
 
         assert len(fallback_inputs) == len(original_inputs)
         result = gm.forward(*fallback_inputs)
