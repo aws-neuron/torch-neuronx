@@ -5,6 +5,68 @@ import torch
 from ..operation_registry import Preprocessing, register_aten
 
 
+def _wrap_dim(dim, ndim):
+    """Validate/normalize `dim` like ATen's maybe_wrap_dim so invalid-dimension cases
+    raise the same IndexError messages native torch.roll does (see test_errors_roll)
+    instead of "IndexError: tuple index out of range" from x.shape[dim].
+
+    Note: these are TORCH_CHECK_INDEX failures in ATen, so they raise IndexError —
+    unlike the shifts/dims alignment checks in torch_roll, which are RuntimeError."""
+    if ndim == 0:
+        # A 0-dim (scalar) tensor has no dimensions to index.
+        raise IndexError(f"Dimension specified as {dim} but tensor has no dimensions")
+    if dim < -ndim or dim >= ndim:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    return dim % ndim
+
+
+def _roll_one_dim(x, shift, dim):
+    """Roll a single dim by `shift` using narrow+cat (on-device slice+concatenate)."""
+    dim = _wrap_dim(dim, x.dim())
+    n = x.shape[dim]
+    if n == 0:
+        return x
+    shift = int(shift) % n
+    if shift == 0:
+        return x
+    tail = x.narrow(dim, n - shift, shift)  # last `shift` elements wrap to front
+    head = x.narrow(dim, 0, n - shift)
+    return torch.cat([tail, head], dim=dim)
+
+
+@register_aten(["aten::roll", "aten::roll.out"], static_argnums=(1, 2), output_params=("out",))
+def torch_roll(self, shifts, dims=(), out=None):
+    """On-device aten::roll (avoids the CPU fallback). Decomposes to narrow+cat, which
+    lowers to slice + concatenate. shifts/dims are static (static_argnums) so the result
+    is shape-stable and compiles once per shape/shift config (swin window shifts are
+    constant per layer). Also covers roll's backward, which autograd expresses as
+    roll(grad, -shifts, dims)."""
+    # Validate inputs exactly like native torch.roll so error cases raise the correct
+    # RuntimeError (matching the aten::roll TORCH_CHECK messages) rather than an
+    # IndexError from shifts[0] during meta/dtype inference — see test_errors_roll.
+    if len(shifts) == 0:
+        raise RuntimeError("`shifts` required")
+    if not dims:
+        # dims empty -> native requires exactly one shift; flatten, roll dim 0, reshape back.
+        if len(shifts) != 1:
+            raise RuntimeError(f"shifts and dimensions must align. shifts: {len(shifts)}, dims:0")
+        orig_shape = self.shape
+        flat = self.reshape(-1)
+        flat = _roll_one_dim(flat, shifts[0], 0)
+        return flat.reshape(orig_shape)
+    if len(shifts) != len(dims):
+        raise RuntimeError(
+            f"shifts and dimensions must align. shifts: {len(shifts)}, dims:{len(dims)}"
+        )
+    result = self
+    for shift, dim in zip(shifts, dims, strict=False):
+        result = _roll_one_dim(result, shift, dim)
+    return result
+
+
 @register_aten(["aten::cat", "aten::cat.out"], static_argnums=(1,))
 def torch_cat(tensors, dim=0, out=None):
     non_empty = [t for t in tensors if t.numel() > 0]
