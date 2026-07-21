@@ -784,9 +784,23 @@ public:
       return op->emitError(
           "output padding attr is valid only in transposed convolution");
     }
+
+    // Broadcast scalar padding/stride/dilation to match spatial dimensions.
+    // PyTorch allows a single value that applies to all spatial dims.
+    auto nSpatialDimsExpected = static_cast<size_t>(inputTy.getRank()) - 2;
+    if (padding.size() == 1 && nSpatialDimsExpected > 1) {
+      padding.resize(nSpatialDimsExpected, padding[0]);
+    }
+    if (stride.size() == 1 && nSpatialDimsExpected > 1) {
+      stride.resize(nSpatialDimsExpected, stride[0]);
+    }
+    if (dilation.size() == 1 && nSpatialDimsExpected > 1) {
+      dilation.resize(nSpatialDimsExpected, dilation[0]);
+    }
+
     assert(padding.size() == dilation.size() &&
            padding.size() == stride.size() &&
-           padding.size() == static_cast<size_t>(inputTy.getRank()) - 2 &&
+           padding.size() == nSpatialDimsExpected &&
            inputTy.getRank() == weightTy.getRank());
 
     auto nSpatialDims = padding.size();
