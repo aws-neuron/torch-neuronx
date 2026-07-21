@@ -1268,7 +1268,6 @@ class TestEpilogueRandomFuzz:
                         f"offset={probe_view.storage_offset()}. "
                         f"Fallback ops: {fallback_ops}"
                     )
-                # else: pattern not decomposable, fallback is expected
 
     @pytest.mark.parametrize("seed", range(100))
     def test_random_inplace_mul_on_random_view(self, seed):
@@ -1349,3 +1348,101 @@ class TestEpilogueRandomFuzz:
                         f"offset={probe_view.storage_offset()}. "
                         f"Fallback ops: {fallback_ops}"
                     )
+
+
+# ============================================================================
+# Test: Epilogue for MULTI-OUTPUT ops with non-contiguous out= tensors
+
+#
+# Regression coverage for the SCATTER_IOTA extra-src wiring bug: the generic
+# scatter epilogue must emit ONE extra base-storage input (and one extra src)
+# PER scatter output. Multi-output ops (max.dim / min.dim -> values+indices,
+# _native_batch_norm_legit -> 3 outputs) with a strided out= previously hit
+#     "Module1 input address count (N) does not match function argument count (M)"
+# (or SIGSEGV for foreach) because the wiring assumed a single scatter output.
+# ============================================================================
+
+
+def _make_noncontiguous_like(t):
+    """Build a non-contiguous tensor with the same shape/dtype/device as ``t``.
+
+    Mirrors torch.testing.make_tensor(noncontiguous=True): allocates 2x storage
+    and takes a stride-2 view, which AnalyzeEpilogueLayout rejects and the
+    generic SCATTER_IOTA epilogue must handle. Returns a contiguous fallback for
+    0/1-element tensors (nothing to make non-contiguous).
+    """
+    if t.dim() == 0 or t.numel() <= 1:
+        return torch.empty_like(t)
+    doubled = torch.empty([2 * x for x in t.shape], dtype=t.dtype, device=t.device)
+    view = doubled[(slice(None, None, 2),) * t.dim()]
+    assert view.shape == t.shape and not view.is_contiguous()
+    return view
+
+
+class TestEpilogueMultiOutputOps:
+    """Multi-output ops with non-contiguous out= tensors must run end-to-end and
+    stay numerically correct — each transformed output wires its own scatter."""
+
+    @pytest.mark.skipif(
+        not epilogue_enabled() or not scatter_iota_enabled(),
+        reason="Requires TORCH_NEURONX_ENABLE_EPILOGUE=1 and TORCH_NEURONX_ENABLE_SCATTER_IOTA=1",
+    )
+    @pytest.mark.parametrize("fn_name", ["max", "min"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32])
+    def test_dim_reduction_two_outputs_noncontiguous_out(self, fn_name, dtype):
+        """max/min over a dim return (values, indices). Both out= tensors are
+        non-contiguous, so BOTH outputs get a SCATTER_IOTA epilogue. Previously
+        raised 'input address count (1) does not match function argument count (2)'.
+        """
+        x = (torch.arange(3 * 4 * 5).reshape(3, 4, 5) % 17).to(dtype)
+        fn = getattr(torch, fn_name)
+
+        cpu_vals, cpu_idx = fn(x, dim=1)
+
+        xn = x.to("neuron")
+        vals_out = _make_noncontiguous_like(cpu_vals.to(dtype)).to("neuron")
+        idx_out = _make_noncontiguous_like(cpu_idx).to("neuron")
+        assert not vals_out.is_contiguous() and not idx_out.is_contiguous()
+
+        fn(xn, dim=1, out=(vals_out, idx_out))
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(vals_out.cpu(), cpu_vals.to(dtype))
+        torch.testing.assert_close(idx_out.cpu(), cpu_idx)
+
+    @pytest.mark.skipif(
+        not epilogue_enabled() or not scatter_iota_enabled(),
+        reason="Requires TORCH_NEURONX_ENABLE_EPILOGUE=1 and TORCH_NEURONX_ENABLE_SCATTER_IOTA=1",
+    )
+    def test_sort_two_outputs_noncontiguous_out(self):
+        """sort returns (values, indices); exercises two-output scatter wiring."""
+        x = (torch.arange(5 * 6).reshape(5, 6) % 13).to(torch.float32)
+        cpu_vals, cpu_idx = torch.sort(x, dim=1)
+
+        xn = x.to("neuron")
+        vals_out = _make_noncontiguous_like(cpu_vals).to("neuron")
+        idx_out = _make_noncontiguous_like(cpu_idx).to("neuron")
+
+        torch.sort(xn, dim=1, out=(vals_out, idx_out))
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(vals_out.cpu(), cpu_vals)
+        torch.testing.assert_close(idx_out.cpu(), cpu_idx)
+
+    @pytest.mark.skipif(
+        not epilogue_enabled() or not scatter_iota_enabled(),
+        reason="Requires TORCH_NEURONX_ENABLE_EPILOGUE=1 and TORCH_NEURONX_ENABLE_SCATTER_IOTA=1",
+    )
+    def test_dim_reduction_cache_hit_two_outputs(self):
+        """Run the same two-output strided-out reduction twice to exercise the
+        MergedOperationCache HIT re-wire path (one extra src per scatter output)."""
+        x = (torch.arange(4 * 5).reshape(4, 5) % 11).to(torch.float32)
+        for _ in range(2):
+            cpu_vals, cpu_idx = torch.max(x, dim=1)
+            xn = x.to("neuron")
+            vals_out = _make_noncontiguous_like(cpu_vals).to("neuron")
+            idx_out = _make_noncontiguous_like(cpu_idx).to("neuron")
+            torch.max(xn, dim=1, out=(vals_out, idx_out))
+            torch.neuron.synchronize()
+            torch.testing.assert_close(vals_out.cpu(), cpu_vals)
+            torch.testing.assert_close(idx_out.cpu(), cpu_idx)

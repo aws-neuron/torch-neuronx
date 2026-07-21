@@ -3,6 +3,7 @@
 #include <chrono>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -26,9 +27,13 @@ struct MergedOperationCacheEntry {
   std::vector<size_t> input_dedup_map;  // empty if no dedup
   size_t deduped_input_count = 0;
   std::vector<std::vector<int64_t>> deduped_input_shapes;  // shape per deduped slot
-  bool has_scatter_iota_extra_src = false;  // epilogue needs extra src (dst→src wiring)
-  size_t scatter_iota_output_idx = 0;       // which output index has the SCATTER_IOTA
+  // Epilogue extra-src wiring (dst→src): the merged epilogue MLIR has ONE extra
+  // input (the flat base storage) per SCATTER_IOTA output. On a cache hit we must
+  // re-add one extra src (the output buffer) per entry, in this same order, so
+  // the kernel's src count matches the merged program's argument count.
+  std::vector<size_t> scatter_iota_output_indices;
 };
+
 static std::unordered_map<std::string, MergedOperationCacheEntry> g_merged_operation_cache;
 static std::mutex g_merged_operation_cache_mutex;
 
@@ -360,24 +365,28 @@ void LazyTransformationManager::ProcessOperationOutputs(
       TORCH_NEURONX_DEBUG("MergedOperationCache HIT (epilogue)", "op=", op_name);
       ApplyCachedMlirToKernel(xla_compilable, it->second.mlir_bytes, merged_epilogue_cache_key);
 
-      // Re-wire extra src tensor for SCATTER_IOTA on cache hit.
-      // LIMITATION: Only one SCATTER_IOTA output is supported per op.
-      // The merged MLIR expects N+1 inputs (extra base/flat storage), but the kernel
-      // only has N src tensors. We must add the dst tensor as extra src every time.
-      if (it->second.has_scatter_iota_extra_src) {
-        size_t out_idx = it->second.scatter_iota_output_idx;
+      // Re-wire extra src tensors for SCATTER_IOTA on cache hit.
+      // The merged MLIR expects num_outputs + K inputs, where K is the number of
+      // SCATTER_IOTA outputs (each adds an extra base/flat-storage input). The
+      // kernel only has its original src tensors, so we must re-add one extra src
+      // (the output buffer, which IS the flat storage) per scatter output — in the
+      // SAME order the merged program's arguments were built (ascending output
+      // index, matching scatter_iota_output_indices).
+      if (!it->second.scatter_iota_output_indices.empty()) {
         const auto& dst_ptrs = xla_compilable->GetDstPtrs();
         const auto& dst_ctxs = xla_compilable->GetOutputContexts();
+        const auto& dst_refs = xla_compilable->GetDstRefs();
         auto src_refs = xla_compilable->GetSrcRefs();
         auto src_ctxs = xla_compilable->GetSrcTensorContexts();
-        if (out_idx < dst_ptrs.size() && out_idx < dst_ctxs.size()) {
-          const auto& dst_refs = xla_compilable->GetDstRefs();
-          src_refs.push_back(dst_refs[out_idx]);
-          src_ctxs.push_back(dst_ctxs[out_idx]);
-          xla_compilable->UpdateSrcData(std::move(src_refs), src_ctxs);
-          TORCH_NEURONX_DEBUG("Epilogue cache HIT: re-wired extra src for SCATTER_IOTA",
-                              "op=", op_name, "output_idx=", out_idx);
+        for (size_t out_idx : it->second.scatter_iota_output_indices) {
+          if (out_idx < dst_ptrs.size() && out_idx < dst_ctxs.size() && out_idx < dst_refs.size()) {
+            src_refs.push_back(dst_refs[out_idx]);
+            src_ctxs.push_back(dst_ctxs[out_idx]);
+            TORCH_NEURONX_DEBUG("Epilogue cache HIT: re-wired extra src for SCATTER_IOTA",
+                                "op=", op_name, "output_idx=", out_idx);
+          }
         }
+        xla_compilable->UpdateSrcData(std::move(src_refs), src_ctxs);
       }
       return;
     }
@@ -407,29 +416,19 @@ void LazyTransformationManager::ProcessOperationOutputs(
 
   ApplyCachedMlirToKernel(xla_compilable, merged_mlir_bytes, merged_epilogue_cache_key);
 
-  // Cache the result — record whether extra src wiring is needed on cache hit,
-  // and which output index has the SCATTER_IOTA (for correct dst→src wiring).
-  bool needs_extra_src = epilogue_result.has_scatter_iota;
-  size_t scatter_output_idx = 0;
-  if (needs_extra_src) {
-    size_t scatter_count = 0;
-    for (size_t i = 0; i < epilogue_result.output_was_transformed.size(); ++i) {
-      if (epilogue_result.output_was_transformed[i]) {
-        scatter_output_idx = i;
-        ++scatter_count;
-      }
-    }
-    TORCH_CHECK(scatter_count <= 1,
-                "[ProcessOperationOutputs] Only one SCATTER_IOTA output is supported per op, "
-                "but found ",
-                scatter_count, " for op=", op_name);
-  }
+  // Cache the result — record the SCATTER_IOTA output indices so a cache HIT can
+  // re-wire one extra src (the output buffer / flat storage) per scatter output,
+  // in the same order the merged program's extra arguments were built. Multiple
+  // scatter outputs per op are fully supported (e.g. multi-output ops such as
+  // max.dim / min.dim / _native_batch_norm_legit with a strided out= tensor).
+  MergedOperationCacheEntry entry;
+  entry.mlir_bytes = merged_mlir_bytes;
+  entry.scatter_iota_output_indices = epilogue_result.scatter_iota_output_indices;
+
   std::lock_guard<std::mutex> lock(g_merged_operation_cache_mutex);
-  g_merged_operation_cache[merged_epilogue_cache_key] =
-      MergedOperationCacheEntry{merged_mlir_bytes, {}, 0, {}, needs_extra_src, scatter_output_idx};
+  g_merged_operation_cache[merged_epilogue_cache_key] = std::move(entry);
   TORCH_NEURONX_DEBUG("Cached merged epilogue result", "op=", op_name,
-                      "has_scatter_iota_extra_src=", needs_extra_src,
-                      "scatter_iota_output_idx=", scatter_output_idx);
+                      "num_scatter_outputs=", epilogue_result.scatter_iota_output_indices.size());
 }
 
 std::vector<uint8_t> LazyTransformationManager::ProcessEpilogueWithMlirMerge(
@@ -446,8 +445,12 @@ std::vector<uint8_t> LazyTransformationManager::ProcessEpilogueWithMlirMerge(
   std::vector<size_t> operation_output_slots(num_outputs);
   std::vector<size_t> epilogue_input_slots(num_outputs);
   std::vector<size_t> epilogue_output_slots(num_outputs);
-  // Extra slot for SCATTER_IOTA base tensor input
-  size_t epilogue_base_slot = 0;
+  // One extra base-storage slot per output (only the scatter outputs' slots are
+  // actually wired). Each must be a DISTINCT address so the merge creates a
+  // separate function argument.
+  const auto& scatter_indices = epilogue_result.scatter_iota_output_indices;
+  std::set<size_t> scatter_set(scatter_indices.begin(), scatter_indices.end());
+  std::vector<size_t> epilogue_base_slots(num_outputs);
 
   std::vector<void*> operation_input_addrs, operation_output_addrs;
   std::vector<void*> epilogue_input_addrs, epilogue_output_addrs;
@@ -457,18 +460,25 @@ std::vector<uint8_t> LazyTransformationManager::ProcessEpilogueWithMlirMerge(
   }
   for (size_t i = 0; i < num_outputs; ++i) {
     operation_output_addrs.push_back(&operation_output_slots[i]);
-    // Epilogue inputs connect to operation outputs
-    epilogue_input_addrs.push_back(&operation_output_slots[i]);
     epilogue_output_addrs.push_back(&epilogue_output_slots[i]);
   }
 
-  // If the epilogue has SCATTER_IOTA, add the extra base tensor input.
-  // The epilogue MLIR has num_outputs + 1 inputs (the extra one is the base tensor / flat storage).
-  // Use a unique slot address so the merge creates a new input in the merged program.
-  if (epilogue_result.has_extra_base_input()) {
-    epilogue_input_addrs.push_back(&epilogue_base_slot);
-    TORCH_NEURONX_DEBUG("ProcessEpilogueWithMlirMerge: adding extra base tensor input",
-                        "op=", op_name, "has_scatter_iota=", epilogue_result.has_scatter_iota);
+  // Build the epilogue module's input-argument signature in EXACTLY the order
+  // GenerateEpilogue produced it: per output, the primary (update) input, then —
+  // if that output has a SCATTER_IOTA — its extra base-storage input, immediately
+  // after. This interleaved order (primary_0, base_0?, primary_1, base_1?, ...)
+  // must match the merged epilogue MLIR's argument order, otherwise the operation
+  // outputs and the scatter base storage get wired to the wrong arguments.
+  for (size_t i = 0; i < num_outputs; ++i) {
+    // Epilogue primary input connects to the operation output of the same index.
+    epilogue_input_addrs.push_back(&operation_output_slots[i]);
+    if (scatter_set.count(i)) {
+      epilogue_input_addrs.push_back(&epilogue_base_slots[i]);
+    }
+  }
+  if (!scatter_indices.empty()) {
+    TORCH_NEURONX_DEBUG("ProcessEpilogueWithMlirMerge: adding extra base tensor inputs",
+                        "op=", op_name, "num_scatter_outputs=", scatter_indices.size());
   }
 
   // Merge: operation + epilogue
@@ -479,26 +489,24 @@ std::vector<uint8_t> LazyTransformationManager::ProcessEpilogueWithMlirMerge(
 
   TORCH_CHECK(!merged_mlir.empty(), "Failed to merge operation with epilogue for '", op_name, "'");
 
-  // If SCATTER_IOTA is present, the merged program has an extra input (the flat storage).
-  // The output buffer IS the flat storage, so add it as extra src.
-  if (epilogue_result.has_scatter_iota) {
+  // For each SCATTER_IOTA output the merged program has an extra input (the flat
+  // storage). The output buffer IS that flat storage, so add one extra src per
+  // scatter output, in ascending output-index order (the same order the extra
+  // inputs were appended above and in GenerateEpilogue's per-output merge).
+  if (!scatter_indices.empty()) {
     const auto& dst_ptrs = compilable_kernel->GetDstPtrs();
     const auto& dst_ctxs = compilable_kernel->GetOutputContexts();
+    const auto& dst_refs = compilable_kernel->GetDstRefs();
 
     auto src_refs = compilable_kernel->GetSrcRefs();
     auto src_ctxs = compilable_kernel->GetSrcTensorContexts();
 
-    for (size_t i = 0; i < num_outputs; ++i) {
-      if (i < epilogue_result.output_was_transformed.size() &&
-          epilogue_result.output_was_transformed[i]) {
-        if (i < dst_ptrs.size() && i < dst_ctxs.size()) {
-          const auto& dst_refs = compilable_kernel->GetDstRefs();
-          src_refs.push_back(dst_refs[i]);
-          src_ctxs.push_back(dst_ctxs[i]);
-        }
+    for (size_t out_idx : scatter_indices) {
+      if (out_idx < dst_ptrs.size() && out_idx < dst_ctxs.size() && out_idx < dst_refs.size()) {
+        src_refs.push_back(dst_refs[out_idx]);
+        src_ctxs.push_back(dst_ctxs[out_idx]);
         TORCH_NEURONX_DEBUG("Added flat storage as extra src input (SCATTER_IOTA)", "op=", op_name,
-                            "output_idx=", i);
-        break;
+                            "output_idx=", out_idx);
       }
     }
 
@@ -509,7 +517,7 @@ std::vector<uint8_t> LazyTransformationManager::ProcessEpilogueWithMlirMerge(
   }
 
   TORCH_NEURONX_DEBUG("Merged operation with epilogue", "op=", op_name,
-                      "has_scatter_iota=", epilogue_result.has_scatter_iota);
+                      "num_scatter_outputs=", scatter_indices.size());
 
   return std::vector<uint8_t>(merged_mlir.begin(), merged_mlir.end());
 }

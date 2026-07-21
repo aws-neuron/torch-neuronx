@@ -2156,13 +2156,16 @@ TEST_F(TransformationsTest, TryCreateEpilogue_StridedSliceRejection) {
   // a slice on dim 1 from the stride perspective. Let me use a clearer strided slice.
 
   // Use a 1D strided slice instead
+  // shape [5], stride [2] — innermost stride != 1, so AnalyzeEpilogueLayout rejects,
+  // but TryCreateGenericScatterEpilogue handles it via raw-stride SCATTER_IOTA.
   auto base1d = at::zeros({10}, at::TensorOptions().dtype(c10::ScalarType::Float));
   auto tensor1d = base1d.slice(0, 0, 10, 2);  // shape [5], stride [2]
   ASSERT_FALSE(tensor1d.is_contiguous());
 
   auto result1d = Creators::TryCreateEpilogue(tensor1d, "test_op", 0);
-  EXPECT_FALSE(result1d.has_value())
-      << "1D strided slice (stride=2) should be rejected (innermost stride != 1)";
+  ASSERT_TRUE(result1d.has_value())
+      << "1D strided slice (stride=2) should be handled by generic scatter epilogue";
+  EXPECT_EQ(result1d->pattern_name, "EPILOGUE_GENERIC_SCATTER");
 }
 
 TEST_F(TransformationsTest, TryCreateEpilogue_Size1Dims) {
