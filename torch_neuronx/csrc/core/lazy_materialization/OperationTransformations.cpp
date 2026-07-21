@@ -3,6 +3,7 @@
 #include <chrono>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -525,12 +526,33 @@ PrologueResult OperationPrologue::MergeTransformations(const std::vector<Transfo
 
 namespace {
 
-// Separate cache for epilogue MLIR strings
-// Cache stores {epilogue_mlir_str, has_scatter_iota} — both are needed on cache hit
-// because has_scatter_iota determines whether ProcessEpilogueWithMlirMerge adds an
-// extra input address for the SCATTER_IOTA base tensor.
-static std::unordered_map<std::string, std::pair<std::string, bool>> g_epilogue_cache;
+// Separate cache for epilogue MLIR strings.
+//
+// Cache stores only the merged {epilogue_mlir_str}. The set of SCATTER_IOTA
+// output indices (which drives how many extra base inputs
+// ProcessEpilogueWithMlirMerge must wire) is reconstructed deterministically
+// from the transformation `tasks` on both cache HIT and MISS — tasks are always
+// available before the cache is consulted, so we don't need to store the index
+// list. Reconstructing from tasks also keeps a single source of truth for the
+// per-output scatter detection.
+static std::unordered_map<std::string, std::string> g_epilogue_cache;
 static std::mutex g_epilogue_cache_mutex;
+
+// Reconstruct the SCATTER_IOTA output indices from the collected tasks.
+// Returns the output (input_index) of every task whose type is SCATTER_IOTA,
+// in ascending output-index order (matching the std::map iteration order used
+// when the merged epilogue was built), so the extra-base-input wiring order in
+// ProcessEpilogueWithMlirMerge agrees with the merged program's argument order.
+static std::vector<size_t> CollectScatterIotaOutputIndices(
+    const std::vector<TransformationTask>& tasks) {
+  std::set<size_t> scatter_outputs;
+  for (const auto& task : tasks) {
+    if (task.type == TransformationType::SCATTER_IOTA) {
+      scatter_outputs.insert(task.input_index);
+    }
+  }
+  return std::vector<size_t>(scatter_outputs.begin(), scatter_outputs.end());
+}
 
 }  // anonymous namespace
 
@@ -602,13 +624,17 @@ EpilogueResult OperationEpilogue::GenerateEpilogue(
   result.output_was_transformed.resize(output_ptrs.size(), false);
   result.epilogue_cache_key = epilogue_cache_key;
 
+  // The set of scatter output indices is derived purely from the tasks and is
+  // identical on cache HIT and MISS. Compute it once up front so both paths can
+  // populate result.scatter_iota_output_indices consistently.
+  result.scatter_iota_output_indices = CollectScatterIotaOutputIndices(tasks);
+
   // Check epilogue cache
   {
     std::lock_guard<std::mutex> lock(g_epilogue_cache_mutex);
     auto it = g_epilogue_cache.find(epilogue_cache_key);
     if (it != g_epilogue_cache.end()) {
-      result.epilogue_mlir_str = it->second.first;
-      result.has_scatter_iota = it->second.second;
+      result.epilogue_mlir_str = it->second;
       // Restore output_was_transformed from tasks (tasks are available before cache check)
       for (const auto& task : tasks) {
         if (task.input_index < result.output_was_transformed.size()) {
@@ -616,7 +642,7 @@ EpilogueResult OperationEpilogue::GenerateEpilogue(
         }
       }
       TORCH_NEURONX_DEBUG("Epilogue cache HIT", "cache_key=", epilogue_cache_key,
-                          "has_scatter_iota=", result.has_scatter_iota);
+                          "num_scatter_outputs=", result.scatter_iota_output_indices.size());
       return result;
     }
   }
@@ -634,41 +660,68 @@ EpilogueResult OperationEpilogue::GenerateEpilogue(
   TORCH_CHECK(tasks_by_output.size() == num_outputs,
               "Expected one transformation chain per output for '", op_name, "'.");
 
-  // Chain transformations per output
-  // NOTE: SCATTER_IOTA has 2 inputs (update + base), so chaining must
-  // handle the extra base input. The merge function automatically creates a new
-  // input for unmatched slots.
+  // Chain transformations per output.
+  //
+  // A SCATTER_IOTA task has TWO inputs — the update tensor and the flat base
+  // storage. Each per-output chain that contains a scatter therefore exposes
+  // ONE extra input (the base) in addition to its normal (update) input. We
+  // must register that base as a distinct input slot so it survives into the
+  // merged program as a real function argument; otherwise the merged MLIR gains
+  // a 2nd argument with no corresponding input address and
+  // validateAndGetMainFunctions throws:
+  //   "Module1 input address count (N) does not match function argument count (M)".
+  //
+  // This applies whether the scatter is the FIRST task in the chain (the common
+  // generic-scatter case — a lone SCATTER_IOTA per output) or a later task
+  // (decomposed transpose ∘ slice, where the scatter follows a transpose).
+  // Prior code only wired the base for non-first tasks, which silently dropped
+  // it for the generic single-scatter case and for multi-output ops.
   std::vector<std::string> per_output_mlirs;
+  // Per-output flag: does this output's chain expose an extra base input?
+  std::vector<bool> per_output_has_base;
   size_t slot_input = 0, slot_intermediate = 1, slot_output = 2;
-  size_t slot_base = 3;  // Extra slot for SCATTER_IOTA base tensor input
+  // Distinct address used to denote "the extra base input" while building a
+  // single output's chain. It is per-output-local; the final merge step assigns
+  // each output's base a unique slot in the merged program.
+  size_t slot_base = 3;
 
   for (const auto& [output_idx, output_tasks] : tasks_by_output) {
     std::string accumulated_mlir;
     bool first = true;
+    bool chain_has_base = false;
+    // Track the current chain's input signature so a first-task scatter keeps
+    // BOTH its inputs (update + base) exposed on the chain's main function.
+    std::vector<void*> chain_in_addrs;
 
     for (size_t ti = 0; ti < output_tasks.size(); ++ti) {
       std::string task_mlir = transformation_utils::GenerateMlir(output_tasks[ti]);
       bool is_scatter = (output_tasks[ti].type == TransformationType::SCATTER_IOTA);
-      bool has_extra_input = is_scatter;
 
       if (first) {
         accumulated_mlir = task_mlir;
         first = false;
-        if (is_scatter) result.has_scatter_iota = true;
+        // The chain's initial input signature = this task's inputs.
+        // For a scatter, that's {update(=slot_input), base(=slot_base)}.
+        if (is_scatter) {
+          chain_in_addrs = {&slot_input, &slot_base};
+          chain_has_base = true;
+        } else {
+          chain_in_addrs = {&slot_input};
+        }
       } else {
-        // For SCATTER_IOTA: the task MLIR has 2 inputs.
-        // Connect update to the previous chain's output (slot_intermediate),
-        // and add base as a new unique input (slot_base).
+        // Connect this task's (first) input to the previous chain's output
+        // (slot_intermediate). A scatter additionally consumes the base input
+        // as a fresh unique input (slot_base).
         std::vector<void*> task_in_addrs;
-        if (has_extra_input) {
+        if (is_scatter) {
           task_in_addrs = {&slot_intermediate, &slot_base};
-          if (is_scatter) result.has_scatter_iota = true;
+          chain_has_base = true;
         } else {
           task_in_addrs = {&slot_intermediate};
         }
 
         std::string merged = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
-            accumulated_mlir, task_mlir, {&slot_input}, {&slot_intermediate}, task_in_addrs,
+            accumulated_mlir, task_mlir, chain_in_addrs, {&slot_intermediate}, task_in_addrs,
             {&slot_output});
         if (merged.empty()) {
           result.success = false;
@@ -677,22 +730,43 @@ EpilogueResult OperationEpilogue::GenerateEpilogue(
           return result;
         }
         accumulated_mlir = merged;
+        // After merging, the chain's inputs are the original chain input plus
+        // (for a scatter) the newly introduced base input.
+        if (is_scatter) chain_in_addrs.push_back(&slot_base);
       }
     }
     per_output_mlirs.push_back(accumulated_mlir);
+    per_output_has_base.push_back(chain_has_base);
   }
 
-  // Merge all per-output chains (same as prologue, no dedup needed for outputs)
+  // Merge all per-output chains together. Each chain contributes:
+  //   - one primary input  (the update / contiguous result for that output), and
+  //   - optionally one base input (if that output has a SCATTER_IOTA).
+  //
+  // We give every input its own unique slot address so the merged program keeps
+  // one function argument per (update, base?) across all outputs, and record —
+  // in output order — which outputs carry a base. LazyTransformationManager wires
+  // one extra src per entry in scatter_iota_output_indices, in this same order.
   std::vector<size_t> input_slots(num_outputs);
-  std::vector<size_t> output_slots(num_outputs);
+  std::vector<size_t> base_slots(num_outputs);
+  std::vector<size_t> out_slots(num_outputs);
 
-  std::string accumulated_mlir = per_output_mlirs[0];
-  std::vector<void*> acc_in = {&input_slots[0]};
-  std::vector<void*> acc_out = {&output_slots[0]};
+  std::string accumulated_mlir;
+  std::vector<void*> acc_in;
+  std::vector<void*> acc_out;
 
-  for (size_t i = 1; i < per_output_mlirs.size(); ++i) {
+  for (size_t i = 0; i < per_output_mlirs.size(); ++i) {
+    // This chain's input signature: primary input, plus base input if present.
     std::vector<void*> chain_in = {&input_slots[i]};
-    std::vector<void*> chain_out = {&output_slots[i]};
+    if (per_output_has_base[i]) chain_in.push_back(&base_slots[i]);
+    std::vector<void*> chain_out = {&out_slots[i]};
+
+    if (i == 0) {
+      accumulated_mlir = per_output_mlirs[0];
+      acc_in = chain_in;
+      acc_out = chain_out;
+      continue;
+    }
 
     torch_neuronx::MergeMapping mm;
     std::string merged = torch_neuronx::mergeStableHLOModulesSkipIntermediates(
@@ -705,18 +779,26 @@ EpilogueResult OperationEpilogue::GenerateEpilogue(
     }
 
     accumulated_mlir = merged;
+    // Extend the accumulated input signature with this chain's inputs (primary
+    // first, then base) so subsequent merges align argument order.
     acc_in.push_back(&input_slots[i]);
-    acc_out.push_back(&output_slots[i]);
+    if (per_output_has_base[i]) acc_in.push_back(&base_slots[i]);
+    acc_out.push_back(&out_slots[i]);
   }
 
   result.epilogue_mlir_str = accumulated_mlir;
 
-  // Cache the result (MLIR + has_scatter_iota flag)
+  // scatter_iota_output_indices was already populated up front from tasks.
+  TORCH_NEURONX_DEBUG("Built merged epilogue", "op=", op_name, "num_outputs=", num_outputs,
+                      "num_scatter_outputs=", result.scatter_iota_output_indices.size());
+
+  // Cache the merged MLIR. The scatter output indices are reconstructed from
+  // tasks on the next HIT, so only the MLIR needs to be stored.
   {
     std::lock_guard<std::mutex> lock(g_epilogue_cache_mutex);
-    g_epilogue_cache[epilogue_cache_key] = {result.epilogue_mlir_str, result.has_scatter_iota};
+    g_epilogue_cache[epilogue_cache_key] = result.epilogue_mlir_str;
     TORCH_NEURONX_DEBUG("Cached merged epilogue", "cache_key=", epilogue_cache_key,
-                        "has_scatter_iota=", result.has_scatter_iota);
+                        "num_scatter_outputs=", result.scatter_iota_output_indices.size());
   }
 
   return result;

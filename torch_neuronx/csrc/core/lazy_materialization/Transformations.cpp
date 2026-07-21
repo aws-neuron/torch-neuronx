@@ -881,6 +881,171 @@ std::optional<FoldedDecompositionResult> TryFoldedDecomposition(const at::Tensor
   return TryMultiGroupDecomposition(tensor, op_name, input_index);
 }
 
+// ============================================================================
+// GENERIC SCATTER_IOTA EPILOGUE FALLBACK
+//
+// Used by TryCreateEpilogue when the analytical decomposition
+// (transpose ∘ slice of a contiguous base, via AnalyzeEpilogueLayout) cannot
+// express the output's stride pattern, e.g.:
+//   - Diagonal / padded-innermost-dim writes: shape=[5] strides=[6] (diag),
+//     shape=[5,5] strides=[25,6] (diag_embed), shape=[2,2] strides=[1,2]
+//     (as_strided diagonals), shape=[2] strides=[2] (linalg det `mul.out`).
+//   - Select / non-multiple stride-gap writes: shape=[5,5] strides=[25,5]
+//     (select on 3D), shape=[1,5,1] strides=[25,5,1] (cumprod/prod zero_),
+//     shape=[20,20,5] strides=[400,20,2] (slice_scatter step=2).
+//
+// Emits a single SCATTER_IOTA using the raw output strides directly (no
+// decomposition). Each view element maps to a flat index
+//     flat_idx = offset + Σ iₖ · stride_k
+// and stablehlo.scatter writes update[i] into base_flat[flat_idx].
+//
+// SAFETY (must be airtight — wrong scatter = silent miscompile):
+//   1. Reuse the existing scatter_iota_enabled gate (default ON, env "0" to
+//      disable). Disabling SCATTER_IOTA disables ALL scatter paths.
+//   2. Defensive non-negative offset / stride sanity checks.
+//   3. INJECTIVITY GUARD — sort active dims by stride desc; require
+//      stride[outer] >= stride[inner] * size[inner] for every adjacent pair.
+//      This guarantees no two view multi-indices map to the same flat index,
+//      which is required because ScatterIotaOpBuilder hardcodes
+//      unique_indices=true. Overlapping-stride patterns (e.g., `unfold` with
+//      step < window) are correctly rejected here and fall through to the
+//      CPU-bounce path in CopyBackToOriginal.
+//   4. OUT-OF-BOUNDS REJECT (no clamping) — require max_flat_idx <
+//      storage_elements. Clamping would alias / drop writes.
+//   5. 4GB guard on storage_span * element_size.
+// If any check fails we return nullopt — the existing fallback path
+// (contiguous temp + CopyBackToOriginal) takes over, always correct.
+// ============================================================================
+std::optional<TransformationCreationResult> TryCreateGenericScatterEpilogue(
+    const at::Tensor& output, c10::IntArrayRef shape, c10::IntArrayRef strides, int64_t offset,
+    int64_t ndims, int64_t storage_elements, const std::string& op_name, size_t output_index) {
+  // Gate: reuse the existing SCATTER_IOTA env switch.
+  static const bool scatter_iota_enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_ENABLE_SCATTER_IOTA");
+    return env == nullptr || std::string(env) != "0";
+  }();
+  if (!scatter_iota_enabled) {
+    TORCH_NEURONX_DEBUG(
+        "TryCreateGenericScatterEpilogue: skipped (TORCH_NEURONX_ENABLE_SCATTER_IOTA=0)",
+        "op=", op_name, "output_index=", output_index);
+    return std::nullopt;
+  }
+
+  // Defensive checks. The caller (TryCreateEpilogue) already rejects broadcast
+  // / negative-stride patterns, but repeat here so this helper is self-contained
+  // and safely callable from anywhere.
+  if (offset < 0) {
+    TORCH_NEURONX_DEBUG("TryCreateGenericScatterEpilogue: rejected (negative offset)",
+                        "op=", op_name, "output_index=", output_index, "offset=", offset);
+    return std::nullopt;
+  }
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (strides[i] < 0 || (strides[i] == 0 && shape[i] > 1)) {
+      return std::nullopt;
+    }
+  }
+
+  // Injectivity guard: sort ACTIVE (size>1) dims by stride descending and
+  // require the inner dim's INCLUSIVE SPAN to fit within one outer stride step:
+  //     (size[inner] - 1) * stride[inner] + 1  <=  stride[outer]
+  //
+  // This is the correct non-overlap condition for a lexicographic strided
+  // layout — when the inner dim's max reachable offset (== span - 1) is
+  // strictly less than stride[outer], no two view multi-indices can collide
+  // on the same flat index, so stablehlo.scatter's unique_indices=true holds.
+  //
+  // NOTE: a previous version used `size[inner] * stride[inner] <= stride[outer]`
+  // (the "next-step distance"), which was off by `stride[inner]` — too strict
+  // by exactly one element. It rejected valid diagonal-style writes where the
+  // inner span exactly fills one outer stride step, e.g.:
+  //   [5, 5] strides=[25, 6]  (diag_embed): inner span = 4*6+1 = 25 == 25 ✓
+  //   [3, 5] strides=[25, 6]  (linalg_det): inner span = 4*6+1 = 25 == 25 ✓
+  //   [2, 3] strides=[9, 4]   (solve_tri):  inner span = 2*4+1 =  9 ==  9 ✓
+  // These layouts are injective but the old guard rejected them.
+  std::vector<int64_t> active_dims;
+  active_dims.reserve(ndims);
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (shape[i] > 1) active_dims.push_back(i);
+  }
+  std::sort(active_dims.begin(), active_dims.end(),
+            [&](int64_t a, int64_t b) { return strides[a] > strides[b]; });
+  for (size_t k = 0; k + 1 < active_dims.size(); ++k) {
+    int64_t outer = active_dims[k];
+    int64_t inner = active_dims[k + 1];
+    int64_t inner_span = (shape[inner] - 1) * strides[inner] + 1;
+    if (inner_span > strides[outer]) {
+      TORCH_NEURONX_DEBUG(
+          "TryCreateGenericScatterEpilogue: rejected (overlapping strides — inner span exceeds "
+          "outer stride, would produce non-unique flat indices and violate "
+          "stablehlo.scatter unique_indices=true)",
+          "op=", op_name, "output_index=", output_index, "shape=", shape, "strides=", strides,
+          "outer_dim=", outer, "outer_stride=", strides[outer], "inner_dim=", inner,
+          "inner_stride=", strides[inner], "inner_size=", shape[inner], "inner_span=", inner_span);
+      return std::nullopt;
+    }
+  }
+
+  // Out-of-bounds reject (no clamping): max_flat_idx must be < storage_elements.
+  int64_t max_flat_idx = offset;
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (shape[i] > 1) max_flat_idx += (shape[i] - 1) * strides[i];
+  }
+  if (max_flat_idx >= storage_elements) {
+    TORCH_NEURONX_DEBUG("TryCreateGenericScatterEpilogue: rejected (max flat index out of storage)",
+                        "op=", op_name, "output_index=", output_index,
+                        "max_flat_idx=", max_flat_idx, "storage_elements=", storage_elements);
+    return std::nullopt;
+  }
+
+  int64_t scatter_storage_span = storage_elements;
+  if (scatter_storage_span <= 0) {
+    TORCH_NEURONX_DEBUG("TryCreateGenericScatterEpilogue: rejected (storage_span <= 0)",
+                        "op=", op_name, "output_index=", output_index,
+                        "storage_span=", scatter_storage_span);
+    return std::nullopt;
+  }
+
+  // 4GB guard.
+  {
+    int64_t base_bytes = scatter_storage_span * output.element_size();
+    constexpr int64_t kMaxBytes = 4LL * 1024 * 1024 * 1024;
+    if (base_bytes >= kMaxBytes) {
+      TORCH_NEURONX_DEBUG("TryCreateGenericScatterEpilogue: rejected (storage > 4GB)",
+                          "op=", op_name, "output_index=", output_index, "base_bytes=", base_bytes);
+      return std::nullopt;
+    }
+  }
+
+  // Emit a single SCATTER_IOTA with raw output strides. params layout matches
+  // ScatterIotaHandler / ScatterIotaOpBuilder:
+  //   [stride_0, ..., stride_{n-1}, storage_offset, storage_span]
+  std::string element_type = ScalarTypeToElementTypeString(output.scalar_type());
+  std::vector<int64_t> logical_shape(shape.begin(), shape.end());
+  std::vector<int64_t> id_perm(ndims);
+  std::iota(id_perm.begin(), id_perm.end(), 0);
+
+  std::vector<int64_t> scatter_params;
+  scatter_params.reserve(ndims + 2);
+  for (int64_t i = 0; i < ndims; ++i) scatter_params.push_back(strides[i]);
+  scatter_params.push_back(offset);
+  scatter_params.push_back(scatter_storage_span);
+
+  std::vector<TensorTransformation> transforms;
+  transforms.emplace_back(TransformationType::SCATTER_IOTA, logical_shape,
+                          std::vector<int64_t>{scatter_storage_span}, element_type, scatter_params,
+                          id_perm, id_perm);
+
+  at::Tensor base_tensor = output.as_strided({scatter_storage_span}, {1}, 0);
+
+  TORCH_NEURONX_DEBUG("TryCreateGenericScatterEpilogue: succeeded (EPILOGUE_GENERIC_SCATTER)",
+                      "op=", op_name, "output_index=", output_index, "shape=", shape,
+                      "strides=", strides, "offset=", offset,
+                      "storage_span=", scatter_storage_span);
+
+  return TransformationCreationResult{true, std::move(transforms), base_tensor,
+                                      "EPILOGUE_GENERIC_SCATTER"};
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -1836,36 +2001,34 @@ EpiloguePermutation BuildEpiloguePermutation(c10::IntArrayRef shape, c10::IntArr
                              full_is_identity};
 }
 
-std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& output,
-                                                              const std::string& op_name,
-                                                              size_t output_index) {
-  auto shape = output.sizes();
-  auto strides = output.strides();
-  int64_t offset = output.storage_offset();
-  int64_t ndims = shape.size();
+// ----------------------------------------------------------------------------
+// Epilogue creation is a 2-tier strategy. Both tiers are sibling creators that
+// return a TransformationCreationResult or nullopt:
+//
+//   Tier 1  AnalyzeEpilogueLayout  →  TryCreateDecomposedEpilogue
+//           The view DECOMPOSES into  transpose ∘ slice  of a contiguous base.
+//           Emits clean TRANSPOSE (+ SCATTER_IOTA only for the slice part).
+//
+//   Tier 2  TryCreateGenericScatterEpilogue
+//           The view does NOT decompose (diagonal / select / non-multiple gap).
+//           Falls back to a single RAW-STRIDE scatter (flat_idx = Σ iₖ·strideₖ).
+//
+//   none    Both tiers return nullopt → caller bounces through a contiguous
+//           temp (CopyBackToOriginal), which is always correct.
+//
+// TryCreateEpilogue (below) is the orchestrator that wires these tiers together.
+// ----------------------------------------------------------------------------
 
-  if (ndims == 0 || output.is_contiguous()) return std::nullopt;
-
-  // Reject broadcast and negative strides
-  for (int64_t i = 0; i < ndims; ++i) {
-    if (strides[i] < 0) return std::nullopt;
-    if (strides[i] == 0 && shape[i] > 1) {
-      TORCH_NEURONX_DEBUG("TryCreateEpilogue: broadcast view", "op=", op_name,
-                          "output_index=", output_index);
-      return std::nullopt;
-    }
-  }
-
-  int64_t storage_elements =
-      static_cast<int64_t>(output.storage().nbytes() / output.element_size());
-
-  // Phase 1: Analyze physical layout
-  auto layout_opt =
-      AnalyzeEpilogueLayout(shape, strides, offset, storage_elements, op_name, output_index);
-  if (!layout_opt) return std::nullopt;
-  const auto& layout = *layout_opt;
-
-  // Phase 2: Build full-ndims permutation and base shape
+// Tier 1 creator: the layout was DECOMPOSED by AnalyzeEpilogueLayout into a
+// transpose ∘ slice of a contiguous base. Build the inverse transformation
+// chain (inverse TRANSPOSE, plus SCATTER_IOTA for the slice part) that writes a
+// contiguous result back into the non-contiguous output's storage.
+// Returns nullopt if storage bounds fail or SCATTER_IOTA is disabled for a slice.
+std::optional<TransformationCreationResult> TryCreateDecomposedEpilogue(
+    const at::Tensor& output, const EpilogueLayoutInfo& layout, c10::IntArrayRef shape,
+    c10::IntArrayRef strides, int64_t offset, int64_t ndims, int64_t storage_elements,
+    const std::string& op_name, size_t output_index) {
+  // Build full-ndims permutation and base shape from the active-dim analysis.
   auto perm = BuildEpiloguePermutation(shape, strides, layout);
 
   // Verify storage bounds
@@ -1888,7 +2051,7 @@ std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& 
   at::Tensor base_tensor = output.as_strided(c10::IntArrayRef(perm.full_base_phys),
                                              c10::IntArrayRef(base_cont_strides), base_offset);
 
-  // Phase 3: Build transformation chain
+  // Build transformation chain
   std::string element_type = ScalarTypeToElementTypeString(output.scalar_type());
   std::vector<int64_t> id_perm(ndims);
   std::iota(id_perm.begin(), id_perm.end(), 0);
@@ -1914,7 +2077,8 @@ std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& 
     return env == nullptr || std::string(env) != "0";
   }();
   if (layout.has_slice && !scatter_iota_enabled) {
-    TORCH_NEURONX_DEBUG("TryCreateEpilogue: SCATTER_IOTA disabled via env var", "op=", op_name);
+    TORCH_NEURONX_DEBUG("TryCreateDecomposedEpilogue: SCATTER_IOTA disabled via env var",
+                        "op=", op_name, "output_index=", output_index);
     return std::nullopt;
   }
   if (layout.has_slice) {
@@ -1939,6 +2103,48 @@ std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& 
                                  ? (perm.full_is_identity ? "EPILOGUE_SLICE" : "EPILOGUE_COMPOUND")
                                  : "EPILOGUE_TRANSPOSE";
   return TransformationCreationResult{true, std::move(transforms), base_tensor, pattern_name};
+}
+
+// Orchestrator: pre-validate the output, then try the 2-tier strategy described
+// above. See the strategy map comment preceding TryCreateDecomposedEpilogue.
+std::optional<TransformationCreationResult> TryCreateEpilogue(const at::Tensor& output,
+                                                              const std::string& op_name,
+                                                              size_t output_index) {
+  auto shape = output.sizes();
+  auto strides = output.strides();
+  int64_t offset = output.storage_offset();
+  int64_t ndims = shape.size();
+
+  if (ndims == 0 || output.is_contiguous()) return std::nullopt;
+
+  // Reject broadcast and negative strides
+  for (int64_t i = 0; i < ndims; ++i) {
+    if (strides[i] < 0) return std::nullopt;
+    if (strides[i] == 0 && shape[i] > 1) {
+      TORCH_NEURONX_DEBUG("TryCreateEpilogue: broadcast view", "op=", op_name,
+                          "output_index=", output_index);
+      return std::nullopt;
+    }
+  }
+
+  int64_t storage_elements =
+      static_cast<int64_t>(output.storage().nbytes() / output.element_size());
+
+  // Tier 1: can the layout be decomposed into transpose ∘ slice of a contiguous
+  // base? If so, build the precise inverse transform chain.
+  if (auto layout =
+          AnalyzeEpilogueLayout(shape, strides, offset, storage_elements, op_name, output_index)) {
+    return TryCreateDecomposedEpilogue(output, *layout, shape, strides, offset, ndims,
+                                       storage_elements, op_name, output_index);
+  }
+
+  // Tier 2: the analytical decomposition failed. Fall back to a generic
+  // raw-stride scatter for diagonal / select / non-multiple-stride-gap patterns.
+  // Returns nullopt if any safety guard fails (overlap / OOB / 4GB / scatter
+  // disabled), in which case TryCreateEpilogue returns nullopt and the caller's
+  // CPU-bounce fallback (CopyBackToOriginal) takes over.
+  return TryCreateGenericScatterEpilogue(output, shape, strides, offset, ndims, storage_elements,
+                                         op_name, output_index);
 }
 
 }  // namespace Creators

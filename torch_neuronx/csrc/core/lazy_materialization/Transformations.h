@@ -154,14 +154,21 @@ std::optional<TransformationCreationResult> TryCreateFoldedDecomposition(const a
 /**
  * @brief Try to create EPILOGUE (inverse) transformations for a non-contiguous output
  *
- * Analyzes the output tensor's stride pattern via AnalyzeEpilogueLayout() and
- * BuildEpiloguePermutation(), then builds the INVERSE transformation chain needed
- * to write a contiguous operation result back into the non-contiguous output storage.
+ * Orchestrates a 2-tier strategy (implementation in Transformations.cpp):
  *
- * Supported patterns:
- * - EPILOGUE_TRANSPOSE: pure transpose (INVERSE TRANSPOSE only)
- * - EPILOGUE_SLICE: slice without transpose (SCATTER_IOTA)
- * - EPILOGUE_COMPOUND: transpose + slice (INVERSE TRANSPOSE → SCATTER_IOTA)
+ *   Tier 1  AnalyzeEpilogueLayout → TryCreateDecomposedEpilogue
+ *           The view DECOMPOSES into transpose ∘ slice of a contiguous base.
+ *           Emits a clean INVERSE TRANSPOSE (+ SCATTER_IOTA for the slice part):
+ *             - EPILOGUE_TRANSPOSE: pure transpose (INVERSE TRANSPOSE only)
+ *             - EPILOGUE_SLICE:     slice without transpose (SCATTER_IOTA)
+ *             - EPILOGUE_COMPOUND:  transpose + slice (INVERSE TRANSPOSE → SCATTER_IOTA)
+ *
+ *   Tier 2  TryCreateGenericScatterEpilogue
+ *           The view does NOT decompose (diagonal / select / non-multiple gap).
+ *           Falls back to a single RAW-STRIDE scatter (EPILOGUE_GENERIC_SCATTER).
+ *
+ *   none    Both tiers return nullopt → caller bounces through a contiguous temp
+ *           (CopyBackToOriginal), which is always correct.
  *
  * @param output Output tensor to analyze (non-contiguous)
  * @param op_name Name of the operation for logging

@@ -168,13 +168,22 @@ struct EpilogueResult {
   std::vector<bool> output_was_transformed;
   std::vector<TransformationTask> tasks;
 
-  // True if any output chain contains SCATTER_IOTA.
-  // When true, the epilogue MLIR has an extra input (flat storage)
-  // that must be wired to the kernel's output buffer in ProcessEpilogueWithMlirMerge.
-  bool has_scatter_iota = false;
+  // Output indices whose epilogue chain contains a SCATTER_IOTA transform.
+  // Each such output adds ONE extra input to the epilogue MLIR (the flat base
+  // storage) that must be wired to the kernel's output buffer in
+  // ProcessEpilogueWithMlirMerge. The order of this vector matches the order in
+  // which the extra base inputs were appended to the merged program, so the
+  // caller can wire one extra src per entry in the same order.
+  std::vector<size_t> scatter_iota_output_indices;
 
-  // Convenience: true if any epilogue transform has an extra base input
-  bool has_extra_base_input() const { return has_scatter_iota; }
+  // True if any output chain contains SCATTER_IOTA.
+  bool has_scatter_iota() const { return !scatter_iota_output_indices.empty(); }
+
+  // Number of extra base inputs the epilogue MLIR expects (one per scatter output).
+  size_t num_extra_base_inputs() const { return scatter_iota_output_indices.size(); }
+
+  // Convenience: true if any epilogue transform has an extra base input.
+  bool has_extra_base_input() const { return has_scatter_iota(); }
 };
 
 // ============================================================================
