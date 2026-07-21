@@ -81,7 +81,6 @@ class TestCompileFxToStablehlo:
                 example_inputs,
                 None,
                 job=job,
-                shard_input_info=None,
             )
 
             # Verify stablehlo file was saved to debug directory
@@ -567,11 +566,7 @@ class TestNeuronBackendFxCompiler:
         mock_post_aot = MagicMock()
         mock_post_aot.graph_module = mock_gm
         mock_post_aot.analysis = {
-            "mutation_info": None,
-            "none_output_info": None,
-            "shard_input_info": None,
-            "removed_device_mesh_indices": None,
-            "passthrough_info": None,
+            "pass_mutations": [],
         }
 
         with (
@@ -616,18 +611,20 @@ class TestNeuronBackendFxCompiler:
             compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
 
             result = compiled_fn(*example_inputs)
-            assert torch.equal(result, fallback_output)
+            assert isinstance(result, tuple)
+            assert len(result) == 1
+            assert torch.equal(result[0], fallback_output)
             mock_gm.forward.assert_called_once()
 
     def test_execution_fallback_with_analysis_params(self):
         """
-        Test execution-time fallback correctly applies shard_input_info,
-        removed_device_mesh_indices, and none_output_info.
+        Test execution-time fallback correctly applies input_mutations and output_mutations.
         """
-        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
-            NoneOutputInfo,
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
         )
-        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
 
         mock_gm = MagicMock()
         mock_gm.graph.nodes = [MagicMock()]
@@ -636,19 +633,49 @@ class TestNeuronBackendFxCompiler:
         mock_gm.forward.return_value = (out_tensor,)
         example_inputs = [torch.randn(2, 3)]
 
-        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=9)
-        none_info = NoneOutputInfo(
-            non_none_positions=[0], original_output_count=2, new_output_count=1
-        )
+        # Original had 3 inputs, DeviceMesh removes index 1 -> 2 left,
+        # then ShardIndexInjection adds at index 2
+        pass_mutations = [
+            PassMutations(
+                pass_name="ReplaceDeviceMeshPlaceholders",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[1],
+                        pass_name="ReplaceDeviceMeshPlaceholders",
+                    )
+                ],
+            ),
+            PassMutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[2],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": 9},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            ),
+            # Original had 2 outputs, position 1 was None
+            PassMutations(
+                pass_name="RemoveNoneOutputs",
+                output_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[1],
+                        transform_key="none",
+                        pass_name="RemoveNoneOutputs",
+                    )
+                ],
+            ),
+        ]
 
         mock_post_aot = MagicMock()
         mock_post_aot.graph_module = mock_gm
         mock_post_aot.analysis = {
-            "mutation_info": None,
-            "none_output_info": none_info,
-            "shard_input_info": shard_info,
-            "removed_device_mesh_indices": [1],
-            "passthrough_info": None,
+            "pass_mutations": pass_mutations,
         }
 
         with (
@@ -692,7 +719,7 @@ class TestNeuronBackendFxCompiler:
 
             compiled_fn = backend.neuron_backend_fx_compiler(mock_gm, example_inputs)
 
-            # Inputs: index 1 removed (device mesh), indices 0,2 kept, shard appended
+            # Inputs: index 1 removed (device mesh), indices 0,2 kept, shard appended at index 2
             t0 = torch.randn(2)
             t1_mesh = torch.randn(1)
             t2 = torch.randn(3)
@@ -705,7 +732,7 @@ class TestNeuronBackendFxCompiler:
             assert torch.equal(args[1], t2)
             assert args[2].item() == 9
 
-            # Output: [out_tensor, None]
+            # Output: [out_tensor, None] (None re-inserted at position 1)
             assert len(result) == 2
             assert torch.equal(result[0], out_tensor)
             assert result[1] is None
@@ -722,11 +749,7 @@ class TestNeuronBackendFxCompiler:
         mock_post_aot = MagicMock()
         mock_post_aot.graph_module = mock_gm
         mock_post_aot.analysis = {
-            "mutation_info": None,
-            "none_output_info": None,
-            "shard_input_info": None,
-            "removed_device_mesh_indices": None,
-            "passthrough_info": None,
+            "pass_mutations": [],
         }
 
         with (
@@ -752,18 +775,20 @@ class TestNeuronBackendFxCompiler:
             assert callable(compiled_fn)
             assert compiled_fn._boxed_call is True
             result = compiled_fn(example_inputs)
-            assert torch.equal(result, fallback_output)
+            assert isinstance(result, tuple)
+            assert len(result) == 1
+            assert torch.equal(result[0], fallback_output)
             mock_gm.forward.assert_called_once()
 
     def test_stablehlo_compile_failure_falls_back_with_analysis_params(self):
         """
-        Test StableHLO fallback correctly applies shard_input_info,
-        removed_device_mesh_indices, and none_output_info.
+        Test StableHLO fallback correctly applies input_mutations and output_mutations.
         """
-        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
-            NoneOutputInfo,
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
         )
-        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
 
         mock_gm = MagicMock()
         mock_gm.graph.nodes = [MagicMock()]
@@ -772,19 +797,49 @@ class TestNeuronBackendFxCompiler:
         mock_gm.forward.return_value = (out_tensor,)
         example_inputs = [torch.randn(2, 3)]
 
-        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=4)
-        none_info = NoneOutputInfo(
-            non_none_positions=[1], original_output_count=3, new_output_count=1
-        )
+        # Original had 3 inputs, DeviceMesh removes index 0 -> 2 left,
+        # then ShardIndexInjection adds at index 2
+        pass_mutations = [
+            PassMutations(
+                pass_name="ReplaceDeviceMeshPlaceholders",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[0],
+                        pass_name="ReplaceDeviceMeshPlaceholders",
+                    )
+                ],
+            ),
+            PassMutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[2],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": 4},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            ),
+            # Original had 3 outputs, positions 0 and 2 were None
+            PassMutations(
+                pass_name="RemoveNoneOutputs",
+                output_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[0, 2],
+                        transform_key="none",
+                        pass_name="RemoveNoneOutputs",
+                    )
+                ],
+            ),
+        ]
 
         mock_post_aot = MagicMock()
         mock_post_aot.graph_module = mock_gm
         mock_post_aot.analysis = {
-            "mutation_info": None,
-            "none_output_info": none_info,
-            "shard_input_info": shard_info,
-            "removed_device_mesh_indices": [0],
-            "passthrough_info": None,
+            "pass_mutations": pass_mutations,
         }
 
         with (
@@ -836,11 +891,7 @@ class TestNeuronBackendFxCompiler:
         mock_post_aot = MagicMock()
         mock_post_aot.graph_module = mock_gm
         mock_post_aot.analysis = {
-            "mutation_info": None,
-            "none_output_info": None,
-            "shard_input_info": None,
-            "removed_device_mesh_indices": None,
-            "passthrough_info": None,
+            "pass_mutations": [],
         }
 
         with (
@@ -970,27 +1021,52 @@ class TestMakeFallbackFn:
 
     def test_basic_fallback(self):
         """Fallback with no special adjustments passes inputs through to gm.forward."""
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
+        )
+
         mock_gm = MagicMock()
         expected = (torch.randn(2, 3),)
         mock_gm.forward.return_value = expected
 
-        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None)
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=[])
 
         assert fn._boxed_call is True
         inputs = [torch.randn(2, 3)]
         result = fn(inputs)
-        assert result is expected
+        assert len(result) == 1
+        assert torch.equal(result[0], expected[0])
         mock_gm.forward.assert_called_once_with(inputs[0])
 
     def test_shard_input_appended(self):
-        """When shard_input_info indicates extra inputs, a shard index tensor is appended."""
-        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+        """When input_mutations includes a shard ADD, a shard index tensor is appended."""
+        # 2 original inputs, shard added at index 2
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
+        )
 
-        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=7)
+        pass_mutations = [
+            PassMutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[2],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": 7},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            ),
+        ]
         mock_gm = MagicMock()
         mock_gm.forward.return_value = (torch.randn(1),)
 
-        fn = backend._make_fallback_fn(mock_gm, shard_input_info=shard_info)
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=pass_mutations)
 
         inputs = [torch.randn(2), torch.randn(3)]
         fn(inputs)
@@ -999,17 +1075,16 @@ class TestMakeFallbackFn:
         assert len(args) == 3
         # Last arg should be the shard index tensor
         assert args[2].item() == 7
-        assert args[2].dtype == torch.int32
+        assert args[2].dtype == torch.int64
 
-    def test_shard_input_not_appended_when_counts_equal(self):
-        """No shard index appended when new_input_count == original_input_count."""
-        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
+    def test_shard_input_not_appended_when_no_mutations(self):
+        """No shard index appended when input_mutations is empty."""
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import IOMutation, MutationKind
 
-        shard_info = ShardInputInfo(original_input_count=2, new_input_count=2, shard_index=0)
         mock_gm = MagicMock()
         mock_gm.forward.return_value = (torch.randn(1),)
 
-        fn = backend._make_fallback_fn(mock_gm, shard_input_info=shard_info)
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=[])
 
         inputs = [torch.randn(2), torch.randn(3)]
         fn(inputs)
@@ -1019,12 +1094,28 @@ class TestMakeFallbackFn:
 
     def test_device_mesh_inputs_removed(self):
         """DeviceMesh placeholder inputs are filtered out before calling gm.forward."""
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
+        )
+
+        pass_mutations = [
+            PassMutations(
+                pass_name="ReplaceDeviceMeshPlaceholders",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[1, 3],
+                        pass_name="ReplaceDeviceMeshPlaceholders",
+                    )
+                ],
+            ),
+        ]
         mock_gm = MagicMock()
         mock_gm.forward.return_value = (torch.randn(1),)
 
-        fn = backend._make_fallback_fn(
-            mock_gm, shard_input_info=None, removed_device_mesh_indices=[1, 3]
-        )
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=pass_mutations)
 
         t0, t1, t2, t3, t4 = [torch.randn(i + 1) for i in range(5)]
         fn([t0, t1, t2, t3, t4])
@@ -1037,19 +1128,31 @@ class TestMakeFallbackFn:
 
     def test_none_outputs_reinserted(self):
         """None outputs are re-inserted at their original positions."""
-        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
-            NoneOutputInfo,
+        # Original had 4 outputs, positions 1 and 3 were None
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
         )
 
-        # Original had 4 outputs, positions 0 and 2 were non-None
-        none_info = NoneOutputInfo(
-            non_none_positions=[0, 2], original_output_count=4, new_output_count=2
-        )
+        pass_mutations = [
+            PassMutations(
+                pass_name="RemoveNoneOutputs",
+                output_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[1, 3],
+                        transform_key="none",
+                        pass_name="RemoveNoneOutputs",
+                    )
+                ],
+            ),
+        ]
         mock_gm = MagicMock()
         t0, t1 = torch.randn(1), torch.randn(2)
         mock_gm.forward.return_value = (t0, t1)
 
-        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None, none_output_info=none_info)
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=pass_mutations)
 
         result = fn([torch.randn(1)])
 
@@ -1059,38 +1162,71 @@ class TestMakeFallbackFn:
         assert torch.equal(result[2], t1)
         assert result[3] is None
 
-    def test_none_outputs_not_modified_when_no_info(self):
-        """Without none_output_info, gm.forward output is returned as-is."""
-        mock_gm = MagicMock()
-        expected = (torch.randn(1), torch.randn(2))
-        mock_gm.forward.return_value = expected
+    def test_none_outputs_not_modified_when_no_mutations(self):
+        """Without output_mutations, gm.forward output is returned as-is (as tuple)."""
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import IOMutation, MutationKind
 
-        fn = backend._make_fallback_fn(mock_gm, shard_input_info=None, none_output_info=None)
+        mock_gm = MagicMock()
+        t0, t1 = torch.randn(1), torch.randn(2)
+        mock_gm.forward.return_value = (t0, t1)
+
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=[])
 
         result = fn([torch.randn(1)])
-        assert result is expected
+        assert len(result) == 2
+        assert torch.equal(result[0], t0)
+        assert torch.equal(result[1], t1)
 
     def test_all_adjustments_combined(self):
         """All adjustments applied together: remove DeviceMesh, append shard, re-insert Nones."""
-        from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import (
-            NoneOutputInfo,
+        # 3 inputs: index 0 is DeviceMesh (removed) -> 2 left, then shard added at index 2
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
         )
-        from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
 
-        shard_info = ShardInputInfo(original_input_count=2, new_input_count=3, shard_index=5)
-        none_info = NoneOutputInfo(
-            non_none_positions=[1], original_output_count=3, new_output_count=1
-        )
+        pass_mutations = [
+            PassMutations(
+                pass_name="ReplaceDeviceMeshPlaceholders",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[0],
+                        pass_name="ReplaceDeviceMeshPlaceholders",
+                    )
+                ],
+            ),
+            PassMutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[2],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": 5},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            ),
+            # Original had 3 outputs, positions 0 and 2 were None
+            PassMutations(
+                pass_name="RemoveNoneOutputs",
+                output_mutations=[
+                    IOMutation(
+                        kind=MutationKind.REMOVE,
+                        indices=[0, 2],
+                        transform_key="none",
+                        pass_name="RemoveNoneOutputs",
+                    )
+                ],
+            ),
+        ]
         mock_gm = MagicMock()
         out_tensor = torch.randn(4)
         mock_gm.forward.return_value = (out_tensor,)
 
-        fn = backend._make_fallback_fn(
-            mock_gm,
-            shard_input_info=shard_info,
-            removed_device_mesh_indices=[0],
-            none_output_info=none_info,
-        )
+        fn = backend._make_fallback_fn(mock_gm, pass_mutations=pass_mutations)
 
         # 3 inputs: index 0 is DeviceMesh (removed), indices 1,2 kept, then shard appended
         t0_mesh = MagicMock()  # DeviceMesh placeholder

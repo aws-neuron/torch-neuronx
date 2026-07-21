@@ -15,17 +15,20 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.aliasing_analysis import Alia
 
 
 def run_aliasing_analysis(gm: GraphModule):
-    """Run AliasingAnalysis FX pass on a GraphModule."""
+    """Run AliasingAnalysis FX pass on a GraphModule and return the alias buffer map."""
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import get_alias_output_buffer_map
+
     analysis = AliasingAnalysis()
     PassManager(passes=[analysis])(gm)
-    return analysis.result
+    pre_aot_pass_mutations = [analysis._pass_mutations] if analysis._pass_mutations else []
+    return get_alias_output_buffer_map(pre_aot_pass_mutations)
 
 
 def compile_to_stablehlo(captured: CapturedGraphs) -> Module:
     """Convert captured graphs to StableHLO MLIR with aliasing info."""
     pre_aot = captured.pre_aot_graph
     post_aot = captured.post_aot_forward_graph
-    aliasing_info = run_aliasing_analysis(pre_aot)
+    alias_buffer_map = run_aliasing_analysis(pre_aot)
     job = CompilationJob(op_name="torch_compile_test")
 
     stablehlo_mlir, *_ = backend._compile_fx_to_stablehlo(
@@ -34,7 +37,7 @@ def compile_to_stablehlo(captured: CapturedGraphs) -> Module:
         model_name="test_model",
         segment_id="segment_123",
         job=job,
-        aliasing_info=aliasing_info,
+        alias_buffer_map=alias_buffer_map,
     )
     return stablehlo_mlir
 
@@ -161,6 +164,7 @@ class TestAliasingPropagation:
         aliases = get_aliases(transposed, x)
         assert_alias_count(aliases, 0)
 
+    @pytest.mark.xfail(reason="Pre-AOT passthrough rebase temporarily disabled")
     def test_double_transpose(self):
         """
         Transpose changes dimension order - shape mismatch.

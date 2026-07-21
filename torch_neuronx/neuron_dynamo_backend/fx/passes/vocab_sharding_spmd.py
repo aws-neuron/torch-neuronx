@@ -6,8 +6,8 @@ across all TP ranks:
 
 1. ShardIndexInjection: Appends a vocab_shard_index i64[] placeholder to every
    graph. The shard index is inferred from vocab sharding pattern constants
-   (lower_bound // shard_size). The Executor reads it from ShardInputInfo
-   and injects torch.tensor(shard_index) at runtime.
+   (lower_bound // shard_size). The Executor injects torch.tensor(shard_index)
+   at runtime via the IOMutation interface.
 
 2. VocabShardingSPMD: Rewrites per-shard vocab sharding constants to
    expressions of vocab_shard_index:
@@ -28,11 +28,11 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Graph, Node
 from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import IOMutation, MutationKind
 from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
     NeuronFXPass,
     NeuronFXPassState,
 )
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import ShardInputInfo
 
 logger = logging.getLogger(__name__)
 
@@ -333,38 +333,30 @@ class ShardIndexInjection(NeuronFXPass):
 
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__(state)
-        self.result: ShardInputInfo | None = None
-
-    def _no_op(self, graph_module: fx.GraphModule, count: int) -> PassResult:
-        self.result = ShardInputInfo(
-            original_input_count=count, new_input_count=count, shard_index=0
-        )
-        return PassResult(graph_module, False)
 
     def call(self, graph_module: fx.GraphModule) -> PassResult:
         graph = graph_module.graph
 
         # Escape hatch
         if os.environ.get("TORCH_NEURONX_VOCAB_SHARDING_SPMD_DISABLE") == "1":
-            placeholders = [n for n in graph.nodes if n.op == "placeholder"]
-            return self._no_op(graph_module, len(placeholders))
+            return PassResult(graph_module, False)
 
         placeholders = [n for n in graph.nodes if n.op == "placeholder"]
 
         # Guard: no placeholders
         if not placeholders:
-            return self._no_op(graph_module, 0)
+            return PassResult(graph_module, False)
 
         # Guard: already injected (idempotent)
         if any(n.name == "vocab_shard_index" for n in placeholders):
-            return self._no_op(graph_module, len(placeholders))
+            return PassResult(graph_module, False)
 
         original_input_count = len(placeholders)
 
         # Guard: conflicting shard indices
         shard_index = _infer_shard_index(graph)
         if shard_index is None:
-            return self._no_op(graph_module, original_input_count)
+            return PassResult(graph_module, False)
 
         last_placeholder = placeholders[-1]
         with graph.inserting_after(last_placeholder):
@@ -375,12 +367,21 @@ class ShardIndexInjection(NeuronFXPass):
         graph.lint()
         graph_module.recompile()
 
-        self.result = ShardInputInfo(
-            original_input_count=original_input_count,
-            new_input_count=original_input_count + 1,
-            shard_index=shard_index,
-        )
-        logger.debug(f"ShardIndexInjection: shard_index={shard_index} ({self.result})")
+        if self.state is not None:
+            self.state.add_pass_mutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[original_input_count],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": shard_index},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            )
+
+        logger.debug(f"ShardIndexInjection: shard_index={shard_index}")
         return PassResult(graph_module, True)
 
 

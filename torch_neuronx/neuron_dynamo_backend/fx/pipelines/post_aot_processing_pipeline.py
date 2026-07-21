@@ -12,6 +12,7 @@ import torch
 from torch.fx.passes.infra.pass_manager import PassManager
 
 from torch_neuronx.kernels.cache_utils import CompilationJob
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import PassMutations
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     CollectiveLegalization,
 )
@@ -52,7 +53,10 @@ class PostAOTProcessingResults(NamedTuple):
 
 
 def post_aot_processing(
-    gm: torch.fx.GraphModule, job: CompilationJob, model_name: str
+    gm: torch.fx.GraphModule,
+    job: CompilationJob,
+    model_name: str,
+    pre_aot_pass_mutations: PassMutations | None = None,
 ) -> PostAOTProcessingResults:
     """
     Apply FX graph analysis and transformations after AOTAutograd.
@@ -65,7 +69,12 @@ def post_aot_processing(
     Returns:
         PostAOTProcessingResults containing the graph and analysis results
     """
-    config = NeuronFXPassState(job=job, model_name=model_name, dumping_enabled=job.preserve)
+    config = NeuronFXPassState(
+        job=job,
+        model_name=model_name,
+        dumping_enabled=job.preserve,
+        pre_aot_pass_mutations=pre_aot_pass_mutations,
+    )
 
     flex_lowering_pass = FlexAttentionNKILowering(config)
     flex_attention_pass = FlexAttentionLegalization(config)
@@ -101,11 +110,7 @@ def post_aot_processing(
     pass_result = pm(gm)
 
     analysis_results = {
-        "mutation_info": functionalize_pass.get_mutation_info(),
-        "passthrough_info": functionalize_pass.get_passthrough_info(),
-        "none_output_info": remove_none_outputs.result,
-        "shard_input_info": shard_injection.result,
-        "removed_device_mesh_indices": replace_device_mesh.removed_indices,
+        "pass_mutations": config.pass_mutations,
     }
 
     return PostAOTProcessingResults(pass_result.graph_module, analysis_results)

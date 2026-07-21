@@ -11,11 +11,13 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.executor import Executor
-from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+)
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
-    ShardInputInfo,
     TensorSpec,
 )
 
@@ -62,7 +64,7 @@ class TestExecutor:
         executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
 
         # Call with wrong number of inputs
-        with pytest.raises(NEFFExecutionError, match="Expected 1 inputs, got 2"):
+        with pytest.raises(NEFFExecutionError, match="Expected 1 inputs after mutations, got 2"):
             executor(torch.randn(2, 3), torch.randn(2, 3))
 
     @patch("torch_neuronx._C.execute_compiled_graph")
@@ -107,7 +109,7 @@ class TestExecutor:
         executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
 
         # Call with inputs when none expected
-        with pytest.raises(NEFFExecutionError, match="Expected 0 inputs, got 1"):
+        with pytest.raises(NEFFExecutionError, match="Expected 0 inputs after mutations, got 1"):
             executor(torch.randn(2, 3))
 
     def test_executor_call_multiple_inputs_wrong_count(self):
@@ -121,7 +123,7 @@ class TestExecutor:
         executor = Executor("test_graph", "test_cache_key", io_specs, cast_spec)
 
         # Call with wrong number of inputs
-        with pytest.raises(NEFFExecutionError, match="Expected 2 inputs, got 1"):
+        with pytest.raises(NEFFExecutionError, match="Expected 2 inputs after mutations, got 1"):
             executor(torch.randn(2, 3))
 
     @patch("torch_neuronx._C.execute_compiled_graph")
@@ -523,25 +525,39 @@ class TestExecutor:
         """Test that None outputs are correctly restored in their original positions."""
         mock_current_device.return_value = 0
         mock_execute.return_value = None
-        none_output_info = NoneOutputInfo(
-            non_none_positions=non_none_positions,
-            original_output_count=original_output_count,
-            new_output_count=len(non_none_positions),
+
+        # Compute none_positions from non_none_positions
+        none_positions = [i for i in range(original_output_count) if i not in non_none_positions]
+        new_output_count = len(non_none_positions)
+
+        output_mutations = (
+            [
+                IOMutation(
+                    kind=MutationKind.REMOVE,
+                    indices=none_positions,
+                    transform_key="none",
+                    pass_name="RemoveNoneOutputs",
+                )
+            ]
+            if none_positions
+            else []
         )
 
         input_spec = TensorSpec(dtype=torch.float32, shape=(2, 3))
         output_specs = tuple(
-            TensorSpec(dtype=torch.float32, shape=(2, 3))
-            for _ in range(none_output_info.new_output_count)
+            TensorSpec(dtype=torch.float32, shape=(2, 3)) for _ in range(new_output_count)
         )
         io_specs = FunctionIO(inputs=(input_spec,), outputs=output_specs)
-        cast_spec = [
-            TensorSpec(dtype=torch.float32, shape=(2, 3))
-            for _ in range(none_output_info.new_output_count)
-        ]
+        cast_spec = [TensorSpec(dtype=torch.float32, shape=(2, 3)) for _ in range(new_output_count)]
 
         executor = Executor(
-            "test_graph", "test_cache_key", io_specs, cast_spec, none_output_info=none_output_info
+            "test_graph",
+            "test_cache_key",
+            io_specs,
+            cast_spec,
+            pass_mutations=[
+                PassMutations(pass_name="RemoveNoneOutputs", output_mutations=output_mutations)
+            ],
         )
 
         input_tensor = MagicMock(spec=torch.Tensor)
@@ -557,10 +573,10 @@ class TestExecutor:
             mock_output.dtype = torch.float32
         result = executor(input_tensor)
         assert (
-            len(result) == none_output_info.original_output_count
-        ), f"Output count does not match: {none_output_info.original_output_count=} {len(result)=}"
+            len(result) == original_output_count
+        ), f"Output count does not match: {original_output_count=} {len(result)=}"
         for i in range(len(result)):
-            if i in none_output_info.non_none_positions:
+            if i in non_none_positions:
                 assert result[i] is not None
             else:
                 assert result[i] is None
@@ -882,12 +898,21 @@ class TestExecutor:
         mock_current_device.return_value = 0
 
         io_specs, cast_spec = _make_io_specs(num_inputs=2, num_outputs=1)
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[1], pass_name="ReplaceDeviceMeshPlaceholders"
+            )
+        ]
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            removed_device_mesh_indices=[1],
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders", input_mutations=input_mutations
+                )
+            ],
         )
 
         with _mock_empty_output():
@@ -899,15 +924,24 @@ class TestExecutor:
     def test_device_mesh_input_count_validation(self):
         """Test that input count validation accounts for DeviceMesh inputs."""
         io_specs, cast_spec = _make_io_specs(num_inputs=2, num_outputs=1)
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[1], pass_name="ReplaceDeviceMeshPlaceholders"
+            )
+        ]
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            removed_device_mesh_indices=[1],
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders", input_mutations=input_mutations
+                )
+            ],
         )
 
-        with pytest.raises(NEFFExecutionError, match="Expected 3 inputs, got 4"):
+        with pytest.raises(NEFFExecutionError, match="Expected 2 inputs after mutations"):
             executor(torch.randn(2, 3), torch.randn(2, 3), torch.randn(2, 3), torch.randn(2, 3))
 
     @patch("torch_neuronx._C.execute_compiled_graph")
@@ -919,11 +953,6 @@ class TestExecutor:
         """
         mock_current_device.return_value = 0
 
-        shard_input_info = ShardInputInfo(
-            original_input_count=1,
-            new_input_count=2,
-            shard_index=3,
-        )
         io_specs, cast_spec = _make_io_specs(
             num_inputs=2,
             num_outputs=1,
@@ -931,14 +960,32 @@ class TestExecutor:
                 TensorSpec(dtype="float32", shape=[2, 3]),
                 TensorSpec(dtype="int64", shape=[]),
             ],
-            shard_input_info=shard_input_info,
         )
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[1], pass_name="ReplaceDeviceMeshPlaceholders"
+            ),
+            IOMutation(
+                kind=MutationKind.ADD,
+                indices=[1],
+                transform_key="shard_index",
+                transform_params={"shard_index": 3},
+                pass_name="ShardIndexInjection",
+            ),
+        ]
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            removed_device_mesh_indices=[1],
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders", input_mutations=[input_mutations[0]]
+                ),
+                PassMutations(
+                    pass_name="ShardIndexInjection", input_mutations=[input_mutations[1]]
+                ),
+            ],
         )
 
         with _mock_empty_output(), patch("torch.tensor") as mock_tensor:
@@ -954,22 +1001,29 @@ class TestExecutor:
     def test_device_mesh_with_mutation_info(self, mock_current_device, mock_execute):
         """Test aliased output references the tensor input buffer, not the DeviceMesh.
 
-        _allocate_output runs before DeviceMesh removal, so alias indices must
-        point to the correct tensor in the pre-removal input list.
+        _allocate_output runs after input mutations, so alias indices must
+        point to the correct tensor in the post-mutation input list.
         """
         mock_current_device.return_value = 0
 
-        mutation_info = AliasingInfo()
-        mutation_info.add(parameter_number=0, parameter_index=[], output_index=0)
-
         io_specs, cast_spec = _make_io_specs(num_inputs=1, num_outputs=1)
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[1], pass_name="ReplaceDeviceMeshPlaceholders"
+            )
+        ]
+        # output[0] aliases neff_input[0] (after DeviceMesh removal shifts input indices)
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            removed_device_mesh_indices=[1],
-            mutation_info=mutation_info,
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders", input_mutations=input_mutations
+                )
+            ],
+            alias_buffer_map={0: 0},
         )
 
         cpu_tensor = _make_cpu_tensor()
@@ -981,6 +1035,102 @@ class TestExecutor:
             args, _ = mock_execute.call_args
             assert len(args[2]) == 1  # neuron_inputs: DeviceMesh removed
             assert args[3][0] is mock_neuron  # aliased output reuses tensor buffer
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_device_mesh_passthrough_output_restored(self, mock_current_device, mock_execute):
+        """DeviceMesh removed from outputs by the pass is re-inserted from original inputs.
+
+        Graph (after pass): forward(tensor) -> (result,)
+        Original signature:  forward(tensor, mesh) -> (result, mesh)
+        input_mutations:  REMOVE [1]   (strip mesh before NEFF)
+        output_mutations: ADD [1] input_passthrough {index_to_input: {1: 1}}  (restore mesh)
+        """
+        mock_current_device.return_value = 0
+
+        io_specs, cast_spec = _make_io_specs(num_inputs=1, num_outputs=1)
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[1], pass_name="ReplaceDeviceMeshPlaceholders"
+            )
+        ]
+        output_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE,
+                indices=[1],
+                transform_key="input_passthrough",
+                transform_params={"index_to_input": {1: 1}},
+                pass_name="ReplaceDeviceMeshPlaceholders",
+            )
+        ]
+        executor = Executor(
+            "test_graph",
+            "test_cache_key",
+            io_specs,
+            cast_spec,
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders",
+                    input_mutations=input_mutations,
+                    output_mutations=output_mutations,
+                )
+            ],
+        )
+
+        tensor_input = _make_cpu_tensor(name="tensor")
+        mesh = _make_device_mesh_mock()
+
+        with _mock_empty_output():
+            result = executor(tensor_input, mesh)
+
+        assert len(result) == 2
+        assert result[1] is mesh
+
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_device_mesh_passthrough_output_at_position_zero(
+        self, mock_current_device, mock_execute
+    ):
+        """DeviceMesh passthrough output restored at position 0."""
+        mock_current_device.return_value = 0
+
+        io_specs, cast_spec = _make_io_specs(num_inputs=1, num_outputs=1)
+        input_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE, indices=[0], pass_name="ReplaceDeviceMeshPlaceholders"
+            )
+        ]
+        output_mutations = [
+            IOMutation(
+                kind=MutationKind.REMOVE,
+                indices=[0],
+                transform_key="input_passthrough",
+                transform_params={"index_to_input": {0: 0}},
+                pass_name="ReplaceDeviceMeshPlaceholders",
+            )
+        ]
+        executor = Executor(
+            "test_graph",
+            "test_cache_key",
+            io_specs,
+            cast_spec,
+            pass_mutations=[
+                PassMutations(
+                    pass_name="ReplaceDeviceMeshPlaceholders",
+                    input_mutations=input_mutations,
+                    output_mutations=output_mutations,
+                )
+            ],
+        )
+
+        mesh = _make_device_mesh_mock()
+        tensor_input = _make_cpu_tensor(name="tensor")
+
+        with _mock_empty_output():
+            result = executor(mesh, tensor_input)
+
+        assert len(result) == 2
+        assert result[0] is mesh
 
     @patch("torch_neuronx._C.execute_compiled_graph")
     @patch("torch.neuron.current_device")
@@ -996,17 +1146,13 @@ class TestExecutor:
         """
         mock_current_device.return_value = 0
 
-        passthrough_info = AliasingInfo()
-        passthrough_info.add(parameter_number=0, parameter_index=[], output_index=1)
-        passthrough_info.add(parameter_number=1, parameter_index=[], output_index=2)
-
         io_specs, cast_spec = _make_io_specs(num_inputs=2, num_outputs=3)
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            passthrough_info=passthrough_info,
+            alias_buffer_map={1: 0, 2: 1},
         )
 
         input_0 = _make_cpu_tensor(name="primals_1")
@@ -1020,11 +1166,11 @@ class TestExecutor:
             args, _ = mock_execute.call_args
             neuron_outputs = args[3]
 
-            # output[0] = computed → torch.empty (new allocation)
+            # output[0] = computed -> torch.empty (new allocation)
             assert neuron_outputs[0] is mock_output
-            # output[1] = pass-through of input[0] → reuses input buffer
+            # output[1] = pass-through of input[0] -> reuses input buffer
             assert neuron_outputs[1] is neuron_0
-            # output[2] = pass-through of input[1] → reuses input buffer
+            # output[2] = pass-through of input[1] -> reuses input buffer
             assert neuron_outputs[2] is neuron_1
 
     @patch("torch_neuronx._C.execute_compiled_graph")
@@ -1041,17 +1187,13 @@ class TestExecutor:
         """
         mock_current_device.return_value = 0
 
-        passthrough_info = AliasingInfo()
-        passthrough_info.add(parameter_number=0, parameter_index=[], output_index=1)
-        passthrough_info.add(parameter_number=1, parameter_index=[], output_index=2)
-
         io_specs, cast_spec = _make_io_specs(num_inputs=2, num_outputs=3)
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            passthrough_info=passthrough_info,
+            alias_buffer_map={1: 0, 2: 1},
         )
 
         input_0 = _make_cpu_tensor(name="primals_1")
@@ -1077,20 +1219,13 @@ class TestExecutor:
         """
         mock_current_device.return_value = 0
 
-        mutation_info = AliasingInfo()
-        mutation_info.add(parameter_number=0, parameter_index=[], output_index=0)
-
-        passthrough_info = AliasingInfo()
-        passthrough_info.add(parameter_number=2, parameter_index=[], output_index=2)
-
         io_specs, cast_spec = _make_io_specs(num_inputs=3, num_outputs=3)
         executor = Executor(
             "test_graph",
             "test_cache_key",
             io_specs,
             cast_spec,
-            mutation_info=mutation_info,
-            passthrough_info=passthrough_info,
+            alias_buffer_map={0: 0, 2: 2},
         )
 
         input_0 = _make_cpu_tensor(name="arg0")
@@ -1105,11 +1240,11 @@ class TestExecutor:
             args, _ = mock_execute.call_args
             neuron_outputs = args[3]
 
-            # output[0] = mutation → reuses input[0] buffer
+            # output[0] = mutation -> reuses input[0] buffer
             assert neuron_outputs[0] is neuron_0
-            # output[1] = computed → torch.empty
+            # output[1] = computed -> torch.empty
             assert neuron_outputs[1] is mock_output
-            # output[2] = pass-through → reuses input[2] buffer
+            # output[2] = pass-through -> reuses input[2] buffer
             assert neuron_outputs[2] is neuron_2
 
     @patch("torch_neuronx._C._nrt_copy_strided_neuron_to_neuron")
@@ -1221,7 +1356,6 @@ def _make_io_specs(
     num_outputs,
     *,
     input_specs_override=None,
-    shard_input_info=None,
 ):
     """Create FunctionIO and cast_spec with float32 [2,3] tensors."""
     input_specs = input_specs_override or [
@@ -1231,7 +1365,6 @@ def _make_io_specs(
     io_specs = FunctionIO(
         inputs=tuple(input_specs),
         outputs=tuple(output_specs),
-        shard_input_info=shard_input_info,
     )
     cast_spec = [TensorSpec(dtype="float32", shape=[2, 3]) for _ in range(num_outputs)]
     return io_specs, cast_spec
@@ -1259,3 +1392,305 @@ def _mock_empty_output():
         mock_output.dtype = torch.float32
         mock_empty.return_value = mock_output
         yield mock_output
+
+
+# ---------------------------------------------------------------------------
+# Helpers for alias integration tests
+# ---------------------------------------------------------------------------
+
+
+def _pm(name, in_muts=None, out_muts=None):
+    return PassMutations(
+        pass_name=name, input_mutations=in_muts or [], output_mutations=out_muts or []
+    )
+
+
+def _inp_remove(indices, name="P"):
+    return IOMutation(kind=MutationKind.REMOVE, indices=indices, pass_name=name)
+
+
+def _inp_add(indices, key="shard_index", params=None, name="P"):
+    return IOMutation(
+        kind=MutationKind.ADD,
+        indices=indices,
+        transform_key=key,
+        transform_params=params or {},
+        pass_name=name,
+    )
+
+
+def _out_add(indices, name="P"):
+    return IOMutation(kind=MutationKind.ADD, indices=indices, pass_name=name)
+
+
+def _out_remove(indices, key="none", params=None, name="P"):
+    return IOMutation(
+        kind=MutationKind.REMOVE,
+        indices=indices,
+        transform_key=key,
+        transform_params=params or {},
+        pass_name=name,
+    )
+
+
+def _alias(out_indices, in_indices, is_mutation=False, name="P"):
+    return IOMutation(
+        kind=MutationKind.ALIAS,
+        indices=out_indices,
+        alias_input_indices=in_indices,
+        is_mutation=is_mutation,
+        pass_name=name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parametrized integration tests: aliasing in conjunction with other passes
+#
+# Each scenario builds pass_mutations from custom PassMutations objects and
+# verifies the full Executor behaviour:
+#   - correct NEFF inputs after apply_input_mutations
+#   - correct buffer reuse (_allocate_output via alias_buffer_map)
+#   - correct caller outputs after apply_output_mutations
+# ---------------------------------------------------------------------------
+
+_ALIAS_INTEGRATION_CASES = [
+    pytest.param(
+        {
+            "desc": "passthrough alias only, no other passes",
+            # Original: 2 inputs, 2 NEFF outputs; output[1] passthroughs input[1]
+            "num_neff_inputs": 2,
+            "num_neff_outputs": 2,
+            "pass_mutations": [
+                _pm("Alias", out_muts=[_alias([1], [1], is_mutation=False)]),
+            ],
+            "alias_buffer_map": {1: 1},
+            "caller_input_names": ["inp0", "inp1"],
+            # output[0] = new alloc; output[1] = reuse inp1 buffer
+            "expect_output1_reuses_input": 1,
+            # caller outputs: all NEFF outputs returned (passthrough NOT filtered)
+            "expect_caller_output_count": 2,
+        },
+        id="passthrough_only",
+    ),
+    pytest.param(
+        {
+            "desc": "mutation alias only (copy_), no other passes",
+            # FunctionalizeCopyInplace: output[0] is copy_ result (aliased to input[0]),
+            # will be filtered out by the ADD output mutation
+            "num_neff_inputs": 1,
+            "num_neff_outputs": 2,
+            "pass_mutations": [
+                _pm(
+                    "Functionalize",
+                    out_muts=[
+                        _alias([0], [0], is_mutation=True),  # mutation alias
+                        _out_add([0]),  # filter copy_ result at exec
+                    ],
+                ),
+            ],
+            "alias_buffer_map": {0: 0},
+            "caller_input_names": ["inp0"],
+            "expect_output0_reuses_input": 0,
+            "expect_caller_output_count": 1,
+        },
+        id="mutation_alias_only",
+    ),
+    pytest.param(
+        {
+            "desc": "input remove + passthrough alias (alias index shifts in NEFF)",
+            # Pass A removes input[1] (e.g. a dropped constant)
+            # Pass B: output[0] passthroughs input[1] in pass-local space
+            #   -> after Pass A's input remove, neff_in for input[1] -> 1
+            #     (still 1 since only [1] was removed but idx=1 is removed, this would be None)
+            # Use: Pass A removes input[0]; pass B aliases output[0] -> input[0] (pass-local)
+            #   -> neff_in: input[0] after REMOVE [0] = None -> not in buffer_map (warn)
+            # Better: Pass A removes input[2]; pass B aliases output[0] -> input[1]
+            #   -> neff_in: input[1] after REMOVE [2] = 1 (no shift, 2 > 1) -> stays 1
+            "num_neff_inputs": 2,  # original was 3 inputs, [2] removed
+            "num_neff_outputs": 2,
+            "pass_mutations": [
+                _pm("RemoveInput2", in_muts=[_inp_remove([2])]),
+                _pm("Alias", out_muts=[_alias([1], [1], is_mutation=False)]),
+            ],
+            "alias_buffer_map": {1: 1},  # input[1] unaffected by removal of input[2]
+            "caller_input_names": ["inp0", "inp1", "inp2_removed"],
+            "expect_output1_reuses_input": 1,
+            "expect_caller_output_count": 2,
+        },
+        id="input_remove_then_passthrough",
+    ),
+    pytest.param(
+        {
+            "desc": "shard injection + passthrough alias (alias input index shifts)",
+            # Pass A adds shard at input[2]
+            # Pass B: output[0] passthroughs input[1] (pass-local)
+            #   -> neff_in: input[1] after ADD [2] = 1 (2 > 1, no shift) -> stays 1
+            "num_neff_inputs": 3,  # original 2 + 1 injected shard
+            "num_neff_outputs": 1,
+            "pass_mutations": [
+                _pm("ShardInject", in_muts=[_inp_add([2], "shard_index", {"shard_index": 7})]),
+                _pm("Alias", out_muts=[_alias([0], [1], is_mutation=False)]),
+            ],
+            "alias_buffer_map": {0: 1},
+            "caller_input_names": ["inp0", "inp1"],
+            "expect_output0_reuses_input": 1,
+            "expect_caller_output_count": 1,
+        },
+        id="shard_then_passthrough",
+    ),
+    pytest.param(
+        {
+            "desc": "mutation alias + None output removal (output mutation shifts alias output)",
+            # Pass A: output[0] is copy_ result, aliased to input[0]; ADD output mutation
+            # Pass B: removes output that was a None, re-inserts at exec;
+            #      output position [2] removed
+            #   -> subsequent output REMOVE [2] on alias output[0]: 2 > 0, no shift
+            #   -> neff_out stays 0
+            "num_neff_inputs": 1,
+            "num_neff_outputs": 2,
+            "pass_mutations": [
+                _pm(
+                    "Functionalize",
+                    out_muts=[
+                        _alias([0], [0], is_mutation=True),
+                        _out_add([0]),
+                    ],
+                ),
+                _pm("RemoveNone", out_muts=[_out_remove([2], "none")]),
+            ],
+            "alias_buffer_map": {0: 0},
+            "caller_input_names": ["inp0"],
+            "expect_output0_reuses_input": 0,
+            # undo RemoveNone REMOVE[2]: re-insert None at [2] -> ["copy","real",None]
+            # undo Functionalize ADD[0]: filter [0] -> ["real",None]
+            "expect_caller_output_count": 2,
+            "expect_caller_output_has_none_at": 1,
+        },
+        id="mutation_then_none_removal",
+    ),
+    pytest.param(
+        {
+            "desc": "input remove + mutation alias + shard inject (index translation chain)",
+            # Pass A: removes input[1] → [inp0, inp2]
+            # Pass B: output[0] aliased to input[0], is_mutation=True; ADD output mutation
+            # Pass C: adds shard at input[1] (post-PassA space) → [inp0, inp2, shard]
+            # alias_buffer_map: neff_in for input[0]:
+            #   PassC ADD [1]: idx=0, 1>0 no shift -> stays 0
+            "num_neff_inputs": 3,  # original 3: [1] removed then shard added = 3
+            "num_neff_outputs": 2,
+            "pass_mutations": [
+                _pm("RemoveInput1", in_muts=[_inp_remove([1])]),
+                _pm(
+                    "Functionalize",
+                    out_muts=[
+                        _alias([0], [0], is_mutation=True),
+                        _out_add([0]),
+                    ],
+                ),
+                _pm("ShardInject", in_muts=[_inp_add([1], "shard_index", {"shard_index": 3})]),
+            ],
+            "alias_buffer_map": {0: 0},
+            "caller_input_names": ["inp0", "inp1_removed", "inp2"],
+            "expect_output0_reuses_input": 0,
+            "expect_caller_output_count": 1,
+        },
+        id="remove_mutation_shard_chain",
+    ),
+    pytest.param(
+        {
+            "desc": "passthrough + mutation alias coexist in same executor",
+            # Output[0]: mutation alias (copy_), filtered; Output[1]: passthrough alias
+            "num_neff_inputs": 2,
+            "num_neff_outputs": 3,
+            "pass_mutations": [
+                _pm(
+                    "Passes",
+                    out_muts=[
+                        _alias([0], [0], is_mutation=True),
+                        _alias([2], [1], is_mutation=False),
+                        _out_add([0]),  # filter copy_ result
+                    ],
+                ),
+            ],
+            "alias_buffer_map": {0: 0, 2: 1},
+            "caller_input_names": ["inp0", "inp1"],
+            "expect_output0_reuses_input": 0,
+            "expect_output2_reuses_input": 1,
+            "expect_caller_output_count": 2,
+        },
+        id="passthrough_and_mutation_coexist",
+    ),
+]
+
+
+class TestAliasIntegrationWithOtherPasses:
+    """Verify that aliasing (mutation + passthrough) works correctly in
+    conjunction with input REMOVE/ADD and output ADD/REMOVE passes."""
+
+    @pytest.mark.parametrize("case", _ALIAS_INTEGRATION_CASES)
+    @patch("torch_neuronx._C.execute_compiled_graph")
+    @patch("torch.neuron.current_device")
+    def test_alias_integration(self, mock_current_device, mock_execute, case):
+        mock_current_device.return_value = 0
+
+        num_neff_in = case["num_neff_inputs"]
+        num_neff_out = case["num_neff_outputs"]
+        io_specs, cast_spec = _make_io_specs(num_neff_in, num_neff_out)
+
+        pass_mutations = case["pass_mutations"]
+        alias_buffer_map = case.get("alias_buffer_map")
+
+        executor = Executor(
+            "test_graph",
+            "test_cache_key",
+            io_specs,
+            cast_spec,
+            pass_mutations=pass_mutations,
+            alias_buffer_map=alias_buffer_map,
+        )
+
+        caller_inputs = [_make_cpu_tensor(name=n) for n in case["caller_input_names"]]
+        neuron_inputs = [t.to.return_value for t in caller_inputs]
+
+        with _mock_empty_output():
+            result = executor(*caller_inputs)
+
+            args, _ = mock_execute.call_args
+            actual_neff_inputs = args[2]
+            actual_neff_outputs = args[3]
+
+            # Verify NEFF input count
+            assert len(actual_neff_inputs) == num_neff_in, (
+                f"[{case['desc']}] expected {num_neff_in} NEFF inputs, "
+                f"got {len(actual_neff_inputs)}"
+            )
+
+            # Verify buffer reuse for output[i] -> input[j]
+            if "expect_output0_reuses_input" in case:
+                in_idx = case["expect_output0_reuses_input"]
+                assert (
+                    actual_neff_outputs[0] is neuron_inputs[in_idx]
+                ), f"[{case['desc']}] output[0] should reuse input[{in_idx}] buffer"
+            if "expect_output1_reuses_input" in case:
+                in_idx = case["expect_output1_reuses_input"]
+                assert (
+                    actual_neff_outputs[1] is neuron_inputs[in_idx]
+                ), f"[{case['desc']}] output[1] should reuse input[{in_idx}] buffer"
+            if "expect_output2_reuses_input" in case:
+                in_idx = case["expect_output2_reuses_input"]
+                assert (
+                    actual_neff_outputs[2] is neuron_inputs[in_idx]
+                ), f"[{case['desc']}] output[2] should reuse input[{in_idx}] buffer"
+
+            # Verify caller output count
+            assert len(result) == case["expect_caller_output_count"], (
+                f"[{case['desc']}] expected {case['expect_caller_output_count']} caller outputs, "
+                f"got {len(result)}"
+            )
+
+            # Verify None re-inserted at expected position
+            if "expect_caller_output_has_none_at" in case:
+                pos = case["expect_caller_output_has_none_at"]
+                assert (
+                    result[pos] is None
+                ), f"[{case['desc']}] expected None at caller output[{pos}]"

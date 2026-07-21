@@ -704,6 +704,57 @@ class TestRetainDeviceMutation:
 
 
 # ============================================================================
+# TEST CLASS: Two Outputs Aliasing Same Input
+# ============================================================================
+
+
+class TwoOutputsSameInput(nn.Module):
+    """Model where two outputs both alias the same mutated input."""
+
+    def forward(self, cache, indices, new_values):
+        cache.scatter_(2, indices, new_values)
+        return cache, cache
+
+
+class TestDuplicateInputAlias:
+    """Verify that two outputs aliasing the same input works correctly."""
+
+    def test_two_outputs_alias_same_input(self, device):
+        """Both outputs should reflect the scattered update."""
+        model = TwoOutputsSameInput().eval().to(device)
+        cache = torch.ones(1, 1, 128, 16, device=device)
+        indices = torch.zeros(1, 1, 1, 16, dtype=torch.int64, device=device)
+        new_values = torch.full((1, 1, 1, 16), 5.0, device=device)
+
+        expected_cache = cache.clone()
+        expected_cache.scatter_(2, indices, new_values)
+
+        out1, out2 = compile_and_run(model, cache, indices, new_values)
+
+        torch.testing.assert_close(
+            out1.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="First output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            out2.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Second output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            cache.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Original input should be mutated in-place",
+        )
+
+
+# ============================================================================
 # RUN TESTS
 # ============================================================================
 

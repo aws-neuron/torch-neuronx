@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 
 import torch
 from torch.fx.passes.infra.pass_base import PassBase, PassResult
 
 from torch_neuronx.kernels.cache_utils import CompilationJob
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import IOMutation, PassMutations
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -15,6 +19,23 @@ class NeuronFXPassState:
     job: CompilationJob
     model_name: str
     dumping_enabled: bool
+    pass_mutations: list[PassMutations] = field(default_factory=list)
+    pre_aot_pass_mutations: PassMutations | None = None
+
+    def add_pass_mutations(
+        self,
+        pass_name: str,
+        input_mutations: list[IOMutation] | None = None,
+        output_mutations: list[IOMutation] | None = None,
+    ) -> None:
+        """Record the input and output mutations emitted by a single FX pass."""
+        pm = PassMutations(
+            pass_name=pass_name,
+            input_mutations=input_mutations or [],
+            output_mutations=output_mutations or [],
+        )
+        logger.debug(f"Added pass mutations from {pass_name}: {pm}")
+        self.pass_mutations.append(pm)
 
 
 class NeuronFXPass(PassBase):

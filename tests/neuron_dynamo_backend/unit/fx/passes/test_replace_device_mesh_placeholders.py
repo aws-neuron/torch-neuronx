@@ -13,9 +13,19 @@ import torch.fx as fx
 from torch._library.fake_class_registry import FakeScriptObject
 from torch.distributed.device_mesh import DeviceMesh
 
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    MutationKind,
+    apply_output_mutations,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
 from torch_neuronx.neuron_dynamo_backend.fx.passes.replace_device_mesh_placeholders import (
     ReplaceDeviceMeshPlaceholders,
 )
+
+
+def _make_state():
+    """Create a minimal NeuronFXPassState for testing."""
+    return NeuronFXPassState(job=MagicMock(), model_name="test", dumping_enabled=False)
 
 
 def _make_device_mesh_fso():
@@ -81,32 +91,34 @@ class TestReplaceDeviceMeshPlaceholders:
 
     def test_single_device_mesh_removed(self):
         """Test removal of a single DeviceMesh placeholder."""
-        # Graph: [tensor, device_mesh, tensor]
         gm = _build_graph_with_device_mesh_placeholders(
             num_tensor_inputs=2, device_mesh_indices=[1]
         )
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
         assert result.modified
-        assert pass_instance.removed_indices == [1]
+        assert len(state.pass_mutations[0].input_mutations) == 1
+        assert state.pass_mutations[0].input_mutations[0].kind == MutationKind.REMOVE
+        assert state.pass_mutations[0].input_mutations[0].indices == [1]
 
         placeholders = [n for n in result.graph_module.graph.nodes if n.op == "placeholder"]
         assert len(placeholders) == 2
 
     def test_multiple_device_meshes_removed(self):
         """Test removal of multiple DeviceMesh placeholders."""
-        # Graph: [device_mesh, tensor, device_mesh, tensor, device_mesh]
         gm = _build_graph_with_device_mesh_placeholders(
             num_tensor_inputs=2, device_mesh_indices=[0, 2, 4]
         )
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
         assert result.modified
-        assert pass_instance.removed_indices == [0, 2, 4]
+        assert state.pass_mutations[0].input_mutations[0].indices == [0, 2, 4]
 
         placeholders = [n for n in result.graph_module.graph.nodes if n.op == "placeholder"]
         assert len(placeholders) == 2
@@ -115,11 +127,12 @@ class TestReplaceDeviceMeshPlaceholders:
         """Test that graph without DeviceMesh placeholders is not modified."""
         gm = _build_graph_with_device_mesh_placeholders(num_tensor_inputs=3, device_mesh_indices=[])
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
         assert not result.modified
-        assert pass_instance.removed_indices == []
+        assert len(state.pass_mutations) == 0
 
         placeholders = [n for n in result.graph_module.graph.nodes if n.op == "placeholder"]
         assert len(placeholders) == 3
@@ -130,11 +143,12 @@ class TestReplaceDeviceMeshPlaceholders:
             num_tensor_inputs=0, device_mesh_indices=[0, 1]
         )
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
         assert result.modified
-        assert pass_instance.removed_indices == [0, 1]
+        assert state.pass_mutations[0].input_mutations[0].indices == [0, 1]
 
         placeholders = [n for n in result.graph_module.graph.nodes if n.op == "placeholder"]
         assert len(placeholders) == 0
@@ -149,26 +163,27 @@ class TestReplaceDeviceMeshPlaceholders:
         graph.output(p0)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
         assert not result.modified
-        assert pass_instance.removed_indices == []
+        assert len(state.pass_mutations) == 0
 
         placeholders = [n for n in result.graph_module.graph.nodes if n.op == "placeholder"]
         assert len(placeholders) == 2
 
     def test_removed_indices_tracks_original_positions(self):
-        """Test that removed_indices reflects positions in the original placeholder list."""
-        # Graph: [tensor, device_mesh, tensor, device_mesh, tensor]
+        """Test that mutation indices reflect positions in the original placeholder list."""
         gm = _build_graph_with_device_mesh_placeholders(
             num_tensor_inputs=3, device_mesh_indices=[1, 3]
         )
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         pass_instance.call(gm)
 
-        assert pass_instance.removed_indices == [1, 3]
+        assert state.pass_mutations[0].input_mutations[0].indices == [1, 3]
 
     def test_graph_executes_after_pass(self):
         """Test that the modified graph still executes correctly."""
@@ -176,11 +191,104 @@ class TestReplaceDeviceMeshPlaceholders:
             num_tensor_inputs=2, device_mesh_indices=[1]
         )
 
-        pass_instance = ReplaceDeviceMeshPlaceholders()
+        state = _make_state()
+        pass_instance = ReplaceDeviceMeshPlaceholders(state)
         result = pass_instance.call(gm)
 
-        # Execute with only tensor inputs (DeviceMesh removed)
         x = torch.randn(2, 3)
         y = torch.randn(2, 3)
         output = result.graph_module(x, y)
         assert torch.equal(output, x + y)
+
+
+class TestReplaceDeviceMeshOutputs:
+    """Tests for DeviceMesh passthrough output removal."""
+
+    def _build_graph_with_mesh_output(self, mesh_input_idx: int, mesh_output_idx: int):
+        """Build a graph where a DeviceMesh placeholder is also returned as an output."""
+        graph = fx.Graph()
+        p_tensor = graph.placeholder("tensor_input")
+        p_tensor.meta["val"] = torch.randn(2, 3)
+        p_mesh = graph.placeholder("mesh_input")
+        p_mesh.meta["val"] = _make_device_mesh_fso()
+
+        compute = graph.call_function(torch.ops.aten.add.Tensor, (p_tensor, p_tensor))
+
+        # Output both the compute result and the mesh passthrough
+        if mesh_output_idx == 0:
+            graph.output((p_mesh, compute))
+        else:
+            graph.output((compute, p_mesh))
+
+        return fx.GraphModule(torch.nn.Module(), graph), p_mesh
+
+    def test_device_mesh_output_removed(self):
+        """DeviceMesh passthrough output is removed from the graph."""
+        gm, _ = self._build_graph_with_mesh_output(mesh_input_idx=1, mesh_output_idx=1)
+        state = _make_state()
+        result = ReplaceDeviceMeshPlaceholders(state).call(gm)
+
+        assert result.modified
+        output_node = next(n for n in result.graph_module.graph.nodes if n.op == "output")
+        outputs = output_node.args[0]
+        assert len(outputs) == 1
+
+    def test_output_mutation_recorded(self):
+        """A single ADD output mutation is recorded with the correct index mapping."""
+        gm, _ = self._build_graph_with_mesh_output(mesh_input_idx=1, mesh_output_idx=1)
+        state = _make_state()
+        ReplaceDeviceMeshPlaceholders(state).call(gm)
+
+        assert len(state.pass_mutations[0].output_mutations) == 1
+        m = state.pass_mutations[0].output_mutations[0]
+        assert m.kind == MutationKind.REMOVE
+        assert m.transform_key == "input_passthrough"
+        assert 1 in m.indices
+        # Output index 1 should map back to original input index 1
+        assert m.transform_params["index_to_input"][1] == 1
+
+    def test_output_mutation_restores_mesh_at_runtime(self):
+        """apply_output_mutations re-inserts the original mesh at the correct position."""
+        gm, _ = self._build_graph_with_mesh_output(mesh_input_idx=1, mesh_output_idx=1)
+        state = _make_state()
+        ReplaceDeviceMeshPlaceholders(state).call(gm)
+
+        # Simulate original inputs: [tensor, mesh]
+        original_mesh = MagicMock(spec=DeviceMesh)
+        original_inputs = [torch.randn(2, 3), original_mesh]
+
+        # NEFF outputs only the compute result (mesh was stripped)
+        neff_outputs = [torch.randn(2, 3)]
+
+        restored = apply_output_mutations(
+            neff_outputs, state.pass_mutations, "cpu", original_inputs
+        )
+        assert len(restored) == 2
+        assert restored[1] is original_mesh
+
+    def test_mesh_output_at_position_zero(self):
+        """DeviceMesh output at position 0 is correctly removed and mutation records index 0."""
+        gm, _ = self._build_graph_with_mesh_output(mesh_input_idx=1, mesh_output_idx=0)
+        state = _make_state()
+        result = ReplaceDeviceMeshPlaceholders(state).call(gm)
+
+        assert result.modified
+        m = state.pass_mutations[0].output_mutations[0]
+        assert 0 in m.indices
+        assert m.transform_params["index_to_input"][0] == 1
+
+    def test_non_passthrough_device_mesh_output_raises(self):
+        """A DeviceMesh output that isn't a direct placeholder passthrough raises RuntimeError."""
+        graph = fx.Graph()
+        p_tensor = graph.placeholder("tensor_input")
+        p_tensor.meta["val"] = torch.randn(2, 3)
+
+        # Fake an intermediate node whose val is a DeviceMesh FSO (not a placeholder)
+        intermediate = graph.call_function(torch.ops.aten.add.Tensor, (p_tensor, p_tensor))
+        intermediate.meta["val"] = _make_device_mesh_fso()
+
+        graph.output((p_tensor, intermediate))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with pytest.raises(RuntimeError, match="intermediate computation"):
+            ReplaceDeviceMeshPlaceholders(_make_state()).call(gm)

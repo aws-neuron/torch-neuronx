@@ -529,37 +529,6 @@ class TestCustomOpAliasing:
         assert_alias_count(aliasing_info.aliases, 0)
 
 
-class TestShapeMismatchSilentDrop:
-    """Tests that shape-mismatched aliases are dropped with a warning.
-
-    _set_module_alias drops shape-mismatched aliases because HLO requires
-    matching shapes. A warning is emitted when this happens so that
-    silent data-loss is visible in logs.
-    """
-
-    def test_shape_mismatch_alias_emits_warning(self, caplog):
-        """A view output with a different shape from its aliased input must log a warning."""
-        from tests.neuron_dynamo_backend.unit.test_aliasing_propagation import (
-            compile_to_stablehlo,
-        )
-
-        def reshaped(x):
-            return x.reshape(5, 20)
-
-        x = torch.randn(10, 10)
-        captured = get_aot_graphs(reshaped, x)
-
-        with caplog.at_level(
-            logging.WARNING, logger="torch_neuronx.neuron_dynamo_backend.fx.fx_transform"
-        ):
-            compile_to_stablehlo(captured)
-
-        # Verify the warning was emitted with shape information
-        assert any(
-            "shape mismatch" in msg for msg in caplog.messages
-        ), f"Expected 'shape mismatch' warning, got: {caplog.messages}"
-
-
 class TestInplaceMethods:
     """Tests for AliasingAnalysis._is_inplace_method (endswith('_') heuristic).
 

@@ -18,11 +18,16 @@ import torch
 from torch.fx import Node
 from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
     NeuronFXPass,
     NeuronFXPassState,
 )
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasInfo, AliasingInfo
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class AliasingAnalysis(NeuronFXPass):
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__(state)
         self.result: AliasingInfo | None = None
+        self._pass_mutations = None
 
     @property
     def name(self) -> str:
@@ -739,6 +745,31 @@ class AliasingAnalysis(NeuronFXPass):
             logger.info(
                 f"Mutated inputs: {sorted(mutated_input_indices)}, "
                 f"Explicit outputs: {explicit_output_count}"
+            )
+
+            # Build PassMutations from the AliasingInfo result.
+            # Only entries where the input was mutated (inplace) → is_mutation=True.
+            # Passthrough aliases are detected and emitted by
+            # FunctionalizeCopyInplacePass which sees the post-AOT graph.
+            out_muts = []
+            if self.result is not None:
+                mutation_aliases: list[AliasInfo] = []
+                for a in self.result.aliases:
+                    if a.parameter_number in mutated_input_indices:
+                        mutation_aliases.append(a)
+                if mutation_aliases:
+                    out_muts.append(
+                        IOMutation(
+                            kind=MutationKind.ALIAS,
+                            indices=[a.output_index for a in mutation_aliases],
+                            alias_input_indices=[a.parameter_number for a in mutation_aliases],
+                            is_mutation=True,
+                            pass_name="AliasingAnalysis",
+                        )
+                    )
+            self._pass_mutations = PassMutations(
+                pass_name="AliasingAnalysis",
+                output_mutations=out_muts,
             )
 
             return PassResult(gm, modified=False)

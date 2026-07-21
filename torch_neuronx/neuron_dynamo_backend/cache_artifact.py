@@ -18,8 +18,7 @@ from torch._inductor.output_code import OutputCode
 from torch.compiler._cache import CacheArtifact, CacheArtifactFactory, CacheArtifactManager
 
 import torch_neuronx
-from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import PassMutations
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
 
 logger = logging.getLogger(__name__)
@@ -74,10 +73,8 @@ class NeuronOutputCode(OutputCode):
     cast_spec: list[TensorSpec] = dataclasses.field(default_factory=list)
     has_collectives: bool = False
     retain_device: bool = False
-    mutation_info: AliasingInfo | None = None
-    none_output_info: NoneOutputInfo | None = None
-    removed_device_mesh_indices: list[int] | None = None
-    passthrough_info: AliasingInfo | None = None
+    pass_mutations: list[PassMutations] = dataclasses.field(default_factory=list)
+    alias_buffer_map: dict[int, int] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         self._executor = None
@@ -127,10 +124,8 @@ class NeuronOutputCode(OutputCode):
                 self.cast_spec,
                 self.has_collectives,
                 retain_device=self.retain_device,
-                mutation_info=self.mutation_info,
-                none_output_info=self.none_output_info,
-                removed_device_mesh_indices=self.removed_device_mesh_indices,
-                passthrough_info=self.passthrough_info,
+                pass_mutations=self.pass_mutations,
+                alias_buffer_map=self.alias_buffer_map,
             )
         return self._executor
 

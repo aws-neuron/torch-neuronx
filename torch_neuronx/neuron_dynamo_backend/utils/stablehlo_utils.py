@@ -99,26 +99,12 @@ class TensorSpec:
         return any(d < 0 for d in self.shape)
 
 
-@dataclass
-class ShardInputInfo:
-    """Metadata for the TP shard index input added for SPMD vocab sharding.
-
-    The shard_index is inferred from the vocab sharding pattern constants
-    in the graph (e.g., lower_bound // shard_size for triads).
-    """
-
-    original_input_count: int
-    new_input_count: int
-    shard_index: int
-
-
 @dataclass(frozen=True)
 class FunctionIO:
     """Input/Output specification for a function."""
 
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
-    shard_input_info: ShardInputInfo | None = None
 
     def __repr__(self) -> str:
         inputs_str = ", ".join(str(t) for t in self.inputs)
@@ -156,14 +142,12 @@ def _parse_mlir_type(mlir_type) -> TensorSpec:
 def parse_module_io(
     module,
     func_name: str = "main",
-    shard_input_info: ShardInputInfo | None = None,
 ) -> FunctionIO:
     """Parse input/output specs from a StableHLO module's function.
 
     Args:
         module: torch_mlir MLIR module
         func_name: Target function name (default: "main")
-        shard_input_info: Optional metadata about TP shard index input for SPMD vocab sharding
 
     Returns:
         FunctionIO with input and output TensorSpecs
@@ -176,11 +160,7 @@ def parse_module_io(
             func_type = op.attributes["function_type"].value
             inputs = tuple(_parse_mlir_type(i) for i in func_type.inputs)
             outputs = tuple(_parse_mlir_type(o) for o in func_type.results)
-            return FunctionIO(
-                inputs=inputs,
-                outputs=outputs,
-                shard_input_info=shard_input_info,
-            )
+            return FunctionIO(inputs=inputs, outputs=outputs)
         raise ValueError(f"Function '{func_name}' not found in module")
 
 
