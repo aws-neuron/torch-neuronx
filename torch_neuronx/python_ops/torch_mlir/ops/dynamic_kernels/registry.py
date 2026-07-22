@@ -32,6 +32,18 @@ class DynamicNkiEntry:
 
     _compiled: dict = field(default_factory=dict, repr=False)
 
+    # Instrumentation (for tests / debugging): every time this dynamic kernel
+    # actually executes, _exec_count is bumped and the runtime dynamic dim
+    # (actual_M from prepare_io) is recorded. This distinguishes "the dynamic
+    # NEFF ran" from "the op silently fell back to the default lowering" — the
+    # compiled-NEFF count alone can't tell those apart.
+    _exec_count: int = field(default=0, repr=False)
+    _exec_ms: set = field(default_factory=set, repr=False)
+
+    def record_exec(self, actual_m: int):
+        self._exec_count += 1
+        self._exec_ms.add(int(actual_m))
+
     def get_compiled(self, compile_key=None) -> tuple[bytes, str]:
         """Lazily compile the dynamic kernel for `compile_key`, memoized per key."""
         if compile_key not in self._compiled:
