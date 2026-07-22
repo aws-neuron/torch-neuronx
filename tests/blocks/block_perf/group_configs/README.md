@@ -13,6 +13,12 @@ Each test entry has three MFU-related fields:
 `mfu_threshold` includes a 5% regression tolerance — if actual MFU drops below
 this value, the test fails and blocks the PR.
 
+**MFU is derived from the MEDIAN iteration time**, not the mean. A rare isolated
+latency outlier in a single iteration can inflate the mean enough to trip the gate
+on unrelated changes; the median ignores such outliers and reflects steady-state
+throughput. When measuring a new baseline, read the `MFU` value the benchmark
+reports (already median-based) — do not recompute it from the mean/average.
+
 ## How to Update
 
 When perf legitimately improves:

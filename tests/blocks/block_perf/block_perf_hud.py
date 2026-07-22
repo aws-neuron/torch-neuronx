@@ -18,6 +18,7 @@ BENCHMARK_RESULTS_FILENAME = "benchmark_results.jsonl"
 
 _SCALAR_METRICS = (
     "avg_time_ms",
+    "median_time_ms",
     "std_time_ms",
     "min_time_ms",
     "max_time_ms",

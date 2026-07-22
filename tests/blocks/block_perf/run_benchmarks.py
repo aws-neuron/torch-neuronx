@@ -488,18 +488,22 @@ def print_performance_metrics(timings, total_flops, device_name, forward_only=Tr
 
     # Calculate statistics
     avg_time = np.mean(timings)
+    median_time = np.median(timings)
     std_time = np.std(timings)
     min_time = np.min(timings)
     max_time = np.max(timings)
 
     printf("\nExecution Time Statistics:")
+    printf(f"  Median: {median_time:.2f} ms")
     printf(f"  Average: {avg_time:.2f} ms")
     printf(f"  Std Dev: {std_time:.2f} ms")
     printf(f"  Min: {min_time:.2f} ms")
     printf(f"  Max: {max_time:.2f} ms")
 
-    # Calculate throughput
-    flops_per_sec = total_flops / (avg_time / 1000)
+    # Use the median iteration time: robust to rare host-side scheduling stalls
+    # that spike a single iteration, unlike the mean. Iterations are host-timed
+    # around a device sync, so a descheduled host thread inflates that sample.
+    flops_per_sec = total_flops / (median_time / 1000)
     tflops = flops_per_sec / 1e12
 
     operation_type = "forward pass" if forward_only else "forward+loss+backward"
@@ -523,6 +527,7 @@ def print_performance_metrics(timings, total_flops, device_name, forward_only=Tr
 
     return {
         "avg_time_ms": avg_time,
+        "median_time_ms": median_time,
         "std_time_ms": std_time,
         "min_time_ms": min_time,
         "max_time_ms": max_time,
