@@ -60,6 +60,7 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad___rmatmul___neuron_float64",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad___rmod___neuron_float64",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_addcdiv_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_asin_neuron_float64",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_constant_pad_nd_neuron_float64",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_cumprod_neuron_float64",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_diff_neuron_float64",

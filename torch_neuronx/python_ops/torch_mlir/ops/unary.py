@@ -92,6 +92,56 @@ def torch_acosh(x, out=None):
     return torch.acosh(x)
 
 
+def _validate_asin(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    asin promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::asin", "aten::asin.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_asin,
+)
+def torch_asin(x, out=None):
+    """Inverse sine (arcsin) — elementwise transcendental."""
+    return torch.asin(x)
+
+
+def _validate_asinh(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    asinh promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::asinh", "aten::asinh.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_asinh,
+)
+def torch_asinh(x, out=None):
+    """Inverse hyperbolic sine — elementwise transcendental."""
+    return torch.asinh(x)
+
+
 @register_aten(["aten::exp", "aten::exp.out"])
 def torch_exp(x, out=None):
     return torch.exp(x)
