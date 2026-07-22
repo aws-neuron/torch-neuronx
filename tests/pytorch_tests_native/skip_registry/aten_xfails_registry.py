@@ -470,4 +470,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_autograd.py::TestAutograd::test_disabling_saved_tensor_hooks_nested",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "TorchScript execution of TransformerEncoderLayer subclasses does"
+            " not preserve eager-mode behavior on Neuron."
+        ),
+        tests=[
+            "test_transformers.py::TestTransformersNEURON::test_transformerencoderlayer_subclass_model_neuron",
+            "test_transformers.py::TestTransformersNEURON::test_transformerencoderlayer_subclass_neuron",
+        ],
+    ),
 ]
