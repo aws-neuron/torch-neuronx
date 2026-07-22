@@ -354,3 +354,19 @@ class TestIndexPut:
             expected_grad = torch.zeros(4, 8)
             expected_grad[cpu_indices] = 1.0
             torch.testing.assert_close(x.grad.cpu(), expected_grad)
+
+    def test_index_put_invalid_index(self, device):
+        """index_put with an out-of-bounds index raises IndexError via the
+        in-graph device bounds check + error handler."""
+        x = torch.zeros(4, 6, dtype=torch.float32, device=device)
+        # index 10 is out of bounds for dim 0 (size 4)
+        indices = (torch.tensor([0, 1, 10], dtype=torch.int64, device=device),)
+        values = torch.ones(3, 6, dtype=torch.float32, device=device)
+
+        @assert_raises(
+            IndexError, match=r".*index 10 is out of bounds for dimension 0 with size 4*"
+        )
+        def _test_invalid_index():
+            x.index_put_(indices, values)
+
+        _test_invalid_index()

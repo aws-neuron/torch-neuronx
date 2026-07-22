@@ -58,10 +58,9 @@ class TestIndexSelect:
 
         assert result.shape == torch.Size([1, 4])
 
-    @pytest.mark.xfail(reason="produces nan instead of OOB error")
     @assert_raises(IndexError, match="index out of range in self")
     def test_index_select_with_indices_out_of_range(self):
-        """Test index select with input empty"""
+        """Test index select with an out-of-range index raises IndexError."""
 
         device = "neuron"
         input = torch.ones((3, 4))

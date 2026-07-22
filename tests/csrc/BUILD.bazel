@@ -269,6 +269,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "OpErrorHandlerTest",
+    srcs = ["core/utils/OpErrorHandlerTest.cpp"],
+    deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
     name = "ProcessExecutorPipeReadTest",
     srcs = ["core/utils/ProcessExecutorPipeReadTest.cpp"],
     deps = ["//:compilation"],

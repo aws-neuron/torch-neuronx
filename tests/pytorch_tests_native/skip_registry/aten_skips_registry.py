@@ -5,6 +5,18 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "Neuron does the index bounds check on-device (async), like CUDA/XPU,"
+            " so an out-of-bounds fancy index does not raise a synchronous"
+            " IndexError at the op call. The upstream test already skips CUDA/XPU"
+            " for the same reason ('CUDA/XPU asserts instead of raising an"
+            " exception'); Neuron is in the same category."
+        ),
+        tests=[
+            "test_indexing.py::NumpyTestsNEURON::test_trivial_fancy_out_of_bounds_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "FFT ops and complex dtypes (cfloat, cdouble, chalf)"
             " are not supported on Neuron hardware. Includes tests that"
             " primarily exercise complex output ops (polar, linalg_eigvals,"

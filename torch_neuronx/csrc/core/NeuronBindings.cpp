@@ -31,6 +31,8 @@
 // Include logging
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
+#include "torch_neuronx/csrc/core/utils/ErrorHandler.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
 // Include dispatch helpers (HasComplexInput)
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 // Include device management
@@ -980,6 +982,58 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "_neuron_synchronize",
       [](c10::DeviceIndex device_index) { at::neuron::synchronize(device_index); },
       "Synchronize all streams on device", py::arg("device_index") = -1);
+
+  // Bind the lazy per-op error context handed to Python error handlers. Its
+  // accessors materialize tensors to CPU only when asked; shapes/scalars come
+  // from metadata with no copy. See torch_neuronx/python_ops/op_error_handlers.py.
+  py::class_<at::neuron::OpErrorContext>(m, "OpErrorContext")
+      .def(
+          "shape",
+          [](const at::neuron::OpErrorContext& ctx, size_t arg_index) {
+            py::list out;
+            for (int64_t d : ctx.Shape(arg_index)) {
+              out.append(d);
+            }
+            return out;
+          },
+          "Shape of the arg_index-th positional arg (a tensor). Metadata only.",
+          py::arg("arg_index"))
+      .def(
+          "scalar",
+          [](const at::neuron::OpErrorContext& ctx, size_t arg_index) {
+            return torch::jit::toPyObject(ctx.Scalar(arg_index));
+          },
+          "Value of the arg_index-th positional arg (a scalar).", py::arg("arg_index"))
+      .def("tensor", &at::neuron::OpErrorContext::Tensor,
+           "Copy the arg_index-th positional arg (a single tensor) to CPU.", py::arg("arg_index"))
+      .def(
+          "tensor_list",
+          [](const at::neuron::OpErrorContext& ctx, size_t arg_index) {
+            py::list out;
+            for (auto& t : ctx.TensorList(arg_index)) {
+              out.append(t);
+            }
+            return out;
+          },
+          "Copy the arg_index-th positional arg (a tensor list) to CPU.", py::arg("arg_index"));
+
+  m.def(
+      "_register_error_handler_invoker",
+      [](py::object invoker) {
+        // Leak the py::object so its destructor never runs without the GIL
+        // (e.g. at interpreter shutdown); the std::function holds only a raw
+        // pointer, so it is itself trivially destructible.
+        auto* held = new py::object(std::move(invoker));
+        at::neuron::OpErrorHandler::RegisterInvoker(
+            [held](const std::string& op_name, at::neuron::OpErrorContext& ctx) {
+              py::gil_scoped_acquire gil;
+              // Pass ctx by reference; the handler must not retain it (it is a
+              // stack object valid only for this call). Calls
+              // op_error_handlers._invoke, which may raise.
+              (*held)(op_name, py::cast(&ctx, py::return_value_policy::reference));
+            });
+      },
+      "Register the Python invoker(op_name, ctx) for per-op error handlers.", py::arg("invoker"));
 
   // Expose allocator submodule temporarily for testing
   // ToDo: Remove this later

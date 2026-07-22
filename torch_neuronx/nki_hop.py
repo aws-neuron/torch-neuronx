@@ -543,13 +543,19 @@ def register_kernel_to_torch(nki_func, k_fields, arg_names, kernel_default_args,
     return kernel_registry.add_kernel(kernel, arg_names, kernel_default_args)
 
 
-def wrap_nki(nki_kernel, **kwargs) -> Any:
+def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     """Allows capture of a nki kernel into a graph via torch.compile
 
     These technologies perform Dispatcher-based tracing (via
     ``__torch_dispatch__``) and cannot see calls to raw nki kernels.
     The ``wrap_nki`` API wraps a nki kernel into a callable that
     can actually be traced into a graph.
+
+    ``has_side_effect=True`` marks the lowered custom call as side-effecting so
+    it survives dead-code elimination even when its result is unused. Needed for
+    kernels whose effect is the call itself (e.g. a bounds check that faults via
+    ``oob_mode.error``); otherwise the optimizer drops the call and the effect
+    never runs.
     """
     sig = inspect.signature(nki_kernel.func)
     arg_names = list(sig.parameters.keys())
@@ -564,7 +570,9 @@ def wrap_nki(nki_kernel, **kwargs) -> Any:
         nki_kernel.func, k_fields, arg_names, kernel_default_args, **kwargs
     )
 
-    return NKIHOPCaller(kernel_idx, [], arg_names, kernel_default_args)
+    return NKIHOPCaller(
+        kernel_idx, [], arg_names, kernel_default_args, has_side_effect=has_side_effect
+    )
 
 
 def nki_op(
