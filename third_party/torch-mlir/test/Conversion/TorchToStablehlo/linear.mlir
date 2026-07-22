@@ -515,7 +515,7 @@ func.func @torch.aten.convolution$transposed_groups(%arg0: !torch.vtensor<[1,2,7
 // CHECK-DAG:       %[[T_0:.*]] = torch_c.to_builtin_tensor %[[ARG_0]] : !torch.vtensor<[1,3,224,224],bf16> -> tensor<1x3x224x224xbf16>
 // CHECK-DAG:       %[[T_1:.*]] = torch_c.to_builtin_tensor %[[ARG_1]] : !torch.vtensor<[1152,3,14,14],bf16> -> tensor<1152x3x14x14xbf16>
 // CHECK:           %[[T_CONV:.*]] = stablehlo.convolution(%[[T_0]], %[[T_1]])
-// CHECK-SAME{LITERAL}:                                                 dim_numbers = [b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1], window = {stride = [14, 14], pad = [[0, 0], [0, 0]]} {batch_group_count = 1 : i64, feature_group_count = 1 : i64} : (tensor<1x3x224x224xbf16>, tensor<1152x3x14x14xbf16>) -> tensor<1x1152x16x16xbf16>
+// CHECK-SAME{LITERAL}:                                                 dim_numbers = [b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1], window = {stride = [14, 14], pad = [[0, 0], [0, 0]], rhs_dilate = [1, 1]} {batch_group_count = 1 : i64, feature_group_count = 1 : i64} : (tensor<1x3x224x224xbf16>, tensor<1152x3x14x14xbf16>) -> tensor<1x1152x16x16xbf16>
 // CHECK:           %[[T_OUT:.*]] = torch_c.from_builtin_tensor %[[T_CONV]] : tensor<1x1152x16x16xbf16> -> !torch.vtensor<[1,1152,16,16],bf16>
 // CHECK:           return %[[T_OUT]] : !torch.vtensor<[1,1152,16,16],bf16>
 func.func @torch.aten.convolution$scalar_padding(%arg0: !torch.vtensor<[1,3,224,224],bf16>, %arg1: !torch.vtensor<[1152,3,14,14],bf16>) -> !torch.vtensor<[1,1152,16,16],bf16> {
