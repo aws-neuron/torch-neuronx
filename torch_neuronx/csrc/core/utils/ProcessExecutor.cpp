@@ -7,6 +7,14 @@
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 
+// POSIX requires programs to declare `environ` themselves (it is not standardised
+// in any header). glibc's <unistd.h> exposes it under default feature-test macros
+// today, but a stricter sysroot would not. The declaration MUST be at file scope
+// (or wrapped in `extern "C"`) — declaring it inside a C++ namespace produces a
+// mangled namespace-scoped symbol (e.g. `at::neuron::environ`) that the linker
+// cannot resolve against the C-linkage global.
+extern "C" char** environ;
+
 namespace at::neuron {
 
 // PipeManager implementation
@@ -51,7 +59,7 @@ void ProcessExecutor::Execute(const std::vector<std::string>& args, const std::s
     throw std::runtime_error("No command arguments provided");
   }
 
-  // Convert args to char* array for execvp
+  // Convert args to char* array for posix_spawn (same format as execvp)
   std::vector<char*> argv;
   for (const auto& arg : args) {
     argv.push_back(const_cast<char*>(arg.c_str()));
@@ -61,40 +69,66 @@ void ProcessExecutor::Execute(const std::vector<std::string>& args, const std::s
   // Create pipes using RAII
   PipeManager stdout_pipe, stderr_pipe;
 
-  pid_t pid = fork();
-  if (pid == 0) {
-    SetupChildProcess(stdout_pipe, stderr_pipe, working_dir);
-    ExecCommand(argv);
-  } else if (pid > 0) {
-    WaitAndCheckResult(pid, stdout_pipe, stderr_pipe, context);
-  } else {
-    throw std::runtime_error("Fork failed: " + std::string(strerror(errno)));
-  }
-}
-
-void ProcessExecutor::SetupChildProcess(PipeManager& stdout_pipe, PipeManager& stderr_pipe,
-                                        const std::string& working_dir) {
-  stdout_pipe.CloseRead();
-  stderr_pipe.CloseRead();
-
-  if (!working_dir.empty()) {
-    if (chdir(working_dir.c_str()) == -1) {
-      exit(kExitDup2Failed);
+  // RAII for posix_spawn_file_actions_t so destroy runs on every exit path.
+  struct FileActionsGuard {
+    posix_spawn_file_actions_t actions{};
+    bool inited{false};
+    int Init() {
+      int rc = posix_spawn_file_actions_init(&actions);
+      inited = (rc == 0);
+      return rc;
     }
+    ~FileActionsGuard() {
+      if (inited) posix_spawn_file_actions_destroy(&actions);
+    }
+  };
+
+  // Set up file actions for the spawned child. posix_spawn avoids fork()'s
+  // copy-on-write of the parent's address space.
+  FileActionsGuard guard;
+  int rc = guard.Init();
+  if (rc != 0) {
+    throw std::runtime_error("posix_spawn_file_actions_init failed: " + std::string(strerror(rc)));
   }
 
-  if (dup2(stdout_pipe.write_fd(), STDOUT_FILENO) == -1 ||
-      dup2(stderr_pipe.write_fd(), STDERR_FILENO) == -1) {
-    exit(kExitDup2Failed);
+  // Helper: throw on non-zero rc from posix_spawn_file_actions_*.
+  auto check = [](int rc, const char* op) {
+    if (rc != 0) {
+      throw std::runtime_error(std::string("posix_spawn_file_actions_") + op +
+                               " failed: " + strerror(rc));
+    }
+  };
+
+  // Redirect stdout and stderr to pipes (dup2 actions execute in registration
+  // order; close actions below run after dup2 so STDOUT/STDERR retain the pipe).
+  check(posix_spawn_file_actions_adddup2(&guard.actions, stdout_pipe.write_fd(), STDOUT_FILENO),
+        "adddup2(stdout)");
+  check(posix_spawn_file_actions_adddup2(&guard.actions, stderr_pipe.write_fd(), STDERR_FILENO),
+        "adddup2(stderr)");
+
+  // Close pipe ends the child doesn't need (parent's read fds, plus the
+  // original write fds whose duplicates already live on STDOUT/STDERR_FILENO).
+  check(posix_spawn_file_actions_addclose(&guard.actions, stdout_pipe.read_fd()),
+        "addclose(stdout_read)");
+  check(posix_spawn_file_actions_addclose(&guard.actions, stderr_pipe.read_fd()),
+        "addclose(stderr_read)");
+  check(posix_spawn_file_actions_addclose(&guard.actions, stdout_pipe.write_fd()),
+        "addclose(stdout_write)");
+  check(posix_spawn_file_actions_addclose(&guard.actions, stderr_pipe.write_fd()),
+        "addclose(stderr_write)");
+
+  // Set working directory if specified.
+  if (!working_dir.empty()) {
+    check(posix_spawn_file_actions_addchdir_np(&guard.actions, working_dir.c_str()), "addchdir_np");
   }
 
-  stdout_pipe.CloseWrite();
-  stderr_pipe.CloseWrite();
-}
+  pid_t pid;
+  int err = posix_spawnp(&pid, argv[0], &guard.actions, nullptr, argv.data(), environ);
+  if (err != 0) {
+    throw std::runtime_error("posix_spawn failed: " + std::string(strerror(err)));
+  }
 
-void ProcessExecutor::ExecCommand(const std::vector<char*>& argv) {
-  execvp(argv[0], argv.data());
-  exit(kExitExecvpFailed);
+  WaitAndCheckResult(pid, stdout_pipe, stderr_pipe, context);
 }
 
 void ProcessExecutor::WaitAndCheckResult(pid_t pid, PipeManager& stdout_pipe,

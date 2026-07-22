@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -48,13 +49,8 @@ class ProcessExecutor {
                       const std::string& working_dir = "");
 
  private:
-  static constexpr int kExitDup2Failed = 126;
-  static constexpr int kExitExecvpFailed = 127;
   static constexpr size_t kPipeBufferSize = 1024;
 
-  static void SetupChildProcess(PipeManager& stdout_pipe, PipeManager& stderr_pipe,
-                                const std::string& working_dir);
-  [[noreturn]] static void ExecCommand(const std::vector<char*>& argv);
   static void WaitAndCheckResult(pid_t pid, PipeManager& stdout_pipe, PipeManager& stderr_pipe,
                                  const std::string& context);
 };
