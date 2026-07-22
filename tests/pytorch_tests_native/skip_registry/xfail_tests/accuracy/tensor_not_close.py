@@ -482,4 +482,43 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_acosh_neuron_int16",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_acosh_neuron_int32",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_acosh_neuron_int64",
+    # aten::asin — Neuron computes the transcendental in its native fp32 engine, so
+    # results are a few ULP coarser than CPU libm and fail the strict default rtol.
+    # Expected hardware precision, not a defect.
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asin_neuron_float16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_non_contig_asin_neuron_float16",
+    # aten::asinh — two causes. Normal-range and int cases have the same fp32-transcendental
+    # coarseness as asin above. Large-magnitude cases (|x| >~ 1e19, fp32/bf16/fp64) are a
+    # compiler bug: neuronx-cc miscompiles a numerically-valid StableHLO graph, returning
+    # 39.70 where the HLO and CPU give 46.74 (~15% error). Tracked in P476261353.
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_int16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_int32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_int64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_int8",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing__refs_asinh_neuron_uint8",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_float16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_int16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_int32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_int64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_int8",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_batch_vs_slicing_asinh_neuron_uint8",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_contig_vs_every_other__refs_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_contig_vs_every_other_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_contig_vs_every_other_asinh_neuron_int32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_asinh_neuron_bfloat16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_asinh_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_asinh_neuron_bfloat16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_asinh_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal__refs_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal__refs_asinh_neuron_int16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal__refs_asinh_neuron_int32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal__refs_asinh_neuron_int64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_asinh_neuron_float32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_asinh_neuron_int16",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_asinh_neuron_int32",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_asinh_neuron_int64",
 ]
