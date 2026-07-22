@@ -983,6 +983,66 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Dynamic-NKI pre-check
+// ═══════════════════════════════════════════════════════════════
+
+// Feature flag, read once. The env var is process-fixed, so when the feature is
+// off this is a single cached bool test on the hot path (no getenv, no GIL).
+static const bool kDynNkiEnabled = []() {
+  const char* env = std::getenv("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS");
+  return env != nullptr && std::string(env) == "1";
+}();
+
+// When the feature is enabled and a registered dynamic kernel can_handle this
+// op, Python compiles-once + executes the NEFF at the actual runtime shape and
+// pushes the result onto the stack; returns true (op handled). Otherwise returns
+// false and the caller proceeds with the standard lower/compile/execute path.
+//
+// Called from the boxed-dispatch entry points (DispatchImpl for
+// mm/scatter/silu/add/mul; DispatchIndexImpl for index)
+//
+// The Python entry fn is imported once and cached as a leaked py::object* to
+// avoid a destructor during interpreter finalization. Acquires the GIL.
+static bool TryDynNkiDispatch(const c10::OperatorHandle& op, torch::jit::Stack* stack,
+                              const std::string& lookup_name, const std::vector<c10::IValue>& args,
+                              const c10::FunctionSchema& schema, const std::string& op_name) {
+  if (!kDynNkiEnabled) {
+    return false;
+  }
+  py::gil_scoped_acquire gil;
+  static py::object* entry_fn = new py::object(
+      py::module_::import("torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dispatch_entry")
+          .attr("try_dynamic_nki_dispatch"));
+  auto py = IValuesToPyArgsKwargs(args, schema);
+  try {
+    // entry fn: (op_name, args_tuple, kwargs_dict). Returns result tensor/tuple or None.
+    py::object handled = (*entry_fn)(lookup_name, py.args, py.kwargs);
+    if (handled.is_none()) {
+      return false;  // op not handled by a dynamic kernel -> standard path
+    }
+    std::vector<torch::Tensor> outputs;
+    if (py::isinstance<py::tuple>(handled) || py::isinstance<py::list>(handled)) {
+      for (auto item : handled) {
+        outputs.push_back(py::cast<torch::Tensor>(item));
+      }
+    } else {
+      outputs.push_back(py::cast<torch::Tensor>(handled));
+    }
+    PushOutputsToStack(stack, outputs, schema);
+    logOperationExecuted(op_name);
+    return true;
+  } catch (const py::error_already_set& e) {
+    if (e.matches(PyExc_TypeError) || e.matches(PyExc_ValueError) || e.matches(PyExc_IndexError) ||
+        kFallbackOnlyForUnimplemented) {
+      throw;
+    }
+    TORCH_NEURONX_WARN("[TryDynNkiDispatch] dynamic NKI dispatch failed for op=", op_name, ": ",
+                       e.what(), " — falling back to standard lowering");
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Main Dispatch Pipeline
 // ═══════════════════════════════════════════════════════════════
 
@@ -1010,6 +1070,12 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
 
   // Empty tensors (numel()==0) cannot be compiled by the Neuron compiler.
   if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+    return;
+  }
+
+  // Dynamic-NKI pre-check. Runs before the lower_func TORCH_CHECK below because
+  // the dynamic path has no lower_func. No-op (single bool test) when off.
+  if (TryDynNkiDispatch(op, stack, lookup_name, args, schema, op_name)) {
     return;
   }
 
@@ -1496,6 +1562,13 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
       }
       dim++;
     }
+  }
+
+  // ── Dynamic-NKI pre-check ──
+  // After bool→int + device normalization above, so the dynamic gather adapter
+  // receives clean on-device integer indices. No-op when the feature is off.
+  if (TryDynNkiDispatch(op, stack, lookup_name, args, schema, op_name)) {
+    return;
   }
 
   // ── Generate cache key with converted indices ──

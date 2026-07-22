@@ -21,11 +21,7 @@ from torch_neuronx.utils import use_dynamic_nki_kernels
 if use_dynamic_nki_kernels():
     import importlib.util
 
-    if importlib.util.find_spec(".silu_adapter", __name__) is not None:
-        from .silu_adapter import register_silu_adapters
+    if importlib.util.find_spec(".adapters", __name__) is not None:
+        from .adapters import register_all
 
-        register_silu_adapters()
-    if importlib.util.find_spec(".nll_loss_backward_adapter", __name__) is not None:
-        from .nll_loss_backward_adapter import register_nll_backward_adapter
-
-        register_nll_backward_adapter()
+        register_all()

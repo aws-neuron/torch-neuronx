@@ -1500,67 +1500,24 @@ class TorchMlirKernel(BaseNeuronKernel):
     def _try_dynamic_nki_fallback(
         self, original_args, device, entry=None, kwargs=None
     ) -> torch.Tensor | None:
-        """Try to execute via a pre-compiled dynamic NKI NEFF.
+        """Try to execute via a pre-compiled dynamic NKI NEFF (Python path).
 
-        Phase 1 (first call): Compile the NKI kernel at min tile size via
-        _submit_xla_task_to_pipeline (which validates IO sizes — fine because
-        we use min-tile-sized tensors for the compile run).
-
-        Phase 2 (all subsequent calls): Execute via execute_compiled_graph
-        which bypasses IO size validation and passes actual-sized tensor
-        data pointers directly to the NEFF.
+        Thin wrapper over ``try_dynamic_nki_dispatch`` — the shared, ``self``-free
+        entry point also used by the C++ ``DispatchImpl`` hook. This method is
+        reached only when ``TORCH_NEURONX_CPP_DISPATCH=0`` routes ops through the
+        Python ``_call_impl``; under the default C++ dispatch the same function
+        is invoked directly from C++. Kept so the compile/execute logic has one
+        source of truth.
 
         Returns the result tensor if handled, None otherwise.
         """
         if entry is None:
             return None
-
-        if not entry.can_handle(*original_args):
-            return None
-
-        dest = None
-        if kwargs is not None:
-            dest = kwargs.pop("out", None)
-            if dest is None:
-                dest = kwargs.pop("grad_input", None)
-
-        # Compile once per compile_key (dims baked into NEFF, e.g. H).
-        compile_key_fn = getattr(entry, "compile_key_fn", None)
-        compile_key = compile_key_fn(*original_args) if compile_key_fn is not None else None
-        hlo_bytes, cache_key = entry.get_compiled(compile_key)
-
-        # Prepare actual-sized IO. `dest` is the caller-provided output buffer
-        # (out=/grad_input=) when present; prepare_io writes the NEFF result
-        # directly into it when it is a usable contiguous buffer, otherwise it
-        # allocates a fresh output.
-        short_name = self.op_name.replace("aten::", "").split(".")[0]
-        inputs, outputs, _actual_m = entry.prepare_io(*original_args, dest=dest)
-
-        logger.debug(
-            "dynamic NKI execute op=%s cache_key=%s... in=%s out=%s",
-            short_name,
-            cache_key[:48],
-            [tuple(t.shape) for t in inputs],
-            [tuple(t.shape) for t in outputs],
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dispatch_entry import (
+            try_dynamic_nki_dispatch,
         )
 
-        # Use execute_compiled_graph which bypasses IO size validation
-        _C.execute_compiled_graph(
-            short_name,
-            cache_key,
-            list(inputs),
-            list(outputs),
-            False,  # has_collectives
-        )
-
-        # Map the kernel output to the op's expected result shape. Elementwise
-        # ops reshape to the first input's shape; ops like embedding provide a
-        # custom reshape_output (output shape differs from inputs).
-        reshape_output = getattr(entry, "reshape_output", None)
-        if reshape_output is not None:
-            return reshape_output(outputs, original_args)
-        x = original_args[0]
-        return outputs[0].reshape(x.shape)
+        return try_dynamic_nki_dispatch(self.op_name, original_args, kwargs)
 
     def _execute(
         self,
