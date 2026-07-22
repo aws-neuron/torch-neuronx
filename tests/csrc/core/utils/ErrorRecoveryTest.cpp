@@ -10,6 +10,7 @@
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/utils/ErrorRecovery.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
 
 using namespace at::neuron;
 namespace mock = at::neuron::testing;
@@ -430,6 +431,59 @@ TEST_F(ErrorRecoveryTest, OOMRecoveryIncrementsTelemetryCounters) {
   EXPECT_FALSE(result.IsSuccess());
   EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), retries_before + 1);
   EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), ooms_before + 1);
+}
+
+// --- Per-op OOB error handler routing ---------------------------------------
+
+// ShouldSurfaceOOBException is true only for the out-of-bounds NRT status.
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionTrueForOOB) {
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  EXPECT_TRUE(error_recovery_->ShouldSurfaceOOBException(oob));
+}
+
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionFalseForOtherStatus) {
+  torch_neuronx::ExecutionRuntimeException busy("busy", static_cast<NRT_STATUS>(1005));
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(busy));
+  torch_neuronx::ExecutionRuntimeException oom("oom", NRT_RESOURCE);
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(oom));
+}
+
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionFalseWhenNoNRTStatus) {
+  torch_neuronx::ExecutionRuntimeException no_status("no NRT status");
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(no_status));
+}
+
+// SurfaceOOBException delegates to the op's registered error handler: it is a
+// no-op when no handler is registered, and propagates the handler's exception
+// when one is (and the op carries a reconstruction context).
+TEST_F(ErrorRecoveryTest, SurfaceOOBExceptionNoHandlerIsNoOp) {
+  OpErrorHandler::RegisterInvoker({});  // no handler
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("aten::scatter");
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  EXPECT_NO_THROW(error_recovery_->SurfaceOOBException(&op));
+}
+
+TEST_F(ErrorRecoveryTest, SurfaceOOBExceptionPropagatesHandlerException) {
+  OpErrorHandler::RegisterInvoker([](const std::string&, OpErrorContext&) {
+    throw std::runtime_error("index 7 is out of bounds for dimension 0 with size 4");
+  });
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("aten::scatter");
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  try {
+    error_recovery_->SurfaceOOBException(&op);
+    FAIL() << "expected the handler's exception to propagate";
+  } catch (const std::runtime_error& e) {
+    EXPECT_STREQ(e.what(), "index 7 is out of bounds for dimension 0 with size 4");
+  }
+  OpErrorHandler::RegisterInvoker({});
 }
 
 int main(int argc, char** argv) {

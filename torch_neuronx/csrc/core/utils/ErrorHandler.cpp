@@ -347,6 +347,24 @@ OperationContextResult ErrorHandler::HandleOperationError(
   uint32_t stream_id = op->stream->stream_id;
   TORCH_NEURONX_DEBUG("Handling execution error", "stream_id=", stream_id, "op=", op->GetOpName());
 
+  // Out-of-bounds index fault: for ops with a registered error handler
+  // (register_aten(error_handler=...)), invoke the handler with a lazy context
+  // over the faulting op's inputs to raise the exact op-specific exception
+  // (e.g. scatter/index_put). The op is NOT re-run, and only the tensors the
+  // handler asks for are copied to CPU. If no handler is registered (or it does
+  // not raise), it falls through to the generic error path.
+  if (error_recovery_->ShouldSurfaceOOBException(e)) {
+    try {
+      error_recovery_->SurfaceOOBException(op);
+    } catch (...) {
+      // Caught on the worker thread (HandleOperationError must return, not
+      // throw); re-thrown at the surfacing sync as the exact Python exception.
+      RecordFirstException(stream_id, std::current_exception());
+      return OperationContextResult::CreateError(
+          "Out-of-bounds index (exact exception surfaced via op error handler)");
+    }
+  }
+
   auto recovery_status = error_recovery_->AttemptRecovery(op, e);
   if (recovery_status.IsSuccess()) {
     return recovery_status;

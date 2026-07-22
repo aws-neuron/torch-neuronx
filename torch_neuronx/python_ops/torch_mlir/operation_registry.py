@@ -28,6 +28,7 @@ def register_aten(
     validate_static_inputs: Callable | None = None,
     skip_dispatch_registration: bool = False,
     translate_args_fn: Callable | None = None,
+    error_handler: Callable | None = None,
     **kwargs,
 ):
     """
@@ -93,6 +94,17 @@ def register_aten(
         # Mark function with metadata
         func._aten_operations = operations
         func.preprocessing = preprocessing
+
+        # Register the op's error handler (general; see op_error_handlers.py).
+        # On a matching device fault the C++ error path invokes the handler
+        # (with a lazy OpErrorContext over this op's inputs) to raise the exact
+        # op-specific exception. Registered once, at import; keyed by op name (no
+        # per-call state).
+        if error_handler is not None:
+            from torch_neuronx.python_ops import op_error_handlers
+
+            for op_name in operations:
+                op_error_handlers.register(op_name, error_handler)
 
         return func
 

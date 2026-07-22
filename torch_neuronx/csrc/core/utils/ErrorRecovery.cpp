@@ -13,6 +13,7 @@
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
 
 namespace at::neuron {
 
@@ -73,6 +74,15 @@ bool ErrorRecovery::ShouldAttemptCpuFallback() { return fallback_enabled_; }
 
 OperationContextResult ErrorRecovery::ExecuteCpuFallback(OperationContext* op) {
   return cpu_fallback_executor_->ExecuteCpuFallback(op);
+}
+
+bool ErrorRecovery::ShouldSurfaceOOBException(
+    const torch_neuronx::ExecutionRuntimeException& e) const {
+  return e.HasNRTStatus() && e.GetNRTStatus() == NRT_EXEC_OOB;
+}
+
+void ErrorRecovery::SurfaceOOBException(OperationContext* op) {
+  OpErrorHandler::SurfaceException(op);
 }
 
 bool ErrorRecovery::ShouldAttemptOOMRecovery(const torch_neuronx::ExecutionRuntimeException& e) {

@@ -2,6 +2,7 @@
 
 import torch
 
+from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bounds
 from torch_neuronx.utils import skip_op_preconditions
 
 from ..operation_registry import Preprocessing, register_aten
@@ -44,6 +45,29 @@ def index_checking(tensor, indices):
                     f"index {torch.max(idx).item()} is out of bounds "
                     f"for dimension {dim} with size {size}"
                 )
+
+
+def _device_bounds_check(data, dim, index, *, wrap) -> torch.Tensor:
+    """Device bounds check (no host sync); returns the checked index.
+
+    Int32-exact, any ``dim``, any dim size. The check window is [-n, n) for wrap
+    ops (negatives accepted) or [0, n) otherwise, applied directly via the
+    kernel's lower bound (no host ``torch.where`` normalization). On an OOB fault
+    the runtime invokes the op's registered ``error_handler`` (with the op's
+    inputs reconstructed from the OperationContext) to raise the exact
+    op-specific exception; no host precondition is needed.
+
+    Issued inside the op's compute_fn: the caller MUST consume the returned
+    index (the data dependency keeps the in-graph check alive through DCE — see
+    bound_check._mask_bounds_check).
+    """
+    ndim = data.dim()
+    # 0-d (scalar) self has an effective bound of 1 (one addressable element);
+    # this also avoids a `dim % 0`. n == 0 (empty dim) is handled by the kernel
+    # (every index is out of [0, 0) -> faults).
+    n = data.shape[dim % ndim] if ndim >= 1 else 1
+
+    return assert_index_in_bounds(index, n, lo=(-n if wrap else 0))
 
 
 def _assert_no_internal_overlap(tensor, op_name=""):
@@ -149,10 +173,28 @@ def torch_gather(x, dim, index, *, sparse_grad=False, out=None):
     return torch.gather(x, dim, index)
 
 
+def _scatter_error_handler(ctx):
+    """Raise scatter's exact out-of-bounds exception. Invoked by the C++ error
+    path on an OOB device fault (see op_error_handlers.py) with a lazy context
+    over scatter's inputs (x, dim, index, value/src) — it does not re-run the
+    op. Only the index is copied to CPU; the size comes from metadata. Negatives
+    are accepted in [-size, size) to match scatter.
+    """
+    dim = ctx.scalar(1)
+    shape = ctx.shape(0)
+    size = shape[dim] if len(shape) > 0 else 1
+    index = ctx.tensor(2)
+    raise RuntimeError(
+        f"index {torch.max(index.abs()).item()} is out of "
+        f"bounds for dimension {dim} with size {size}"
+    )
+
+
 @register_aten(
     ["aten::scatter", "aten::scatter.value_out"],
     static_argnums=(1,),
     preprocessing=Preprocessing.SHAPE_ONLY,
+    error_handler=_scatter_error_handler,
 )
 def torch_scatter_value(x, dim, index, value, out=None):
     # Convert scalar to tensor with matching dtype
@@ -160,20 +202,16 @@ def torch_scatter_value(x, dim, index, value, out=None):
         value = torch.tensor(value, dtype=x.dtype, device=x.device)
 
     def torch_scatter_value_fn(x, dim, index, value, out=None):
+        # In-graph bounds check: scatter consumes the checked index (keeps the
+        # check alive through DCE, ordered before the scatter).
+        if not skip_op_preconditions():
+            index = _device_bounds_check(x, dim, index, wrap=True)
         if value.dim() == 0:
             # without expanding, we hit dimension mismatch issues
             value = value.expand_as(index)
         if value.dtype != x.dtype:
             value = value.to(x.dtype)
         return torch.scatter(x, dim, index, value)
-
-    if not skip_op_preconditions():
-        size = x.shape[dim] if x.dim() > 0 else 1
-        if torch.any(index >= size) or torch.any(index < -size):
-            raise RuntimeError(
-                f"index {torch.max(index.abs()).item()} is out of "
-                f"bounds for dimension {dim} with size {size}"
-            )
 
     return torch_scatter_value_fn, (x, dim, index, value), {"out": out}
 
@@ -189,9 +227,13 @@ def torch_scatter_value(x, dim, index, value, out=None):
     static_argnums=(1,),
     static_argnames=("reduce",),
     preprocessing=Preprocessing.SHAPE_ONLY,
+    error_handler=_scatter_error_handler,
 )
 def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     def torch_scatter_src_fn(x, dim, index, src, out=None, reduce=None):
+        # In-graph bounds check: scatter consumes the checked index.
+        if not skip_op_preconditions():
+            index = _device_bounds_check(x, dim, index, wrap=True)
         if isinstance(src, torch.Tensor) and src.dim() == 0:
             # without expanding, we hit dimension mismatch issues
             src = src.expand_as(index)
@@ -225,15 +267,6 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
             return x * multiplier
         else:
             raise RuntimeError(f"reduce argument must be either add or multiply. Got {reduce}")
-
-    # index OOB check
-    if not skip_op_preconditions():
-        size = x.shape[dim] if x.dim() > 0 else 1
-        if torch.any(index >= size) or torch.any(index < -size):
-            raise RuntimeError(
-                f"index {torch.max(index.abs()).item()} is out of "
-                f"bounds for dimension {dim} with size {size}"
-            )
 
     # handle out and reduce kwargs
     out_kwargs = {}
@@ -347,18 +380,49 @@ def _translate_index_put_args(*args, **kwargs):
     return args, kwargs
 
 
+def _index_put_error_handler(ctx):
+    """Raise index_put's exact out-of-bounds exception. Invoked by the C++ error
+    path on an OOB device fault (see op_error_handlers.py) with a lazy context
+    over index_put's inputs (x, indices, values) — it does not re-run the op.
+    Only the index tensors are copied to CPU; the sizes come from metadata.
+    Iterates the index list to report the offending dim/value; negatives are
+    accepted in [-size, size) to match index_put.
+    """
+    shape = ctx.shape(0)
+    indices = ctx.tensor_list(1)
+    for dim, idx in enumerate(indices):
+        if idx is None or not isinstance(idx, torch.Tensor) or idx.dtype == torch.bool:
+            continue
+        size = shape[dim]
+        if bool(torch.any(idx >= size)) or bool(torch.any(idx < -size)):
+            raise IndexError(
+                f"index {torch.max(idx).item()} is out of bounds "
+                f"for dimension {dim} with size {size}"
+            )
+
+
 @register_aten(
     ["aten::_index_put_impl_"],
     static_argnames=("accumulate", "unsafe", "use_masked_fill"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     translate_args_fn=_translate_index_put_args,
+    error_handler=_index_put_error_handler,
 )
 def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out=None):
     """Torch MLIR implementation of torch._index_put_impl_."""
 
-    # Perform index checking unless unsafe=True
+    # Validate index dtypes eagerly (raises before dispatch). The bounds check is
+    # fused into _index_put_fn below (in-graph), so an OOB index faults as
+    # aten::_index_put_impl_ and its error handler surfaces the exact exception.
+    # Both are skipped for unsafe=True.
     if not unsafe:
-        index_checking(x, indices)
+        for idx in indices:
+            if (
+                isinstance(idx, torch.Tensor)
+                and idx.dtype != torch.bool
+                and idx.is_floating_point()
+            ):
+                raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
 
     def can_dispatch_to_masked_fill(x, indices, values):
         """Check if index_put can be optimized to masked_fill."""
@@ -412,6 +476,13 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
             if idx is not None and isinstance(idx, torch.Tensor):
                 dim_size = x.shape[i]
                 idx = torch.where(idx < 0, idx + dim_size, idx)
+                # In-graph bounds check (post-normalization -> [0, dim_size)):
+                # index_put is a genuine scatter that consumes the index, so the
+                # check survives DCE and faults as aten::_index_put_impl_ on an
+                # OOB index; its error handler then surfaces the exact exception.
+                # Skipped for unsafe.
+                if not unsafe and not skip_op_preconditions():
+                    idx = assert_index_in_bounds(idx, dim_size, lo=0)
                 # Ensure scalar indices are properly shaped for MLIR
                 if idx.dim() == 0:
                     idx = idx.unsqueeze(0)  # Convert scalar to [1] shape

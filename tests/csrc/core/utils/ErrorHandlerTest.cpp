@@ -10,6 +10,7 @@
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/ErrorHandler.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
 
 using namespace at::neuron;
 using ::testing::_;
@@ -808,6 +809,55 @@ TEST_F(ErrorHandlerTest, HandleOperationErrorWithSeqId) {
   // Error message should contain seq_id info
   EXPECT_THAT(result.GetError(), ::testing::HasSubstr("seq_id=42"));
   EXPECT_THAT(result.GetError(), ::testing::HasSubstr("Neuron core busy"));
+}
+
+// --- Out-of-bounds error-handler branch in HandleOperationError -------------
+
+// On an NRT_EXEC_OOB fault for an op with a registered handler, the handler's
+// exact exception is recorded and re-thrown at the surfacing sync; the op is
+// NOT re-run.
+TEST_F(ErrorHandlerTest, HandleOperationErrorOOBSurfacesViaHandler) {
+  OpErrorHandler::RegisterInvoker([](const std::string&, OpErrorContext&) {
+    throw std::runtime_error("index 10 is out of bounds for dimension 0 with size 5");
+  });
+
+  auto mock_op = create_mock_operation("aten::scatter");
+  // Non-empty reconstruction context so SurfaceException invokes the handler.
+  mock_op->cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  auto result = error_handler_->HandleOperationError(mock_op.get(), oob);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_TRUE(error_handler_->has_pending_exception_);
+
+  // The recorded exception is the handler's exact one. (stream_id is only used
+  // for logging by CheckAndThrowPendingException; the first pending exception
+  // is re-thrown regardless of the id.)
+  try {
+    error_handler_->CheckAndThrowPendingException(/*stream_id=*/0, /*clear_exception=*/true);
+    FAIL() << "expected the pending exception to be re-thrown";
+  } catch (const std::runtime_error& e) {
+    EXPECT_STREQ(e.what(), "index 10 is out of bounds for dimension 0 with size 5");
+  }
+
+  OpErrorHandler::RegisterInvoker({});
+}
+
+// With no handler registered, the OOB branch is a no-op and control falls
+// through to the generic recovery path (which fails for this mock op) — no
+// handler exception is recorded.
+TEST_F(ErrorHandlerTest, HandleOperationErrorOOBNoHandlerFallsThrough) {
+  OpErrorHandler::RegisterInvoker({});  // no handler
+
+  auto mock_op = create_mock_operation("aten::scatter");
+  mock_op->cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  auto result = error_handler_->HandleOperationError(mock_op.get(), oob);
+
+  // Fell through to generic recovery, which fails for this mock operation.
+  EXPECT_FALSE(result.IsSuccess());
 }
 
 int main(int argc, char** argv) {
