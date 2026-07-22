@@ -3,7 +3,7 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "Neuron SDPA doesn't support float64. " "TODO: Once resolved, xfails will be removed."
+            "Neuron SDPA doesn't support float64. TODO: Once resolved, xfails will be removed."
         ),
         tests=[
             "DistTensorParallelExampleTest::test_transformer_req_grad_float64_thaw_all",
@@ -432,6 +432,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_utils.py::TestMedatadaIndex::test_dcp_logger",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Replicate CPU compile path is unsupported on Neuron. ReplicateTest"
+            " compiles a CPU-only model path that does not translate to the"
+            " Neuron backend."
+        ),
+        tests=[
+            "test_replicate_with_compiler.py::ReplicateTest::test_compile_cpu",
         ],
     ),
 ]
