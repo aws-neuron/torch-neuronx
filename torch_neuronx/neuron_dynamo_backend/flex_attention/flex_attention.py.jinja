@@ -7,7 +7,7 @@ import nki.language as nl
 
 from nkilib.core.utils.allocator import align_to
 from nkilib.core.utils.kernel_assert import assert_shape, kernel_assert
-from nkilib.core.utils.kernel_helpers import PSUM_BANK_SIZE, get_verified_program_sharding_info
+from nkilib.core.utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, get_verified_program_sharding_info
 from nkilib.core.utils.modular_allocator import ModularAllocator
 from nkilib.core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
@@ -1095,14 +1095,14 @@ def _allocate_attention_buffers(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * (nl.tile_size.psum_num_banks - 4) + 3) * PSUM_BANK_SIZE),
+                address=(0, ((i % 2) * (NUM_HW_PSUM_BANKS - 4) + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_flash_attn_correction_factor_psum.append(tp_flash_attn_correction_factor_psum_tile)
             tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
                 (ac.d, atp.sb_p),
                 dtype=nl.float32,
                 buffer=nl.psum,
-                address=(0, ((i % 2) * (nl.tile_size.psum_num_banks - 4) + 3) * PSUM_BANK_SIZE),
+                address=(0, ((i % 2) * (NUM_HW_PSUM_BANKS - 4) + 3) * PSUM_BANK_SIZE),
             )
             bufs.tp_exp_sum_reciprocal_psum.append(tp_exp_sum_reciprocal_psum_tile)
 
@@ -1219,14 +1219,14 @@ def _allocate_attention_buffers(
                     (mm2_n, mm2_p),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % (nl.tile_size.psum_num_banks - 4))) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (j % (NUM_HW_PSUM_BANKS - 4))) * PSUM_BANK_SIZE)),
                 )
             else:
                 mm2_psum_tile = nl.ndarray(
                     (mm2_p, mm2_n),
                     dtype=nl.float32,
                     buffer=nl.psum,
-                    address=(0, ((4 + (j % (nl.tile_size.psum_num_banks - 4))) * PSUM_BANK_SIZE)),
+                    address=(0, ((4 + (j % (NUM_HW_PSUM_BANKS - 4))) * PSUM_BANK_SIZE)),
                 )
             grp_row.append(mm2_psum_tile)
         bufs.mm2_psum.append(grp_row)
@@ -1904,7 +1904,14 @@ def _exp_impl(
             # Classify tile for exp skip (use global index for multi-section correctness)
             k_tile_idx_in_section = large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx
             k_tile_idx_global_exp = atp.num_k_tiles_per_section * sp.section_idx + k_tile_idx_in_section
-            exp_tile_type = QK_TILE_TYPES[grp_i][k_tile_idx_global_exp]
+            # num_exp_insts_per_large_tile is fixed (_LARGE_TILE_SZ // _EXP_TILE_SZ) regardless of
+            # seqlen, so a section with fewer real tiles (e.g. a single-tile section where
+            # seqlen_kv == _K_TILE_SZ) leaves phantom exp tiles whose global index is out of range
+            # for QK_TILE_TYPES. Treat those as skipped, mirroring the QK/PV guards.
+            if k_tile_idx_in_section >= atp.num_k_tiles_per_section:
+                exp_tile_type = _TILE_SKIP
+            else:
+                exp_tile_type = QK_TILE_TYPES[grp_i][k_tile_idx_global_exp]
             if exp_tile_type != _TILE_SKIP:
 
                 # Step 1: Compute exponential
