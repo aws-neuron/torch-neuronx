@@ -225,6 +225,87 @@ class TestGetConfigCache:
         assert kernel.compile.call_count == 2
         assert not hasattr(kernel.func, "_config_cache") or None not in kernel.func._config_cache
 
+    def test_file_lock_acquired_around_compile(self):
+        """Compilation for a given cache key is guarded by a cross-rank FileLock."""
+        from unittest.mock import patch
+
+        from torch_neuronx.nki_kernel import get_config
+
+        kernel = self._make_kernel()
+
+        with patch("torch_neuronx.nki_kernel.FileLock") as mock_lock:
+            get_config(kernel, x=torch.randn(1, 128))
+
+        # Lock file path is derived from the cache key; the lock must be
+        # entered before compile() runs.
+        mock_lock.assert_called_once()
+        mock_lock.return_value.__enter__.assert_called_once()
+        kernel.compile.assert_called_once()
+
+    def test_no_file_lock_when_cache_key_is_none(self):
+        """Unhashable args (cache_key=None) compile directly without a lock."""
+        from unittest.mock import patch
+
+        from torch_neuronx.nki_kernel import get_config
+
+        kernel = self._make_kernel()
+        kernel.get_cache_key.return_value = None
+
+        with patch("torch_neuronx.nki_kernel.FileLock") as mock_lock:
+            get_config(kernel, x=torch.randn(1, 128))
+
+        mock_lock.assert_not_called()
+        kernel.compile.assert_called_once()
+
+    def test_concurrent_compiles_serialize_on_lock(self, tmp_path):
+        """Two ranks compiling the same key never run compile() concurrently.
+
+        Uses a real (OS-level) FileLock over a shared cache dir and two
+        threads. compile() records how many callers are inside it at once;
+        the lock must keep that at 1. The in-memory cache is disabled
+        (_get_compile_cache -> None) so both threads bypass the pre-lock
+        shortcut and genuinely contend on the same lock file.
+        """
+        import threading
+        import time
+        from unittest.mock import patch
+
+        from torch_neuronx.nki_kernel import get_config
+
+        kernel = self._make_kernel()
+        kernel._get_compile_cache.return_value = None  # force both threads past the cache
+        kernel.get_cache_key.return_value = "shared_key"  # same key -> same lock file
+
+        inside = 0
+        max_concurrent = 0
+        state_lock = threading.Lock()
+        mock_config = kernel.compile.return_value[0]
+
+        def fake_compile(**_kwargs):
+            nonlocal inside, max_concurrent
+            with state_lock:
+                inside += 1
+                max_concurrent = max(max_concurrent, inside)
+            time.sleep(0.2)  # widen the window so an unlocked overlap would be caught
+            with state_lock:
+                inside -= 1
+            return mock_config, "shared_key"
+
+        kernel.compile = MagicMock(side_effect=fake_compile)
+
+        with patch("torch_neuronx.nki_kernel.CACHE_DIR", str(tmp_path)):
+            threads = [
+                threading.Thread(target=lambda: get_config(kernel, x=torch.randn(1, 128)))
+                for _ in range(2)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert kernel.compile.call_count == 2  # both ranks reached compile
+        assert max_concurrent == 1  # but never at the same time — the lock serialized them
+
 
 class TestCacheKeyInvalidation:
     """Test that get_cache_key changes when kernel source is modified."""

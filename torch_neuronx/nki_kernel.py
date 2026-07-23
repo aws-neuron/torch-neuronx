@@ -1,9 +1,14 @@
 """NKI kernel support for torch-neuronx (free-function get_config)."""
 
+import hashlib
+import os
 from typing import Any
 
 from nki.compiler.ncc_driver import FrameworkConfig
 from nki.framework.compiled import CompileKernel
+from torch.utils._filelock import FileLock
+
+from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
 
 
 def return_types_of(config: FrameworkConfig) -> list[tuple]:
@@ -33,8 +38,11 @@ def get_config(kernel: CompileKernel, **kwargs: Any) -> FrameworkConfig:
 
         config = get_config(kernel[grid], **meta_args)
 
-    Caching: in-memory cache keyed by NKI's cache_key avoids repeated
-    compile() calls for the same kernel+inputs combination.
+    Caching layers (checked in order):
+    1. In-memory cache keyed by NKI's cache_key.
+    2. Cross-rank file lock so only one rank compiles per unique key; the
+       rest wait on the lock and pick up the on-disk compilation cache that
+       kernel.compile() maintains internally.
     """
     cache_key = kernel.get_cache_key(**kwargs)
 
@@ -42,7 +50,25 @@ def get_config(kernel: CompileKernel, **kwargs: Any) -> FrameworkConfig:
     if dc_cache is not None and cache_key is not None and cache_key in dc_cache:
         return dc_cache[cache_key]
 
-    config, _ = kernel.compile(**kwargs)
+    # Cross-rank coordination: serialize compilation of a given key across
+    # ranks so only one rank performs the (potentially expensive) NKI
+    # compile; the others block on the lock and then hit kernel.compile()'s
+    # own persistent cache.
+    #
+    # NOTE: kernel.get_cache_key() currently derives the key by calling
+    # compile() internally, so the first compile happens before the lock is
+    # taken. This lock therefore only fully serializes ranks once NKI makes
+    # get_cache_key() a cheap, compile-free operation.
+    if cache_key is not None:
+        lock_path = os.path.join(
+            CACHE_DIR, hashlib.sha256(cache_key.encode()).hexdigest() + ".lock"
+        )
+        with FileLock(lock_path, timeout=1800):
+            # NOTE: We rely on NKI's persistent cache to handle picking up the
+            # result of the kernel compile from another rank
+            config, _ = kernel.compile(**kwargs)
+    else:
+        config, _ = kernel.compile(**kwargs)
 
     if dc_cache is not None and cache_key is not None:
         dc_cache[cache_key] = config
