@@ -1,5 +1,6 @@
 #include "OperationExecutionEngine.h"
 
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -235,7 +236,13 @@ OperationExecutionEngine::OperationExecutionEngine(CompilationCache* compilation
   // Start the runtime worker thread. The host worker pool is created lazily on
   // first kHost dispatch (EnsureHostWorkerPool), not here.
   try {
-    completion_efd_ = eventfd(0, EFD_CLOEXEC);
+    // EFD_NONBLOCK so the worker can fully drain the counter before parking:
+    // completion_efd_ is a coalescing counter shared by submission writes
+    // (NotifyExecutionReady) and NRT completion signals. A single blocking read
+    // drains an unknown number of accumulated wakes at once, so a coalesced read
+    // could consume the wake meant for a still-pending op and the worker would
+    // re-park forever (missed-wakeup deadlock seen at training steady state).
+    completion_efd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     TORCH_CHECK(completion_efd_ >= 0, "Failed to create eventfd for runtime worker");
 
     runtime_thread_ = std::thread(&OperationExecutionEngine::RuntimeWorker, this);
@@ -489,14 +496,40 @@ void OperationExecutionEngine::RuntimeWorker() {
       RegisterCompletionEvents();
     }
 
-    // Block until NRT signals completion or new work arrives
+    // Block until NRT signals completion or new work arrives. completion_efd_ is
+    // a coalescing counter (EFD_NONBLOCK) shared by submission writes and NRT
+    // completion signals, so a single read drains an unknown number of wakes.
+    // Drain it fully and only actually park (poll) when it is truly empty: a read
+    // that returns a count means something happened — fall through to re-scan
+    // rather than risk consuming a coalesced wake meant for a still-pending op.
+    // Any WriteEventfd racing the check-then-park window leaves the counter > 0,
+    // so the read returns it (no park) and the worker re-scans.
     auto sleep_start = std::chrono::steady_clock::now();
     uint64_t count;
-    while (::read(completion_efd_, &count, sizeof(count)) == -1) {
-      if (errno == EINTR) continue;
-      if (shutdown_requested_.load(std::memory_order_acquire)) break;
+    ssize_t r = ::read(completion_efd_, &count, sizeof(count));
+    if (r == -1 && errno == EAGAIN) {
+      // Counter empty: nothing pending right now. Park on poll() until a write
+      // arrives, then loop back to re-scan + re-drain. Use a bounded timeout as
+      // a safety net: NRT device-completion signals are registered one-shot per
+      // stream (RegisterSeqCompletion's last_registered_efd_seq_ guard), so a
+      // completion that fires for an already-registered seq, or any signal that
+      // races/coalesces against the check-then-park window, could otherwise be
+      // lost and hang an op FIFO-blocked behind it forever. Waking periodically
+      // routes back through CheckCompletions() (which polls NRT state directly,
+      // independent of the eventfd), bounding worst-case wake latency to the
+      // timeout instead of deadlocking. The eventfd remains the fast path.
+      static constexpr int kRuntimeWorkerPollTimeoutMs = 50;
+      struct pollfd pfd {
+        completion_efd_, POLLIN, 0
+      };
+      while (::poll(&pfd, 1, kRuntimeWorkerPollTimeoutMs) == -1) {
+        if (errno == EINTR) continue;
+        if (shutdown_requested_.load(std::memory_order_acquire)) break;
+        TORCH_NEURONX_ERROR("poll on completion_efd_ failed: ", strerror(errno));
+        break;
+      }
+    } else if (r == -1 && errno != EINTR && !shutdown_requested_.load(std::memory_order_acquire)) {
       TORCH_NEURONX_ERROR("read from completion_efd_ failed: ", strerror(errno));
-      break;
     }
     if (auto* buffer = at::neuron::getActiveProfilerBuffer()) {
       at::neuron::RuntimeSleepEvent sleep_evt;
