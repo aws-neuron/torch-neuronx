@@ -1,7 +1,9 @@
 """NKI kernel support for torch-neuronx (free-function get_config)."""
 
+import functools
 import hashlib
 import os
+import warnings
 from typing import Any
 
 from nki.compiler.ncc_driver import FrameworkConfig
@@ -9,6 +11,20 @@ from nki.framework.compiled import CompileKernel
 from torch.utils._filelock import FileLock
 
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_trace_cache_once() -> None:
+    """Emit a one-time (per-process) warning when the NKI trace cache is on."""
+    if os.environ.get("NKI_ENABLE_TRACE_CACHE", "1") == "1":
+        warnings.warn(
+            "NKI_ENABLE_TRACE_CACHE=1: the NKI kernel compile cache is persisted "
+            "across processes. The caching process may not capture all kernel "
+            "environment dependencies or non-argument values and can yield stale "
+            "cache hits; see the torch-neuronx environment variables documentation "
+            "for details. Set NKI_ENABLE_TRACE_CACHE=0 to disable.",
+            stacklevel=2,
+        )
 
 
 def return_types_of(config: FrameworkConfig) -> list[tuple]:
@@ -44,6 +60,8 @@ def get_config(kernel: CompileKernel, **kwargs: Any) -> FrameworkConfig:
        rest wait on the lock and pick up the on-disk compilation cache that
        kernel.compile() maintains internally.
     """
+    _warn_trace_cache_once()
+
     cache_key = kernel.get_cache_key(**kwargs)
 
     dc_cache = _get_config_cache(kernel)
