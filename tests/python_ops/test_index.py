@@ -142,10 +142,6 @@ class TestIndexRegistration:
             torch.testing.assert_close(result.cpu(), expected)
             assert_op_runs_on_neuron("index")
 
-    @pytest.mark.xfail(
-        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
-        reason="Need to update the op logging for sync mode for short-circuited tests",
-    )
     @pytest.mark.parametrize(
         "shape",
         [
@@ -155,7 +151,12 @@ class TestIndexRegistration:
         ],
     )
     def test_boolean_mask_all_false(self, shape):
-        """Test boolean mask indexing where all mask values are False"""
+        """Test full-rank boolean mask indexing where all mask values are False.
+
+        The empty result must preserve PyTorch's shape contract: x[mask] with a
+        full-shape mask flattens to (0,). The empty case flows through the normal
+        index lowering (no hardcoded {0} short-circuit), so `index` runs.
+        """
         x_cpu = torch.randn(shape)
         mask_cpu = torch.zeros(shape, dtype=torch.bool)
         expected = x_cpu[mask_cpu]
@@ -164,9 +165,36 @@ class TestIndexRegistration:
             x = x_cpu.to(device="neuron")
             mask = mask_cpu.to(device="neuron")
             result = x[mask]
+            assert result.shape == expected.shape, f"{result.shape} != {expected.shape}"
             torch.testing.assert_close(result.cpu(), expected)
-            assert_op_did_not_run_on_neuron("index")
-            assert_op_runs_on_neuron("nonzero")
+            assert_op_runs_on_neuron("index")
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 5),
+            (3, 4, 5),
+        ],
+    )
+    def test_boolean_mask_all_false_preserves_trailing_dims(self, shape):
+        """All-False 1-D mask over dim 0 must keep the un-indexed trailing dims.
+
+        Regression for a rank collapse where x[all_false_mask] on a [N, *trailing]
+        tensor returned (0,) instead of (0, *trailing) — the empty-index branch
+        hardcoded torch::empty({0}) and dropped the trailing dims. This broke any
+        downstream op assuming the result rank (e.g. perplexity's gather(dim=1)).
+        """
+        x_cpu = torch.randn(shape)
+        mask_cpu = torch.zeros(shape[0], dtype=torch.bool)  # 1-D mask over dim 0 only
+        expected = x_cpu[mask_cpu]  # CPU: (0, *shape[1:])
+
+        with track_neuron_ops():
+            x = x_cpu.to(device="neuron")
+            mask = mask_cpu.to(device="neuron")
+            result = x[mask]
+            assert result.shape == expected.shape, f"{result.shape} != {expected.shape}"
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("index")
 
     @assert_raises(IndexError, match=r"index .* is out of bounds for dimension 0 with size 4")
     def test_out_of_bounds_indexing_raises_error(self):

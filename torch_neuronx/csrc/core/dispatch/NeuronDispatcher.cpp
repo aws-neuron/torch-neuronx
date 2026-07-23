@@ -1509,22 +1509,13 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
       TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] converted boolean indices to integer",
                                    " op=", op_name, " num_converted_indices=", converted.size());
 
-      // Check for empty indices after conversion (e.g., all-false boolean mask).
-      // Return empty result without executing the kernel.
-      bool has_empty_index = false;
-      for (size_t i = 0; i < converted.size(); ++i) {
-        auto elem = converted.get(i);
-        if (elem.has_value() && elem->defined() && elem->numel() == 0) {
-          has_empty_index = true;
-          break;
-        }
-      }
-      if (has_empty_index) {
-        auto self = args[0].toTensor();
-        auto result = torch::empty({0}, self.options());
-        torch::jit::push(*stack, result);
-        return;
-      }
+      // NOTE: empty converted indices (e.g. an all-false boolean mask) are NOT
+      // special-cased here. A hardcoded `torch::empty({0}, ...)` short-circuit
+      // would collapse the un-indexed trailing dims — x[63,8] indexed by an
+      // all-false [63] mask must yield [0, 8], not [0]. Instead the empty case
+      // flows through the normal lowering pipeline, which infers the correct
+      // shape from original_output_specs and skips compilation/NRT for the
+      // zero-sized output — the same path the empty-integer-index case uses.
     }
   }
 
