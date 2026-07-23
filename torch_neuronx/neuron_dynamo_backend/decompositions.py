@@ -5899,6 +5899,324 @@ def put_inplace_decomp(self, index, source, accumulate=False):
     return self
 
 
+# ── Factory ``.out`` variants: full_like / ones_like / zeros_like / new_full /
+#    new_ones / new_zeros ─────────────────────────────────────────────────
+# PyTorch's ``torch._subclasses.fake_impls.constructors()`` handler catches
+# every factory op (including the ``.out`` variants) and injects
+# ``device=meta`` into the kwargs before re-dispatching. The ``.default``
+# variants declare a ``device`` kwarg in their schema, so the injection is
+# harmless; the ``.out`` variants don't (they inherit device from ``out=``),
+# so the extra kwarg fails schema validation during Dynamo FakeTensor
+# propagation:
+#
+#     RuntimeError: aten::<op>() expected at most N argument(s) but received
+#     N+1 argument(s). Declaration: aten::<op>.out(...)
+#
+# Because the bug lives inside FakeTensor's own dispatch, neither
+# ``register_meta`` / ``py_kernels[Meta]`` nor ``register_decomposition``
+# fixes it — the buggy handler runs before either kicks in. Overwriting
+# ``fake_impls.op_implementations_dict`` with a routing wrapper that calls
+# the ``.default`` variant (which ``constructors()`` handles correctly) and
+# drops the ``out=`` kwarg is the workable path.
+#
+# We still register a decomposition on ``neuron_decompositions`` so that
+# once the FakeTensor probe succeeds, AOT autograd lowers the ``.out`` call
+# to a plain ``out.copy_(<functional_result>)`` sequence that the Neuron
+# backend can compile end-to-end.
+
+
+def _factory_out_decomp_full_like(self, fill_value, *, memory_format=None, out):
+    result = torch.full_like(self, fill_value, memory_format=memory_format)
+    return out.copy_(result)
+
+
+def _factory_out_decomp_ones_like(self, *, memory_format=None, out):
+    return out.copy_(torch.ones_like(self, memory_format=memory_format))
+
+
+def _factory_out_decomp_zeros_like(self, *, memory_format=None, out):
+    return out.copy_(torch.zeros_like(self, memory_format=memory_format))
+
+
+def _factory_out_decomp_new_full(self, size, fill_value, *, out):
+    return out.copy_(self.new_full(size, fill_value))
+
+
+def _factory_out_decomp_new_ones(self, size, *, out):
+    return out.copy_(self.new_ones(size))
+
+
+def _factory_out_decomp_new_zeros(self, size, *, out):
+    return out.copy_(self.new_zeros(size))
+
+
+def _factory_out_fake_impl(fake_mode, func, self, *args, **kwargs):
+    """FakeTensor op impl for factory ``.out`` overloads.
+
+    Routes the ``.out`` call to the corresponding ``.default`` variant (whose
+    ``constructors()`` dispatch is intact) and drops the ``out=`` kwarg —
+    Dynamo needs only the returned FakeTensor's shape/dtype, and AOT
+    autograd's decomposition (registered below on ``neuron_decompositions``)
+    then rewrites ``.out`` to ``out.copy_(<default_result>)`` for lowering.
+    Sidesteps the fake_impls.constructors() bug that unconditionally injects
+    ``device=meta`` into kwargs the ``.out`` schema doesn't accept.
+    """
+    kwargs.pop("out", None)
+    default_op = func.overloadpacket.default
+    return default_op(self, *args, **kwargs)
+
+
+from torch._subclasses import fake_impls as _fake_impls
+
+for _op, _decomp_fn in (
+    (aten.full_like.out, _factory_out_decomp_full_like),
+    (aten.ones_like.out, _factory_out_decomp_ones_like),
+    (aten.zeros_like.out, _factory_out_decomp_zeros_like),
+    (aten.new_full.out, _factory_out_decomp_new_full),
+    (aten.new_ones.out, _factory_out_decomp_new_ones),
+    (aten.new_zeros.out, _factory_out_decomp_new_zeros),
+):
+    # 1. Fix FakeTensor propagation (Dynamo trace stage). Overwrite in place
+    #    — ``register_op_impl`` refuses duplicates and the pre-existing entry
+    #    routes to the buggy ``constructors()`` handler.
+    _fake_impls.op_implementations_dict[_op] = _factory_out_fake_impl
+    # 2. Provide AOT autograd with a decomposition that produces a lowerable
+    #    ``.default + copy_`` sequence for the Neuron backend.
+    neuron_decompositions[_op] = _decomp_fn
+
+
+# ── _foreach_addc{div,mul}.Tensor / .Tensor_out / _.Tensor  ─────────────
+# The ``.Tensor`` foreach overloads take a real ``scalars: Tensor`` argument
+# whose meta kernel asserts ``scalars.device == cpu``. Under Dynamo
+# FakeTensor propagation every input lives on ``meta``, so the assertion
+# always fires:
+#
+#     RuntimeError: Expected scalars to be on CPU, got meta instead.
+#
+# The check belongs at kernel runtime, not at meta / FakeTensor time —
+# ``scalars`` carries per-element scale metadata, not compute data — so this
+# is an upstream PyTorch bug in the meta kernel.
+#
+# Fix: register FakeTensor op impls that construct outputs from the input
+# tensor list (same shape/dtype) instead of dispatching to the buggy meta,
+# and register decompositions that expand the vectorized call into per-index
+# elementwise arithmetic (``self_i + scalars[i] * (t1_i / t2_i)`` /
+# ``... * (t1_i * t2_i)``) so the Neuron backend can lower them.
+
+
+def _foreach_addc_tensor_fake_impl(fake_mode, func, self, *args, **kwargs):
+    """FakeTensor impl for ``_foreach_addc{div,mul}.Tensor`` overloads.
+
+    Sidesteps the meta's ``scalars.device == cpu`` check by never calling
+    into it. Output shape/dtype matches ``self`` element-wise; the
+    ``.Tensor_out`` and ``_.Tensor`` mutating variants have a unit return
+    type ``()``.
+    """
+    schema = func._schema
+    if not schema.returns:
+        return None
+    if "out" in kwargs:
+        return kwargs["out"]
+    return [torch.empty_like(t) for t in self]
+
+
+for _op in (
+    aten._foreach_addcdiv.Tensor,
+    aten._foreach_addcdiv.Tensor_out,
+    aten._foreach_addcdiv_.Tensor,
+    aten._foreach_addcmul.Tensor,
+    aten._foreach_addcmul.Tensor_out,
+    aten._foreach_addcmul_.Tensor,
+):
+    _fake_impls.op_implementations_dict[_op] = _foreach_addc_tensor_fake_impl
+
+
+def _foreach_addcdiv_tensor_decomp(self, tensor1, tensor2, scalars):
+    """``self_i + scalars[i] * (tensor1_i / tensor2_i)`` per index."""
+    return [
+        s + scalars[i] * (t1 / t2)
+        for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True))
+    ]
+
+
+def _foreach_addcmul_tensor_decomp(self, tensor1, tensor2, scalars):
+    """``self_i + scalars[i] * (tensor1_i * tensor2_i)`` per index."""
+    return [
+        s + scalars[i] * (t1 * t2)
+        for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True))
+    ]
+
+
+def _foreach_addcdiv_tensor_out_decomp(self, tensor1, tensor2, scalars, *, out):
+    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True)):
+        out[i].copy_(s + scalars[i] * (t1 / t2))
+
+
+def _foreach_addcmul_tensor_out_decomp(self, tensor1, tensor2, scalars, *, out):
+    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True)):
+        out[i].copy_(s + scalars[i] * (t1 * t2))
+
+
+def _foreach_addcdiv_inplace_tensor_decomp(self, tensor1, tensor2, scalars):
+    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True)):
+        s.add_(scalars[i] * (t1 / t2))
+
+
+def _foreach_addcmul_inplace_tensor_decomp(self, tensor1, tensor2, scalars):
+    for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=True)):
+        s.add_(scalars[i] * (t1 * t2))
+
+
+for _op, _decomp_fn in (
+    (aten._foreach_addcdiv.Tensor, _foreach_addcdiv_tensor_decomp),
+    (aten._foreach_addcdiv.Tensor_out, _foreach_addcdiv_tensor_out_decomp),
+    (aten._foreach_addcdiv_.Tensor, _foreach_addcdiv_inplace_tensor_decomp),
+    (aten._foreach_addcmul.Tensor, _foreach_addcmul_tensor_decomp),
+    (aten._foreach_addcmul.Tensor_out, _foreach_addcmul_tensor_out_decomp),
+    (aten._foreach_addcmul_.Tensor, _foreach_addcmul_inplace_tensor_decomp),
+):
+    neuron_decompositions[_op] = _decomp_fn
+
+
+# ── _foreach_{clamp_max,clamp_min,lerp,maximum,minimum,pow}.ScalarList[_out|_]
+# ────────────────────────────────────────────────────────────────────────
+# Every ``.ScalarList`` foreach overload has a ``Scalar[]`` argument, which
+# torch-mlir's FX importer can't lower because ``TORCH_TYPE_TO_PY_TYPE`` in
+# ``fx_importer.py`` has no entry for ``torch.NumberType``. The importer
+# raises
+#
+#     KeyError: <class 'torch.NumberType'>
+#
+# which the Neuron backend wraps as
+#
+#     RuntimeError: Neuron backend NEFF execution setup failed with
+#     unexpected error: <class 'torch.NumberType'>
+#
+# FakeTensor propagation and AOT tracing both succeed for these ops (verified
+# via ``torch.compile(backend="aot_eager")``); the failure is strictly in
+# the StableHLO import path. Decomposing each vectorized ScalarList call
+# into per-index elementwise ops with a plain Python scalar argument avoids
+# the unlowerable ``!torch.list<number>`` operand entirely — the resulting
+# per-index ops (``clamp.Scalar``, ``pow.Scalar``, ``lerp.Scalar``,
+# ``maximum``, ``minimum``) lower cleanly.
+
+
+# clamp_max / clamp_min: element-wise clamp with per-tensor scalar bound.
+
+
+def _foreach_clamp_max_scalarlist_decomp(self, scalars):
+    return [t.clamp(max=s) for t, s in zip(self, scalars, strict=True)]
+
+
+def _foreach_clamp_min_scalarlist_decomp(self, scalars):
+    return [t.clamp(min=s) for t, s in zip(self, scalars, strict=True)]
+
+
+def _foreach_clamp_max_scalarlist_out_decomp(self, scalars, *, out):
+    for i, (t, s) in enumerate(zip(self, scalars, strict=True)):
+        out[i].copy_(t.clamp(max=s))
+
+
+def _foreach_clamp_min_scalarlist_out_decomp(self, scalars, *, out):
+    for i, (t, s) in enumerate(zip(self, scalars, strict=True)):
+        out[i].copy_(t.clamp(min=s))
+
+
+def _foreach_clamp_max_inplace_scalarlist_decomp(self, scalars):
+    for t, s in zip(self, scalars, strict=True):
+        t.clamp_(max=s)
+
+
+def _foreach_clamp_min_inplace_scalarlist_decomp(self, scalars):
+    for t, s in zip(self, scalars, strict=True):
+        t.clamp_(min=s)
+
+
+# lerp: linear interpolation with per-index scalar weight.
+# torch.lerp(start, end, weight) = start + weight * (end - start).
+
+
+def _foreach_lerp_scalarlist_decomp(self, tensors1, weight):
+    return [torch.lerp(s, e, w) for s, e, w in zip(self, tensors1, weight, strict=True)]
+
+
+def _foreach_lerp_scalarlist_out_decomp(self, tensors1, weight, *, out):
+    for i, (s, e, w) in enumerate(zip(self, tensors1, weight, strict=True)):
+        out[i].copy_(torch.lerp(s, e, w))
+
+
+def _foreach_lerp_inplace_scalarlist_decomp(self, tensors1, weight):
+    for s, e, w in zip(self, tensors1, weight, strict=True):
+        s.lerp_(e, w)
+
+
+# maximum / minimum: element-wise binary max/min against a per-tensor scalar.
+# torch.maximum / minimum require two tensors, so we broadcast the scalar
+# via torch.full_like — preserves NaN propagation semantics.
+#
+# We register the ``.ScalarList`` (functional) variant even though only
+# ``.ScalarList_out`` is a coverage target: AOT autograd's functionalization
+# pass rewrites ``.ScalarList_out(..., out=X)`` into a functional
+# ``.ScalarList(...)`` call followed by ``X.copy_(...)``, so it's the
+# functional decomp that actually fires during lowering.
+
+
+def _foreach_maximum_scalarlist_decomp(self, scalars):
+    return [torch.maximum(t, torch.full_like(t, s)) for t, s in zip(self, scalars, strict=True)]
+
+
+def _foreach_minimum_scalarlist_decomp(self, scalars):
+    return [torch.minimum(t, torch.full_like(t, s)) for t, s in zip(self, scalars, strict=True)]
+
+
+def _foreach_maximum_scalarlist_out_decomp(self, scalars, *, out):
+    for i, (t, s) in enumerate(zip(self, scalars, strict=True)):
+        out[i].copy_(torch.maximum(t, torch.full_like(t, s)))
+
+
+def _foreach_minimum_scalarlist_out_decomp(self, scalars, *, out):
+    for i, (t, s) in enumerate(zip(self, scalars, strict=True)):
+        out[i].copy_(torch.minimum(t, torch.full_like(t, s)))
+
+
+# pow: element-wise power with per-tensor scalar exponent.
+
+
+def _foreach_pow_scalarlist_decomp(self, exponent):
+    return [torch.pow(t, e) for t, e in zip(self, exponent, strict=True)]
+
+
+def _foreach_pow_scalarlist_out_decomp(self, exponent, *, out):
+    for i, (t, e) in enumerate(zip(self, exponent, strict=True)):
+        out[i].copy_(torch.pow(t, e))
+
+
+def _foreach_pow_inplace_scalarlist_decomp(self, exponent):
+    for t, e in zip(self, exponent, strict=True):
+        t.pow_(e)
+
+
+for _op, _decomp_fn in (
+    (aten._foreach_clamp_max.ScalarList, _foreach_clamp_max_scalarlist_decomp),
+    (aten._foreach_clamp_max.ScalarList_out, _foreach_clamp_max_scalarlist_out_decomp),
+    (aten._foreach_clamp_max_.ScalarList, _foreach_clamp_max_inplace_scalarlist_decomp),
+    (aten._foreach_clamp_min.ScalarList, _foreach_clamp_min_scalarlist_decomp),
+    (aten._foreach_clamp_min.ScalarList_out, _foreach_clamp_min_scalarlist_out_decomp),
+    (aten._foreach_clamp_min_.ScalarList, _foreach_clamp_min_inplace_scalarlist_decomp),
+    (aten._foreach_lerp.ScalarList, _foreach_lerp_scalarlist_decomp),
+    (aten._foreach_lerp.ScalarList_out, _foreach_lerp_scalarlist_out_decomp),
+    (aten._foreach_lerp_.ScalarList, _foreach_lerp_inplace_scalarlist_decomp),
+    (aten._foreach_maximum.ScalarList, _foreach_maximum_scalarlist_decomp),
+    (aten._foreach_maximum.ScalarList_out, _foreach_maximum_scalarlist_out_decomp),
+    (aten._foreach_minimum.ScalarList, _foreach_minimum_scalarlist_decomp),
+    (aten._foreach_minimum.ScalarList_out, _foreach_minimum_scalarlist_out_decomp),
+    (aten._foreach_pow.ScalarList, _foreach_pow_scalarlist_decomp),
+    (aten._foreach_pow.ScalarList_out, _foreach_pow_scalarlist_out_decomp),
+    (aten._foreach_pow_.ScalarList, _foreach_pow_inplace_scalarlist_decomp),
+):
+    neuron_decompositions[_op] = _decomp_fn
+
+
 def get_decomposition_table(decompose_all: bool = False) -> dict:
     """Get the decomposition table for the Neuron backend.
 
