@@ -24,7 +24,7 @@ from nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib.core.attention.attention_cte import attention_cte
 from torch._decomp import get_decompositions
 
-from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool, _getenv_int
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
 )
@@ -70,6 +70,12 @@ from torch_neuronx.utils import get_logical_neuron_cores
 
 wrapped_flash_fwd = wrap_nki(attention_cte)
 wrapped_flash_bwd = wrap_nki(attention_bwd)
+
+from torch_neuronx.python_ops.nki_kernels.embedding_dense_backward_nki import (
+    embedding_dense_backward_nki as _embedding_dense_backward_nki_kernel,
+)
+
+wrapped_embedding_dense_backward_nki = wrap_nki(_embedding_dense_backward_nki_kernel)
 
 # Build the base decomposition table from standard PyTorch decompositions
 # for ops that are not supported by the backend (yet)
@@ -1840,6 +1846,72 @@ def slice_backward_decomposition(grad_output, input_sizes, dim, start, end, step
     return torch.ops.aten.constant_pad_nd.default(grad_output, pad, 0)
 
 
+def _argsort_via_topk(x):
+    """Ascending argsort of a 1D tensor via topk (sort/argsort don't lower on Neuron;
+    topk does). Unstable, but callers only need equal values contiguous. (PR #1116.)"""
+    return torch.topk(x, x.shape[0], largest=False, sorted=True)[1]
+
+
+def _embedding_dense_backward_index_add(
+    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+):
+    """Small-table path: fp32 index_add into an [E, D] accumulator."""
+    embed_dim = grad_output.shape[-1]
+    indices_flat = indices.reshape(-1).to(torch.int64)
+    grad_flat = grad_output.reshape(-1, embed_dim).to(torch.float32)
+
+    if scale_grad_by_freq:
+        counts = torch.zeros(num_weights, dtype=torch.float32, device=grad_flat.device)
+        ones = torch.ones_like(indices_flat, dtype=torch.float32)
+        counts = counts.index_add(0, indices_flat, ones)
+        counts = torch.clamp(counts, min=1.0)
+        grad_flat = grad_flat * (1.0 / counts)[indices_flat].unsqueeze(-1)
+
+    # Zero out gradients for padding positions
+    if padding_idx >= 0:
+        mask = (indices_flat != padding_idx).unsqueeze(-1).to(grad_flat.dtype)
+        grad_flat = grad_flat * mask
+
+    grad_weight = torch.zeros(num_weights, embed_dim, dtype=torch.float32, device=grad_flat.device)
+    grad_weight = grad_weight.index_add(0, indices_flat, grad_flat)
+    return grad_weight.to(grad_output.dtype)
+
+
+def _embedding_dense_backward_nki(
+    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+):
+    """Large-table path: per-tile-dedup NKI scatter; bounds scratchpad to small tiles."""
+    embed_dim = grad_output.shape[-1]
+    indices_flat = indices.reshape(-1).to(torch.int64)
+    grad_flat = grad_output.reshape(-1, embed_dim)
+
+    if scale_grad_by_freq:
+        counts = torch.zeros(num_weights, dtype=torch.float32, device=grad_flat.device)
+        ones = torch.ones_like(indices_flat, dtype=torch.float32)
+        counts = counts.index_add(0, indices_flat, ones)
+        counts = torch.clamp(counts, min=1.0)
+        grad_flat = grad_flat * (1.0 / counts)[indices_flat].unsqueeze(-1).to(grad_flat.dtype)
+
+    # Zero out gradients for padding positions
+    if padding_idx >= 0:
+        mask = (indices_flat != padding_idx).unsqueeze(-1).to(grad_flat.dtype)
+        grad_flat = grad_flat * mask
+
+    # Sort so each index's duplicates are contiguous (the kernel dedups within a tile
+    # and carries the running sum across tile boundaries). int32 indices for the
+    # kernel's indirect addressing (vocab fits int32).
+    order = _argsort_via_topk(indices_flat)
+    idx_i32 = indices_flat[order].to(torch.int32)
+    src = grad_flat[order].contiguous()
+
+    # D-shard the [E, D] table across logical cores (each owns a disjoint column
+    # slice). Fall back to single shard if embed_dim is not divisible by the core
+    # count (the kernel splits D evenly).
+    logical_neuron_cores = int(get_logical_neuron_cores())
+    grid = (logical_neuron_cores,) if embed_dim % logical_neuron_cores == 0 else (1,)
+    return wrapped_embedding_dense_backward_nki[grid](num_weights, idx_i32, src)
+
+
 @register_decomposition([aten.embedding_dense_backward.default])
 def embedding_dense_backward_decomposition(
     grad_output: torch.Tensor,
@@ -1848,29 +1920,21 @@ def embedding_dense_backward_decomposition(
     padding_idx: int,
     scale_grad_by_freq: bool,
 ) -> torch.Tensor:
-    """Decompose embedding_dense_backward using one-hot + tensordot."""
+    """Decompose embedding_dense_backward, dispatching on the [E, D] table size.
+
+    Small [E, D]: fp32 index_add. Large: the bounded-scratchpad NKI kernel. Threshold
+    (E*D elements) overridable via TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD; default
+    2**28 = a 1GB fp32 [E, D] index_add accumulator.
+    """
+    threshold = _getenv_int("TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD", 2**28)
     embed_dim = grad_output.shape[-1]
-    indices_flat = indices.reshape(-1).to(torch.int64)
-    grad_flat = grad_output.reshape(-1, embed_dim)
-
-    # Handle scale_grad_by_freq
-    if scale_grad_by_freq:
-        one_hot_counts = torch.nn.functional.one_hot(indices_flat, num_weights).to(grad_flat.dtype)
-        counts = one_hot_counts.sum(dim=0)
-        counts = torch.clamp(counts, min=1.0)
-        scale = 1.0 / counts
-        grad_flat = grad_flat * scale[indices_flat].unsqueeze(-1)
-
-    # Zero out gradients for padding positions
-    if padding_idx >= 0:
-        mask = (indices_flat != padding_idx).unsqueeze(-1).to(grad_flat.dtype)
-        grad_flat = grad_flat * mask
-
-    # scatter-add
-    indices_one_hot = torch.nn.functional.one_hot(indices_flat, num_weights).to(grad_flat.dtype)
-    grad_weight = torch.tensordot(indices_one_hot, grad_flat, dims=([0], [0]))
-
-    return grad_weight
+    if num_weights * embed_dim <= threshold:
+        return _embedding_dense_backward_index_add(
+            grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+        )
+    return _embedding_dense_backward_nki(
+        grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+    )
 
 
 @register_decomposition([aten.linear_backward])
