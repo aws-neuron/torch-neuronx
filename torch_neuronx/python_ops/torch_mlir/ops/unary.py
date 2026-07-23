@@ -142,6 +142,56 @@ def torch_asinh(x, out=None):
     return torch.asinh(x)
 
 
+def _validate_atan(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    atan promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::atan", "aten::atan.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_atan,
+)
+def torch_atan(x, out=None):
+    """Inverse tangent (arctan) — elementwise transcendental."""
+    return torch.atan(x)
+
+
+def _validate_atanh(x, out=None):
+    """Reject an out= tensor whose dtype can't hold the float result.
+
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    atanh promotes integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
+    if out is not None and out.dtype != expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
+        )
+
+
+@register_aten(
+    ["aten::atanh", "aten::atanh.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_atanh,
+)
+def torch_atanh(x, out=None):
+    """Inverse hyperbolic tangent — elementwise transcendental."""
+    return torch.atanh(x)
+
+
 @register_aten(["aten::exp", "aten::exp.out"])
 def torch_exp(x, out=None):
     return torch.exp(x)
