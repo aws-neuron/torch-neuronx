@@ -8,6 +8,7 @@ from torch_neuronx.python_ops.nki_kernels.rng_state import (
     eager_rand,
     get_rng_state,
     rand,
+    randint,
     set_rng_state,
 )
 
@@ -101,6 +102,46 @@ class TestRngState:
         out2 = rand(ref, [128])
 
         torch.testing.assert_close(out1, out2)
+
+
+class TestEmptyShape:
+    """Zero-element outputs must skip the NKI kernel (it requires every
+    dimension > 0) and return a correctly-shaped empty tensor.
+
+    Regression: ``torch.randn(0, 5)`` (e.g. from ``torch.cat([torch.randn(r, 5)
+    for r in range(3)])``) previously hit ``AssertionError: shape must be a
+    tuple of positive integers, got: torch.Size([1, 0])`` when the seeded
+    on-device RNG allocated a ``(1, total=0)`` buffer and handed it to the
+    kernel.
+    """
+
+    @pytest.mark.parametrize("shape", [[0, 5], [3, 0], [0], [2, 0, 4]])
+    def test_rand_empty(self, shape):
+        ref = torch.empty(1, device="neuron")
+        out = rand(ref, shape)
+        assert out.shape == torch.Size(shape)
+        assert out.numel() == 0
+        assert out.dtype == torch.float32
+
+    def test_rand_empty_dtype(self):
+        ref = torch.empty(1, device="neuron")
+        out = rand(ref, [0, 5], dtype=torch.bfloat16)
+        assert out.shape == torch.Size([0, 5])
+        assert out.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("shape", [[0, 5], [3, 0], [0]])
+    def test_eager_rand_empty(self, shape):
+        ref = torch.empty(1, device="neuron")
+        out = eager_rand(ref, shape)
+        assert out.shape == torch.Size(shape)
+        assert out.numel() == 0
+
+    @pytest.mark.parametrize("shape", [[0, 5], [3, 0], [0]])
+    def test_randint_empty(self, shape):
+        ref = torch.empty(1, device="neuron")
+        out = randint(ref, 0, 10, shape)
+        assert out.shape == torch.Size(shape)
+        assert out.numel() == 0
 
 
 class TestManualSeed:
