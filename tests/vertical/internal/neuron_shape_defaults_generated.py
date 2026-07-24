@@ -633,8 +633,13 @@ def register_all_defaults(r):
         {
             "grad_out": (4, 64, 4096),
             "input": (4, 64, 4096),
-            "mean": (4, 4, 1),
-            "rstd": (4, 4, 1),
+            # mean/rstd carry per-group stats with shape (N, group). PyTorch's
+            # meta_native_group_norm_backward (torch/_meta_registrations.py)
+            # rejects the (N, group, 1) shape a previous entry used with
+            # ``Expect mean to have shape (N, group)``, which the harness then
+            # surfaces as a Dynamo FakeTensor RuntimeError. Verified 2026-07-20.
+            "mean": (4, 4),
+            "rstd": (4, 4),
             "weight": (64,),
             "N": 4,
             "C": 64,
@@ -2955,8 +2960,13 @@ def register_all_defaults(r):
     r(
         "aten::_grouped_mm",
         {
-            "self": (64, 256),
-            "mat2": (256, 128),
+            # _grouped_mm requires BF16 inputs — the meta kernel
+            # (torch/_meta_registrations.py::_meta_grouped_mm_common) rejects
+            # fp32 with "Expected inputs of BF16 type but got mat_a.dtype=..."
+            # during Dynamo FakeTensor propagation, so the sample must force
+            # bfloat16. Verified 2026-07-20.
+            "self": {"shape": (64, 256), "dtype": "bfloat16"},
+            "mat2": {"shape": (256, 128), "dtype": "bfloat16"},
             "offs": {"shape": (3,), "dtype": "int", "low": 0, "high": 256},
         },
         source="builtin",
@@ -3094,7 +3104,18 @@ def register_all_defaults(r):
     r(
         "aten::repeat_interleave.Tensor_out",
         {
-            "repeats": {"shape": (256,), "dtype": "long", "low": 1, "high": 4},
+            # Deterministic repeats so that sum(repeats) == output_size == 512
+            # matches the pre-allocated out buffer. Random low/high produced a
+            # variable sum that the CPU oracle rejected as
+            # "allocated size does not match required size". Fixed 2026-07-20.
+            "repeats": {"shape": (256,), "dtype": "long", "low": 2, "high": 3},
+            # ``repeat_interleave(repeats)`` has a data-dependent output shape
+            # (``sum(repeats)``). Without an explicit ``output_size``, meta
+            # (torch/_meta_registrations.py::meta_repeat_interleave_Tensor)
+            # raises "cannot repeat_interleave a meta tensor without
+            # output_size" during Dynamo FakeTensor propagation. Verified
+            # 2026-07-20: with output_size=512 the FakeTensor call succeeds.
+            "output_size": 512,
             "out": {"shape": (512,), "dtype": "long"},
         },
         source="builtin",
@@ -4172,8 +4193,14 @@ def register_all_defaults(r):
             "input_gates": (32, 4 * 512),
             "hidden_gates": (32, 4 * 512),
             "cx": (32, 512),
-            "input_bias": None,
-            "hidden_bias": None,
+            # PyTorch's meta (torch/_meta_registrations.py::rnn_cell_checkSizes)
+            # iterates over ``input_bias``/``hidden_bias`` and dereferences
+            # ``.device`` unconditionally, blowing up with ``AttributeError:
+            # 'NoneType' object has no attribute 'device'`` when either is
+            # None. Passing concrete bias tensors here sidesteps the upstream
+            # meta bug so the FakeTensor call succeeds. Verified 2026-07-20.
+            "input_bias": (4 * 512,),
+            "hidden_bias": (4 * 512,),
         },
         source="builtin",
     )
