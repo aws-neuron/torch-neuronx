@@ -24,9 +24,11 @@ def add_kernel(input_a, input_b, num_m_tiles):
     m_static, hidden = input_a.shape
 
     tile_size_m = 128
-    tile_size_h = 512
-    # H is compile-time constant: tile the free dim in Python, 512-wide tiles plus
-    # a final short tile of width `hidden % 512` — arbitrary H, no padding.
+    # Free-dim tile width ~4 KB/partition (DMA saturation knee): bf16/fp16 -> 2048,
+    # fp32 -> 1024. H compile-time constant -> resolved at trace time; tile_size_h-
+    # wide tiles plus a final short tile of `hidden % tile_size_h` — arbitrary H.
+    _dtype_bytes = {"bfloat16": 2, "float16": 2, "float32": 4}.get(str(input_a.dtype), 2)
+    tile_size_h = min(hidden, 4096 // _dtype_bytes)
     h_starts, h_widths = [], []
     _off = 0
     while _off < hidden:

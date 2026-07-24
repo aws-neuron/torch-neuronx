@@ -24,11 +24,14 @@ def silu_kernel(input_tensor, num_m_tiles):
     m_static, hidden = input_tensor.shape
 
     tile_size_m = 128
-    tile_size_h = 512
-    # H is a compile-time constant (baked into the NEFF), so the free-dim tiling
-    # is resolved in Python at trace time. Cover the full width with 512-wide
-    # tiles plus a final short tile of width `hidden % 512` — arbitrary H, no
+    # Free-dim tile width targets ~4 KB/partition (the DMA-throughput saturation
+    # knee): bf16/fp16 -> 2048, fp32 -> 1024. Enough per descriptor to saturate DMA
+    # bandwidth while minimizing descriptor count. H is compile-time constant, so
+    # this + the free-dim tiling below resolve at trace time: tile_size_h-wide tiles
+    # plus a final short tile of width `hidden % tile_size_h` — arbitrary H, no
     # padding. (Contrast M: runtime-dynamic via num_m_tiles + dynamic_range.)
+    _dtype_bytes = {"bfloat16": 2, "float16": 2, "float32": 4}.get(str(input_tensor.dtype), 2)
+    tile_size_h = min(hidden, 4096 // _dtype_bytes)
     h_starts, h_widths = [], []
     _off = 0
     while _off < hidden:
