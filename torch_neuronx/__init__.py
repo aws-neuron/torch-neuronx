@@ -133,6 +133,9 @@ os.environ.setdefault("TORCH_NEURONX_ENABLE_LAZY_ALLOC", "1")
 # Enable NKI colz for intermediate NKI artifacts
 os.environ.setdefault("NKI_USE_COLZ", "1")
 
+# Enable NKI persistent cache
+os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "1")
+
 # Import and register neuron device
 try:
     from . import _C
