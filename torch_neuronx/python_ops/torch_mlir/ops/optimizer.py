@@ -193,7 +193,13 @@ def _register_fused_adam(op_names, decoupled_wd):
     static_args = (7, 8, 9, 10) if _has_nki_adam_kernels else ()
 
     @register_aten(
-        op_names, preprocessing=Preprocessing.VALUE_DEPENDENT, static_argnums=static_args
+        op_names,
+        preprocessing=Preprocessing.VALUE_DEPENDENT,
+        static_argnums=static_args,
+        # Multi-arg in-place op: the kept inputs interleave read-only tensors
+        # (gradients) with mutated state, so outputs do not map one-to-one onto
+        # IR parameters as the C++ cached aliasing assumes. Not yet onboarded.
+        python_dispatch=True,
     )
     def fused_adam_impl(
         params,

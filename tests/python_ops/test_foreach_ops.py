@@ -1217,3 +1217,138 @@ def test_foreach_lerp_scalarlist_out_variant():
     for i, t in enumerate(out):
         assert t.shape == (4, 8)
         torch.testing.assert_close(t.cpu(), ref[i].cpu())
+
+
+# ── CPU-parity grid: foreach scalar/scalarlist ops x input dtype x scalar ────
+#
+# Asserts Neuron matches CPU in dtype AND values, on cache miss AND cache hit,
+# for the scalar-driven dtype promotions on the C++ cached dispatch path:
+#   - bool tensor x int scalar   -> promotes to int (int64 downcast to int32)
+#   - int tensor  x float scalar -> promotes to float32
+#   - div on any integer/bool    -> promotes to float32 (true division)
+# with an interspersed empty tensor in every list, so the zero-size promotion
+# convert (which the compiler rejects unless the empty is retyped up front) is
+# also exercised.
+#
+# int32 is kept distinct from int8 on the dtype axis: int32 is the same width as
+# float32, so a mismatched int->float promotion produces silently reinterpreted
+# values with no size error, whereas int8 fails loudly. int64 additionally
+# exercises the packed-int64 path.
+_PARITY_DTYPES = [
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.float32,
+]
+_PARITY_SCALARS = [3, 2.5]
+_PARITY_SCALAR_OPS = ["mul", "add", "div"]
+
+
+def _make_parity_list(dtype):
+    """A foreach list of mixed shapes with an interspersed empty tensor."""
+    shapes = [(20, 20), (0,), (19, 19), (4, 4)]
+    if dtype == torch.bool:
+        return [torch.ones(s, dtype=dtype) for s in shapes]
+    if dtype.is_floating_point:
+        return [torch.randn(s).to(dtype) for s in shapes]
+    # Small positive ints keep values representable across every dtype/scalar pair.
+    return [torch.arange(1, torch.tensor(s).prod().item() + 1).reshape(s).to(dtype) for s in shapes]
+
+
+@pytest.mark.parametrize("op_name", _PARITY_SCALAR_OPS)
+@pytest.mark.parametrize("dtype", _PARITY_DTYPES)
+@pytest.mark.parametrize("scalar", _PARITY_SCALARS)
+def test_foreach_scalar_cpu_parity(op_name, dtype, scalar):
+    """Neuron == CPU (dtype + values) for the scalar variant, miss and hit."""
+    op = getattr(torch, f"_foreach_{op_name}")
+    tensors_cpu = _make_parity_list(dtype)
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    # CPU is the oracle. If CPU rejects the combination, Neuron must reject it
+    # too — error parity is part of the contract.
+    try:
+        result_cpu = op(tensors_cpu, scalar)
+    except Exception:
+        with assert_raises(Exception):
+            op(tensors_neuron, scalar)
+        return
+
+    # Run twice: the cache-hit path is where dropped-promotion bugs surface.
+    for _ in range(2):
+        result_neuron = op(tensors_neuron, scalar)
+        for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+            assert (
+                r_neuron.dtype == r_cpu.dtype
+            ), f"{op_name} {dtype} x {scalar!r}: dtype {r_neuron.dtype} != CPU {r_cpu.dtype}"
+            torch.testing.assert_close(r_neuron.cpu(), r_cpu, equal_nan=True)
+
+
+@pytest.mark.parametrize("op_name", _PARITY_SCALAR_OPS)
+@pytest.mark.parametrize("dtype", _PARITY_DTYPES)
+@pytest.mark.parametrize("scalar_kind", _PARITY_SCALARS)
+def test_foreach_scalarlist_cpu_parity(op_name, dtype, scalar_kind):
+    """ScalarList variant — same promotion contract as the scalar variant, with
+    the scalar supplied once per tensor. CPU is the oracle, miss and hit."""
+    op = getattr(torch, f"_foreach_{op_name}")
+    tensors_cpu = _make_parity_list(dtype)
+    scalars = [scalar_kind] * len(tensors_cpu)
+    tensors_neuron = [t.clone().to("neuron") for t in tensors_cpu]
+
+    try:
+        result_cpu = op(tensors_cpu, scalars)
+    except Exception:
+        with assert_raises(Exception):
+            op(tensors_neuron, scalars)
+        return
+
+    for _ in range(2):
+        result_neuron = op(tensors_neuron, scalars)
+        for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+            assert (
+                r_neuron.dtype == r_cpu.dtype
+            ), f"{op_name} {dtype} scalarlist: dtype {r_neuron.dtype} != CPU {r_cpu.dtype}"
+            torch.testing.assert_close(r_neuron.cpu(), r_cpu, equal_nan=True)
+
+
+@pytest.mark.parametrize("op_name", ["mul", "add", "sub", "div"])
+@pytest.mark.parametrize(
+    "dtype_a,dtype_b",
+    [
+        (torch.int32, torch.float32),  # cross-dtype: promotion is traced natively
+        (torch.int32, torch.int32),
+        (torch.float16, torch.float32),
+    ],
+)
+def test_foreach_list_cpu_parity(op_name, dtype_a, dtype_b):
+    """`.List` variant: the second operand is a tensor list, so cross-dtype
+    promotion is traced into the HLO natively and needs no scalar handling.
+    CPU is the oracle for dtype and values, miss and hit."""
+    op = getattr(torch, f"_foreach_{op_name}")
+    a_cpu = [
+        torch.arange(1, 101).reshape(10, 10).to(dtype_a),
+        torch.arange(1, 17).reshape(4, 4).to(dtype_a),
+    ]
+    b_cpu = [
+        torch.arange(1, 101).reshape(10, 10).to(dtype_b),
+        torch.arange(1, 17).reshape(4, 4).to(dtype_b),
+    ]
+    a_neuron = [t.clone().to("neuron") for t in a_cpu]
+    b_neuron = [t.clone().to("neuron") for t in b_cpu]
+
+    try:
+        result_cpu = op(a_cpu, b_cpu)
+    except Exception:
+        with assert_raises(Exception):
+            op(a_neuron, b_neuron)
+        return
+
+    for _ in range(2):
+        result_neuron = op(a_neuron, b_neuron)
+        for r_cpu, r_neuron in zip(result_cpu, result_neuron, strict=False):
+            assert (
+                r_neuron.dtype == r_cpu.dtype
+            ), f"{op_name} list {dtype_a}x{dtype_b}: dtype {r_neuron.dtype} != CPU {r_cpu.dtype}"
+            torch.testing.assert_close(r_neuron.cpu(), r_cpu, equal_nan=True)

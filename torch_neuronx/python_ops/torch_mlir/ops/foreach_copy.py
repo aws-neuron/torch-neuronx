@@ -130,6 +130,9 @@ def _raw_nrt_copy_same_dtype(self_tensors, src_tensors):
     ["aten::_foreach_copy_"],
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     static_argnames=("out_dtype", "out_dtypes"),
+    # Preprocessing branches on runtime device placement and lazy neg/conj bits,
+    # none of which the cache key captures, so the lowering cannot be cached.
+    python_dispatch=True,
 )
 def torch_foreach_copy_inplace(self_tensors, src_tensors, non_blocking=False):
     """Preprocessing for aten::_foreach_copy_.

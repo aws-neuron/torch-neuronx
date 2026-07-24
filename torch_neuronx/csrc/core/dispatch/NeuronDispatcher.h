@@ -306,7 +306,9 @@ class NeuronDispatcher {
    */
   static std::vector<torch::Tensor> FlattenAndFilterInputs(
       const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
-      const std::vector<int>& kept_input_indices, const std::string& op_name);
+      const std::vector<int>& kept_input_indices, const std::string& op_name,
+      const std::unordered_set<size_t>& static_argnums = {},
+      const std::unordered_set<std::string>& static_argnames = {});
 
   // ════════════════════════════════════════════════════
   //  Dispatch implementations — called with a pre-captured
