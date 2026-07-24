@@ -175,6 +175,23 @@ def test_build_pytest_argv_distributed_uses_forked_no_timeout(tmp_path):
     assert "tests/pytorch_tests_native/test/distributed/fsdp" in cmd
 
 
+def test_build_pytest_argv_foreach_uses_timeout_no_fork(tmp_path):
+    # test_foreach must NOT use --forked / --timeout-method=thread. --forked
+    # forks each test inside an xdist worker that holds a live Neuron runtime
+    # with background threads (RuntimeWorker); that fork hazard segfaults the
+    # worker ("node down"). The env_lock.so shim (always LD_PRELOADed by the
+    # runner) fixes the glibc<2.41 environ race, so test_foreach is safe on
+    # the plain --timeout path like any other non-distributed suite.
+    args = parse_args(["test_foreach.py", "--output-dir", str(tmp_path)])
+    paths = derive_report_paths(args.output_dir, args.items, args.shard_id)
+    cmd = build_pytest_argv(args, paths, num_workers=64)
+
+    assert "--forked" not in cmd
+    assert "--timeout-method=thread" not in cmd
+    assert any(a.startswith("--timeout=") for a in cmd)
+    assert "tests/pytorch_tests_native/test/test_foreach.py" in cmd
+
+
 def test_build_pytest_argv_mixed_items_treated_as_distributed(tmp_path):
     # Any distributed item in the list flips the whole invocation. Defensive
     # — distribution_config.py always groups by single test type, but if a
@@ -422,7 +439,13 @@ def test_build_env_lock_shim_compiles(tmp_path):
     shim = build_env_lock_shim(tmp_path)
     assert shim.exists()
     lib = ctypes.CDLL(str(shim))
-    for sym in ("getenv", "setenv", "unsetenv", "putenv"):
+    for sym in (
+        "getenv",
+        "setenv",
+        "unsetenv",
+        "putenv",
+        "torch_neuronx_posix_spawn_with_stable_environ",
+    ):
         assert hasattr(lib, sym)
 
 
@@ -446,7 +469,88 @@ def test_preload_env_without_prior_ld_preload(monkeypatch, tmp_path):
     assert preload_env(shim)["LD_PRELOAD"] == str(shim)
 
 
-def test_preloaded_env_lock_makes_writer_progress_and_resets_after_fork(tmp_path, monkeypatch):
+def test_preloaded_env_lock_snapshot_avoids_reentrant_string_deadlock(tmp_path, monkeypatch):
+    import subprocess
+
+    cc = shutil.which("cc") or shutil.which("gcc")
+    assert cc is not None
+    interposer_source = tmp_path / "reentrant_strlen.c"
+    interposer = tmp_path / "reentrant_strlen.so"
+    caller_source = tmp_path / "stable_spawn_caller.c"
+    caller = tmp_path / "stable_spawn_caller"
+    interposer_source.write_text(
+        r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
+
+size_t strlen(const char *value) {
+  static size_t (*real_strlen)(const char *);
+  static __thread int resolving;
+  static __thread int reentering;
+  if (!real_strlen) {
+    if (resolving) {
+      const volatile unsigned char *cursor = (const volatile unsigned char *)value;
+      size_t length = 0;
+      while (cursor[length] != '\0')
+        ++length;
+      return length;
+    }
+    resolving = 1;
+    real_strlen = (size_t (*)(const char *))dlsym(RTLD_NEXT, "strlen");
+    resolving = 0;
+  }
+  if (!reentering) {
+    reentering = 1;
+    (void)setenv("ENV_LOCK_REENTRANT", "1", 1);
+    reentering = 0;
+  }
+  return real_strlen(value);
+}
+"""
+    )
+    caller_source.write_text(
+        r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+typedef int (*stable_spawn_fn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                               const posix_spawnattr_t *, char *const[], const char *);
+int main(void) {
+  stable_spawn_fn spawn_fn = (stable_spawn_fn)dlsym(
+      RTLD_DEFAULT, "torch_neuronx_posix_spawn_with_stable_environ");
+  if (!spawn_fn)
+    return 1;
+  char *argv[] = {"true", NULL};
+  pid_t pid;
+  int status;
+  int rc = spawn_fn(&pid, argv[0], NULL, NULL, argv, NULL);
+  return rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+                 WEXITSTATUS(status) == 0
+             ? 0
+             : 2;
+}
+"""
+    )
+    subprocess.run(
+        [cc, "-fPIC", "-shared", "-o", str(interposer), str(interposer_source), "-ldl"],
+        check=True,
+    )
+    subprocess.run([cc, "-o", str(caller), str(caller_source), "-ldl"], check=True)
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = build_env_lock_shim(shim_dir)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    env = preload_env(shim)
+    env["LD_PRELOAD"] = f"{env['LD_PRELOAD']} {interposer}"
+    subprocess.run([str(caller)], env=env, check=True, timeout=5)
+
+
+def test_preloaded_env_lock_stabilizes_spawn_during_environment_churn(tmp_path, monkeypatch):
     import subprocess
 
     cc = shutil.which("cc") or shutil.which("gcc")
@@ -456,17 +560,38 @@ def test_preloaded_env_lock_makes_writer_progress_and_resets_after_fork(tmp_path
     source.write_text(
         r"""
 #define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sched.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define READERS 128
-#define WRITES 10000
+#define SPAWNERS 16
+#define ENV_VARS 20000
 
+extern char **environ;
+typedef int (*stable_spawn_fn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                               const posix_spawnattr_t *, char *const[], const char *);
+static stable_spawn_fn stable_spawn;
 static atomic_bool stop = false;
+static atomic_bool stop_spawning = false;
+static atomic_bool stop_mutating = false;
+static atomic_bool mutator_ready = false;
+static atomic_int mutation_index = 0;
+static atomic_int spawn_generation = 0;
+static atomic_int spawners_ready = 0;
+static atomic_int spawn_calls = 0;
+static atomic_int spawn_failure = 0;
 static const char *volatile sink;
 
 static void *read_env(void *unused) {
@@ -476,7 +601,158 @@ static void *read_env(void *unused) {
   return NULL;
 }
 
-int main(void) {
+static void *mutate_env(void *unused) {
+  (void)unused;
+  char name[64];
+  atomic_store_explicit(&mutator_ready, true, memory_order_release);
+  while (!atomic_load_explicit(&stop_mutating, memory_order_acquire)) {
+    int index = atomic_fetch_add_explicit(&mutation_index, 1, memory_order_relaxed);
+    if (index < ENV_VARS)
+      snprintf(name, sizeof(name), "ENV_LOCK_STRESS_%06d", index);
+    else
+      snprintf(name, sizeof(name), "ENV_LOCK_CHURN_%02d", index % 32);
+    if (setenv(name, "value-that-forces-environ-growth", 1) != 0)
+      return (void *)1;
+    sched_yield();
+  }
+  return NULL;
+}
+
+static void *spawn_child(void *unused) {
+  (void)unused;
+  char *argv[] = {"true", NULL};
+  int completed_generation = 0;
+  atomic_fetch_add_explicit(&spawners_ready, 1, memory_order_release);
+  while (!atomic_load_explicit(&stop_spawning, memory_order_acquire)) {
+    int requested_generation =
+        atomic_load_explicit(&spawn_generation, memory_order_acquire);
+    if (requested_generation == completed_generation) {
+      sched_yield();
+      continue;
+    }
+
+    pid_t pid;
+    int status;
+    int rc = stable_spawn(&pid, argv[0], NULL, NULL, argv, NULL);
+    if (rc != 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+      atomic_store_explicit(&spawn_failure, rc ? rc : 255, memory_order_release);
+      return NULL;
+    }
+    completed_generation = requested_generation;
+    atomic_fetch_add_explicit(&spawn_calls, 1, memory_order_release);
+  }
+  return NULL;
+}
+
+static int wait_for_spawn_count(int expected_calls) {
+  while (atomic_load_explicit(&spawn_calls, memory_order_acquire) < expected_calls) {
+    if (atomic_load_explicit(&spawn_failure, memory_order_acquire) != 0)
+      return -1;
+    sched_yield();
+  }
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--check-stable-env") == 0) {
+    const char *baseline = getenv("ENV_LOCK_BASELINE");
+    const char *transient = getenv("ENV_LOCK_TRANSIENT");
+    const char *path = getenv("PATH");
+    return !baseline && transient &&
+                   strcmp(transient, "must-reach-child") == 0 && path && *path
+               ? 0
+               : 20;
+  }
+
+  stable_spawn = (stable_spawn_fn)dlsym(
+      RTLD_DEFAULT, "torch_neuronx_posix_spawn_with_stable_environ");
+  if (!stable_spawn)
+    return 1;
+
+  const char *initial_path = getenv("PATH");
+  if (!initial_path)
+    return 13;
+  char *saved_path = strdup(initial_path);
+  if (!saved_path)
+    return 14;
+
+  /* Prove that missing PATH is repaired while legitimate post-start additions
+   * and removals of other variables still reach the child. */
+  if (unsetenv("PATH") != 0 || unsetenv("ENV_LOCK_BASELINE") != 0 ||
+      setenv("ENV_LOCK_TRANSIENT", "must-reach-child", 1) != 0)
+    return 15;
+  pid_t snapshot_pid;
+  int snapshot_status;
+  char *snapshot_argv[] = {argv[0], "--check-stable-env", NULL};
+  int snapshot_rc = stable_spawn(&snapshot_pid, argv[0], NULL, NULL, snapshot_argv, NULL);
+  if (snapshot_rc != 0 || waitpid(snapshot_pid, &snapshot_status, 0) != snapshot_pid ||
+      !WIFEXITED(snapshot_status) || WEXITSTATUS(snapshot_status) != 0)
+    return 16;
+  char *true_argv[] = {"true", NULL};
+  snapshot_rc = stable_spawn(&snapshot_pid, true_argv[0], NULL, NULL, true_argv, NULL);
+  if (snapshot_rc != 0 || waitpid(snapshot_pid, &snapshot_status, 0) != snapshot_pid ||
+      !WIFEXITED(snapshot_status) || WEXITSTATUS(snapshot_status) != 0)
+    return 17;
+
+  char workdir_template[] = "/tmp/env_lock_workdir_XXXXXX";
+  char *workdir = mkdtemp(workdir_template);
+  if (!workdir)
+    return 21;
+  char tool_path[PATH_MAX];
+  snprintf(tool_path, sizeof(tool_path), "%s/local-tool", workdir);
+  FILE *tool = fopen(tool_path, "w");
+  if (!tool || fputs("#!/bin/sh\nexit 0\n", tool) < 0 || fclose(tool) != 0 ||
+      chmod(tool_path, 0700) != 0)
+    return 22;
+  if (setenv("PATH", ".", 1) != 0)
+    return 23;
+  posix_spawn_file_actions_t actions;
+  if (posix_spawn_file_actions_init(&actions) != 0 ||
+      posix_spawn_file_actions_addchdir_np(&actions, workdir) != 0)
+    return 24;
+  char *local_argv[] = {"local-tool", NULL};
+  snapshot_rc = stable_spawn(&snapshot_pid, local_argv[0], &actions, NULL, local_argv,
+                             workdir);
+  posix_spawn_file_actions_destroy(&actions);
+  if (snapshot_rc != 0 || waitpid(snapshot_pid, &snapshot_status, 0) != snapshot_pid ||
+      !WIFEXITED(snapshot_status) || WEXITSTATUS(snapshot_status) != 0)
+    return 25;
+
+  char directory_candidate[PATH_MAX];
+  snprintf(directory_candidate, sizeof(directory_candidate), "%s/true", workdir);
+  if (mkdir(directory_candidate, 0700) != 0)
+    return 26;
+  char search_path[PATH_MAX + 32];
+  snprintf(search_path, sizeof(search_path), "%s:/bin:/usr/bin", workdir);
+  if (setenv("PATH", search_path, 1) != 0)
+    return 27;
+  snapshot_rc = stable_spawn(&snapshot_pid, true_argv[0], NULL, NULL, true_argv, NULL);
+  if (snapshot_rc != 0 || waitpid(snapshot_pid, &snapshot_status, 0) != snapshot_pid ||
+      !WIFEXITED(snapshot_status) || WEXITSTATUS(snapshot_status) != 0)
+    return 28;
+
+  char loop_path[PATH_MAX];
+  snprintf(loop_path, sizeof(loop_path), "%s/loop-tool", workdir);
+  if (symlink("loop-tool", loop_path) != 0)
+    return 29;
+  snprintf(search_path, sizeof(search_path), "%s:/bin:/usr/bin", workdir);
+  if (setenv("PATH", search_path, 1) != 0)
+    return 30;
+  char *loop_argv[] = {"loop-tool", NULL};
+  snapshot_rc = stable_spawn(&snapshot_pid, loop_argv[0], NULL, NULL, loop_argv, NULL);
+  if (snapshot_rc != ELOOP)
+    return 31;
+  unlink(loop_path);
+  rmdir(directory_candidate);
+  unlink(tool_path);
+  rmdir(workdir);
+
+  if (unsetenv("ENV_LOCK_TRANSIENT") != 0 ||
+      setenv("ENV_LOCK_BASELINE", "captured-before-tests", 1) != 0 ||
+      setenv("PATH", saved_path, 1) != 0)
+    return 18;
+
   pthread_t readers[READERS];
   for (int i = 0; i < READERS; ++i)
     if (pthread_create(&readers[i], NULL, read_env, NULL) != 0)
@@ -493,20 +769,71 @@ int main(void) {
       WEXITSTATUS(status) != 0)
     return 4;
 
-  for (int i = 0; i < WRITES; ++i) {
-    if (setenv("ENV_LOCK_STRESS", "1", 1) != 0 || unsetenv("ENV_LOCK_STRESS") != 0)
+  pthread_t spawners[SPAWNERS];
+  for (int i = 0; i < SPAWNERS; ++i)
+    if (pthread_create(&spawners[i], NULL, spawn_child, NULL) != 0)
       return 5;
+
+  while (atomic_load_explicit(&spawners_ready, memory_order_acquire) != SPAWNERS)
+    sched_yield();
+
+  pthread_t mutator;
+  if (pthread_create(&mutator, NULL, mutate_env, NULL) != 0)
+    return 6;
+  while (!atomic_load_explicit(&mutator_ready, memory_order_acquire))
+    sched_yield();
+
+  int expected_spawn_calls = 0;
+  char name[64];
+  for (int generation = 0; generation < 20; ++generation) {
+    /* Every spawn generation runs while live PATH is absent, and the mutator
+     * keeps changing environ between the helper's sizing and copy phases. */
+    if (unsetenv("PATH") != 0)
+      return 13;
+    atomic_fetch_add_explicit(&spawn_generation, 1, memory_order_release);
+    expected_spawn_calls += SPAWNERS;
+    if (wait_for_spawn_count(expected_spawn_calls) != 0)
+      return 10;
+    if (setenv("PATH", saved_path, 1) != 0)
+      return 14;
   }
+
+  while (atomic_load_explicit(&mutation_index, memory_order_acquire) < ENV_VARS)
+    sched_yield();
+  atomic_store_explicit(&stop_mutating, true, memory_order_release);
+  void *mutator_result = NULL;
+  if (pthread_join(mutator, &mutator_result) != 0 || mutator_result != NULL)
+    return 6;
+  int calls_after_growth = atomic_load_explicit(&spawn_calls, memory_order_acquire);
+  if (calls_after_growth != expected_spawn_calls)
+    return 12;
+
+  atomic_store_explicit(&stop_spawning, true, memory_order_release);
+  for (int i = 0; i < SPAWNERS; ++i)
+    if (pthread_join(spawners[i], NULL) != 0)
+      return 9;
+  if (atomic_load_explicit(&spawn_failure, memory_order_acquire) != 0)
+    return 10;
 
   atomic_store_explicit(&stop, true, memory_order_relaxed);
   for (int i = 0; i < READERS; ++i)
     if (pthread_join(readers[i], NULL) != 0)
-      return 6;
+      return 11;
+
+  for (int i = 0; i < ENV_VARS; ++i) {
+    snprintf(name, sizeof(name), "ENV_LOCK_STRESS_%06d", i);
+    if (unsetenv(name) != 0)
+      return 8;
+  }
+  free(saved_path);
+
   return 0;
 }
 """
     )
-    subprocess.run([cc, "-O2", "-pthread", str(source), "-o", str(binary)], check=True)
+    subprocess.run([cc, "-O2", "-pthread", str(source), "-o", str(binary), "-ldl"], check=True)
     shim = build_env_lock_shim(tmp_path)
     monkeypatch.delenv("LD_PRELOAD", raising=False)
-    subprocess.run([str(binary)], env=preload_env(shim), check=True, timeout=15)
+    env = preload_env(shim)
+    env["ENV_LOCK_BASELINE"] = "captured-before-tests"
+    subprocess.run([str(binary)], env=env, check=True, timeout=30)

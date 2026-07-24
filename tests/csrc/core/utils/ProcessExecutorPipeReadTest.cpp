@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -10,6 +11,20 @@
 #include <string>
 
 #include "torch_neuronx/csrc/core/utils/ProcessExecutor.h"
+
+extern "C" char** environ;
+
+namespace {
+std::atomic<int> stable_spawn_calls{0};
+}
+
+extern "C" int torch_neuronx_posix_spawn_with_stable_environ(
+    pid_t* pid, const char* file, const posix_spawn_file_actions_t* file_actions,
+    const posix_spawnattr_t* attrp, char* const argv[], const char* working_dir) {
+  (void)working_dir;
+  stable_spawn_calls.fetch_add(1, std::memory_order_relaxed);
+  return posix_spawnp(pid, file, file_actions, attrp, argv, environ);
+}
 
 using namespace at::neuron;
 
@@ -125,4 +140,12 @@ TEST_F(ProcessExecutorPipeReadTest, EmptyWorkingDirUsesParentCwd) {
   std::vector<std::string> args = {"python3", "-c", script};
   EXPECT_NO_THROW(ProcessExecutor::Execute(args, "empty workdir test", ""));
   unsetenv("EXPECTED_CWD");
+}
+
+// When the env-lock preload exports its helper, ProcessExecutor must use it so
+// compiler children receive a consistent environment snapshot.
+TEST_F(ProcessExecutorPipeReadTest, UsesStableEnvironSpawnHelperWhenAvailable) {
+  int calls_before = stable_spawn_calls.load(std::memory_order_relaxed);
+  ASSERT_NO_THROW(ProcessExecutor::Execute({"true"}, "stable environ helper test"));
+  EXPECT_EQ(stable_spawn_calls.load(std::memory_order_relaxed), calls_before + 1);
 }
