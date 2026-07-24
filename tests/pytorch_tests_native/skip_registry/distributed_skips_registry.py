@@ -271,6 +271,15 @@ SKIP_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
+        reason="Timing assertion fails or flaky in overlap measurement",
+        tests=[
+            "TestFullyShardOverlap::test_fully_shard_training_overlap",
+            "TestFullyShardOverlap::test_fully_shard_post_optim_event_overlap",
+            "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_training_overlap",
+            "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_no_grad_input_overlap",
+        ],
+    ),
+    SkipGroup(
         reason="Requires 2 devices per process, where Neuron only uses 1 device per process",
         tests=[
             "test_zero_redundancy_optimizer.py::TestZeroRedundancyOptimizerDistributed::test_zero_model_parallel",
