@@ -22,6 +22,11 @@ The pytest invocation has two flavors:
     the worker-level isolation is sufficient and ``--forked`` interacts
     badly with ``pytest-timeout``).
 
+``test_foreach`` must NOT get ``--forked``: forking a worker that holds a
+live Neuron runtime (background ``RuntimeWorker`` thread) segfaults the child.
+The glibc<2.41 ``environ`` race it was meant to dodge is handled by the
+``env_lock.so`` shim below.
+
 No ``--dist=loadfile``, no ``--max-worker-restart`` — bash didn't have
 those and adding them caused regressions.
 """
@@ -154,15 +159,6 @@ def needs_process_isolation_flag(items: Sequence[str]) -> bool:
     return any(item.startswith("distributed") for item in items)
 
 
-def needs_process_isolation_with_timeouts_flag(items: Sequence[str]) -> bool:
-    """Suites that need process isolation and thread-based timeouts.
-
-    Uses --forked and --timeout-method thread together to reliably terminate
-    hanging tests via process isolation without crashing the entire test suite.
-    """
-    return any("test_foreach" in item for item in items)
-
-
 def build_pytest_argv(
     args: argparse.Namespace,
     paths: dict[str, Path],
@@ -194,8 +190,6 @@ def build_pytest_argv(
     ]
     if needs_process_isolation_flag(args.items):
         argv.append("--forked")
-    elif needs_process_isolation_with_timeouts_flag(args.items):
-        argv.extend(["--forked", f"--timeout={args.test_timeout}", "--timeout-method=thread"])
     else:
         argv.append(f"--timeout={args.test_timeout}")
     if args.shard_id is not None and args.num_shards is not None:
@@ -210,16 +204,17 @@ def build_pytest_argv(
 # ---------------------------------------------------------------------------
 # env-lock LD_PRELOAD shim
 # ---------------------------------------------------------------------------
-# glibc < 2.41 getenv() walks the global environ array unlocked, while
-# setenv()/unsetenv() mutate it. libnrt calls getenv() during nrt_load on
-# torch-neuronx's background RuntimeWorker thread; upstream logging tests
-# restore os.environ (→ unsetenv) in teardown on the main thread. When the
-# two overlap, the worker process segfaults — observed as flaky
-# "[gwNN] node down" worker crashes in test_logging.py under xdist.
-# env_lock.c interposes getenv/setenv/unsetenv/putenv behind a process-wide
-# read-write lock; preloading it into the pytest process (workers inherit
-# LD_PRELOAD) closes the race. Verified: 12/12 repro-loop iterations clean
-# on glibc 2.35 with the shim vs a crash by iteration 2 without it.
+# glibc < 2.41 getenv() can walk the global environment array while
+# setenv()/unsetenv() mutate it. libnrt calls getenv() during nrt_load, while
+# upstream tests restore os.environ in teardown, so the race can crash a worker.
+# unittest.mock.patch.dict also clears and rebuilds os.environ non-atomically;
+# a compiler spawn can therefore observe a valid but incomplete environment
+# without PATH. env_lock.c interposes environment readers/mutators, captures
+# an immutable startup baseline, and takes a consistent current snapshot for
+# each ProcessExecutor spawn. A missing PATH is filled from the baseline, while
+# intentional late additions, updates, and other removals still reach children.
+# Executables are resolved against that snapshot and the child working directory,
+# closing both the memory-safety race and the partial-restoration race.
 ENV_LOCK_SOURCE = Path(__file__).resolve().parent / "env_lock.c"
 
 

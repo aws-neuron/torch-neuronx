@@ -15,6 +15,15 @@
 // cannot resolve against the C-linkage global.
 extern "C" char** environ;
 
+// The upstream-test env-lock preload exports this helper. It takes a consistent
+// current environment snapshot, repairs a temporarily missing PATH from an
+// immutable baseline, and resolves the executable for the intended child CWD.
+// The weak reference preserves the normal non-preloaded path.
+extern "C" int torch_neuronx_posix_spawn_with_stable_environ(
+    pid_t* pid, const char* file, const posix_spawn_file_actions_t* file_actions,
+    const posix_spawnattr_t* attrp, char* const argv[], const char* working_dir)
+    __attribute__((weak));
+
 namespace at::neuron {
 
 // PipeManager implementation
@@ -123,7 +132,13 @@ void ProcessExecutor::Execute(const std::vector<std::string>& args, const std::s
   }
 
   pid_t pid;
-  int err = posix_spawnp(&pid, argv[0], &guard.actions, nullptr, argv.data(), environ);
+  int err;
+  if (torch_neuronx_posix_spawn_with_stable_environ != nullptr) {
+    err = torch_neuronx_posix_spawn_with_stable_environ(&pid, argv[0], &guard.actions, nullptr,
+                                                        argv.data(), working_dir.c_str());
+  } else {
+    err = posix_spawnp(&pid, argv[0], &guard.actions, nullptr, argv.data(), environ);
+  }
   if (err != 0) {
     throw std::runtime_error("posix_spawn failed: " + std::string(strerror(err)));
   }
