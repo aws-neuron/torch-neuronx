@@ -200,13 +200,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Timing assertion failures in overlap measurement",
-        tests=[
-            "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_training_overlap",
-            "TestFullyShardPerParamMeshOverlap::test_fully_shard_per_param_mesh_no_grad_input_overlap",
-        ],
-    ),
-    SkipGroup(
         reason="Neuron lacks native batch_norm — CPU fallback rejects mixed "
         "precision (bf16/fp16 input, fp32 stats)",
         tests=[
