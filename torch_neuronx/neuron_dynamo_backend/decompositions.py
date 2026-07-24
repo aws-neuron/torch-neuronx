@@ -3487,6 +3487,80 @@ def _normal_from_std(mean, std, shape, ref, dtype):
     return mean + std * z
 
 
+def _standard_uniform(
+    ref: torch.Tensor, shape, dtype: torch.dtype, low: float = 0.0, high: float = 1.0
+):
+    """Uniform samples in ``[low, high)`` via the seeded on-device RNG.
+
+    Routes through the seeded ``rand`` HOP (``nki_kernels.rand``), the same path
+    ``normal`` / ``native_dropout`` use. Ops that fall through to torch-mlir's
+    ``stablehlo.rng`` instead are NOT threaded with the ``manual_seed`` GPSIMD
+    state and are non-reproducible once compiled; these decompositions move the
+    whole ``rand``/``randn``/``uniform``/``bernoulli`` family onto the seeded
+    path so they reproduce under ``torch.manual_seed`` in the compiled graph.
+    """
+    shape_list = list(shape)
+    if _has_nki_rng:
+        u = rand(ref, shape_list, torch.float32)
+    else:
+        u = torch.rand(shape_list, dtype=torch.float32, device=ref.device)
+    if low != 0.0 or high != 1.0:
+        u = low + (high - low) * u
+    return u.to(dtype)
+
+
+@register_decomposition([aten.rand.default])
+def rand_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    ref = torch.empty((), device=device, dtype=out_dtype)
+    return _standard_uniform(ref, size, out_dtype)
+
+
+@register_decomposition([aten.rand_like.default])
+def rand_like_decomp(
+    self, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
+):
+    return _standard_uniform(self, self.shape, dtype if dtype is not None else self.dtype)
+
+
+@register_decomposition([aten.randn.default])
+def randn_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    ref = torch.empty((), device=device, dtype=out_dtype)
+    return _standard_normal(ref, size, out_dtype)
+
+
+@register_decomposition([aten.randn_like.default])
+def randn_like_decomp(
+    self, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
+):
+    return _standard_normal(self, self.shape, dtype if dtype is not None else self.dtype)
+
+
+@register_decomposition([aten.uniform.default])
+def uniform_decomp(self, from_=0.0, to=1.0, *, generator=None):
+    """Functional ``uniform`` (what ``uniform_`` is functionalized into)."""
+    if generator is not None:
+        return NotImplemented
+    return _standard_uniform(self, self.shape, self.dtype, float(from_), float(to))
+
+
+@register_decomposition([aten.bernoulli.default])
+def bernoulli_decomp(self, *, generator=None):
+    """``bernoulli(self)``: element is 1 with probability ``self[i]``."""
+    if generator is not None:
+        return NotImplemented
+    return (_standard_uniform(self, self.shape, self.dtype) < self).to(self.dtype)
+
+
+@register_decomposition([aten.bernoulli.p])
+def bernoulli_p_decomp(self, p=0.5, *, generator=None):
+    """``bernoulli.p``: every element is 1 with probability scalar ``p``."""
+    if generator is not None:
+        return NotImplemented
+    return (_standard_uniform(self, self.shape, self.dtype) < float(p)).to(self.dtype)
+
+
 @register_decomposition([aten.normal.Tensor_Tensor])
 def normal_tensor_tensor(mean, std, *, generator=None):
     """``normal(mean, std)`` with per-element mean/std tensors.

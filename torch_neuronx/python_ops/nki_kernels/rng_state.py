@@ -53,6 +53,12 @@ try:
         total = 1
         for s in shape:
             total *= s
+        # A zero-element output (any dim == 0, e.g. torch.randn(0, 5)) has no
+        # values to draw. Skip the NKI kernel entirely: it requires every
+        # dimension to be a positive integer and would assert on the (1, 0)
+        # buffer otherwise.
+        if total == 0:
+            return torch.empty(tuple(shape), dtype=torch.int32, device=ref.device)
         output_buffer = torch.empty((1, total), dtype=torch.int32, device=ref.device)
         flat = wrapped_rand(output_buffer, total)
         return flat.squeeze(0).reshape(shape)
