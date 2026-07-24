@@ -1666,7 +1666,8 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
 
   // Execute
   auto device = ExtractDevice(args);
-  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name);
+  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
+                                                reg.static_argnums, reg.static_argnames);
   auto exec_outputs = AllocateExecutionOutputs(*entry, args, filtered_inputs, device, schema);
 
   int device_id = c10_neuron::GetTargetDeviceId(filtered_inputs, exec_outputs);
@@ -1903,7 +1904,8 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
 
   auto device = ExtractDevice(args);
 
-  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name);
+  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
+                                                reg.static_argnums, reg.static_argnames);
 
   TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] filtered inputs ready", " op=", op_name,
                                " num_filtered_inputs=", filtered_inputs.size());
@@ -2225,16 +2227,122 @@ static void FlattenTensorsFromIValue(const c10::IValue& val, std::vector<torch::
   }
 }
 
+// True if the schema arg is a list of numbers (Scalar[], int[], float[]) —
+// any ListType whose element is a subtype of NumberType. Note: this matches
+// int[] too, so callers must skip static args (which are HLO constants, not
+// runtime tensor inputs) before converting — see FlattenAndFilterInputs.
+static bool IsScalarListType(const c10::Argument& arg) {
+  auto type = arg.type();
+  if (type->kind() != c10::TypeKind::ListType) return false;
+  auto elem_type = type->cast<c10::ListType>()->getElementType();
+  return elem_type->isSubtypeOf(*c10::NumberType::get());
+}
+
+// Convert a scalar list (IntList or DoubleList) to 0-dim tensors and append to out.
+// This mirrors Python preprocess_inputs(scalar_to_tensor=True) which converts
+// each scalar element of a Scalar[] arg to a 0-dim tensor during lowering.
+// On cache hit, C++ must produce the same flat tensor layout.
+static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch::Tensor>& out,
+                                       const torch::Device& target_device) {
+  static const bool native_int64 = IsNativeInt64Enabled();
+
+  if (val.isIntList()) {
+    const auto& il = val.toIntList();
+    auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
+    for (size_t j = 0; j < il.size(); ++j) {
+      auto t = torch::tensor(il[j], torch::TensorOptions().dtype(int_dtype)).to(target_device);
+      out.push_back(std::move(t));
+    }
+  } else if (val.isDoubleList()) {
+    const auto& dl = val.toDoubleList();
+    for (size_t j = 0; j < dl.size(); ++j) {
+      auto t =
+          torch::tensor(dl[j], torch::TensorOptions().dtype(torch::kFloat32)).to(target_device);
+      out.push_back(std::move(t));
+    }
+  } else if (val.isList()) {
+    // Generic List<Scalar>, as produced by _foreach_*.ScalarList ops. Expanding
+    // each scalar with its own .to(device) costs one host→device submission per
+    // element; the per-submission overhead dominates. Instead, pack all scalars
+    // into one CPU tensor, transfer once, and return 0-dim views into it.
+    auto list = val.toList();
+    if (list.size() == 0) return;
+
+    // Determine homogeneous dtype: int only if every element is integral.
+    bool all_int = true;
+    for (size_t j = 0; j < list.size(); ++j) {
+      if (!list.get(j).toScalar().isIntegral(false)) {
+        all_int = false;
+        break;
+      }
+    }
+    auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
+    auto c_dtype = all_int ? int_dtype : torch::kFloat32;
+
+    // Build one CPU tensor holding all scalars.
+    torch::Tensor cpu_vec;
+    if (all_int) {
+      std::vector<int64_t> v;
+      v.reserve(list.size());
+      for (size_t j = 0; j < list.size(); ++j) v.push_back(list.get(j).toScalar().toLong());
+      cpu_vec = torch::tensor(v, torch::TensorOptions().dtype(c_dtype));
+    } else {
+      std::vector<double> v;
+      v.reserve(list.size());
+      for (size_t j = 0; j < list.size(); ++j) v.push_back(list.get(j).toScalar().toDouble());
+      cpu_vec = torch::tensor(v, torch::TensorOptions().dtype(c_dtype));
+    }
+
+    // One async host→device transfer. copy_cpu_to_neuron (vs cpu_vec.to(), which
+    // would block) is safe here: it copies cpu_vec's bytes into a kernel-owned
+    // bounce buffer before returning, and schedules the write on the same stream
+    // as the consuming NEFF — so in-order execution guarantees it lands first.
+    auto dev_vec = torch::empty({static_cast<int64_t>(list.size())},
+                                torch::TensorOptions().dtype(c_dtype).device(target_device));
+    torch_neuronx::utils::copy_cpu_to_neuron(cpu_vec, dev_vec, /*non_blocking=*/true);
+
+    // select(0, j) is a 0-dim view (contiguous, data_ptr at element j) — feeds
+    // the NEFF identically to a standalone 0-dim tensor.
+    out.reserve(out.size() + list.size());
+    for (int64_t j = 0; j < dev_vec.size(0); ++j) out.push_back(dev_vec.select(0, j));
+  }
+}
+
 std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
-    const std::vector<int>& kept_input_indices, const std::string& op_name) {
+    const std::vector<int>& kept_input_indices, const std::string& op_name,
+    const std::unordered_set<size_t>& static_argnums,
+    const std::unordered_set<std::string>& static_argnames) {
   const auto& schema_args = schema.arguments();
   std::vector<torch::Tensor> flattened;
+
+  // Determine target device for scalar→tensor conversion (same logic as PreprocessArgs)
+  torch::Device target_device(c10::DeviceType::PrivateUse1,
+                              static_cast<c10::DeviceIndex>(at::neuron::current_device()));
+  bool found_device = false;
+  ForEachTensor(args, [&](const at::Tensor& t) {
+    if (!found_device && t.is_privateuseone() && t.dim() > 0) {
+      target_device = t.device();
+      found_device = true;
+    }
+  });
 
   // Positional (non-kwarg-only) tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (schema_args[i].kwarg_only()) continue;
-    FlattenTensorsFromIValue(args[i], flattened);
+    bool is_static =
+        static_argnums.count(i) > 0 || static_argnames.count(schema_args[i].name()) > 0;
+    // A non-static number list (Scalar[]) is a runtime input: the NEFF was lowered
+    // with each element as its own 0-dim tensor, so expand it the same way here.
+    // A static number list (e.g. normalized_shape int[]) is a compile-time
+    // constant baked into the NEFF, not an input, so leave it out of `flattened`.
+    if (!is_static && IsScalarListType(schema_args[i]) &&
+        (args[i].isIntList() || args[i].isDoubleList() || args[i].isList())) {
+      FlattenScalarListToTensors(args[i], flattened, target_device);
+    } else {
+      // Extracts real tensors only; for a static number list this adds nothing.
+      FlattenTensorsFromIValue(args[i], flattened);
+    }
   }
   // Kwarg-only tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {

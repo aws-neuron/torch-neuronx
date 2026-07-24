@@ -117,6 +117,9 @@ def _validate_histc(
     static_argnames=("bins", "range_min", "range_max"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_histc,
+    # When the range is unset the bin edges are derived from min()/max() of the
+    # data, so the lowering depends on tensor values and cannot be cached.
+    python_dispatch=True,
 )
 def torch_histc(
     input: torch.Tensor, bins: int = 100, min: float = 0.0, max: float = 0.0, out=None

@@ -18,6 +18,9 @@ def _validate_one_hot(x, num_classes=-1):
     static_argnums=(1,),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_one_hot,
+    # When num_classes is -1 it is inferred from max(x).item(), a function of
+    # tensor values rather than the cache key, so the lowering cannot be cached.
+    python_dispatch=True,
 )
 def torch_one_hot(x, num_classes=-1):
     def torch_one_hot_fn(x, num_classes):

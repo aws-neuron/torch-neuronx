@@ -227,6 +227,9 @@ def compute_repeat_interleave(input, repeats, dim=None, output_size=None):
     ],
     static_argnames=("output_size",),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
+    # Output size is sum(repeats).item(), a function of tensor values rather
+    # than the cache key, so the lowering cannot be cached and replayed in C++.
+    python_dispatch=True,
 )
 def torch_repeat_interleave_tensor(repeats, output_size=None):
     """releat_interleave.Tensor variant is not supported in MLIR.

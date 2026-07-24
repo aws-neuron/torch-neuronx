@@ -380,7 +380,11 @@ def _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, nki_fn, torc
                 )
             )
         else:
-            vt = torch.tensor(v, device=s.device, dtype=compute_dtype).reshape(1, 1)
+            vt = (
+                v.to(dtype=compute_dtype, device=s.device)
+                if isinstance(v, torch.Tensor)
+                else torch.tensor(v, device=s.device, dtype=compute_dtype)
+            ).reshape(1, 1)
             result.append(
                 _cast_to_dtype(
                     nki_fn(s.to(compute_dtype), t1.to(compute_dtype), t2.to(compute_dtype), vt),

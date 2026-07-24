@@ -28,6 +28,7 @@ def register_aten(
     validate_static_inputs: Callable | None = None,
     skip_dispatch_registration: bool = False,
     translate_args_fn: Callable | None = None,
+    python_dispatch: bool = False,
     error_handler: Callable | None = None,
     **kwargs,
 ):
@@ -42,6 +43,14 @@ def register_aten(
                        static for cache key
         static_argnames: Tuple of keyword argument names that should be treated as
                         static for cache key
+        python_dispatch: Register the op on the Python dispatch path rather
+                       than C++ cached dispatch. Required for ops whose lowering
+                       is not a pure function of the cache key (op name, shapes,
+                       dtypes, static args): for example, ops whose output shape
+                       depends on tensor values (``masked_select``, ``one_hot``)
+                       or whose preprocessing branches on runtime tensor state
+                       (``_foreach_copy_``). This property cannot be inferred
+                       from the op definition and must be declared explicitly.
 
     Usage:
         @register_aten("aten::add")
@@ -79,6 +88,7 @@ def register_aten(
                 "preprocessing": preprocessing,
                 "validate_static_inputs": validate_static_inputs,
                 "translate_args_fn": translate_args_fn,
+                "python_dispatch": python_dispatch,
             }
 
             # Phase 1: Add to torch-mlir registry immediately
@@ -279,16 +289,151 @@ def _maybe_register_autograd(aten_name):
     _AUTOGRAD_LIBS[aten_name] = lib
 
 
+def _compute_preprocessing_index_map(original_args, preprocessed_args):
+    """Compute mapping from preprocessed tensor positions to original tensor positions.
+
+    When preprocessing filters tensors (e.g., removes empties from a list),
+    the positions in the preprocessed arg list don't match the original.
+    This function builds a map: preprocessed_flat_idx → original_flat_idx.
+
+    Used to remap kept_input_indices (which are relative to preprocessed args)
+    back to positions in the original args (which C++ FlattenAndFilterInputs uses).
+
+    Returns None if no remapping is needed (lists are same length).
+    """
+
+    # Flatten both arg lists to get individual tensors
+    def flatten_tensors(args):
+        flat = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                flat.append(arg)
+            elif isinstance(arg, list | tuple):
+                for item in arg:
+                    if isinstance(item, torch.Tensor):
+                        flat.append(item)
+        return flat
+
+    orig_flat = flatten_tensors(original_args)
+    prep_flat = flatten_tensors(preprocessed_args)
+
+    # If same length, no filtering happened — no remapping needed
+    if len(orig_flat) == len(prep_flat):
+        return None
+
+    # Build map: for each tensor in prep_flat, find its position in orig_flat
+    # We match by object identity (same tensor object)
+    index_map = []
+    for prep_tensor in prep_flat:
+        for orig_idx, orig_tensor in enumerate(orig_flat):
+            if prep_tensor is orig_tensor:
+                index_map.append(orig_idx)
+                break
+        else:
+            # Tensor not found in original — shouldn't happen, but fall back to identity
+            index_map.append(len(index_map))
+
+    return index_map
+
+
+def _reconstruct_full_args_for_lowering(original_args, filtered_args, filtered_kwargs, aten_name):
+    """Reconstruct full-length args when preprocessing filtered tensors.
+
+    For inplace foreach ops that filter empty tensors, the filtered list is
+    shorter than the original. This reconstructs the full-length list using
+    _replace_empty so that output indices align with C++ SnapshotOutTensors.
+
+    Returns (full_args, full_kwargs) or None if reconstruction is not applicable.
+    """
+    from .ops.foreach_ops import _replace_empty
+
+    # Don't pass op="div" here — that would cast int tensors to float32 during
+    # reconstruction, but on cache hit C++ provides original (int32) tensors.
+    # The NKI kernel handles div dtype promotion internally via _cast_results.
+    op = ""
+
+    full_args = list(filtered_args)
+    found_replacement = False
+
+    for i, (orig_a, filt_a) in enumerate(zip(original_args, filtered_args, strict=False)):
+        if not isinstance(orig_a, list | tuple):
+            continue
+        if not isinstance(filt_a, list | tuple):
+            continue
+        if len(filt_a) >= len(orig_a):
+            continue
+
+        orig_tensors = [t for t in orig_a if isinstance(t, torch.Tensor)]
+        if orig_tensors and len(orig_tensors) == len(orig_a):
+            full_args[i] = _replace_empty(list(orig_a), op)
+            found_replacement = True
+        else:
+            full_args[i] = list(orig_a)
+            found_replacement = True
+
+    if not found_replacement:
+        return None
+
+    full_kwargs = dict(filtered_kwargs)
+    if "out" in full_kwargs:
+        out_val = full_kwargs["out"]
+        if isinstance(out_val, tuple | list):
+            for orig_a in original_args:
+                if isinstance(orig_a, list | tuple):
+                    orig_tensors = [t for t in orig_a if isinstance(t, torch.Tensor)]
+                    if orig_tensors and any(t.numel() == 0 for t in orig_tensors):
+                        full_kwargs["out"] = tuple(_replace_empty(list(orig_a), op))
+                        break
+
+    return tuple(full_args), full_kwargs
+
+
+def _is_scalar_list(arg):
+    """True if arg is a non-empty list/tuple of raw Python scalars (no tensors)."""
+    return (
+        isinstance(arg, list | tuple)
+        and len(arg) > 0
+        and all(isinstance(item, int | float) for item in arg)
+    )
+
+
+def _static_argnums_for_lowering(new_args, original_args, base_static_argnums):
+    """Extend static_argnums with scalar-list args that preprocessing introduced.
+
+    Preprocessing can turn a non-list ATen arg (e.g. a Tensor) into a list of raw
+    scalars. Such scalars must be compile-time constants (baked into the NEFF via
+    the cache key), so they are marked static.
+
+    Genuine Scalar[] ATen args (e.g. _foreach_add.ScalarList) are left alone: the
+    original arg at the same position is also a scalar list, and C++
+    FlattenAndFilterInputs converts those to tensor inputs on cache hit.
+    """
+    effective_static = set(base_static_argnums)
+    for idx, new_arg in enumerate(new_args):
+        if idx in effective_static or not _is_scalar_list(new_arg):
+            continue
+        orig_is_scalar_list = idx < len(original_args) and _is_scalar_list(original_args[idx])
+        if not orig_is_scalar_list:
+            effective_static.add(idx)
+    return tuple(effective_static)
+
+
 def _make_preprocessing_lower(
     torch_fn, aten_name, output_params, static_argnums, static_argnames, validate_fn=None
 ):
-    """Create a lower_func for a shape_only preprocessing op.
+    """Create the lowering function for a preprocessing op.
 
-    On cache miss, the C++ dispatcher calls this function. It runs the
-    preprocessing torch_fn to get (compute_fn, new_args, new_kwargs), then
-    creates a TorchMlirKernel for compute_fn and calls kernel.lower().
+    On cache miss the C++ dispatcher calls the returned function, which runs the
+    preprocessing ``torch_fn`` to obtain ``(compute_fn, new_args, new_kwargs)``,
+    builds a ``TorchMlirKernel`` for ``compute_fn``, and calls its ``lower``.
 
-    Returns a LoweringResult, required by the C++ dispatcher.
+    Preprocessing may filter the input list (for example, dropping empty
+    tensors). When it does, ``kept_input_indices`` are remapped to positions in
+    the original, unfiltered argument list so that ``FlattenAndFilterInputs``
+    selects the correct tensors on a cache hit.
+
+    Returns:
+        A ``LoweringResult``, as required by the C++ dispatcher.
     """
     from torch_neuronx.utils import is_native_int64_enabled
 
@@ -315,6 +460,20 @@ def _make_preprocessing_lower(
                 stablehlo_bytes=b"",
             )
 
+        # Compute index mapping: preprocessed positions → original positions.
+        # Needed when preprocessing filters tensors (e.g. foreach empty-tensor
+        # removal). When the lists are the same length, this returns None.
+        preprocess_index_map = _compute_preprocessing_index_map(args, new_args)
+
+        # When preprocessing filtered the tensor list (e.g. foreach empty-tensor
+        # removal), reconstruct full-length args so output indices align with C++
+        # SnapshotOutTensors/ReconstructOutputs.
+        if preprocess_index_map is not None:
+            full_args = _reconstruct_full_args_for_lowering(args, new_args, new_kwargs, aten_name)
+            if full_args is not None:
+                new_args, new_kwargs = full_args
+                preprocess_index_map = None
+
         # Preprocess original (pre-downcast) args for dtype inference.
         orig_new_args = None
         orig_new_kwargs = None
@@ -324,6 +483,16 @@ def _make_preprocessing_lower(
             if orig_result[1]:
                 orig_new_args = orig_result[1]
                 orig_new_kwargs = orig_result[2]
+                # Also reconstruct original args if we reconstructed the main args
+                if (
+                    preprocess_index_map is None
+                    and _compute_preprocessing_index_map(original_args, orig_new_args) is not None
+                ):
+                    orig_full = _reconstruct_full_args_for_lowering(
+                        original_args, orig_new_args, orig_new_kwargs, aten_name
+                    )
+                    if orig_full is not None:
+                        orig_new_args, orig_new_kwargs = orig_full
 
         # Get or create cached kernel
         fn_key = id(getattr(compute_fn, "__code__", compute_fn))
@@ -344,19 +513,36 @@ def _make_preprocessing_lower(
         # contiguous). Set static_argnums for this call's arg count.
         # Note: mutates cached kernel state — safe because lower() is only called
         # on C++ dispatch cache miss (single-threaded, GIL held).
-        kernel.arg_processor._static_argnums = kernel._normalize_static_argnums(len(new_args))
+        static_argnums_for_call = kernel._normalize_static_argnums(len(new_args))
+        kernel.arg_processor._static_argnums = _static_argnums_for_lowering(
+            new_args, args, static_argnums_for_call
+        )
         processed_new_args = kernel.arg_processor.preprocess_inputs(
             new_args,
             scalar_to_tensor=True,
             convert_int64=not is_native_int64_enabled(),
         )
 
-        return kernel.lower(
+        lowering_result = kernel.lower(
             *processed_new_args,
             original_args=orig_new_args,
             original_kwargs=orig_new_kwargs,
             **new_kwargs,
         )
+
+        # Remap kept_input_indices from preprocessed positions to original positions.
+        # kernel.lower() produces indices relative to the PREPROCESSED arg list.
+        # C++ FlattenAndFilterInputs applies them to the ORIGINAL (unfiltered) list.
+        # Without remapping, C++ picks wrong tensors when preprocessing filters.
+        if preprocess_index_map is not None and lowering_result is not None:
+            original_kept = lowering_result.kept_input_indices
+            if original_kept:
+                remapped = [
+                    preprocess_index_map[i] for i in original_kept if i < len(preprocess_index_map)
+                ]
+                lowering_result.kept_input_indices = remapped
+
+        return lowering_result
 
     return lower
 
@@ -469,6 +655,48 @@ def _make_preprocessing_dispatch(
     return combined
 
 
+def _resolve_lower_func(
+    reg_info,
+    operation,
+    torch_fn,
+    aten_name,
+    output_params,
+    static_argnums,
+    static_argnames,
+    validate_fn,
+):
+    """Build the lowering function the C++ NeuronDispatcher invokes on cache miss.
+
+    All C++-path ops share a single registration call; the only thing that
+    varies is how the lowering function is obtained, which this resolver
+    isolates so the caller does not branch:
+
+    - Ops that declare ``preprocessing=`` follow the factory protocol, where
+      ``torch_fn`` returns ``(compute_fn, new_args, new_kwargs[, postprocess])``.
+      ``_make_preprocessing_lower`` folds that factory into a lowering function
+      and remaps ``kept_input_indices`` when preprocessing filters the input
+      list, so ``FlattenAndFilterInputs`` selects the correct tensors on a hit.
+    - Plain ops already own a ``TorchMlirKernel``; its ``lower`` method is used
+      directly. ``validate_fn`` is attached to the kernel so input validation
+      runs during dtype inference on cache miss.
+
+    Returns:
+        The lowering function, or ``None`` for a wrapper-only op that has no
+        kernel (the dispatcher then falls back to the Python wrapper).
+    """
+    if reg_info.get("preprocessing") is not None:
+        return _make_preprocessing_lower(
+            torch_fn, aten_name, output_params, static_argnums, static_argnames, validate_fn
+        )
+
+    for impl in operation._implementations:
+        if hasattr(impl, "kernel") and impl.kernel is not None:
+            if validate_fn is not None:
+                impl.kernel.validate_static_inputs_func = validate_fn
+            return impl.kernel.lower
+    return None
+
+
 def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
     """
     Complete registration for all pending operations via C++ NeuronDispatcher.
@@ -553,49 +781,15 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
             # Create wrapper function (Phase 1 fallback)
             wrapper_func = create_wrapper_function(aten_name, operation)
 
-            preprocessing = reg_info.get("preprocessing")
             op_name = aten_name.replace("aten::", "")
+            validate_fn = reg_info.get("validate_static_inputs")
 
-            # shape_only preprocessing — fold into lower_func, register
-            # with C++ dispatcher for full caching.
-            if preprocessing == Preprocessing.SHAPE_ONLY:
-                validate_fn = reg_info.get("validate_static_inputs")
-                lower_func = _make_preprocessing_lower(
-                    torch_fn,
-                    aten_name,
-                    output_params,
-                    static_argnums,
-                    static_argnames,
-                    validate_fn,
-                )
-                try:
-                    _C._register_neuron_op(
-                        op_name,
-                        wrapper_func,
-                        lower_func,
-                        list(static_argnums) if static_argnums else [],
-                        list(static_argnames) if static_argnames else [],
-                    )
-                    registered_count += 1
-                    _maybe_register_autograd(aten_name)
-                    if verbose:
-                        print(
-                            f"[OK] Registered via C++ dispatcher (preprocessing=shape_only): "
-                            f"{aten_name} -> {func_name}"
-                        )
-                except Exception as e:
-                    if verbose:
-                        print(f"[WARN] Failed to register {op_name} via C++ dispatcher: {e}")
-                continue
-
-            # value_dependent preprocessing — these ops read tensor values
-            # during preprocessing, so they must call Python on every dispatch.
-            # Registered via aten_lib.impl (Python dispatch) with an optimized
-            # function that does preprocessing + cached kernel execution directly,
-            # bypassing the Operation.__call__ / TorchMlirOpImpl.execute() overhead.
-            # This is faster than routing through C++ boxed dispatch
-            if preprocessing == Preprocessing.VALUE_DEPENDENT:
-                validate_fn = reg_info.get("validate_static_inputs")
+            # Python dispatch path. Ops opt in with python_dispatch=True when
+            # their lowering is not a pure function of the C++ cache key (op name,
+            # shapes, dtypes, static args) and so cannot be replayed from it. They
+            # run preprocessing and the cached kernel in Python on every call. See
+            # register_aten's python_dispatch argument for when this is required.
+            if reg_info.get("python_dispatch"):
                 combined_fn = _make_preprocessing_dispatch(
                     torch_fn,
                     aten_name,
@@ -612,39 +806,39 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
                         _C._register_neuron_op(
                             op_name,
                             wrapper_func,
-                            None,
+                            combined_fn,
                             list(static_argnums) if static_argnums else [],
                             list(static_argnames) if static_argnames else [],
                             True,
-                            combined_fn,
                         )
                     registered_count += 1
                     _maybe_register_autograd(aten_name)
                     if verbose:
-                        print(
-                            f"[OK] Registered via optimized Phase 2: " f"{aten_name} -> {func_name}"
-                        )
+                        print(f"[OK] Registered via Python dispatch: {aten_name} -> {func_name}")
                 except Exception as e:
                     if verbose:
                         print(f"[WARN] Failed to register {op_name}: {e}")
                 continue
 
-            # Extract kernel.lower from the first implementation that has a kernel.
-            # Attach validate_static_inputs to the kernel so it fires during
-            # dtype inference (on original pre-downcast args) on cache miss.
-            lower_func = None
-            validate_fn = reg_info.get("validate_static_inputs")
-            for impl in operation._implementations:
-                if hasattr(impl, "kernel") and impl.kernel is not None:
-                    lower_func = impl.kernel.lower
-                    if validate_fn is not None:
-                        impl.kernel.validate_static_inputs_func = validate_fn
-                    break
+            # C++ cached dispatch path, shared by every remaining op. The lowering
+            # function is produced by a single resolver, so registration does not
+            # branch on op kind. On a cache hit these ops execute entirely in C++,
+            # without acquiring the GIL or calling back into Python.
+            lower_func = _resolve_lower_func(
+                reg_info,
+                operation,
+                torch_fn,
+                aten_name,
+                output_params,
+                static_argnums,
+                static_argnames,
+                validate_fn,
+            )
 
-            # Register with C++ NeuronDispatcher.
-            # Dtype inference is unified into lower_func: on cache miss, C++
-            # passes both downcasted and original args, and lower_func infers
-            # output dtypes at original precision inside the single Python call.
+            # Register with C++ NeuronDispatcher. Dtype inference is unified into
+            # lower_func: on cache miss, C++ passes both downcasted and original
+            # args, and lower_func infers output dtypes at original precision
+            # inside the single Python call.
             try:
                 _C._register_neuron_op(
                     op_name,

@@ -1165,13 +1165,28 @@ class TorchMlirKernel(BaseNeuronKernel):
                 )
         return input_specs, kw_input_specs
 
-    def _build_input_output_aliases(self, kept_input_indices):
-        """Build aliasing info for inplace ops.
+    def _build_input_output_aliases(self, kept_input_indices, num_outputs):
+        """Build (ir_param_idx, output_idx) aliases telling the NEFF to write each
+        output back into an input buffer (so inplace ops mutate in place, no copy).
 
-        For inplace ops (add_, mul_), output[0] aliases the first input
-        (the "self" tensor).  Returns list of (ir_param_idx, output_idx) pairs.
+        - Foreach inplace ops have one TensorList where input i and output i are
+        the same tensor, so output[i] aliases input[i] for all N (avoids N-1
+        copy_ ops).
+
+        - Other inplace ops alias output[0] to input[0] only. In ops like
+        fused_adam, input i and output i may correspond to different tensors, and
+        a 1:1 alias would cause value corruption.
         """
-        if self._is_inplace_op() and kept_input_indices and 0 in kept_input_indices:
+        if not self._is_inplace_op() or not kept_input_indices:
+            return []
+
+        # Foreach ops: single TensorList self arg, outputs map 1:1 to list tensors.
+        if "_foreach_" in self.op_name and num_outputs > 0:
+            num_ir_params = len(kept_input_indices)
+            return [(i, i) for i in range(min(num_outputs, num_ir_params))]
+
+        # All other inplace ops alias only the first output to the "self" tensor.
+        if 0 in kept_input_indices:
             ir_param_idx = list(kept_input_indices).index(0)
             return [(ir_param_idx, 0)]
         return []
@@ -1284,7 +1299,9 @@ class TorchMlirKernel(BaseNeuronKernel):
                 op_name=self.op_name,
                 is_inplace=self._is_inplace_op(),
                 has_collectives=self.has_collectives,
-                input_output_aliases=self._build_input_output_aliases(kept_input_indices),
+                input_output_aliases=self._build_input_output_aliases(
+                    kept_input_indices, len(io_spec.outputs) if io_spec else 0
+                ),
                 inferred_output_dtypes=inferred_output_dtypes,
             )
         finally:

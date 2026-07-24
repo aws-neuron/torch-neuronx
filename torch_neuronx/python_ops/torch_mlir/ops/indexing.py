@@ -284,11 +284,14 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     ["aten::masked_select", "aten::masked_select.out", "aten::masked_select.Tensor_out"],
     static_argnums=(2,),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
+    # Output size is mask.sum().item(), a function of tensor values rather than
+    # the cache key, so the lowering cannot be cached and replayed in C++.
+    python_dispatch=True,
 )
 def torch_masked_select(x, mask, out=None):
     if mask.dtype != torch.bool:
         raise RuntimeError(
-            "masked_select: expected BoolTensor for mask, but got " f"{mask.dtype} tensor"
+            f"masked_select: expected BoolTensor for mask, but got {mask.dtype} tensor"
         )
     size = mask.sum().item()
 
@@ -406,6 +409,9 @@ def _index_put_error_handler(ctx):
     static_argnames=("accumulate", "unsafe", "use_masked_fill"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     translate_args_fn=_translate_index_put_args,
+    # Preprocessing branches on the boolean index contents (via nonzero), so the
+    # lowering depends on tensor values and cannot be cached and replayed in C++.
+    python_dispatch=True,
     error_handler=_index_put_error_handler,
 )
 def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out=None):

@@ -151,6 +151,60 @@ def _check_inplace_dtype_casting(tensors, scalars):
         _check_inplace_casting(tensors, s)
 
 
+def _replace_empty_promoted(tensors, dtype=None, scalars=None):
+    """Retype empty tensors to the dtype compute_fn will promote them to.
+
+    compute_fn promotes non-float inputs inside the traced graph (bool->int,
+    int->float for div), and the compiler rejects that convert on a zero-size
+    tensor (NCC_ISPP060). Retyping empties up front keeps the convert off them;
+    non-empty tensors are left untouched for the C++ cache-hit path. The target
+    is `dtype`, or result_type(t, s) per element when `scalars` is given.
+    """
+    if scalars is None:
+        scalars = [None] * len(tensors)
+    elif not isinstance(scalars, list | tuple):
+        scalars = [scalars] * len(tensors)
+
+    def _target(t, s):
+        d = dtype if s is None else torch.result_type(t, s)
+        if d.is_floating_point and t.dtype.is_floating_point:
+            return t.dtype
+        return d
+
+    return [
+        torch.empty(t.shape, dtype=_target(t, s), device=t.device) if t.numel() == 0 else t
+        for t, s in zip(tensors, scalars, strict=False)
+    ]
+
+
+def _promote_inside(op, tensors, scalars=None):
+    """Promote input dtypes inside compute_fn, traced into the HLO.
+
+    The NEFF itself converts raw inputs — C++ cached dispatch feeds raw args
+    on cache hit without re-running preprocessing, so any promotion done
+    outside the traced graph would be dropped there (bool fed to an int NEFF
+    crashes; int32 fed to a float32 NEFF is read as IEEE-754 bits).
+
+    div: non-float -> float32 (true-division semantics, independent of scalar).
+    others: result_type(t, s) per element (bool x int, int x float, ...);
+    non-promoting pairs (int x int, float x weak scalar) are no-ops.
+
+    Derived only from live args: the lowering kernel cache reuses compute_fn
+    closures by __code__, so capturing dtype decisions from the enclosing
+    scope would leak state across dtypes.
+    """
+    if op == "div":
+        return [t.float() if not t.dtype.is_floating_point else t for t in tensors]
+    if scalars is None:
+        return tensors
+    if not isinstance(scalars, list | tuple):
+        scalars = [scalars] * len(tensors)
+    return [
+        t.to(rt) if (rt := torch.result_type(t, s)) != t.dtype else t
+        for t, s in zip(tensors, scalars, strict=False)
+    ]
+
+
 def _replace_empty(tensors, op=""):
     """Replace empty tensors with new empty tensors (passthrough for dynamo).
     For div, use float32 dtype to match PyTorch int/int -> float semantics.
@@ -214,19 +268,24 @@ def _void_postprocess(results):
 def _make_scalar_op(op):
     """Create a non-inplace foreach scalar op (also handles .out variant)."""
     nki_fn = NKI_SCALAR_FNS[op]
+    is_div = op == "div"
 
     def fn(tensors, scalar, out=None):
         _check_tensors(tensors)
-        if tensors and not tensors[0].dtype.is_floating_point:
-            out_dtype = torch.result_type(tensors[0], scalar)
-            tensors = [t.to(out_dtype) for t in tensors]
-        tensors = _replace_empty(tensors, op)
+        # On the dtype-inference call (scalar is still a Python number, not a
+        # traced 0-dim tensor) also promote eagerly, so the inferred output
+        # dtype matches CPU (e.g. bool x int -> int64).
+        if not is_div and not isinstance(scalar, torch.Tensor):
+            tensors = _promote_inside(op, tensors, scalar)
+        if is_div:
+            tensors = _replace_empty_promoted(tensors, torch.float32)
+        else:
+            tensors = _replace_empty_promoted(tensors, scalars=scalar)
 
         def compute_fn(tensors, scalar):
+            tensors = _promote_inside(op, tensors, scalar)
             return _cast_results(op, nki_fn(tensors, scalar))
 
-        if out is not None:
-            return compute_fn, (tensors, scalar), {"out": out}, _void_postprocess
         return compute_fn, (tensors, scalar), {}, None
 
     return fn
@@ -256,12 +315,22 @@ def _make_list_op(op):
     """Create a non-inplace foreach list op (also handles .out variant)."""
     nki_fn = NKI_LIST_FNS[op]
     has_alpha = op in HAS_ALPHA
+    is_div = op == "div"
 
     def fn(tensors1, tensors2, *args, out=None, alpha=1):
         _check_tensors_tensors(tensors1, tensors2)
-        tensors1 = _replace_empty(tensors1, op)
+        # Both operands are tensors, so cross-dtype promotion is traced
+        # natively; only div needs the float32 empty placeholders (NCC_ISPP060).
+        if is_div:
+            tensors1 = _replace_empty_promoted(tensors1, torch.float32)
+            tensors2 = _replace_empty_promoted(tensors2, torch.float32)
+        else:
+            tensors1 = _replace_empty(tensors1)
 
         def compute_fn(tensors1, tensors2, **kwargs):
+            if is_div:
+                tensors1 = [t.float() if not t.dtype.is_floating_point else t for t in tensors1]
+                tensors2 = [t.float() if not t.dtype.is_floating_point else t for t in tensors2]
             if has_alpha:
                 results = nki_fn(tensors1, tensors2, kwargs.get("alpha", 1))
             else:
@@ -312,15 +381,20 @@ def _make_list_inplace_op(op):
 def _make_scalarlist_op(op):
     """Create a non-inplace foreach scalarlist op (also handles .out variant)."""
     nki_fn = NKI_SCALARLIST_FNS[op]
+    is_div = op == "div"
 
     def fn(tensors, scalars, out=None):
         _check_tensors_scalars(tensors, scalars)
-        if tensors and scalars and not tensors[0].dtype.is_floating_point:
-            out_dtype = torch.result_type(tensors[0], scalars[0])
-            tensors = [t.to(out_dtype) for t in tensors]
-        tensors = _replace_empty(tensors, op)
+        # Promotion is per (tensor, scalar) pair. No eager outside branch as in
+        # _make_scalar_op: scalars stay Python numbers into compute_fn, so
+        # _promote_inside there already yields the CPU-matching output dtype.
+        if is_div:
+            tensors = _replace_empty_promoted(tensors, torch.float32)
+        else:
+            tensors = _replace_empty_promoted(tensors, scalars=scalars)
 
         def compute_fn(tensors, scalars):
+            tensors = _promote_inside(op, tensors, scalars)
             return _cast_results(op, nki_fn(tensors, scalars))
 
         if out is not None:
@@ -362,14 +436,21 @@ def _make_tensor_op(op):
     """Create a non-inplace foreach tensor (0-dim) op (also handles .out variant)."""
     nki_fn = NKI_SCALAR_FNS[op]
     has_alpha = op in HAS_ALPHA
+    is_div = op == "div"
 
     def fn(tensors, tensor, *args, out=None, alpha=1):
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
-        tensors = _replace_empty(tensors, op)
+        # The 0-dim `tensor` plays the scalar's role for promotion (result_type
+        # per list element against it), same as _make_scalar_op.
+        if is_div:
+            tensors = _replace_empty_promoted(tensors, torch.float32)
+        else:
+            tensors = _replace_empty_promoted(tensors, scalars=tensor)
         effective_tensor = tensor * alpha if has_alpha else tensor
 
         def compute_fn(tensors, tensor):
+            tensors = _promote_inside(op, tensors, tensor)
             return _cast_results(op, nki_fn(tensors, tensor))
 
         if out is not None:
@@ -589,8 +670,6 @@ def _make_addcop_tensor(nki_scalarlist_fn):
         if self and self[0].dtype == torch.bool:
             raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         self = _replace_empty(self)
-        # TODO: need NKI support for passing in multiple scalars as a tensor
-        scalar_list = scalars.tolist()
 
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
@@ -598,27 +677,30 @@ def _make_addcop_tensor(nki_scalarlist_fn):
         if out is not None:
             return (
                 compute_fn,
-                (self, tensor1, tensor2, scalar_list),
+                (self, tensor1, tensor2, scalars),
                 {"out": out},
                 _void_postprocess,
             )
-        return compute_fn, (self, tensor1, tensor2, scalar_list), {}, None
+        return compute_fn, (self, tensor1, tensor2, scalars), {}, None
 
     return fn
 
 
 def _make_addcop_tensor_inplace(nki_scalarlist_fn):
+    """Inplace tensor variant of _make_addcop_tensor (same scalars-as-tensor
+    handling). Empty tensors are dropped from the 3 lists; _make_preprocessing_lower
+    reconstructs them to full length before lowering, so list[i] still pairs with
+    scalars[i].
+    """
+
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         if self and self[0].dtype == torch.bool:
             raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
-        # TODO: need NKI support for passing in multiple scalars as a tensor
-        scalar_list = scalars.tolist()
         non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
         ne_self = [self[i] for i in non_empty_idx]
         ne_t1 = [tensor1[i] for i in non_empty_idx]
         ne_t2 = [tensor2[i] for i in non_empty_idx]
-        ne_s = [scalar_list[i] for i in non_empty_idx]
 
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
@@ -627,7 +709,7 @@ def _make_addcop_tensor_inplace(nki_scalarlist_fn):
             return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
-            (ne_self, ne_t1, ne_t2, ne_s),
+            (ne_self, ne_t1, ne_t2, scalars),
             {"out": tuple(ne_self)},
             _void_postprocess,
         )
