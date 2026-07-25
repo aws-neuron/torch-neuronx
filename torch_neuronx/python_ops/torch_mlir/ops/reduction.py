@@ -4,6 +4,8 @@ import warnings
 
 import torch
 
+from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name
+
 from ..operation_registry import register_aten
 
 
@@ -322,3 +324,57 @@ def torch_cdist_forward(x1, x2, p, compute_mode=None, out=None):
     if p == 0 or p == float("inf") or needs_broadcast:
         return _cdist_decompose(x1, x2, p)
     return torch.ops.aten._cdist_forward(x1, x2, p, compute_mode)
+
+
+def _validate_pdist(self, p=2.0, out=None):
+    """Reject dtypes pdist can't handle correctly.
+
+    CPU pdist (and its OpInfo) supports only float32/float64; other dtypes raise
+    on CPU, so we raise here too rather than silently accepting fp16/bf16 or
+    hitting an internal compiler error on integers. Under strict-fallback mode
+    (TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1) this surfaces as an
+    explicit error, matching CPU behavior.
+
+    The message is spelled identically to CPU (e.g. 'Half', not 'torch.float16'),
+    using the shared ScalarType-name table in ``dtype_utils``.
+    """
+    if self.dtype not in (torch.float32, torch.float64):
+        aten_name = torch_dtype_to_scalar_type_name(self.dtype) or str(self.dtype)
+        raise NotImplementedError(f"\"pdist\" not implemented for '{aten_name}'")
+
+
+def _pdist_pairwise(self, reduce_fn):
+    """Compute pdist for the strict upper triangle (i < j) by reducing each
+    pair's (d,) difference vector, in torch.pdist's row-major order.
+
+    The row count n is static at trace time, so self[i]/self[j] are static row
+    indices and the pair loop unrolls in the trace. This deliberately avoids the
+    (n, n, d) broadcast + amax-over-last-dim + matrix-slice path, which either
+    fails fx import (constructed index tensors: "cannot copy out of meta") or
+    trips an internal neuronx-cc compiler error on the 3-D reduction.
+    """
+    n = self.shape[0]
+    vals = [
+        reduce_fn((self[i] - self[j]).abs()).reshape(1)
+        for i in range(n - 1)
+        for j in range(i + 1, n)
+    ]
+    return torch.cat(vals) if vals else self.new_zeros(0)
+
+
+@register_aten(
+    ["aten::_pdist_forward", "aten::_pdist_forward.out"],
+    output_params=("out",),
+    static_argnums=(1,),
+    validate_static_inputs=_validate_pdist,
+)
+def torch_pdist_forward(self, p=2.0, out=None):
+    # The generic sum(|diff|^p)^(1/p) lowering degenerates for p=0 (^inf) and
+    # p=inf (^0 == 1), silently producing wrong results. Decompose those two
+    # cases into an explicit per-pair reduction (p=0: count of differing coords;
+    # p=inf: max abs coord diff) so the Neuron result is correct. p is static.
+    if p == 0:
+        return _pdist_pairwise(self, lambda ad: (ad != 0).to(self.dtype).sum())
+    if p == float("inf"):
+        return _pdist_pairwise(self, lambda ad: ad.amax())
+    return torch.ops.aten._pdist_forward(self, p)

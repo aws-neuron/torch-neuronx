@@ -49,3 +49,33 @@ def torch_dtype_to_scalar_type(dtype: torch.dtype) -> int | None:
         call sites.
     """
     return TORCH_DTYPE_TO_SCALAR_TYPE.get(dtype)
+
+
+# The capitalized ScalarType name PyTorch uses in error messages and
+# ``Tensor.type()`` (e.g. "Half", not "float16"). These are the ``#name``
+# tokens from ``AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS`` in
+# ``c10/core/ScalarType.h``, the same source as the ordinals above.
+TORCH_DTYPE_TO_SCALAR_TYPE_NAME: dict[torch.dtype, str] = {
+    torch.uint8: "Byte",
+    torch.int8: "Char",
+    torch.int16: "Short",
+    torch.int32: "Int",
+    torch.int64: "Long",
+    torch.float16: "Half",
+    torch.float32: "Float",
+    torch.float64: "Double",
+    torch.complex64: "ComplexFloat",
+    torch.complex128: "ComplexDouble",
+    torch.bool: "Bool",
+    torch.bfloat16: "BFloat16",
+}
+
+
+def torch_dtype_to_scalar_type_name(dtype: torch.dtype) -> str | None:
+    """Return the ``c10::ScalarType`` name for a ``torch.dtype``.
+
+    Matches the spelling PyTorch uses in error messages (e.g. ``torch.float16``
+    -> ``"Half"``). Returns ``None`` for unmapped dtypes; callers decide how to
+    handle them.
+    """
+    return TORCH_DTYPE_TO_SCALAR_TYPE_NAME.get(dtype)
