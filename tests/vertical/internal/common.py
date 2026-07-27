@@ -45,8 +45,31 @@ STATUS_RANK = {
 
 
 def allocate_to_device(data, device):
-    """Deep-clone tensors/lists/dicts to ``device``. Non-tensors pass through."""
+    """Deep-clone tensors/lists/dicts to ``device``. Non-tensors pass through.
+
+    Broadcast (zero-stride) tensors are re-expanded on the target device rather
+    than cloned. A plain ``.clone()`` materializes an expanded view as a dense
+    contiguous tensor (expanded dims overlap in storage, so ``clone`` can't
+    preserve the zero stride), which would silently change the input. This
+    matters for ``aten::scatter_add_``: its index is a 1-D row index broadcast
+    to ``(n, H)`` with ``stride(1)==0``, and the static NKI scatter_add only
+    routes to its fast kernel when that stride is 0. A materialized contiguous
+    index falls back to the slow GPSIMD path.
+    """
     if isinstance(data, torch.Tensor):
+        if data.dim() > 0 and 0 in data.stride():
+            # Move the compact base (unique elements), then re-broadcast to the
+            # original expanded shape so zero strides survive the device move.
+            base_shape = [
+                s if st != 0 else 1 for s, st in zip(data.shape, data.stride(), strict=True)
+            ]
+            base = data.detach()[tuple(slice(0, s) for s in base_shape)].contiguous()
+            # Downcast int64 -> int32 for the device copy (the static NKI
+            # scatter_add index is int32). The CPU tensor stays int64, which
+            # torch's CPU scatter_add_ requires for the reference.
+            if base.dtype == torch.int64:
+                base = base.to(torch.int32)
+            return base.to(device).expand(data.shape)
         return data.detach().clone().to(device)
     if isinstance(data, list | tuple):
         return type(data)(allocate_to_device(item, device) for item in data)

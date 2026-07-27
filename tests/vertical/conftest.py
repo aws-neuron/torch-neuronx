@@ -56,6 +56,12 @@ _COMPILE_COVERAGE_DIR = (
     / "neuron_compile_coverage_metrics"
 )
 
+# test_dynamic_aten_ops.py drops per-op JSON row-lists here.
+_DYNAMIC_METRICS_DIR = (
+    Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
+    / "neuron_dynamic_metrics"
+)
+
 COVERAGE_FIELDS = [
     "op_name",
     "op_group",
@@ -163,6 +169,9 @@ def pytest_sessionstart(session):
     if _COMPILE_COVERAGE_DIR.exists():
         for f in _COMPILE_COVERAGE_DIR.glob("*.json"):
             f.unlink()
+    if _DYNAMIC_METRICS_DIR.exists():
+        for f in _DYNAMIC_METRICS_DIR.glob("*.json"):
+            f.unlink()
     os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -180,6 +189,7 @@ def pytest_sessionfinish(session, exitstatus):
 
     _aggregate_metrics(_COVERAGE_DIR, "target_ops_coverage")
     _aggregate_metrics(_COMPILE_COVERAGE_DIR, "target_ops_compile_coverage")
+    _aggregate_dynamic_metrics(_DYNAMIC_METRICS_DIR, "dynamic_aten_ops")
 
 
 def _aggregate_metrics(metrics_dir: Path, prefix: str):
@@ -211,6 +221,43 @@ def _aggregate_metrics(metrics_dir: Path, prefix: str):
                     for k in COVERAGE_FIELDS
                 }
             )
+
+    for fp in metrics_dir.glob("*.json"):
+        fp.unlink()
+
+
+def _aggregate_dynamic_metrics(metrics_dir: Path, prefix: str):
+    """Merge per-cell JSON rows (one file per unit per xdist worker) into one
+    timestamped ``<prefix>_<ts>.csv``."""
+
+    if not metrics_dir.exists():
+        return
+
+    rows: list[dict] = []
+    for fp in sorted(metrics_dir.glob("*.json")):
+        try:
+            payload = json.loads(fp.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to read {fp}: {e}")
+            continue
+        rows.extend(payload if isinstance(payload, list) else [payload])
+
+    if not rows:
+        return
+
+    fields = list(rows[0].keys())
+    lead = fields[:4]
+    rows.sort(key=lambda r: tuple(str(r.get(k, "")) for k in lead))
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output = Path(f"{prefix}_{ts}.csv")
+    with open(output, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_MINIMAL, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(
+                {k: str(row.get(k, "")).replace("\n", " ").replace("\r", "") for k in fields}
+            )
+    logger.info(f"wrote {len(rows)} rows -> {output}")
 
     for fp in metrics_dir.glob("*.json"):
         fp.unlink()

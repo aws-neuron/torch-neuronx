@@ -521,11 +521,14 @@ class TestNeuronOpInfo:
         assert sample is not None
         assert sample.input.shape == (4, 4)
 
-    def test_shape_sweep_uses_registry(self):
+    def test_shape_sweep_uses_registry(self, monkeypatch):
         import torch
 
         from .neuron_shape_registry import SHAPE_REGISTRY
 
+        # Disable the top-N cap: relu carries many builtin shapes all larger than
+        # (7, 7), which would otherwise evict the tiny probe shape.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "0")
         SHAPE_REGISTRY.register("aten::relu", arg_shapes={"self": (7, 7)}, source="test_sweep")
 
         info = self.NeuronOpInfo.from_schema("aten::relu")
@@ -534,11 +537,14 @@ class TestNeuronOpInfo:
         shapes = [s.input.shape for s in samples]
         assert (7, 7) in shapes
 
-    def test_sample_inputs_includes_registry(self):
+    def test_sample_inputs_includes_registry(self, monkeypatch):
         import torch
 
         from .neuron_shape_registry import SHAPE_REGISTRY
 
+        # Disable the top-N cap (see test_shape_sweep_uses_registry): neg carries
+        # many builtin shapes larger than the (13, 13) probe shape.
+        monkeypatch.setenv("NEURON_MAX_SHAPES_PER_OP", "0")
         SHAPE_REGISTRY.register("aten::neg", arg_shapes={"self": (13, 13)}, source="test_sample")
 
         info = self.NeuronOpInfo.from_schema("aten::neg")
