@@ -14,6 +14,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Callable, Iterable
+from math import prod
 
 import torch
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput, _dispatch_dtypes
@@ -76,7 +77,8 @@ def _tensor_from_spec(spec, device, default_dtype):
     """Build a tensor from a shape tuple/list or a dict spec.
 
     Supported dict keys:
-      shape (required), dtype, low, high, sigmoid, names, sorted, starts_at.
+      shape (required), dtype, low, high, sigmoid, names, sorted, starts_at,
+      expand, distinct.
 
     When ``names`` is provided (tuple of strings matching ``len(shape)``),
     the tensor is tagged with those names via ``refine_names`` so it can be
@@ -87,15 +89,30 @@ def _tensor_from_spec(spec, device, default_dtype):
     When ``starts_at`` is set, the first element is forced to that value.
     These are useful for ops like embedding_bag that require monotonically
     increasing offsets starting at 0.
+
+    When ``expand`` is provided, the tensor built from ``shape`` is broadcast
+    (via ``.expand``) to the ``expand`` size, producing zero-stride dims. Used
+    by ``aten::scatter_add_``: its index must broadcast a 1-D ``(n,)`` row
+    index to ``(n, H)`` with ``stride(1)==0`` so the static NKI scatter_add
+    routes to its fast kernel (a materialized contiguous ``(n, H)`` index
+    falls back to the slow GP-SIMD path). ``allocate_to_device`` re-applies the
+    broadcast on the target device so the zero stride survives the move.
     """
     if isinstance(spec, dict):
         shape = tuple(spec["shape"])
         dt = _DTYPE_MAP.get(spec.get("dtype", "float"))
         dt = dt if dt is not None else default_dtype
         if dt in (torch.long, torch.int32):
-            t = torch.randint(
-                spec.get("low", 0), spec.get("high", 4), shape, device=device, dtype=dt
-            )
+            if spec.get("distinct"):
+                # A permutation guarantees each output row receives at most one add,
+                # making the comparison order-independent
+                low, high = spec.get("low", 0), spec.get("high", 4)
+                n = int(prod(shape))
+                t = (low + torch.randperm(high - low, device=device)[:n]).to(dt).reshape(shape)
+            else:
+                t = torch.randint(
+                    spec.get("low", 0), spec.get("high", 4), shape, device=device, dtype=dt
+                )
         elif dt is torch.bool:
             t = torch.randint(0, 2, shape, device=device, dtype=torch.bool)
         else:
@@ -109,6 +126,13 @@ def _tensor_from_spec(spec, device, default_dtype):
         names = spec.get("names")
         if names:
             t = t.refine_names(*names)
+        expand = spec.get("expand")
+        if expand is not None:
+            # Insert trailing singleton dims to match the expand rank, then
+            # broadcast — e.g. (n,) -> (n, 1) -> (n, H) with stride(1)==0.
+            while t.dim() < len(expand):
+                t = t.unsqueeze(-1)
+            t = t.expand(*expand)
         return t
     return torch.randn(tuple(spec), device=device, dtype=default_dtype)
 

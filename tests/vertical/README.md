@@ -16,16 +16,17 @@ tests/vertical/
 │   ├── __init__.py
 │   ├── target_ops.py               # Curated list of ~1362 target ATen ops
 │   ├── neuron_shape_registry.py    # Op-specific shape registry (CSV/JSON backed)
-│   ├── neuron_shape_defaults_generated.py  # Auto-generated shapes for ~670 ops
+│   ├── neuron_shape_defaults_generated.py  # Auto-generated shapes
 │   ├── neuron_op_info.py           # NeuronOpInfo extending PyTorch OpInfo
 │   ├── neuron_op_db.py             # build_neuron_op_db() merging all sources
 │   ├── generate_op_shape_registry.py       # Tool: cache keys → op_shape_registry.json
 │   ├── test_generate_op_shape_registry.py  # Unit tests for the parser
 ├── test_target_ops_coverage.py             # Eager coverage + perf + correctness
 ├── test_target_ops_compile_coverage.py     # torch.compile coverage + perf + correctness
+├── test_dynamic_aten_ops.py                # dynamic-shape NKI kernels perf (compared to static) + correctness
 ```
 
-## Running Tests
+## Running ATen Ops Tests
 
 ```sh
 # Run all eager coverage tests in parallel (recommended)
@@ -45,7 +46,27 @@ python -m pytest tests/vertical/test_target_ops_coverage.py -v -k "relu or gelu"
 
 ```
 
-## Coverage CSV
+## Running Dynamic ATen Ops Tests
+
+```sh
+
+# Run all dynamic NKI kernels
+python -m pytest tests/vertical/test_dynamic_aten_ops.py -n 8 --tb=no -q
+
+# Run a single op
+python -m pytest "tests/vertical/test_dynamic_aten_ops.py::TestDynamicAtenOps::test_op[aten::mm]" -v -s
+
+# Run ops matching a pattern
+python -m pytest tests/vertical/test_dynamic_aten_ops.py -v -k "silu or mm"
+
+# Limit each op to its N largest shapes (default 10)
+python -m pytest "tests/vertical/test_dynamic_aten_ops.py::TestDynamicAtenOps::test_op[aten::mm]" --max-shapes-per-op 2 -v -s
+
+```
+
+neuron-profile artifacts (ntff + NEFFs) are written under each test's pytest tmp dir: `/tmp/pytest-of-<user>/pytest-<N>/`.
+
+## ATen Ops Coverage CSV
 
 Results are aggregated into:
 - **Eager**: `target_ops_coverage_<timestamp>.csv`
@@ -66,6 +87,25 @@ Results are aggregated into:
 | `error` | Error message if failed |
 | `last_updated` | Timestamp |
 | `correctness_test` | `pass`, `fail`, or empty |
+
+## Dynamic ATen Ops CSV
+
+Per-op rows are merged into one timestamped `dynamic_aten_ops_<timestamp>.csv`. Each row is one (op, shape, dtype) cell profiled in both **dynamic** (NKI kernel) and **static** (default lowering) modes.
+
+| Column | Description |
+|--------|-------------|
+| `op_name` | Full ATen op name (e.g., `aten::add.Tensor`) |
+| `input_shape` | Tensor-arg dims joined with `x`, args with `_` (scalar args skipped) |
+| `dtype` | Float dtype of the swept sample (e.g., `bfloat16`) |
+| `input_size_mb` | Total input size (sum of input-tensor bytes) in MiB |
+| `dynamic_time_to_first_ms` / `static_time_to_first_ms` | Cold time-to-first (compile + load + execute), per mode |
+| `dynamic_e2e_time_us` / `static_e2e_time_us` | Warm wall-clock latency incl. host overhead, per mode |
+| `e2e_ratio` | `dynamic_e2e / static_e2e` (>1 ⇒ dynamic slower) |
+| `dynamic_device_time_us` / `static_device_time_us` | On-device busy time (neuron-profile `total_exec_time`), per mode |
+| `device_ratio` | `dynamic_device / static_device` |
+| `correctness_test` | `pass` / `fail` — device output vs CPU reference |
+| `last_updated` | Timestamp |
+| `error` | Error message, or an informational note (e.g. `fell back` when the dynamic kernel declined and the op ran via the default lowering) |
 
 ## Input Source Priority
 
