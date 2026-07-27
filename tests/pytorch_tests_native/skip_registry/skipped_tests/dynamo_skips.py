@@ -479,3 +479,13 @@ DYNAMO_SEGMENTATION_FAULT = [
     "test_trace_functional_tensor_with",
     "LoggingTests::test_aot_graphs",
 ]
+
+DYNAMO_CUDA_SPECIFIC_UNSUPPORTED = [
+    "test_ctx_manager.py::CtxManagerTests::test_cuda_stream_compared_with_constant",
+    "test_ctx_manager.py::CtxManagerTests::test_cuda_device",
+    "test_functions.py::FunctionTests::test_tensor_type5",
+    "test_functions.py::FunctionTests::test_get_device_properties_tensor_device",
+    "test_repros.py::ReproTests::test_mem_leak_guards",
+    "test_streams.py::TestStreams::test_record_stream_problem_basic",
+    "test_streams.py::TestStreams::test_record_stream_problem_interleaved",
+]
