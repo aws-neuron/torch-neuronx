@@ -35,7 +35,7 @@ from internal.neuron_shape_registry import SHAPE_REGISTRY
 # fixture RETURNS EARLY in the parent pytest process.
 pytestmark = pytest.mark.multi_device
 
-_NEURON_PROFILE_BIN = os.environ.get("NEURON_PROFILE_BIN", "/opt/aws/neuron/bin/neuron-profile")
+_NEURON_PROFILE_BIN = os.environ.get("NEURON_PROFILE_BIN", "/opt/aws/neuron/bin/neuron-explorer")
 _CORE_START = int(os.environ.get("AOP_CORE_START", "0"))
 
 
