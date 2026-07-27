@@ -1,25 +1,22 @@
 """Tests for dynamic-shape NKI kernel dispatch.
 
-When TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 and the input shape meets the
-kernel's constraints, the op routes to the dynamic NKI kernel instead of the
-default MLIR/PyTorch lowering.
-Each op test asserts TWO things:
+With TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 and a supported shape, an op routes
+to its dynamic NKI kernel instead of the default lowering.
 
-  1. the dynamic kernel actually executed
-  2. the result matches the CPU reference.
+Each op is one ``OpSpec`` row (registry name, input+reference builder, invoke fn);
+generic tests fan out over ``_OP_SPECS`` via parametrize, so a new op is one table
+entry. Every op is checked for both: the dynamic kernel ran (not a silent
+fallback), and the result matches the CPU reference for each supported dtype.
+Plus sweeps: arbitrary-H (free-dim remainder tiling) and compile-once (one NEFF
+reused across M / the MoE-forward loop).
 
-Plus shape-invariance tests: compile-for-one-shape / execute-on-others must NOT
-recompile (single op, and the full MoE-forward loop).
-
-Covers the MoE-forward ops: silu, add, mul, mm (dynamic-M), index (row gather),
-scatter_add.
-
-The whole module is skipped unless the feature flag is EXPORTED before the
-process starts.
+Skipped unless the flag is EXPORTED before the process starts.
 """
 
 import contextlib
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import ClassVar
 
 import pytest
@@ -28,6 +25,7 @@ import torch
 import torch_neuronx
 
 _DTYPES = [torch.bfloat16, torch.float32, torch.float16]
+_DTYPE_ID = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
 _TOL = {torch.float32: (1e-4, 1e-4), torch.bfloat16: (1e-2, 1e-2), torch.float16: (5e-3, 5e-3)}
 
 _FLAG_ON = os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") == "1"
@@ -45,13 +43,8 @@ def _entry(op_name):
 
 @contextlib.contextmanager
 def _assert_dynamic_ran(op_name, min_execs=1):
-    """Assert the dynamic NKI kernel for `op_name` executed inside the block.
-
-    Guards against the silent-fallback trap: a numerically-correct result can
-    come from the DEFAULT lowering without ever touching the dynamic kernel.
-    exec_count only advances in the dynamic dispatch entry point, so a jump of
-    >= min_execs proves the dynamic path ran.
-    """
+    """Assert the dynamic kernel ran (exec_count advanced). Guards the
+    silent-fallback trap: a correct result can come from the default lowering."""
     e = _entry(op_name)
     before = e._exec_count
     yield e
@@ -71,6 +64,106 @@ def _assert_dynamic_skipped(op_name):
     assert e._exec_count == before, f"{op_name}: dynamic kernel ran but should have declined"
 
 
+# ── per-op specification table ───────────────────────────────────────────────
+# One row per dynamic op. build(dtype, *, rows, h) -> (run_args, cpu_ref), where
+# run_args are neuron operands; run(*run_args) invokes the op on neuron. `rows` is
+# the dynamic dim (M / gather-scatter n), `h` the free dim; sweeps vary both.
+
+
+@dataclass
+class OpSpec:
+    name: str  # registry entry name, e.g. "exp", "mm", "scatter_add_"
+    build: Callable  # (dtype, *, rows, h) -> (run_args, cpu_ref)
+    run: Callable  # (*run_args) -> neuron result tensor
+    dtypes: tuple = tuple(_DTYPES)
+    arbitrary_h: bool = False  # in the free-dim remainder sweep
+    compile_once: bool = False  # in the compile-once-per-shape sweep
+
+
+def _unary_spec(name, fn, **flags):
+    """Unary elementwise (silu/exp/sin/cos); 3-D input exercises the flatten to [M, H]."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(1, rows, h, dtype=dtype) / 8
+        return (x.to("neuron"),), fn(x)
+
+    return OpSpec(name, build, lambda x: fn(x), **flags)
+
+
+def _binary_spec(name, fn, **flags):
+    """Binary elementwise (add/mul): two operands of identical shape/dtype."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(1, rows, h, dtype=dtype) / 8
+        y = torch.randn(1, rows, h, dtype=dtype) / 8
+        return (x.to("neuron"), y.to("neuron")), fn(x, y)
+
+    return OpSpec(name, build, lambda x, y: fn(x, y), **flags)
+
+
+def _mm_spec():
+    """mm is bf16-only; K=2048, N=4096 (both % 1024 == 0), M % 128 == 0."""
+
+    def build(dtype, *, rows=256, h=None):
+        k, n = 2048, 4096
+        a = torch.randn(rows, k, dtype=dtype) / 8
+        w = torch.randn(k, n, dtype=dtype) / 8
+        return (a.to("neuron"), w.to("neuron")), a @ w
+
+    return OpSpec("mm", build, lambda a, w: a @ w, dtypes=(torch.bfloat16,))
+
+
+def _index_spec(**flags):
+    """x[idx] row-gather: source [T, H], 1-D index of n rows (n % 128 == 0, n <= T)."""
+
+    def build(dtype, *, rows=512, h=2048):
+        t = 2 * rows  # n < T exercises the index-padding path
+        src = torch.randn(t, h, dtype=dtype) / 8
+        idx = torch.randperm(t)[:rows]
+        return (src.to("neuron"), idx.to("neuron")), src[idx]
+
+    return OpSpec("index", build, lambda src, idx: src[idx], **flags)
+
+
+def _scatter_add_spec(**flags):
+    """in-place scatter_add_ into [T, H] at n unique rows (MoE token->row unique)."""
+
+    def build(dtype, *, rows=512, h=2048):
+        t, n = 2 * rows, rows
+        src = torch.randn(n, h, dtype=dtype) / 8
+        idx = torch.randperm(t)[:n]
+        ref = torch.zeros(t, h, dtype=dtype)
+        ref.scatter_add_(0, idx.unsqueeze(1).expand(n, h).to(torch.int64), src)
+        out = torch.zeros(t, h, dtype=dtype).to("neuron")
+        idx_n = idx.to("neuron").unsqueeze(1).expand(n, h)
+        return (out, idx_n, src.to("neuron")), ref
+
+    def run(out, idx_n, src):
+        out.scatter_add_(0, idx_n, src)  # in-place -> "scatter_add_" entry
+        return out
+
+    return OpSpec("scatter_add_", build, run, **flags)
+
+
+_OP_SPECS = [
+    _unary_spec("silu", torch.nn.functional.silu, arbitrary_h=True, compile_once=True),
+    _unary_spec("exp", torch.exp, arbitrary_h=True, compile_once=True),
+    _unary_spec("sin", torch.sin, arbitrary_h=True, compile_once=True),
+    _unary_spec("cos", torch.cos, arbitrary_h=True, compile_once=True),
+    _binary_spec("add", torch.add),
+    _binary_spec("mul", torch.mul),
+    _mm_spec(),
+    _index_spec(arbitrary_h=True),
+    _scatter_add_spec(arbitrary_h=True),
+]
+
+# one correctness case per op per supported dtype
+_OP_DTYPE_CASES = [(s, dt) for s in _OP_SPECS for dt in s.dtypes]
+_OP_DTYPE_IDS = [f"{s.name}-{_DTYPE_ID[dt]}" for s, dt in _OP_DTYPE_CASES]
+_ARBITRARY_H_SPECS = [s for s in _OP_SPECS if s.arbitrary_h]
+_COMPILE_ONCE_SPECS = [s for s in _OP_SPECS if s.compile_once]
+
+
 @pytest.mark.skipif(
     not _FLAG_ON,
     reason="dynamic NKI disabled — export TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 to run",
@@ -82,169 +175,80 @@ class TestDynamicNkiKernels:
     def _bf16_neuron(self, *shapes):
         return [torch.randn(s, dtype=torch.bfloat16).to("neuron") for s in shapes]
 
-    def _neuron(self, dtype, *shapes):
-        return [(torch.randn(s, dtype=dtype) / 8).to("neuron") for s in shapes]
-
-    def test_dynamic_nki_silu(self):
-        (x,) = self._bf16_neuron(self.SHAPE)
-        with _assert_dynamic_ran("silu"):
-            out = torch.nn.functional.silu(x).cpu()
-        torch.testing.assert_close(out, torch.nn.functional.silu(x.cpu()), rtol=1e-2, atol=1e-2)
-
-    def test_dynamic_nki_add(self):
-        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
-        with _assert_dynamic_ran("add"):
-            out = torch.add(x, y).cpu()
-        torch.testing.assert_close(out, x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
-
-    def test_dynamic_nki_add_alpha_declines(self):
-        # alpha != 1 (kwarg-only) can't be honored by the a+b kernel -> can_handle
-        # rejects -> falls back to the default lowering -> still numerically correct.
-        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
-        with _assert_dynamic_skipped("add"):
-            out = torch.add(x, y, alpha=2).cpu()
-        torch.testing.assert_close(out, x.cpu() + 2 * y.cpu(), rtol=1e-2, atol=1e-2)
-
-    def test_dynamic_nki_add_alpha_one_routes(self):
-        # alpha == 1 is the default -> dynamic path still handles it.
-        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
-        with _assert_dynamic_ran("add"):
-            out = torch.add(x, y, alpha=1).cpu()
-        torch.testing.assert_close(out, x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
-
-    def test_dynamic_nki_add_out_writes_in_place(self):
-        # out= is the destination buffer (not an op kwarg); dynamic path runs and
-        # the caller's buffer receives the result.
-        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
-        buf = torch.empty_like(x)
-        with _assert_dynamic_ran("add"):
-            torch.add(x, y, out=buf)
-        torch.testing.assert_close(buf.cpu(), x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
-
-    def test_dynamic_nki_mul(self):
-        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
-        with _assert_dynamic_ran("mul"):
-            out = torch.mul(x, y).cpu()
-        torch.testing.assert_close(out, x.cpu() * y.cpu(), rtol=1e-2, atol=1e-2)
-
-    # ── dtype coverage for the elementwise / gather / scatter kernels ──
-    # 2-D [M, H]: M % 128 == 0 (H arbitrary).
-    ELEM_SHAPE = (256, 2048)
-    T, N = 2048, 512  # gather/scatter source rows, gathered/scattered rows
-
-    @pytest.mark.parametrize("dtype", _DTYPES)
-    def test_dynamic_nki_silu_dtypes(self, dtype):
+    # ── per-op correctness: routes to dynamic kernel AND matches CPU ──
+    @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
+    def test_dynamic_nki_op(self, spec, dtype):
         rtol, atol = _TOL[dtype]
-        (x,) = self._neuron(dtype, self.ELEM_SHAPE)
-        with _assert_dynamic_ran("silu"):
-            out = torch.nn.functional.silu(x).cpu()
-        torch.testing.assert_close(out, torch.nn.functional.silu(x.cpu()), rtol=rtol, atol=atol)
+        run_args, ref = spec.build(dtype)
+        with _assert_dynamic_ran(spec.name):
+            got = spec.run(*run_args).cpu()
+        torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
 
-    @pytest.mark.parametrize("dtype", _DTYPES)
-    def test_dynamic_nki_mul_dtypes(self, dtype):
-        rtol, atol = _TOL[dtype]
-        x, y = self._neuron(dtype, self.ELEM_SHAPE, self.ELEM_SHAPE)
-        with _assert_dynamic_ran("mul"):
-            out = torch.mul(x, y).cpu()
-        torch.testing.assert_close(out, x.cpu() * y.cpu(), rtol=rtol, atol=atol)
+    # ── free-dim remainder sweep ──
+    # H values hitting the remainder tile: 640=512+128, 576=512+64, 384 (single
+    # short tile), 1000=512+488 (non-128 remainder). H is baked, so the kernel
+    # tiles the free dim at trace time (512-wide + final short tile), no padding.
+    @pytest.mark.parametrize("H", [640, 576, 384, 1000])
+    @pytest.mark.parametrize("spec", _ARBITRARY_H_SPECS, ids=lambda s: s.name)
+    def test_dynamic_nki_arbitrary_h(self, spec, H):  # noqa: N803
+        run_args, ref = spec.build(torch.bfloat16, h=H)
+        with _assert_dynamic_ran(spec.name):
+            got = spec.run(*run_args).cpu()
+        torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
 
-    def test_dynamic_nki_mm(self):
-        # mm is bf16-only. K=2048, N=4096 (K,N % 1024 == 0), M % 128 == 0.
-        a, w = self._neuron(torch.bfloat16, (256, 2048), (2048, 4096))
-        with _assert_dynamic_ran("mm"):
-            out = (a @ w).cpu()
-        torch.testing.assert_close(out, a.cpu() @ w.cpu(), rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.parametrize("dtype", _DTYPES)
-    def test_dynamic_nki_index(self, dtype):
-        # x[idx] row-gather: source [T, H], 1-D index of n rows (n % 128 == 0, n <= T).
-        rtol, atol = _TOL[dtype]
-        (src,) = self._neuron(dtype, (self.T, 2048))
-        idx = torch.randperm(self.T)[: self.N]
-        with _assert_dynamic_ran("index"):
-            out = src[idx.to("neuron")].cpu()
-        torch.testing.assert_close(out, src.cpu()[idx], rtol=rtol, atol=atol)
-
-    @pytest.mark.parametrize("dtype", _DTYPES)
-    def test_dynamic_nki_scatter_add(self, dtype):
-        # in-place scatter_add_ into [T, H] at n unique rows (MoE token->row unique).
-        rtol, atol = _TOL[dtype]
-        n, H = self.N, 2048  # noqa: N806
-        (src,) = self._neuron(dtype, (n, H))
-        idx = torch.randperm(self.T)[:n]
-
-        ref = torch.zeros(self.T, H, dtype=dtype)
-        ref.scatter_add_(0, idx.unsqueeze(1).expand(n, H).to(torch.int64), src.cpu())
-
-        out = torch.zeros(self.T, H, dtype=dtype).to("neuron")
-        # in-place variant routes to the "scatter_add_" registry entry.
-        with _assert_dynamic_ran("scatter_add_"):
-            out.scatter_add_(0, idx.to("neuron").unsqueeze(1).expand(n, H), src)
-        torch.testing.assert_close(out.cpu(), ref, rtol=rtol, atol=atol)
-
-    def test_dynamic_nki_compile_once(self):
-        """Compile for one shape, execute on OTHERS, without recompiling.
-
-        Sweep M over distinct 128-multiples (per-expert token counts). The
-        dynamic kernel must run at every M (exec_count advances, >=2 distinct Ms
-        seen) while reusing ONE NEFF per compile_key (compiled count grows <=1).
-        """
-        entry = _entry("silu")
+    # ── compile-once-per-shape sweep ──
+    @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.name)
+    def test_dynamic_nki_compile_once(self, spec):
+        """Compile for one M, run on other Ms without recompiling — the
+        warm-restart / MoE-routing scenario. Runs at every M while one (H, dtype)
+        stays one NEFF (compiled count grows <=1)."""
+        entry = _entry(spec.name)
         compiled_before = len(entry._compiled)
         exec_before = entry._exec_count
         entry._exec_ms.clear()
 
         ms = (128, 256, 512)
         for m in ms:
-            x = (torch.randn(m, 2048, dtype=torch.bfloat16) / 8).to("neuron")
-            torch.nn.functional.silu(x).cpu()
+            run_args, _ = spec.build(torch.bfloat16, rows=m, h=2048)
+            spec.run(*run_args).cpu()
 
-        # dynamic kernel ran for each M ...
-        assert entry._exec_count - exec_before == len(ms), "dynamic silu did not run for every M"
+        # ran at every M ...
+        assert entry._exec_count - exec_before == len(
+            ms
+        ), f"dynamic {spec.name} did not run for every M"
         assert entry._exec_ms.issuperset(
             set(ms)
         ), f"expected to execute at Ms {set(ms)}, saw {entry._exec_ms}"
-        # ... but bf16 H=2048 is ONE compile_key -> at most one NEFF added.
+        # ... but one (H, dtype) is one compile_key -> <=1 NEFF added.
         assert len(entry._compiled) - compiled_before <= 1, "recompiled across M values"
 
-    # H values that exercise the free-dim remainder tile: 640=512+128,
-    # 576=512+64, 384<512 (single short tile), 1000=512+488 (non-128 remainder).
-    # H is a compile-time constant, so the kernel tiles the free dim at trace
-    # time (512-wide tiles + a final short tile) — arbitrary H, no padding.
-    @pytest.mark.parametrize("H", [640, 576, 384, 1000])
-    def test_dynamic_nki_arbitrary_h_silu(self, H):  # noqa: N803
-        with _assert_dynamic_ran("silu"):
-            x = (torch.randn(256, H, dtype=torch.bfloat16) / 8).to("neuron")
-            out = torch.nn.functional.silu(x).cpu()
-        torch.testing.assert_close(out, torch.nn.functional.silu(x.cpu()), rtol=1e-2, atol=1e-2)
+    # ── add-specific declining / routing (not in the op table) ──
+    def test_dynamic_nki_add_alpha_declines(self):
+        # alpha != 1 can't be honored by the a+b kernel -> can_handle rejects -> fallback.
+        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
+        with _assert_dynamic_skipped("add"):
+            out = torch.add(x, y, alpha=2).cpu()
+        torch.testing.assert_close(out, x.cpu() + 2 * y.cpu(), rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.parametrize("H", [640, 576, 384, 1000])
-    def test_dynamic_nki_arbitrary_h_gather(self, H):  # noqa: N803
-        T, n = 512, 256  # noqa: N806
-        src = (torch.randn(T, H, dtype=torch.bfloat16) / 8).to("neuron")
-        idx = torch.randperm(T)[:n]
-        with _assert_dynamic_ran("index"):
-            out = src[idx.to("neuron")].cpu()
-        torch.testing.assert_close(out, src.cpu()[idx], rtol=1e-2, atol=1e-2)
+    def test_dynamic_nki_add_alpha_one_routes(self):
+        # alpha == 1 (default) -> dynamic path handles it.
+        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
+        with _assert_dynamic_ran("add"):
+            out = torch.add(x, y, alpha=1).cpu()
+        torch.testing.assert_close(out, x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.parametrize("H", [640, 576, 384, 1000])
-    def test_dynamic_nki_arbitrary_h_scatter_add(self, H):  # noqa: N803
-        T, n = 512, 256  # noqa: N806
-        src = (torch.randn(n, H, dtype=torch.bfloat16) / 8).to("neuron")
-        idx = torch.randperm(T)[:n]
-        ref = torch.zeros(T, H, dtype=torch.bfloat16)
-        ref.scatter_add_(0, idx.unsqueeze(1).expand(n, H).to(torch.int64), src.cpu())
-        out = torch.zeros(T, H, dtype=torch.bfloat16).to("neuron")
-        with _assert_dynamic_ran("scatter_add_"):
-            out.scatter_add_(0, idx.to("neuron").unsqueeze(1).expand(n, H), src)
-        torch.testing.assert_close(out.cpu(), ref, rtol=1e-2, atol=1e-2)
+    def test_dynamic_nki_add_out_writes_in_place(self):
+        # out= is the destination buffer; dynamic path writes into it.
+        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
+        buf = torch.empty_like(x)
+        with _assert_dynamic_ran("add"):
+            torch.add(x, y, out=buf)
+        torch.testing.assert_close(buf.cpu(), x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
 
-    # ── end-to-end MoE forward: no recompiles as routing (token counts) change ──
-    # per-expert SwiGLU FFN over a routed token slice
-    # — index -> mm -> silu -> mul -> mm -> scatter_add. Real routing
-    # changes every step, so per-expert token counts (the M dim) change; the point
-    # of dynamic shapes is that each op reuses ONE NEFF per compile_key across all
-    # those M values instead of recompiling.
+    # ── E2E MoE forward: no recompiles as routing (token counts) change ──
+    # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.
+    # Routing changes per-expert token counts (M) each step; each op must reuse
+    # one NEFF across all M instead of recompiling.
     MOE_T = 1024  # tokens (multiple of 128)
     MOE_E = 4  # experts
     MOE_H = 2048  # hidden (multiple of mm N-block 1024)
@@ -253,11 +257,8 @@ class TestDynamicNkiKernels:
     MOE_OPS: ClassVar = ["index", "mm", "silu", "mul", "scatter_add_"]
 
     def _moe_routing_128(self, route_seed):
-        """Partition MOE_T tokens across MOE_E experts; each count a 128-multiple.
-
-        Different route_seed -> different per-expert counts -> different M shapes.
-        Returns a list of 1-D int32 index tensors (a partition of [0, MOE_T)).
-        """
+        """Partition MOE_T tokens across MOE_E experts (each count a 128-multiple)
+        into 1-D int32 index tensors. Different seed -> different M shapes."""
         T, E, tile = self.MOE_T, self.MOE_E, 128  # noqa: N806
         n_tiles = T // tile
         g = torch.Generator().manual_seed(route_seed)

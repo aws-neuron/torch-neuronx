@@ -10,11 +10,14 @@ from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
 
 from .add_kernel import add_kernel
+from .cos_kernel import cos_kernel
 from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
+from .exp_kernel import exp_kernel
 from .gather_kernel import gather_kernel
 from .mul_kernel import mul_kernel
 from .scatter_add_kernel import scatter_add_kernel
 from .silu_kernel import silu_kernel
+from .sin_kernel import sin_kernel
 
 # Grid must match logical_neuron_cores so the compiler emits identical code on
 # every core (NCC_IXGM002 fires on basic-block-count mismatch otherwise). The
@@ -24,6 +27,9 @@ _GRID = (int(get_logical_neuron_cores()),)
 
 _wrapped_add = wrap_nki(add_kernel)
 _wrapped_silu = wrap_nki(silu_kernel)
+_wrapped_exp = wrap_nki(exp_kernel)
+_wrapped_cos = wrap_nki(cos_kernel)
+_wrapped_sin = wrap_nki(sin_kernel)
 _wrapped_mul = wrap_nki(mul_kernel)
 _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
 _wrapped_gather = wrap_nki(gather_kernel)
@@ -40,6 +46,21 @@ def dynamic_add_nki(
 @nki_op("dynamic_nki::silu", mutates_args={})
 def dynamic_silu_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
     return _wrapped_silu[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::exp", mutates_args={})
+def dynamic_exp_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_exp[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::cos", mutates_args={})
+def dynamic_cos_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_cos[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::sin", mutates_args={})
+def dynamic_sin_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_sin[_GRID](input_tensor, num_m_tiles)
 
 
 @nki_op("dynamic_nki::mul", mutates_args={})
