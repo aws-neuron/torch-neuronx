@@ -53,14 +53,12 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[PT2.11] CUDA-specific tests in test_ctx_manager.py that assume CUDA"
-            " device_type; not applicable to Neuron (hits NameError or hardcoded"
-            " 'cuda' assertions)."
+            "[PT2.11] CUDA-specific tests that assume CUDA device_type or rely on"
+            " CUDA-only APIs/semantics with no Neuron equivalent (hardcoded 'cuda'"
+            " assertions, torch.cuda.HalfTensor, torch.cuda.get_device_properties,"
+            " CUDA memory-stats, CUDA stream/event graphs). Not applicable to Neuron."
         ),
-        tests=[
-            "test_cuda_stream_compared_with_constant",
-            "test_cuda_device",
-        ],
+        tests=s.DYNAMO_CUDA_SPECIFIC_UNSUPPORTED,
     ),
     SkipGroup(
         reason=(
