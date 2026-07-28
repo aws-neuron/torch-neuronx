@@ -3852,6 +3852,18 @@ class TestSearchsortedDecomposition:
         expected = torch.searchsorted(sorted_seq, 2.0, right=True)
         torch.testing.assert_close(result, expected)
 
+    def test_searchsorted_scalar_fractional_int_sequence(self):
+        """Fractional scalar against an integer sequence must not be truncated.
+
+        Regression: forcing the scalar to ``sorted_sequence.dtype`` cast 2.5 to
+        2 before the comparison, returning 1 instead of the correct 2. The
+        decomposition now promotes via ``torch.result_type`` to match upstream.
+        """
+        sorted_seq = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        result = decompositions.searchsorted_scalar_decomposition(sorted_seq, 2.5)
+        expected = torch.searchsorted(sorted_seq, 2.5)
+        torch.testing.assert_close(result, expected)
+
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSearchsortedDecompositionCompileE2E:
@@ -3923,6 +3935,63 @@ class TestSearchsortedDecompositionCompileE2E:
         result = compiled_fn(sorted_seq, values)
 
         torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("value", [0.5, 2.5, 3.5, 5.0, 9.5])
+    def test_searchsorted_scalar_e2e(self, value):
+        """Scalar-value searchsorted via torch.compile — exercises the scalar
+        overload decomposition (scalar promoted via sorted_sequence.new_full).
+
+        Regression test: previously failed with ``AssertionError: aot_autograd
+        expected to have an entirely functional graph, but found %detach_``
+        because the old decomp used ``torch.tensor([value]).to(...)`` which
+        emits a ``lift_fresh_copy → detach_`` sequence AOT rejects."""
+        sorted_seq_cpu = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+
+        def fn(s):
+            return torch.searchsorted(s, value)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled_fn(sorted_seq_cpu.to("neuron"))
+        expected = fn(sorted_seq_cpu)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("right", [False, True])
+    def test_searchsorted_scalar_right_e2e(self, right):
+        """Scalar-value searchsorted honouring the ``right`` boundary flag."""
+        sorted_seq_cpu = torch.tensor([1.0, 2.0, 2.0, 3.0, 4.0])
+        value = 2.0
+
+        def fn(s):
+            return torch.searchsorted(s, value, right=right)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled_fn(sorted_seq_cpu.to("neuron"))
+        expected = fn(sorted_seq_cpu)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_searchsorted_scalar_out_e2e(self):
+        """Explicit-out scalar searchsorted via the aten overload.
+
+        ``torch.searchsorted``'s Python API doesn't accept scalar+out, so this
+        exercises ``torch.ops.aten.searchsorted.Scalar_out`` directly — the
+        overload the neuron backend dispatches when tracing a graph that
+        contains an out-writing scalar searchsorted."""
+        sorted_seq_cpu = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+        value = 4.5
+
+        def fn(s, out):
+            return torch.ops.aten.searchsorted.Scalar_out(s, value, out=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        out_neuron = torch.empty((), dtype=torch.int64, device="neuron")
+        result = compiled_fn(sorted_seq_cpu.to("neuron"), out_neuron)
+
+        expected_out = torch.empty((), dtype=torch.int64)
+        fn(sorted_seq_cpu, expected_out)
+
+        torch.testing.assert_close(result.cpu(), expected_out)
 
 
 class TestNativeBatchNormDecomposition:
@@ -6232,6 +6301,31 @@ class TestUnsafeMaskedIndexDecompositionE2E:
         torch.testing.assert_close(result.cpu(), fn(x_cpu, idx, src), rtol=1e-4, atol=1e-4)
 
 
+class TestBucketizeScalarDecomposition:
+    """Hardware-free numeric tests for the bucketize.Scalar decomposition."""
+
+    def test_bucketize_scalar_float(self):
+        boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+        result = decompositions.bucketize_scalar_decomposition(4.5, boundaries)
+        torch.testing.assert_close(result, torch.bucketize(4.5, boundaries))
+
+    def test_bucketize_scalar_right(self):
+        boundaries = torch.tensor([1.0, 2.0, 2.0, 3.0, 4.0])
+        result = decompositions.bucketize_scalar_decomposition(2.0, boundaries, right=True)
+        torch.testing.assert_close(result, torch.bucketize(2.0, boundaries, right=True))
+
+    def test_bucketize_scalar_fractional_int_boundaries(self):
+        """Fractional scalar against integer boundaries must not be truncated.
+
+        Regression: forcing the scalar to ``boundaries.dtype`` cast 2.5 to 2
+        before bucketing, returning 1 instead of the correct 2. The
+        decomposition now promotes via ``torch.result_type`` to match upstream.
+        """
+        boundaries = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        result = decompositions.bucketize_scalar_decomposition(2.5, boundaries)
+        torch.testing.assert_close(result, torch.bucketize(2.5, boundaries))
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestBucketizeDecompositionE2E:
     """E2E tests for bucketize.Scalar decomposition"""
@@ -6252,6 +6346,67 @@ class TestBucketizeDecompositionE2E:
         compiled_fn = torch.compile(fn_neuron, backend="neuron")
         result = compiled_fn()
         torch.testing.assert_close(result.cpu(), fn())
+
+    @pytest.mark.parametrize("value", [0.5, 2.5, 4.5, 7.5, 9.5])
+    def test_bucketize_scalar_parametrized_e2e(self, value):
+        """Scalar-value bucketize via torch.compile across multiple scalar
+        inputs — regression test for the scalar-indexing failure.
+
+        Before the fix, ``bucketize.Scalar`` would fail with
+        ``GuardOnDataDependentSymNode: Could not extract specialized integer
+        from data-dependent expression u0``: upstream ``_refs.bucketize``
+        promotes the scalar via ``torch.tensor(a)`` to a 0-D fake tensor, and
+        the subsequent ``boundaries[mid]`` advanced-indexing meta rule
+        allocates an unbacked SymInt for the output shape."""
+        boundaries_cpu = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+
+        def fn(b):
+            return torch.bucketize(value, b)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled_fn(boundaries_cpu.to("neuron"))
+        expected = fn(boundaries_cpu)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("right", [False, True])
+    def test_bucketize_scalar_right_e2e(self, right):
+        """Scalar-value bucketize honouring the ``right`` boundary flag."""
+        boundaries_cpu = torch.tensor([1.0, 2.0, 2.0, 3.0, 4.0])
+        value = 2.0
+
+        def fn(b):
+            return torch.bucketize(value, b, right=right)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled_fn(boundaries_cpu.to("neuron"))
+        expected = fn(boundaries_cpu)
+
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_bucketize_scalar_out_e2e(self):
+        """Explicit-out scalar bucketize via the aten overload.
+
+        ``torch.bucketize``'s Python API rejects scalar+out, so this exercises
+        ``torch.ops.aten.bucketize.Scalar_out`` directly. The .Scalar_out
+        overload additionally requires overriding a broken upstream meta
+        (``meta_bucketize_scalar`` doesn't accept ``out=``, unlike its
+        ``.Tensor`` sibling); the fix registers a corrected fake impl with
+        ``allow_override=True`` so Dynamo's fake-tensor pass succeeds."""
+        boundaries_cpu = torch.tensor([1.0, 3.0, 5.0, 7.0, 9.0])
+        value = 4.5
+
+        def fn(b, out):
+            return torch.ops.aten.bucketize.Scalar_out(value, b, out=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        out_neuron = torch.empty((), dtype=torch.int64, device="neuron")
+        result = compiled_fn(boundaries_cpu.to("neuron"), out_neuron)
+
+        expected_out = torch.empty((), dtype=torch.int64)
+        fn(boundaries_cpu, expected_out)
+
+        torch.testing.assert_close(result.cpu(), expected_out)
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
