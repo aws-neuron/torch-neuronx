@@ -260,6 +260,49 @@ def bmm_dtype(self, mat2, out_dtype):
     return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
 
 
+def _zero_result(shape, a, b):
+    """Build a zero-filled tensor with the standard matmul promoted dtype."""
+    return torch.zeros(shape, dtype=torch.promote_types(a.dtype, b.dtype), device=a.device)
+
+
+# ── Empty-input short-circuits ──────────────────────────────────────
+# PyTorch allows empty inputs for matmul ops to return a full tensor
+# of zeros. Add a decomposition to related ops to handle this, returning
+# NotImplemented if any input is nonempty to fallback to default behavior
+
+
+@register_decomposition([aten.mm.default])
+def mm_empty_shortcut(a, b):
+    """Short-circuit 2D x 2D matmul on zero-element inputs (any of M/K/N == 0)."""
+    if a.numel() != 0 and b.numel() != 0:
+        return NotImplemented
+    return _zero_result((a.shape[0], b.shape[1]), a, b)
+
+
+@register_decomposition([aten.bmm.default])
+def bmm_empty_shortcut(a, b):
+    """Short-circuit batched 3D x 3D matmul on zero-element inputs."""
+    if a.numel() != 0 and b.numel() != 0:
+        return NotImplemented
+    return _zero_result((a.shape[0], a.shape[1], b.shape[2]), a, b)
+
+
+@register_decomposition([aten.mv.default])
+def mv_empty_shortcut(a, b):
+    """Short-circuit 2D x 1D matrix-vector product on zero-element inputs."""
+    if a.numel() != 0 and b.numel() != 0:
+        return NotImplemented
+    return _zero_result((a.shape[0],), a, b)
+
+
+@register_decomposition([aten.dot.default])
+def dot_empty_shortcut(a, b):
+    """Short-circuit 1D x 1D dot product on zero-element inputs → scalar 0."""
+    if a.numel() != 0 and b.numel() != 0:
+        return NotImplemented
+    return _zero_result((), a, b)
+
+
 # ``aten::_stack`` is the internal variant of ``stack`` (it assumes all inputs
 # already share a shape). Unlike ``aten::stack`` it ships no meta kernel, so
 # Dynamo can't trace it and it reaches the backend as an opaque ``torch.operator``
