@@ -16,6 +16,8 @@ caller then proceeds with the default lowering).
 
 import logging
 
+import torch
+
 from torch_neuronx import _C
 from torch_neuronx.python_ops.shared.config import CompilationConfig
 
@@ -32,6 +34,32 @@ def _short_name(op_name: str) -> str:
     return op_name.replace("aten::", "").split(".")[0]
 
 
+def _is_transpose_view(t) -> bool:
+    """True if `t` is a 2-D transpose view: stride (1, rows), i.e. a .t() of a
+    contiguous tensor."""
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dim() == 2
+        and t.stride(0) == 1
+        and t.stride(1) == t.size(0)
+    )
+
+
+def _resolve_entry(short_name, args):
+    """Pick the dynamic-NKI entry, disambiguating aten::mm by operand layout.
+
+    grad_input and grad_weight are both aten::mm; they differ in which dim is the
+    dynamic token count. grad_weight = matᵀ @ grad, so its mat1 arrives as a
+    transpose view -> dynamic-K "mm_k"; grad_input / forward mat1 are contiguous ->
+    dynamic-M "mm". Routing is intent-only; the entry's can_handle still gates shape.
+    """
+    if short_name == "mm" and args and _is_transpose_view(args[0]):
+        entry_k = get_dynamic_nki_entry("mm_k")
+        if entry_k is not None:
+            return entry_k
+    return get_dynamic_nki_entry(short_name)
+
+
 def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     """Execute ``op_name`` via a pre-compiled dynamic NKI NEFF, if registered.
 
@@ -42,14 +70,14 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     Returns the result tensor (or tuple) if handled, else ``None``.
     """
     short_name = _short_name(op_name)
-    entry = get_dynamic_nki_entry(short_name)  # flag-gated: None unless feature on
+    args = tuple(args)
+    entry = _resolve_entry(short_name, args)  # flag-gated: None unless feature on
     if entry is None:
         return None
 
     # Split kwargs: out=/grad_input= are the destination buffer; framework params
     # (device, memory_format, ...) aren't op args — drop both. What remains are
     # real op kwargs, forwarded to can_handle / compile_key_fn / prepare_io.
-    args = tuple(args)
     kwargs = dict(kwargs) if kwargs else {}
     dest = None
     for k in _DEST_KWARGS:

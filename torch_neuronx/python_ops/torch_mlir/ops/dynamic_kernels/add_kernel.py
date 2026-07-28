@@ -93,5 +93,4 @@ def add_kernel(input_a, input_b, num_m_tiles):
 
         nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
 
-    nisa.dma_copy(result, result)
     return result

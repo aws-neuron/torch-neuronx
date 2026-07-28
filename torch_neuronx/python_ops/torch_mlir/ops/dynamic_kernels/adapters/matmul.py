@@ -43,10 +43,10 @@ def _compile_mm(compile_key) -> tuple[bytes, str]:
     from ..wrappers import dynamic_matmul_nki
 
     K, N = compile_key  # noqa: N806
-    lhs = torch.empty(_TILE_M, K, dtype=torch.bfloat16, device="neuron")
-    rhs = torch.empty(K, N, dtype=torch.bfloat16, device="neuron")
-    nm = torch.tensor([[1]], dtype=torch.int32, device="neuron")
-    out = torch.empty(_TILE_M, N, dtype=torch.bfloat16, device="neuron")
+    lhs = torch.empty(_TILE_M, K, dtype=torch.bfloat16, device="meta")
+    rhs = torch.empty(K, N, dtype=torch.bfloat16, device="meta")
+    nm = torch.tensor([[1]], dtype=torch.int32, device="meta")
+    out = torch.empty(_TILE_M, N, dtype=torch.bfloat16, device="meta")
 
     kernel = TorchMlirKernel(torch_fn=dynamic_matmul_nki, op_name="dynamic_nki_matmul")
     return _compile_or_load_neff(kernel, "dynamic_nki_matmul", (lhs, rhs, nm), out)

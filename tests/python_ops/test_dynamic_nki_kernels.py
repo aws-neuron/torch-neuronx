@@ -353,3 +353,113 @@ class TestDynamicNkiKernels:
                 f"{compiled_after_warmup[name]} to {len(e._compiled)} "
                 f"(dynamic shapes not reused)"
             )
+
+    @pytest.mark.parametrize("H", [640, 576, 384, 1000])
+    def test_dynamic_nki_arbitrary_h_silu_backward(self, H):  # noqa: N803
+        M = 256  # noqa: N806
+        x = (torch.randn(M, H, dtype=torch.bfloat16) / 4).to("neuron").requires_grad_(True)
+        grad_out = (torch.randn(M, H, dtype=torch.bfloat16) / 4).to("neuron")
+        with _assert_dynamic_ran("silu_backward"):
+            (dx,) = torch.autograd.grad(torch.nn.functional.silu(x), x, grad_out)
+        x_c = x.detach().cpu().float().requires_grad_(True)
+        (dx_ref,) = torch.autograd.grad(torch.nn.functional.silu(x_c), x_c, grad_out.cpu().float())
+        torch.testing.assert_close(dx.cpu().float(), dx_ref, rtol=1e-2, atol=1e-2)
+
+    # backward mm disambiguation: grad_weight (transposed mat1) -> "mm_k",
+    # grad_input/fwd (contiguous mat1) -> "mm". See dispatch_entry._resolve_entry.
+    def test_dynamic_nki_mm_backward_routing_no_recompile(self):
+        """grad_weight routes to mm_k, everything else to mm; no recompile on a
+        token-count change."""
+        H, H4 = 2048, 4096  # noqa: N806
+        mm = _entry("mm")
+        mm_k = _entry("mm_k")
+
+        def _fwd_bwd(n):
+            dt = torch.bfloat16
+            x = (torch.randn(n, H, dtype=dt) / 64).to("neuron").requires_grad_(True)
+            w1 = (torch.randn(H, H4, dtype=dt) / 64).to("neuron").requires_grad_(True)
+            w3 = (torch.randn(H4, H, dtype=dt) / 64).to("neuron").requires_grad_(True)
+            out = torch.nn.functional.silu(x @ w1) @ w3
+            (out * out).sum().backward()  # non-degenerate loss (no stride-0 grad seed)
+            torch_neuronx.synchronize()
+
+        _fwd_bwd(384)  # warmup
+        mm_neffs, mmk_neffs = len(mm._compiled), len(mm_k._compiled)
+        mm_execs, mmk_execs = mm._exec_count, mm_k._exec_count
+
+        _fwd_bwd(512)  # different token count -> must not recompile
+
+        assert mm_k._exec_count > mmk_execs, "grad_weight not routed to mm_k"
+        assert mm._exec_count > mm_execs, "fwd/grad_input not routed to mm"
+        assert len(mm._compiled) == mm_neffs, "mm recompiled on token change"
+        assert len(mm_k._compiled) == mmk_neffs, "mm_k recompiled on token change"
+
+    # backward ops asserted on (mm/mm_k = grad_input/grad_weight).
+    MOE_BWD_OPS: ClassVar = ["mm", "mm_k", "silu_backward", "index", "mul"]
+
+    @staticmethod
+    def _moe_expert_loop_autograd(x, w1, w2, w3, expert_indices, T, H, num_experts):  # noqa: N803
+        """Functional MoE forward (index_add, autograd-friendly)."""
+        output = torch.zeros(T, H, dtype=x.dtype, device=x.device)
+        for e in range(num_experts):
+            idx = expert_indices[e]
+            if idx.numel() == 0:
+                continue
+            x_expert = x[idx]
+            gated = torch.nn.functional.silu(x_expert @ w1[e]) * (x_expert @ w2[e])
+            out = gated @ w3[e]
+            output = output.index_add(0, idx.to(torch.int64), out)
+        return output
+
+    def test_dynamic_nki_moe_backward_no_recompile(self):
+        """E2E MoE fwd+bwd across changing routing: every backward op runs dynamic,
+        grads match CPU, and no NEFF recompiles after warmup."""
+        T, E, H, H4 = self.MOE_T, self.MOE_E, self.MOE_H, self.MOE_H4  # noqa: N806
+        torch.manual_seed(0)
+
+        def _mk_weights(device):
+            g = torch.Generator().manual_seed(1)
+            w1 = [(torch.randn(H, H4, dtype=torch.bfloat16, generator=g) / 64) for _ in range(E)]
+            w2 = [(torch.randn(H, H4, dtype=torch.bfloat16, generator=g) / 64) for _ in range(E)]
+            w3 = [(torch.randn(H4, H, dtype=torch.bfloat16, generator=g) / 64) for _ in range(E)]
+            xv = torch.randn(T, H, dtype=torch.bfloat16, generator=g) / 8
+
+            def move(t):
+                return t.to(device).detach().requires_grad_(True)
+
+            return [move(w) for w in w1], [move(w) for w in w2], [move(w) for w in w3], move(xv)
+
+        entries = {name: _entry(name) for name in self.MOE_BWD_OPS}
+
+        def _step(route_seed, on_neuron):
+            device = "neuron" if on_neuron else "cpu"
+            w1, w2, w3, x = _mk_weights(device)
+            idx = self._moe_routing_128(route_seed)
+            idx_d = [i.to(device) for i in idx]
+            out = self._moe_expert_loop_autograd(x, w1, w2, w3, idx_d, T, H, E)
+            (out * out).sum().backward()
+            if on_neuron:
+                torch_neuronx.synchronize()
+            grads = [x.grad, *[w.grad for w in w1], *[w.grad for w in w2], *[w.grad for w in w3]]
+            return [g.cpu() for g in grads]
+
+        _step(route_seed=1, on_neuron=True)  # warmup
+        compiled_after_warmup = {n: len(e._compiled) for n, e in entries.items()}
+        exec_after_warmup = {n: e._exec_count for n, e in entries.items()}
+        for e in entries.values():
+            e._exec_ms.clear()
+
+        warm_seeds = (5, 9, 13)  # different routing -> different token counts
+        for route_seed in warm_seeds:
+            neuron_grads = _step(route_seed, on_neuron=True)
+            cpu_grads = _step(route_seed, on_neuron=False)
+            for gi, (gn, gc) in enumerate(zip(neuron_grads, cpu_grads, strict=True)):
+                torch.testing.assert_close(gn, gc, rtol=3e-2, atol=3e-2, msg=f"grad[{gi}] mismatch")
+
+        for name, e in entries.items():
+            execs = e._exec_count - exec_after_warmup[name]
+            assert execs >= len(warm_seeds), f"{name}: ran only {execs}x (fell back?)"
+            assert len(e._exec_ms) >= 2, f"{name}: only saw Ms={e._exec_ms}"
+            assert (
+                len(e._compiled) == compiled_after_warmup[name]
+            ), f"{name}: recompiled on routing change"

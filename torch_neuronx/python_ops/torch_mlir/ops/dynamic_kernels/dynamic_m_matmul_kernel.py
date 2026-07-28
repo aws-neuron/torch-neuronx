@@ -171,5 +171,4 @@ def dynamic_m_matmul_kernel(lhs, rhs, num_m_tiles):
         # (in row-major: 128 * k_max elements for lhs, 128 * n_max for res)
         nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
 
-    nisa.dma_copy(res, res)
     return res

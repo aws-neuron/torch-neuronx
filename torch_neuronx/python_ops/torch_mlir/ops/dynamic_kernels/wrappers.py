@@ -1,7 +1,7 @@
-"""@nki_op wrappers for the dynamic-shape MoE-forward NKI kernels.
+"""@nki_op wrappers for the dynamic-shape MoE NKI kernels.
 
-Covers the MoE forward path: add, mul, silu, matmul (dynamic-M), gather (index),
-scatter_add.
+Forward path: add, mul, silu, matmul (dynamic-M), gather (index), scatter_add.
+Backward: matmul_k (dynamic-K, for grad_weight = x_eᵀ @ dout), silu_bwd.
 """
 
 import torch
@@ -11,11 +11,14 @@ from torch_neuronx.utils import get_logical_neuron_cores
 
 from .add_kernel import add_kernel
 from .cos_kernel import cos_kernel
+from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
 from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
 from .exp_kernel import exp_kernel
 from .gather_kernel import gather_kernel
 from .mul_kernel import mul_kernel
 from .scatter_add_kernel import scatter_add_kernel
+from .sigmoid_kernel import sigmoid_kernel
+from .silu_bwd_kernel import silu_bwd_kernel
 from .silu_kernel import silu_kernel
 from .sin_kernel import sin_kernel
 
@@ -32,6 +35,8 @@ _wrapped_cos = wrap_nki(cos_kernel)
 _wrapped_sin = wrap_nki(sin_kernel)
 _wrapped_mul = wrap_nki(mul_kernel)
 _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
+_wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
+_wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
 _wrapped_gather = wrap_nki(gather_kernel)
 _wrapped_scatter_add = wrap_nki(scatter_add_kernel)
 
@@ -75,6 +80,22 @@ def dynamic_matmul_nki(
     lhs: torch.Tensor, rhs: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_matmul[_GRID](lhs, rhs, num_m_tiles)
+
+
+@nki_op("dynamic_nki::matmul_k", mutates_args={})
+def dynamic_matmul_k_nki(
+    x_e: torch.Tensor,
+    dout: torch.Tensor,
+    num_k_tiles: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_matmul_k[_GRID](x_e, dout, num_k_tiles)
+
+
+@nki_op("dynamic_nki::silu_bwd", mutates_args={})
+def dynamic_silu_bwd_nki(
+    grad_output: torch.Tensor, input_tensor: torch.Tensor, num_m_tiles: torch.Tensor
+) -> torch.Tensor:
+    return _wrapped_silu_bwd[_GRID](grad_output, input_tensor, num_m_tiles)
 
 
 @nki_op("dynamic_nki::gather", mutates_args={})
