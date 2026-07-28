@@ -90,6 +90,16 @@ def _unary_spec(name, fn, **flags):
     return OpSpec(name, build, lambda x: fn(x), **flags)
 
 
+def _log_spec(**flags):
+    """log: unary, but the input must be positive (log domain)."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = (torch.randn(1, rows, h, dtype=dtype) / 8).abs() + 0.1
+        return (x.to("neuron"),), torch.log(x)
+
+    return OpSpec("log", build, torch.log, **flags)
+
+
 def _binary_spec(name, fn, **flags):
     """Binary elementwise (add/mul): two operands of identical shape/dtype."""
 
@@ -150,6 +160,9 @@ _OP_SPECS = [
     _unary_spec("exp", torch.exp, arbitrary_h=True, compile_once=True),
     _unary_spec("sin", torch.sin, arbitrary_h=True, compile_once=True),
     _unary_spec("cos", torch.cos, arbitrary_h=True, compile_once=True),
+    _unary_spec("sigmoid", torch.sigmoid, arbitrary_h=True, compile_once=True),
+    _log_spec(arbitrary_h=True, compile_once=True),
+    _unary_spec("neg", torch.neg, arbitrary_h=True, compile_once=True),
     _binary_spec("add", torch.add),
     _binary_spec("mul", torch.mul),
     _mm_spec(),

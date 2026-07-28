@@ -1,6 +1,6 @@
-"""Elementwise dynamic NKI adapters (silu / exp / sin / cos / add / mul).
+"""Elementwise dynamic NKI adapters (silu / exp / sin / cos / sigmoid / log / neg / add / mul).
 
-All six share one shape scheme — a [128, H] NEFF per (H, dtype), M dynamic —
+All share one shape scheme — a [128, H] NEFF per (H, dtype), M dynamic —
 differing only in name, operand count, and whether IO needs a contiguous copy.
 ``make_elementwise_entry`` builds the shared ``compile_fn`` + ``prepare_io``;
 each op keeps its OWN ``can_handle`` (add's alpha guard and the binary
@@ -22,7 +22,8 @@ from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 # ── per-op can_handle (kept separate; NOT merged into the factory) ──
 def _can_handle_unary(x, out=None) -> bool:
-    """silu / exp / sin / cos: one 2-D+ neuron tensor, supported dtype, M % 128 == 0."""
+    """silu / exp / sin / cos / sigmoid / log / neg: one 2-D+ neuron tensor,
+    supported dtype, M % 128 == 0."""
     return _can_handle_elementwise_2d(x)
 
 
@@ -91,13 +92,16 @@ def make_elementwise_entry(name, can_handle, *, arity=1, contiguous=False):
 
 
 # ── declarative table: one row per elementwise op ──
-# (name, can_handle, arity, contiguous). exp/sin/cos drop the contiguous copy as
-# redundant; silu/add/mul keep it.
+# (name, can_handle, arity, contiguous). exp/sin/cos/sigmoid/log/neg drop the
+# contiguous copy as redundant; silu/add/mul keep it.
 _ELEMENTWISE_OPS = [
     ("silu", _can_handle_unary, 1, True),
     ("exp", _can_handle_unary, 1, False),
     ("sin", _can_handle_unary, 1, False),
     ("cos", _can_handle_unary, 1, False),
+    ("sigmoid", _can_handle_unary, 1, False),
+    ("log", _can_handle_unary, 1, False),
+    ("neg", _can_handle_unary, 1, False),
     ("add", _can_handle_add, 2, True),
     ("mul", _can_handle_mul, 2, True),
 ]
