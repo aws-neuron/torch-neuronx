@@ -150,7 +150,9 @@ class NeuronOutputCode(OutputCode):
 def _collect_neuron_artifacts() -> None:
     """Record compiled NEFFs as MegaCache artifacts.
 
-    Iterates tracked cache keys and records each NEFF with its persistent key.
+    Records each NEFF under its base cache key; ``put_neff_cache`` /
+    ``get_neff_cache`` derive the persistent-cache key internally, so
+    callers on both sides only ever deal with the base key.
     Keys are cleared after collection to prevent unbounded memory growth.
     """
     # Import here to avoid circular dependency: compile.py imports ArtifactType from this module
@@ -162,9 +164,9 @@ def _collect_neuron_artifacts() -> None:
     for cache_key in get_compiled_cache_keys(ArtifactType.NEURON_NEFF):
         result = torch_neuronx._C.get_neff_info(cache_key)
         if result:
-            persistent_key, neff_bytes = result
+            _persistent_key, neff_bytes = result
             CacheArtifactManager.record_artifact(
-                ArtifactType.NEURON_NEFF.value, persistent_key, neff_bytes
+                ArtifactType.NEURON_NEFF.value, cache_key, neff_bytes
             )
     clear_compiled_cache_keys(ArtifactType.NEURON_NEFF)
 
