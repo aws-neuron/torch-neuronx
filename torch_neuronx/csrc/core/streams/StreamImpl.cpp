@@ -96,8 +96,9 @@ StreamImpl::StreamImpl(c10::DeviceIndex device_idx, c10::StreamId id)
 StreamImpl::~StreamImpl() {
   TORCH_NEURONX_DEBUG("Destroying StreamImpl", "stream_id=", stream_id);
 
-  TORCH_NEURONX_DEBUG("Synchronizing stream before destruction", "stream_id=", stream_id);
-  Synchronize();
+  // Drain, not Synchronize: an unconsumed operation error would rethrow out of
+  // this destructor and call std::terminate.
+  Drain();
 
   TORCH_NEURONX_DEBUG("Stream destruction completed", "stream_id=", stream_id);
 }
@@ -132,9 +133,7 @@ bool StreamImpl::Query() const {
   return engine.IsStreamDrained(this);
 }
 
-void StreamImpl::Synchronize() {
-  TORCH_NEURONX_DEBUG("Synchronizing stream", "stream_id=", stream_id);
-
+void StreamImpl::Drain() {
   auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
   auto is_complete = [this, &engine] { return engine.IsStreamDrained(this); };
 
@@ -147,6 +146,12 @@ void StreamImpl::Synchronize() {
     std::unique_lock<std::mutex> lock(completion_mutex_);
     completion_cv_.wait(lock, is_complete);
   }
+}
+
+void StreamImpl::Synchronize() {
+  TORCH_NEURONX_DEBUG("Synchronizing stream", "stream_id=", stream_id);
+
+  Drain();
 
   // After synchronization completes, check for and propagate any pending exceptions
   error_handler_->CheckAndThrowPendingException(stream_id, /* clear exception */ true);

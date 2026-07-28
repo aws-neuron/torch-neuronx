@@ -5,6 +5,7 @@
 #include <c10/core/impl/InlineStreamGuard.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -36,6 +37,9 @@ int rank_vnc_count = -1;
 
 bool g_initialized = false;
 std::mutex g_init_mutex;
+
+// Lazily initialized from TORCH_NEURONX_COMPILE_ONLY on first read.
+std::atomic<int> g_compile_only{-1};  // -1 = not yet resolved, 0/1 = value
 }  // namespace
 
 bool is_initialized() {
@@ -46,6 +50,22 @@ bool is_initialized() {
 void set_initialized(bool value) {
   std::lock_guard<std::mutex> lock(g_init_mutex);
   g_initialized = value;
+}
+
+bool is_compile_only() {
+  int v = g_compile_only.load(std::memory_order_acquire);
+  if (v < 0) {
+    const char* env = std::getenv("TORCH_NEURONX_COMPILE_ONLY");
+    v = (env && (env[0] == '1' || env[0] == 't' || env[0] == 'T')) ? 1 : 0;
+    int expected = -1;
+    g_compile_only.compare_exchange_strong(expected, v, std::memory_order_acq_rel);
+    v = g_compile_only.load(std::memory_order_acquire);
+  }
+  return v != 0;
+}
+
+void set_compile_only(bool value) {
+  g_compile_only.store(value ? 1 : 0, std::memory_order_release);
 }
 
 // Helper to check if a device is a Neuron device

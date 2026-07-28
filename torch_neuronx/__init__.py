@@ -194,18 +194,20 @@ from .profiling import NeuronProfiler
 # Import stream and event classes
 from .streams import Event, Stream
 
-# Register neuron as a custom backend
-# This replaces PrivateUse1 with 'neuron'
-torch.utils.rename_privateuse1_backend("neuron")
+# Register neuron as a custom backend (Python side of the PrivateUse1 surface).
+# Skip if another backend already owns PrivateUse1 (imported first) — re-registering
+# would raise or shadow its device module/ops. Uses the frozen C++ snapshot shared
+# by both guards. See Coexistence.h.
+_should_register_device = not _C._privateuse1_owned_by_other()
 
-# Register the device module - this makes torch.neuron available
-torch._register_device_module("neuron", neuron)
+if _should_register_device:
+    torch.utils.rename_privateuse1_backend("neuron")
 
-# Generate standard methods for the neuron backend
-# This creates methods like tensor.neuron(), module.neuron(), etc.
-torch.utils.generate_methods_for_privateuse1_backend(
-    for_tensor=True, for_module=True, for_storage=True
-)
+    torch._register_device_module("neuron", neuron)
+
+    torch.utils.generate_methods_for_privateuse1_backend(
+        for_tensor=True, for_module=True, for_storage=True
+    )
 
 # Global state for lazy initialization
 _initialized = False
@@ -262,11 +264,13 @@ os.register_at_fork(after_in_child=_after_fork)
 # HLO persistent cache configuration (enabled by default, disable with TORCH_NEURONX_HLO_CACHE=0)
 os.environ.setdefault("TORCH_NEURONX_HLO_CACHE", "1")
 
-# Register Python operations first
-python_ops.register_python_operations()
+# Register Python operations (aten PrivateUse1 op impls). Skip if another backend
+# owns the device — ours would shadow its kernels and route to our uninitialized
+# runtime. Same guard as the device-module registration above.
+if _should_register_device:
+    python_ops.register_python_operations()
 
-# Tell C++ that Python ops are now registered
-_C._set_python_ops_registered(True)
+    _C._set_python_ops_registered(True)
 
 # Register neuron::nki_strided_copy_ custom op for packed int64 support
 import torch_neuronx.nki_strided_copy_op

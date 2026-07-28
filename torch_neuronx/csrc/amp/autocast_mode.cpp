@@ -1,6 +1,8 @@
 #include <ATen/autocast_mode.h>
 #include <torch/library.h>
 
+#include "torch_neuronx/csrc/core/Coexistence.h"
+
 namespace at::autocast {
 
 namespace {
@@ -18,6 +20,10 @@ Tensor binary_cross_entropy_banned(const Tensor&, const Tensor&, const std::opti
 }  // namespace
 
 TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
+  // Another backend owns PrivateUse1; skip.
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   // lower_precision_fp
 #define _KERNEL_NEURON_LOW_PRECISION_FP(...) KERNEL_PRIVATEUSEONE(__VA_ARGS__, lower_precision_fp)
 

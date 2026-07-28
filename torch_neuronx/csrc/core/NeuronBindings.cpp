@@ -29,6 +29,7 @@
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
 // Include logging
+#include "torch_neuronx/csrc/core/Coexistence.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/utils/ErrorHandler.h"
@@ -44,6 +45,7 @@
 #include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
 #include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
+#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/core/utils/PythonTypeConverter.h"
@@ -464,7 +466,6 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
     }
   }
 
-  // Fallback
   at::native::cpu_fallback(op, stack);
 }
 
@@ -487,39 +488,22 @@ void neuron_init() {
   // OOM ourselves (only on final OOM, not on every recoverable retry).
   setenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG", "0", 0);  // 0 = don't overwrite if user set
 
-  // Initialize Neuron Runtime
+  // Compile-only: nrt_init failure is non-fatal; compilation uses streams only.
   NRT_STATUS status = nrt_init(NRT_FRAMEWORK_TYPE_PYTORCH,  // Framework type
                                "2.0",                       // Framework version (PyTorch version)
                                "1.0"                        // FAL version
   );
 
   if (status != NRT_SUCCESS) {
-    std::stringstream ss;
-    ss << "Failed to initialize Neuron Runtime: status code " << status;
-    throw std::runtime_error(ss.str());
+    if (!c10_neuron::is_compile_only()) {
+      std::stringstream ss;
+      ss << "Failed to initialize Neuron Runtime: status code " << status;
+      throw std::runtime_error(ss.str());
+    }
   }
 
-  // Guard against a device count that PyTorch cannot represent.
-  //
-  // Context:
-  // - PyTorch defines c10::DeviceIndex as an 8-bit integer (int8_t); see:
-  //   pytorch/c10/core/Device.h (typedef of DeviceIndex)
-  // - The autograd engine obtains device counts from the registered
-  //   DeviceGuardImpl implementations (via c10::impl::VirtualGuardImpl) and
-  //   uses them to size per-device data structures, e.g. when starting device
-  //   threads and when stashing current streams; see:
-  //   - pytorch/torch/csrc/autograd/engine.cpp (start_device_threads)
-  //   - pytorch/torch/csrc/autograd/engine.cpp (GraphTask::stash_current_streams)
-  // - If a backend exposes >= 128 devices, converting that count to
-  //   c10::DeviceIndex overflows (128 -> -128), which leads autograd to size
-  //   vectors with a negative count that becomes a huge size_t, ultimately
-  //   triggering std::vector growth errors during backward (e.g.,
-  //   "vector::_M_default_append").
-  //
-  // To fail fast with a clear message instead of crashing deep in autograd,
-  // we detect this condition right after the Neuron runtime is initialized and
-  // bail out.
-  {
+  // DeviceIndex is int8_t; >127 devices overflows autograd's per-device vectors.
+  if (status == NRT_SUCCESS) {
     int actual_devices = c10_neuron::device_count();
     const auto max_representable = std::numeric_limits<c10::DeviceIndex>::max();
     if (actual_devices > static_cast<int>(max_representable) + 1) {
@@ -554,6 +538,10 @@ void maybe_lazy_init() {
 
 // Register 'neuron' as the name for PrivateUse1 device type
 void register_neuron_device() {
+  // Another backend owns PrivateUse1; re-registering overwrites its allocator/hooks.
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   static bool registered = false;
   if (!registered) {
     c10::register_privateuse1_backend("neuron");
@@ -630,6 +618,10 @@ static void neuron_cleanup_atexit() { neuron_close(); }
 
 // Register native functions with PyTorch dispatch
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  // Another backend owns PrivateUse1; registering here overwrites its kernels.
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   m.impl("empty.memory_format", &at::native::empty_neuron);
   m.impl("empty_strided", &at::native::empty_strided_neuron);
   m.impl("new_empty", &at::native::new_empty_neuron);
@@ -743,25 +735,39 @@ void autograd_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispat
 
 }  // namespace torch_neuronx
 
-// Register CPU fallback for unimplemented operations
-// This happens at module load time, but can be overridden by Python ops
+// CPU fallback for unimplemented ops. Dispatcher aborts on duplicate
+// PrivateUse1 fallback registration; gate on ownership. See Coexistence.h.
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&torch_neuronx::neuron_cpu_fallback>());
 }
 
 // Register autograd fallback that just redispatches
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&torch_neuronx::autograd_fallback>());
 }
 
 // Register contiguous for AutogradPrivateUse1 — redispatches to PrivateUse1
 // (DispatchContiguous) so the C++ lowering path handles requires_grad tensors.
 TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
   m.impl("contiguous", &torch_neuronx::contiguous_autograd_neuron);
 }
 
 // Register autocast fallback
-TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) { m.fallback(torch::CppFunction::makeFallthrough()); }
+TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
+  if (torch_neuronx::privateuse1_owned_by_other()) {
+    return;
+  }
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
 
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -912,6 +918,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Get the default generator for a Neuron device", py::arg("device_index") = -1);
   m.def("_is_neuron_runtime_initialized", &c10_neuron::is_initialized,
         "Check if the runtime is initialized");
+  m.def("_is_compile_only", &c10_neuron::is_compile_only,
+        "Check if compile-only mode is enabled (compile without device/runtime)");
+  m.def("_set_compile_only", &c10_neuron::set_compile_only, "Enable/disable compile-only mode",
+        py::arg("value"));
+  m.def("_privateuse1_owned_by_other", &torch_neuronx::privateuse1_owned_by_other,
+        "True if another backend (e.g. libtorch_neuronx_lite) owns the PrivateUse1 "
+        "device surface. Frozen snapshot taken at native's first static-init "
+        "registration; Python-side registrations gate on this to match the C++ "
+        "yield. See Coexistence.h.");
   m.def("_neuron_init", &torch_neuronx::neuron_init, "Initialize Neuron runtime");
   m.def("_neuron_getDeviceCount", &torch_neuronx::neuron_getDeviceCount,
         "Get the number of Neuron devices");
@@ -2095,11 +2110,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         if (!entry) {
           return py::none();
         }
+        // Failed compiles are cached; raise the stored error, not empty bytes.
+        if (entry->IsFailed()) {
+          throw torch_neuronx::CompilationRuntimeException(entry->GetFailureMessage());
+        }
         return py::make_tuple(entry->persistent_cache_key,
                               py::bytes(reinterpret_cast<const char*>(entry->neff_bytes.data()),
                                         entry->neff_bytes.size()));
       },
-      "Get (persistent_key, neff_bytes) from compilation cache, returns None if not found",
+      "Get (persistent_key, neff_bytes) from compilation cache; returns None if not "
+      "found, raises the stored compiler error if the compilation failed",
       py::arg("cache_key"));
 
   // Register cleanup function that runs during module destruction

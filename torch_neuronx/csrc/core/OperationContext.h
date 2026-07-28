@@ -400,6 +400,9 @@ struct OperationContext {
   // Check if this operation requires compilation.
   bool RequiresCompilation() const { return kernel_execution->RequiresCompilation(); }
 
+  // Check if this operation has a device execution stage.
+  bool RequiresExecution() const { return kernel_execution->RequiresExecution(); }
+
   // Check if this operation requires preparation (e.g., collectives).
   bool RequiresPrepare() const { return kernel_execution->RequiresPrepare(); }
 
@@ -407,6 +410,9 @@ struct OperationContext {
   void MarkExecutionReady() { execution_ready_.store(true, std::memory_order_release); }
   // Check if operation is ready for execution
   bool IsExecutionReady() const { return execution_ready_.load(std::memory_order_acquire); }
+
+  // True when the operation has no execution stage after compilation.
+  bool EndsAtCompilation() const { return RequiresCompilation() && !RequiresExecution(); }
 
   // Check if this operation is ready to execute (for event wait primitives)
   bool IsSchedulable() const {

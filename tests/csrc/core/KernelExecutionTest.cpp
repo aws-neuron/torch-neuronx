@@ -22,6 +22,8 @@ class KernelExecutionTest : public ::testing::Test {
   torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
 
   void SetUp() override {
+    c10_neuron::set_compile_only(false);
+
     // Mock NRT instance info for CompilationCacheKey construction
     nrt_instance_info_t info{};
     info.family = NRT_INSTANCE_TRN3;
@@ -43,6 +45,8 @@ class KernelExecutionTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    c10_neuron::set_compile_only(false);
+
     // Reset distributed state so next test can set it again
     c10_neuron::reset_distributed_state();
   }
@@ -67,6 +71,21 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
   EXPECT_FALSE(kernel.HasCachedNeff());
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, ExecutionRequirementCapturedAtConstruction) {
+  CopyDirectKernelExecution normal_kernel("normal_copy", TensorDataRef(input_ptrs_[0]),
+                                          TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float), 0);
+  EXPECT_TRUE(normal_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(true);
+  CopyDirectKernelExecution compile_only_kernel("compile_only_copy", TensorDataRef(input_ptrs_[0]),
+                                                TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float),
+                                                0);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(false);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
 }
 
 TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
@@ -568,6 +587,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
+  EXPECT_FALSE(kernel.RequiresExecution());
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.GetCompileKey().find("base_cache_key") == 0);
@@ -610,6 +630,37 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
 
   unsetenv("NEURON_CC_FLAGS");
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelDoesNotForceFmaFlag) {
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution compile_only_kernel("key", bytes, false);
+
+  EXPECT_EQ(compile_only_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  EXPECT_NE(compile_only_kernel.GetAdditionalArgs().find("--model-type transformer"),
+            std::string::npos);
+
+  setenv("NEURON_CC_FLAGS", "--internal-disable-fma-on-ios", 1);
+  CompileOnlyKernelExecution optin_kernel("key2", bytes, false);
+  EXPECT_NE(optin_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  unsetenv("NEURON_CC_FLAGS");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelCapturesTargetAtConstruction) {
+  // Verify target is captured at construction, not read live by the worker.
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2", 1);
+  CompileOnlyKernelExecution kernel("key", bytes, false);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3", 1);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  unsetenv("NEURON_PLATFORM_TARGET_OVERRIDE");
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelDefaultOptLevel) {

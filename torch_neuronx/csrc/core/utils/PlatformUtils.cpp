@@ -82,6 +82,10 @@ const PlatformConfig& GetPlatformConfigFor(const std::string& instance_type) {
 std::string GetInstanceType() { return FamilyToInstanceType(QueryInstanceInfo().family); }
 
 std::string GetPlatformTarget() {
+  const char* env_target = std::getenv("NEURON_PLATFORM_TARGET_OVERRIDE");
+  if (env_target && env_target[0] != '\0') {
+    return std::string(env_target);
+  }
   const auto info = QueryInstanceInfo();
   std::string instance_type = FamilyToInstanceType(info.family);
   return GetPlatformConfigFor(instance_type).target;
@@ -93,7 +97,6 @@ std::string GetLogicalNeuronCores() {
   if (env_lnc) {
     return std::string(env_lnc);
   }
-
   return GetPlatformConfigFor(GetInstanceType()).logical_cores;
 }
 
