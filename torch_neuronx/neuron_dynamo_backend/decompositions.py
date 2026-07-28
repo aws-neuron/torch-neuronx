@@ -160,7 +160,6 @@ neuron_decompositions = get_decompositions(
         aten.index_fill,
         aten._unsafe_masked_index,
         aten._unsafe_masked_index_put_accumulate,
-        aten.bucketize.Scalar,
         aten.isin,
         aten.std_mean.correction,
         aten.all.dims,
@@ -234,13 +233,16 @@ def register_decomposition(
     return decomp.register_decomposition(ops, neuron_decompositions)
 
 
-def _register_fake(qualname: str):
+def _register_fake(qualname: str, override: bool = False):
     """Register a fake/meta impl, guarding against double-registration on
-    re-import (register_fake raises if the op already has one)."""
+    re-import (register_fake raises if the op already has one).
+
+    Set ``override=True`` to intentionally replace an existing meta (used to
+    work around broken upstream meta registrations)."""
 
     def deco(fn):
         try:
-            torch.library.register_fake(qualname, fn)
+            torch.library.register_fake(qualname, fn, allow_override=override)
         except RuntimeError as e:
             # Already registered — keep existing.
             logger.debug("fake impl already present for %s: %s", qualname, e)
@@ -2475,12 +2477,67 @@ def searchsorted_tensor_decomposition(
 def searchsorted_scalar_decomposition(
     sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None
 ):
-    """Decompose scalar searchsorted by wrapping the scalar as a tensor."""
-    values = torch.tensor([value], dtype=sorted_sequence.dtype).to(sorted_sequence.device)
+    """Decompose scalar searchsorted by wrapping the scalar as a tensor.
+
+    Promote the scalar via ``torch.result_type`` rather than forcing it to the
+    sequence dtype: a fractional ``value`` against an integer ``sorted_sequence``
+    must not be truncated before the comparison (matches upstream promotion)."""
+    values = sorted_sequence.new_full((1,), value, dtype=torch.result_type(value, sorted_sequence))
     result = searchsorted_tensor_decomposition(
         sorted_sequence, values, out_int32=out_int32, right=right, side=side, sorter=sorter
     )
     return result.squeeze(-1)
+
+
+@register_decomposition([aten.searchsorted.Scalar_out])
+def searchsorted_scalar_out_decomposition(
+    sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None, out
+):
+    result = searchsorted_scalar_decomposition(
+        sorted_sequence, value, out_int32=out_int32, right=right, side=side, sorter=sorter
+    )
+    out.copy_(result)
+    return out
+
+
+@register_decomposition([aten.bucketize.Scalar])
+def bucketize_scalar_decomposition(a, boundaries, *, out_int32=False, right=False):
+    """Route .Scalar to .Tensor with the scalar embedded via torch.full.
+
+    Upstream ``_refs.bucketize`` promotes ``a`` via ``torch.tensor(a)`` into a
+    0-D fake tensor, which propagates 0-D-ness into ``boundaries[mid]``; the
+    ``aten.index.Tensor`` meta rule then allocates an unbacked SymInt for the
+    output shape and trips ``GuardOnDataDependentSymNode``. Using
+    ``torch.full((1,), a, ...)`` keeps ``a`` as a Python constant on the
+    ``aten.full`` FX node so every intermediate is rank-1 and statically
+    shaped.
+
+    The scalar is promoted via ``torch.result_type`` rather than forced to
+    ``boundaries.dtype``: a fractional ``a`` against integer ``boundaries``
+    must not be truncated before bucketing (matches upstream promotion)."""
+    a_t = torch.full((1,), a, dtype=torch.result_type(a, boundaries), device=boundaries.device)
+    result = aten.bucketize.Tensor(a_t, boundaries, out_int32=out_int32, right=right)
+    return result.squeeze(0)
+
+
+@_register_fake("aten::bucketize.Scalar_out", override=True)
+def _bucketize_scalar_out_fake(a, boundaries, *, out_int32=False, right=False, out):
+    """Fake impl for ``bucketize.Scalar_out``.
+
+    Upstream ``meta_bucketize_scalar`` in ``torch/_meta_registrations.py`` is
+    registered for both ``.Scalar`` and ``.Scalar_out`` but doesn't accept the
+    ``out=`` kwarg (missing ``@out_wrapper``, unlike its sibling
+    ``meta_bucketize`` for the ``.Tensor`` overloads). Dynamo invokes the meta
+    before AOT decompositions fire, so the decomp below cannot rescue the
+    call. Override the meta to accept ``out=`` and return it directly."""
+    return out
+
+
+@register_decomposition([aten.bucketize.Scalar_out])
+def bucketize_scalar_out_decomposition(a, boundaries, *, out_int32=False, right=False, out):
+    result = bucketize_scalar_decomposition(a, boundaries, out_int32=out_int32, right=right)
+    out.copy_(result)
+    return out
 
 
 @register_decomposition([aten.histc.default])
