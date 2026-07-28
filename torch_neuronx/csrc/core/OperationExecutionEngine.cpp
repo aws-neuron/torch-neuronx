@@ -348,7 +348,8 @@ void OperationExecutionEngine::ProcessPrepareTask(OperationContext* operation) n
       operation->MarkExecutionReady();
     }
   } catch (const torch_neuronx::CompilationRuntimeException& e) {
-    operation->MarkExecutionReady();
+    // Reached when a cached failed entry re-throws on lookup.
+    RouteCompilationFailure(operation, e.what());
   } catch (...) {
     stream->HandleErrorWithExceptionPtr(operation, std::current_exception());
   }
@@ -372,16 +373,40 @@ void OperationExecutionEngine::ProcessPreprocessingTask(OperationContext* operat
   c10_neuron::lazy::LazyTransformationManager::ProcessOperationOutputs(operation);
 }
 
+void OperationExecutionEngine::RouteCompilationFailure(OperationContext* operation,
+                                                       const std::string& error) {
+  if (operation->EndsAtCompilation()) {
+    const std::string error_message =
+        error.empty() ? "NEFF creation failed for operation: " + operation->GetOpName() : error;
+    operation->stream->HandleErrorWithExceptionPtr(
+        operation,
+        std::make_exception_ptr(torch_neuronx::CompilationRuntimeException(error_message)));
+    return;
+  }
+  // Executable failures are reported in stream order by the execution stage.
+  operation->MarkExecutionReady();
+}
+
 void OperationExecutionEngine::HandleCompilationComplete(OperationContext* operation) {
   auto* stream = operation->stream;
   const std::string& op_name = operation->GetOpName();
 
   if (!operation->GetCompilableKernel().HasCachedNeff()) {
-    operation->MarkExecutionReady();
+    RouteCompilationFailure(operation, operation->GetCompilableKernel().GetCompilationError());
     return;
   }
 
   operation->compile_end = std::chrono::steady_clock::now();
+
+  // No execution stage; retire now to unblock IsStreamDrained.
+  if (operation->EndsAtCompilation()) {
+    TORCH_NEURONX_DEBUG("Compile-only op retired at compilation completion",
+                        "stream_id=", stream->stream_id, "op=", op_name);
+    operation->execute_start = operation->compile_end;
+    stream->CompleteOperation(operation);
+    return;
+  }
+
   operation->MarkExecutionReady();
   TORCH_NEURONX_DEBUG("Compilation task completed successfully", "stream_id=", stream->stream_id,
                       "op=", op_name);
@@ -418,11 +443,10 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
           if (success) {
             HandleCompilationComplete(operation);
           } else {
-            // Stash error on kernel for the execution worker to report.
             if (!error.empty()) {
               operation->GetCompilableKernel().SetCompilationError(error);
             }
-            operation->MarkExecutionReady();
+            RouteCompilationFailure(operation, error);
           }
           NotifyExecutionReady();
         });
@@ -658,6 +682,13 @@ void OperationExecutionEngine::SubmitOperation(
   EXECUTION_RUNTIME_CHECK(
       operation_context->stream != nullptr,
       "SubmitOperation: operation has null stream, op_name=", operation_context->GetOpName());
+
+  // A direct op with no execution stage resolves without entering the runtime queue.
+  if (!operation_context->RequiresCompilation() && !operation_context->RequiresExecution()) {
+    operation_context->kernel_execution->CompleteWithoutExecution();
+    operation_context->promise.set_value(OperationContextResult::CreateSuccess());
+    return;
+  }
 
   if (concatenation_enabled_) {
     // Concat-ON: park on dispatch_queue_; ConcatenationWorker reorders the

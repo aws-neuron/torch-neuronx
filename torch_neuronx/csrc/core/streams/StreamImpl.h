@@ -164,6 +164,10 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   bool Query() const;
   void Synchronize();
 
+  // Waits for the stream to drain without reporting operation errors. Safe in a
+  // destructor, where a rethrow from Synchronize() would call std::terminate.
+  void Drain();
+
   void CompleteOperation(OperationContext* operation);
 
   // Ensure all prior operations preceding the given one are completed.

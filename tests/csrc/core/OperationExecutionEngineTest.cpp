@@ -35,6 +35,8 @@ using ::testing::SetArgPointee;
 class OperationExecutionEngineTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    c10_neuron::set_compile_only(false);
+
     // Initialize mock NRT session first
     mock_nrt_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
 
@@ -82,6 +84,8 @@ class OperationExecutionEngineTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    c10_neuron::set_compile_only(false);
+
     if (engine_) {
       engine_->Shutdown();
     }
@@ -1133,6 +1137,24 @@ TEST_F(OperationExecutionEngineTest, SubmitOperationMarksReadyBeforePublish) {
 
   engine.ClearRuntimeQueue(stream.get());
   engine.pending_async_ops_count_.store(0);
+}
+
+TEST_F(OperationExecutionEngineTest, SubmitOperationUsesCapturedExecutionRequirement) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+  at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
+  auto& engine = scoped.engine();
+
+  auto stream = std::make_shared<StreamImpl>(0, 1);
+  c10_neuron::set_compile_only(true);
+  auto op = MakeNonCompileDeviceOp(stream.get());
+  EXPECT_FALSE(op->RequiresExecution());
+
+  // Submission must use the kernel's captured policy, not the current global mode.
+  c10_neuron::set_compile_only(false);
+  engine.SubmitOperation(op);
+
+  EXPECT_EQ(engine.RuntimeQueueSize(stream.get()), 0);
+  EXPECT_EQ(op->result_future.wait_for(0s), std::future_status::ready);
 }
 
 TEST_F(OperationExecutionEngineTest, AllocScheduleHappyPathNoRetryState) {

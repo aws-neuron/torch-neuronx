@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 
 #include "NeuronEvent.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
@@ -59,6 +60,8 @@ inline int GetPriorityFromStreamId(c10::StreamId id) {
 std::array<std::array<StreamImpl*, kStreamPoolSize>, kMaxDevices> stream_pools{};
 std::array<StreamImpl*, kMaxDevices> default_streams{};
 std::array<std::atomic<uint32_t>, kMaxDevices> stream_counters{};
+std::array<std::atomic<bool>, kMaxDevices> stream_state_initialized{};
+std::array<std::mutex, kMaxDevices> stream_init_mutexes{};
 std::atomic<uint32_t> round_robin_counter{0};
 
 // Check if host-cc is enabled via environment variable.
@@ -88,33 +91,47 @@ void InitDeviceStreamState(c10::DeviceIndex device) {
   TORCH_NEURONX_DEBUG("Initialized streams for device", "device=", static_cast<int>(device));
 }
 
+void EnsureDeviceStreamState(c10::DeviceIndex device) {
+  if (stream_state_initialized[device].load(std::memory_order_acquire)) return;
+
+  std::lock_guard<std::mutex> lock(stream_init_mutexes[device]);
+  if (stream_state_initialized[device].load(std::memory_order_relaxed)) return;
+
+  InitDeviceStreamState(device);
+  stream_state_initialized[device].store(true, std::memory_order_release);
+}
+
 void InitializeStreamPools() {
   if (IsHostCCEnabled()) {
     EnableHostCC(kStreamPoolSize);
   }
   auto devices = c10_neuron::get_visible_device_indices();
   for (auto device : devices) {
-    InitDeviceStreamState(device);
+    EnsureDeviceStreamState(device);
   }
   TORCH_NEURONX_DEBUG("Initialized stream pools for", "device_count=", devices.size());
 }
 
 void CleanupStreamPools() {
-  for (auto& device_streams : stream_pools) {
-    for (auto& stream : device_streams) {
+  for (int device = 0; device < kMaxDevices; ++device) {
+    std::lock_guard<std::mutex> lock(stream_init_mutexes[device]);
+    for (auto& stream : stream_pools[device]) {
       delete stream;
       stream = nullptr;
     }
-  }
-  for (auto& stream : default_streams) {
-    delete stream;
-    stream = nullptr;
+    delete default_streams[device];
+    default_streams[device] = nullptr;
+    stream_state_initialized[device].store(false, std::memory_order_release);
   }
 }
 
 StreamImpl* GetStreamImplById(c10::DeviceIndex device_index, c10::StreamId stream_id) {
   TORCH_CHECK(device_index >= 0 && device_index < kMaxDevices, "Device index ",
               static_cast<int>(device_index), " out of range [0, ", kMaxDevices, ")");
+
+  if (c10_neuron::is_compile_only()) {
+    EnsureDeviceStreamState(device_index);
+  }
   TORCH_CHECK(default_streams[device_index] != nullptr, "Stream pool not initialized for device ",
               static_cast<int>(device_index));
 

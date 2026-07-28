@@ -21,6 +21,8 @@
 
 namespace at::neuron {
 
+bool NeuronKernelExecution::CaptureRequiresExecution() { return !c10_neuron::is_compile_only(); }
+
 // CompilableKernelExecution implementation
 
 bool CompilableKernelExecution::ValidateImpl() const { return !compile_key_.IsEmpty(); }
@@ -110,7 +112,6 @@ std::vector<uint8_t> XLACompilableKernelExecution::CompileToNeff() const {
 
 // CompileOnlyKernelExecution implementation
 std::string CompileOnlyKernelExecution::GetCompileAdditionalArgs() {
-  // Base torch.compile compilation arguments
   std::string args = "--model-type transformer --auto-cast=none";
 
   // Append user-provided flags from environment
@@ -137,9 +138,11 @@ CompileOnlyKernelExecution::CompileOnlyKernelExecution(const std::string& base_c
                                                     CacheKeySource::TORCH_COMPILE),
                                 GetCompileAdditionalArgs(), GetCompileOptimizationLevel(),
                                 has_collectives),
-      NeuronKernelExecution("torch_compile", -1),  // Compilation-only, no actual execution
+      NeuronKernelExecution("torch_compile", -1, false),
       mlir_bytes_(mlir_bytes),
-      use_tensorizer_(use_tensorizer) {}
+      use_tensorizer_(use_tensorizer),
+      platform_target_(utils::GetPlatformTarget()),
+      logical_neuron_cores_(utils::GetLogicalNeuronCores()) {}
 
 bool CompileOnlyKernelExecution::ValidateImpl() const {
   return CompilableKernelExecution::ValidateImpl() && !mlir_bytes_.empty();
@@ -150,11 +153,11 @@ std::vector<uint8_t> CompileOnlyKernelExecution::CompileToNeff() const {
 
   try {
     if (use_tensorizer_)
-      return TensorizerCompiler::CompileLinalgToNeff(mlir_bytes_, utils::GetPlatformTarget());
+      return TensorizerCompiler::CompileLinalgToNeff(mlir_bytes_, platform_target_);
 
     CompilationConfig config{.framework = "XLA",
-                             .platform_target = utils::GetPlatformTarget(),
-                             .logical_neuron_cores = utils::GetLogicalNeuronCores(),
+                             .platform_target = platform_target_,
+                             .logical_neuron_cores = logical_neuron_cores_,
                              .optimization_level = GetOptimizationLevel(),
                              .additional_args = GetAdditionalArgs()};
     return NeuronCompiler::CompileHloToNeff(mlir_bytes_, config, "StableHLO", "torch_compile",

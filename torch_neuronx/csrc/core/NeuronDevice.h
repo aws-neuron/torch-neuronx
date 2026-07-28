@@ -13,6 +13,10 @@ namespace c10_neuron {
 bool is_initialized();
 void set_initialized(bool value);
 
+// Compile-only mode flag. Process-global; from TORCH_NEURONX_COMPILE_ONLY.
+bool is_compile_only();
+void set_compile_only(bool value);
+
 // Helper to check if a device is a Neuron device
 bool IsNeuronDevice(const c10::Device& device);
 

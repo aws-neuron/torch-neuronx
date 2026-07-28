@@ -65,6 +65,64 @@ def _add_compiled_cache_key(artifact_type: ArtifactType, key: str) -> None:
         _compiled_cache_keys[artifact_type].add(key)
 
 
+def _serialize_mlir_module(mlir, *, use_tensorizer: bool = False) -> bytes:
+    """Serialize MLIR exactly as it will be submitted to the compiler."""
+    attrs = mlir.operation.attributes
+    for attr_name in _NON_DETERMINISTIC_ATTRS:
+        if attr_name in attrs:
+            del attrs[attr_name]
+
+    if use_tensorizer:
+        run_pipeline_with_repro_report(
+            mlir,
+            "builtin.module(stablehlo-legalize-to-linalg)",
+            "Lowering StableHLO IR -> Linalg IR",
+        )
+
+    bytecode_buffer = io.BytesIO()
+    mlir.operation.write_bytecode(bytecode_buffer)
+    return bytecode_buffer.getvalue()
+
+
+def _submit_mlir_bytes(
+    mlir_bytes: bytes,
+    *,
+    has_collectives: bool,
+    use_tensorizer: bool = False,
+) -> str:
+    """Submit serialized MLIR and track its NEFF cache key."""
+    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
+        content_key = hashlib.sha256(mlir_bytes).hexdigest()
+    else:
+        from torch_neuronx.utils import global_version_hash
+
+        content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
+
+    exec_handle = torch_neuronx._C.compile_graph(
+        content_key,
+        mlir_bytes,
+        has_collectives,
+        use_tensorizer=use_tensorizer,
+    )
+    _add_compiled_cache_key(ArtifactType.NEURON_NEFF, exec_handle)
+    return exec_handle
+
+
+def _compile_stablehlo_bytes(
+    stablehlo: bytes,
+    *,
+    has_collectives: bool,
+    use_tensorizer: bool = False,
+) -> str:
+    """Compile canonical StableHLO bytes without in-process lowering state."""
+    if use_tensorizer:
+        raise ValueError(
+            "Detached StableHLO artifacts do not support use_tensorizer=True; "
+            "the tensorizer path requires the in-process MLIR module."
+        )
+    return _submit_mlir_bytes(stablehlo, has_collectives=has_collectives)
+
+
 class CompileGraph:
     """
     Takes MLIR, compiles it to NEFF, and returns cache key.
@@ -108,49 +166,9 @@ class CompileGraph:
         """
         logger.debug(f"CompileGraph.compile() called: model={self.model_name}")
 
-        # Strip non-deterministic attributes before serializing for C++ backend.
-        # This ensures persistent cache keys are consistent across ranks.
-        # Note: Artifacts are already saved with debug_dump_path intact by this point.
-        attrs = self.mlir.operation.attributes
-        for attr_name in _NON_DETERMINISTIC_ATTRS:
-            if attr_name in attrs:
-                del attrs[attr_name]
-
-        if self.use_tensorizer:
-            run_pipeline_with_repro_report(
-                self.mlir,
-                "builtin.module(stablehlo-legalize-to-linalg)",
-                "Lowering StableHLO IR -> Linalg IR",
-            )
-
-        bytecode_buffer = io.BytesIO()
-        self.mlir.operation.write_bytecode(bytecode_buffer)
-        mlir_bytes = bytecode_buffer.getvalue()
-
-        # Cache key composition gated on TORCH_NEURONX_NEFF_KEY_FROM_HLO,
-        # mirroring the C++ CompilationCacheKey behavior:
-        #   - on  (dev/CI): pure MLIR-content hash. C++ rehashes mlir_bytes
-        #     for the persistent key; global_version_hash is excluded so
-        #     benign Python edits don't invalidate the on-disk NEFF cache.
-        #   - off (default/prod): legacy mlir_hash + ":" + global_version_hash.
-        #     The C++ persistent key derives from this base_key, so any
-        #     Python source change in the lowering directories busts the cache.
-        if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
-            content_key = hashlib.sha256(mlir_bytes).hexdigest()
-        else:
-            from torch_neuronx.utils import global_version_hash
-
-            content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
-
-        exec_handle = torch_neuronx._C.compile_graph(
-            content_key,
+        mlir_bytes = _serialize_mlir_module(self.mlir, use_tensorizer=self.use_tensorizer)
+        return _submit_mlir_bytes(
             mlir_bytes,
-            self.has_collectives,
+            has_collectives=self.has_collectives,
             use_tensorizer=self.use_tensorizer,
         )
-
-        # Track for MegaCache integration
-        _add_compiled_cache_key(ArtifactType.NEURON_NEFF, exec_handle)
-
-        logger.debug(f"Compilation complete: execution_cache_key={exec_handle}")
-        return exec_handle

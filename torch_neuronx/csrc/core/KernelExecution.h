@@ -132,7 +132,11 @@ class NeuronKernelExecution {
   int GetDeviceId() const { return device_id_; }
 
   virtual bool RequiresCompilation() const = 0;
+  bool RequiresExecution() const { return requires_execution_; }
   virtual KernelTypeEnum GetKernelType() const = 0;
+
+  // Called when the op resolves without device execution.
+  virtual void CompleteWithoutExecution() const {}
 
   const std::vector<void*>& GetSrcPtrs() const { return src_ptrs_; }
   const std::vector<void*>& GetDstPtrs() const { return dst_ptrs_; }
@@ -151,11 +155,18 @@ class NeuronKernelExecution {
 
  protected:
   NeuronKernelExecution(const std::string& op_name, int device_id)
-      : op_name_(op_name), device_id_(device_id) {}
+      : NeuronKernelExecution(op_name, device_id, CaptureRequiresExecution()) {}
 
   NeuronKernelExecution(const std::string& op_name, const std::vector<void*>& src_ptrs,
                         const std::vector<void*>& dst_ptrs, int device_id)
-      : op_name_(op_name), src_ptrs_(src_ptrs), dst_ptrs_(dst_ptrs), device_id_(device_id) {}
+      : op_name_(op_name),
+        src_ptrs_(src_ptrs),
+        dst_ptrs_(dst_ptrs),
+        device_id_(device_id),
+        requires_execution_(CaptureRequiresExecution()) {}
+
+  NeuronKernelExecution(const std::string& op_name, int device_id, bool requires_execution)
+      : op_name_(op_name), device_id_(device_id), requires_execution_(requires_execution) {}
 
   virtual bool ValidateImpl() const { return true; }
 
@@ -166,6 +177,10 @@ class NeuronKernelExecution {
   std::vector<void*> src_ptrs_;
   std::vector<void*> dst_ptrs_;
   int device_id_;
+
+ private:
+  static bool CaptureRequiresExecution();
+  const bool requires_execution_;
 };
 
 template <KernelTypeEnum KernelType, ::c10::DeviceType SrcDevice, ::c10::DeviceType DstDevice>
@@ -491,12 +506,18 @@ class CompileOnlyKernelExecution : public CompilableKernelExecution, public Neur
   static std::string GetCompileAdditionalArgs();
   static std::string GetCompileOptimizationLevel();
 
+  // Target captured at submit time; async workers compile for this, not live env.
+  const std::string& GetCapturedPlatformTarget() const { return platform_target_; }
+
  protected:
   bool ValidateImpl() const override;
 
  private:
   std::vector<uint8_t> mlir_bytes_;
   bool use_tensorizer_;
+  // Captured at submit time so async compile uses the correct target/LNC.
+  std::string platform_target_;
+  std::string logical_neuron_cores_;
 };
 
 // NEFF execution kernel (torch.compile executor)
@@ -638,6 +659,12 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   bool RequiresCompilation() const override { return false; }
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kEvent; }
 
+  void CompleteWithoutExecution() const override {
+    if (action_ == EventAction::kSignal) {
+      event_.complete_event();
+    }
+  }
+
   // Event-specific methods
   EventAction GetEventAction() const { return action_; }
   const NeuronEvent& GetEvent() const { return event_; }
@@ -764,6 +791,12 @@ class ReadDirectKernelExecution
 
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                 c10::StreamId stream_id) const override;
+
+  void CompleteWithoutExecution() const override {
+    TORCH_WARN_ONCE(
+        "Neuron compile-only: device-to-host read returns placeholder data because no device "
+        "executed the graph. Do not use the value for data-dependent control flow.");
+  }
 
  protected:
   bool ValidateImpl() const override;

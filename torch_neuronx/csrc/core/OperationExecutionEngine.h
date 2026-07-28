@@ -210,6 +210,9 @@ class OperationExecutionEngine {
   // Shared completion logic for both sync and async compilation paths.
   void HandleCompilationComplete(OperationContext* operation);
 
+  // Retires compile-only failures here; executable failures remain stream-ordered.
+  void RouteCompilationFailure(OperationContext* operation, const std::string& error);
+
   // Handle execution failure for concatenated operations
   // Returns true if this was a concatenated op failure that requires retry
   bool HandleConcatenatedExecutionFailure(OperationContext* operation,

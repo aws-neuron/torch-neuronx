@@ -70,6 +70,7 @@ cc_library(
         "torch_neuronx/csrc/core/OperationContext.h",
         "torch_neuronx/csrc/core/ProfilerMappingCollector.h",
         "torch_neuronx/csrc/core/KernelExecution.h",
+        "torch_neuronx/csrc/core/Coexistence.h",
         "torch_neuronx/csrc/core/NeuronLogging.h",
         "torch_neuronx/csrc/core/compilation/NeuronCompiler.h",
         "torch_neuronx/csrc/core/compilation/experimental/TensorizerCompiler.h",
