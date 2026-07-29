@@ -112,5 +112,4 @@ def scatter_add_kernel(data, indices, output_buffer, num_m_tiles):
 
         nisa.tensor_scalar(data_row_offset, data_row_offset, nl.add, tile_size_m)
 
-    nisa.dma_copy(output_buffer, output_buffer)
     return output_buffer

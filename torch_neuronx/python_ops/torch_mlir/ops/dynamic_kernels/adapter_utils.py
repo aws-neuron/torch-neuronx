@@ -71,17 +71,17 @@ def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
 def _compile_or_load_neff(kernel, graph_name, example_inputs, outputs):
     """Compile (cold) or load (warm) a dynamic NKI kernel at min tile size.
 
-    ``outputs`` may be a single tensor or a tuple (e.g. scatter_add's aliased
-    pair). On a warm cache, preload the persisted NEFF into the in-memory
-    compilation cache and skip the submit + blocking synchronize:
-    ``execute_compiled_graph`` resolves NEFFs only from the in-memory cache, and
-    its persistent fallback derives a different cache key than the store path so
-    it can't load an XLA-stored NEFF directly. On a cold miss, submit + persist
-    the NEFF once. Returns (hlo_bytes, cache_key).
+    ``outputs`` is accepted for signature symmetry with the adapters but is not
+    needed here — the cold path compiles + stores the NEFF without executing it.
+    On a warm cache, preload the persisted NEFF into the in-memory compilation
+    cache: ``execute_compiled_graph`` resolves NEFFs only from the in-memory cache,
+    and its persistent fallback derives a different cache key than the store path
+    so it can't load an XLA-stored NEFF directly. On a cold miss, compile + store
+    the NEFF once WITHOUT executing it, so the dispatch caller's
+    ``execute_compiled_graph`` runs the kernel exactly once on the real inputs.
+    Returns (hlo_bytes, cache_key).
     """
     import torch_neuronx
-
-    out_tuple = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
 
     kernel.arg_processor._static_argnums = ()
     processed_inputs = kernel.arg_processor.preprocess_inputs(example_inputs, scalar_to_tensor=True)
@@ -92,29 +92,20 @@ def _compile_or_load_neff(kernel, graph_name, example_inputs, outputs):
     cache_key = result[-1]
 
     # Warm path: load the persisted NEFF into the in-memory compilation cache and
-    # skip the redundant submit + blocking synchronize. Guarded with getattr so
-    # running this Python against an older _C (without the binding) safely falls
-    # back to the always-correct submit + synchronize path below.
+    # skip the compile. Guarded with getattr so running this Python against an older
+    # _C (without the binding) falls through to the cold compile below.
     _preload = getattr(torch_neuronx._C, "_preload_neff_into_memory", None)
     if _preload is not None and _preload(cache_key):
-        logger.debug("[DYN_NKI_CACHE] %s: WARM_PRELOAD -> skip submit/synchronize", graph_name)
+        logger.debug("[DYN_NKI_CACHE] %s: WARM_PRELOAD -> skip compile", graph_name)
         return hlo_bytes, cache_key
 
-    # Cold miss: compile + persist the NEFF exactly once (submit then sync).
-    logger.debug("[DYN_NKI_CACHE] %s: COLD_COMPILE -> submit + synchronize once", graph_name)
-
-    torch_neuronx._C._submit_xla_task_to_pipeline(
-        graph_name,
-        example_inputs,
-        out_tuple,
-        hlo_bytes,
-        None,
-        cache_key,
-        "",
-        False,
-        {"original_inputs": list(example_inputs), "original_kwargs": {}},
-        "",
-    )
+    # Cold miss: compile + store the NEFF once WITHOUT executing it (compile_graph
+    # uses CompileOnlyKernelExecution). The kernel then runs exactly once, in the
+    # caller's execute_compiled_graph on the real inputs. Called unconditionally,
+    # matching execute_compiled_graph — both are torch.compile _C bindings the
+    # dynamic-NKI path requires.
+    logger.debug("[DYN_NKI_CACHE] %s: COLD_COMPILE -> compile_graph (no execute)", graph_name)
+    cache_key = torch_neuronx._C.compile_graph(cache_key, hlo_bytes, False)
     torch_neuronx.synchronize()
     return hlo_bytes, cache_key
 

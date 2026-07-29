@@ -58,16 +58,16 @@ def _compile_scatter_add(compile_key) -> tuple[bytes, str]:
     from ..wrappers import dynamic_scatter_add_nki
 
     T, H, dtype = compile_key  # noqa: N806
-    data = torch.empty(T, H, dtype=dtype, device="neuron")
-    idx = torch.zeros(T, 1, dtype=torch.int32, device="neuron")
-    outbuf = torch.empty(T, H, dtype=dtype, device="neuron")
-    nm = torch.tensor([[1]], dtype=torch.int32, device="neuron")
+    data = torch.empty(T, H, dtype=dtype, device="meta")
+    idx = torch.zeros(T, 1, dtype=torch.int32, device="meta")
+    outbuf = torch.empty(T, H, dtype=dtype, device="meta")
+    nm = torch.tensor([[1]], dtype=torch.int32, device="meta")
 
     kernel = TorchMlirKernel(torch_fn=dynamic_scatter_add_nki, op_name="dynamic_nki_scatter_add")
     # Aliased kernel: return_types=[<dtype>[T,H]] + operand_output_aliases={2:0}, so
     # the NEFF output set = declared output0 (fresh) + aliased input#2 (outbuf)
     # appended. Passing only (outbuf,) => runtime can't find "output1"; pass both.
-    fresh = torch.empty(T, H, dtype=dtype, device="neuron")
+    fresh = torch.empty(T, H, dtype=dtype, device="meta")
     return _compile_or_load_neff(
         kernel, "dynamic_nki_scatter_add", (data, idx, outbuf, nm), (fresh, outbuf)
     )

@@ -57,11 +57,16 @@ def make_elementwise_entry(name, can_handle, *, arity=1, contiguous=False):
 
         from .. import wrappers
 
+        # Compile-only example inputs on the meta device: the kernel traces on
+        # meta for shape inference anyway, so fabricating them on meta avoids a
+        # stray aten::empty/zeros dispatch to the neuron device on cold compile.
+        # Only shapes/dtypes matter here; the NEFF target comes from the compiler
+        # config, not the example-input device.
         H, dtype = compile_key  # noqa: N806
         wrapper = getattr(wrappers, f"dynamic_{name}_nki")
-        ins = tuple(torch.empty(_TILE_M, H, dtype=dtype, device="neuron") for _ in range(arity))
-        nm = torch.tensor([[1]], dtype=torch.int32, device="neuron")
-        out = torch.empty(_TILE_M, H, dtype=dtype, device="neuron")
+        ins = tuple(torch.empty(_TILE_M, H, dtype=dtype, device="meta") for _ in range(arity))
+        nm = torch.tensor([[1]], dtype=torch.int32, device="meta")
+        out = torch.empty(_TILE_M, H, dtype=dtype, device="meta")
 
         kernel = TorchMlirKernel(torch_fn=wrapper, op_name=graph_name)
         return _compile_or_load_neff(kernel, graph_name, (*ins, nm), out)

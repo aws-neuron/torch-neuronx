@@ -92,5 +92,4 @@ def gather_kernel(source, indices, num_m_tiles):
 
         nisa.tensor_scalar(out_row_offset, out_row_offset, nl.add, tile_size_m)
 
-    nisa.dma_copy(result, result)
     return result

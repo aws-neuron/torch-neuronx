@@ -66,10 +66,10 @@ def _compile_index(compile_key) -> tuple[bytes, str]:
     from ..wrappers import dynamic_gather_nki
 
     T, H, dtype = compile_key  # noqa: N806
-    source = torch.empty(T, H, dtype=dtype, device="neuron")
-    idx = torch.zeros(T, 1, dtype=torch.int32, device="neuron")  # valid (0) for cold gather
-    nm = torch.tensor([[1]], dtype=torch.int32, device="neuron")
-    out = torch.empty(T, H, dtype=dtype, device="neuron")
+    source = torch.empty(T, H, dtype=dtype, device="meta")
+    idx = torch.zeros(T, 1, dtype=torch.int32, device="meta")  # valid (0) for cold gather
+    nm = torch.tensor([[1]], dtype=torch.int32, device="meta")
+    out = torch.empty(T, H, dtype=dtype, device="meta")
 
     kernel = TorchMlirKernel(torch_fn=dynamic_gather_nki, op_name="dynamic_nki_gather")
     return _compile_or_load_neff(kernel, "dynamic_nki_gather", (source, idx, nm), out)

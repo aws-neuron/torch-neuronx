@@ -8,9 +8,11 @@ package ``__init__`` calls it behind the feature flag.
 
 
 def register_all():
-    from . import elementwise, gather, matmul, scatter
+    from . import elementwise, gather, matmul, matmul_k, scatter, silu_bwd
 
+    silu_bwd.register()
     elementwise.register()
     matmul.register()
+    matmul_k.register()
     gather.register()
     scatter.register()
