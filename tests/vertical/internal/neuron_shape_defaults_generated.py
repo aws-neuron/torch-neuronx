@@ -3144,7 +3144,19 @@ def register_all_defaults(r):
     )
     r(
         "aten::repeat_interleave.Tensor",
-        {"repeats": {"shape": (256,), "dtype": "long", "low": 1, "high": 4}},
+        {
+            # Deterministic repeats so that sum(repeats) == output_size == 512.
+            # Random low/high produced a variable sum that triggered
+            # "allocated size does not match required size" when a model-trace
+            # entry supplied a fixed output_size.
+            "repeats": {"shape": (256,), "dtype": "long", "low": 2, "high": 3},
+            # ``repeat_interleave(repeats)`` has a data-dependent output shape
+            # (``sum(repeats)``). Without an explicit ``output_size``, the
+            # decomposition uses repeats.sum() as a symbolic tensor, producing
+            # a dynamic shape (tensor<?xi64>) that StableHLO rejects under
+            # fullgraph=True compilation.
+            "output_size": 512,
+        },
         source="builtin",
     )
     r(
