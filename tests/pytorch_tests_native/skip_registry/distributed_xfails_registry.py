@@ -64,14 +64,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason=(
-            "BatchNorm buffer sync in DDP multi-forward does inplace op corrupting autograd graph."
-        ),
-        tests=[
-            "test_c10d_nccl.py::DistributedDataParallelTest::test_ddp_buffer_sync_multi_forward_with_batchnorm",
-        ],
-    ),
-    SkipGroup(
         reason="ProcessGroupNeuron missing API: coalescing, sequence numbers, sort_ranks",
         tests=[
             "test_c10d_nccl.py::CommTest::test_all_gather_into_tensor_coalesced_manager_nccl",
@@ -171,7 +163,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " - Neuron collectives bypass CommDebugMode dispatch hooks"
         ),
         tests=[
-            "TestFullyShardGradientAccumulation::test_gradient_accumulation",
             "TestFullyShardCollectiveOps::test_reduce_scatter_fp16",
             "TestFullyShardCollectiveOps::test_all_gather_fp32",
             "TestFullyShardCollectiveOps::test_reduce_scatter_fp32",
@@ -182,7 +173,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "TestFullyShardMemory::test_fully_shard_del_memory",
             "TestFullyShardMemory::test_fully_shard_training_memory",
-            "TestFullyShardMemory::test_fully_shard_training_memory_no_gc",
         ],
     ),
     SkipGroup(
@@ -258,13 +248,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="torch.distributed.record_comm API not supported",
-        tests=[
-            "RecordCommTest::test_nesting",
-            "RecordCommTest::test_set_get",
-        ],
-    ),
-    SkipGroup(
         reason=(
             "NRT all_gather fails with invalid DMA block size for the tensor "
             "shape used in FSDP fine tuning pretrain step"
@@ -332,15 +315,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "TestLoadStateDict ref-cycle scalar mismatch — state dict reload"
-            " surfaces float precision differences on Neuron."
-        ),
-        tests=[
-            "test_load_state_dict.py::TestLoadStateDict::test_load_state_dict_ref_cycle_swap_False",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "Change needed in upstream PT 2.11 for code path outside"
             " torch/testing/_internal — BF16 compress comm hooks only"
             " allow CUDA/XPU devices."
@@ -376,15 +350,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " support that is not yet in place."
         ),
         tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_compile_redistribute_flattened_mesh",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_basic",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_dynamo_device_mesh_attrs",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_input_mutations",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_noncontiguous_output",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor",
             "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_dtensor_from_local_redistribute",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dynamo_to_local_kwargs_forward_hook",
-            "test_dtensor_compile.py::TestDTensorCompile::test_get_local_rank_compile",
         ],
     ),
     SkipGroup(
@@ -394,28 +360,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " surfaced traceback in the parent log."
         ),
         tests=[
-            "test_tensor_ops.py::DistArgMaxArgMinTest::test_argmax_argmin_with_placements",
             "test_redistribute.py::DistributeWithStridedShardTest::test_strided_shard_redistribution",
             "test_dtensor_resharding.py::TestDTensorReshardMeshChange::test_dtensor_checkpoint_resharding_with_empty_shard",
-            "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
-            "test_fully_shard_comm.py::TestFullyShardCommunication::test_set_reduce_scatter_divide_factor",
-            "test_fully_shard_training.py::TestFullyShardGradientAccumulation::test_1f1b_microbatching",
-            "test_fully_shard_training.py::TestFullyShardSharedParams::test_train_parity_with_shared_params",
-            "test_fully_shard_training.py::TestFullyShardShardPlacementFnMultiProcess::test_train_parity_shard_placement_fn_shard_largest_dim",
-            "test_fully_shard_autograd.py::TestFullyShardPostAccGradHookMultiProcess::test_post_acc_grad_hook_optim_parity",
-            "test_replicate_training.py::TestReplicateGradientAccumulation::test_1f1b_microbatching",
-            "test_replicate_training.py::TestReplicateSharedParams::test_train_parity_with_shared_params",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT2.12] HSDP 2D device mesh collective init fails with"
-            " 'failed to init a collective algorithm. reason: no_hier no_mesh'."
-            " PT 2.12 runtime lacks support for the replica-group topology"
-            " required by HSDP DTensor state dict tests. Fixed in PT 2.13."
-        ),
-        tests=[
-            "test_hsdp_dtensor_state_dict.py::TestHSDPWithDeviceMeshAndDTensorNEURON::test_hsdp_init_with_device_mesh_neuron",
         ],
     ),
     SkipGroup(

@@ -4,15 +4,6 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "[PT2.11] Autocast SDPA fails Torch-MLIR partial lowering from TorchFX"
-            " IR -> StableHLO IR: 'torch.operator' explicitly marked illegal."
-        ),
-        tests=[
-            "test_autocast_sdpa",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "[PT2.11] test_inplace_ops: Numerical tolerance mismatch on Neuron"
             " hardware. Gradient metadata propagation differs from CPU reference"
             " on bfloat16/float16 for various inplace ops (fmod, lerp, etc.)."
@@ -39,17 +30,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.DYNAMO_ERROR_LOG_FORMAT_MISMATCH,
     ),
     SkipGroup(
-        reason=(
-            "Log message side-effects format mismatch: Neuron backend "
-            "produces extra stack frames in mutation logs"
-        ),
-        tests=[
-            "LoggingTests::test_side_effects_dict_mutations",
-            "LoggingTests::test_side_effects_multiple_mutations_same_object",
-            "LoggingTests::test_side_effects_nn_module_buffer",
-        ],
-    ),
-    SkipGroup(
         reason=("Inductor-specific logging/output tests fail on " "Neuron backend"),
         tests=[
             "LoggingTests::test_inductor_error",
@@ -64,8 +44,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Test output includes device='neuron:0' in string " "representation"),
         tests=[
             "ReorderLogsTests::test_constant_mutation",
-            "ReorderLogsTests::test_reorder_print",
-            "ReorderLogsTests::test_reorder_print_graph_break",
         ],
     ),
     # TODO: Upstream fix needed - test input/output devices will mismatch
@@ -371,7 +349,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "HigherOrderOpVmapGuardTests::test_vmap_grad_vmap_guard_fail",
             "HigherOrderOpVmapGuardTests::test_vmap_guard_fail",
-            "HigherOrderOpVmapGuardTests::test_vmap_guard_ok",
             "HigherOrderOpVmapGuardTests::test_vmap_recompile_different_states",
         ],
     ),
@@ -417,20 +394,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.DYNAMO_ADDMM_COMPILATION_FAILURE,
     ),
     SkipGroup(
-        reason="index_copy: list assignment index out of range on Neuron",
-        tests=[
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_bfloat16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float16",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float32",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float64",
-        ],
-    ),
-    SkipGroup(
         reason="Neuron NEFF param_num / output_idx out of bounds",
         tests=[
             "AOTAutogradCacheBundledTests::test_dtensor_cache_hit",
             "MiscTests::test_builtin_abs",
-            "TestAOTCompile::test_aot_compile_with_redistribute",
             "TestNestedTensor::test_basic_autograd",
         ],
     ),
@@ -454,7 +421,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "DynamicShapesNNModuleTests::test_conv_transpose_call_forward_directly_dynamic_shapes",
             "DynamicShapesNNModuleTests::test_conv_transpose_call_super_forward_directly_dynamic_shapes",
             "NNModuleTests::test_conv_transpose_call_forward_directly",
-            "NNModuleTests::test_conv_transpose_call_super_forward_directly",
         ],
     ),
     SkipGroup(
@@ -491,10 +457,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "DynamicShapesFunctionTests::test_compare_constant_and_tensor_dynamic_shapes",
-            "FunctionTests::test_itemgetter",
-            "FunctionTests::test_methodcaller",
             "FunctionTests::test_operator_concat",
-            "FunctionTests::test_unary_fold_op_seq",
         ],
     ),
     SkipGroup(
@@ -553,7 +516,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="InternalTorchDynamoError: KeyError or AttributeError in guard/getattr",
         tests=[
             "GuardManagerTests::test_dimension_marking_guard_dependent_attrs",
-            "OptimizedModuleTest::test_dict_insertion_guard_method_func",
         ],
     ),
     SkipGroup(
@@ -578,12 +540,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="SymInt proxy tracking failure on Neuron",
         tests=[
             "SubclassTests::test_tensor_subclass_metadata_with_symint",
-        ],
-    ),
-    SkipGroup(
-        reason="BytecodeDebugger verbose mode assertion failure on Neuron",
-        tests=[
-            "TestBytecodeDebugger::test_verbose_mode",
         ],
     ),
     SkipGroup(
@@ -639,22 +595,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " (param_num/output_idx out of bounds)."
         ),
         tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_dce",
-            "test_dtensor_compile.py::TestDTensorCompile::test_dtensor_from_local_with_extracted_device_mesh_no_dce",
             "test_dtensor_compile.py::TestDTensorCompile::test_device_mesh_input_to_dtensor_from_local",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "torch.compile failure from torch 2.13 API changes."
-            " mesh_registry.py calls .nest() on the mesh layout, but torch 2.13"
-            " replaced it with _FlatLayout which no longer has that method."
-            " Eager paths tolerate the failed sub-mesh registration, but"
-            " torch.compile's sharding propagation needs the PG at trace time,"
-            " finds nothing, and emits a no-op graph — result is 100% mismatch."
-        ),
-        tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_device_mesh_slice",
         ],
     ),
     SkipGroup(
@@ -691,12 +632,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason=("DictGuardManager does not support leaf_guard on Neuron."),
-        tests=[
-            "test_guard_manager.py::GuardManagerTests::test_dict_guard_manager",
-        ],
-    ),
-    SkipGroup(
         reason=(
             "torch.compile graph capture fails on Neuron for dynamic ops"
             " (randint, isin, interpolate, module.to)."
@@ -707,24 +642,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "MiscTestsDeviceNEURON::test_scalar_isin_decomposition_neuron",
             "MiscTestsDeviceNEURON::test_module_to_move_compile_neuron",
             "MiscTestsDeviceNEURON::test_interpolate_propagate_real_tensors_neuron",
-        ],
-    ),
-    SkipGroup(
-        reason=("scatter reduce op compilation regressed in compiler for scalar inputs"),
-        tests=x.SCATTER_COMPILE_FAILURE,
-    ),
-    SkipGroup(
-        reason=(
-            "Test transitively imports `transformers`, which imports"
-            " `torchvision`. `torchvision::nms` operator is not registered in"
-            " the test environment. Environment issue, not a backend issue."
-        ),
-        tests=[
-            "HooksTests::test_global_module_forward_pre_hook",
-            "InPlaceCompilationTests::test_compile_frozen_module_error",
-            "InPlaceCompilationTests::test_compile_frozen_module_inductor_error",
-            "ReproTests::test_dynamo_set_recursion_limit_usage",
-            "TestDynamoConfigOverrideIntegration::test_dynamo_config_override_warning",
         ],
     ),
     SkipGroup(
@@ -746,16 +663,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "SubclassTests::test_subclass_dont_invoke_torch_function_on_overridden_method",
             "TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "float64 inplace index_add: NEFF creation fails on Neuron. f64"
-            " support in neuronx-cc is limited; the index_add path produces"
-            " a graph that the compiler cannot lower."
-        ),
-        tests=[
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float64",
         ],
     ),
     SkipGroup(

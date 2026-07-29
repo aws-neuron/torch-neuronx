@@ -198,17 +198,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "index_put with None in the indices "
-            "list generates a torch.constant.bool op in the IR, and neuron's "
-            "torch-mlir → StableHLO pass has no legalization pattern for it, "
-            "so compilation aborts."
-        ),
-        tests=[
-            "test_tensor_ops.py::DistTensorOpsTest::test_index_put_noncontiguous_indexed_dims",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "Upstream test bug: TestDifferentiableOptimizer uses beta=1.0 which"
             " is rejected by Adam/AdamW validation (must be < 1.0). This is not"
             " Neuron-specific - test needs to be fixed upstream."
@@ -297,10 +286,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.PT211_BF16_RECIPROCAL_REGRESSION,
     ),
     SkipGroup(
-        reason=("Compiler bug: stablehlo.transpose on f16 corrupts inf values to NaN."),
-        tests=x.COMPILER_F16_TRANSPOSE_INF_BUG,
-    ),
-    SkipGroup(
         reason=(
             "masked_sum on Neuron fp16 returns NaN when masked-out positions"
             " contain Inf, while torch CPU and numpy references correctly"
@@ -308,18 +293,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_reductions.py::TestReductionsNEURON::test_reference_masked_masked_sum_neuron_float16",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Neuron's Event.query() returns False after the associated"
-            " stream work has completed. Violates the Accelerator API"
-            " contract that Event.query() should return True once the"
-            " recorded work has finished. Bug in torch_neuronx stream/event"
-            " signaling."
-        ),
-        tests=[
-            "test_accelerator.py::TestAccelerator::test_generic_stream_behavior",
         ],
     ),
     SkipGroup(
@@ -350,43 +323,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_margin_ranking_loss_neuron_int32",
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_margin_ranking_loss_neuron_int64",
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_margin_ranking_loss_neuron_uint8",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "NRT Execution error on aten::ne.Tensor_out when prod reduction hits"
-            " the high-dim-count limit (>ndim). Likely a Neuron kernel bug in"
-            " the out-variant of ne for high-rank tensors."
-        ),
-        tests=[
-            "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_prod_neuron",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Test expects _foreach_addcmul with a bool tensor to raise"
-            " RuntimeError, but Neuron's fastpath inplace variant silently"
-            " succeeds. Indicates either a missing dtype check in the Neuron"
-            " foreach_addcmul kernel or a mismatch between the upstream OpInfo"
-            " expectation and the Neuron implementation."
-        ),
-        tests=[
-            "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_fastpath_inplace_neuron_bool",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[prologue] Data-dependent NaN in standalone transpose NEFF for"
-            " non-contiguous fp16 tensors of shape (357, 789). The _refs"
-            " decomposition (promote->op->demote) triggers CopyToNonContiguous"
-            " which uses an on-device transpose that produces spurious NaN at"
-            " row 128 for specific data patterns. Affects any _refs op that"
-            " does promote/demote on this shape. Native ops with epilogue work"
-            " correctly."
-        ),
-        tests=[
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_div_no_rounding_mode_neuron_float16",
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_pow_neuron_float16",
         ],
     ),
     SkipGroup(
@@ -453,21 +389,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_python_dispatch.py::TestPythonDispatch::test_nested_push_logging_tensor_mode",
             "test_python_dispatch.py::TestPythonDispatch::test_nesting_same_mode",
             "test_python_dispatch.py::TestPythonDispatch::test_capture_logs_with_torch_dispatch_mode",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "A prior test that uses saved_tensors_hooks leaves a hook pushed on the thread-state"
-            " hooks stack without a proper pop/cleanup. A later test then enters"
-            " disable_saved_tensors_hooks('outer'); _saved_tensors_hooks_disable"
-            " first flips the process-global to disabled, then sees a hook still on the"
-            " stack (it expects empty stack), so raises RuntimeError('outer')."
-            " The individual test passes in isolation and under --forked, and only fails after"
-            " a hook-leaking test ran earlier in the same worker. xfail (not skip) so a future"
-            " upstream fix or a --forked run xpasses and flags it."
-        ),
-        tests=[
-            "test_autograd.py::TestAutograd::test_disabling_saved_tensor_hooks_nested",
         ],
     ),
 ]
