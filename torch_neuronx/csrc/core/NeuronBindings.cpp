@@ -916,6 +916,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             torch_neuronx::getDefaultNeuronGenerator(device_index)));
       },
       "Get the default generator for a Neuron device", py::arg("device_index") = -1);
+  m.def("_get_default_generator_count", &torch_neuronx::getDefaultGeneratorCount,
+        "Number of per-device default generators this process can access");
   m.def("_is_neuron_runtime_initialized", &c10_neuron::is_initialized,
         "Check if the runtime is initialized");
   m.def("_is_compile_only", &c10_neuron::is_compile_only,
