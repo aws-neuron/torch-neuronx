@@ -600,3 +600,247 @@ func.func @pad_default_nofold_same_shape(%arg0: tensor<4x8xf32>) -> tensor<4x8xf
   return %0 : tensor<4x8xf32>
 }
 }
+
+// -----
+
+// arith.constant scalar index -> stablehlo.constant tensor<i64>
+// CHECK-LABEL: func.func @arith_constant_index_scalar
+// CHECK-SAME:  () -> tensor<i64> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<42> : tensor<i64>
+// CHECK:         %[[C0:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         return %[[C0]] : tensor<i64>
+// CHECK:       }
+func.func @arith_constant_index_scalar() -> tensor<i64> {
+  %0 = arith.constant 42 : index
+  %1 = stablehlo.constant dense<0> : tensor<i64>
+  return %1 : tensor<i64>
+}
+
+// -----
+
+// arith.constant scalar index with different value
+// CHECK-LABEL: func.func @arith_constant_index_scalar_99
+// CHECK-SAME:  () -> tensor<i64> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<99> : tensor<i64>
+// CHECK:         %[[C0:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         return %[[C0]] : tensor<i64>
+// CHECK:       }
+func.func @arith_constant_index_scalar_99() -> tensor<i64> {
+  %0 = arith.constant 99 : index
+  %1 = stablehlo.constant dense<0> : tensor<i64>
+  return %1 : tensor<i64>
+}
+
+// -----
+
+// arith.constant non-index i32 unchanged (negative test)
+// CHECK-LABEL: func.func @arith_constant_non_index
+// CHECK-SAME:  () -> tensor<i32> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<7> : tensor<i32>
+// CHECK:         %[[C0:.*]] = stablehlo.constant dense<0> : tensor<i32>
+// CHECK:         return %[[C0]] : tensor<i32>
+// CHECK:       }
+func.func @arith_constant_non_index() -> tensor<i32> {
+  %0 = arith.constant 7 : i32
+  %1 = stablehlo.constant dense<0> : tensor<i32>
+  return %1 : tensor<i32>
+}
+
+// -----
+
+// stablehlo op with non-index operands passes through
+// CHECK-LABEL: func.func @stablehlo_legal_non_index
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<4xf32>, %[[ARG1:[a-zA-Z0-9_]+]]: tensor<1xi64>) -> tensor<4xf32> {
+// CHECK:         %[[R:.*]] = stablehlo.dynamic_broadcast_in_dim %[[ARG0]], %[[ARG1]], dims = [0] : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>
+// CHECK:         return %[[R]] : tensor<4xf32>
+// CHECK:       }
+func.func @stablehlo_legal_non_index(%arg0: tensor<4xf32>, %arg1: tensor<1xi64>) -> tensor<4xf32> {
+  %0 = stablehlo.dynamic_broadcast_in_dim %arg0, %arg1, dims = [0] : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>
+  return %0 : tensor<4xf32>
+}
+
+// -----
+
+// tensor.dim on static shape produces constant (dim result consumed internally)
+// CHECK-LABEL: func.func @tensor_dim_static
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<4x8xf32>) -> tensor<i1> {
+// CHECK:         %[[C4:.*]] = stablehlo.constant dense<4> : tensor<i64>
+// CHECK:         %[[FALSE:.*]] = stablehlo.constant dense<false> : tensor<i1>
+// CHECK:         return %[[FALSE]] : tensor<i1>
+// CHECK:       }
+func.func @tensor_dim_static(%arg0: tensor<4x8xf32>) -> tensor<i1> {
+  %c0 = arith.constant 0 : index
+  %dim = tensor.dim %arg0, %c0 : tensor<4x8xf32>
+  %result = stablehlo.constant dense<false> : tensor<i1>
+  return %result : tensor<i1>
+}
+
+// -----
+
+// tensor.dim on dynamic shape uses get_dimension_size
+// CHECK-LABEL: func.func @tensor_dim_dynamic
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x8xf32>) -> tensor<i1> {
+// CHECK:         %[[DIM:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 0 : (tensor<?x8xf32>) -> tensor<i32>
+// CHECK:         %[[CVT:.*]] = stablehlo.convert %[[DIM]] : (tensor<i32>) -> tensor<i64>
+// CHECK:         %[[FALSE:.*]] = stablehlo.constant dense<false> : tensor<i1>
+// CHECK:         return %[[FALSE]] : tensor<i1>
+// CHECK:       }
+func.func @tensor_dim_dynamic(%arg0: tensor<?x8xf32>) -> tensor<i1> {
+  %c0 = arith.constant 0 : index
+  %dim = tensor.dim %arg0, %c0 : tensor<?x8xf32>
+  %result = stablehlo.constant dense<false> : tensor<i1>
+  return %result : tensor<i1>
+}
+
+// -----
+
+// tensor.dim on second dynamic dimension
+// CHECK-LABEL: func.func @tensor_dim_dynamic_dim1
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<4x?xf32>) -> tensor<i1> {
+// CHECK:         %[[DIM:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 1 : (tensor<4x?xf32>) -> tensor<i32>
+// CHECK:         %[[CVT:.*]] = stablehlo.convert %[[DIM]] : (tensor<i32>) -> tensor<i64>
+// CHECK:         %[[FALSE:.*]] = stablehlo.constant dense<false> : tensor<i1>
+// CHECK:         return %[[FALSE]] : tensor<i1>
+// CHECK:       }
+func.func @tensor_dim_dynamic_dim1(%arg0: tensor<4x?xf32>) -> tensor<i1> {
+  %c1 = arith.constant 1 : index
+  %dim = tensor.dim %arg0, %c1 : tensor<4x?xf32>
+  %result = stablehlo.constant dense<false> : tensor<i1>
+  return %result : tensor<i1>
+}
+
+// -----
+
+// tensor.cast identity (same type) is no-op
+// CHECK-LABEL: func.func @tensor_cast_identity
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?xf32>) -> tensor<?x?xf32> {
+// CHECK:         return %[[ARG0]] : tensor<?x?xf32>
+// CHECK:       }
+func.func @tensor_cast_identity(%arg0: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %0 = tensor.cast %arg0 : tensor<?x?xf32> to tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// tensor.cast to fully static shape uses reshape
+// CHECK-LABEL: func.func @tensor_cast_to_static
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?xf32>) -> tensor<4x8xf32> {
+// CHECK:         %[[RES:.*]] = stablehlo.reshape %[[ARG0]] : (tensor<?x?xf32>) -> tensor<4x8xf32>
+// CHECK:         return %[[RES]] : tensor<4x8xf32>
+// CHECK:       }
+func.func @tensor_cast_to_static(%arg0: tensor<?x?xf32>) -> tensor<4x8xf32> {
+  %0 = tensor.cast %arg0 : tensor<?x?xf32> to tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// -----
+
+// tensor.cast shape refinement uses dynamic_reshape
+// CHECK-LABEL: func.func @tensor_cast_shape_refinement
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?x?xf32>) -> tensor<1x?x?xf32> {
+// CHECK:         stablehlo.dynamic_reshape %[[ARG0]]
+// CHECK-SAME:    -> tensor<1x?x?xf32>
+// CHECK:       }
+func.func @tensor_cast_shape_refinement(%arg0: tensor<?x?x?xf32>) -> tensor<1x?x?xf32> {
+  %0 = tensor.cast %arg0 : tensor<?x?x?xf32> to tensor<1x?x?xf32>
+  return %0 : tensor<1x?x?xf32>
+}
+
+// -----
+
+// shape.shape_of on rank-2 tensor
+// CHECK-LABEL: func.func @shape_shape_of_rank2
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?xf32>) -> tensor<2xi64> {
+// CHECK:         %[[D0:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 0 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:         %[[D0_I64:.*]] = stablehlo.convert %[[D0]] : (tensor<i32>) -> tensor<i64>
+// CHECK:         %[[D0_R:.*]] = stablehlo.reshape %[[D0_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:         %[[D1:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 1 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:         %[[D1_I64:.*]] = stablehlo.convert %[[D1]] : (tensor<i32>) -> tensor<i64>
+// CHECK:         %[[D1_R:.*]] = stablehlo.reshape %[[D1_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:         %[[RESULT:.*]] = stablehlo.concatenate %[[D0_R]], %[[D1_R]], dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+// CHECK:       }
+func.func @shape_shape_of_rank2(%arg0: tensor<?x?xf32>) -> tensor<2xindex> {
+  %0 = shape.shape_of %arg0 : tensor<?x?xf32> -> tensor<2xindex>
+  return %0 : tensor<2xindex>
+}
+
+// -----
+
+// shape.shape_of on rank-3 tensor
+// CHECK-LABEL: func.func @shape_shape_of_rank3
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?x?xf32>) -> tensor<3xi64> {
+// CHECK:         stablehlo.get_dimension_size %[[ARG0]], dim = 0
+// CHECK:         stablehlo.get_dimension_size %[[ARG0]], dim = 1
+// CHECK:         stablehlo.get_dimension_size %[[ARG0]], dim = 2
+// CHECK:         %[[RESULT:.*]] = stablehlo.concatenate {{.*}}, dim = 0 : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<3xi64>
+// CHECK:       }
+func.func @shape_shape_of_rank3(%arg0: tensor<?x?x?xf32>) -> tensor<3xindex> {
+  %0 = shape.shape_of %arg0 : tensor<?x?x?xf32> -> tensor<3xindex>
+  return %0 : tensor<3xindex>
+}
+
+// -----
+
+// shape.num_elements reduces shape to scalar product
+// CHECK-LABEL: func.func @shape_num_elements
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<3xi64>) -> tensor<i64> {
+// CHECK:         %[[INIT:.*]] = stablehlo.constant dense<1> : tensor<i64>
+// CHECK:         %[[REDUCE:.*]] = stablehlo.reduce(%{{.*}} init: %[[INIT]])
+// CHECK:       }
+func.func @shape_num_elements(%arg0: tensor<3xindex>) -> index {
+  %0 = shape.num_elements %arg0 : tensor<3xindex> -> index
+  return %0 : index
+}
+
+// -----
+
+// shape.num_elements on rank-2 shape
+// CHECK-LABEL: func.func @shape_num_elements_rank2
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<2xi64>) -> tensor<i64> {
+// CHECK:         %[[INIT:.*]] = stablehlo.constant dense<1> : tensor<i64>
+// CHECK:         %[[REDUCE:.*]] = stablehlo.reduce(%{{.*}} init: %[[INIT]])
+// CHECK:       }
+func.func @shape_num_elements_rank2(%arg0: tensor<2xindex>) -> index {
+  %0 = shape.num_elements %arg0 : tensor<2xindex> -> index
+  return %0 : index
+}
+
+// -----
+
+// function signature conversion - i64 arg becomes tensor<i64>
+// CHECK-LABEL: func.func @func_sig_i64_arg
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<i64>) -> tensor<i64> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         return %[[C]] : tensor<i64>
+// CHECK:       }
+func.func @func_sig_i64_arg(%arg0: i64) -> tensor<i64> {
+  %0 = stablehlo.constant dense<0> : tensor<i64>
+  return %0 : tensor<i64>
+}
+
+// -----
+
+// function signature conversion - f64 arg becomes tensor<f64>
+// CHECK-LABEL: func.func @func_sig_f64_arg
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<f64>) -> tensor<f64> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+// CHECK:         return %[[C]] : tensor<f64>
+// CHECK:       }
+func.func @func_sig_f64_arg(%arg0: f64) -> tensor<f64> {
+  %0 = stablehlo.constant dense<0.0> : tensor<f64>
+  return %0 : tensor<f64>
+}
+
+// -----
+
+// function with index arg gets converted to tensor<i64>
+// CHECK-LABEL: func.func @func_sig_index_arg
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<i64>) -> tensor<i64> {
+// CHECK:         %[[C:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:         return %[[C]] : tensor<i64>
+// CHECK:       }
+func.func @func_sig_index_arg(%arg0: index) -> tensor<i64> {
+  %0 = stablehlo.constant dense<0> : tensor<i64>
+  return %0 : tensor<i64>
+}

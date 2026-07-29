@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
@@ -53,7 +54,8 @@ void mlir::torch::registerOptionalInputDialects(
     mlir::DialectRegistry &registry) {
   registry.insert<complex::ComplexDialect, linalg::LinalgDialect,
                   memref::MemRefDialect, scf::SCFDialect,
-                  sparse_tensor::SparseTensorDialect, tensor::TensorDialect>();
+                  shape::ShapeDialect, sparse_tensor::SparseTensorDialect,
+                  tensor::TensorDialect>();
 }
 
 void mlir::torch::registerAllPasses() {
