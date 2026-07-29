@@ -6,6 +6,7 @@ from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bou
 from torch_neuronx.utils import skip_op_preconditions
 
 from ..operation_registry import Preprocessing, register_aten
+from ..validation import validate_inplace_broadcast
 
 
 def convert_indices(indices):
@@ -313,7 +314,8 @@ def torch_masked_select(x, mask, out=None):
     return masked_select_fn, (x, mask, size), {"out": out}
 
 
-@register_aten(["aten::masked_fill", "aten::masked_fill_.Scalar"])
+@register_aten(["aten::masked_fill"])
+@register_aten(["aten::masked_fill_.Scalar"], validate_static_inputs=validate_inplace_broadcast)
 def torch_masked_fill(x, mask, value, out=None):
     return torch.masked_fill(x, mask, value)
 
