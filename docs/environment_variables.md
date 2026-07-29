@@ -14,6 +14,7 @@ This document provides an overview of the different environment variables availa
 | `TORCH_NEURONX_ENABLE_LAZY_ALLOC` | bool | `False` | When `1`, defers NRT tensor allocation to execution time; otherwise allocates eagerly. |
 | `TORCH_NEURONX_COMPILE_ONLY` | bool | `False` | When `1`, compile to NEFF without device execution. Ops compile but never run; `nrt_init` failure is non-fatal. Also set by `torch_neuronx.compiler.compile_only()`. |
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | str | (query live instance) | Target platform (e.g. `trn2`, `trn3`) for cross-compilation on a device-less host. Also set via `CompileOptions(target=...)`. |
+| `TORCH_NEURONX_ATEN_HIERARCHY` | bool | `False` | When `1`, appends aten op hierarchy metadata to the graph for hierarchy based micro-modules flow compilation. |
 
 ### Artifact Directory Structure
 
