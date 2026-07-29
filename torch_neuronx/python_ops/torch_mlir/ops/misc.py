@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import Preprocessing, register_aten
+from ..validation import validate_inplace_broadcast
 
 
 @register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
@@ -90,9 +91,11 @@ def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=N
         "aten::lerp.Scalar_out",
         "aten::lerp.Tensor",
         "aten::lerp.Tensor_out",
-        "aten::lerp_.Scalar",
-        "aten::lerp_.Tensor",
     ]
+)
+@register_aten(
+    ["aten::lerp_.Scalar", "aten::lerp_.Tensor"],
+    validate_static_inputs=validate_inplace_broadcast,
 )
 def torch_lerp(start, end, weight, out=None):
     return torch.ops.aten.lerp(start, end, weight)

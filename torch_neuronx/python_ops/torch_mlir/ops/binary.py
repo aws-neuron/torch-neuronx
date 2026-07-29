@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import register_aten
+from ..validation import validate_inplace_broadcast
 
 
 @register_aten(["aten::add.Tensor", "aten::add.out", "aten::add_"], static_argnames=("alpha",))
@@ -23,23 +24,37 @@ def torch_add_scalar(x, y, alpha=1):
 
 
 @register_aten(
-    ["aten::mul.Scalar", "aten::mul.Tensor", "aten::mul.out", "aten::mul.Scalar_out", "aten::mul_"]
+    [
+        "aten::mul.Scalar",
+        "aten::mul.Tensor",
+        "aten::mul.out",
+        "aten::mul.Scalar_out",
+        "aten::mul_",
+    ]
 )
 def torch_mul(x, y, out=None):
     """Multiply operation."""
     return torch.mul(x, y)
 
 
+@register_aten(["aten::sub.Tensor", "aten::sub.out"], static_argnames=("alpha",))
 @register_aten(
-    ["aten::sub.Tensor", "aten::sub.out", "aten::sub_.Tensor"], static_argnames=("alpha",)
+    ["aten::sub_.Tensor"],
+    static_argnames=("alpha",),
+    validate_static_inputs=validate_inplace_broadcast,
 )
 def torch_sub(x, y, alpha=1, out=None):
     return torch.sub(x, y, alpha=alpha)
 
 
 @register_aten(
-    ["aten::div", "aten::div.out", "aten::div.out_mode", "aten::div_.Tensor"],
+    ["aten::div", "aten::div.out", "aten::div.out_mode"],
     static_argnames=("rounding_mode",),
+)
+@register_aten(
+    ["aten::div_.Tensor"],
+    static_argnames=("rounding_mode",),
+    validate_static_inputs=validate_inplace_broadcast,
 )
 def torch_div(x, y, rounding_mode=None, out=None):
     if rounding_mode is None:
@@ -72,7 +87,8 @@ def torch_floor_divide(x, y, out=None):
     return torch.floor_divide(x, y)
 
 
-@register_aten(["aten::addcmul", "aten::addcmul.out", "aten::addcmul_"])
+@register_aten(["aten::addcmul", "aten::addcmul.out"])
+@register_aten(["aten::addcmul_"], validate_static_inputs=validate_inplace_broadcast)
 def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
     if input.dtype == torch.bool:
         raise RuntimeError("\"addcmul\" not implemented for 'Bool'")
@@ -80,7 +96,8 @@ def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
     return input + value * tensor1 * tensor2
 
 
-@register_aten(["aten::addcdiv", "aten::addcdiv.out", "aten::addcdiv_"])
+@register_aten(["aten::addcdiv", "aten::addcdiv.out"])
+@register_aten(["aten::addcdiv_"], validate_static_inputs=validate_inplace_broadcast)
 def torch_addcdiv(input, tensor1, tensor2, value=1, out=None):
     if not input.dtype.is_floating_point:
         raise RuntimeError(

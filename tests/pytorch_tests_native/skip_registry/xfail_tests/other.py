@@ -1662,8 +1662,6 @@ OTHER = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float64",
     "test_torch.py::TestTorchDeviceTypeNEURON::test__local_scalar_dense_with_empty_tensor_neuron",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_assertRaisesRegex_ignore_msg_non_native_device_neuron",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_broadcast_fn_map2_neuron",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_broadcast_fn_map_neuron",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_deterministic_empty_neuron_uint32",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_deterministic_empty_neuron_uint64",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_deterministic_resize_neuron_bfloat16",
@@ -1731,7 +1729,5 @@ OTHER = [
     "test_indexing.py::TestIndexingNEURON::test_index_put_accumulate_large_tensor_neuron",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_combinations_neuron",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_like_fn_stride_proparation_vs_tensoriterator_unary_op_neuron",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_broadcast_fn_addcdiv_neuron",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_broadcast_fn_addcmul_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_instancenorm_mixed_dtype_backward_neuron",
 ]
