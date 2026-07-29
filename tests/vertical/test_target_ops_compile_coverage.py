@@ -86,6 +86,31 @@ _OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
     "aten::_softmax_backward_data",
 )
 
+
+def _requires_named_tensor(op_name: str) -> bool:
+    """True for dimname / names_out overloads (a ``dim``/``names`` arg typed as
+    ``str`` / ``List[str]`` / ``Optional[List[str]]``).
+
+    Named tensors can't be traced through ``torch.compile(backend='neuron')`` —
+    the ``torch.ops.aten.*`` dispatch this suite uses rejects them ("NYI: Named
+    tensors are currently unsupported in TorchScript"). The shape registry omits
+    these overloads (see the "Dimname / names_out variants" note in
+    neuron_shape_defaults_generated.py), but PyTorch's op_db still vends a
+    functional-variant fallback sample, which then surfaces as a misleading
+    ``invalid_sample`` (op_db path) or ``failed_lowering`` (factory ``.names_out``)
+    row. Detecting them here lets the compile test report ``no_input_sample``
+    instead.
+
+    Compile-only on purpose: the eager coverage test may still exercise these
+    via op_db, so this filtering is not applied in the shared NeuronOpInfo layer.
+    """
+    op = _resolve_op(op_name)
+    schema = getattr(op, "_schema", None)
+    if schema is None:
+        return False
+    return any(a.name in ("dim", "names") and "str" in str(a.type) for a in schema.arguments)
+
+
 # Above this many input elements, the float32 CPU oracle's own reduction loses
 # enough precision (a float32 sum drops small terms once the partial exceeds
 # 2**24 ~= 16.7M) that an accurate device result reads as a mismatch. Only above
@@ -507,6 +532,19 @@ class TestTargetOpsCompileCoverage:
             result["status"] = "unresolved"
             _save_compile_result(result)
             pytest.skip(f"{op_name}: op not found")
+
+        # Named-tensor / dimname overloads aren't traceable through
+        # torch.compile(backend='neuron'); report them as no_input_sample rather
+        # than letting an op_db fallback sample produce a misleading
+        # invalid_sample / failed_lowering row. See _requires_named_tensor.
+        if _requires_named_tensor(op_name):
+            result["error"] = (
+                "no shapes registered (named-tensor overload, not traceable via torch.compile)"
+            )
+            result["status"] = "no_input_sample"
+            result["input_source"] = "pending_registry"
+            _save_compile_result(result)
+            pytest.skip(f"{op_name}: pending_registry (named-tensor overload)")
 
         try:
             samples = list(op_info.sample_inputs("cpu", torch.float32, requires_grad=False))
