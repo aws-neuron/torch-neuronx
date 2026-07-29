@@ -512,19 +512,19 @@ def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
     # NeuronXCC starfish dtype: explicitly handle bf16 and float8 which lack a NumPy dtype
     if _ndt is not None:
         target = get_platform_target()
-        if nki_or_numpy_dtype is getattr(_ndt, "bfloat16", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "bfloat16", object()):
             return torch.bfloat16
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e5m2", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e5m2", object()):
             return torch.float8_e5m2
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e4m3", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e4m3", object()):
             if is_float8_e4m3_supported():
                 return torch.float8_e4m3fn
             raise RuntimeError(f"Unexpected dtype {nki_or_numpy_dtype} for platform {target}")
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e4m3fn", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e4m3fn", object()):
             if not is_float8_e4m3fn_supported():
                 raise RuntimeError(f"Unsupported dtype {nki_or_numpy_dtype} for platform {target}")
             return torch.float8_e4m3fn
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e8m0fnu", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e8m0fnu", object()):
             if not is_float8_e8m0fnu_supported():
                 raise RuntimeError(f"Unsupported dtype {nki_or_numpy_dtype} for platform {target}")
             return torch.float8_e8m0fnu
