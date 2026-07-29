@@ -6,6 +6,18 @@ from torch_mlir.dialects import torch as torch_d
 from torch_mlir.extras.fx_importer import ContextCache, FxImporter, FxImporterHooks
 from torch_mlir.ir import Location
 
+from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
+
+ATEN_HIERARCHY_ENV_VAR = "TORCH_NEURONX_ATEN_HIERARCHY"
+
+
+def enable_aten_hierarchy() -> bool:
+    """Whether to append an aten-op leaf to each node's hierarchy string.
+
+    Off by default -- see ``_get_hierarchy_string`` for why this is opt-in
+    """
+    return bool(_getenv_bool(ATEN_HIERARCHY_ENV_VAR, False))
+
 
 def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
     """Build hierarchy string from FX node metadata.
@@ -13,7 +25,10 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
     If 'call_hierarchy' metadata is present (function call and module stacks),
     uses it directly. Otherwise falls back to nn_module_stack (module-only).
 
-    Output format: ClassName[attr][count]/func_name[count]/...
+    Output format (default): ClassName[attr][count]/func_name[count]/...
+
+    When TORCH_NEURONX_ATEN_HIERARCHY=1, an aten-op leaf is appended:
+        ClassName[attr][count]/.../aten.op.overload[node_name]
     """
     # Preferred path: unified call hierarchy
     call_hierarchy = node.meta.get("call_hierarchy")
@@ -24,11 +39,15 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
     # Fallback: module-only hierarchy from nn_module_stack
     # fwd_nn_module_stack is set by AOT autograd on backward nodes
     nn_module_stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
-    if not nn_module_stack:
+    aten_hierarchy = enable_aten_hierarchy()
+
+    # Legacy behavior when the flag is off: no module stack -> no hierarchy.
+    # With the flag on, a call_function node still gets an aten-op leaf.
+    if not nn_module_stack and not aten_hierarchy:
         return None
 
     segments = []
-    for key, (path, cls) in nn_module_stack.items():
+    for key, (path, cls) in (nn_module_stack or {}).items():
         path = path.replace("L['self'].", "")
 
         if path == "L['self']":
@@ -38,6 +57,9 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
         attr = path.rsplit(".", 1)[-1] if "." in path else path
         call_count = int(str(key).split("@")[1]) if "@" in str(key) else 0
         segments.append(f"{cls_name}[{attr}][{call_count}]")
+
+    if aten_hierarchy and node.op == "call_function":
+        segments.append(f"{node.target}[{node.name}]")
 
     return "/".join(segments) if segments else None
 

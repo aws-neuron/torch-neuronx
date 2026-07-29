@@ -8,10 +8,17 @@ import torch.nn as nn
 
 from tests.neuron_dynamo_backend.unit.utils.test_utils import get_aot_graphs
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import (
+    ATEN_HIERARCHY_ENV_VAR,
     NeuronContextCache,
     NeuronFxImporter,
     _get_hierarchy_string,
 )
+
+
+@pytest.fixture
+def aten_hierarchy_enabled(monkeypatch):
+    """Turn on the opt-in aten-op hierarchy leaf for the duration of a test."""
+    monkeypatch.setenv(ATEN_HIERARCHY_ENV_VAR, "1")
 
 
 class SimpleLinear(nn.Module):
@@ -191,6 +198,99 @@ class TestGetHierarchyString:
     #     ...
 
 
+class TestAtenHierarchyLeaf:
+    """Tests for the opt-in aten-op leaf (TORCH_NEURONX_ATEN_HIERARCHY)."""
+
+    def test_no_aten_leaf_by_default(self):
+        """Default (flag off) emits module-only hierarchy — no aten segment."""
+        gm = get_fx_graph(SimpleLinear())
+        for node in get_nodes_with_hierarchy(gm):
+            assert _get_hierarchy_string(node) == "Linear[linear][0]"
+
+    def test_aten_leaf_appended_when_enabled(self, aten_hierarchy_enabled):
+        """Flag on appends aten.<op>.<overload>[<node_name>] to call_function nodes."""
+        gm = get_fx_graph(SimpleLinear())
+        results = [
+            _get_hierarchy_string(n)
+            for n in get_nodes_with_hierarchy(gm)
+            if n.op == "call_function"
+        ]
+        assert results, "expected call_function nodes carrying a module stack"
+        for r in results:
+            assert r.startswith("Linear[linear][0]/aten.")
+            # leaf is aten.<op>.<overload>[<node_name>]
+            assert r.rsplit("/", 1)[-1].endswith("]")
+
+    def test_leaf_only_on_call_function_nodes(self, aten_hierarchy_enabled):
+        """Non-call_function nodes get no aten leaf."""
+        gm = get_fx_graph(SimpleLinear())
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                continue
+            result = _get_hierarchy_string(node)
+            if result:
+                assert "/aten." not in result
+
+    def test_leaf_without_module_stack(self, aten_hierarchy_enabled):
+        """A call_function node with no module stack still yields a bare aten leaf."""
+        gm = get_fx_graph(MixedModel())
+        for node in get_nodes_without_hierarchy(gm):
+            result = _get_hierarchy_string(node)
+            assert result is not None
+            assert result.startswith("aten.")
+            assert "/" not in result
+
+    def test_deterministic_across_repeated_traces(self, aten_hierarchy_enabled):
+        """Same model traced twice yields identical strings.
+
+        This is the property the NEFF cache key depends on: the hierarchy is fused
+        into the MLIR loc(...) and the serialized module is hashed, so a rerun of an
+        unchanged model must reproduce byte-identical hierarchy strings to hit cache.
+        """
+        first = [
+            _get_hierarchy_string(n)
+            for n in get_fx_graph(SimpleLinear()).graph.nodes
+            if n.op == "call_function"
+        ]
+        second = [
+            _get_hierarchy_string(n)
+            for n in get_fx_graph(SimpleLinear()).graph.nodes
+            if n.op == "call_function"
+        ]
+        assert first == second
+
+    def test_repeated_same_target_distinguished_by_node_name(self, aten_hierarchy_enabled):
+        """Repeated calls to one submodule stay distinguishable via the leaf."""
+
+        class Repeated(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.fc(x) + self.fc(x)
+
+        gm = get_fx_graph(Repeated())
+        results = [_get_hierarchy_string(n) for n in gm.graph.nodes if n.op == "call_function"]
+        # node_name suffixes (addmm, addmm_1, ...) keep every op uniquely labeled.
+        assert len(set(results)) == len(results)
+
+    def test_mlir_contains_aten_leaf(self, aten_hierarchy_enabled):
+        """The aten leaf reaches the printed MLIR locations."""
+        from torch_mlir.fx import OutputType, stateless_fx_import
+
+        gm = get_fx_graph(SimpleLinear())
+        importer = NeuronFxImporter()
+        module = stateless_fx_import(gm, output_type=OutputType.RAW, fx_importer=importer)
+
+        import io
+
+        buf = io.StringIO()
+        module.operation.print(file=buf, enable_debug_info=True)
+        mlir_text = buf.getvalue()
+        assert "Linear[linear][0]/aten." in mlir_text
+
+
 class TestGetNodeLocation:
     """Tests for NeuronContextCache.get_node_location."""
 
@@ -317,8 +417,7 @@ class TestHasHierarchyFlag:
         importer = NeuronFxImporter()
         assert importer.has_hierarchy is False
 
-    @pytest.mark.xfail(reason="Reverted hierarchy location changes")
-    def test_has_hierarchy_true_when_only_aten_suffix(self):
+    def test_has_hierarchy_true_when_only_aten_suffix(self, aten_hierarchy_enabled):
         """Flag is set even without nn_module_stack — aten-op suffix counts as hierarchy."""
         from torch_mlir.fx import OutputType, stateless_fx_import
 
@@ -330,6 +429,18 @@ class TestHasHierarchyFlag:
         importer = NeuronFxImporter()
         stateless_fx_import(gm, output_type=OutputType.RAW, fx_importer=importer)
         assert importer.has_hierarchy is True
+
+    def test_has_hierarchy_false_when_only_aten_suffix_and_flag_off(self):
+        """With the flag off, a stripped graph yields no hierarchy at all."""
+        from torch_mlir.fx import OutputType, stateless_fx_import
+
+        gm = get_fx_graph(SimpleLinear())
+        for node in gm.graph.nodes:
+            node.meta.pop("nn_module_stack", None)
+            node.meta.pop("fwd_nn_module_stack", None)
+        importer = NeuronFxImporter()
+        stateless_fx_import(gm, output_type=OutputType.RAW, fx_importer=importer)
+        assert importer.has_hierarchy is False
 
     def test_has_hierarchy_false_when_no_hierarchy_nor_aten_suffix(self):
         """Flag stays False when every processed node produces no hierarchy string.
@@ -384,8 +495,7 @@ class TestHierarchySplitterCompatibleAttribute:
         attr = stablehlo.operation.attributes["stablehlo.hierarchy_splitter_compatible"]
         assert str(attr.value) == "true"
 
-    @pytest.mark.xfail(reason="Reverted hierarchy location changes")
-    def test_attribute_set_even_without_module_stack(self):
+    def test_attribute_set_even_without_module_stack(self, aten_hierarchy_enabled):
         """Attribute is still present when only aten-suffix hierarchy is emitted."""
         from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
             convert_fx_to_stablehlo,
