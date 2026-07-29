@@ -94,11 +94,16 @@ def _is_in_bad_fork() -> bool:
 
 
 def manual_seed_all(seed: int) -> None:
-    """Set seed for all neuron devices."""
+    """Set seed for all neuron devices.
+
+    Note: In distributed settings, device_count() may report more devices than
+    this process has generators for (e.g. after init_process_group restricts
+    visible cores), so iterate over the generator count instead.
+    """
     import torch_neuronx
 
     seed = int(seed)
-    for i in range(device_count()):
+    for i in range(torch_neuronx._C._get_default_generator_count()):
         default_generator = torch_neuronx._C._get_default_generator(i)
         default_generator.manual_seed(seed)
     if is_initialized():
@@ -148,7 +153,7 @@ def seed_all() -> None:
     import torch_neuronx
 
     random_seed = 0
-    for i in range(device_count()):
+    for i in range(torch_neuronx._C._get_default_generator_count()):
         default_generator = torch_neuronx._C._get_default_generator(i)
         if i == 0:
             default_generator.seed()

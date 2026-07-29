@@ -57,4 +57,8 @@ at::PrivateUse1HooksInterface* get_neuron_hooks();
 // Get the default generator for a Neuron device
 const at::Generator& getDefaultNeuronGenerator(c10::DeviceIndex device_index = -1);
 
+// Number of per-device default generators this process can access. Captured
+// once at first generator access; valid indices are [0, count).
+int64_t getDefaultGeneratorCount();
+
 }  // namespace torch_neuronx

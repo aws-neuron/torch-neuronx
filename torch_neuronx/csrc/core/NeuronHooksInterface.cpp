@@ -111,6 +111,11 @@ static void initNeuronGenVector() {
   });
 }
 
+int64_t getDefaultGeneratorCount() {
+  initNeuronGenVector();
+  return num_devices;
+}
+
 const at::Generator& getDefaultNeuronGenerator(c10::DeviceIndex device_index) {
   initNeuronGenVector();
   c10::DeviceIndex idx = device_index;
