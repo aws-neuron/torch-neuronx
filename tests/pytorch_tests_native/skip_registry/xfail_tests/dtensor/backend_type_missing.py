@@ -11,7 +11,6 @@ DTENSOR_BACKEND_TYPE_MISSING = [
     "test_output_placements",
     "test_pretty_print_dtensor_make_fx",
     "test_dtensor_matmul_cost_hint_or_upper_bound",
-    "test_dtensor_requires_grad_intermediate_backward",
     "test_to_local_symbolic_sizes_uneven_shard",
     "test_annotate_aot_export_joint_with_descriptors_alone",
     "test_dtensor_dynamic",

@@ -49,16 +49,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "torch.compile traces optimizer step and incorrectly reuses the param's"
-            " 2D symbolic context for the grad's 1D view base, causing"
-            " AssertionError: 2 != 1. Upstream pytorch bug, should be fixed with latest sync"
-        ),
-        tests=[
-            "test_compile_optimizer_grad_view_base_dim_mismatch",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "No backend type associated with device type neuron,"
             " passes when we set backend as neuron:fake"
         ),
@@ -84,12 +74,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="channels_last memory format backward fails on Neuron",
-        tests=[
-            "test_backward_channels_last",
-        ],
-    ),
-    SkipGroup(
         reason="AssertionError: Tensor-likes are not close!",
         tests=[
             "test_dtensor_op_db_logit_neuron_float32",
@@ -100,12 +84,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "test_tp_compile_fullgraph_is_seq_parallel_False_use_ca_True",
             "test_tp_compile_fullgraph_is_seq_parallel_True_use_ca_True",
-        ],
-    ),
-    SkipGroup(
-        reason="Scalars not equal - comm count mismatch",
-        tests=[
-            "test_distribute_tensor_rank",
         ],
     ),
     SkipGroup(
@@ -271,15 +249,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "test_pointwise_ops.py::DistElementwiseOpsTest::test_activations",
             "test_pointwise_ops.py::DistElementwiseOpsTest::test_dropout_backward",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Test body passes (SUBPASSED logged). xdist's pytest_runtest_logreport"
-            " then tries to pickle a Shard placement object and fails."
-        ),
-        tests=[
-            "test_single_dim_strategy.py::TestDijkstraExpandSingleDimStrategy::test_pq_vs_full_expansion_data_driven",
         ],
     ),
 ]
