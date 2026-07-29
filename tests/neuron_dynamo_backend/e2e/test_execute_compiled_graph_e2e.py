@@ -13,9 +13,9 @@ the current neuron stream:
   until kernel completion.
 
 Every test stages the NEFF into the persistent cache via
-``put_neff_cache(persistent_key, neff_bytes)`` where
-``persistent_key = _get_neff_persistent_key(cache_key)`` (see
-``_stage_neff``) before submitting.
+``put_neff_cache(cache_key, neff_bytes)`` (see ``_stage_neff``) before
+submitting. ``put_neff_cache`` derives the persistent-cache key
+internally, matching what ``NeffDirectKernelExecution`` will look up.
 
 The NEFFs are produced by the NKI beta frontend — chosen so we can
 control the port names via source-level parameter names + the
@@ -76,10 +76,10 @@ _NEFF_CACHE: dict = {}
 
 
 def _stage_neff(neff_bytes, cache_key):
-    """Stage ``neff_bytes`` under the persistent key derived from
-    ``cache_key`` so ``execute_compiled_graph(cache_key=...)`` can find it."""
-    persistent_key = _C._get_neff_persistent_key(cache_key)
-    _C.put_neff_cache(persistent_key, neff_bytes)
+    """Stage ``neff_bytes`` under ``cache_key`` so
+    ``execute_compiled_graph(cache_key=...)`` can find it.
+    ``put_neff_cache`` derives the persistent-cache key internally."""
+    _C.put_neff_cache(cache_key, neff_bytes)
 
 
 def _compile_beta_add_kernel(shape, fn, input_port_names, output_port_names):

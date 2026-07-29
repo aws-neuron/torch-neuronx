@@ -1999,47 +1999,50 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("has_collectives"), py::arg("input_names") = std::vector<std::string>{},
       py::arg("output_names") = std::vector<std::string>{});
 
-  // torch.compile MegaCache: write NEFF to persistent cache
+  // torch.compile MegaCache: write NEFF to persistent cache.
   m.def(
       "put_neff_cache",
       [](const std::string& key, py::bytes neff_bytes) -> bool {
+        auto cache_key = at::neuron::CompilationCacheKey(
+            key, at::neuron::CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
+            at::neuron::CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
+            /*hlo_bytes_ptr=*/nullptr, at::neuron::CacheKeySource::TORCH_COMPILE);
+        const std::string* pk = cache_key.GetPersistentKey();
+        if (!pk) return false;
+
         at::neuron::PersistentCacheBackend cache;
 
         std::string_view neff_str = neff_bytes.cast<std::string_view>();
         // Copy required: Put() takes const ref, needs owned data
         std::vector<uint8_t> neff_vec(neff_str.begin(), neff_str.end());
 
-        return cache.Put(key, neff_vec);
+        return cache.Put(*pk, neff_vec);
       },
-      "Write NEFF to persistent cache", py::arg("key"), py::arg("neff_bytes"));
+      "Write NEFF to persistent cache, keyed by the base cache key (persistent key derived "
+      "internally to match execute_compiled_graph's lookup)",
+      py::arg("key"), py::arg("neff_bytes"));
 
-  // Compute the persistent-cache key for a base ``cache_key``
-  m.def(
-      "_get_neff_persistent_key",
-      [](const std::string& cache_key) -> std::string {
-        at::neuron::CompilationCacheKey key(cache_key, at::neuron::CacheKeySource::TORCH_COMPILE);
-        const std::string* pk = key.GetPersistentKey();
-        TORCH_CHECK(pk != nullptr, "Failed to derive persistent key from cache_key='", cache_key,
-                    "'");
-        return *pk;
-      },
-      "Persistent-cache key derived from a NeffDirectKernelExecution cache_key. Use this "
-      "as the key argument to put_neff_cache before calling _execute_neff.",
-      py::arg("cache_key"));
-
-  // torch.compile MegaCache: read NEFF from persistent cache
+  // torch.compile MegaCache: read NEFF from persistent cache.
   m.def(
       "get_neff_cache",
       [](const std::string& key) -> py::object {
+        auto cache_key = at::neuron::CompilationCacheKey(
+            key, at::neuron::CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
+            at::neuron::CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
+            /*hlo_bytes_ptr=*/nullptr, at::neuron::CacheKeySource::TORCH_COMPILE);
+        const std::string* pk = cache_key.GetPersistentKey();
+        if (!pk) return py::none();
+
         at::neuron::PersistentCacheBackend cache;
 
-        auto result = cache.Get(key);
+        auto result = cache.Get(*pk);
         if (result.has_value()) {
           return py::bytes(reinterpret_cast<const char*>(result->data()), result->size());
         }
         return py::none();
       },
-      "Read NEFF from persistent cache, returns None if not found", py::arg("key"));
+      "Read NEFF from persistent cache by the base cache key, returns None if not found",
+      py::arg("key"));
 
   // HLO persistent cache: write serialized HLO entry
   m.def(

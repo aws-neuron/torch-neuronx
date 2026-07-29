@@ -178,8 +178,16 @@ NeffDirectKernelExecution::NeffDirectKernelExecution(
                                  c10::DeviceType::PrivateUse1>(
           graph_name, std::move(input_refs), std::move(output_refs), input_contexts,
           output_contexts, device_id),
-      CompilableKernelExecution(CompilationCacheKey(cache_key, CacheKeySource::TORCH_COMPILE), "",
-                                "", has_collectives) {}
+      // Match CompileOnlyKernelExecution's persistent-key derivation so the on-disk
+      // lookup performed by CompilationCache::CheckCacheAndCoordinateWork finds the
+      // NEFF written by the compile path (torch.compile → compile_graph) or an
+      // external put_neff_cache under the same base cache key.
+      CompilableKernelExecution(
+          CompilationCacheKey(cache_key, CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
+                              CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
+                              /*hlo_bytes_ptr=*/nullptr, CacheKeySource::TORCH_COMPILE),
+          CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
+          CompileOnlyKernelExecution::GetCompileOptimizationLevel(), has_collectives) {}
 
 bool NeffDirectKernelExecution::ValidateImpl() const { return HasOutputs(); }
 
