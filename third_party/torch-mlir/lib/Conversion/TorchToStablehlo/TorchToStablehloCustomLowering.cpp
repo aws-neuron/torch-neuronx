@@ -13,7 +13,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/Quant/IR/Quant.h"
+#include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Pass/Pass.h"
 #include "stablehlo/dialect/ChloOps.h"
@@ -71,8 +73,20 @@ public:
           "unsupported int/float constant type - must contain a typed attr");
     } else if (auto tensorType = dyn_cast<RankedTensorType>(originalType)) {
       if (auto attr = dyn_cast<ElementsAttr>(value)) {
-        rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, tensorType,
-                                                           attr);
+        if (tensorType.getElementType().isIndex()) {
+          auto i64Type = rewriter.getI64Type();
+          auto i64TensorType =
+              RankedTensorType::get(tensorType.getShape(), i64Type);
+          SmallVector<int64_t> values;
+          for (auto v : attr.getValues<IntegerAttr>())
+            values.push_back(v.getInt());
+          auto i64Attr = DenseIntElementsAttr::get(i64TensorType, values);
+          rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, i64TensorType,
+                                                             i64Attr);
+        } else {
+          rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, tensorType,
+                                                             attr);
+        }
         return success();
       }
       return rewriter.notifyMatchFailure(
@@ -1034,10 +1048,6 @@ public:
   }
 };
 
-// This converter replaces tensor::dimOp with an equivalent implementation
-// stablehlo.get_dimension_size is a direct substitute but it is not supported
-// by the compiler Since Neuron compiler does not support dynamic shapes, this
-// converter spits out a constant tensor with the dimension size
 class ConvertTensorDimOp : public OpConversionPattern<tensor::DimOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -1053,23 +1063,26 @@ public:
       return rewriter.notifyMatchFailure(
           op, "tensor::DimOp does not have constant dim");
 
-    // Get the input tensor type
     auto inputType = dyn_cast<RankedTensorType>(input.getType());
     if (!inputType)
       return rewriter.notifyMatchFailure(op, "input is not a ranked tensor");
 
-    // Get the dimension size (static shapes only)
     auto dimSize = inputType.getDimSize(*dim);
-    if (ShapedType::isDynamic(dimSize))
-      return rewriter.notifyMatchFailure(op, "dimension is dynamic");
+    auto i64Type = RankedTensorType::get({}, rewriter.getI64Type());
 
-    // Create an int32 scalar constant tensor with the dimension size
-    // stablehlo.get_dimension_size return type is int32
-    auto constantType = RankedTensorType::get({}, rewriter.getI32Type());
-    auto constantAttr = DenseElementsAttr::get(
-        constantType, rewriter.getI32IntegerAttr(dimSize));
-    rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, constantType,
-                                                       constantAttr);
+    if (ShapedType::isDynamic(dimSize)) {
+      auto i32Type = RankedTensorType::get({}, rewriter.getI32Type());
+      auto getDimSize = stablehlo::GetDimensionSizeOp::create(
+          rewriter, op.getLoc(), i32Type, input,
+          rewriter.getI64IntegerAttr(*dim));
+      rewriter.replaceOpWithNewOp<stablehlo::ConvertOp>(op, i64Type,
+                                                        getDimSize);
+    } else {
+      auto constantAttr = DenseElementsAttr::get(
+          i64Type, rewriter.getI64IntegerAttr(dimSize));
+      rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, i64Type,
+                                                         constantAttr);
+    }
 
     return success();
   }
@@ -1140,19 +1153,39 @@ public:
     if (!inputType || !resultType)
       return failure();
 
-    // No-op cast
+    // No-op cast (types identical or shape refinement with dynamic dims)
     if (inputType == resultType) {
       rewriter.replaceOp(op, input);
       return success();
     }
-    // Cast to static shape - use reshape
-    // A valid MLIR should never trigger this as cast op does not allow static
-    // dim size mismatch
-    if (!resultType.hasStaticShape())
-      return rewriter.notifyMatchFailure(
-          op, "tensor::CastOp does not does not support dynamic shapes");
 
-    rewriter.replaceOpWithNewOp<stablehlo::ReshapeOp>(op, resultType, input);
+    if (resultType.hasStaticShape()) {
+      rewriter.replaceOpWithNewOp<stablehlo::ReshapeOp>(op, resultType, input);
+      return success();
+    }
+
+    // Shape refinement cast (e.g., tensor<?x?x?xf32> -> tensor<1x?x?xf32>):
+    // reconstruct the result shape at runtime using DynamicReshapeOp
+    auto rank = resultType.getRank();
+    auto resultShape = resultType.getShape();
+    SmallVector<Value> dimValues;
+    for (int64_t i = 0; i < rank; ++i) {
+      if (resultShape[i] != ShapedType::kDynamic) {
+        dimValues.push_back(arith::ConstantOp::create(
+            rewriter, op.getLoc(),
+            rewriter.getI64IntegerAttr(resultShape[i])));
+      } else {
+        Value dimIdx = arith::IndexCastOp::create(
+            rewriter, op.getLoc(), rewriter.getI64Type(),
+            tensor::DimOp::create(rewriter, op.getLoc(), input, i));
+        dimValues.push_back(dimIdx);
+      }
+    }
+    Value shapeTensor = tensor::FromElementsOp::create(
+        rewriter, op.getLoc(),
+        RankedTensorType::get({rank}, rewriter.getI64Type()), dimValues);
+    rewriter.replaceOpWithNewOp<stablehlo::DynamicReshapeOp>(
+        op, resultType, input, shapeTensor);
     return success();
   }
 };
@@ -1695,6 +1728,97 @@ public:
   }
 };
 
+// Convert shape.shape_of (which produces tensor<Nxindex>) into stablehlo
+// get_dimension_size + concatenate (producing tensor<Nxi64>).
+class ConvertShapeShapeOfOp
+    : public OpConversionPattern<shape::ShapeOfOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(shape::ShapeOfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value input = adaptor.getArg();
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType)
+      return failure();
+
+    int64_t rank = inputType.getRank();
+    auto i64Type = rewriter.getI64Type();
+    auto scalarI32Type = RankedTensorType::get({}, rewriter.getI32Type());
+
+    SmallVector<Value> dimValues;
+    for (int64_t i = 0; i < rank; ++i) {
+      Value dim = stablehlo::GetDimensionSizeOp::create(
+          rewriter, loc, scalarI32Type, input,
+          rewriter.getI64IntegerAttr(i));
+      auto i64ScalarType = RankedTensorType::get({}, i64Type);
+      Value dimI64 = stablehlo::ConvertOp::create(
+          rewriter, loc, i64ScalarType, dim);
+      auto i64_1dType = RankedTensorType::get({1}, i64Type);
+      Value reshaped = stablehlo::ReshapeOp::create(
+          rewriter, loc, i64_1dType, dimI64);
+      dimValues.push_back(reshaped);
+    }
+
+    auto resultType = RankedTensorType::get({rank}, i64Type);
+    Value result = stablehlo::ConcatenateOp::create(
+        rewriter, loc, resultType, dimValues,
+        rewriter.getI64IntegerAttr(0));
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// Convert shape.num_elements (tensor<Nxindex> -> index) into a stablehlo
+// reduce with multiplication, producing a scalar tensor<i64>.
+class ConvertShapeNumElementsOp
+    : public OpConversionPattern<shape::NumElementsOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(shape::NumElementsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value shape = adaptor.getShape();
+    auto shapeType = dyn_cast<RankedTensorType>(shape.getType());
+    if (!shapeType)
+      return failure();
+
+    auto i64Type = rewriter.getI64Type();
+    auto scalarType = RankedTensorType::get({}, i64Type);
+
+    if (shapeType.getElementType().isIndex()) {
+      auto convertedType =
+          RankedTensorType::get(shapeType.getShape(), i64Type);
+      shape = stablehlo::ConvertOp::create(rewriter, loc, convertedType, shape);
+      shapeType = convertedType;
+    }
+
+    Value initValue = stablehlo::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(i64Type, 1));
+    auto reduceOp = stablehlo::ReduceOp::create(
+        rewriter, loc, scalarType, ValueRange{shape}, ValueRange{initValue},
+        rewriter.getDenseI64ArrayAttr({0}));
+
+    Block &block = reduceOp.getBody().emplaceBlock();
+    block.addArgument(scalarType, loc);
+    block.addArgument(scalarType, loc);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&block);
+      Value mul = stablehlo::MulOp::create(rewriter, loc, block.getArgument(0),
+                                           block.getArgument(1));
+      stablehlo::ReturnOp::create(rewriter, loc, mul);
+    }
+
+    rewriter.replaceOp(op, reduceOp.getResults()[0]);
+    return success();
+  }
+};
+
 namespace {
 class ConvertTorchToStablehloCustomLowering
     : public impl::ConvertTorchToStablehloCustomLoweringBase<
@@ -1708,6 +1832,7 @@ public:
     registry.insert<Torch::TorchDialect>();
     registry.insert<tensor::TensorDialect>();
     registry.insert<arith::ArithDialect>();
+    registry.insert<shape::ShapeDialect>();
     registry.insert<func::FuncDialect>();
     TorchConversion::getBackendTypeConversionDependentDialects(registry);
   }
@@ -1744,6 +1869,12 @@ public:
       TorchConversion::setupBackendTypeConversionForStablehlo(target,
                                                               typeConverter);
       RewritePatternSet patterns(context);
+
+      target.addIllegalOp<shape::ShapeOfOp>();
+      patterns.add<ConvertShapeShapeOfOp>(typeConverter, context);
+
+      target.addIllegalOp<shape::NumElementsOp>();
+      patterns.add<ConvertShapeNumElementsOp>(typeConverter, context);
 
       target.addIllegalOp<tensor::DimOp>();
       patterns.add<ConvertTensorDimOp>(typeConverter, context);
@@ -1921,6 +2052,18 @@ public:
 
       target.addIllegalOp<arith::XOrIOp>();
       patterns.add<ConvertArithXOrIOp>(typeConverter, context);
+
+      // Convert function signatures so scalar i64/f64 args become tensor<i64>/tensor<f64>.
+      populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
+          patterns, typeConverter);
+      target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+        return typeConverter.isSignatureLegal(op.getFunctionType()) &&
+               typeConverter.isLegal(&op.getBody());
+      });
+      populateReturnOpTypeConversionPattern(patterns, typeConverter);
+      target.addDynamicallyLegalOp<func::ReturnOp>(
+          [&](func::ReturnOp op) { return typeConverter.isLegal(op); });
+
       result =
           applyPartialConversion(getOperation(), target, std::move(patterns));
     });
