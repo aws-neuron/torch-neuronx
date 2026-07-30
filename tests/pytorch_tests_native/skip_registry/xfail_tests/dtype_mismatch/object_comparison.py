@@ -1,7 +1,6 @@
 DTYPE_MISMATCH_OBJECT_COMPARISON = [
     "CtxManagerTests::test_autocast_cpu_graph_break",
     "CtxManagerTests::test_autocast_cpu_graph_break_inner_fn",
-    "CtxManagerTests::test_autocast_device",
     "CtxManagerTests::test_autocast_float64",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_add_neuron",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_type_promotion_clamp_max_neuron",

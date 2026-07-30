@@ -54,11 +54,52 @@ SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
             "[PT2.11] CUDA-specific tests that assume CUDA device_type or rely on"
-            " CUDA-only APIs/semantics with no Neuron equivalent (hardcoded 'cuda'"
-            " assertions, torch.cuda.HalfTensor, torch.cuda.get_device_properties,"
-            " CUDA memory-stats, CUDA stream/event graphs). Not applicable to Neuron."
+            " CUDA-only APIs/semantics with no Neuron equivalent (torch.cuda"
+            " stream/event APIs, torch.autocast(\"cuda\"), hardcoded 'cuda'"
+            " assertions). Not applicable to Neuron."
         ),
         tests=s.DYNAMO_CUDA_SPECIFIC_UNSUPPORTED,
+    ),
+    SkipGroup(
+        reason=(
+            "Tests run under dynamic=True, which makes scalar operands SymInts and"
+            " tensor shapes symbolic. "
+        ),
+        tests=[
+            "DecoratorTests::test_nonstrict_trace_tuple_and_sym_int_output",
+            "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg",
+            "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph",
+            "ExportTests::test_dupes_and_bypass_with_non_tensor_arg",
+            "ExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph",
+            "ExportTests::test_dupes_and_bypass_with_non_tensor_output",
+            "ExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph",
+            "FunctionTests::test_pos",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_inline_and_install",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph_inline_and_install",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_inline_and_install",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph_inline_and_install",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_inline_and_install",
+            "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph_inline_and_install",
+            "MiscTests::test_dynamic_shapes_as_strided",
+            "MiscTests::test_make_contiguous_strides_for_under_compile",
+            "ReproTests::test_add_sub_alpha_out",
+            "ReproTests::test_addr_alpha_beta_out",
+            "ReproTests::test_dynamic_shape_disable_duck_size",
+            "SubclassTests::test_tensor_subclass_TwoTensor_nested",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Scalar operands become SymInts via automatic dynamic (a scalar value"
+            " changes across calls, triggering recompilation with a symbolic int)."
+        ),
+        tests=[
+            "DictTests::test_dict_tag_guard",
+            "DictTests::test_mapping_proxy_existing",
+            "FunctionTests::test_dict_tuple_lazy_guard",
+            "MiscTests::test_itertools_infinite_count",
+            "ReproTests::test_guard_with_tuple_mutation",
+        ],
     ),
     SkipGroup(
         reason=(

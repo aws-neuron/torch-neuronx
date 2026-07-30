@@ -3,9 +3,6 @@ DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH = [
     "ContextlibContextManagerTests::test_functorch_low_level_gb_True",
     "CtxManagerTests::test_autocast_decorator",
     "CtxManagerTests::test_is_autocast_cpu_enabled",
-    "DecoratorTests::test_nonstrict_trace_tuple_and_sym_int_output",
-    "DictTests::test_dict_tag_guard",
-    "DictTests::test_mapping_proxy_existing",
     "DynamicShapesCtxManagerTests::test_cuda_amp_autocast_dynamic_shapes",
     "DynamicShapesFunctionTests::test_dict_id_guard_dynamic_shapes",
     "DynamicShapesFunctionTests::test_dict_key_set3_dynamic_shapes",
@@ -25,20 +22,7 @@ DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH = [
     "DynamicShapesReproTests::test_guard_with_tuple_mutation_dynamic_shapes",
     "DynamicShapesReproTests::test_issue111522_dynamic_shapes",
     "DynamicShapesReproTests::test_omegaconf_listconfig_iter_dynamic_shapes",
-    "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg",
-    "ExportTests::test_dupes_and_bypass_with_non_tensor_arg",
-    "ExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph",
-    "ExportTests::test_dupes_and_bypass_with_non_tensor_output",
-    "ExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph",
-    "FunctionTests::test_pos",
-    "MiscTests::test_dynamic_shapes_as_strided",
-    "MiscTests::test_make_contiguous_strides_for_under_compile",
     "NestedGraphBreakLoggingTests::test_try_block_with_graph_break_suppression",
-    "ReproTests::test_add_sub_alpha_out",
-    "ReproTests::test_addr_alpha_beta_out",
-    "ReproTests::test_dynamic_shape_disable_duck_size",
-    "ReproTests::test_guard_with_tuple_mutation",
-    "SubclassTests::test_tensor_subclass_TwoTensor_nested",
     "TestBytecodeDebugger::test_stack_variable_access",
     "AOTAutogradCacheTests::test_pre_grad_passes_timing_late_with_uuid",
     "DynamicShapesAotAutogradFallbackTests::test_mutation_dynamic_shapes",
@@ -65,13 +49,6 @@ DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH = [
     "DynamicShapesMiscTests::test_write_to_cells_with_name_shadowing_dynamic_shapes",
     "DynamicShapesReproTests::test_dynamic_shape_disable_duck_size_dynamic_shapes",
     "DynamicShapesReproTests::test_super_classmethod_inheritance_dynamic_shapes",
-    "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_inline_and_install",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph_inline_and_install",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_inline_and_install",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph_inline_and_install",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_inline_and_install",
-    "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph_inline_and_install",
 ]
 
 DYNAMO_UNRESOLVED_MATERIALIZATION_I64 = [
@@ -265,7 +242,6 @@ DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
 DYNAMO_FAILED_TO_LEGALIZE_TENSOR_DIM = [
     "AOTAutogradCacheBundledTests::test_autograd_function",
     "AutogradFunctionTests::test_fwd_no_grad",
-    "CtxManagerTests::test_cuda_stream_method",
     "DynamicShapesAotAutogradFallbackTests::test_mutation1_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_autocast_low_level_api_dynamic_shapes",
     "DynamicShapesFunctionTests::test_elipsis_dynamic_shapes",
@@ -356,7 +332,6 @@ DYNAMO_LOWERING_FAILURE_ATEN_ADD = [
     "CtxManagerTests::test_autocast_graph_break_method",
     "DynamicShapesMiscTests::test_overridden_getattribute_dynamic_shapes",
     "MiscTests::test_tensor_setattr_getset_descriptor",
-    "CtxManagerTests::test_cuda_stream_context_manager1",
     "DynamicShapesMiscTests::test_ordered_dict_alias_reconstruct_dynamic_shapes",
     "DynamicShapesMiscTests::test_tensor_setattr_getset_descriptor_dynamic_shapes",
     "DynamicShapesReproTests::test_property_setter_with_dict_get_176608_dynamic_shapes",
@@ -393,7 +368,8 @@ DYNAMO_LOWERING_FAILURE_ATEN_CUMSUM = [
 
 DYNAMO_LOWERING_FAILURE_ATEN_XLOGY = [
     "AOTAutogradCacheTests::test_dtensor_cache_hit",
-    "FunctionTests::test_dict_tuple_lazy_guard",
+    "FunctionTests::test_enumerate_custom",
+    "FunctionTests::test_unary_fold_op",
     "GraphDededuplicationTests::test_tuple_return",
 ]
 
@@ -490,8 +466,6 @@ DYNAMO_VMAP_RECOMPILE_GUARD = [
 ]
 
 DYNAMO_STREAM_EVENT_TYPE_MISMATCH = [
-    "CtxManagerTests::test_cuda_event_method",
-    "CtxManagerTests::test_cuda_stream_compared_with_stream",
     "DynamicShapesCtxManagerTests::test_cuda_event_method_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_cuda_stream_compared_with_stream_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_cuda_stream_context_manager1_dynamic_shapes",

@@ -101,16 +101,13 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason="Test hardcodes 'cuda' device string comparison",
-        tests=[
-            "CtxManagerTests::test_cuda_amp_autocast",
-        ],
+        tests=[],
     ),
     # TODO: Upstream fix needed - test expects autocast behavior matching CPU, but
     #   neuron autocast behavior is different
     SkipGroup(
         reason=("Autocast dtype mismatch: Neuron does not support " "expected autocast dtype"),
         tests=[
-            "CtxManagerTests::test_autocast_device",
             "CtxManagerTests::test_autocast_float64",
             "DynamicShapesCtxManagerTests::test_autocast_float64_dynamic_shapes",
         ],
@@ -560,7 +557,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_error_dynamic_shapes",
             "FunctionTests::test_quantize_per_tensor",
-            "MiscTests::test_itertools_infinite_count",
             "NbFloatTests::test_tensor_dunder_float",
             "NbFloatTests::test_tensor_int_dtype",
             "NbIntTests::test_tensor_dunder_int",
