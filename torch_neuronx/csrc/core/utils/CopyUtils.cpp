@@ -3,6 +3,8 @@
 #include <c10/util/Logging.h>
 
 #include <algorithm>
+#include <exception>
+#include <limits>
 #include <numeric>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
@@ -80,11 +82,14 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "Source must be Neuron tensor");
   TORCH_CHECK(dst.is_cpu(), "Destination tensor must be CPU tensor");
 
-  // Callers must ensure src is contiguous or handle layout themselves.
+  TORCH_CHECK(src.is_contiguous(),
+              "Source Neuron tensor must be contiguous for direct copy to CPU");
   TORCH_CHECK(dst.is_contiguous(),
               "Destination CPU tensor must be contiguous for direct copy from Neuron");
 
   size_t size_bytes = dst.nbytes();
+  TORCH_CHECK(src.nbytes() == size_bytes, "Source and destination byte counts must match (source ",
+              src.nbytes(), " bytes, destination ", size_bytes, " bytes)");
   // Skip copy if there are no bytes to copy (empty tensor)
   if (size_bytes == 0) {
     return;
@@ -93,7 +98,16 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
   int device = src.device().index();
   void* dst_data_ptr = dst.data_ptr();
   // Calculate offset based on tensor's storage offset
-  size_t byte_offset = src.storage_offset() * src.element_size();
+  const auto storage_offset = src.storage_offset();
+  const size_t element_size = src.element_size();
+  TORCH_CHECK(storage_offset >= 0, "Source storage offset must be non-negative");
+  TORCH_CHECK(
+      static_cast<uint64_t>(storage_offset) <= std::numeric_limits<size_t>::max() / element_size,
+      "Source storage offset overflows byte offset");
+  size_t byte_offset = static_cast<size_t>(storage_offset) * element_size;
+  const size_t storage_bytes = src.storage().nbytes();
+  TORCH_CHECK(byte_offset <= storage_bytes && size_bytes <= storage_bytes - byte_offset,
+              "Direct Neuron-to-CPU copy exceeds source storage bounds");
 
   auto stream = at::neuron::getCurrentNeuronStream(device);
   void* src_ptr = src.storage().mutable_data();
@@ -102,17 +116,32 @@ void copy_neuron_to_cpu(const at::Tensor& src, at::Tensor& dst, bool non_blockin
       "neuron::copy::neuron_to_cpu", at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr},
       dst_data_ptr, byte_offset, size_bytes, device);
   auto context = std::make_unique<at::neuron::OperationContext>(std::move(read_kernel));
-  at::neuron::SubmitOperationContext(stream, std::move(context));
+
+  // record_event registers the stream on the host block; the allocator records
+  // the actual completion event if the block is released. Register before
+  // enqueue so an exception cannot leave accepted DMA untracked.
+  bool async_lifetime_registered = false;
   if (non_blocking) {
     auto* host_alloc = torch_neuronx::GetNeuronHostAllocatorAsHostAllocator();
-    bool recorded = host_alloc->record_event(dst_data_ptr, dst.storage().data_ptr().get_context(),
-                                             c10::Stream(stream.unwrap()));
-    // record_event returns false when dst wasn't allocated by NeuronHostAllocator
-    // (e.g. regular CPU tensor), so fall back to synchronize for safety.
-    if (!recorded) {
+    async_lifetime_registered = host_alloc->record_event(
+        dst_data_ptr, dst.storage().data_ptr().get_context(), c10::Stream(stream.unwrap()));
+  }
+
+  try {
+    at::neuron::SubmitOperationContext(stream, std::move(context));
+  } catch (...) {
+    auto submit_error = std::current_exception();
+    try {
       stream.synchronize();
+    } catch (...) {
+      // Preserve the submission exception after draining any accepted work.
     }
-  } else {
+    std::rethrow_exception(submit_error);
+  }
+
+  // Pageable/foreign destinations cannot be protected by the host allocator,
+  // so non_blocking is best-effort and must synchronize before returning.
+  if (!async_lifetime_registered) {
     stream.synchronize();
   }
 }

@@ -1,3 +1,4 @@
+#include <ATen/ExpandUtils.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/transformers/sdp_utils.h>
 #include <ATen/ops/nonzero_numpy.h>
@@ -353,6 +354,27 @@ static torch::Tensor CastContiguousCPU(const at::Tensor& src, c10::ScalarType ta
   return out;
 }
 
+static bool IsExactSelfCopy(const at::Tensor& dst, const at::Tensor& src) {
+  return dst.device() == src.device() && dst.scalar_type() == src.scalar_type() &&
+         dst.storage().is_alias_of(src.storage()) && dst.storage_offset() == src.storage_offset() &&
+         dst.sizes() == src.sizes() && dst.strides() == src.strides() &&
+         dst.is_conj() == src.is_conj() && dst.is_neg() == src.is_neg();
+}
+
+/// Neuron's equivalent of "copy does not require a temporary": a raw NRT read
+/// completely implements Neuron-to-CPU copy_ semantics.
+///
+/// NRT bypasses TensorIterator and cannot perform dtype/layout conversion or
+/// reconcile mismatched conjugate or negative metadata.
+static bool CanUseDirectNeuronToCPUCopy(const at::Tensor& logical_src,
+                                        const at::Tensor& transfer_src, const at::Tensor& dst) {
+  return logical_src.sizes() == dst.sizes() && transfer_src.layout() == c10::kStrided &&
+         dst.layout() == c10::kStrided && !transfer_src.is_quantized() && !dst.is_quantized() &&
+         transfer_src.sizes() == dst.sizes() && transfer_src.scalar_type() == dst.scalar_type() &&
+         transfer_src.is_contiguous() && dst.is_contiguous() &&
+         transfer_src.is_conj() == dst.is_conj() && transfer_src.is_neg() == dst.is_neg();
+}
+
 /// Dtype supported by the MLIR aten::copy_ lowering (excludes Bool).
 static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
   return IsSupportedDtype(dt) && !c10::isComplexType(dt);
@@ -462,7 +484,13 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
                                " src_dtype=", src.scalar_type(), " src_shape=", src.sizes(),
                                " non_blocking=", non_blocking);
 
-  // ── Empty tensor shortcircuit: no-op ──
+  bool needs_broadcast = (self_tensor.sizes() != src.sizes());
+  if (needs_broadcast) {
+    TORCH_CHECK(at::is_expandable_to(src.sizes(), self_tensor.sizes()), "copy_(): source shape ",
+                src.sizes(), " is not broadcastable to destination shape ", self_tensor.sizes());
+  }
+
+  // ── Empty tensor shortcircuit: validated no-op ──
   if (self_tensor.numel() == 0) {
     logOperationExecuted("aten::copy_");
     torch::jit::push(*stack, self_tensor);
@@ -470,14 +498,12 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
   }
 
   // ── Self-copy shortcircuit ──
-  if (self_tensor.data_ptr() == src.data_ptr() &&
-      self_tensor.storage_offset() == src.storage_offset() && self_tensor.sizes() == src.sizes()) {
+  if (IsExactSelfCopy(self_tensor, src)) {
     logOperationExecuted("aten::copy_");
     torch::jit::push(*stack, self_tensor);
     return;
   }
 
-  bool needs_broadcast = (self_tensor.sizes() != src.sizes());
   bool src_is_neuron = src.is_privateuseone();
   bool dst_is_neuron = self_tensor.is_privateuseone();
 
@@ -494,10 +520,23 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
 
   // ── Neuron → CPU ──
   if (src_is_neuron && self_tensor.device().is_cpu()) {
-    // Copy small src to CPU first, then let CPU handle broadcast natively
     auto src_prepared = src.is_contiguous() ? src
                                             : torch_neuronx::ops::contiguous_internal(
                                                   src, c10::MemoryFormat::Contiguous);
+
+    // Raw D2H is valid only when the transfer itself fully implements copy_
+    // semantics. Everything requiring broadcast, conversion, restriding, or
+    // metadata materialization stays on the CPU-temporary fallback.
+    if (CanUseDirectNeuronToCPUCopy(src, src_prepared, self_tensor)) {
+      TORCH_NEURONX_DISPATCH_DEBUG(
+          "[DispatchCopy] Neuron→CPU raw NRT direct", " src_dtype=", src_prepared.scalar_type(),
+          " src_shape=", src_prepared.sizes(), " non_blocking=", non_blocking);
+      torch_neuronx::utils::copy_neuron_to_cpu(src_prepared, self_tensor, non_blocking);
+      logOperationExecuted("aten::copy_");
+      torch::jit::push(*stack, self_tensor);
+      return;
+    }
+
     auto tmp_cpu = CopyNeuronToCPU(src_prepared, self_tensor.scalar_type(), /*non_blocking=*/false);
     // CPU copy_ handles broadcasting natively
     self_tensor.copy_(tmp_cpu, non_blocking);
