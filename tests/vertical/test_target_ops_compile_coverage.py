@@ -54,7 +54,10 @@ from internal.roofline import compute_roofline
 
 logger = logging.getLogger(__name__)
 
-_USE_DYNAMIC = os.environ.get("NEURON_COMPILE_COVERAGE_DYNAMIC") == "1"
+
+def _use_dynamic() -> bool:
+    return os.environ.get("NEURON_COMPILE_COVERAGE_DYNAMIC") == "1"
+
 
 NUM_EXEC_ITERATIONS = 3
 METRICS_DIR = (
@@ -84,6 +87,18 @@ _OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
     "linspace",
     "logspace",
     "aten::_softmax_backward_data",
+)
+
+# Ops that hang or segfault under dynamic shapes; skip when --dynamic is active.
+# - _foreach_* ops: each variant compiles N sub-graphs sequentially, taking 50-120 min
+# - native_dropout, addr, cumprod_backward: triggers extremely long compilation (120+ min)
+# - range: hangs with dynamic scalar inputs
+_OPS_SKIP_COMPILE_DYNAMIC: tuple[str, ...] = (
+    "_foreach_",
+    "native_dropout",
+    "range",
+    "addr",
+    "cumprod_backward",
 )
 
 
@@ -300,7 +315,7 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         return op(*args, **kwargs)
 
     try:
-        compiled_fn = torch.compile(op_fn, backend="neuron", fullgraph=True, dynamic=_USE_DYNAMIC)
+        compiled_fn = torch.compile(op_fn, backend="neuron", fullgraph=True, dynamic=_use_dynamic())
     except Exception as e:
         out["error"] = f"compile failed: {str(e)[:ERROR_MAXLEN]}"
         out["status"] = "failed_lowering"
@@ -500,6 +515,8 @@ class TestTargetOpsCompileCoverage:
         op_name = op_info.op_name
         if any(pat in op_name for pat in _OPS_SKIP_COMPILE_HANG):
             pytest.skip(f"{op_name}: skipped (hangs with 0d tensor inputs)")
+        if _use_dynamic() and any(pat in op_name for pat in _OPS_SKIP_COMPILE_DYNAMIC):
+            pytest.skip(f"{op_name}: skipped (hangs/segfaults with dynamic shapes)")
         classification = _classify_op(op_name)
 
         result = {
