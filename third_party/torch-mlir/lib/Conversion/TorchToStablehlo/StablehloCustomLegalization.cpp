@@ -219,12 +219,52 @@ static void normalizeBoolFuncArgs(func::FuncOp funcOp) {
     auto scalarZero = stablehlo::ConstantOp::create(
         builder, funcOp.getLoc(),
         DenseElementsAttr::get(scalarI8Type, IntegerAttr::get(i8Type, 0)));
-    auto zero = stablehlo::BroadcastInDimOp::create(
-        builder, funcOp.getLoc(), i8TensorType, scalarZero.getResult(),
-        builder.getDenseI64ArrayAttr({}));
+
+    Value zero;
+    if (i8TensorType.hasStaticShape()) {
+      zero = stablehlo::BroadcastInDimOp::create(
+          builder, funcOp.getLoc(), i8TensorType, scalarZero.getResult(),
+          builder.getDenseI64ArrayAttr({}));
+    } else {
+      // For dynamic shapes, compute the shape tensor from the converted arg
+      // and use dynamic_broadcast_in_dim.
+      int64_t rank = i8TensorType.getRank();
+      auto i32Type = builder.getI32Type();
+      auto i32ScalarType = RankedTensorType::get({}, i32Type);
+      auto i32x1Type = RankedTensorType::get({1}, i32Type);
+      SmallVector<Value> dimSlices;
+      for (int64_t d = 0; d < rank; ++d) {
+        if (!i8TensorType.isDynamicDim(d)) {
+          auto dimAttr = DenseElementsAttr::get(
+              i32ScalarType, builder.getI32IntegerAttr(i8TensorType.getDimSize(d)));
+          auto dimVal = stablehlo::ConstantOp::create(builder, funcOp.getLoc(),
+                                                      i32ScalarType, dimAttr);
+          dimSlices.push_back(stablehlo::ReshapeOp::create(
+              builder, funcOp.getLoc(), i32x1Type, dimVal));
+        } else {
+          auto dimVal = stablehlo::GetDimensionSizeOp::create(
+              builder, funcOp.getLoc(), i32ScalarType, toI8.getResult(),
+              builder.getI64IntegerAttr(d));
+          dimSlices.push_back(stablehlo::ReshapeOp::create(
+              builder, funcOp.getLoc(), i32x1Type, dimVal));
+        }
+      }
+      Value shapeTensor;
+      if (dimSlices.size() == 1) {
+        shapeTensor = dimSlices[0];
+      } else {
+        auto shapeType = RankedTensorType::get({rank}, i32Type);
+        shapeTensor = stablehlo::ConcatenateOp::create(
+            builder, funcOp.getLoc(), shapeType, dimSlices,
+            builder.getI64IntegerAttr(0));
+      }
+      zero = stablehlo::DynamicBroadcastInDimOp::create(
+          builder, funcOp.getLoc(), i8TensorType, scalarZero.getResult(),
+          shapeTensor, builder.getDenseI64ArrayAttr({}));
+    }
 
     auto normalized = stablehlo::CompareOp::create(
-        builder, funcOp.getLoc(), toI8.getResult(), zero.getResult(),
+        builder, funcOp.getLoc(), toI8.getResult(), zero,
         stablehlo::ComparisonDirection::NE);
 
     // Replace all uses of the arg with the normalized i1 value
