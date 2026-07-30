@@ -16,7 +16,6 @@ def _register_common_ops():
     """Register operations shared between legacy and MLIR paths."""
     import os
 
-    from .equal import equal_neuron
     from .gather import (
         _gather_op,
         _gather_out_op,
@@ -45,10 +44,6 @@ def _register_common_ops():
         scatter_add_neuron,
         scatter_add_out_neuron,
     )
-
-    # equal returns a host bool (not a tensor), so it bypasses the MLIR
-    # lowering path and is registered directly for both dispatch modes.
-    aten_lib.impl("equal", equal_neuron, "PrivateUse1")
 
     # Register the fused attention operations - with qkv and out projection for inference
     aten_lib.impl("_native_multi_head_attention", native_multi_head_attention_neuron, "PrivateUse1")
