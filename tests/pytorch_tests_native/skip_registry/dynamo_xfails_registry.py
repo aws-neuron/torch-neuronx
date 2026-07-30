@@ -99,10 +99,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "FunctionTests::test_get_device_properties_tensor_device",
         ],
     ),
-    SkipGroup(
-        reason="Test hardcodes 'cuda' device string comparison",
-        tests=[],
-    ),
     # TODO: Upstream fix needed - test expects autocast behavior matching CPU, but
     #   neuron autocast behavior is different
     SkipGroup(
