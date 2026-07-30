@@ -393,6 +393,36 @@ class NeuronOpInfo(OpInfo):
             return None
         return _schema_make_sample(self._resolved_op, arg_shapes, device, dtype)
 
+    # Shapes like [1,16,8192,8192] (4 GB per tensor) trigger a native
+    # SIGABRT inside libnrt during compilation or execution — likely due to
+    # compiler-internal memory pressure or runtime scratch buffer overflow
+    # at that scale (trn2 LNC=2 provides 24 GiB per logical core, but the
+    # abort occurs before tensor allocation saturates HBM). Cap per-tensor
+    # element count to a safe empirical limit: 512M elements x 4 bytes =
+    # 2 GB per tensor keeps all tested shapes crash-free.
+    _MAX_TENSOR_ELEMS = int(os.environ.get("NEURON_MAX_TENSOR_ELEMS", str(512 * 1024 * 1024)))
+
+    # Ops that invoke the full neuronx-cc compiler per shape (convolutions,
+    # attention, linear, fused optimizers) take 1-3 min per cold-compile.
+    # With 10 shapes they can exceed the workload TTL. Cap these to 5
+    # shapes so they complete within budget when parallelized across xdist
+    # workers.
+    _SLOW_COMPILE_OPS = frozenset(
+        {
+            "aten::convolution_backward",
+            "aten::convolution_backward.out",
+            "aten::_scaled_dot_product_fused_attention_overrideable",
+            "aten::_scaled_dot_product_fused_attention_overrideable_backward",
+            "aten::linear",
+            "aten::linear_backward",
+            "aten::embedding_dense_backward",
+            "aten::embedding_dense_backward.out",
+            "aten::cross_entropy_loss",
+            "aten::_fused_adamw_",
+        }
+    )
+    _SLOW_COMPILE_MAX_SHAPES = 5
+
     def _registry_entries(self) -> list:
         """Registry entries for this op. Propagation at registry-load time
         (see NeuronShapeRegistry.propagate_to_compatible_overloads) already
@@ -413,7 +443,20 @@ class NeuronOpInfo(OpInfo):
         if entries and os.environ.get("NEURON_MODEL_SHAPES_ONLY"):
             entries = [e for e in entries if any(s != "builtin" for s in e.sources)]
 
+        # Drop entries whose largest tensor exceeds a single NeuronCore's
+        # usable HBM. Without this, shapes like [1,16,8192,8192] (4 GB per
+        # tensor) get selected by the top-N sort below and SIGABRT the xdist
+        # worker when libnrt can't allocate device memory.
+        if entries:
+            entries = [
+                e
+                for e in entries
+                if max_tensor_elems(e.arg_shapes, self.op_name) <= self._MAX_TENSOR_ELEMS
+            ]
+
         max_per_op = int(os.environ.get("NEURON_MAX_SHAPES_PER_OP", "10"))
+        if self.op_name in self._SLOW_COMPILE_OPS:
+            max_per_op = min(max_per_op, self._SLOW_COMPILE_MAX_SHAPES)
         if max_per_op > 0 and len(entries) > max_per_op:
             entries = sorted(
                 entries,
