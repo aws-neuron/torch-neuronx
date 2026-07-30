@@ -401,11 +401,17 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Replicate CPU compile test not supported — ReplicateTest uses"
-            " CPU-only compile path that doesn't translate to Neuron backend."
+            "Replicate CPU compile tests — not Neuron-related. CPU-only compile"
+            " path (device='cpu', gloo, inductor) that does not involve the"
+            " Neuron backend. The _with_compiler variant is additionally flaky:"
+            " it compares eager vs inductor-compiled gradients, which accumulate"
+            " reductions in a different order, yielding ~3.8e-5-7.3e-5 abs diffs"
+            " that intermittently exceed the test's tight rtol=1.3e-6 (~1/5 fail"
+            " rate on trn2, worse under parallel CPU contention)."
         ),
         tests=[
             "test_replicate.py::ReplicateTest::test_compile_cpu",
+            "test_replicate_with_compiler.py::ReplicateTest::test_compile_cpu",
         ],
     ),
     SkipGroup(
