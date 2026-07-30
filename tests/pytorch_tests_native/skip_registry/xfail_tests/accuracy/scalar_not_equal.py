@@ -1,5 +1,4 @@
 ACCURACY_SCALAR_NOT_EQUAL = [
-    "CtxManagerTests::test_cuda_stream_compared_with_stream",
     "ErrorMessagesTest::test_assert_failure_in_generic_ctx_mgr",
     "HOPCacheTests::test_same_sac_policy_causes_cache_hit",
     "LoggingTests::test_kernel_code",
