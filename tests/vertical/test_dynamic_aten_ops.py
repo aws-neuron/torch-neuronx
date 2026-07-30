@@ -38,6 +38,12 @@ pytestmark = pytest.mark.multi_device
 _NEURON_PROFILE_BIN = os.environ.get("NEURON_PROFILE_BIN", "/opt/aws/neuron/bin/neuron-explorer")
 _CORE_START = int(os.environ.get("AOP_CORE_START", "0"))
 
+if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:
+    os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+_SESSION_TIMESTAMP = os.environ["NEURON_COVERAGE_TIMESTAMP"]
+
 
 def _xdist_core_index() -> int:
     """Logical NeuronCore index this pytest worker owns."""
@@ -78,6 +84,7 @@ _CSV_COLUMNS = [
     "correctness_test",
     "last_updated",
     "error",
+    "profile_rel_path",  # local profile-artifact dir
 ]
 
 
@@ -464,14 +471,16 @@ def _run_op_cells(op: str, profile_dir: str, env_base: dict, now: str) -> list[d
     rows = []
     entries = _entries(op)
     for idx, entry in enumerate(entries):
+        shape_s = _shape_str(entry.arg_shapes)
         for dtype in _DTYPES_TO_TEST:
             d = _run_job(op, idx, dtype, "dynamic", profile_dir, env_base)
             s = _run_job(op, idx, dtype, "static", profile_dir, env_base)
             err = d.get("error") or s.get("error") or ""
+            cell = f"{op}_{shape_s}_{_DTYPES[dtype]}"
             rows.append(
                 {
                     "op_name": _OPS[op],
-                    "input_shape": _shape_str(entry.arg_shapes),
+                    "input_shape": shape_s,
                     "dtype": _DTYPES[dtype],
                     "input_size_mb": _entry_mb(entry.arg_shapes, dtype),
                     "dynamic_time_to_first_ms": d.get("ttf_ms", -1.0),
@@ -485,6 +494,7 @@ def _run_op_cells(op: str, profile_dir: str, env_base: dict, now: str) -> list[d
                     "correctness_test": "pass" if d.get("ok") else "fail",
                     "last_updated": now,
                     "error": err,
+                    "profile_rel_path": f"aten_profiles/{cell}",
                 }
             )
     return rows
@@ -519,7 +529,7 @@ def _save_op_rows(op_full: str, rows: list[dict]) -> None:
 
 def driver(out_csv: str, profile_dir: str) -> list[dict]:
     env_base = dict(os.environ)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = _SESSION_TIMESTAMP
     total = sum(len(_entries(op)) for op in _OPS) * len(_DTYPES_TO_TEST)
     print(
         f"[aop.driver] {len(_OPS)} ops, {total} (op,shape,dtype) cells x 2 modes",
@@ -564,10 +574,10 @@ class TestDynamicAtenOps:
     every dynamically-routed cell is numerically correct."""
 
     @pytest.mark.parametrize("op", _op_params())
-    def test_op(self, op, tmp_path):
-        profile_dir = str(tmp_path / "aten_profiles")
+    def test_op(self, op):
+        profile_dir = os.environ.get("AOP_PROFILE_DIR", os.path.abspath("aten_profiles"))
         env_base = dict(os.environ)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now = _SESSION_TIMESTAMP
         rows = _run_op_cells(op, profile_dir, env_base, now)
         _save_op_rows(_OPS[op], rows)
 
