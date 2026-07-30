@@ -31,17 +31,60 @@ from .base import ExecutionResult, OperationImplementation
 logger = logging.getLogger(__name__)
 
 
+def _is_expandable_to(src_shape: torch.Size, dst_shape: torch.Size) -> bool:
+    if len(src_shape) > len(dst_shape):
+        return False
+    return all(
+        src_dim == 1 or src_dim == dst_dim
+        for src_dim, dst_dim in zip(reversed(src_shape), reversed(dst_shape), strict=False)
+    )
+
+
 def _is_same_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Cheap check for self-copy (same underlying storage and offset)."""
+    if a.device != b.device:
+        return False
     try:
         return (
-            a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
-            and a.storage_offset() == b.storage_offset()
-            and tuple(a.size()) == tuple(b.size())
+            a.dtype == b.dtype
+            and a.is_set_to(b)
+            and a.is_conj() == b.is_conj()
+            and a.is_neg() == b.is_neg()
         )
     except Exception:
         # Fallback if storage isn't available; compare data_ptr
-        return a.data_ptr() == b.data_ptr() and tuple(a.size()) == tuple(b.size())
+        return (
+            a.dtype == b.dtype
+            and a.data_ptr() == b.data_ptr()
+            and a.storage_offset() == b.storage_offset()
+            and tuple(a.size()) == tuple(b.size())
+            and tuple(a.stride()) == tuple(b.stride())
+            and a.is_conj() == b.is_conj()
+            and a.is_neg() == b.is_neg()
+        )
+
+
+def _can_use_direct_neuron_to_cpu_copy(
+    logical_src: torch.Tensor, transfer_src: torch.Tensor, dst: torch.Tensor
+) -> bool:
+    """Return whether Neuron-to-CPU copy_ needs no temporary.
+
+    NRT bypasses TensorIterator and cannot perform dtype/layout conversion or
+    reconcile mismatched conjugate or negative metadata.
+    """
+    return (
+        tuple(logical_src.shape) == tuple(dst.shape)
+        and transfer_src.layout == torch.strided
+        and dst.layout == torch.strided
+        and not transfer_src.is_quantized
+        and not dst.is_quantized
+        and tuple(transfer_src.shape) == tuple(dst.shape)
+        and transfer_src.dtype == dst.dtype
+        and transfer_src.is_contiguous()
+        and dst.is_contiguous()
+        and transfer_src.is_conj() == dst.is_conj()
+        and transfer_src.is_neg() == dst.is_neg()
+    )
 
 
 def _layout_change_needed(src: torch.Tensor | int | float | bool, dst: torch.Tensor) -> bool:
@@ -99,9 +142,7 @@ class CopyNeuronImpl(OperationImplementation):
 
         # 1) Validate shapes - handle broadcasting
         if tuple(self_tensor.size()) != tuple(src.size()):
-            try:
-                src = src.expand_as(self_tensor).contiguous()
-            except RuntimeError:
+            if not _is_expandable_to(src.shape, self_tensor.shape):
                 return ExecutionResult(
                     success=False,
                     error_msg=(
@@ -109,6 +150,7 @@ class CopyNeuronImpl(OperationImplementation):
                         f"Got src: {tuple(src.size())} and dst: {tuple(self_tensor.size())}"
                     ),
                 )
+            src = src.expand_as(self_tensor).contiguous()
 
         dst_dev = self_tensor.device.type
         src_dev = src.device.type
@@ -158,24 +200,16 @@ class CopyNeuronImpl(OperationImplementation):
                 if not src.is_contiguous():
                     src_prepared = ensure_contiguous_on_device(src)
 
-                # Fast path: matching dtype and contiguous dst
-                if src_prepared.dtype == self_tensor.dtype and self_tensor.is_contiguous():
+                if _can_use_direct_neuron_to_cpu_copy(src, src_prepared, self_tensor):
                     _C._nrt_copy_neuron_to_cpu_tensor(
                         src_prepared, self_tensor, non_blocking=non_blocking
                     )
-                    # Materialize conj/neg bits that raw byte copy does not handle.
-                    if src.is_conj():
-                        self_tensor.conj_physical_()
-                    if src.is_neg():
-                        self_tensor.neg_()
                 else:
                     # Copy to contiguous CPU buffer first
                     tmp_cpu = torch.empty(
                         src_prepared.shape, dtype=src_prepared.dtype, device="cpu"
                     )
-                    _C._nrt_copy_neuron_to_cpu_tensor(
-                        src_prepared, tmp_cpu, non_blocking=non_blocking
-                    )
+                    _C._nrt_copy_neuron_to_cpu_tensor(src_prepared, tmp_cpu, non_blocking=False)
                     # Materialize conj/neg bits that raw byte copy does not handle.
                     if src.is_conj():
                         tmp_cpu.conj_physical_()
@@ -252,6 +286,14 @@ class CopyNeuronImpl(OperationImplementation):
 
         Matches PyTorch semantics where copy_ with numel()==0 leaves destination unchanged.
         """
+        if isinstance(src, torch.Tensor) and not _is_expandable_to(src.shape, self_tensor.shape):
+            return ExecutionResult(
+                success=False,
+                error_msg=(
+                    "copy_(): Source and destination sizes must match or be broadcastable. "
+                    f"Got src: {tuple(src.size())} and dst: {tuple(self_tensor.size())}"
+                ),
+            )
         return ExecutionResult(success=True, output=self_tensor)
 
     # -------------------- Helpers --------------------
