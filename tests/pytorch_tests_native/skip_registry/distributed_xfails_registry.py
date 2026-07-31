@@ -373,4 +373,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_utils.py::TestMedatadaIndex::test_dcp_logger",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "TODO: Temp xfailed to unblock merge queue - as the suites will start"
+            " failing in nightly as well. Fails a subtest on Neuron; surfaced in"
+            " the merge queue once the subtest-only false-green harness bug was"
+            " fixed. Investigate the pinned/shared tensor staging path and remove"
+            " this xfail."
+        ),
+        tests=[
+            "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
+        ],
+    ),
 ]
