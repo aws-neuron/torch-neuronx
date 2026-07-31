@@ -97,6 +97,42 @@ class TestReciprocalRegistration:
                 assert torch.isclose(result.cpu(), torch.tensor([expected])).item()
             assert_op_runs_on_neuron("aten::reciprocal")
 
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+        ],
+    )
+    def test_reciprocal_integer_dtypes(self, dtype):
+        """reciprocal promotes integer/bool inputs to the default float dtype.
+
+        Regression fence for the torch-mlir lowering error "only floating-point
+        datatype legalization supported for AtenReciprocalOp": integer
+        ``__rdiv__`` / ``__rtruediv__`` (``1 / int_tensor``) reaches
+        ``aten::reciprocal`` with an integer operand, which the StableHLO
+        lowering rejects. The Neuron handler must cast integer/bool inputs up
+        front, matching PyTorch's type-promotion semantics.
+        """
+        with track_neuron_ops():
+            if dtype == torch.bool:
+                input_tensor = torch.tensor([True, False, True])
+            else:
+                input_tensor = torch.tensor([1, 2, 4, 3], dtype=dtype)
+            input_tensor_device = input_tensor.to("neuron")
+
+            result = torch.reciprocal(input_tensor_device)
+            expected = torch.reciprocal(input_tensor)
+
+            assert result.device.type == "neuron"
+            assert result.dtype == expected.dtype == torch.get_default_dtype()
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::reciprocal")
+
     def test_reciprocal_backward(self):
         """Test reciprocal backward pass (gradient computation)."""
         with track_neuron_ops():
