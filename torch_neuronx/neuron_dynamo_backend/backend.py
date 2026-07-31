@@ -2,6 +2,7 @@
 Neuron backend implementation for torch.compile
 """
 
+import contextlib
 import io
 import logging
 import os
@@ -528,6 +529,62 @@ def make_compiler(
     return wrapper
 
 
+@contextlib.contextmanager
+def _preserve_act_input_grad():
+    """Preserve requires_grad through the eager->compile boundary for
+    grad-requiring top-level AsyncCollectiveTensor inputs.
+
+    AOTAutograd's process_inputs resolves an ACT input via trigger_wait(), which
+    returns the grad-less inner .elem; the fake built from it reads
+    requires_grad=False, so AOTAutograd builds a non-differentiable graph and
+    silently drops the gradient to the upstream eager producer (e.g. a
+    RowwiseParallel nn.Embedding feeding a torch.compile'd TP block). Record
+    grad-requiring top-level ACT inputs before the unwrap and re-sync
+    requires_grad onto their fakes afterward. Scoped to one Neuron compile;
+    process_inputs is restored on exit. Fail-open on any AOTAutograd/collectives
+    API drift so a torch version change can never break the compile path.
+
+    This is a temporary bridge. Remove it once the fix lands upstream
+    (pytorch AsyncCollectiveTensor.trigger_wait, tracked in pytorch#191113) and
+    the pinned torch version includes it.
+    """
+    import torch._functorch.aot_autograd as _aot_autograd
+
+    if not hasattr(_aot_autograd, "process_inputs"):
+        yield
+        return
+
+    _original = _aot_autograd.process_inputs
+
+    def _wrapped(flat_args, *args, **kwargs):
+        try:
+            from torch.distributed._functional_collectives import AsyncCollectiveTensor
+
+            grad_act_indices = [
+                i
+                for i, a in enumerate(flat_args)
+                if isinstance(a, AsyncCollectiveTensor) and a.requires_grad
+            ]
+        except Exception:
+            grad_act_indices = []
+        result = _original(flat_args, *args, **kwargs)
+        try:
+            fake_flat_args = result[0] if isinstance(result, tuple) else result
+            for i in grad_act_indices:
+                fi = fake_flat_args[i]
+                if isinstance(fi, torch.Tensor) and not fi.requires_grad:
+                    fi.requires_grad_(True)
+        except Exception:
+            return result  # fail-open on any shape/API drift
+        return result
+
+    _aot_autograd.process_inputs = _wrapped
+    try:
+        yield
+    finally:
+        _aot_autograd.process_inputs = _original
+
+
 def create_neuron_backend():
     """Create a neuron backend for torch.compile.
 
@@ -581,7 +638,8 @@ def create_neuron_backend():
             keep_inference_input_mutations=True,  # Prevent Copy-back.
             decompositions=decomposition_table,
         )
-        return aot_backend(gm, example_inputs)
+        with _preserve_act_input_grad():
+            return aot_backend(gm, example_inputs)
 
     return neuron_backend_wrapper
 
