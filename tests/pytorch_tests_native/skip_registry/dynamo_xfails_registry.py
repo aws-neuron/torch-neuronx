@@ -99,15 +99,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "FunctionTests::test_get_device_properties_tensor_device",
         ],
     ),
-    # TODO: Upstream fix needed - test expects autocast behavior matching CPU, but
-    #   neuron autocast behavior is different
-    SkipGroup(
-        reason=("Autocast dtype mismatch: Neuron does not support " "expected autocast dtype"),
-        tests=[
-            "CtxManagerTests::test_autocast_float64",
-            "DynamicShapesCtxManagerTests::test_autocast_float64_dynamic_shapes",
-        ],
-    ),
     SkipGroup(
         reason=(
             "Torch-MLIR scalar-tensor type mismatch: aten.add.Tensor/aten.mul.Tensor "
