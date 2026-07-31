@@ -6,7 +6,6 @@
 
 #include <atomic>
 #include <cstdlib>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,21 +34,24 @@ int world_size = -1;
 int rank = -1;
 int rank_vnc_count = -1;
 
-bool g_initialized = false;
-std::mutex g_init_mutex;
+// Atomic, not mutex-guarded: mark_in_bad_fork() runs from a pthread_atfork
+// child handler, where a lock the parent held at fork() would never unlock.
+std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_in_bad_fork{false};
 
 // Lazily initialized from TORCH_NEURONX_COMPILE_ONLY on first read.
 std::atomic<int> g_compile_only{-1};  // -1 = not yet resolved, 0/1 = value
 }  // namespace
 
-bool is_initialized() {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-  return g_initialized;
-}
+bool is_initialized() { return g_initialized.load(std::memory_order_acquire); }
 
-void set_initialized(bool value) {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-  g_initialized = value;
+void set_initialized(bool value) { g_initialized.store(value, std::memory_order_release); }
+
+bool is_in_bad_fork() { return g_in_bad_fork.load(std::memory_order_relaxed); }
+
+void mark_in_bad_fork() {
+  g_in_bad_fork.store(true, std::memory_order_relaxed);
+  g_initialized.store(false, std::memory_order_release);
 }
 
 bool is_compile_only() {
