@@ -6754,6 +6754,35 @@ class TestIndexReduceDecompositionE2E:
         result = compiled_fn(x_cpu.to("neuron"), index_cpu.to("neuron"), source_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+    @pytest.mark.parametrize("reduce", ["prod", "amax", "amin", "mean"])
+    def test_index_reduce_scalar_input_e2e(self, reduce, dtype):
+        """0-d (scalar) self/source must not IndexError.
+
+        A scalar tensor has shape (), so the decomposition's `source.shape[dim]`
+        used to raise `IndexError: tuple index out of range`. Eager accepts this
+        and returns a scalar, so the compiled path must match it.
+        """
+        # mean is a floating-point reduction; skip it for integer dtypes.
+        if dtype == torch.int32 and reduce == "mean":
+            pytest.skip("index_reduce mean is not defined for integer dtypes")
+
+        torch.manual_seed(0)
+
+        def fn(x, index, source):
+            return torch.ops.aten.index_reduce(x, 0, index, source, reduce, include_self=True)
+
+        compiled_fn = torch.compile(fn, backend="neuron")
+
+        x_cpu = torch.tensor(5, dtype=dtype)
+        index_cpu = torch.tensor([0])
+        source_cpu = torch.tensor(3, dtype=dtype)
+
+        expected = fn(x_cpu, index_cpu, source_cpu)
+        result = compiled_fn(x_cpu.to("neuron"), index_cpu.to("neuron"), source_cpu.to("neuron"))
+        assert result.shape == expected.shape == ()
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestDiagonalScatterDecompositionE2E:
