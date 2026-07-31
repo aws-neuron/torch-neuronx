@@ -205,3 +205,276 @@ func.func @chlo_broadcast_shift_3d_matrix(%arg0: tensor<5x6x7xi32>, %arg1: tenso
   %0 = chlo.broadcast_shift_right_logical %arg0, %arg1 : (tensor<5x6x7xi32>, tensor<6x7xi32>) -> tensor<5x6x7xi32>
   return %0 : tensor<5x6x7xi32>
 }
+
+// -----
+
+// Test dynamic shape: both operands and result are fully dynamic (same shape, no broadcast)
+// CHECK-LABEL: func.func @chlo_broadcast_add_dynamic_dynamic
+// CHECK-SAME:    (%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32>
+// CHECK:         %[[ADD:.*]] = stablehlo.add %arg0, %arg1 : tensor<?x?xf32>
+// CHECK:         return %[[ADD]] : tensor<?x?xf32>
+func.func @chlo_broadcast_add_dynamic_dynamic(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %0 = chlo.broadcast_add %arg0, %arg1 : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: dynamic vector + scalar -> dynamic vector (only RHS broadcast)
+// CHECK-LABEL: func.func @chlo_broadcast_mul_dynamic_vector_scalar
+// CHECK-SAME:    (%arg0: tensor<?xf32>, %arg1: tensor<f32>) -> tensor<?xf32>
+// CHECK-DAG:     %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK-DAG:     %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM:.*]] = tensor.dim %arg0, %[[C0]] : tensor<?xf32>
+// CHECK:         %[[CAST:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST]] : tensor<1xi64>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [] : (tensor<f32>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:         %[[MUL:.*]] = stablehlo.multiply %arg0, %[[RHS_BROADCAST]] : tensor<?xf32>
+// CHECK:         return %[[MUL]] : tensor<?xf32>
+func.func @chlo_broadcast_mul_dynamic_vector_scalar(%arg0: tensor<?xf32>, %arg1: tensor<f32>) -> tensor<?xf32> {
+  %0 = chlo.broadcast_multiply %arg0, %arg1 : (tensor<?xf32>, tensor<f32>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// Test dynamic shape: partially dynamic (dim 0 static, dim 1 dynamic)
+// CHECK-LABEL: func.func @chlo_broadcast_sub_partially_dynamic
+// CHECK-SAME:    (%arg0: tensor<3x?xf32>, %arg1: tensor<?xf32>) -> tensor<3x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<3x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM1_RHS:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?xf32>
+// CHECK:         %[[CAST1_RHS:.*]] = arith.index_cast %[[DIM1_RHS]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0_2]] : tensor<3x?xf32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST1_RHS]] : tensor<2xi64>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [1] : (tensor<?xf32>, tensor<2xi64>) -> tensor<3x?xf32>
+// CHECK:         %[[SUB:.*]] = stablehlo.subtract %arg0, %[[RHS_BROADCAST]] : tensor<3x?xf32>
+// CHECK:         return %[[SUB]] : tensor<3x?xf32>
+func.func @chlo_broadcast_sub_partially_dynamic(%arg0: tensor<3x?xf32>, %arg1: tensor<?xf32>) -> tensor<3x?xf32> {
+  %0 = chlo.broadcast_subtract %arg0, %arg1 : (tensor<3x?xf32>, tensor<?xf32>) -> tensor<3x?xf32>
+  return %0 : tensor<3x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: 3D dynamic + dynamic vector -> 3D dynamic
+// CHECK-LABEL: func.func @chlo_broadcast_div_3d_dynamic
+// CHECK-SAME:    (%arg0: tensor<?x?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?x?x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C2:.*]] = arith.constant 2 : index
+// CHECK:         %[[DIM2:.*]] = tensor.dim %arg0, %[[C2]] : tensor<?x?x?xf32>
+// CHECK:         %[[CAST2:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM2_RHS:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?xf32>
+// CHECK:         %[[CAST2_RHS:.*]] = arith.index_cast %[[DIM2_RHS]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<?x?x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C1_I64_3:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_4:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0_4]] : tensor<?x?x?xf32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST1]], %[[CAST2_RHS]] : tensor<3xi64>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [2] : (tensor<?xf32>, tensor<3xi64>) -> tensor<?x?x?xf32>
+// CHECK:         %[[DIV:.*]] = stablehlo.divide %arg0, %[[RHS_BROADCAST]] : tensor<?x?x?xf32>
+// CHECK:         return %[[DIV]] : tensor<?x?x?xf32>
+func.func @chlo_broadcast_div_3d_dynamic(%arg0: tensor<?x?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?x?x?xf32> {
+  %0 = chlo.broadcast_divide %arg0, %arg1 : (tensor<?x?x?xf32>, tensor<?xf32>) -> tensor<?x?x?xf32>
+  return %0 : tensor<?x?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: compare with different-rank dynamic operands
+// CHECK-LABEL: func.func @chlo_broadcast_compare_dynamic
+// CHECK-SAME:    (%arg0: tensor<?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?x?xi1>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<?x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM1_RHS:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?xf32>
+// CHECK:         %[[CAST1_RHS:.*]] = arith.index_cast %[[DIM1_RHS]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0_2]] : tensor<?x?xf32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST1_RHS]] : tensor<2xi64>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [1] : (tensor<?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:         %[[COMPARE:.*]] = stablehlo.compare  LT, %arg0, %[[RHS_BROADCAST]],  FLOAT : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xi1>
+// CHECK:         return %[[COMPARE]] : tensor<?x?xi1>
+func.func @chlo_broadcast_compare_dynamic(%arg0: tensor<?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?x?xi1> {
+  %0 = chlo.broadcast_compare %arg0, %arg1 {comparison_direction = #chlo<comparison_direction LT>, compare_type = #chlo<comparison_type FLOAT>} : (tensor<?x?xf32>, tensor<?xf32>) -> tensor<?x?xi1>
+  return %0 : tensor<?x?xi1>
+}
+
+// -----
+
+// Test dynamic shape: compare with same-rank dynamic operands (no broadcast needed)
+// CHECK-LABEL: func.func @chlo_broadcast_compare_dynamic_same_rank
+// CHECK-SAME:    (%arg0: tensor<?x?xi64>, %arg1: tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:         %[[COMPARE:.*]] = stablehlo.compare  EQ, %arg0, %arg1,  SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:         return %[[COMPARE]] : tensor<?x?xi1>
+func.func @chlo_broadcast_compare_dynamic_same_rank(%arg0: tensor<?x?xi64>, %arg1: tensor<?x?xi64>) -> tensor<?x?xi1> {
+  %0 = chlo.broadcast_compare %arg0, %arg1 {comparison_direction = #chlo<comparison_direction EQ>, compare_type = #chlo<comparison_type SIGNED>} : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+  return %0 : tensor<?x?xi1>
+}
+
+// -----
+
+// Test dynamic shape: select with dynamic predicate (only pred broadcast)
+// CHECK-LABEL: func.func @chlo_broadcast_select_dynamic
+// CHECK-SAME:    (%arg0: tensor<?xi1>, %arg1: tensor<?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0]] : tensor<?xi1>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg1, %[[C1]] : tensor<?x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C1_1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM2:.*]] = tensor.dim %arg2, %[[C1_1]] : tensor<?x?xf32>
+// CHECK:         %[[CAST2:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:         %[[C1_I64_3:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_4:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM3:.*]] = tensor.dim %arg1, %[[C0_4]] : tensor<?x?xf32>
+// CHECK:         %[[CAST3:.*]] = arith.index_cast %[[DIM3]] : index to i64
+// CHECK:         %[[C0_6:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM4:.*]] = tensor.dim %arg2, %[[C0_6]] : tensor<?x?xf32>
+// CHECK:         %[[CAST4:.*]] = arith.index_cast %[[DIM4]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST4]], %[[CAST2]] : tensor<2xi64>
+// CHECK:         %[[PRED_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg0, %[[SHAPE]], dims = [1] : (tensor<?xi1>, tensor<2xi64>) -> tensor<?x?xi1>
+// CHECK:         %[[SELECT:.*]] = stablehlo.select %[[PRED_BROADCAST]], %arg1, %arg2 : tensor<?x?xi1>, tensor<?x?xf32>
+// CHECK:         return %[[SELECT]] : tensor<?x?xf32>
+func.func @chlo_broadcast_select_dynamic(%arg0: tensor<?xi1>, %arg1: tensor<?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %0 = chlo.broadcast_select %arg0, %arg1, %arg2 : (tensor<?xi1>, tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: select with fully dynamic 3D result (lhs and rhs broadcast, pred not)
+// CHECK-LABEL: func.func @chlo_broadcast_select_3d_dynamic
+// CHECK-SAME:    (%arg0: tensor<?x?x?xi1>, %arg1: tensor<?x?xf32>, %arg2: tensor<f32>) -> tensor<?x?x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C2:.*]] = arith.constant 2 : index
+// CHECK:         %[[DIM2:.*]] = tensor.dim %arg0, %[[C2]] : tensor<?x?x?xi1>
+// CHECK:         %[[CAST2:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1_LHS:.*]] = tensor.dim %arg1, %[[C1]] : tensor<?x?xf32>
+// CHECK:         %[[CAST1_LHS:.*]] = arith.index_cast %[[DIM1_LHS]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1_2:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1_2]] : tensor<?x?x?xi1>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0_LHS:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?x?xf32>
+// CHECK:         %[[CAST0_LHS:.*]] = arith.index_cast %[[DIM0_LHS]] : index to i64
+// CHECK:         %[[C1_I64_5:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_6:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0_6]] : tensor<?x?x?xi1>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST0_LHS]], %[[CAST1_LHS]] : tensor<3xi64>
+// CHECK:         %[[LHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [1, 2] : (tensor<?x?xf32>, tensor<3xi64>) -> tensor<?x?x?xf32>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg2, %[[SHAPE]], dims = [] : (tensor<f32>, tensor<3xi64>) -> tensor<?x?x?xf32>
+// CHECK:         %[[SELECT:.*]] = stablehlo.select %arg0, %[[LHS_BROADCAST]], %[[RHS_BROADCAST]] : tensor<?x?x?xi1>, tensor<?x?x?xf32>
+// CHECK:         return %[[SELECT]] : tensor<?x?x?xf32>
+func.func @chlo_broadcast_select_3d_dynamic(%arg0: tensor<?x?x?xi1>, %arg1: tensor<?x?xf32>, %arg2: tensor<f32>) -> tensor<?x?x?xf32> {
+  %0 = chlo.broadcast_select %arg0, %arg1, %arg2 : (tensor<?x?x?xi1>, tensor<?x?xf32>, tensor<f32>) -> tensor<?x?x?xf32>
+  return %0 : tensor<?x?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: both LHS and RHS need dynamic broadcast (1x? + ?x1 -> ?x?)
+// CHECK-LABEL: func.func @chlo_broadcast_add_both_dynamic_broadcast
+// CHECK-SAME:    (%arg0: tensor<1x?xf32>, %arg1: tensor<?x1xf32>) -> tensor<?x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<1x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C1_I64_0:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?x1xf32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST1]] : tensor<2xi64>
+// CHECK:         %[[LHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg0, %[[SHAPE]], dims = [0, 1] : (tensor<1x?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [0, 1] : (tensor<?x1xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:         %[[ADD:.*]] = stablehlo.add %[[LHS_BROADCAST]], %[[RHS_BROADCAST]] : tensor<?x?xf32>
+// CHECK:         return %[[ADD]] : tensor<?x?xf32>
+func.func @chlo_broadcast_add_both_dynamic_broadcast(%arg0: tensor<1x?xf32>, %arg1: tensor<?x1xf32>) -> tensor<?x?xf32> {
+  %0 = chlo.broadcast_add %arg0, %arg1 : (tensor<1x?xf32>, tensor<?x1xf32>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: LHS needs broadcast (vector + matrix -> matrix)
+// CHECK-LABEL: func.func @chlo_broadcast_add_lhs_broadcast_dynamic
+// CHECK-SAME:    (%arg0: tensor<?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0]] : tensor<?xf32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg1, %[[C1]] : tensor<?x?xf32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0_RHS:.*]] = tensor.dim %arg1, %[[C0_2]] : tensor<?x?xf32>
+// CHECK:         %[[CAST0_RHS:.*]] = arith.index_cast %[[DIM0_RHS]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0_RHS]], %[[CAST1]] : tensor<2xi64>
+// CHECK:         %[[LHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg0, %[[SHAPE]], dims = [1] : (tensor<?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:         %[[ADD:.*]] = stablehlo.add %[[LHS_BROADCAST]], %arg1 : tensor<?x?xf32>
+// CHECK:         return %[[ADD]] : tensor<?x?xf32>
+func.func @chlo_broadcast_add_lhs_broadcast_dynamic(%arg0: tensor<?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %0 = chlo.broadcast_add %arg0, %arg1 : (tensor<?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Test dynamic shape: integer type dynamic broadcast
+// CHECK-LABEL: func.func @chlo_broadcast_add_dynamic_i32
+// CHECK-SAME:    (%arg0: tensor<?x?xi32>, %arg1: tensor<?xi32>) -> tensor<?x?xi32>
+// CHECK:         %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : index
+// CHECK:         %[[DIM1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<?x?xi32>
+// CHECK:         %[[CAST1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM1_RHS:.*]] = tensor.dim %arg1, %[[C0]] : tensor<?xi32>
+// CHECK:         %[[CAST1_RHS:.*]] = arith.index_cast %[[DIM1_RHS]] : index to i64
+// CHECK:         %[[C1_I64_1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %arg0, %[[C0_2]] : tensor<?x?xi32>
+// CHECK:         %[[CAST0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[CAST0]], %[[CAST1_RHS]] : tensor<2xi64>
+// CHECK:         %[[RHS_BROADCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %arg1, %[[SHAPE]], dims = [1] : (tensor<?xi32>, tensor<2xi64>) -> tensor<?x?xi32>
+// CHECK:         %[[ADD:.*]] = stablehlo.add %arg0, %[[RHS_BROADCAST]] : tensor<?x?xi32>
+// CHECK:         return %[[ADD]] : tensor<?x?xi32>
+func.func @chlo_broadcast_add_dynamic_i32(%arg0: tensor<?x?xi32>, %arg1: tensor<?xi32>) -> tensor<?x?xi32> {
+  %0 = chlo.broadcast_add %arg0, %arg1 : (tensor<?x?xi32>, tensor<?xi32>) -> tensor<?x?xi32>
+  return %0 : tensor<?x?xi32>
+}
+
+// -----
+
+// Test static shape: verify no DynamicBroadcastInDimOp is produced
+// CHECK-LABEL: func.func @chlo_broadcast_add_static_no_dynamic_broadcast
+// CHECK-SAME:    (%arg0: tensor<3x4xf32>, %arg1: tensor<4xf32>) -> tensor<3x4xf32>
+// CHECK-NOT:     stablehlo.dynamic_broadcast_in_dim
+// CHECK:         %[[BROADCAST:.*]] = stablehlo.broadcast_in_dim %arg1, dims = [1] : (tensor<4xf32>) -> tensor<3x4xf32>
+// CHECK-NOT:     stablehlo.dynamic_broadcast_in_dim
+// CHECK:         %[[ADD:.*]] = stablehlo.add %arg0, %[[BROADCAST]] : tensor<3x4xf32>
+// CHECK:         return %[[ADD]] : tensor<3x4xf32>
+func.func @chlo_broadcast_add_static_no_dynamic_broadcast(%arg0: tensor<3x4xf32>, %arg1: tensor<4xf32>) -> tensor<3x4xf32> {
+  %0 = chlo.broadcast_add %arg0, %arg1 : (tensor<3x4xf32>, tensor<4xf32>) -> tensor<3x4xf32>
+  return %0 : tensor<3x4xf32>
+}

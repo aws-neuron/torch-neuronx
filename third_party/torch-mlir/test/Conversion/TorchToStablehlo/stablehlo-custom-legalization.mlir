@@ -141,3 +141,60 @@ func.func @bool_output_preserved(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> 
   %0 = stablehlo.compare NE, %arg0, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
   return %0 : tensor<4xi1>
 }
+
+// -----
+
+// Test: dynamic i1 arg uses dynamic_broadcast_in_dim for the zero constant
+// CHECK-LABEL: func.func @bool_arg_dynamic_1d(%arg0: tensor<?xi1>) -> tensor<?xf32>
+// CHECK: %[[TO_I8:.*]] = stablehlo.convert %arg0 : (tensor<?xi1>) -> tensor<?xi8>
+// CHECK: %[[SCALAR_ZERO:.*]] = stablehlo.constant dense<0> : tensor<i8>
+// CHECK: %[[DIM:.*]] = stablehlo.get_dimension_size %[[TO_I8]], dim = 0 : (tensor<?xi8>) -> tensor<i32>
+// CHECK: %[[DIM_R:.*]] = stablehlo.reshape %[[DIM]] : (tensor<i32>) -> tensor<1xi32>
+// CHECK: %[[ZERO:.*]] = stablehlo.dynamic_broadcast_in_dim %[[SCALAR_ZERO]], %[[DIM_R]], dims = [] : (tensor<i8>, tensor<1xi32>) -> tensor<?xi8>
+// CHECK: %[[NORM:.*]] = stablehlo.compare NE, %[[TO_I8]], %[[ZERO]] : (tensor<?xi8>, tensor<?xi8>) -> tensor<?xi1>
+// CHECK: %[[RESULT:.*]] = stablehlo.convert %[[NORM]] : (tensor<?xi1>) -> tensor<?xf32>
+// CHECK: return %[[RESULT]] : tensor<?xf32>
+func.func @bool_arg_dynamic_1d(%arg0: tensor<?xi1>) -> tensor<?xf32> {
+  %0 = stablehlo.convert %arg0 : (tensor<?xi1>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// Test: multi-dim dynamic i1 arg normalization
+// CHECK-LABEL: func.func @bool_arg_dynamic_2d(%arg0: tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK: %[[TO_I8:.*]] = stablehlo.convert %arg0 : (tensor<?x?xi1>) -> tensor<?x?xi8>
+// CHECK: %[[SCALAR_ZERO:.*]] = stablehlo.constant dense<0> : tensor<i8>
+// CHECK: %[[DIM0:.*]] = stablehlo.get_dimension_size %[[TO_I8]], dim = 0 : (tensor<?x?xi8>) -> tensor<i32>
+// CHECK: %[[DIM0_R:.*]] = stablehlo.reshape %[[DIM0]] : (tensor<i32>) -> tensor<1xi32>
+// CHECK: %[[DIM1:.*]] = stablehlo.get_dimension_size %[[TO_I8]], dim = 1 : (tensor<?x?xi8>) -> tensor<i32>
+// CHECK: %[[DIM1_R:.*]] = stablehlo.reshape %[[DIM1]] : (tensor<i32>) -> tensor<1xi32>
+// CHECK: %[[SHAPE:.*]] = stablehlo.concatenate %[[DIM0_R]], %[[DIM1_R]], dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+// CHECK: %[[ZERO:.*]] = stablehlo.dynamic_broadcast_in_dim %[[SCALAR_ZERO]], %[[SHAPE]], dims = [] : (tensor<i8>, tensor<2xi32>) -> tensor<?x?xi8>
+// CHECK: %[[NORM:.*]] = stablehlo.compare NE, %[[TO_I8]], %[[ZERO]] : (tensor<?x?xi8>, tensor<?x?xi8>) -> tensor<?x?xi1>
+// CHECK: %[[RESULT:.*]] = stablehlo.convert %[[NORM]] : (tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK: return %[[RESULT]] : tensor<?x?xf32>
+func.func @bool_arg_dynamic_2d(%arg0: tensor<?x?xi1>) -> tensor<?x?xf32> {
+  %0 = stablehlo.convert %arg0 : (tensor<?x?xi1>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Test: partially dynamic i1 arg (dim 0 static, dim 1 dynamic)
+// CHECK-LABEL: func.func @bool_arg_partially_dynamic(%arg0: tensor<3x?xi1>) -> tensor<3x?xf32>
+// CHECK: %[[TO_I8:.*]] = stablehlo.convert %arg0 : (tensor<3x?xi1>) -> tensor<3x?xi8>
+// CHECK: %[[SCALAR_ZERO:.*]] = stablehlo.constant dense<0> : tensor<i8>
+// CHECK: %[[C3:.*]] = stablehlo.constant dense<3> : tensor<i32>
+// CHECK: %[[R0:.*]] = stablehlo.reshape %[[C3]] : (tensor<i32>) -> tensor<1xi32>
+// CHECK: %[[DIM1:.*]] = stablehlo.get_dimension_size %[[TO_I8]], dim = 1 : (tensor<3x?xi8>) -> tensor<i32>
+// CHECK: %[[R1:.*]] = stablehlo.reshape %[[DIM1]] : (tensor<i32>) -> tensor<1xi32>
+// CHECK: %[[SHAPE:.*]] = stablehlo.concatenate %[[R0]], %[[R1]], dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+// CHECK: %[[ZERO:.*]] = stablehlo.dynamic_broadcast_in_dim %[[SCALAR_ZERO]], %[[SHAPE]], dims = [] : (tensor<i8>, tensor<2xi32>) -> tensor<3x?xi8>
+// CHECK: %[[NORM:.*]] = stablehlo.compare NE, %[[TO_I8]], %[[ZERO]] : (tensor<3x?xi8>, tensor<3x?xi8>) -> tensor<3x?xi1>
+// CHECK: %[[RESULT:.*]] = stablehlo.convert %[[NORM]] : (tensor<3x?xi1>) -> tensor<3x?xf32>
+// CHECK: return %[[RESULT]] : tensor<3x?xf32>
+func.func @bool_arg_partially_dynamic(%arg0: tensor<3x?xi1>) -> tensor<3x?xf32> {
+  %0 = stablehlo.convert %arg0 : (tensor<3x?xi1>) -> tensor<3x?xf32>
+  return %0 : tensor<3x?xf32>
+}

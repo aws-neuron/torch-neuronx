@@ -181,21 +181,20 @@ Value promoteType(PatternRewriter &rewriter, Location loc, Value input,
 Value promoteAndBroadcast(ConversionPatternRewriter &rewriter, Value input,
                           TensorType outType,
                           std::optional<Value> bcastSizeTensor) {
-  // Two tensors are “broadcastable” if the following rules hold:
+  // Two tensors are "broadcastable" if the following rules hold:
   //   - Each tensor has at least one dimension.
   //   - When iterating over the dimension sizes, starting at the trailing
   //   dimension, the dimension sizes must either be equal, one of them is 1, or
   //   one of them does not exist.
   // If one provide bcastSizeTensor, we emit stablehlo::DynamicBroadcastInDimOp
   // instead of stablehlo::BroadcastInDimOp to support dynamic shape.
-  Operation *op = input.getDefiningOp();
+  Location loc = input.getLoc();
   TensorType in_type = dyn_cast<TensorType>(input.getType());
 
   if (in_type.getElementType() != outType.getElementType()) {
     TensorType promoted_type =
         in_type.cloneWith(in_type.getShape(), outType.getElementType());
-    input = stablehlo::ConvertOp::create(rewriter, op->getLoc(), promoted_type,
-                                         input);
+    input = stablehlo::ConvertOp::create(rewriter, loc, promoted_type, input);
   }
 
   ArrayRef<int64_t> inShape = in_type.getShape();
@@ -215,7 +214,7 @@ Value promoteAndBroadcast(ConversionPatternRewriter &rewriter, Value input,
       bcastDims.push_back(outPos);
       do_bcast = true;
     } else {
-      op->emitError("The size of tensor a (")
+      mlir::emitError(loc, "The size of tensor a (")
           << inDim << ")" << "must match the size of tensor b (" << outDim
           << ")" << "at non-singleton dimension " << inPos;
     }
@@ -227,12 +226,11 @@ Value promoteAndBroadcast(ConversionPatternRewriter &rewriter, Value input,
   auto bcast_attr = rewriter.getDenseI64ArrayAttr(bcastDims);
   if (bcastSizeTensor.has_value()) {
     auto bcast_op = stablehlo::DynamicBroadcastInDimOp::create(
-        rewriter, op->getLoc(), outType, input, bcastSizeTensor.value(),
-        bcast_attr);
+        rewriter, loc, outType, input, bcastSizeTensor.value(), bcast_attr);
     return bcast_op.getResult();
   }
-  auto bcast_op = stablehlo::BroadcastInDimOp::create(
-      rewriter, op->getLoc(), outType, input, bcast_attr);
+  auto bcast_op = stablehlo::BroadcastInDimOp::create(rewriter, loc, outType,
+                                                       input, bcast_attr);
   return bcast_op.getResult();
 }
 

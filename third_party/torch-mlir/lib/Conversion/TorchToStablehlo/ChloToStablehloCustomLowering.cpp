@@ -30,7 +30,6 @@ using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 namespace mlir::torch {
-
 #define GEN_PASS_DEF_CONVERTCHLOTOSTABLEHLOCUSTOMLOWERING
 #include "torch-mlir/Conversion/Passes.h.inc"
 
@@ -60,30 +59,26 @@ public:
           op, "ChloBroadcastOpConversionPattern: operand types are not ranked "
               "tensors");
     }
-    auto resultShape = resultType.getShape();
-    int64_t resultRank = resultShape.size();
+    std::optional<Value> shapeTensor = std::nullopt;
+    if (!resultType.hasStaticShape()) {
+      SmallVector<Value> ops = {lhs, rhs};
+      auto bcastInfo = hlo::getBroadcastResultShape(
+          rewriter, op, ops, /*dimSizeIndexBits=*/64);
+      if (failed(bcastInfo))
+        return rewriter.notifyMatchFailure(
+            op, "Could not infer broadcast result shape: at least 1 operand has "
+                "incompatible dimension sizes or no operands match the "
+                "broadcasted result type dimension sizes");
+      shapeTensor = (*bcastInfo).first;
+    }
 
-    // broadcast lhs/rhs by
-    // (i) prepending dimensions of size 1 to match rank
-    // (ii) broadcasting to match output shape
-    int64_t lhsRank = lhsType.getRank();
-    if (lhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - lhsRank, resultRank));
-      lhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, lhsType.getElementType()), lhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
-    int64_t rhsRank = rhsType.getRank();
-    if (rhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - rhsRank, resultRank));
-      rhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, rhsType.getElementType()), rhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
+    auto lhsResultType =
+        RankedTensorType::get(resultType.getShape(), lhsType.getElementType());
+    lhs = hlo::promoteAndBroadcast(rewriter, lhs, lhsResultType, shapeTensor);
+
+    auto rhsResultType =
+        RankedTensorType::get(resultType.getShape(), rhsType.getElementType());
+    rhs = hlo::promoteAndBroadcast(rewriter, rhs, rhsResultType, shapeTensor);
 
     rewriter.replaceOpWithNewOp<StablehloOp>(op, resultType, lhs, rhs);
 
@@ -155,30 +150,26 @@ public:
           op, "ChloBroadcastCompareOpConversionPattern: operand types are not "
               "ranked tensors");
     }
-    auto resultShape = resultType.getShape();
-    int64_t resultRank = resultShape.size();
+    std::optional<Value> shapeTensor = std::nullopt;
+    if (!resultType.hasStaticShape()) {
+      SmallVector<Value> ops = {lhs, rhs};
+      auto bcastInfo = hlo::getBroadcastResultShape(
+          rewriter, op, ops, /*dimSizeIndexBits=*/64);
+      if (failed(bcastInfo))
+        return rewriter.notifyMatchFailure(
+            op, "Could not infer broadcast result shape: at least 1 operand has "
+                "incompatible dimension sizes or no operands match the "
+                "broadcasted result type dimension sizes");
+      shapeTensor = (*bcastInfo).first;
+    }
 
-    // broadcast lhs/rhs by
-    // (i) prepending dimensions of size 1 to match rank
-    // (ii) broadcasting to match output shape
-    int64_t lhsRank = lhsType.getRank();
-    if (lhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - lhsRank, resultRank));
-      lhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, lhsType.getElementType()), lhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
-    int64_t rhsRank = rhsType.getRank();
-    if (rhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - rhsRank, resultRank));
-      rhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, rhsType.getElementType()), rhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
+    auto lhsResultType =
+        RankedTensorType::get(resultType.getShape(), lhsType.getElementType());
+    lhs = hlo::promoteAndBroadcast(rewriter, lhs, lhsResultType, shapeTensor);
+
+    auto rhsResultType =
+        RankedTensorType::get(resultType.getShape(), rhsType.getElementType());
+    rhs = hlo::promoteAndBroadcast(rewriter, rhs, rhsResultType, shapeTensor);
 
     // Map chlo compare attributes to stablehlo compare attributes
     auto chloDirection = op.getComparisonDirection();
@@ -237,39 +228,30 @@ public:
           op, "ChloBroadcastSelectOpConversionPattern: operand types are not "
               "ranked tensors");
     }
-    auto resultShape = resultType.getShape();
-    int64_t resultRank = resultShape.size();
+    std::optional<Value> shapeTensor = std::nullopt;
+    if (!resultType.hasStaticShape()) {
+      SmallVector<Value> ops = {pred, lhs, rhs};
+      auto bcastInfo = hlo::getBroadcastResultShape(
+          rewriter, op, ops, /*dimSizeIndexBits=*/64);
+      if (failed(bcastInfo))
+        return rewriter.notifyMatchFailure(
+            op, "Could not infer broadcast result shape: at least 1 operand has "
+                "incompatible dimension sizes or no operands match the "
+                "broadcasted result type dimension sizes");
+      shapeTensor = (*bcastInfo).first;
+    }
 
-    // broadcast pred/lhs/rhs by
-    // (i) prepending dimensions of size 1 to match rank
-    // (ii) broadcasting to match output shape
-    int64_t predRank = predType.getRank();
-    if (predType.getShape() != resultShape) {
-      auto broadcastDims = llvm::to_vector(
-          llvm::seq<int64_t>(resultRank - predRank, resultRank));
-      pred = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, predType.getElementType()), pred,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
-    int64_t lhsRank = lhsType.getRank();
-    if (lhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - lhsRank, resultRank));
-      lhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, lhsType.getElementType()), lhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
-    int64_t rhsRank = rhsType.getRank();
-    if (rhsType.getShape() != resultShape) {
-      auto broadcastDims =
-          llvm::to_vector(llvm::seq<int64_t>(resultRank - rhsRank, resultRank));
-      rhs = stablehlo::BroadcastInDimOp::create(
-          rewriter, op.getLoc(),
-          RankedTensorType::get(resultShape, rhsType.getElementType()), rhs,
-          rewriter.getDenseI64ArrayAttr(broadcastDims));
-    }
+    auto predResultType =
+        RankedTensorType::get(resultType.getShape(), predType.getElementType());
+    pred = hlo::promoteAndBroadcast(rewriter, pred, predResultType, shapeTensor);
+
+    auto lhsResultType =
+        RankedTensorType::get(resultType.getShape(), lhsType.getElementType());
+    lhs = hlo::promoteAndBroadcast(rewriter, lhs, lhsResultType, shapeTensor);
+
+    auto rhsResultType =
+        RankedTensorType::get(resultType.getShape(), rhsType.getElementType());
+    rhs = hlo::promoteAndBroadcast(rewriter, rhs, rhsResultType, shapeTensor);
 
     rewriter.replaceOpWithNewOp<stablehlo::SelectOp>(op, resultType, pred, lhs,
                                                      rhs);
