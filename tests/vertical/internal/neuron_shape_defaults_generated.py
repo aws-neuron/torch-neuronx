@@ -3013,7 +3013,15 @@ def register_all_defaults(r):
             # bfloat16. Verified 2026-07-20.
             "self": {"shape": (64, 256), "dtype": "bfloat16"},
             "mat2": {"shape": (256, 128), "dtype": "bfloat16"},
-            "offs": {"shape": (3,), "dtype": "int", "low": 0, "high": 256},
+            # offs values must be sorted and divisible by 128 (NKI tile alignment).
+            "offs": {
+                "shape": (3,),
+                "dtype": "int",
+                "low": 0,
+                "high": 3,
+                "multiple_of": 128,
+                "sorted": True,
+            },
         },
         source="builtin",
     )

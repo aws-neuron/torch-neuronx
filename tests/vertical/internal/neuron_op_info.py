@@ -78,7 +78,7 @@ def _tensor_from_spec(spec, device, default_dtype):
 
     Supported dict keys:
       shape (required), dtype, low, high, sigmoid, names, sorted, starts_at,
-      expand, distinct.
+      expand, distinct, multiple_of.
 
     When ``names`` is provided (tuple of strings matching ``len(shape)``),
     the tensor is tagged with those names via ``refine_names`` so it can be
@@ -113,6 +113,9 @@ def _tensor_from_spec(spec, device, default_dtype):
                 t = torch.randint(
                     spec.get("low", 0), spec.get("high", 4), shape, device=device, dtype=dt
                 )
+            mul = spec.get("multiple_of")
+            if mul:
+                t = t * mul
         elif dt is torch.bool:
             t = torch.randint(0, 2, shape, device=device, dtype=torch.bool)
         else:
