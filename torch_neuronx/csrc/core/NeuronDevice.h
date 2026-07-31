@@ -17,6 +17,11 @@ void set_initialized(bool value);
 bool is_compile_only();
 void set_compile_only(bool value);
 
+// True if this process was forked after the runtime was initialized; device
+// ops check it to fail fast instead of using inherited (invalid) NRT state.
+bool is_in_bad_fork();
+void mark_in_bad_fork();
+
 // Helper to check if a device is a Neuron device
 bool IsNeuronDevice(const c10::Device& device);
 

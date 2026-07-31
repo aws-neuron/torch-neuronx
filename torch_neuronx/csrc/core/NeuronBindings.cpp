@@ -3,6 +3,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/DeviceType.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
+#include <pthread.h>
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
@@ -484,6 +485,16 @@ void neuron_init() {
     return;
   }
 
+  TORCH_CHECK(!c10_neuron::is_in_bad_fork(),
+              "Neuron runtime should not be used after fork(); use spawn or num_workers=0.");
+
+  // pthread_atfork (not Python's register_at_fork, which gates on a flag the
+  // C++ op path never sets): fires in every forked child to poison inherited
+  // runtime state so device ops fail fast.
+  static std::once_flag atfork_once;
+  std::call_once(atfork_once,
+                 [] { pthread_atfork(nullptr, nullptr, [] { c10_neuron::mark_in_bad_fork(); }); });
+
   // Disable NRT's automatic OOM logging/file dumps. We control when to report
   // OOM ourselves (only on final OOM, not on every recoverable retry).
   setenv("NEURON_RT_ENABLE_DEVICE_MEMORY_OOM_LOG", "0", 0);  // 0 = don't overwrite if user set
@@ -531,6 +542,9 @@ void neuron_init() {
 
 // Maybe initialize - this is what native functions should call
 void maybe_lazy_init() {
+  // fail fast (not deadlock) if used in a bad-forked child.
+  TORCH_CHECK(!c10_neuron::is_in_bad_fork(),
+              "Neuron runtime should not be used after fork(); use spawn or num_workers=0.");
   if (!c10_neuron::is_initialized()) {
     neuron_init();
   }

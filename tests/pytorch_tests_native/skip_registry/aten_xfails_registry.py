@@ -4,6 +4,18 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "these are @unittest.expectedFailure"
+            " upstream but run on Neuron. The expected failure no longer occurs and"
+            " unittest reports an Unexpected success. xfailing so the test"
+            " still runs and an xpass flags if/when upstream drops the decorator."
+        ),
+        tests=[
+            "test_dataloader.py::TestDataLoader::test_multiprocessing_iterdatapipe_with_dill",
+            "test_dataloader.py::TestDataLoaderPersistentWorkers::test_multiprocessing_iterdatapipe_with_dill",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Error-expectation test: the test asserts a specific op-native error"
             " message (e.g., 'torch.frexp() only supports floating-point dtypes'),"
             " but Neuron's CPU fallback layer intercepts complex-dtype inputs"
