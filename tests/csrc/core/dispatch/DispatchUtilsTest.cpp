@@ -198,12 +198,14 @@ TEST(DowncastArgsTest, Float64ToFloat32) {
   EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Float);
 }
 
-TEST(DowncastArgsTest, Int64ToInt32) {
+TEST(DowncastArgsTest, Int64KeptUnderPackedMode) {
+  // Under packed int64 mode (default), int64 operands are kept Long (packed
+  // on-device), not downcast to int32.
   auto t = torch::ones({2, 3}, torch::kInt64);
   std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
   DowncastArgs(args, AddSchema());
-  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Int);
-  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Int);
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
 }
 
 TEST(DowncastArgsTest, SupportedDtypeUnchanged) {

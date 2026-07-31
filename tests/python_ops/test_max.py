@@ -142,3 +142,14 @@ class TestMaxRegistration:
         expected_indices = torch.tensor([0, 0], dtype=torch.int64)  # First occurrence indices
         torch.testing.assert_close(values.cpu(), expected_values)
         torch.testing.assert_close(indices.cpu(), expected_indices)
+
+    def test_max_dim_bool(self):
+        """max.dim over a bool tensor (reduced in int32 since neuronx-cc cannot
+        reduce over a pred operand; values cast back to bool)."""
+        torch.manual_seed(0)
+        x = torch.randint(0, 2, (5, 5, 5), dtype=torch.bool)
+        values, indices = torch.max(x.to("neuron"), dim=0)
+        expected_values, expected_indices = torch.max(x, dim=0)
+        assert values.dtype == torch.bool
+        torch.testing.assert_close(values.cpu(), expected_values)
+        torch.testing.assert_close(indices.cpu(), expected_indices)

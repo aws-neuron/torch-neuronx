@@ -43,6 +43,27 @@ class TestAddRegistration:
         expected[:, 3].add_(2)
         torch.testing.assert_close(m1.cpu(), expected)
 
+    def test_add_inplace_wider_int_operand_no_promotion(self):
+        """int32.add_(int64) keeps self's shape+dtype — in-place does not promote."""
+        with track_neuron_ops():
+            a = torch.ones([4, 4, 4], dtype=torch.int32, device="neuron")
+            b = torch.ones([4, 4, 4], dtype=torch.int64, device="neuron")
+            a.add_(b)
+
+            expected = torch.ones([4, 4, 4], dtype=torch.int32)
+            expected.add_(torch.ones([4, 4, 4], dtype=torch.int64))
+
+            assert a.device.type == "neuron"
+            assert a.dtype == torch.int32
+            assert tuple(a.shape) == (4, 4, 4)
+            torch.testing.assert_close(a.cpu(), expected)
+
+    @assert_raises(RuntimeError, match="can't be cast")
+    def test_add_inplace_float_into_int_raises(self):
+        """int.add_(float) is rejected — a float result can't be cast to int."""
+        a = torch.ones([4], dtype=torch.int32, device="neuron")
+        a.add_(1.5)
+
     def test_add_operator_syntax(self):
         """Test that a + b syntax works with neuron tensors."""
         # Create neuron tensors

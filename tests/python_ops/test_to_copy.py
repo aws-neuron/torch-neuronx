@@ -475,3 +475,26 @@ def test_to_copy_complex_strided_does_not_redispatch():
     assert dst.device.type == "neuron"
     assert dst.stride() == src.stride()
     torch.testing.assert_close(dst.cpu(), src)
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+@pytest.mark.skipif(
+    is_native_int64_enabled(),
+    reason="Packed int64 path; native int64 passes through to the compiler (different path).",
+)
+@pytest.mark.parametrize("n", [64, 1026])
+def test_noncontiguous_packed_int64_downcast(n):
+    """Non-contiguous packed int64 must contiguify correctly on the downcast path."""
+    big = torch.arange(2 * n, device="neuron", dtype=torch.int64)
+    t = big[::2]
+    assert not t.is_contiguous()
+    t.masked_fill_(t > 4, 1)
+
+    big_ref = torch.arange(2 * n, dtype=torch.int64)
+    t_ref = big_ref[::2]
+    t_ref.masked_fill_(t_ref > 4, 1)
+
+    # The view holds the correct logical values ...
+    assert torch.equal(t.cpu(), t_ref)
+    # ... and only the sliced (even) positions of the backing storage changed.
+    assert torch.equal(big.cpu(), big_ref)

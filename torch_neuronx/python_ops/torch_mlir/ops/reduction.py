@@ -99,6 +99,14 @@ def torch_mean(x, dim=None, keepdim=False, dtype=None, out=None):
     output_params=("max", "max_values"),
 )
 def torch_max(x, dim=None, keepdim=False, out=None, **kwargs):
+    # neuronx-cc cannot reduce over a pred (bool) operand ("operand: pred[]").
+    # Reduce in int32 and cast the values back to bool; indices stay int64.
+    if x.dtype == torch.bool:
+        xi = x.to(torch.int32)
+        if dim is None:
+            return torch.max(xi).to(torch.bool)
+        values, indices = torch.max(xi, dim, keepdim)
+        return values.to(torch.bool), indices
     if dim is None:
         return torch.max(x)
     return torch.max(x, dim, keepdim)
@@ -110,6 +118,14 @@ def torch_max(x, dim=None, keepdim=False, out=None, **kwargs):
     output_params=("min", "min_indices"),
 )
 def torch_min(x, dim=None, keepdim=False, out=None, **kwargs):
+    # neuronx-cc cannot reduce over a pred (bool) operand ("operand: pred[]").
+    # Reduce in int32 and cast the values back to bool; indices stay int64.
+    if x.dtype == torch.bool:
+        xi = x.to(torch.int32)
+        if dim is None:
+            return torch.min(xi).to(torch.bool)
+        values, indices = torch.min(xi, dim, keepdim)
+        return values.to(torch.bool), indices
     if dim is None:
         return torch.min(x)
     return torch.min(x, dim, keepdim)

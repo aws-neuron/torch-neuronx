@@ -1124,7 +1124,7 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
   // a complex tensor is at an input position (not just an out= tensor).
   if (HasComplexInput(args)) {
     static const std::unordered_set<std::string> kComplexSupportedOps = {
-        "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_",
+        "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_.Tensor",
         "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
     };
     if (kComplexSupportedOps.find(lookup_name) == kComplexSupportedOps.end()) {
@@ -1378,6 +1378,24 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
       original_args[i] = c10::IValue(original_args[i].toList().copy());
     }
   }
+  // ── Strip the out= arg before dispatch ──
+  // nonzero's execution output spec is the *static max-count* index buffer
+  // (shape [numel, ndim]) — not the logical result shape [count, ndim].
+  // Letting AllocateExecutionOutputs see the out= arg makes it resize the
+  // user's out= tensor to the max-count spec shape (reallocating storage and
+  // emitting a spurious resize warning) before the epilogue below resizes it
+  // back — violating the out= storage-reuse contract
+  // (test_nonzero_discontiguous). Replace the write-aliased arg with an
+  // undefined tensor so DispatchCore always allocates a fresh execution
+  // buffer; the epilogue copies indices[:count] into the original out=
+  // (still held by original_args).
+  for (size_t i = 0; i < args.size() && i < schema.arguments().size(); ++i) {
+    const auto& alias_info = schema.arguments()[i].alias_info();
+    if (alias_info && alias_info->isWrite() && args[i].isTensor()) {
+      args[i] = c10::IValue(torch::Tensor());
+    }
+  }
+
   DowncastArgs(args, schema);
 
   auto effective_static_argnums = reg.static_argnums;
@@ -2392,6 +2410,23 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   TORCH_NEURONX_DISPATCH_DEBUG("[FlattenAndFilterInputs] flattened", " op=", op_name,
                                " num_flattened=", flattened.size(),
                                " num_kept=", kept_input_indices.size());
+
+  // Packed int64 graph inputs are kept logical int64 through dispatch (so
+  // host-level shape reads see the correct shape); bind their int32[..., 2]
+  // physical view to the NEFF here. This matches the int32 graph parameter
+  // (the fake input is generated as int32[..., 2]) — the in-graph NKI gather
+  // then extracts the low words. Zero-copy reinterpret.
+  if (IsPackedInt64Enabled()) {
+    for (auto& t : flattened) {
+      if (t.defined() && t.scalar_type() == c10::ScalarType::Long &&
+          t.device().type() == c10::DeviceType::PrivateUse1 && t.is_contiguous() && t.numel() > 0) {
+        // Empty int64 is kept unpacked (clean int64[0]) to match the fake input
+        // (create_fake_recursive) — a packed (…, 2) view of a 0-element tensor
+        // is elided by the compiler and shifts the inplace output binding.
+        t = torch_neuronx::packed_int64::physical_view(t);
+      }
+    }
+  }
 
   if (kept_input_indices.empty()) return flattened;
 

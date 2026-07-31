@@ -69,6 +69,13 @@ def torch_full(size, value, out=None, dtype=None):
     """Scalar are converted into tensor to avoid recompilation
     so input `value` will be a tensor
     """
+    # The full.out overload has no dtype kwarg — its output dtype comes from the
+    # `out` tensor. Without deriving it here, dtype stays None and both
+    # torch.tensor(value, dtype=None) and .to(None) default to int64, so an
+    # int32 out= yields an int64 result packed as int32[..., 2] — a shape leak
+    # ([10] -> [10, 2]). Mirror PyTorch's full.out semantics: dtype = out.dtype.
+    if dtype is None and isinstance(out, torch.Tensor):
+        dtype = out.dtype
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value, dtype=dtype)
 

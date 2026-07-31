@@ -9,10 +9,12 @@ namespace torch_neuronx {
 namespace packed_int64 {
 
 /// Compute physical shape for packed int64: appends trailing dim of 2.
-/// Scalar (empty shape) becomes {1, 2}.
+/// Scalar (empty shape) becomes {2} (append the lane dim to the empty logical
+/// shape). NOT {1, 2}: that collides with a 1-D {1} tensor and disagrees with
+/// the output-packing / logical_view convention, which use {2} for a scalar.
 inline std::vector<int64_t> physical_sizes(c10::IntArrayRef logical_sizes) {
   if (logical_sizes.empty()) {
-    return {1, 2};
+    return {2};
   }
   std::vector<int64_t> out;
   out.reserve(logical_sizes.size() + 1);
@@ -24,10 +26,10 @@ inline std::vector<int64_t> physical_sizes(c10::IntArrayRef logical_sizes) {
 }
 
 /// Compute physical strides for packed int64: doubles all strides, appends 1.
-/// Scalar (empty strides) becomes {2, 1}.
+/// Scalar (empty strides) becomes {1} (single contiguous lane axis).
 inline std::vector<int64_t> physical_strides(c10::IntArrayRef logical_strides) {
   if (logical_strides.empty()) {
-    return {2, 1};
+    return {1};
   }
   std::vector<int64_t> out;
   out.reserve(logical_strides.size() + 1);
@@ -77,6 +79,40 @@ inline torch::Tensor low_word_alias(const torch::Tensor& t) {
   // Create int32 tensor sharing the same untyped storage
   auto out = at::empty({0}, t.options().dtype(c10::ScalarType::Int));
   out.set_(t.storage(), offset, sizes, result_strides);
+  return out;
+}
+
+/// Reinterpret a contiguous packed int32 pair-stream as int64 (zero-copy).
+/// Inverse of physical_view: given an int32 tensor of shape (*logical, 2) whose
+/// storage already holds [low, high] pairs (e.g. a fused-materialize execution
+/// output), returns an int64 tensor of shape (*logical) sharing that storage.
+/// Used by UpcastExecutionOutputs to bind a fused packed int64 output without a
+/// materialize copy.
+inline torch::Tensor logical_view(const torch::Tensor& packed) {
+  TORCH_CHECK(packed.scalar_type() == c10::ScalarType::Int,
+              "packed_int64::logical_view: expected int32 tensor, got ", packed.scalar_type());
+  TORCH_CHECK(packed.dim() >= 1 && packed.size(-1) == 2,
+              "packed_int64::logical_view: expected trailing packed dim of 2, got shape ",
+              packed.sizes());
+  TORCH_CHECK(packed.is_contiguous(),
+              "packed_int64::logical_view: expected contiguous packed input");
+
+  auto psizes = packed.sizes();
+  std::vector<int64_t> logical_sizes(psizes.begin(), psizes.end() - 1);
+
+  // Contiguous int64 strides for the logical shape.
+  std::vector<int64_t> logical_strides(logical_sizes.size());
+  int64_t s = 1;
+  for (int64_t i = static_cast<int64_t>(logical_sizes.size()) - 1; i >= 0; --i) {
+    logical_strides[i] = s;
+    s *= logical_sizes[i];
+  }
+
+  // int32 storage_offset -> int64 element offset (2 int32 per int64).
+  int64_t offset = static_cast<int64_t>(packed.storage_offset()) / 2;
+
+  auto out = at::empty({0}, packed.options().dtype(c10::ScalarType::Long));
+  out.set_(packed.storage(), offset, logical_sizes, logical_strides);
   return out;
 }
 

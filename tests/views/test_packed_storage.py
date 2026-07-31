@@ -71,12 +71,23 @@ class TestPackedPhysicalLayout:
         assert offset == 0
 
     def test_int64_scalar(self):
+        # Scalar () packs to (2,) — a single [low, high] lane pair. NOT (1, 2):
+        # that would collide with a 1-D (1,) tensor and disagree with the
+        # output-packing / logical_view conventions.
         shape, stride, offset = packed_physical_layout(
             torch.int64, shape=(), stride=(), storage_offset=0
         )
-        assert shape == (1, 2)
-        assert stride == (2, 1)
+        assert shape == (2,)
+        assert stride == (1,)
         assert offset == 0
+
+    def test_int64_scalar_with_offset(self):
+        shape, stride, offset = packed_physical_layout(
+            torch.int64, shape=(), stride=(), storage_offset=5
+        )
+        assert shape == (2,)
+        assert stride == (1,)
+        assert offset == 10  # offset doubled
 
     def test_int64_with_offset(self):
         shape, stride, offset = packed_physical_layout(

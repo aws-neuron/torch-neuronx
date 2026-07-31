@@ -64,6 +64,29 @@ class TestRemainder:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::remainder")
 
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("shape", [(), (3, 4)])
+    def test_remainder_integer_scalar_divisor(self, device, dtype, shape):
+        """remainder(int tensor, python-int) must keep the input's shape and dtype.
+
+        Regression: remainder.Scalar was not registered for Neuron, so it fell
+        back to PyTorch's decomposition that wraps the Python int as a *strong*
+        int64 tensor. That promoted the result to int64 and packed a 0-dim
+        output as int32[2], leaking shape [2] instead of () (and int64 instead
+        of int32). Registering remainder.Scalar routes the raw scalar through
+        PreprocessArgs (-> int32), matching CPU weak-scalar semantics.
+        """
+        with track_neuron_ops():
+            x = torch.randint(1, 20, shape, dtype=dtype, device=device)
+            neuron_result = torch.remainder(x, 3)
+            cpu_result = torch.remainder(x.cpu(), 3)
+
+            assert neuron_result.device.type == "neuron"
+            assert tuple(neuron_result.shape) == tuple(cpu_result.shape)
+            assert neuron_result.dtype == cpu_result.dtype
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::remainder")
+
     def test_remainder_single_element(self, device):
         """Test remainder with single element tensor."""
         with track_neuron_ops():

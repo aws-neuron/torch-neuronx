@@ -15,6 +15,13 @@ import torch
 from neuronxcc.starfish.support import dtype as _ndt
 from packaging.version import Version
 
+from torch_neuronx.packed_storage import (
+    packed_int64_execution_view,
+    packed_int64_high_word_alias,
+    packed_logical_view,
+    packed_physical_view,
+)
+
 
 def deterministic_hash(obj) -> str:
     """Generate a deterministic hash string from an object.
@@ -630,17 +637,13 @@ def convert_for_neuron(
         from torch_neuronx.int64_policy import is_packed_int64_mode
 
         if is_packed_int64_mode() and tensor.device.type == "neuron":
-            from torch_neuronx.packed_storage import packed_int64_execution_view
-
-            low = packed_int64_execution_view(tensor, contiguous=True)
-
-            # Optional overflow check (off by default for performance)
+            # Leave it *logical int64*. kernel.py reinterprets to the int32[..., 2]
+            # physical view at the graph boundary, gathers the low words in-graph,
+            # and binds the physical view at execution — so packed int64 is handled
+            # in one place and dispatch args keep their logical shape (avoids the
+            # shape-leak that broke shape-reading ops like nonzero / cross_entropy).
             if os.environ.get("TORCH_NEURONX_PACKED_INT64_CHECK_OVERFLOW", "0") == "1":
-                from torch_neuronx.packed_storage import packed_int64_high_word_alias
-
-                # Gather the high lane. Contiguous → NKI kernel via the op (same
-                # fast path as the low words); non-contiguous → general int32
-                # copy of the lane alias.
+                low = packed_int64_execution_view(tensor, contiguous=True)
                 high_alias = packed_int64_high_word_alias(tensor)
                 high = torch.empty_like(low)
                 if tensor.is_contiguous():
@@ -656,7 +659,21 @@ def convert_for_neuron(
                         "TORCH_NEURONX_INT64_MODE=cpu_bounce for full range."
                     )
 
-            return low
+            if not tensor.is_contiguous():
+                # Mirror the C++ NeuronSafeCast fix for non-contiguous packed
+                # int64. The graph boundary binds the int32[..., 2] physical
+                # view; a non-contiguous int64 otherwise binds only the low-word
+                # half (e.g. NRT "input0 too small: 100 vs 200"). Contiguify the
+                # int32 *physical view* (not the int64 tensor — that redispatches
+                # through convert_for_neuron and recurses; on int32 it doesn't).
+                # The [low, high] pairs are value-preserving, so logical_view of
+                # the contiguous result equals tensor.contiguous().
+                phys_contig = packed_physical_view(tensor).contiguous()
+                return packed_logical_view(
+                    phys_contig, tensor.dtype, tuple(int(d) for d in tensor.shape)
+                )
+
+            return tensor
         target_dtype = torch.int32
     elif tensor.dtype == torch.float64:
         target_dtype = torch.float32

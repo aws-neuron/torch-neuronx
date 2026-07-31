@@ -5,6 +5,7 @@
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
+#include "torch_neuronx/csrc/ops/InternalOps.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -14,18 +15,66 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     return t;
   }
 
-  // Packed int64: extract low words on-device via the NKI strided-copy kernel.
-  // Only for *contiguous* int64: the flat-stream gather assumes logical element
-  // k lives at pair k, which holds only for a row-major contiguous source. A
+  // Packed int64 graph input: keep it *logical int64* here. Both the low-word
+  // extraction (in-graph NKI gather) and the int32[..., 2] physical-view
+  // reinterpret are consolidated at the graph boundary — the fake input is
+  // generated as int32[..., 2] (so the NEFF parameter is int32) and the int64
+  // arg's physical view is bound to the NEFF at execution (FlattenAndFilterInputs).
+  // Returning the int64 tensor unchanged (rather than reinterpreting to int32
+  // here) keeps the dispatch arg's logical shape intact, so ops that read the
+  // input shape at the host level (nonzero, cross_entropy, ...) are not confused
+  // by the trailing packed lane dim. Only for *contiguous* int64 — a
   // non-contiguous int64 (broadcast, slice, transpose, permuted) falls through
-  // to the CPU round-trip below, which copies the full storage to CPU, restrides
-  // (correct for stride-0 broadcast), and casts int64->int32 on the host (the
-  // low word). is_contiguous() on the logical int64 is the right, simple gate.
+  // to the CPU round-trip below (copies to CPU, restrides, casts to the low word).
+  //
+  // NOTE: the explicit _to_copy Int<-Long cast (DispatchToCopyImpl) still calls
+  // execution_view directly — it produces the actual gathered int32 result.
   static const bool packed_int64 = IsPackedInt64Enabled();
   if (packed_int64 && t.scalar_type() == c10::ScalarType::Long &&
-      target_dtype == c10::ScalarType::Int && t.device().type() == c10::DeviceType::PrivateUse1 &&
-      t.is_contiguous()) {
-    return torch_neuronx::packed_int64::execution_view(t);
+      target_dtype == c10::ScalarType::Int && t.device().type() == c10::DeviceType::PrivateUse1) {
+    if (t.is_contiguous()) {
+      return t;
+    }
+    // Non-contiguous packed int64 (slice/broadcast/transpose/permute): return a
+    // *contiguous* int64 copy so it flows through the same physical-view binding
+    // as the contiguous case. The fused NEFF expects the int32[..., 2] physical
+    // view (fake input + in-graph gather + materialized output); binding the old
+    // CPU-bounced int32[numel] low-word buffer is half the required size (e.g.
+    // "output0 too small: 4104 vs 8208").
+    //
+    // Contiguify the int32 *physical view* (well-defined 4-byte element strides)
+    // via contiguous_internal — the fast on-device (MLIR/transpose) contiguify
+    // used by DispatchContiguousImpl. Doing it on the int32 view (not the int64)
+    // is essential: contiguous_internal redispatches, and on int32
+    // NeuronSafeCast(Int->Int) is a no-op, so it can't recurse back into this
+    // int64 branch (t.contiguous() on the int64 would). The physical view's
+    // [low, high] pairs are value-preserving, so logical_view of the contiguous
+    // result equals t.contiguous(). For in-place ops the result is written back
+    // into this non-contiguous tensor by UpcastExecutionOutputs ->
+    // CopyBackToOriginal (CopyToNonContiguous).
+    auto phys = torch_neuronx::packed_int64::physical_view(t);  // int32[..., 2], strided
+    auto phys_contig = torch_neuronx::ops::contiguous_internal(phys, c10::MemoryFormat::Contiguous);
+    return torch_neuronx::packed_int64::logical_view(phys_contig);  // int64, contiguous
+  }
+
+  // CPU int64 operand feeding a packed-int64 graph. Kept *Long* so PreprocessArgs
+  // materializes it on-device as packed int64 and the graph boundary binds its
+  // int32[..., 2] physical view (matching the NEFF parameter). Two cases:
+  //   1. 0-dim wrapped Python scalars — a binary op mixing a neuron int64 with a
+  //      Python-int / CPU scalar (e.g. `len(x) - offsets[i]`) wraps the int as a
+  //      0-dim CPU int64.
+  //   2. Multi-element CPU int64 *indices* — index/index_select/index_copy/
+  //      index_add accept a CPU index against a neuron self, reaching here as a
+  //      multi-element CPU int64.
+  // Downcasting either to int32 (the t.to() fallback below) would bind a
+  // half-width low word and trip NRT "input0 too small: 4 vs 8".
+  //
+  // (A non-index multi-element CPU tensor feeding a neuron op is a genuine device
+  // mismatch that PyTorch rejects before reaching here, so this does not swallow
+  // real downcast requests.)
+  if (packed_int64 && t.scalar_type() == c10::ScalarType::Long &&
+      target_dtype == c10::ScalarType::Int && t.device().is_cpu()) {
+    return t;
   }
 
   // Packed int64 output: int32 execution result → int64 packed storage.

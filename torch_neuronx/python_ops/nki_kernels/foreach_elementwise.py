@@ -231,7 +231,13 @@ def foreach_list_nki(tensors1, tensors2, op="mul", alpha=1):
             result.append(t1)
         elif t1.numel() == 1 or not _has_nki_elementwise_kernels or t1.shape != t2.shape:
             out_dtype = torch.promote_types(t1.dtype, t2.dtype)
-            result.append(mlir_ops[op](t1.to(out_dtype), t2.to(out_dtype), alpha))
+            # Cast back to out_dtype: `alpha * t2` can promote beyond out_dtype
+            # (e.g. an int alpha on a bool tensor -> int64), which would widen a
+            # bool result and wrongly pack it to shape (..., 2). Mirrors the NKI
+            # branch's _cast_to_dtype below.
+            result.append(
+                _cast_to_dtype(mlir_ops[op](t1.to(out_dtype), t2.to(out_dtype), alpha), out_dtype)
+            )
         else:
             out_dtype = torch.promote_types(t1.dtype, t2.dtype)
             d1, d2 = t1.to(out_dtype), t2.to(out_dtype)

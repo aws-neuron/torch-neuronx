@@ -6,57 +6,38 @@ from ..operation_registry import register_aten
 from ..validation import validate_inplace_broadcast
 
 
-@register_aten(["aten::add.Tensor", "aten::add.out", "aten::add_"], static_argnames=("alpha",))
-def torch_add(x, y, alpha=1, out=None):
-    """Add operation."""
-    return torch.add(x, y, alpha=alpha)
+def _inplace_result(result, self_tensor):
+    """Cast an in-place op's (promoted) result back to self's dtype.
 
+    In-place ops do not type-promote and cannot resize self by broadcasting the
+    other operand up. Mirror PyTorch's two rejections and the demotion:
 
-@register_aten(
-    ["aten::add.Scalar", "aten::add_.Scalar"],
-    static_argnames=("alpha",),
-)
-def torch_add_scalar(x, y, alpha=1):
-    """Add with scalar. Delegates to torch.add which handles type promotion
-    checks.
+      * broadcast that expands self (result shape != self shape) -> RuntimeError;
+      * promoted result not castable to self (e.g. float -> int) -> RuntimeError;
+      * otherwise cast the result to self's dtype (e.g. int64 -> int32).
+
+    The final cast also keeps the graph output at self's dtype, so a wider
+    (int64) operand doesn't leave a packed int32[..., 2] output whose logical
+    shape then leaks (the inferred output dtype is self's, so the unpack never
+    fires).
     """
-    return torch.add(x, y, alpha=alpha)
+    if isinstance(self_tensor, torch.Tensor):
+        if tuple(result.shape) != tuple(self_tensor.shape):
+            raise RuntimeError(
+                f"output with shape {list(self_tensor.shape)} doesn't match "
+                f"the broadcast shape {list(result.shape)}"
+            )
+        if not torch.can_cast(result.dtype, self_tensor.dtype):
+            raise RuntimeError(
+                f"result type {result.dtype} can't be cast to the desired "
+                f"output type {self_tensor.dtype}"
+            )
+        return result.to(self_tensor.dtype)
+    return result
 
 
-@register_aten(
-    [
-        "aten::mul.Scalar",
-        "aten::mul.Tensor",
-        "aten::mul.out",
-        "aten::mul.Scalar_out",
-        "aten::mul_",
-    ]
-)
-def torch_mul(x, y, out=None):
-    """Multiply operation."""
-    return torch.mul(x, y)
-
-
-@register_aten(["aten::sub.Tensor", "aten::sub.out"], static_argnames=("alpha",))
-@register_aten(
-    ["aten::sub_.Tensor"],
-    static_argnames=("alpha",),
-    validate_static_inputs=validate_inplace_broadcast,
-)
-def torch_sub(x, y, alpha=1, out=None):
-    return torch.sub(x, y, alpha=alpha)
-
-
-@register_aten(
-    ["aten::div", "aten::div.out", "aten::div.out_mode"],
-    static_argnames=("rounding_mode",),
-)
-@register_aten(
-    ["aten::div_.Tensor"],
-    static_argnames=("rounding_mode",),
-    validate_static_inputs=validate_inplace_broadcast,
-)
-def torch_div(x, y, rounding_mode=None, out=None):
+def _div_compute(x, y, rounding_mode=None):
+    """Core division shared by the out-of-place and in-place div handlers."""
     if rounding_mode is None:
         return x / y
     elif rounding_mode == "floor":
@@ -70,14 +51,103 @@ def torch_div(x, y, rounding_mode=None, out=None):
     return torch.where(y == 0, torch.sign(x) * float("inf"), result)
 
 
+@register_aten(["aten::add.Tensor", "aten::add.out"], static_argnames=("alpha",))
+def torch_add(x, y, alpha=1, out=None):
+    """Add operation."""
+    return torch.add(x, y, alpha=alpha)
+
+
+@register_aten(["aten::add_.Tensor"], static_argnames=("alpha",))
+def torch_add_inplace(x, y, alpha=1, out=None):
+    """In-place add — no type promotion; result follows self's dtype."""
+    return _inplace_result(torch.add(x, y, alpha=alpha), x)
+
+
+@register_aten(
+    ["aten::add.Scalar", "aten::add_.Scalar"],
+    static_argnames=("alpha",),
+)
+def torch_add_scalar(x, y, alpha=1):
+    """Add with scalar. Delegates to torch.add which handles type promotion
+    checks.
+    """
+    return torch.add(x, y, alpha=alpha)
+
+
+@register_aten(["aten::mul.Scalar", "aten::mul.Tensor", "aten::mul.out", "aten::mul.Scalar_out"])
+def torch_mul(x, y, out=None):
+    """Multiply operation."""
+    return torch.mul(x, y)
+
+
+@register_aten(["aten::mul_.Tensor"])
+def torch_mul_inplace(x, y, out=None):
+    """In-place multiply — no type promotion; result follows self's dtype."""
+    return _inplace_result(torch.mul(x, y), x)
+
+
+@register_aten(["aten::sub.Tensor", "aten::sub.out"], static_argnames=("alpha",))
+def torch_sub(x, y, alpha=1, out=None):
+    return torch.sub(x, y, alpha=alpha)
+
+
+@register_aten(
+    ["aten::sub_.Tensor"],
+    static_argnames=("alpha",),
+    validate_static_inputs=validate_inplace_broadcast,
+)
+def torch_sub_inplace(x, y, alpha=1, out=None):
+    """In-place sub — no type promotion; result follows self's dtype."""
+    return _inplace_result(torch.sub(x, y, alpha=alpha), x)
+
+
+@register_aten(
+    ["aten::div", "aten::div.out", "aten::div.out_mode"],
+    static_argnames=("rounding_mode",),
+)
+@register_aten(
+    ["aten::div_.Tensor"],
+    static_argnames=("rounding_mode",),
+    validate_static_inputs=validate_inplace_broadcast,
+)
+def torch_div(x, y, rounding_mode=None, out=None):
+    return _div_compute(x, y, rounding_mode)
+
+
+@register_aten(["aten::div_.Tensor"], static_argnames=("rounding_mode",))
+def torch_div_inplace(x, y, rounding_mode=None, out=None):
+    """In-place divide — no type promotion; result follows self's dtype.
+
+    Without this, a broadcasting divisor (e.g. [5, 1].div_([5]) -> [5, 5]) would
+    try to write the broadcast result into the smaller self, tripping NRT
+    "output0 too small". _inplace_result rejects broadcast-expand-self and
+    enforces PyTorch's cast rule (e.g. int.div_(int) -> float is not castable
+    to int, so it raises, matching PyTorch).
+    """
+    return _inplace_result(_div_compute(x, y, rounding_mode), x)
+
+
 @register_aten(
     ["aten::pow", "aten::pow.Tensor_Scalar_out", "aten::pow.Tensor_Tensor_out"], static_argnums=(1,)
 )
 def torch_pow(x, exponent, out=None):
+    # neuronx-cc has no 64-bit-integer `power` opcode, so an int64-promoted result
+    # (e.g. `bool ** int` / `int ** int`) is computed in int32 and widened back.
+    if torch.result_type(x, exponent) == torch.int64:
+        exp = exponent.to(torch.int32) if isinstance(exponent, torch.Tensor) else exponent
+        return torch.pow(x.to(torch.int32), exp).to(torch.int64)
     return torch.pow(x, exponent)
 
 
-@register_aten(["aten::remainder", "aten::remainder.Tensor_out"])
+@register_aten(
+    [
+        "aten::remainder",
+        "aten::remainder.Tensor_out",
+        "aten::remainder.Scalar",
+        "aten::remainder.Scalar_out",
+        "aten::remainder_.Scalar",
+    ]
+)
 def torch_remainder(x, y, out=None):
     return torch.remainder(x, y)
 
