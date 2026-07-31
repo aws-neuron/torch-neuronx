@@ -199,10 +199,22 @@ def _promote_inside(op, tensors, scalars=None):
         return tensors
     if not isinstance(scalars, list | tuple):
         scalars = [scalars] * len(tensors)
-    return [
-        t.to(rt) if (rt := torch.result_type(t, s)) != t.dtype else t
-        for t, s in zip(tensors, scalars, strict=False)
-    ]
+    out = []
+    for t, s in zip(tensors, scalars, strict=False):
+        rt = torch.result_type(t, s)
+        if rt == t.dtype:
+            out.append(t)
+        elif t.numel() == 0:
+            # A dtype convert on a 0-size tensor is rejected by the compiler
+            # (NCC_ISPP060). Allocate a fresh empty of the target dtype so the
+            # promotion is a no-data allocation, not an input convert — this
+            # keeps the graph *input* at its original dtype, which matters when
+            # the op is fused (op-concat) with an upstream module that produces
+            # the empty in its original dtype (empty i1 -> i32 mismatch).
+            out.append(torch.empty(t.shape, dtype=rt, device=t.device))
+        else:
+            out.append(t.to(rt))
+    return out
 
 
 def _replace_empty(tensors, op=""):
@@ -272,15 +284,23 @@ def _make_scalar_op(op):
 
     def fn(tensors, scalar, out=None):
         _check_tensors(tensors)
-        # On the dtype-inference call (scalar is still a Python number, not a
-        # traced 0-dim tensor) also promote eagerly, so the inferred output
-        # dtype matches CPU (e.g. bool x int -> int64).
-        if not is_div and not isinstance(scalar, torch.Tensor):
-            tensors = _promote_inside(op, tensors, scalar)
+        # NOTE: do NOT eagerly promote the (non-empty) tensors here. compute_fn
+        # promotes in-graph and infer_outputs_from_meta runs compute_fn, so the
+        # inferred output dtype is already correct (bool x float -> float, ...).
+        # Eagerly promoting the returned tensors would leak the *promoted* dtype
+        # into the NEFF cache key (via context.original_inputs), collapsing
+        # distinct input dtypes that share a promoted type — e.g. bool x 2.5 and
+        # int32 x 2.5 both key as `[Float]` and reuse each other's (wrong) NEFF.
+        # Keeping the original dtype here makes the key distinguish them.
         if is_div:
             tensors = _replace_empty_promoted(tensors, torch.float32)
         else:
-            tensors = _replace_empty_promoted(tensors, scalars=scalar)
+            # Keep empties at their *original* dtype (not the promoted one): the
+            # promoted empty output is allocated in-graph by _promote_inside, and
+            # keeping the input original lets a fused upstream module (e.g. a
+            # non-contiguous transform emitting the empty as bool) connect by
+            # type (avoids the empty i1 -> i32 op-concat dependency mismatch).
+            tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalar):
             tensors = _promote_inside(op, tensors, scalar)

@@ -164,3 +164,21 @@ class TestMinRegistration:
             torch.testing.assert_close(values.cpu(), expected_values)
             torch.testing.assert_close(indices.cpu(), expected_indices)
             assert_op_runs_on_neuron("aten::min")
+
+    def test_min_dim_bool(self):
+        """min.dim over a bool tensor (reduced in int32 since neuronx-cc cannot
+        reduce over a pred operand; values cast back to bool)."""
+        torch.manual_seed(0)
+        x = torch.randint(0, 2, (5, 5, 5), dtype=torch.bool)
+        values, indices = torch.min(x.to("neuron"), dim=0)
+        expected_values, expected_indices = torch.min(x, dim=0)
+        assert values.dtype == torch.bool
+        torch.testing.assert_close(values.cpu(), expected_values)
+        torch.testing.assert_close(indices.cpu(), expected_indices)
+
+    def test_min_all_bool(self):
+        """torch.min (no dim) over a bool tensor."""
+        x = torch.tensor([[True, True], [True, False]], dtype=torch.bool)
+        result = torch.min(x.to("neuron"))
+        assert result.dtype == torch.bool
+        torch.testing.assert_close(result.cpu(), torch.min(x))

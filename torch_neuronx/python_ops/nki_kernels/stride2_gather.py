@@ -58,7 +58,9 @@ from __future__ import annotations
 import nki
 import nki.isa as nisa
 import nki.language as nl
+import torch
 
+from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
 
 # Partition dimension: the hardware partition count.
@@ -76,47 +78,22 @@ def div_ceil(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-@nki.jit
-def stride2_flat_gather_kernel(packed_in, out, parity):
-    """Gather one lane of a flat packed pair-stream into a contiguous buffer.
+def _flat_gather_lane(packed_in, out, parity):
+    """Gather lane ``parity`` of a flat packed pair-stream into ``out``.
 
-    Args:
-        packed_in: flat int32 [2*numel] contiguous packed pairs ``[lo,hi,...]``,
-            rebased so element ``parity`` of each pair is the requested lane.
-        out: flat int32 [numel] contiguous output.
-        parity: lane to gather — 0 = low word, 1 = high word.
+    Shared tiling for the in-place (``stride2_flat_gather_kernel_``) and
+    out-of-place (``stride2_flat_gather_kernel``) entry points — a plain function
+    that emits NKI ops into the caller's kernel trace (mirrors the helper
+    pattern in ``nonzero.py``). ``numel`` is taken from ``out.shape[0]``.
 
-    Returns:
-        out (written in place; also returned per NKI convention).
-
-    Notes:
-        Balanced flat tiling: the stream is tiled as [P_MAX, F_SIZE] pair-blocks
-        independent of logical shape, so the partition dim is always full for
-        the bulk. A <P_MAX remainder is handled by a separate tail tile.
-
-        Lane select uses nisa.tensor_copy on the Vector Engine, reading the
-        strided SBUF source ``pk[:, parity::2]`` and writing a contiguous tile.
-        On the Vector Engine tensor_copy is a bit-accurate copy when src/dst
-        dtypes match (int32==int32), so unlike nl.copy (Scalar Engine, which
-        casts through fp32 and corrupts int32) it preserves all 32 bits. The
-        Vector Engine does the on-chip select while the DMA engines overlap the
-        HBM bursts, and it is ~2x faster than the GpSimd nc_n_gather select and
-        ~4x faster than a strided dma_copy select.
-
-        (Vector tensor_copy has no multi-tile size limit — it is correct at
-        F=2048 across the full shape sweep. This is unlike nc_n_gather, which
-        decomposes into ceil(elems/512) ISA groups and corrupts later tiles when
-        chained at >1 group; ticket V2245128914.)
-
-        SPMD: when launched with LNC2 the stream is split across the two
-        programs (P_MAX-aligned per-program slice). With LNC1 there is a single
-        program over the whole stream.
+    Balanced flat tiling: SPMD split into P_MAX-aligned per-program slices, then
+    [P_MAX, F_SIZE] pair blocks with a <P_MAX tail. Each tile burst-loads packed
+    pairs, selects lane ``parity`` on the Vector Engine (``tensor_copy`` is a
+    bit-accurate int32 copy, unlike Scalar-Engine ``nl.copy`` which casts through
+    fp32), and burst-stores contiguous words.
     """
     numel = out.shape[0]
 
-    # SPMD split: each program handles a contiguous P_MAX-aligned slice of pairs.
-    # P_MAX alignment guarantees every program's bulk fills 128 partitions; the
-    # last program absorbs whatever remains (including the <P_MAX final tail).
     num_progs = nl.num_programs(0)
     prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
@@ -154,6 +131,45 @@ def stride2_flat_gather_kernel(packed_in, out, parity):
 
 
 @nki.jit
+def stride2_flat_gather_kernel_(packed_in, out, parity):
+    """Gather one lane of a flat packed pair-stream into a contiguous buffer.
+
+    Args:
+        packed_in: flat int32 [2*numel] contiguous packed pairs ``[lo,hi,...]``,
+            rebased so element ``parity`` of each pair is the requested lane.
+        out: flat int32 [numel] contiguous output.
+        parity: lane to gather — 0 = low word, 1 = high word.
+
+    Returns:
+        out (written in place; also returned per NKI convention).
+
+    Notes:
+        Balanced flat tiling: the stream is tiled as [P_MAX, F_SIZE] pair-blocks
+        independent of logical shape, so the partition dim is always full for
+        the bulk. A <P_MAX remainder is handled by a separate tail tile.
+
+        Lane select uses nisa.tensor_copy on the Vector Engine, reading the
+        strided SBUF source ``pk[:, parity::2]`` and writing a contiguous tile.
+        On the Vector Engine tensor_copy is a bit-accurate copy when src/dst
+        dtypes match (int32==int32), so unlike nl.copy (Scalar Engine, which
+        casts through fp32 and corrupts int32) it preserves all 32 bits. The
+        Vector Engine does the on-chip select while the DMA engines overlap the
+        HBM bursts, and it is ~2x faster than the GpSimd nc_n_gather select and
+        ~4x faster than a strided dma_copy select.
+
+        (Vector tensor_copy has no multi-tile size limit — it is correct at
+        F=2048 across the full shape sweep. This is unlike nc_n_gather, which
+        decomposes into ceil(elems/512) ISA groups and corrupts later tiles when
+        chained at >1 group; ticket V2245128914.)
+
+        SPMD: when launched with LNC2 the stream is split across the two
+        programs (P_MAX-aligned per-program slice). With LNC1 there is a single
+        program over the whole stream.
+    """
+    return _flat_gather_lane(packed_in, out, parity)
+
+
+@nki.jit
 def stride2_flat_scatter_kernel(packed_io, vals, parity):
     """Scatter a contiguous buffer into one lane of a flat packed pair-stream.
 
@@ -178,7 +194,7 @@ def stride2_flat_scatter_kernel(packed_io, vals, parity):
     """
     numel = vals.shape[0]
 
-    # SPMD split — see stride2_flat_gather_kernel for the rationale.
+    # SPMD split — see stride2_flat_gather_kernel_ for the rationale.
     num_progs = nl.num_programs(0)
     prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
@@ -237,7 +253,7 @@ def run_stride2_gather(src_tensor, dst_tensor, *, parity: int = 0):
 
     packed = src_tensor.as_strided((2 * numel,), (1,), storage_offset=base_off)
     out_flat = dst_tensor.reshape(numel)
-    stride2_flat_gather_kernel[LNC](packed, out_flat, int(parity))
+    stride2_flat_gather_kernel_[LNC](packed, out_flat, int(parity))
 
 
 def run_stride2_scatter(src_tensor, dst_tensor, *, parity: int = 0):
@@ -259,3 +275,51 @@ def run_stride2_scatter(src_tensor, dst_tensor, *, parity: int = 0):
     packed = dst_tensor.as_strided((2 * numel,), (1,), storage_offset=base_off)
     src_flat = src_tensor.reshape(numel)
     stride2_flat_scatter_kernel[LNC](packed, src_flat, int(parity))
+
+
+@nki.jit
+def stride2_flat_gather_kernel(packed_in, parity: int = 0):
+    """Out-of-place gather of one lane from a flat packed pair-stream.
+
+    Args:
+        packed_in: flat int32 [2*numel] contiguous ``[lo, hi, ...]`` pairs (the
+            physical view of a contiguous int64 tensor).
+        parity: lane to gather — 0 = low words (default), 1 = high words.
+
+    Returns:
+        out: flat int32 [numel] contiguous lane words, allocated in shared_hbm.
+
+    Out-of-place on purpose: when several packed inputs are gathered in one
+    graph, an in-place kernel's ``out`` buffer becomes a custom_call operand with
+    ``output_operand_aliases``, and the identically-shaped ``torch.empty``
+    buffers get CSE'd into a single constant — so the gathers alias and clobber
+    each other. Allocating the output internally gives each call an independent
+    result. Shares the tiling with ``stride2_flat_gather_kernel_`` via
+    ``_flat_gather_lane``.
+    """
+    numel = packed_in.shape[0] // 2
+    out = nl.ndarray((numel,), dtype=nl.int32, buffer=nl.shared_hbm)
+    return _flat_gather_lane(packed_in, out, parity)
+
+
+_wrapped_flat_gather = wrap_nki(stride2_flat_gather_kernel)
+
+
+@nki_op("nki_kernels::packed_gather", mutates_args={})
+def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 1) -> torch.Tensor:
+    """Gather one lane (low words by default) from a packed int32[..., 2] tensor.
+
+    Called inside a traced ``torch_fn`` so the gather co-compiles into the op's
+    NEFF. Returns int32 with the input's logical shape.
+    """
+    logical_shape = packed.shape[:-1]
+    # Empty operand (e.g. cat / foreach with a size-0 int64 tensor): the NKI
+    # kernel rejects a 0-sized shape ("shape must be a tuple of positive
+    # integers"). Nothing to gather — return an empty int32 of the logical
+    # shape. Mirrors the numel()==0 guard in packed_int64::execution_view (C++)
+    # and nki_strided_copy_ (Python).
+    if packed.numel() == 0:
+        return torch.empty(logical_shape, dtype=torch.int32, device=packed.device)
+    flat = packed.reshape(-1)
+    lane = _wrapped_flat_gather[(lnc,)](flat, parity)
+    return lane.reshape(logical_shape)

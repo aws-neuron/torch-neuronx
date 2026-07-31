@@ -20,15 +20,25 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._filelock import FileLock
 
 from torch_neuronx import _C
+from torch_neuronx.int64_policy import is_packed_int64_mode
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
     FunctionalizeCopyInplacePass,
 )
+from torch_neuronx.packed_storage import (
+    is_packed_logical_dtype,
+    is_packed_physical_view,
+    packed_logical_view,
+    packed_physical_dtype,
+    packed_physical_layout,
+    packed_physical_view,
+)
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
+from torch_neuronx.python_ops.nki_kernels.stride2_gather import packed_gather_nki
 from torch_neuronx.python_ops.shared import (
     CompilationConfig,
     ExecutionContext,
@@ -42,6 +52,91 @@ from ..processors import ArgumentProcessor
 from .compilation import TorchMlirCompiler
 
 logger = logging.getLogger(__name__)
+
+
+def _wrap_torch_fn_for_packed_int64(fn, original_inputs, output_positions):
+    """Wrap ``fn`` to move packed int64 casting into the traced graph.
+
+    Input side: each int64 input arrives as its packed ``int32[..., 2]`` physical
+    view (reinterpreted in NeuronSafeCast). Prepend the NKI low-word gather so
+    the extraction co-compiles into the op's NEFF::
+
+        low = packed_gather_nki(packed)   # int32[..., 2] -> int32[...]
+
+    Inputs are matched against ``original_inputs`` (walked in parallel, recursing
+    into tensor lists like ``cat``/``stack``): an arg is gathered iff the
+    original was int64 and the downcast arg is int32 with a trailing packed lane
+    of 2. Non-contiguous int64 inputs take a CPU round-trip in NeuronSafeCast and
+    arrive already-gathered as int32[...] (no trailing 2), so they are skipped.
+
+    Output side (``output_positions``): each int64 output is emitted in packed
+    form via sign-extend + interleave::
+
+        packed = stack([low, bitwise_right_shift(low, 31)], dim=-1)  # int32[...,2]
+
+    Both are plain torch / traced-nki ops, so ``make_fx`` +
+    ``convert_fx_to_stablehlo`` fold them into the *same* NEFF as the compute op,
+    making the whole int64 op a single dispatch. ``torch.bitwise_right_shift``
+    (not Python ``>>``) is required — the latter mis-lowers to a logical shift.
+    """
+
+    def _gather_arg(arg, orig):
+        if isinstance(orig, torch.Tensor) and orig.numel() == 0:
+            # Empty int64 is kept unpacked (see create_fake_recursive) — there is
+            # nothing to gather, and gathering would reintroduce a zero-size
+            # packed value. Pass it through clean.
+            return arg
+        if is_packed_physical_view(arg, orig):
+            # arg is the packed physical view of the int64 `orig`; gather the low
+            # words in-graph and reshape to orig's logical shape (handles the
+            # scalar (1,2) -> () case, where packed_gather_nki alone yields (1,)).
+            return packed_gather_nki(arg).reshape(tuple(orig.shape))
+        if (
+            isinstance(orig, list | tuple)
+            and isinstance(arg, list | tuple)
+            and len(arg) == len(orig)
+        ):
+            return type(arg)(_gather_arg(a, o) for a, o in zip(arg, orig, strict=False))
+        return arg
+
+    def wrapped(*args, **kwargs):
+        if original_inputs is not None:
+            args = [
+                _gather_arg(a, original_inputs[i] if i < len(original_inputs) else None)
+                for i, a in enumerate(args)
+            ]
+
+        result = fn(*args, **kwargs)
+
+        if not output_positions:
+            return result
+        is_single = not isinstance(result, tuple | list)
+        outs = [result] if is_single else list(result)
+        for i in output_positions:
+            if i < len(outs) and isinstance(outs[i], torch.Tensor) and outs[i].dtype == torch.int32:
+                low = outs[i]
+                if low.numel() == 0:
+                    continue  # empty int64 output: keep it unpacked (clean empty)
+                high = torch.bitwise_right_shift(low, 31)
+                outs[i] = torch.stack([low, high], dim=-1)
+        if is_single:
+            return outs[0]
+        return tuple(outs)
+
+    return wrapped
+
+
+def _reinterpret_packed_int64_output(exec_tensor, orig_out, downcast_out):
+    """If ``exec_tensor`` is a fused packed int64 output, reinterpret it as int64.
+
+    The execution tensor's storage already holds the [low, high] pairs (its
+    downcast output ``downcast_out`` is the packed physical view of the int64
+    ``orig_out``), so reinterpreting to int64 is zero-copy. Returns the int64
+    view, or None if not a packed output.
+    """
+    if not is_packed_physical_view(downcast_out, orig_out):
+        return None
+    return packed_logical_view(exec_tensor, orig_out.dtype, tuple(int(d) for d in orig_out.shape))
 
 
 class TorchMlirKernel(BaseNeuronKernel):
@@ -141,13 +236,20 @@ class TorchMlirKernel(BaseNeuronKernel):
         return compilation_kwargs
 
     def _generate_fake_inputs(
-        self, inputs: tuple, compilation_kwargs: dict | None = None
+        self, inputs: tuple, compilation_kwargs: dict | None = None, physical_int64: bool = False
     ) -> tuple[list, dict]:
         """Generate fake inputs and mapping for flattened indices.
 
         Args:
             inputs: Input tensors
             compilation_kwargs: Compilation kwargs (optional)
+            physical_int64: When True, int64 tensors are faked as their packed
+                int32[..., 2] physical view (so the traced graph parameter is
+                int32 — the Neuron compiler has no int64 HLO type). Used only for
+                the tracing path; the in-graph wrap gathers the low words and the
+                int64 arg's physical view is bound to the NEFF at execution. The
+                dtype-inference path leaves this False so it sees the true int64
+                shapes.
 
         Returns:
             Tuple of (fake_inputs, fake_to_flattened_idx)
@@ -160,7 +262,23 @@ class TorchMlirKernel(BaseNeuronKernel):
         def create_fake_recursive(obj, original_idx):
             nonlocal flattened_idx
             if isinstance(obj, torch.Tensor):
-                fake_tensor = torch.empty_like(obj, device="meta")
+                if physical_int64 and obj.dtype == torch.int64 and obj.numel() > 0:
+                    # Packed int64: the NEFF parameter is the int32 physical view.
+                    # Use packed_physical_layout (single source of truth for the
+                    # physical shape) so this matches the execution binding exactly
+                    # — including the scalar/0-dim case ((1, 2), not (2,)).
+                    phys_shape, _, _ = packed_physical_layout(
+                        torch.int64, shape=tuple(obj.shape), stride=tuple(obj.stride())
+                    )
+                    fake_tensor = torch.empty(phys_shape, dtype=torch.int32, device="meta")
+                else:
+                    # Empty int64 stays *unpacked* (nothing to pack for 0 elements):
+                    # a packed (…, 2) view of an empty tensor is a zero-size 2-D
+                    # tensor the compiler elides, shifting the 1:1 inplace output
+                    # binding. Keeping it a clean empty makes it a trivial
+                    # pass-through (the execution binding + _gather_arg skip
+                    # packing/gathering it too).
+                    fake_tensor = torch.empty_like(obj, device="meta")
                 fake_to_flattened_idx[id(fake_tensor)] = flattened_idx
                 flattened_idx += 1
                 return fake_tensor
@@ -258,12 +376,18 @@ class TorchMlirKernel(BaseNeuronKernel):
         self._output_dtype_cache[cache_key] = result
         return result
 
-    def _generate_fx_graph(self, fake_inputs: tuple, compilation_kwargs: dict):
+    def _generate_fx_graph(self, fake_inputs: tuple, compilation_kwargs: dict, torch_fn=None):
         """Generate fx graph using meta tensors.
 
         Args:
             fake_inputs: meta tensor inputs
             compilation_kwargs: compilation kwargs for torch_fn
+            torch_fn: optional function to trace instead of ``self.torch_fn``.
+                Used by the packed-int64 path to trace a wrapped version of the
+                op (see ``_wrap_torch_fn_for_packed_int64``) that gathers int64
+                inputs and materializes int64 outputs inside the graph, so those
+                casts co-compile into the op's NEFF. Defaults to
+                ``self.torch_fn`` when None.
 
         Return:
             decomposed_gm: FX GraphModule
@@ -276,7 +400,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         with torch.no_grad():
             # Create a flattened function that handles the args/kwargs structure
             flat_fn, out_spec = create_tree_flattened_fn(
-                self.torch_fn, fake_inputs, compilation_kwargs
+                torch_fn if torch_fn is not None else self.torch_fn, fake_inputs, compilation_kwargs
             )
 
             # Handle kwargs like torch does - flatten everything into positional args
@@ -348,8 +472,13 @@ class TorchMlirKernel(BaseNeuronKernel):
         """
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
-        # Create fake tensors and track flattened indices
-        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs, compilation_kwargs)
+        # Create fake tensors and track flattened indices. In packed int64 mode
+        # the int64 inputs are faked as their int32[..., 2] physical view so the
+        # traced graph parameter is int32 (the compiler has no int64 HLO type);
+        # the wrap gathers the low words and the physical view is bound at exec.
+        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(
+            inputs, compilation_kwargs, physical_int64=is_packed_int64_mode()
+        )
 
         # Generate original_outputs by running meta eval
         original_outputs = self.infer_outputs_from_meta(
@@ -358,7 +487,46 @@ class TorchMlirKernel(BaseNeuronKernel):
         )
 
         flat_args, in_spec = pytree.tree_flatten((fake_inputs, compilation_kwargs))
-        decomposed_gm = self._generate_fx_graph(fake_inputs, compilation_kwargs)
+
+        # Packed int64: fuse both the input low-word gather and the output
+        # materialization into the traced graph so the whole int64 op is a single
+        # dispatch. Int64 inputs arrive as their packed int32[..., 2] physical
+        # view (reinterpreted in NeuronSafeCast) — the graph gathers the low
+        # words; int64 outputs are emitted as packed int32[..., 2] via sign-extend
+        # + interleave and bound to the output's physical storage.
+        packed_output_positions = []
+        trace_fn = None
+        if is_packed_int64_mode():
+            # The wrap keys off `inputs` (the post-preprocess args the fakes were
+            # generated from) — NOT context.original_inputs. `inputs` is aligned
+            # 1:1 with fake_inputs, so operands promoted after the original
+            # snapshot (e.g. a scalar promoted to an int64 tensor in a compare op)
+            # are still detected and gathered, matching their physical-view fake.
+            def _has_int64(x):
+                if isinstance(x, torch.Tensor):
+                    return x.dtype == torch.int64
+                if isinstance(x, list | tuple):
+                    return any(_has_int64(e) for e in x)
+                return False
+
+            has_packed_input = inputs is not None and any(_has_int64(a) for a in inputs)
+            if original_outputs is not None:
+                _orig = (
+                    original_outputs
+                    if isinstance(original_outputs, tuple | list)
+                    else (original_outputs,)
+                )
+                packed_output_positions = [
+                    i
+                    for i, o in enumerate(_orig)
+                    if isinstance(o, torch.Tensor) and o.dtype == torch.int64
+                ]
+            if has_packed_input or packed_output_positions:
+                trace_fn = _wrap_torch_fn_for_packed_int64(
+                    self.torch_fn, inputs, set(packed_output_positions)
+                )
+
+        decomposed_gm = self._generate_fx_graph(fake_inputs, compilation_kwargs, torch_fn=trace_fn)
 
         # Capture original output nodes before any optimization
         original_output_node = list(decomposed_gm.graph.find_nodes(op="output"))[-1]
@@ -620,6 +788,11 @@ class TorchMlirKernel(BaseNeuronKernel):
                 and hasattr(downcasted_outputs, "dtype")
                 and original_outputs.dtype != downcasted_outputs.dtype
             ):
+                packed = _reinterpret_packed_int64_output(
+                    execution_tensors, original_outputs, downcasted_outputs
+                )
+                if packed is not None:
+                    return packed
                 return execution_tensors.to(original_outputs.dtype)
             return execution_tensors
 
@@ -642,7 +815,11 @@ class TorchMlirKernel(BaseNeuronKernel):
                 and hasattr(downcast_out, "dtype")
                 and orig_out.dtype != downcast_out.dtype
             ):
-                upcast_tensors.append(exec_tensor.to(orig_out.dtype))
+                packed = _reinterpret_packed_int64_output(exec_tensor, orig_out, downcast_out)
+                if packed is not None:
+                    upcast_tensors.append(packed)
+                else:
+                    upcast_tensors.append(exec_tensor.to(orig_out.dtype))
             else:
                 upcast_tensors.append(exec_tensor)
 
@@ -791,12 +968,33 @@ class TorchMlirKernel(BaseNeuronKernel):
             if provided is None:
                 return provided, False
 
-            # Resize provided tensor if shape mismatch. Delegates to the shared
+            # A packed provided/inplace output: `downcast` is its packed physical
+            # view (int32[..., 2] for int64, float32[..., 2] for float64, ...),
+            # which legitimately differs in shape/dtype from the logical
+            # `provided`. Detect this by dtype + the trailing packed lane so it's
+            # recognized even when `provided` has the wrong shape — e.g. an empty
+            # out= for a data-dependent op like masked_select/nonzero, where
+            # is_packed_physical_view() would return False (shape mismatch) and we
+            # would wrongly resize the logical out= to the physical [..., 2].
+            is_packed_out = (
+                downcast is not None
+                and is_packed_logical_dtype(provided.dtype)
+                and downcast.dtype == packed_physical_dtype(provided.dtype)
+                and downcast.dim() >= 1
+                and int(downcast.shape[-1]) == 2
+            )
+
+            # Resize the (logical) provided tensor to match the result shape.
+            # For a packed output resize to the LOGICAL shape (physical minus the
+            # trailing packed lane), NOT the physical [..., 2] — otherwise the
+            # logical result can't be copied back into it. Delegates to the shared
             # C++ helper so the UserWarning text stays in sync with
             # at::native::resize_output_check, since this path bypasses the
             # framework's dispatch resize check.
-            if downcast is not None and provided.shape != downcast.shape:
-                _C._resize_output_with_warning(provided, list(downcast.shape))
+            if downcast is not None:
+                target_shape = list(downcast.shape[:-1]) if is_packed_out else list(downcast.shape)
+                if list(provided.shape) != target_shape:
+                    _C._resize_output_with_warning(provided, target_shape)
 
             # If dtype mismatch, create new tensor with execution dtype
             if downcast is not None and provided.dtype != downcast.dtype:
@@ -1227,15 +1425,22 @@ class TorchMlirKernel(BaseNeuronKernel):
             # C++ ParseLoweringResult extracts ScalarType via THPDtype.
             inferred_output_dtypes = []
             if original_args is not None:
-                orig_kw = original_kwargs if original_kwargs else {}
+                orig_kw = original_kwargs if original_kwargs else kwargs
                 if self.validate_static_inputs_func is not None:
                     self.validate_static_inputs_func(*original_args, **orig_kw)
                 inferred_output_dtypes = self._infer_output_dtypes_impl(*original_args, **orig_kw)
 
             # ── Set up context (folded from former _lower_impl) ──
+            # Use the original (pre-downcast) args as the context's original
+            # inputs so original_outputs is inferred at true precision (int64,
+            # not the downcast int32). This lets the lowering detect int64
+            # outputs and fuse their materialization into the graph, and makes
+            # original_output_specs carry the true (original) dtypes.
             context = kwargs.pop("context", None)
             if context is None:
-                context = ExecutionContext(original_inputs=args, original_kwargs=kwargs.copy())
+                ctx_inputs = tuple(original_args) if original_args is not None else args
+                ctx_kwargs = dict(original_kwargs) if original_kwargs else kwargs.copy()
+                context = ExecutionContext(original_inputs=ctx_inputs, original_kwargs=ctx_kwargs)
 
             # C++ PreprocessArgs already did scalar→tensor, dtype conversion,
             # contiguous.  Just set static_argnums and use args directly.
@@ -1464,6 +1669,24 @@ class TorchMlirKernel(BaseNeuronKernel):
                 flattened_processed_inputs.append(value)
         # Create filtered inputs using kept_input_indices on flattened inputs
         filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
+
+        # Packed int64: dispatch args are kept logical int64; bind their
+        # int32[..., 2] physical view to the NEFF here (matches the int32 graph
+        # parameter — the fake input was generated as int32[..., 2] — and the
+        # in-graph gather extracts the low words). Zero-copy reinterpret.
+        if is_packed_int64_mode():
+            filtered_inputs = tuple(
+                packed_physical_view(t)
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.dtype == torch.int64
+                    and t.device.type == "neuron"
+                    and t.is_contiguous()
+                    and t.numel() > 0
+                )
+                else t
+                for t in filtered_inputs
+            )
 
         # Normalize execution_tensors to sequence for execution
         exec_tensors = (

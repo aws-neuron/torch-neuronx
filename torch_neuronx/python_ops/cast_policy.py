@@ -94,16 +94,20 @@ def copy_cpu_to_neuron(
 
     # Packed int64: reinterpret bytes as int32 pairs, bulk upload, preserve strides
     if is_packed_int64_mode() and target_dtype == torch.int64:
+        from torch_neuronx.packed_storage import packed_physical_view
+
         tmp = cpu_src if cpu_src.dtype == torch.int64 else cpu_src.to(torch.int64)
         src_strides = tmp.stride()
         src_is_contiguous = tmp.is_contiguous()
         if not src_is_contiguous:
             tmp = tmp.contiguous()
-        # Zero-copy reinterpret: contiguous int64 → int32 pairs
-        physical_cpu = tmp.view(torch.int32)
+        # Reinterpret contiguous int64 -> int32 pairs. Use packed_physical_view
+        # (not tmp.view(torch.int32)): a 0-dim scalar int64 () has physical shape
+        # (1, 2), but tmp.view(torch.int32) raises on a 0-dim tensor ("self.dim()
+        # cannot be 0 to view Long as Int"). packed_physical_view handles the
+        # scalar case and matches dst_physical's layout.
+        physical_cpu = packed_physical_view(tmp)
         # Allocate contiguous int64 device tensor, upload via physical view
-        from torch_neuronx.packed_storage import packed_physical_view
-
         dst = io_tensor.empty(tmp.shape, dtype=torch.int64, device=target_device)
         dst_physical = packed_physical_view(dst)
         _C._nrt_copy_cpu_to_neuron_tensor(physical_cpu, dst_physical, non_blocking=non_blocking)

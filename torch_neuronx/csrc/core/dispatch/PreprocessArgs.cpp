@@ -16,19 +16,33 @@ namespace dispatch {
 // Handles: CPU 0-dim → device move, contiguous, int64→int32, float64→float32.
 // Returns true if the tensor was modified (caller must write it back).
 static bool PreprocessSingleTensor(at::Tensor& t, const torch::Device& target_device,
-                                   bool skip_contiguous, const char* debug_label) {
+                                   bool skip_contiguous, bool is_write_output,
+                                   const char* debug_label) {
   if (!t.defined()) return false;
   bool changed = false;
 
   TORCH_NEURONX_DISPATCH_DEBUG("[PreprocessSingleTensor] ", debug_label, " ENTER dim=", t.dim(),
                                " dtype=", t.scalar_type(), " device=", t.device().str());
 
+  // out= / inplace-self device contract: a write-aliased tensor argument must be
+  // on the Neuron device. PyTorch raises for a mismatched-device output — its
+  // TensorIterator same-device check only exempts CPU 0-dim *inputs*
+  // (`!op.is_output`), never outputs. We must check here rather than rely on a
+  // downstream execution-time check, because a CPU output would otherwise be
+  // silently relocated to Neuron by the 0-dim fast path below (masking the
+  // mismatch, e.g. logsumexp(neuron, out=cpu-scalar)).
+  if (is_write_output && !t.is_privateuseone()) {
+    TORCH_CHECK(false, "Output storage is not on Neuron device");
+  }
+
   // ════════════════════════════════════════════════════════════
   // CPU 0-dim tensors (PyTorch-wrapped scalars)
   //
   // When you write `neuron_tensor + 1`, PyTorch wraps the Python `1` as a
   // 0-dim CPU tensor before dispatch (because the schema says Tensor other).
-  // These are conceptually scalars — they have no device affinity.
+  // These are conceptually scalars — they have no device affinity. Only
+  // *inputs* reach here as CPU 0-dim (a CPU 0-dim output was rejected above),
+  // matching PyTorch's `allow_cpu_scalars_` for inputs.
   //
   // We handle them by extracting the scalar value and creating a new tensor
   // directly on the target device with the correct dtype. This avoids going
@@ -193,7 +207,10 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     // ════════════════════════════════════════════════════════════
     if (arg.isTensor()) {
       auto t = arg.toTensor();
-      if (PreprocessSingleTensor(t, target_device, skip_contiguous, debug_label.c_str())) {
+      const auto& alias_info = schema_args[i].alias_info();
+      const bool is_write_output = alias_info != nullptr && alias_info->isWrite();
+      if (PreprocessSingleTensor(t, target_device, skip_contiguous, is_write_output,
+                                 debug_label.c_str())) {
         args[i] = c10::IValue(std::move(t));
       }
       continue;
@@ -205,10 +222,13 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     if (arg.isTensorList()) {
       auto tl = arg.toTensorList();
       bool list_changed = false;
+      const auto& tl_alias = schema_args[i].alias_info();
+      const bool tl_is_write = tl_alias != nullptr && tl_alias->isWrite();
       for (size_t j = 0; j < tl.size(); ++j) {
         at::Tensor t = tl[j];
         std::string elem_label = debug_label + "[" + std::to_string(j) + "]";
-        if (PreprocessSingleTensor(t, target_device, skip_contiguous, elem_label.c_str())) {
+        if (PreprocessSingleTensor(t, target_device, skip_contiguous, tl_is_write,
+                                   elem_label.c_str())) {
           tl[j] = std::move(t);
           list_changed = true;
         }
@@ -226,13 +246,15 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     if (arg.isList()) {
       auto list = arg.toList();
       bool list_changed = false;
+      const auto& list_alias = schema_args[i].alias_info();
+      const bool list_is_write = list_alias != nullptr && list_alias->isWrite();
       for (size_t j = 0; j < list.size(); ++j) {
         auto elem = list.get(j);
         if (elem.isTensor()) {
           at::Tensor t = elem.toTensor();
           std::string elem_label = debug_label + "[" + std::to_string(j) + "]";
-          if (t.defined() &&
-              PreprocessSingleTensor(t, target_device, skip_contiguous, elem_label.c_str())) {
+          if (t.defined() && PreprocessSingleTensor(t, target_device, skip_contiguous,
+                                                    list_is_write, elem_label.c_str())) {
             list.set(j, c10::IValue(std::move(t)));
             list_changed = true;
           }

@@ -48,13 +48,44 @@ def packed_physical_layout(
     """
     if dtype == torch.int64:
         if len(shape) == 0:
-            return (1, 2), (2, 1), storage_offset * 2
+            # Scalar: append the trailing lane dim of 2 to the empty logical
+            # shape -> (2,). NOT (1, 2): that collides with a 1-D (1,) tensor
+            # (which also maps to (1, 2)) and disagrees with the output-packing
+            # (stack of two 0-dim words -> (2,)) and logical_view (drops last dim:
+            # (2,) -> ()) conventions. (2,) keeps the scalar path consistent and
+            # unambiguous.
+            return (2,), (1,), storage_offset * 2
         return (
             (*tuple(shape), 2),
             (*tuple(s * 2 for s in stride), 1),
             storage_offset * 2,
         )
     raise TypeError(f"dtype {dtype} does not support packed physical layout")
+
+
+def is_packed_physical_view(physical: torch.Tensor, logical: torch.Tensor) -> bool:
+    """Return True if ``physical`` is the packed physical view of ``logical``.
+
+    i.e. ``logical`` has a packed physical representation (int64/float64/
+    complex128) and ``physical`` matches its physical dtype and shape per
+    :func:`packed_physical_layout` (e.g. int64 ``S`` ↔ int32 ``(*S, 2)``, and
+    scalar ``()`` ↔ ``(2,)``).
+
+    Single source of truth for "is this int32 tensor the packed view of that
+    logical tensor?", shared by the graph-boundary gather (``_gather_arg``), the
+    output reinterpret (``_reinterpret_packed_int64_output``), and the
+    provided/inplace-output preparation (``_prepare_execution_tensors``). Works
+    on meta tensors (uses only dtype/shape).
+    """
+    if not (isinstance(physical, torch.Tensor) and isinstance(logical, torch.Tensor)):
+        return False
+    phys_dtype = packed_physical_dtype(logical.dtype)
+    if phys_dtype is None or physical.dtype != phys_dtype or logical.dtype == phys_dtype:
+        return False
+    phys_shape, _, _ = packed_physical_layout(
+        logical.dtype, shape=tuple(logical.shape), stride=tuple(logical.stride())
+    )
+    return tuple(physical.shape) == tuple(phys_shape)
 
 
 def packed_physical_view(t: torch.Tensor) -> torch.Tensor:
@@ -124,7 +155,7 @@ def packed_int64_low_word_alias(t: torch.Tensor) -> torch.Tensor:
 
     physical = packed_physical_view(t)
     if t.ndim == 0:
-        # Scalar: physical is (1, 2) with stride (2, 1)
+        # Scalar: physical is (2,) with stride (1,); low word is lane 0.
         return torch.as_strided(physical, (), (), int(physical.storage_offset()))
     # Non-scalar: take slice [..., 0] of the physical view
     # physical shape: (*logical_shape, 2), stride: (*logical_stride*2, 1)

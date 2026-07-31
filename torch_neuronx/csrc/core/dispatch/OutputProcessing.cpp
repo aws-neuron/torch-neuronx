@@ -4,6 +4,7 @@
 #include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -68,19 +69,50 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
         auto out_tensor = args[arg_idx].toTensor();
         if (!out_tensor.defined()) continue;
 
-        const auto& ospec = entry.output_specs[ret_idx];
-
-        if (out_tensor.sizes().vec() != ospec.shape) {
-          TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] resizing out tensor",
-                                       " arg_idx=", arg_idx);
-          ResizeOutputWithWarning(out_tensor, ospec.shape);
-        }
+        const auto& ospec = entry.output_specs[ret_idx];  // physical (what the NEFF writes)
 
         if (out_tensor.scalar_type() == ospec.dtype) {
+          // Direct reuse: the out='s dtype matches the execution buffer, so it
+          // can serve as the NEFF output directly. Resize to the spec shape if
+          // needed (here physical == logical, so this is the ordinary out=
+          // resize contract).
+          if (out_tensor.sizes().vec() != ospec.shape) {
+            TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] resizing out tensor",
+                                         " arg_idx=", arg_idx);
+            ResizeOutputWithWarning(out_tensor, ospec.shape);
+          }
           outputs[ret_idx] = out_tensor;
           TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using out tensor from arg[",
                                        arg_idx, "] for output[", ret_idx, "]",
                                        " contiguous=", out_tensor.is_contiguous());
+        } else if (IsPackedInt64Enabled() && out_tensor.scalar_type() == c10::ScalarType::Long &&
+                   ospec.dtype == c10::ScalarType::Int && out_tensor.is_contiguous() &&
+                   ret_idx < entry.original_output_specs.size() &&
+                   entry.original_output_specs[ret_idx].dtype == c10::ScalarType::Long &&
+                   packed_int64::physical_sizes(out_tensor.sizes()) == ospec.shape) {
+          // Packed int64 out=: a logical int64 out= is physically int32[..., 2],
+          // which is exactly the packed execution buffer the NEFF writes. Bind
+          // its zero-copy physical view so the NEFF writes straight into the
+          // out='s storage — true out= reuse (data_ptr preserved), with NO
+          // resize to the physical spec shape (the [N] <-> [N,2] resize would
+          // reallocate and emit a spurious warning). The logical_view epilogue
+          // in UpcastExecutionOutputs shares storage with out=, so the ensuing
+          // CopyBackToOriginal is a no-op (data_ptr match). This is what keeps
+          // the packed-int64 out= contracts correct (empty-out= must not warn;
+          // storage must be reused).
+          //
+          // Cases that intentionally fall through to a fresh buffer + copy-back:
+          //   * non-contiguous int64 out= (no clean int32[...,2] view), handled
+          //     by CopyBackToOriginal -> CopyToNonContiguous;
+          //   * dynamic-shape ops (e.g. nonzero) whose exec spec is a max-count
+          //     buffer, not the logical result shape — their handlers strip the
+          //     out= arg before DispatchCore (see DispatchNonzeroImpl) so
+          //     neither this branch nor the direct-reuse resize above ever
+          //     touches the user's out= tensor.
+          outputs[ret_idx] = packed_int64::physical_view(out_tensor);
+          TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] binding packed-int64 out= view",
+                                       " arg_idx=", arg_idx, " for output[", ret_idx, "]",
+                                       " logical_shape=", out_tensor.sizes());
         }
         break;
       }
@@ -245,6 +277,18 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
   // ── Perform upcast using exact inferred dtypes ──
   std::vector<torch::Tensor> upcasted;
   upcasted.reserve(exec_outputs.size());
+
+  // Fused packed int64 outputs arrive as int32[..., 2] — the sign-extend +
+  // interleave were folded into the compute graph. Reinterpret them as int64
+  // (zero-copy) instead of running NeuronSafeCast -> materialize_from_i32.
+  auto upcast_one = [](const torch::Tensor& t, c10::ScalarType target) -> torch::Tensor {
+    if (IsPackedInt64Enabled() && target == c10::ScalarType::Long &&
+        t.scalar_type() == c10::ScalarType::Int && t.dim() >= 1 && t.size(-1) == 2) {
+      return torch_neuronx::packed_int64::logical_view(t);
+    }
+    return NeuronSafeCast(t, target);
+  };
+
   for (size_t i = 0; i < exec_outputs.size(); ++i) {
     auto target_dtype = (i < inferred.size()) ? inferred[i] : c10::ScalarType::Undefined;
     bool dtype_mismatch = target_dtype != c10::ScalarType::Undefined && exec_outputs[i].defined() &&
@@ -260,14 +304,14 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
         TORCH_NEURONX_DISPATCH_DEBUG("[UpcastExecutionOutputs] upcast + copy-back for out/inplace",
                                      " idx=", i, " exec_dtype=", t.scalar_type(),
                                      " target_dtype=", target_dtype);
-        auto casted = NeuronSafeCast(t, target_dtype);
+        auto casted = upcast_one(t, target_dtype);
         CopyBackToOriginal(orig_tensor, casted,
                            "UpcastExecutionOutputs upcast ret_idx=" + std::to_string(i));
         upcasted.push_back(orig_tensor);
         continue;
       }
 
-      upcasted.push_back(NeuronSafeCast(t, target_dtype));
+      upcasted.push_back(upcast_one(t, target_dtype));
       continue;
     }
 

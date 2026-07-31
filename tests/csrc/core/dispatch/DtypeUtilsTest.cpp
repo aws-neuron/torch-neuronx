@@ -39,11 +39,13 @@ TEST(NeuronSafeCastTest, Float64ToFloat32) {
   EXPECT_NEAR(result[0].item<float>(), 1.5f, 1e-6);
 }
 
-TEST(NeuronSafeCastTest, Int64ToInt32) {
+TEST(NeuronSafeCastTest, Int64KeptUnderPackedMode) {
+  // Under packed int64 mode (default), int64 is kept as Long and materialized
+  // on-device as packed int64 (int32[..., 2]) — not downcast to int32.
   auto t = torch::tensor({10L, 20L}, torch::kInt64);
   auto result = NeuronSafeCast(t, c10::ScalarType::Int);
-  EXPECT_EQ(result.scalar_type(), c10::ScalarType::Int);
-  EXPECT_EQ(result[0].item<int>(), 10);
+  EXPECT_EQ(result.scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(result[0].item<int64_t>(), 10);
 }
 
 TEST(NeuronSafeCastTest, Int32ToInt64) {

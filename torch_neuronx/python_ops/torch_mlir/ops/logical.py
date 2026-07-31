@@ -37,7 +37,14 @@ def torch_logical_xor(x, y, out=None, dtype=None):
 
 
 @register_aten(
-    ["aten::bitwise_and", "aten::bitwise_and.out", "aten::bitwise_and.Tensor_out"],
+    [
+        "aten::bitwise_and",
+        "aten::bitwise_and.out",
+        "aten::bitwise_and.Tensor_out",
+        "aten::bitwise_and.Scalar",
+        "aten::bitwise_and.Scalar_out",
+        "aten::bitwise_and_.Scalar",
+    ],
     static_argnames=("dtype",),
 )
 def torch_bitwise_and(x, y, out=None, dtype=None):
@@ -45,7 +52,14 @@ def torch_bitwise_and(x, y, out=None, dtype=None):
 
 
 @register_aten(
-    ["aten::bitwise_or", "aten::bitwise_or.out", "aten::bitwise_or.Tensor_out"],
+    [
+        "aten::bitwise_or",
+        "aten::bitwise_or.out",
+        "aten::bitwise_or.Tensor_out",
+        "aten::bitwise_or.Scalar",
+        "aten::bitwise_or.Scalar_out",
+        "aten::bitwise_or_.Scalar",
+    ],
     static_argnames=("dtype",),
 )
 def torch_bitwise_or(x, y, out=None, dtype=None):
@@ -53,7 +67,14 @@ def torch_bitwise_or(x, y, out=None, dtype=None):
 
 
 @register_aten(
-    ["aten::bitwise_xor", "aten::bitwise_xor.out", "aten::bitwise_xor.Tensor_out"],
+    [
+        "aten::bitwise_xor",
+        "aten::bitwise_xor.out",
+        "aten::bitwise_xor.Tensor_out",
+        "aten::bitwise_xor.Scalar",
+        "aten::bitwise_xor.Scalar_out",
+        "aten::bitwise_xor_.Scalar",
+    ],
     static_argnames=("dtype",),
 )
 def torch_bitwise_xor(x, y, out=None, dtype=None):

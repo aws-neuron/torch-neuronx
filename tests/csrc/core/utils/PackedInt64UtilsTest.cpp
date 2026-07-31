@@ -28,10 +28,18 @@ TEST(PackedInt64Utils, PhysicalSizes_2D) {
 }
 
 TEST(PackedInt64Utils, PhysicalSizes_Scalar) {
+  // Scalar () packs to {2} — a single [low, high] lane pair. NOT {1, 2}: that
+  // would collide with a 1-D {1} tensor and disagree with the output-packing /
+  // logical_view conventions.
   auto sizes = physical_sizes({});
-  ASSERT_EQ(sizes.size(), 2);
-  EXPECT_EQ(sizes[0], 1);
-  EXPECT_EQ(sizes[1], 2);
+  ASSERT_EQ(sizes.size(), 1);
+  EXPECT_EQ(sizes[0], 2);
+}
+
+TEST(PackedInt64Utils, PhysicalStrides_Scalar) {
+  auto strides = physical_strides({});
+  ASSERT_EQ(strides.size(), 1);
+  EXPECT_EQ(strides[0], 1);
 }
 
 TEST(PackedInt64Utils, PhysicalStrides_1D) {
