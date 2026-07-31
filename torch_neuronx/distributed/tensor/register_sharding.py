@@ -378,7 +378,7 @@ def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
     return mm_strategy
 
 
-@register_op_strategy(aten.linear_backward.default)
+@register_op_strategy(aten.linear_backward.default, schema_info=RuntimeSchemaInfo(3))
 def linear_backward_strategy(op_schema: OpSchema) -> OpStrategy:
     """
     Sharding strategy for linear_backward.
