@@ -11,6 +11,7 @@
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "torch-mlir/Conversion/TorchToArith/TorchToArith.h"
 #include "torch-mlir/Conversion/TorchToNeuron/TorchToNeuron.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 
@@ -68,7 +69,8 @@ void TorchConversion::createTorchBackendToStablehloBackendPipeline(
       createConvertChloToStablehloCustomLoweringPass());
   pm.addNestedPass<func::FuncOp>(
       stablehlo::createChloLegalizeToStablehloPass());
-  // Lowering remained ops to Arith
+  // Lower remaining torch scalar ops (e.g. torch.aten.add.int) to arith.
+  pm.addNestedPass<func::FuncOp>(createConvertTorchToArithPass());
 
   // Clean up any non-canonical code introduced above..
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
