@@ -65,6 +65,22 @@ func.func @torch.aten.reciprocal(%arg0: !torch.vtensor<[?,?,?],f32>) -> !torch.v
 
 // -----
 
+// CHECK-LABEL:   func.func @torch.aten.reciprocal$integer(
+// CHECK-SAME:                                                     %[[VAL_0:.*]]: !torch.vtensor<[?,?,?],si64>) -> !torch.vtensor<[?,?,?],f32> {
+// CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,?,?],si64> -> tensor<?x?x?xi64>
+// CHECK:           %[[VAL_2:.*]] = stablehlo.convert %[[VAL_1]] : (tensor<?x?x?xi64>) -> tensor<?x?x?xf32>
+// CHECK:           %[[VAL_3:.*]] = "chlo.constant_like"(%[[VAL_2]]) <{value = 1.000000e+00 : f32}> : (tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+// CHECK:           %[[VAL_4:.*]] = stablehlo.divide %[[VAL_3]], %[[VAL_2]] : tensor<?x?x?xf32>
+// CHECK:           %[[VAL_5:.*]] = torch_c.from_builtin_tensor %[[VAL_4]] : tensor<?x?x?xf32> -> !torch.vtensor<[?,?,?],f32>
+// CHECK:           return %[[VAL_5]] : !torch.vtensor<[?,?,?],f32>
+func.func @torch.aten.reciprocal$integer(%arg0: !torch.vtensor<[?,?,?],si64>) -> !torch.vtensor<[?,?,?],f32> {
+  %0 = torch.aten.reciprocal %arg0 : !torch.vtensor<[?,?,?],si64> -> !torch.vtensor<[?,?,?],f32>
+  return %0 : !torch.vtensor<[?,?,?],f32>
+}
+
+
+// -----
+
 // CHECK-LABEL:   func.func @torch.aten.transpose$basic(
 // CHECK-SAME:                                     %[[VAL_0:.*]]: !torch.vtensor<[4,3],f32>) -> !torch.vtensor<[3,4],f32> {
 // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,3],f32> -> tensor<4x3xf32>

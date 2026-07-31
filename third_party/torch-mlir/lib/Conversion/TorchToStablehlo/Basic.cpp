@@ -932,14 +932,15 @@ LogicalResult ConvertAtenOp<AtenReciprocalOp>::matchAndRewrite(
     AtenReciprocalOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   Value input = adaptor.getSelf();
-  auto inputTy = cast<RankedTensorType>(input.getType());
   auto outTy =
       cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
-  if (!isa<mlir::FloatType>(inputTy.getElementType())) {
-    return op.emitError("only floating-point datatype legalization supported "
+  if (!isa<mlir::FloatType>(outTy.getElementType())) {
+    return op.emitError("only floating-point result legalization supported "
                         "for AtenReciprocalOp");
   }
 
+  input = hlo::promoteType(rewriter, op->getLoc(), input,
+                           outTy.getElementType());
   Value oneTensor =
       hlo::getConstantLike<int64_t>(rewriter, op->getLoc(), 1, input);
   rewriter.replaceOpWithNewOp<stablehlo::DivOp>(op, outTy, oneTensor, input);
