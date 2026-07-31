@@ -100,8 +100,7 @@
       "items": [
         "test_reductions.py",
         "test_torch.py"
-      ],
-      "soft_fail": true
+      ]
     },
     {
       "items": [
