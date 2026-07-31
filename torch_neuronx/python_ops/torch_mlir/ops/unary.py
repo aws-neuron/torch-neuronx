@@ -313,4 +313,16 @@ def torch_sign(x, out=None):
 
 @register_aten(["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"])
 def torch_reciprocal(a, out=None):
+    """Elementwise reciprocal (1/x).
+
+    reciprocal promotes integer/bool inputs to the default floating-point dtype
+    (matching PyTorch's type-promotion semantics). The torch-mlir StableHLO
+    lowering of ``AtenReciprocalOp`` only legalizes floating-point operands
+    ("only floating-point datatype legalization supported for AtenReciprocalOp"),
+    so cast integer/bool inputs up front instead of emitting an illegal integer
+    reciprocal. This is what makes integer ``__rdiv__`` / ``__rtruediv__``
+    (``1 / int_tensor``) lower correctly.
+    """
+    if not a.is_floating_point() and not a.is_complex():
+        a = a.to(torch.get_default_dtype())
     return torch.reciprocal(a)
