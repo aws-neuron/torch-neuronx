@@ -131,6 +131,9 @@ def torch_div_inplace(x, y, rounding_mode=None, out=None):
     ["aten::pow", "aten::pow.Tensor_Scalar_out", "aten::pow.Tensor_Tensor_out"], static_argnums=(1,)
 )
 def torch_pow(x, exponent, out=None):
+    if x.dtype == torch.bool and isinstance(exponent, bool):
+        return x.clone() if exponent else torch.ones_like(x)
+
     # neuronx-cc has no 64-bit-integer `power` opcode, so an int64-promoted result
     # (e.g. `bool ** int` / `int ** int`) is computed in int32 and widened back.
     if torch.result_type(x, exponent) == torch.int64:
