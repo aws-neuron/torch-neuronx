@@ -7,6 +7,7 @@
 #include <torch_neuronx/csrc/c10/neuron/NeuronStream.h>
 #include <torch_neuronx/csrc/core/KernelExecution.h>
 #include <torch_neuronx/csrc/core/NeuronDevice.h>
+#include <torch_neuronx/csrc/core/NeuronStorageImpl.h>
 #include <torch_neuronx/csrc/core/OperationContext.h>
 #include <torch_neuronx/csrc/core/OperationExecutionEngine.h>
 #include <torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h>
@@ -364,12 +365,14 @@ struct AllocatorRegistry {
 
 using AllocationInfo = AllocatorRegistry::AllocationInfo;
 
-// Compile-time materializer hook for PyTorch 2.12+ (StorageImpl::set_materializer).
+// Compile-time materializer hook for PyTorch 2.13+ (StorageImpl::set_materializer).
 #if __has_include(<c10/core/StorageMaterializer.h>)
 #define NEURON_HAS_MATERIALIZER 1
 #include <c10/core/StorageMaterializer.h>
 
-void neuron_materialize_lazy_alloc(c10::StorageImpl* storage) {
+void neuron_deleter(void* ctx);
+
+[[maybe_unused]] void neuron_materialize_lazy_alloc(c10::StorageImpl* storage) {
   void* old_va = storage->data_ptr().get();
   auto* info = AllocatorRegistry::getInstance().find(old_va);
   if (!info || !info->alloc_event) return;
@@ -387,7 +390,9 @@ void neuron_materialize_lazy_alloc(c10::StorageImpl* storage) {
 
   c10::DataPtr new_data_ptr(new_va, info, &neuron_deleter,
                             c10::Device(c10::DeviceType::PrivateUse1, info->device));
-  auto old_data_ptr = storage->set_data_ptr_no_materialize(std::move(new_data_ptr));
+  auto* neuron_storage = static_cast<c10_neuron::NeuronStorageImpl*>(storage);
+  auto old_data_ptr =
+      neuron_storage->replace_data_ptr_without_materializing(std::move(new_data_ptr));
   old_data_ptr.release_context();
 
   munmap(old_va, info->size);
