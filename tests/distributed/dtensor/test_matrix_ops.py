@@ -41,6 +41,7 @@ common_distributed.TIMEOUT_OVERRIDE["test_backward_output_mask_no_grad_weight"] 
 common_distributed.TIMEOUT_OVERRIDE["test_backward_direct_strategy4_grad_output_partial"] = 600
 common_distributed.TIMEOUT_OVERRIDE["test_backward_direct_strategy5_input_partial"] = 600
 common_distributed.TIMEOUT_OVERRIDE["test_backward_direct_strategy6_weight_partial"] = 600
+common_distributed.TIMEOUT_OVERRIDE["test_backward_output_mask_not_cached"] = 600
 
 
 class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
@@ -669,6 +670,80 @@ class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
         self.assertIsNotNone(grad_input)
         self.assertIsNotNone(grad_weight)
         self.assertIsNotNone(grad_bias)
+
+    @with_comms
+    def test_backward_output_mask_not_cached(self):
+        """Two linear_backward calls with identical input specs but different
+        output_mask must not share a sharding-prop cache entry.
+
+        output_mask is arg 3, a non-tensor list[bool] that decides which of
+        (grad_input, grad_weight, grad_bias) exist. RuntimeSchemaInfo(3) is what
+        puts it in the cache key; without it the [True, False, False] spec
+        (grad_input only) is reused for [True, True, True], and the real
+        non-scalar grad_weight then hits "output tensor should be scalar!" in
+        OpDispatcher.wrap, because a None spec means the output must be absent.
+        """
+        mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        batch, in_feat, out_feat = 32, 64, 32
+
+        torch.manual_seed(42)
+        inp_local = torch.rand(
+            batch,
+            in_feat,
+            device=self.device_type,
+            dtype=torch.bfloat16,
+        )
+        grad_out_local = torch.rand(
+            batch,
+            out_feat,
+            device=self.device_type,
+            dtype=torch.bfloat16,
+        )
+        weight_local = torch.rand(
+            out_feat,
+            in_feat,
+            device=self.device_type,
+            dtype=torch.bfloat16,
+        )
+
+        d_inp = DTensor.from_local(inp_local, mesh, [Replicate()])
+        d_grad = DTensor.from_local(grad_out_local, mesh, [Replicate()])
+        d_weight = DTensor.from_local(weight_local, mesh, [Replicate()])
+
+        # Populate the cache with the grad_input-only spec.
+        grad_input, grad_weight, grad_bias = torch.ops.aten.linear_backward.default(
+            d_inp,
+            d_grad,
+            d_weight,
+            [True, False, False],
+        )
+        self.assertIsNotNone(grad_input)
+        self.assertIsNone(grad_weight)
+        self.assertIsNone(grad_bias)
+
+        # Same input specs, wider mask: must re-run sharding prop, not reuse above.
+        grad_input, grad_weight, grad_bias = torch.ops.aten.linear_backward.default(
+            d_inp,
+            d_grad,
+            d_weight,
+            [True, True, True],
+        )
+        self.assertIsNotNone(grad_input)
+        self.assertIsNotNone(grad_weight)
+        self.assertIsNotNone(grad_bias)
+        self.assertEqual(grad_weight.shape, (out_feat, in_feat))
+        self.assertEqual(grad_bias.shape, (out_feat,))
+
+        # And the reverse order, so neither mask can poison the other.
+        grad_input, grad_weight, grad_bias = torch.ops.aten.linear_backward.default(
+            d_inp,
+            d_grad,
+            d_weight,
+            [True, False, False],
+        )
+        self.assertIsNotNone(grad_input)
+        self.assertIsNone(grad_weight)
+        self.assertIsNone(grad_bias)
 
 
 if __name__ == "__main__":
