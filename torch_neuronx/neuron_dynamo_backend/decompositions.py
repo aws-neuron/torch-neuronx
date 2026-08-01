@@ -2708,6 +2708,17 @@ def index_reduce_decomposition(input, dim, index, source, reduce, include_self=T
     if dim < 0:
         dim += input.ndim
 
+    if input.ndim == 0:
+        result = index_reduce_decomposition(
+            input.unsqueeze(0),
+            0,
+            index,
+            source.unsqueeze(0) if source.ndim == 0 else source,
+            reduce,
+            include_self,
+        )
+        return result.squeeze(0)
+
     n = source.shape[dim]
 
     # Reduction identity for filling positions that any index targets when
