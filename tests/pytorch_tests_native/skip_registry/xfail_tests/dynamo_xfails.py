@@ -1,7 +1,6 @@
 DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH = [
     "AotAutogradFallbackTests::test_autograd_function_tangent_mutation",
     "ContextlibContextManagerTests::test_functorch_low_level_gb_True",
-    "CtxManagerTests::test_autocast_decorator",
     "CtxManagerTests::test_is_autocast_cpu_enabled",
     "DynamicShapesCtxManagerTests::test_cuda_amp_autocast_dynamic_shapes",
     "DynamicShapesFunctionTests::test_dict_id_guard_dynamic_shapes",
@@ -471,7 +470,6 @@ DYNAMO_STREAM_EVENT_TYPE_MISMATCH = [
     "DynamicShapesCtxManagerTests::test_cuda_event_method_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_cuda_stream_compared_with_stream_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_cuda_stream_context_manager1_dynamic_shapes",
-    "TestStreams::test_cuda_event_record_on_stream",
 ]
 
 DYNAMO_TUPLE_INDEX_OUT_OF_RANGE = [
