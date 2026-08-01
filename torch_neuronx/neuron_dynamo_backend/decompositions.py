@@ -4284,15 +4284,14 @@ def erfinv_decomposition(y):
 
 @register_decomposition([aten.argmin.default])
 def argmin_decomposition(self, dim=None, keepdim=False):
-    """Decompose argmin into argmax of the negated input.
+    """Decompose argmin via min.dim, mirroring ``argmax_decomposition``.
 
-    argmin has no Neuron lowering (leaves an unlegalized ``torch.constant.bool``)
-    while argmax does. Negation preserves the first-occurrence tie-break, so
-    ``argmin(x) == argmax(-x)``.
+    aten.argmin has no direct Neuron lowering, but min.dim does and carries the
+    winning index as its second result.
     """
     if dim is None:
-        return torch.argmax(self.reshape(-1).neg(), dim=0)
-    return torch.argmax(self.neg(), dim=dim, keepdim=keepdim)
+        return self.reshape(-1).min(dim=0).indices
+    return self.min(dim=dim, keepdim=keepdim).indices
 
 
 @register_decomposition([aten.kthvalue.default])

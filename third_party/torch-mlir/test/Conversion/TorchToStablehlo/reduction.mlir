@@ -85,3 +85,39 @@ func.func @torch.aten.amin$rank0(%arg0: !torch.vtensor<[],f32>) -> !torch.vtenso
   %0 = torch.aten.amin %arg0, %dims, %true : !torch.vtensor<[],f32>, !torch.list<int>, !torch.bool -> !torch.vtensor<[],f32>
   return %0 : !torch.vtensor<[],f32>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.max.dim$unsigned(
+// CHECK:         stablehlo.compare  GE, %{{.*}}, %{{.*}},  UNSIGNED : (tensor<ui8>, tensor<ui8>) -> tensor<i1>
+// CHECK:         stablehlo.compare  EQ, %{{.*}}, %{{.*}},  UNSIGNED : (tensor<ui8>, tensor<ui8>) -> tensor<i1>
+func.func @torch.aten.max.dim$unsigned(%arg0: !torch.vtensor<[4,8],ui8>) -> (!torch.vtensor<[4],ui8>, !torch.vtensor<[4],si64>) {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %values, %indices = torch.aten.max.dim %arg0, %int1, %false : !torch.vtensor<[4,8],ui8>, !torch.int, !torch.bool -> !torch.vtensor<[4],ui8>, !torch.vtensor<[4],si64>
+  return %values, %indices : !torch.vtensor<[4],ui8>, !torch.vtensor<[4],si64>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.min.dim$unsigned(
+// CHECK:         stablehlo.compare  LE, %{{.*}}, %{{.*}},  UNSIGNED : (tensor<ui32>, tensor<ui32>) -> tensor<i1>
+// CHECK:         stablehlo.compare  EQ, %{{.*}}, %{{.*}},  UNSIGNED : (tensor<ui32>, tensor<ui32>) -> tensor<i1>
+func.func @torch.aten.min.dim$unsigned(%arg0: !torch.vtensor<[4,8],ui32>) -> (!torch.vtensor<[4],ui32>, !torch.vtensor<[4],si64>) {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %values, %indices = torch.aten.min.dim %arg0, %int1, %false : !torch.vtensor<[4,8],ui32>, !torch.int, !torch.bool -> !torch.vtensor<[4],ui32>, !torch.vtensor<[4],si64>
+  return %values, %indices : !torch.vtensor<[4],ui32>, !torch.vtensor<[4],si64>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.max.dim$signed(
+// CHECK:         stablehlo.compare  GE, %{{.*}}, %{{.*}},  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+// CHECK:         stablehlo.compare  EQ, %{{.*}}, %{{.*}},  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+func.func @torch.aten.max.dim$signed(%arg0: !torch.vtensor<[4,8],si32>) -> (!torch.vtensor<[4],si32>, !torch.vtensor<[4],si64>) {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %values, %indices = torch.aten.max.dim %arg0, %int1, %false : !torch.vtensor<[4,8],si32>, !torch.int, !torch.bool -> !torch.vtensor<[4],si32>, !torch.vtensor<[4],si64>
+  return %values, %indices : !torch.vtensor<[4],si32>, !torch.vtensor<[4],si64>
+}

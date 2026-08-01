@@ -237,9 +237,12 @@ createReduceOpReturnIndices(ConversionPatternRewriter &rewriter, Operation *op,
   if (isa<mlir::FloatType>(inputTy.getElementType())) {
     compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
         rewriter.getContext(), stablehlo::ComparisonType::FLOAT);
-  } else if (isa<mlir::IntegerType>(inputTy.getElementType())) {
+  } else if (auto intTy =
+                 dyn_cast<mlir::IntegerType>(inputTy.getElementType())) {
     compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
-        rewriter.getContext(), stablehlo::ComparisonType::SIGNED);
+        rewriter.getContext(), intTy.isUnsigned()
+                                   ? stablehlo::ComparisonType::UNSIGNED
+                                   : stablehlo::ComparisonType::SIGNED);
   }
   stablehlo::ComparisonDirectionAttr compareGeDirectionAttr =
       stablehlo::ComparisonDirectionAttr::get(
