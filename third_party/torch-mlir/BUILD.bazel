@@ -299,6 +299,20 @@ cc_library(
 )
 
 cc_library(
+    name = "TorchMLIRTorchToArith",
+    srcs = glob(["lib/Conversion/TorchToArith/*.cpp"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToArith/*.h"]),
+    strip_include_prefix = "include",
+    deps = [
+        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionUtils",
+        ":TorchMLIRTorchBackendTypeConversion",
+        ":TorchMLIRTorchConversionDialect",
+        "@llvm-project//mlir:Dialect",
+    ],
+)
+
+cc_library(
     name = "TorchMLIRTorchToNeuron",
     srcs = glob(["lib/Conversion/TorchToNeuron/*.cpp"]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchToNeuron/*.h"]),
@@ -326,6 +340,7 @@ cc_library(
     defines = ["TORCH_MLIR_ENABLE_STABLEHLO"],
     strip_include_prefix = "include",
     deps = [
+        ":TorchMLIRTorchToArith",
         ":TorchMLIRTorchToNeuron",
         ":TorchMLIRTorchToStablehlo",
     ],
@@ -347,6 +362,7 @@ cc_library(
         ":TorchMLIRTorchConversionPassesIncGen",
         ":TorchMLIRTorchDialect",
         ":TorchMLIRTorchPasses",
+        ":TorchMLIRTorchToArith",
         ":TorchMLIRTorchToNeuron",
         ":TorchMLIRTorchToStablehlo",
         "@llvm-project//mlir:ConversionPasses",

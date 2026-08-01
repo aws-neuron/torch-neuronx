@@ -9,6 +9,7 @@
 
 #include "torch-mlir/Conversion/Passes.h"
 
+#include "torch-mlir/Conversion/TorchToArith/TorchToArith.h"
 #include "torch-mlir/Conversion/TorchToNeuron/TorchToNeuron.h"
 
 #ifdef TORCH_MLIR_ENABLE_STABLEHLO
