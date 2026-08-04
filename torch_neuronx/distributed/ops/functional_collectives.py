@@ -80,6 +80,45 @@ def reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
     return outputs
 
 
+def all_reduce(input, reduce_op, group_name):
+    """Neuron implementation of _c10d_functional::all_reduce.
+
+    The CompositeExplicitAutograd fallback clones the input and does an in-place
+    allreduce on the clone, but the resulting Work/Future lifecycle doesn't
+    synchronize correctly with torch_neuronx.synchronize(), causing one rank to
+    hang. This PrivateUse1 dispatch avoids that path entirely.
+    """
+    output = input.clone(memory_format=torch.contiguous_format)
+    group = _resolve_process_group(group_name)
+
+    opts = torch._C._distributed_c10d.AllreduceOptions()
+    opts.asyncOp = False
+    opts.reduceOp = _REDUCE_OP_MAP[reduce_op]
+
+    work = group.allreduce([output], opts)
+    torch._C._distributed_c10d._register_work(output, work)
+    return output
+
+
+def all_reduce_coalesced(inputs, reduce_op, group_name):
+    """Neuron implementation of _c10d_functional::all_reduce_coalesced.
+
+    Inputs are left unmodified; returns reduced clones. Same asyncOp=False
+    rationale as all_reduce.
+    """
+    outputs = [t.clone(memory_format=torch.contiguous_format) for t in inputs]
+    group = _resolve_process_group(group_name)
+
+    opts = torch._C._distributed_c10d.AllreduceCoalescedOptions()
+    opts.asyncOp = False
+    opts.reduceOp = _REDUCE_OP_MAP[reduce_op]
+
+    work = group.allreduce_coalesced(outputs, opts)
+    for output in inputs:
+        torch._C._distributed_c10d._register_work(output, work)
+    return outputs
+
+
 def register_neuron_collectives():
     torch.library.impl(
         "_c10d_functional::all_gather_into_tensor_out", "PrivateUse1", all_gather_into_tensor_out
@@ -94,4 +133,8 @@ def register_neuron_collectives():
         "_c10d_functional::reduce_scatter_tensor_coalesced",
         "PrivateUse1",
         reduce_scatter_tensor_coalesced,
+    )
+    torch.library.impl("_c10d_functional::all_reduce", "PrivateUse1", all_reduce)
+    torch.library.impl(
+        "_c10d_functional::all_reduce_coalesced", "PrivateUse1", all_reduce_coalesced
     )
