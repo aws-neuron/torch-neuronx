@@ -18,7 +18,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_native" / "runner"))
 
 from run_upstream_tests import (
-    PYTEST_EXIT_NO_COLLECT,
     TIMEOUT_EXIT_CODES,
     WORKSPACE_ROOT,
     build_env_lock_shim,
@@ -28,6 +27,7 @@ from run_upstream_tests import (
     needs_process_isolation_flag,
     parse_args,
     preload_env,
+    retry_fully_cleared,
     retry_paths,
     should_retry,
 )
@@ -59,6 +59,77 @@ def test_timeout_exit_codes_excluded_from_retry():
     # retry decision. Guards against future tweaks to should_retry.
     for code in TIMEOUT_EXIT_CODES:
         assert should_retry(code) is False
+
+
+# ---------------------------------------------------------------------------
+# retry_fully_cleared — the retry pass may flip a shard green only when the
+# main + retry JSON reports agree every failure was re-run and cleared.
+# ---------------------------------------------------------------------------
+def _write_json_report(path: Path, outcomes: dict[str, str]) -> None:
+    """Write a minimal pytest-json report with the given nodeid → outcome map."""
+    import json
+
+    tests = [{"nodeid": nodeid, "outcome": outcome} for nodeid, outcome in outcomes.items()]
+    path.write_text(json.dumps({"tests": tests}))
+
+
+def test_retry_fully_cleared_all_failures_recovered(tmp_path):
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"
+    _write_json_report(main, {"a::t1": "failed", "a::t2": "error"})
+    _write_json_report(retry, {"a::t1": "passed", "a::t2": "passed"})
+    assert retry_fully_cleared(main, retry, retry_exit=0) is True
+
+
+def test_retry_fully_cleared_subtest_failure_not_rerun(tmp_path):
+    # The real bug: a subtest-only failure never lands in --last-failed, so
+    # the retry never re-runs it and it is absent from the retry report.
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"
+    _write_json_report(main, {"a::subtest_parent": "failed"})
+    _write_json_report(retry, {})  # retry collected nothing
+    assert retry_fully_cleared(main, retry, retry_exit=5) is False
+
+
+def test_retry_fully_cleared_partial_coverage(tmp_path):
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"
+    _write_json_report(main, {"a::t1": "failed", "a::subtest": "failed"})
+    # Only t1 was re-run and passed; the subtest failure is missing → red.
+    _write_json_report(retry, {"a::t1": "passed"})
+    assert retry_fully_cleared(main, retry, retry_exit=0) is False
+
+
+def test_retry_fully_cleared_still_failing(tmp_path):
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"
+    _write_json_report(main, {"a::t1": "failed"})
+    _write_json_report(retry, {"a::t1": "failed"})
+    assert retry_fully_cleared(main, retry, retry_exit=1) is False
+
+
+def test_retry_fully_cleared_recovered_to_skipped_or_xfailed(tmp_path):
+    # A main failure that re-runs as any non-failing outcome counts as cleared.
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"
+    _write_json_report(main, {"a::t1": "failed", "a::t2": "error"})
+    _write_json_report(retry, {"a::t1": "skipped", "a::t2": "xfailed"})
+    assert retry_fully_cleared(main, retry, retry_exit=0) is True
+
+
+def test_retry_fully_cleared_missing_retry_report(tmp_path):
+    main = tmp_path / "main.json"
+    retry = tmp_path / "retry.json"  # never written
+    _write_json_report(main, {"a::t1": "failed"})
+    assert retry_fully_cleared(main, retry, retry_exit=0) is False
+
+
+def test_retry_fully_cleared_unreadable_main_report(tmp_path):
+    # If we can't read the main report we can't prove what failed → fail closed.
+    main = tmp_path / "main.json"  # never written
+    retry = tmp_path / "retry.json"
+    _write_json_report(retry, {})
+    assert retry_fully_cleared(main, retry, retry_exit=0) is False
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +415,6 @@ def test_parse_args_requires_at_least_one_item():
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-def test_pytest_exit_no_collect_constant():
-    # Ensures the constant matches pytest's documented behavior. If pytest
-    # ever changes this, the "treat 5 as success on retry" logic would
-    # silently break.
-    assert PYTEST_EXIT_NO_COLLECT == 5
-
-
 def test_timeout_exit_codes_includes_signals():
     # 124 = GNU timeout(1) on plain timeout, 130 = SIGINT (ctrl+C),
     # 137 = SIGKILL after grace. Locked down so future edits don't drop one.
