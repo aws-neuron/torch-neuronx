@@ -112,12 +112,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Layer norm backward failures",
-        tests=[
-            "test_layer_norm_bwd_req_grad",
-        ],
-    ),
-    SkipGroup(
         reason="Device index out of range",
         tests=[
             "test_ring_attention_sdpa",
@@ -212,17 +206,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_dtensor_compile.py::TestDTensorCompile::test_unwrap_async_collective_tensor_tangent",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Neuron's allreduce returns the output with a preserved dim of size 1,"
-            " while upstream _c10d_functional.all_reduce squeezes to scalar. During"
-            " output_tp.sum().backward(), DTensor's OpDispatcher.wrap asserts the"
-            " gradient is scalar and raises 'output tensor should be scalar!' on all ranks."
-        ),
-        tests=[
-            "test_tp_examples.py::DistTensorParallelExampleTest::test_transformer_req_grad_seq_parallel_float32_thaw_layers_0_attention_wv__layers_0_feed_forward_w1__layers_1_feed_forward_w2__layers_1_ffn_norm__output__tok_embeddings",
         ],
     ),
     SkipGroup(

@@ -87,7 +87,6 @@ DTYPE_MISMATCH_OBJECT_COMPARISON = [
     "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv_backend_slow3d_dilated_has_bias_True_strided_False_contiguous_True_neuron",
     "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv_backend_slow3d_dilated_has_bias_True_strided_True_contiguous_False_neuron",
     "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv_backend_slow3d_dilated_has_bias_True_strided_True_contiguous_True_neuron",
-    "test_foreach.py::TestForeachNEURON::test_parity__foreach_add_fastpath_outplace_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_mul_fastpath_inplace_neuron_float64",
     "test_tensor_creation_ops.py::TestLikeTensorCreationNEURON::test_randn_like_neuron",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_large_linspace_neuron_int64",

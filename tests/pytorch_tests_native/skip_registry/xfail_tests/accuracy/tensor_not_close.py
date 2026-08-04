@@ -265,7 +265,6 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_remainder_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
-    "test_torch.py::TestTorchDeviceTypeNEURON::test_cdist_large_neuron",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_copy_math_view_neuron",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_copy_transpose_math_view_neuron_float32",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_corrcoef_neuron_float32",

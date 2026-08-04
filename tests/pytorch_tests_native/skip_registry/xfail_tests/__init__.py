@@ -25,9 +25,6 @@ from .dtype_mismatch.object_comparison import (
     DTYPE_MISMATCH_OBJECT_COMPARISON as DTYPE_MISMATCH_OBJECT_COMPARISON,
 )
 from .dynamo_xfails import (
-    DYNAMO_ADDMM_COMPILATION_FAILURE as DYNAMO_ADDMM_COMPILATION_FAILURE,
-)
-from .dynamo_xfails import (
     DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS as DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
 )
 from .dynamo_xfails import (
