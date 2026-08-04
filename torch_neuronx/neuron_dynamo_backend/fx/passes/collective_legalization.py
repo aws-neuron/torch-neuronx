@@ -41,8 +41,10 @@ def _get_process_group_ranks(group_name: str) -> list[list[int]]:
     """
     Get all replica groups for a process group (SPMD-compatible).
 
-    For mesh-based PGs, returns full replica groups derived from mesh topology.
-    For non-mesh PGs, returns the current rank's group wrapped in a list.
+    For mesh-based PGs (registered from DeviceMesh topology) and raw
+    dist.new_group PGs (captured at creation), returns the full replica groups.
+    If the group cannot be resolved, falls back to the default world group so
+    legalization degrades gracefully instead of aborting compilation.
 
     Args:
         group_name: Process group identifier (e.g., "0", "3", etc.)

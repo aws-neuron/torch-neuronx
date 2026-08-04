@@ -2,6 +2,7 @@
 Unit tests for collective_legalization fx pass.
 """
 
+import inspect
 import os
 from unittest.mock import MagicMock, patch
 
@@ -10,10 +11,15 @@ import torch
 import torch.distributed as dist
 from torch.fx import GraphModule, Node
 
+from torch_neuronx.distributed import mesh_registry
 from torch_neuronx.neuron_dynamo_backend.fx.passes import collective_legalization
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     CollectiveLegalization,
 )
+
+
+def _process_group(group_name):
+    return MagicMock(spec=dist.ProcessGroup, group_name=group_name)
 
 
 class TestGetProcessGroupRanks:
@@ -31,43 +37,46 @@ class TestGetProcessGroupRanks:
         mock_get_all.assert_called_once_with("test_group")
         assert result == [[0, 1], [2, 3]]
 
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.distributed.get_world_size", return_value=4)
     @patch(
         "torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization.get_all_replica_groups"
     )
-    @patch("torch.distributed.get_world_size")
-    @patch("torch.distributed.is_initialized")
-    def test_get_process_group_ranks_fallback_initialized(
-        self, mock_is_init, mock_world_size, mock_get_all
+    def test_get_process_group_ranks_unresolved_falls_back_to_world(
+        self, mock_get_all, mock_world_size, mock_is_initialized
     ):
-        """Test fallback when get_all_replica_groups fails but distributed is initialized."""
-        mock_get_all.side_effect = Exception("Failed to get replica groups")
-        mock_is_init.return_value = True
-        mock_world_size.return_value = 4
+        """A failed lookup degrades to the full world group instead of aborting."""
+        mock_get_all.side_effect = RuntimeError("unresolved group")
 
         result = collective_legalization._get_process_group_ranks("invalid_group")
 
-        assert result == [[0, 1, 2, 3]]  # Should fallback to world group wrapped in list
+        assert result == [[0, 1, 2, 3]]
 
+    @patch("torch.distributed.is_initialized", return_value=False)
     @patch(
         "torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization.get_all_replica_groups"
     )
-    @patch("torch.distributed.is_initialized")
-    def test_get_process_group_ranks_fallback_not_initialized(self, mock_is_init, mock_get_all):
-        """Test fallback behavior when distributed is not initialized"""
-        mock_get_all.side_effect = Exception("Failed to get replica groups")
-        mock_is_init.return_value = False
+    def test_get_process_group_ranks_fallback_not_initialized(
+        self, mock_get_all, mock_is_initialized
+    ):
+        """When dist is not initialized, the unresolved fallback uses world_size=1."""
+        mock_get_all.side_effect = RuntimeError("unresolved group")
 
         result = collective_legalization._get_process_group_ranks("invalid_group")
 
-        assert result == [[0]]  # Should return single rank wrapped in list
+        assert result == [[0]]
 
 
 class TestNeuronSpmdDisable:
     """Test TORCH_NEURONX_SPMD_DISABLE env var bypasses the mesh registry."""
 
     @patch("torch.distributed.get_process_group_ranks", return_value=[0, 1])
+    @patch("torch.distributed.get_world_size", return_value=4)
+    @patch("torch.distributed.is_initialized", return_value=True)
     @patch("torch.distributed.distributed_c10d._resolve_process_group")
-    def test_disable_bypasses_registry(self, mock_resolve, mock_ranks):
+    def test_disable_bypasses_registry(
+        self, mock_resolve, mock_is_initialized, mock_world_size, mock_ranks
+    ):
         """When TORCH_NEURONX_SPMD_DISABLE is set, get_all_replica_groups falls back to per-rank."""
         from torch_neuronx.distributed.mesh_registry import (
             _MESH_REGISTRY,
@@ -98,6 +107,280 @@ class TestNeuronSpmdDisable:
             assert result == [[0, 1], [2, 3]]
         finally:
             _MESH_REGISTRY.pop("test_pg2", None)
+
+
+class TestRawNewGroupCapture:
+    """Test raw new_group capture without requiring Neuron hardware."""
+
+    @pytest.fixture(autouse=True)
+    def reset_registry(self):
+        mesh_registry.clear_mesh_registry()
+        yield
+        mesh_registry.clear_mesh_registry()
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_registers_complete_partition(self, mock_world_size, mock_new_group):
+        pg01 = _process_group("pg_01")
+        pg23 = _process_group("pg_23")
+        mock_new_group.side_effect = [pg01, pg23]
+
+        mesh_registry._patched_new_group(ranks=[0, 1])
+        mesh_registry._patched_new_group(ranks=[2, 3])
+
+        expected = [[0, 1], [2, 3]]
+        assert mesh_registry.get_all_replica_groups("pg_01") == expected
+        assert mesh_registry.get_all_replica_groups("pg_23") == expected
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_nonmember_call_still_completes_partition(self, mock_world_size, mock_new_group):
+        pg01 = _process_group("pg_01")
+        mock_new_group.side_effect = [pg01, mesh_registry.dist.GroupMember.NON_GROUP_MEMBER]
+
+        mesh_registry._patched_new_group(ranks=[0, 1])
+        mesh_registry._patched_new_group(ranks=[2, 3])
+
+        assert mesh_registry.get_all_replica_groups("pg_01") == [[0, 1], [2, 3]]
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_incomplete_partition_warns_and_uses_local_ranks(self, mock_world_size, mock_new_group):
+        pg23 = _process_group("pg_23")
+        mock_new_group.return_value = pg23
+        mesh_registry._patched_new_group(ranks=[2, 3])
+
+        with (
+            patch.object(
+                mesh_registry.dist.distributed_c10d,
+                "_resolve_process_group",
+                return_value=pg23,
+            ),
+            patch.object(mesh_registry.dist, "is_initialized", return_value=True),
+            patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[2, 3]),
+            patch.object(mesh_registry.logger, "warning") as mock_warning,
+        ):
+            result = mesh_registry.get_all_replica_groups("pg_23")
+
+        assert result == [[2, 3]]
+        mock_warning.assert_called_once_with(
+            "No complete replica groups registered for process group 'pg_23' in SPMD mode; "
+            "falling back to local ranks [2, 3] in world size 4."
+        )
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_incomplete_partition_does_not_poison_later_partition(
+        self, mock_world_size, mock_new_group
+    ):
+        pg_invalid = _process_group("pg_invalid")
+        pg01 = _process_group("pg_01")
+        pg_overlap = _process_group("pg_overlap")
+        pg23 = _process_group("pg_23")
+        mock_new_group.side_effect = [pg_invalid, pg_overlap, pg01, pg23]
+
+        mesh_registry._patched_new_group(ranks=[0, 1])
+        mesh_registry._patched_new_group(ranks=[1, 2])
+        mesh_registry._patched_new_group(ranks=[0, 1])
+        mesh_registry._patched_new_group(ranks=[2, 3])
+
+        assert mesh_registry.get_all_replica_groups("pg_01") == [[0, 1], [2, 3]]
+        with (
+            patch.object(
+                mesh_registry.dist.distributed_c10d,
+                "_resolve_process_group",
+                return_value=pg_invalid,
+            ),
+            patch.object(mesh_registry.dist, "is_initialized", return_value=True),
+            patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[1, 2]),
+            patch.object(mesh_registry.logger, "warning") as mock_warning,
+        ):
+            result = mesh_registry.get_all_replica_groups("pg_invalid")
+
+        assert result == [[1, 2]]
+        mock_warning.assert_called_once_with(
+            "No complete replica groups registered for process group 'pg_invalid' in SPMD mode; "
+            "falling back to local ranks [1, 2] in world size 4."
+        )
+
+    @pytest.mark.parametrize("member_cell", ["a", "b"])
+    def test_interleaved_device_and_cpu_partitions(self, member_cell):
+        """vLLM's device/CPU group order closes both independent partitions."""
+        nonmember = mesh_registry.dist.GroupMember.NON_GROUP_MEMBER
+        if member_cell == "a":
+            process_groups = [
+                _process_group("device_a"),
+                _process_group("cpu_a"),
+                nonmember,
+                nonmember,
+            ]
+            local_names = ["device_a", "cpu_a"]
+        else:
+            process_groups = [
+                nonmember,
+                nonmember,
+                _process_group("device_b"),
+                _process_group("cpu_b"),
+            ]
+            local_names = ["device_b", "cpu_b"]
+
+        with (
+            patch.object(mesh_registry, "_original_new_group", side_effect=process_groups),
+            patch.object(mesh_registry.dist, "get_world_size", return_value=4),
+        ):
+            mesh_registry._patched_new_group([0, 1])
+            mesh_registry._patched_new_group([0, 1], backend="gloo")
+            mesh_registry._patched_new_group([2, 3])
+            mesh_registry._patched_new_group([2, 3], backend="gloo")
+
+        expected = [[0, 1], [2, 3]]
+        for local_name in local_names:
+            assert mesh_registry.get_all_replica_groups(local_name) == expected
+        assert mesh_registry._RAW_PENDING == []
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_use_local_synchronization_member_only_sequence_falls_back(
+        self, mock_world_size, mock_new_group
+    ):
+        """With use_local_synchronization=True a rank only calls new_group for the
+        groups it belongs to, so the partition never tiles the world and lookup
+        falls back to local ranks instead of fabricating a full partition."""
+        pg01 = _process_group("pg_01")
+        mock_new_group.return_value = pg01
+
+        mesh_registry._patched_new_group(ranks=[0, 1], use_local_synchronization=True)
+
+        # The flag reaches torch unchanged.
+        assert mock_new_group.call_args.kwargs["use_local_synchronization"] is True
+
+        with (
+            patch.object(
+                mesh_registry.dist.distributed_c10d,
+                "_resolve_process_group",
+                return_value=pg01,
+            ),
+            patch.object(mesh_registry.dist, "is_initialized", return_value=True),
+            patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[0, 1]),
+            patch.object(mesh_registry.logger, "warning") as mock_warning,
+        ):
+            result = mesh_registry.get_all_replica_groups("pg_01")
+
+        assert result == [[0, 1]]
+        mock_warning.assert_called_once()
+
+    def test_registry_lookup_returns_defensive_copy(self):
+        mesh_registry._register_replica_groups("pg", [[0, 1], [2, 3]])
+
+        result = mesh_registry.get_all_replica_groups("pg")
+        result[0].append(99)
+
+        assert mesh_registry.get_all_replica_groups("pg") == [[0, 1], [2, 3]]
+
+
+def _new_group_positional_args(**overrides):
+    """Build a positional arg tuple from torch's ``new_group`` signature.
+
+    Derived rather than hand-written so a torch parameter reorder changes the
+    positions under test instead of leaving a stale hardcoded tuple that keeps
+    passing while production reads the wrong argument.
+
+    Reads the unpatched function: importing torch_neuronx rebinds
+    ``dist.new_group`` to a ``*args, **kwargs`` wrapper whose signature exposes
+    no parameter names.
+    """
+    parameters = inspect.signature(mesh_registry._original_new_group).parameters
+    names = list(parameters)
+    last = max(names.index(name) for name in overrides)
+    return tuple(overrides.get(name, parameters[name].default) for name in names[: last + 1])
+
+
+class TestNormalizeNewGroupRanks:
+    """Directly exercise ``_normalize_new_group_ranks`` argument extraction."""
+
+    def test_sort_ranks_resolves_by_name_not_position(self):
+        """``sort_ranks`` binds by parameter name, wherever torch places it."""
+        args = _new_group_positional_args(ranks=[3, 1, 2], sort_ranks=True)
+        result = mesh_registry._normalize_new_group_ranks(args, {}, world_size=4)
+        assert result == (1, 2, 3)
+
+    def test_sort_ranks_false_positional_preserves_order(self):
+        """``sort_ranks=False`` (positional) keeps the caller's rank order."""
+        args = _new_group_positional_args(ranks=[3, 1, 2], sort_ranks=False)
+        result = mesh_registry._normalize_new_group_ranks(args, {}, world_size=4)
+        assert result == (3, 1, 2)
+
+    def test_positional_sort_ranks_matches_keyword_form(self):
+        """The positional and keyword spellings of one call agree.
+
+        A position-based read would diverge from the keyword read as soon as
+        torch inserts a parameter ahead of ``sort_ranks``.
+        """
+        positional = mesh_registry._normalize_new_group_ranks(
+            _new_group_positional_args(ranks=[3, 1, 2], sort_ranks=False), {}, world_size=4
+        )
+        keyword = mesh_registry._normalize_new_group_ranks(
+            (), {"ranks": [3, 1, 2], "sort_ranks": False}, world_size=4
+        )
+        assert positional == keyword == (3, 1, 2)
+
+    def test_sort_ranks_false_keyword_preserves_order(self):
+        """``sort_ranks=False`` (keyword) keeps the caller's rank order."""
+        result = mesh_registry._normalize_new_group_ranks(
+            (), {"ranks": [3, 1, 2], "sort_ranks": False}, world_size=4
+        )
+        assert result == (3, 1, 2)
+
+    def test_ranks_none_defaults_to_world(self):
+        """``ranks=None`` normalizes to the whole world."""
+        result = mesh_registry._normalize_new_group_ranks((), {}, world_size=4)
+        assert result == (0, 1, 2, 3)
+
+
+class TestRegisterReplicaGroupsConflict:
+    """Cover the conflict-raise in ``_register_replica_groups`` and its callers."""
+
+    @pytest.fixture(autouse=True)
+    def reset_registry(self):
+        mesh_registry.clear_mesh_registry()
+        yield
+        mesh_registry.clear_mesh_registry()
+
+    def test_conflicting_registration_raises(self):
+        """Re-registering a name with different groups raises RuntimeError."""
+        mesh_registry._register_replica_groups("pg", [[0, 1], [2, 3]])
+        with pytest.raises(RuntimeError, match="already registered with different"):
+            mesh_registry._register_replica_groups("pg", [[0, 2], [1, 3]])
+
+    def test_identical_reregistration_is_idempotent(self):
+        """Re-registering the same groups is a no-op, not a raise."""
+        mesh_registry._register_replica_groups("pg", [[0, 1], [2, 3]])
+        mesh_registry._register_replica_groups("pg", [[0, 1], [2, 3]])
+        assert mesh_registry.get_all_replica_groups("pg") == [[0, 1], [2, 3]]
+
+    @patch.object(mesh_registry, "_original_new_group")
+    @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
+    def test_capture_swallows_conflict_and_keeps_first(self, mock_world_size, mock_new_group):
+        """A conflicting capture is swallowed by ``_patched_new_group``; the
+        first-registered table survives and the second name goes unregistered."""
+        pg01 = _process_group("shared_name")
+        pg23 = _process_group("shared_name")
+        mock_new_group.side_effect = [pg01, pg23]
+
+        # First partition [[0,1],[2,3]] registers "shared_name" -> that table.
+        mesh_registry._patched_new_group(ranks=[0, 1])
+        mesh_registry._patched_new_group(ranks=[2, 3])
+        assert mesh_registry.get_all_replica_groups("shared_name") == [[0, 1], [2, 3]]
+
+        # A second, differently-shaped partition reusing the same name conflicts;
+        # the raise is swallowed and the original table is preserved (not corrupted).
+        pg02 = _process_group("shared_name")
+        pg13 = _process_group("shared_name")
+        mock_new_group.side_effect = [pg02, pg13]
+        mesh_registry._patched_new_group(ranks=[0, 2])
+        mesh_registry._patched_new_group(ranks=[1, 3])
+
+        assert mesh_registry.get_all_replica_groups("shared_name") == [[0, 1], [2, 3]]
 
 
 class TestCollectiveLegalization:
