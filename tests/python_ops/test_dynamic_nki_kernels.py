@@ -172,6 +172,13 @@ _COMPILE_ONCE_SPECS = [s for s in _OP_SPECS if s.compile_once]
 class TestDynamicNkiKernels:
     SHAPE = (1, 512, 12288)
 
+    @pytest.fixture(autouse=True)
+    def _seed_rng(self):
+        # Specs' build() draw inputs from global RNG (randn/randperm). Seed per test
+        # so a case is reproducible regardless of suite ordering — otherwise a draw
+        # near the fp16 tolerance edge can pass alone but fail in the full suite.
+        torch.manual_seed(0)
+
     def _bf16_neuron(self, *shapes):
         return [torch.randn(s, dtype=torch.bfloat16).to("neuron") for s in shapes]
 
@@ -195,6 +202,19 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_ran(spec.name):
             got = spec.run(*run_args).cpu()
         torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+
+    # ── non-128 count sweep: the dynamic dim (M / gather-scatter n) is padded up
+    # to the next 128-multiple inside prepare_io; the op still routes dynamically
+    # and stays correct after the padded rows are sliced off. 200->256, 129->256,
+    # 383->384 exercise the pad path (and 383 is just below a tile boundary). ──
+    @pytest.mark.parametrize("rows", [200, 129, 383])
+    @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
+    def test_dynamic_nki_non_128_count(self, spec, dtype, rows):
+        rtol, atol = _TOL[dtype]
+        run_args, ref = spec.build(dtype, rows=rows)
+        with _assert_dynamic_ran(spec.name):
+            got = spec.run(*run_args).cpu()
+        torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
 
     # ── compile-once-per-shape sweep ──
     @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.name)
@@ -221,6 +241,32 @@ class TestDynamicNkiKernels:
         ), f"expected to execute at Ms {set(ms)}, saw {entry._exec_ms}"
         # ... but one (H, dtype) is one compile_key -> <=1 NEFF added.
         assert len(entry._compiled) - compiled_before <= 1, "recompiled across M values"
+
+    # ── non-128 counts don't recompile: the padded dim is not in the compile_key,
+    # so distinct non-128 counts (padding to distinct tiles) reuse one NEFF. This
+    # is the recompile-avoidance guarantee for realistic (unfloored) routing. ──
+    @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.name)
+    def test_dynamic_nki_non_128_no_recompile(self, spec):
+        entry = _entry(spec.name)
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        rows = (100, 200, 300)  # pad to 128/256/384 — three distinct tile counts
+        for m in rows:
+            run_args, _ = spec.build(torch.bfloat16, rows=m, h=2048)
+            spec.run(*run_args).cpu()
+
+        assert entry._exec_count - exec_before == len(
+            rows
+        ), f"dynamic {spec.name} did not run for every non-128 count"
+        assert entry._exec_ms.issuperset(
+            set(rows)
+        ), f"expected exec at actual (unpadded) counts {set(rows)}, saw {entry._exec_ms}"
+        # padded dim not in compile_key -> one (H, dtype) is one NEFF, no recompile.
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "recompiled across non-128 counts (padded dim leaked into compile_key?)"
 
     # ── add-specific declining / routing (not in the op table) ──
     def test_dynamic_nki_add_alpha_declines(self):
@@ -393,6 +439,34 @@ class TestDynamicNkiKernels:
         assert mm._exec_count > mm_execs, "fwd/grad_input not routed to mm"
         assert len(mm._compiled) == mm_neffs, "mm recompiled on token change"
         assert len(mm_k._compiled) == mmk_neffs, "mm_k recompiled on token change"
+
+    @pytest.mark.parametrize("n", [200, 129, 383])
+    def test_dynamic_nki_mm_backward_non_128_count(self, n):
+        """fwd+bwd with a non-128 token count: grad_input (mm, M-pad), grad_weight
+        (mm_k, K-pad), and silu_backward (M-pad) all route dynamically and grads
+        match CPU after the padded rows are sliced/zero-contributed."""
+        H, H4 = 2048, 4096  # noqa: N806
+        mm, mm_k, sb = _entry("mm"), _entry("mm_k"), _entry("silu_backward")
+
+        def _fwd_bwd(device):
+            g = torch.Generator().manual_seed(3)
+            x = (torch.randn(n, H, dtype=torch.bfloat16, generator=g) / 64).to(device)
+            w1 = (torch.randn(H, H4, dtype=torch.bfloat16, generator=g) / 64).to(device)
+            w3 = (torch.randn(H4, H, dtype=torch.bfloat16, generator=g) / 64).to(device)
+            x, w1, w3 = (t.detach().requires_grad_(True) for t in (x, w1, w3))
+            out = torch.nn.functional.silu(x @ w1) @ w3
+            (out * out).sum().backward()
+            if device == "neuron":
+                torch_neuronx.synchronize()
+            return [t.grad.cpu() for t in (x, w1, w3)]
+
+        mm_e, mmk_e, sb_e = mm._exec_count, mm_k._exec_count, sb._exec_count
+        neuron_grads = _fwd_bwd("neuron")
+        assert mm._exec_count > mm_e, "grad_input not routed to mm at non-128 count"
+        assert mm_k._exec_count > mmk_e, "grad_weight not routed to mm_k at non-128 count"
+        assert sb._exec_count > sb_e, "silu_backward not routed at non-128 count"
+        for gi, (gn, gc) in enumerate(zip(neuron_grads, _fwd_bwd("cpu"), strict=True)):
+            torch.testing.assert_close(gn, gc, rtol=3e-2, atol=3e-2, msg=f"grad[{gi}] mismatch")
 
     # backward ops asserted on (mm/mm_k = grad_input/grad_weight).
     MOE_BWD_OPS: ClassVar = ["mm", "mm_k", "silu_backward", "index", "mul"]

@@ -14,9 +14,10 @@ import torch
 from ..adapter_utils import (
     _SUPPORTED_DTYPES,
     _TILE_M,
+    _ceil_to_tile,
     _compile_or_load_neff,
     _num_tiles_tensor,
-    _pad_rows_to_source,
+    _pad_rows_to,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
@@ -36,8 +37,9 @@ def _can_handle_scatter_add(self, dim, index, src, out=None) -> bool:
     if H == 0:  # H is arbitrary — kernel tiles the free dim at trace time
         return False
     n = src.shape[0]
-    # n rows scattered as whole 128-tiles (no padding); data/index padded to T.
-    if n == 0 or n % _TILE_M != 0 or n > T:
+    # n rows scattered as ceil(n/128) whole 128-tiles; data/index padded to T, so
+    # the padded count ceil(n/128)*128 must still fit within T target rows.
+    if n == 0 or _ceil_to_tile(n) > T:
         return False
     # index is [n, H] expanded (stride 0 on dim1) or [n,1]; both give per-row idx.
     if index.shape[0] != n:  # noqa: SIM103
@@ -75,15 +77,17 @@ def _compile_scatter_add(compile_key) -> tuple[bytes, str]:
 
 def _prepare_scatter_add_io(self, dim, index, src, dest=None, **_) -> tuple[tuple, tuple, int]:
     """All tensors padded to baked T; padded data=0 is a no-op add; padded
-    indices=0 touches row 0 with 0 add (harmless). outbuf IS self (in-place)."""
+    indices=0 touches row 0 with 0 add (harmless). num_m_tiles = ceil(n / 128);
+    rows n..ceil(n) fall in the zero-padded region -> no-op add too. outbuf IS
+    self (in-place)."""
     T, H = self.shape  # noqa: N806
     device = self.device
     n = src.shape[0]
 
     idx_1d = index[:, 0].reshape(n, 1).to(torch.int32)
-    idx = _pad_rows_to_source(idx_1d, n, T)
-    data = _pad_rows_to_source(src.contiguous(), n, T)
-    nm = _num_tiles_tensor(n // _TILE_M, device)
+    idx = _pad_rows_to(idx_1d, T)
+    data = _pad_rows_to(src.contiguous(), T)
+    nm = _num_tiles_tensor(_ceil_to_tile(n) // _TILE_M, device)
 
     outbuf = self  # in-place accumulation target (alias {2:0})
     # Output set must match NEFF's 2-ref layout: declared output0 + aliased input.

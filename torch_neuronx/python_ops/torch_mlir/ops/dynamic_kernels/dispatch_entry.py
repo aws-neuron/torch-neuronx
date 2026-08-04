@@ -118,5 +118,20 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
 
     reshape_output = getattr(entry, "reshape_output", None)
     if reshape_output is not None:
-        return reshape_output(outputs, args)
-    return outputs[0].reshape(args[0].shape)
+        result = reshape_output(outputs, args)
+    else:
+        result = outputs[0].reshape(args[0].shape)
+
+    # out=/grad_input=: the result must land in the caller's buffer. The dest-reuse
+    # fast path (adapter_utils._dest_buffer) already writes into dest -> result
+    # aliases it (same data_ptr), so this copy is skipped. It only fires when the
+    # adapter couldn't reuse dest — e.g. row-padding to a 128-multiple forces a
+    # fresh, larger kernel buffer whose sliced result must be copied back.
+    if (
+        isinstance(dest, torch.Tensor)
+        and isinstance(result, torch.Tensor)
+        and result.data_ptr() != dest.data_ptr()
+    ):
+        dest.copy_(result)
+        return dest
+    return result

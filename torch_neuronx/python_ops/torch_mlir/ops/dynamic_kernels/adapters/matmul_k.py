@@ -9,7 +9,7 @@ aten::mm with a transposed mat1 (the grad_weight signature) here.
 
 import torch
 
-from ..adapter_utils import _TILE_M, _compile_or_load_neff
+from ..adapter_utils import _TILE_M, _ceil_to_tile, _compile_or_load_neff, _pad_rows_to
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 _MM_NBLOCK = 512  # dynamic_k kernel n-tile
@@ -27,7 +27,7 @@ def _can_handle_mm_k(mat1, mat2, out=None) -> bool:
         return False
     M, K = mat1.shape  # noqa: N806
     K2, N = mat2.shape  # noqa: N806
-    if K != K2 or K == 0 or K % _TILE_M != 0:  # K (contraction) is the dynamic dim
+    if K != K2 or K == 0:  # K (contraction) dynamic — any K > 0, prepare_io pads it
         return False
     if M % _TILE_M != 0 or N % _MM_NBLOCK != 0:  # noqa: SIM103  (M, N baked)
         return False
@@ -59,14 +59,16 @@ def _prepare_mm_k_io(mat1, mat2, dest=None) -> tuple[tuple, tuple, int]:
     """out[M,N] = mat1[M,K] @ mat2[K,N], contracting K (dynamic).
 
     Kernel is K-major: x_e=[K,M], dout=[K,N]. mat1=[M,K] -> x_e = mat1.T = [K,M];
-    mat2=[K,N] is already dout. num_k_tiles = K // 128.
+    mat2=[K,N] is already dout. K padded to K_ceil (128-multiple) with zero rows in
+    both operands -> 0 contribution to the contraction, so the output needs no slicing.
     """
     M, K = mat1.shape  # noqa: N806
     N = mat2.shape[1]  # noqa: N806
+    K_ceil = _ceil_to_tile(K)  # noqa: N806
     device = mat1.device
-    x_e = mat1.t().contiguous()  # [K, M]
-    dout = mat2.contiguous()  # [K, N]
-    num_k_tiles = torch.tensor([[K // _TILE_M]], dtype=torch.int32, device=device)
+    x_e = _pad_rows_to(mat1.t().contiguous(), K_ceil)  # [K_ceil, M]
+    dout = _pad_rows_to(mat2.contiguous(), K_ceil)  # [K_ceil, N]
+    num_k_tiles = torch.tensor([[K_ceil // _TILE_M]], dtype=torch.int32, device=device)
     inputs = (x_e, dout, num_k_tiles)
     outputs = (torch.empty((M, N), dtype=mat1.dtype, device=device),)
     return inputs, outputs, K

@@ -5,7 +5,13 @@ bf16-only (the dynamic-M matmul kernel is bf16-specialized). compile_key=(K,N).
 
 import torch
 
-from ..adapter_utils import _TILE_M, _compile_or_load_neff, _num_tiles_tensor
+from ..adapter_utils import (
+    _TILE_M,
+    _ceil_to_tile,
+    _compile_or_load_neff,
+    _num_tiles_tensor,
+    _pad_rows_to,
+)
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 # dynamic_m_matmul_kernel block sizes: k_block=8*128=1024, n_block=2*512=1024.
@@ -24,7 +30,7 @@ def _can_handle_mm(mat1, mat2, out=None) -> bool:
         return False
     M, K = mat1.shape  # noqa: N806
     K2, N = mat2.shape  # noqa: N806
-    if K != K2 or M == 0 or M % _TILE_M != 0:
+    if K != K2 or M == 0:  # any M > 0 — prepare_io pads rows up to a 128-multiple
         return False
     if K % _MM_KBLOCK != 0 or N % _MM_NBLOCK != 0:  # noqa: SIM103
         return False
@@ -53,23 +59,25 @@ def _compile_mm(compile_key) -> tuple[bytes, str]:
 
 
 def _prepare_mm_io(mat1, mat2, dest=None, **_) -> tuple[tuple, tuple, int]:
-    """Actual-sized IO (M is a 128-multiple; no padding). K, N baked."""
+    """Pad lhs rows to a 128-multiple (M_ceil); zero rows give zero output rows,
+    sliced off in reshape_output. K, N baked."""
     M, _K = mat1.shape  # noqa: N806
     N = mat2.shape[1]  # noqa: N806
+    M_ceil = _ceil_to_tile(M)  # noqa: N806
     device = mat1.device
-    lhs = mat1.contiguous()
+    lhs = _pad_rows_to(mat1.contiguous(), M_ceil)
     rhs = mat2.contiguous()
-    nm = _num_tiles_tensor(M // _TILE_M, device)
+    nm = _num_tiles_tensor(M_ceil // _TILE_M, device)
     inputs = (lhs, rhs, nm)
-    outputs = (torch.empty((M, N), dtype=mat1.dtype, device=device),)
+    outputs = (torch.empty((M_ceil, N), dtype=mat1.dtype, device=device),)
     return inputs, outputs, M
 
 
 def _reshape_mm_output(outputs, original_args):
-    """mm output is [M, N] (differs from lhs shape, so reshape explicitly)."""
+    """mm output is [M_ceil, N]; slice off padded rows -> [M, N]."""
     M = original_args[0].shape[0]  # noqa: N806
     N = original_args[1].shape[1]  # noqa: N806
-    return outputs[0].reshape(M, N)
+    return outputs[0][:M].reshape(M, N)
 
 
 def register():
