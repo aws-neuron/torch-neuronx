@@ -58,11 +58,7 @@ DYNAMO_UNRESOLVED_MATERIALIZATION_I64 = [
     "DynamicShapesMiscTests::test_item_changes_dynamic_shapes",
     "DynamicShapesMiscTests::test_item_changes_new_shape_dynamic_shapes",
     "DynamicShapesReproTests::test_trace_functional_tensor_with_dynamic_shapes",
-    "MiscTests::test_item",
-    "MiscTests::test_item_changes",
     "MiscTests::test_item_changes_new_shape",
-    "MiscTests::test_itertools_accumulate_tensors_kwargs",
-    "PgoTest::test_whitelist_ints_floats",
     "SubclassTests::test_torch_function_subclass_survives_into_aot_autograd",
     "TestBytecodeDebugger::test_stack_command",
     "DynamicShapesFunctionTests::test_methodcaller_dynamic_shapes",
@@ -218,7 +214,6 @@ DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
     "DynamicShapesMiscTests::test_dim_order_dynamic_shapes",
     "DynamicShapesReproTests::test_unsqueeze_mul_strides_dynamic_shapes",
     "FxGraphRunnableTest::test_dynamic_expression",
-    "FunctionTests::test_itemgetter",
     "HooksTests::test_input_hooks_same",
     "MiscTests::test_aot_autograd_propagate_unbacked_symints_shape",
     "MiscTests::test_dim_order",
@@ -285,7 +280,6 @@ DYNAMO_FAILED_TO_LEGALIZE_CONSTANT_INT = [
     "DynamicShapesReproTests::test_randint_out_dynamic_dynamic_shapes",
     "DynamicShapesReproTests::test_unbind_copy_out_dynamic_shapes",
     "MiscTests::test_bound_shape_checks",
-    "MiscTests::test_onnx_shape_as_tensor",
     "ReproTests::test_distributions_subclass",
     "ReproTests::test_unbind_copy_out",
     "TestCustomBackendAPI::test_backend_recompilation",
@@ -369,8 +363,6 @@ DYNAMO_LOWERING_FAILURE_ATEN_CUMSUM = [
 
 DYNAMO_LOWERING_FAILURE_ATEN_XLOGY = [
     "AOTAutogradCacheTests::test_dtensor_cache_hit",
-    "FunctionTests::test_enumerate_custom",
-    "FunctionTests::test_unary_fold_op",
     "GraphDededuplicationTests::test_tuple_return",
 ]
 
@@ -392,22 +384,6 @@ DYNAMO_TENSOR_EMPTY_DIMENSIONS = [
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float32",
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float64",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float64",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float64",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float64",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float64",
 ]
 
 DYNAMO_NUMERICAL_PRECISION_INPLACE_OPS = [
@@ -479,37 +455,16 @@ DYNAMO_TUPLE_INDEX_OUT_OF_RANGE = [
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float64",
 ]
 
-DYNAMO_ADDMM_COMPILATION_FAILURE = [
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float32",
-]
-
 DYNAMO_GRADIENT_NEURON_TO_CPU = [
     "BackwardHigherOrderOpTests::test_invoke_in_pt2_compiled_autograd_side_effect",
     "MiscTests::test_requires_grad_intermediate_chunked_loss_backward",
 ]
 
 DYNAMO_INPLACE_METADATA_PROPAGATION = [
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",

@@ -113,8 +113,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=("Torch-MLIR return type mismatch: tensor<i64> vs i64"),
         tests=[
-            "DecoratorTests::test_assume_constant_result_on_user_defined_fn",
-            "NbIndexTests::test_tensor_int_index",
             "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_backwards_dynamic_shapes",
             "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_functionalizes_dynamic_shapes",
             "DynamicShapesReproTests::test_intermediate_leaf_requires_grad_dynamic_shapes",
@@ -374,10 +372,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.DYNAMO_TUPLE_INDEX_OUT_OF_RANGE,
     ),
     SkipGroup(
-        reason="Neuron compilation failure for addmm op",
-        tests=x.DYNAMO_ADDMM_COMPILATION_FAILURE,
-    ),
-    SkipGroup(
         reason="Neuron NEFF param_num / output_idx out of bounds",
         tests=[
             "AOTAutogradCacheBundledTests::test_dtensor_cache_hit",
@@ -461,8 +455,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("CompiledFunctionBackward returns incorrect number " "of gradients on Neuron"),
         tests=[
             "DynamicShapesMiscTests::test_compile_with_userland_fake_tensor_mode_dynamic_shapes",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float64",
-            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float64",
         ],
     ),
     SkipGroup(
@@ -546,9 +538,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "FunctionTests::test_quantize_per_tensor",
             "NbFloatTests::test_tensor_dunder_float",
             "NbFloatTests::test_tensor_int_dtype",
-            "NbIntTests::test_tensor_dunder_int",
             "NbIntTests::test_tensor_float_dtype",
-            "NbIntTests::test_tensor_int_dtype",
         ],
     ),
     SkipGroup(
