@@ -99,6 +99,11 @@ _OPS_SKIP_COMPILE_DYNAMIC: tuple[str, ...] = (
     "range",
     "addr",
     "cumprod_backward",
+    "_linalg_det",
+    "linalg_slogdet",
+    "exp.out",
+    "embedding_dense_backward",
+    "rrelu_with_noise_backward",
 )
 
 
