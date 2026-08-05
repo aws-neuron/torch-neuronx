@@ -202,6 +202,27 @@ def torch_log(x, out=None):
     return torch.log(x)
 
 
+@register_aten(["aten::log2", "aten::log2.out", "aten::log2_"])
+def torch_log2(x, out=None):
+    """Base-2 logarithm — elementwise."""
+    return torch.log2(x)
+
+
+@register_aten(["aten::log10", "aten::log10.out", "aten::log10_"])
+def torch_log10(x, out=None):
+    """Base-10 logarithm — elementwise."""
+    return torch.log10(x)
+
+
+@register_aten(["aten::log1p", "aten::log1p.out", "aten::log1p_"])
+def torch_log1p(x, out=None):
+    """Natural logarithm of (1 + x) — elementwise."""
+    # Upcast to float32 for reduced-precision types to match CPU semantics.
+    if x.dtype in (torch.float16, torch.bfloat16):
+        return torch.log1p(x.float()).to(x.dtype)
+    return torch.log1p(x)
+
+
 @register_aten(["aten::erf", "aten::erf.out"])
 def torch_erf(x, out=None):
     # Cast non-floating-point inputs (e.g. bool, int) to float,

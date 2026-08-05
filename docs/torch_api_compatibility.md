@@ -198,9 +198,9 @@
 |191|torch.lerp|Y|Native MLIR impl|
 |192|torch.lgamma|CPU_FALLBACK|aten::lgamma not registered|
 |193|torch.log|Y|Native MLIR impl|
-|194|torch.log10|CPU_FALLBACK|aten::log10 not registered|
-|195|torch.log1p|CPU_FALLBACK|aten::log1p not registered|
-|196|torch.log2|CPU_FALLBACK|aten::log2 not registered|
+|194|torch.log10|Y|Native MLIR impl|
+|195|torch.log1p|Y|Native MLIR impl|
+|196|torch.log2|Y|Native MLIR impl|
 |197|torch.logaddexp|CPU_FALLBACK|aten::logaddexp not registered|
 |198|torch.logaddexp2|CPU_FALLBACK|aten::logaddexp2 not registered|
 |199|torch.logical_and|Y|Native MLIR impl|
@@ -1203,12 +1203,12 @@
 |280|Tensor.log|Y|Native MLIR impl / In-place|
 |281|Tensor.log_|Y|Native MLIR impl / In-place|
 |282|Tensor.logdet|CPU_FALLBACK|Decomposes to linalg_slogdet; CPU fallback|
-|283|Tensor.log10|CPU_FALLBACK|Falls back to CPU|
-|284|Tensor.log10_|CPU_FALLBACK|Falls back to CPU|
-|285|Tensor.log1p|CPU_FALLBACK|Falls back to CPU|
-|286|Tensor.log1p_|CPU_FALLBACK|Falls back to CPU|
-|287|Tensor.log2|CPU_FALLBACK|Falls back to CPU|
-|288|Tensor.log2_|CPU_FALLBACK|Falls back to CPU|
+|283|Tensor.log10|Y|Native MLIR impl|
+|284|Tensor.log10_|Y|Native MLIR impl / In-place|
+|285|Tensor.log1p|Y|Native MLIR impl|
+|286|Tensor.log1p_|Y|Native MLIR impl / In-place|
+|287|Tensor.log2|Y|Native MLIR impl|
+|288|Tensor.log2_|Y|Native MLIR impl / In-place|
 |289|Tensor.log_normal_|CPU_FALLBACK|No native Neuron impl|
 |290|Tensor.logaddexp|CPU_FALLBACK|No native Neuron impl|
 |291|Tensor.logaddexp2|CPU_FALLBACK|No native Neuron impl|

@@ -7,6 +7,9 @@ from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron
 
 UNARY_OPS_LIST = [
     torch.log,
+    torch.log2,
+    torch.log10,
+    torch.log1p,
     torch.sigmoid,
     torch.sin,
     torch.cos,
@@ -24,6 +27,9 @@ UNARY_OPS_LIST = [
 ]
 UNARY_OPS_OUT_LIST = [
     torch.log,
+    torch.log2,
+    torch.log10,
+    torch.log1p,
     torch.sigmoid,
     torch.sin,
     torch.cos,
@@ -40,6 +46,9 @@ UNARY_OPS_OUT_LIST = [
 ]
 UNARY_INPLACE_OPS_LIST = [
     "log_",
+    "log2_",
+    "log10_",
+    "log1p_",
     "sigmoid_",
     "sin_",
     "cos_",

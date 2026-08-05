@@ -19,6 +19,7 @@ Binary arithmetic operations:
 Unary mathematical operations:
 - abs, neg, sqrt, rsqrt
 - cos, sin, exp, log
+- log2, log10, log1p
 - erf, erfinv, ceil, trunc
 - sign, reciprocal
 
