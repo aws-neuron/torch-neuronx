@@ -8,8 +8,12 @@ is easy to see and import.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import PassMutations
 
 
 @dataclass
@@ -86,5 +90,6 @@ class CompilationArtifact:
     stablehlo: bytes | None = None  # set after FX -> StableHLO
     neff: bytes | None = None  # caller-populated after synchronize + get_neff_info
     has_collectives: bool = False
+    pass_mutations: list[PassMutations] = field(default_factory=list)
     _mlir_module: object = None
     _lowering: object = None

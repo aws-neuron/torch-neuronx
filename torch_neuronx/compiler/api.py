@@ -99,6 +99,7 @@ def _make_artifact(lowering, target=None, neff=None, stablehlo=None) -> Compilat
         stablehlo=stablehlo,
         neff=neff,
         has_collectives=lowering.has_collectives,
+        pass_mutations=list(getattr(lowering, "pass_mutations", None) or []),
     )
 
 
@@ -200,6 +201,7 @@ def fx_to_stablehlo(
         target=options.target,
         stablehlo=_serialize_mlir_module(lowering.stablehlo_mlir),
         has_collectives=lowering.has_collectives,
+        pass_mutations=list(getattr(lowering, "pass_mutations", None) or []),
         _mlir_module=lowering.stablehlo_mlir,
         _lowering=lowering,
     )
@@ -253,6 +255,7 @@ def stablehlo_to_neff(
     artifact.target = options.target
     artifact.neff = None
     artifact.has_collectives = lowering.has_collectives
+    artifact.pass_mutations = list(getattr(lowering, "pass_mutations", None) or [])
     artifact._lowering = lowering
     return artifact
 
