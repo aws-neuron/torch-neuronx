@@ -298,6 +298,14 @@ PY_BUILTIN_TO_TORCH_OP = {
     "mod": torch.ops.aten.fmod,
     "eq": torch.ops.aten.eq,
     "floordiv": torch.ops.aten.floordiv,
+    "pow": torch.ops.aten.pow,
+    "neg": torch.ops.aten.neg,
+}
+
+SYMTYPE_TO_BASE_TYPE = {
+    torch.SymInt: int,
+    torch.SymFloat: float,
+    torch.SymBool: bool,
 }
 
 # torch with cuda has a __version__ that looks like  "2.1.0+cu113",
@@ -330,6 +338,8 @@ else:
         torch.ops.aten.sym_stride.default: torch.ops.aten.stride.default,
         torch.ops.aten.sym_stride.int: torch.ops.aten.stride.int,
         torch.ops.aten.sym_numel.default: torch.ops.aten.numel.default,
+        torch.sym_float: torch.ops.aten.Float.Scalar,
+        torch.sym_int: torch.ops.aten.Int.Scalar,
     }
 
     SYMBOLIC_TORCH_OPS = {key for key in SYMBOLIC_OP_TO_TORCH_OP}
@@ -1391,6 +1401,7 @@ class GraphNodeImporter:
         "_on_node_produced",
         "_v",
         "_symbol_to_value",
+        "_sym_to_value",
         "_multi_result_nodes",
         "_unpack_list_values",
         "fx_importer",
@@ -1412,6 +1423,9 @@ class GraphNodeImporter:
         self._v: Dict[Union[Callable[[], Value], Tuple[torch_fx.Node, int]], Value] = {}
         # Map of Shape Symbol to MLIR Value
         self._symbol_to_value: Dict[str, Value] = {}
+        # Map of symbolic value str representation to MLIR Value, populated
+        # from placeholder nodes carrying SymInt/SymFloat/SymBool values.
+        self._sym_to_value: Dict[str, Value] = {}
         # Map of node name to hook that should be called when it is produced.
         self._on_node_produced: Dict[str, Callable[[Value], None]] = {}
         # Statically multi-result nodes which we have de-tupled are noted here.
@@ -1593,7 +1607,13 @@ class GraphNodeImporter:
                 if op == "placeholder" and not skip_placeholders_outputs:
                     # Associate the placeholder node with corresponding block
                     # argument.
-                    self.bind_node_value(node, self._b.arguments[num_placeholders])
+                    block_arg = self._b.arguments[num_placeholders]
+                    self.bind_node_value(node, block_arg)
+                    # Register symbolic values so they can be resolved when
+                    # passed as raw arguments (not Node references) to ops.
+                    val = node.meta.get("val")
+                    if isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                        self._sym_to_value[str(val)] = block_arg
                     num_placeholders += 1
                 elif op == "call_function":
                     target = node.target
@@ -1628,6 +1648,88 @@ class GraphNodeImporter:
 
                 if import_symbolic_shape_expressions:
                     self._create_bind_symbolic_shape_ops(loc, node)
+
+    def _import_symbolic_expr(self, loc: Location, arg) -> Value:
+        """Synthesize torch MLIR ops for a derived symbolic expression (e.g. s8 + 2)."""
+        assert not isinstance(arg, torch.SymFloat), (
+            f"_import_symbolic_expr only supports integer expressions, got SymFloat: {arg}"
+        )
+        import sympy
+        from torch.fx.experimental.sym_node import SymNode
+
+        node = arg.node
+        if isinstance(node, SymNode):
+            expr = node._expr
+        elif isinstance(node, sympy.Basic):
+            expr = node
+        else:
+            raise TypeError(
+                f"Unsupported symbolic expression type: {type(node).__name__} "
+                f"in expression {arg}"
+            )
+        int_type = self._cc.torch_int_type
+
+        def resolve(sub_expr) -> Value:
+            if isinstance(sub_expr, sympy.Symbol):
+                sym_key = str(sub_expr)
+                if sym_key in self._sym_to_value:
+                    return self._sym_to_value[sym_key]
+                raise TypeError(
+                    f"Symbol {sub_expr} not found in placeholder bindings"
+                )
+            if isinstance(sub_expr, sympy.Integer):
+                op = _emit_operation(
+                    "torch.constant.int",
+                    result_types=[int_type],
+                    operands=[],
+                    loc=loc,
+                )
+                op.attributes["value"] = IntegerAttr.get(
+                    IntegerType.get_signless(64), int(sub_expr)
+                )
+                return op.result
+            if isinstance(sub_expr, sympy.Add):
+                result = resolve(sub_expr.args[0])
+                for term in sub_expr.args[1:]:
+                    rhs = resolve(term)
+                    op = _emit_operation(
+                        "torch.aten.add.int",
+                        result_types=[int_type],
+                        operands=[result, rhs],
+                        loc=loc,
+                    )
+                    result = op.result
+                return result
+            if isinstance(sub_expr, sympy.Mul):
+                result = resolve(sub_expr.args[0])
+                for factor in sub_expr.args[1:]:
+                    rhs = resolve(factor)
+                    op = _emit_operation(
+                        "torch.aten.mul.int",
+                        result_types=[int_type],
+                        operands=[result, rhs],
+                        loc=loc,
+                    )
+                    result = op.result
+                return result
+            if isinstance(sub_expr, sympy.Pow):
+                base = resolve(sub_expr.args[0])
+                exp = resolve(sub_expr.args[1])
+                op = _emit_operation(
+                    "torch.aten.pow.int",
+                    result_types=[int_type],
+                    operands=[base, exp],
+                    loc=loc,
+                )
+                return op.result
+            raise TypeError(
+                f"Unsupported symbolic expression type: {type(sub_expr).__name__} "
+                f"in expression {arg}"
+            )
+
+        result = resolve(expr)
+        self._sym_to_value[str(arg)] = result
+        return result
 
     def _promote_symbolic_scalar_int_float(self, loc, graph, param):
         temp_target = torch.ops.aten.Float.Scalar
@@ -2203,9 +2305,17 @@ class GraphNodeImporter:
         mlir_op_name = _get_mlir_op_name_for_schema(schema)
 
         # Intervening to use Scalar ops due to incorrect ops from AOT-autograd with scalar arguments.
-        if mlir_op_name in TENSOR_SCALAR_OP_CONVERTER and (
-            isinstance(node.args[1], float) or isinstance(node.args[1], int)
-        ):
+        # With dynamic shapes, scalar args may also appear as SymInt/SymFloat placeholder nodes.
+        def _is_scalar_arg(arg):
+            if isinstance(arg, (float, int)):
+                return True
+            if isinstance(arg, torch_fx.Node):
+                val = arg.meta.get("val")
+                if isinstance(val, (torch.SymInt, torch.SymFloat, int, float)):
+                    return True
+            return False
+
+        if mlir_op_name in TENSOR_SCALAR_OP_CONVERTER and _is_scalar_arg(node.args[1]):
             mlir_op_name = TENSOR_SCALAR_OP_CONVERTER[mlir_op_name]
             # we are dynamically changing which op is emitted here due to an issue in
             # torch dynamo where it emits the Tensor variant of ops even when processing
@@ -2346,6 +2456,12 @@ class GraphNodeImporter:
         ):
             # promote scalars to tensor types as appropriate
             argument_value = self._import_scalar_as_tensor(loc, arg)
+        elif isinstance(arg, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            sym_key = str(arg)
+            if sym_key in self._sym_to_value:
+                argument_value = self._sym_to_value[sym_key]
+            else:
+                argument_value = self._import_symbolic_expr(loc, arg)
         elif LITERAL_CONVERTER_MAP.lookup(type(arg)) is not None:
             with loc:
                 argument_value = self._import_literal(arg)
@@ -2498,6 +2614,16 @@ class GraphNodeImporter:
                 ) or SCALAR_TYPE_TO_TORCH_MLIR_TYPE.get(
                     element_type
                 ) == val_type, f"Heterogeneous lists are not supported: expected {element_type}, got {val_type}"
+            elif isinstance(operand, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                effective_type = SYMTYPE_TO_BASE_TYPE[operand_type]
+                assert (
+                    element_type == effective_type
+                ), f"Heterogeneous lists are not supported: expected {element_type}, got {operand_type}"
+                sym_key = str(operand)
+                if sym_key in self._sym_to_value:
+                    val = self._sym_to_value[sym_key]
+                else:
+                    val = self._import_symbolic_expr(loc, operand)
             else:
                 assert (is_optional_type and operand_type is NoneType) or (
                     element_type == operand_type
@@ -2957,6 +3083,7 @@ SCALAR_TYPE_TO_TORCH_MLIR_TYPE = {
 TENSOR_SCALAR_OP_CONVERTER = {
     "torch.aten.mul.Tensor": "torch.aten.mul.Scalar",
     "torch.aten.div.Tensor": "torch.aten.div.Scalar",
+    "torch.aten.div.Tensor_mode": "torch.aten.div.Scalar_mode",
     "torch.aten.add.Tensor": "torch.aten.add.Scalar",
     "torch.aten.sub.Tensor": "torch.aten.sub.Scalar",
     "torch.aten.floor_divide": "torch.aten.floor_divide.Scalar",
