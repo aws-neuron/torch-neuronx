@@ -385,12 +385,13 @@ class TestUnaryElementwiseOp:
             result_neg = torch.abs(-input_tensor_device)
             torch.testing.assert_close(result_pos.cpu(), result_neg.cpu(), rtol=1e-4, atol=1e-3)
 
-            # Test abs preserves zeros
+            # Test abs clears the sign bit of zero: abs(-0.0) must be +0.0.
+            # A plain `== 0.0` check can't detect this (-0.0 == 0.0 is True),
+            # so assert on the sign bit directly.
             input_tensor = torch.tensor([0.0, -0.0])
             input_tensor_device = input_tensor.to(device)
-            result = torch.abs(input_tensor_device)
-            assert result.cpu()[0].item() == 0.0
-            assert result.cpu()[1].item() == 0.0
+            result = torch.abs(input_tensor_device).cpu()
+            assert not torch.signbit(result).any(), result
 
             # Test abs with mixed positive and negative values
             input_tensor = torch.tensor([-5.0, -3.0, 0.0, 3.0, 5.0])

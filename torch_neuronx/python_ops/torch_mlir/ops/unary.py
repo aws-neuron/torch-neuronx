@@ -13,7 +13,10 @@ def torch_abs(x, out=None):
     """
     if x.dtype == torch.uint8:
         return x
-    return torch.abs(x)
+    result = torch.abs(x)
+    if x.is_floating_point():
+        result = torch.where(x == 0, torch.zeros_like(result), result)
+    return result
 
 
 @register_aten(["aten::neg", "aten::neg.out"])
