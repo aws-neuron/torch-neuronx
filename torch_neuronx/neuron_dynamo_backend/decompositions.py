@@ -305,6 +305,270 @@ def dot_empty_shortcut(a, b):
     return _zero_result((), a, b)
 
 
+@register_decomposition([aten.ormqr.default])
+def ormqr_decomposition(self, input2, input3, left=True, transpose=False):
+    """Decompose ormqr into reflector reconstruction + matmul.
+
+    ``self`` holds the Householder vectors below the diagonal (shape
+    ``(*, mn, k)``), ``input2`` is tau (``(*, min(mn, k))``), and ``input3`` is
+    the matrix C to multiply. Computes ``op(Q) @ C`` when ``left`` else
+    ``C @ op(Q)``, where ``op(Q)`` is ``Q^T`` when ``transpose`` else ``Q`` and
+    ``Q = H_1 H_2 ... H_k`` with ``H_i = I - tau_i v_i v_i^T``.
+
+    Neuron only supports real dtypes, so a plain transpose of the last two
+    dims is used rather than the conjugate transpose ``ormqr`` applies for
+    complex Q.
+    """
+    reflectors = self
+    tau = input2
+    other = input3
+
+    *batch, mn, _k = reflectors.shape
+    device = reflectors.device
+    dtype = reflectors.dtype
+
+    # Column i of V is the i-th Householder vector: the strictly-lower part of
+    # column i of ``reflectors`` with a unit on the diagonal.
+    V = torch.tril(reflectors, diagonal=-1) + torch.eye(
+        mn, reflectors.shape[-1], dtype=dtype, device=device
+    )
+
+    # Accumulate Q = H_1 @ ... @ H_k via rank-1 updates:
+    #   Q @ H_i = Q - tau_i (Q v_i) v_i^H
+    Q = torch.eye(mn, dtype=dtype, device=device)
+    for i in range(tau.shape[-1]):
+        v = V[..., :, i]  # (*, mn)
+        t = tau[..., i]  # (*,)
+        Qv = torch.matmul(Q, v.unsqueeze(-1)).squeeze(-1)  # (*, mn)
+        update = Qv.unsqueeze(-1) * v.unsqueeze(-2)  # (*, mn, mn)
+        Q = Q - t.reshape(*batch, 1, 1) * update
+
+    opQ = Q.transpose(-2, -1) if transpose else Q
+    if left:
+        return torch.matmul(opQ, other)
+    return torch.matmul(other, opQ)
+
+
+# ``aten::_thnn_fused_lstm_cell`` is the fused LSTM cell kernel. It has no
+# StableHLO lowering and reaches the backend as an opaque ``torch.operator``.
+# Express it with the standard elementwise LSTM equations, which lower natively.
+# The third output (``workspace``) holds the post-activation gates and is
+# consumed by the backward pass; its layout (``cat([i, f, c, o])``) matches
+# ATen so the two decompositions stay consistent fwd → bwd.
+#
+# Upstream's meta (``rnn_cell_checkSizes``) dereferences ``.device`` on the
+# bias args unconditionally, so it raises ``AttributeError`` when the biases
+# are ``None`` — breaking fake-tensor tracing before the decomposition runs.
+# Override it with a bias-agnostic meta (output shapes don't depend on bias).
+@_register_fake("aten::_thnn_fused_lstm_cell", override=True)
+def _thnn_fused_lstm_cell_fake(input_gates, hidden_gates, cx, input_bias=None, hidden_bias=None):
+    return (
+        torch.empty_like(cx),
+        torch.empty_like(cx),
+        input_gates.new_empty(input_gates.shape),
+    )
+
+
+@register_decomposition([aten._thnn_fused_lstm_cell.default])
+def thnn_fused_lstm_cell_decomposition(
+    input_gates, hidden_gates, cx, input_bias=None, hidden_bias=None
+):
+    """Decompose the fused LSTM cell into elementwise ops.
+
+    Returns ``(hy, cy, workspace)`` where ``workspace = cat([i, f, c, o])``
+    holds the activated gates for use by the backward pass.
+    """
+    gates = input_gates + hidden_gates
+    if input_bias is not None:
+        gates = gates + input_bias
+    if hidden_bias is not None:
+        gates = gates + hidden_bias
+
+    ingate, forgetgate, cellgate, outgate = gates.chunk(4, dim=1)
+    ingate = torch.sigmoid(ingate)
+    forgetgate = torch.sigmoid(forgetgate)
+    cellgate = torch.tanh(cellgate)
+    outgate = torch.sigmoid(outgate)
+
+    cy = (forgetgate * cx) + (ingate * cellgate)
+    hy = outgate * torch.tanh(cy)
+    workspace = torch.cat([ingate, forgetgate, cellgate, outgate], dim=1)
+    return hy, cy, workspace
+
+
+# Backward for the fused LSTM cell. The public ``_thnn_fused_lstm_cell_backward``
+# is CompositeImplicitAutograd and decomposes to this ``_impl``, so a single
+# decomposition here covers both. ``grad_hy``/``grad_cy`` are optional (either
+# may be None). Reads the activated gates back out of ``workspace``.
+@register_decomposition([aten._thnn_fused_lstm_cell_backward_impl.default])
+def thnn_fused_lstm_cell_backward_impl_decomposition(grad_hy, grad_cy, cx, cy, workspace, has_bias):
+    """Decompose the fused LSTM cell backward into elementwise ops.
+
+    Returns ``(grad_gates, grad_cx, grad_bias)``. ``grad_gates`` is the gradient
+    w.r.t. the (pre-activation) combined gates; the public wrapper feeds it to
+    both ``input_gates`` and ``hidden_gates``. ``grad_bias`` is None unless
+    ``has_bias``.
+    """
+    ingate, forgetgate, cellgate, outgate = workspace.chunk(4, dim=1)
+    tanh_cy = torch.tanh(cy)
+
+    d_cy = grad_cy if grad_cy is not None else torch.zeros_like(cy)
+    if grad_hy is not None:
+        d_cy = d_cy + grad_hy * outgate * (1 - tanh_cy * tanh_cy)
+
+    d_out = grad_hy * tanh_cy if grad_hy is not None else torch.zeros_like(outgate)
+    d_in = d_cy * cellgate
+    d_forget = d_cy * cx
+    d_cell = d_cy * ingate
+
+    # Back through the gate activations (sigmoid for i/f/o, tanh for c).
+    gi = d_in * ingate * (1 - ingate)
+    gf = d_forget * forgetgate * (1 - forgetgate)
+    gc = d_cell * (1 - cellgate * cellgate)
+    go = d_out * outgate * (1 - outgate)
+
+    grad_gates = torch.cat([gi, gf, gc, go], dim=1)
+    grad_cx = d_cy * forgetgate
+    grad_bias = grad_gates.sum(dim=0) if has_bias else None
+    return grad_gates, grad_cx, grad_bias
+
+
+# ── Fused GRU cell (forward + backward) ─────────────────────────────
+# Neither ``aten::_thnn_fused_gru_cell`` nor its backward ships a meta / CPU /
+# CUDA / composite kernel (only an autograd formula), so they graph-break during
+# fake-tensor tracing before ever reaching the backend. Register fakes so Dynamo
+# can trace them, plus decompositions into the standard elementwise GRU math,
+# which lowers natively. We own the ``workspace`` layout — ``cat([r, z, n, hx,
+# h_n])`` (N x 5H) holds everything the backward needs (it receives only
+# ``grad_hy`` + ``workspace``) — so the fwd / bwd decompositions just have to
+# agree with each other.
+@_register_fake("aten::_thnn_fused_gru_cell")
+def _thnn_fused_gru_cell_fake(input_gates, hidden_gates, hx, input_bias=None, hidden_bias=None):
+    n_batch, hidden = hx.shape[0], hx.shape[-1]
+    return hx.new_empty(hx.shape), hx.new_empty((n_batch, 5 * hidden))
+
+
+@register_decomposition([aten._thnn_fused_gru_cell.default])
+def thnn_fused_gru_cell_decomposition(
+    input_gates, hidden_gates, hx, input_bias=None, hidden_bias=None
+):
+    """Decompose the fused GRU cell into elementwise ops.
+
+    Returns ``(hy, workspace)`` where ``workspace = cat([r, z, n, hx, h_n])``
+    carries the state consumed by the backward pass. Gate order is
+    ``(reset, update, new)`` matching PyTorch's GRU weight layout.
+    """
+    ig = input_gates + input_bias if input_bias is not None else input_gates
+    hg = hidden_gates + hidden_bias if hidden_bias is not None else hidden_gates
+
+    i_r, i_z, i_n = ig.chunk(3, dim=1)
+    h_r, h_z, h_n = hg.chunk(3, dim=1)
+    r = torch.sigmoid(i_r + h_r)
+    z = torch.sigmoid(i_z + h_z)
+    n = torch.tanh(i_n + r * h_n)
+
+    hy = (1 - z) * n + z * hx
+    workspace = torch.cat([r, z, n, hx, h_n], dim=1)
+    return hy, workspace
+
+
+@_register_fake("aten::_thnn_fused_gru_cell_backward")
+def _thnn_fused_gru_cell_backward_fake(grad_hy, workspace, has_bias):
+    n_batch, hidden = grad_hy.shape[0], grad_hy.shape[-1]
+    grad_input_gates = grad_hy.new_empty((n_batch, 3 * hidden))
+    grad_hidden_gates = grad_hy.new_empty((n_batch, 3 * hidden))
+    grad_hx = grad_hy.new_empty((n_batch, hidden))
+    grad_input_bias = grad_hy.new_empty((3 * hidden,)) if has_bias else None
+    grad_hidden_bias = grad_hy.new_empty((3 * hidden,)) if has_bias else None
+    return grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias, grad_hidden_bias
+
+
+@register_decomposition([aten._thnn_fused_gru_cell_backward.default])
+def thnn_fused_gru_cell_backward_decomposition(grad_hy, workspace, has_bias):
+    """Decompose the fused GRU cell backward into elementwise ops.
+
+    Reads ``r, z, n, hx, h_n`` back out of ``workspace`` and returns
+    ``(grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias,
+    grad_hidden_bias)``. The bias grads are None unless ``has_bias``.
+    """
+    r, z, n, hx, h_n = workspace.chunk(5, dim=1)
+
+    d_z = grad_hy * (hx - n)  # from hy = (1 - z) n + z hx
+    d_n = grad_hy * (1 - z)
+    grad_hx = grad_hy * z
+
+    g_n = d_n * (1 - n * n)  # through tanh
+    d_r = g_n * h_n
+    g_z = d_z * z * (1 - z)  # through sigmoid
+    g_r = d_r * r * (1 - r)  # through sigmoid
+
+    # h_n only enters via r * h_n, so the new-gate hidden grad picks up an r.
+    grad_input_gates = torch.cat([g_r, g_z, g_n], dim=1)
+    grad_hidden_gates = torch.cat([g_r, g_z, g_n * r], dim=1)
+    grad_input_bias = grad_input_gates.sum(dim=0) if has_bias else None
+    grad_hidden_bias = grad_hidden_gates.sum(dim=0) if has_bias else None
+    return grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias, grad_hidden_bias
+
+
+# ── Matrix exponential ──────────────────────────────────────────────
+#
+# ``aten::linalg_matrix_exp`` has no StableHLO lowering and reaches the backend
+# as an opaque ``torch.operator`` that fails to legalize. PyTorch's reference is
+# scaling-and-squaring with an adaptive Padé degree — but that involves (a) a
+# matrix solve/inverse (no Neuron lowering) and (b) degree/step selection driven
+# by ‖A‖, i.e. data-dependent control flow that graph-breaks under torch.compile.
+#
+# We instead use scaling-and-squaring with a fixed-order Taylor series and no
+# solve, made compile-safe by turning the one data-dependent quantity — the
+# per-matrix squaring count ``s`` — into a static loop with a per-batch mask:
+#
+#   Identity:  e^A = ( e^{A / 2^s} )^{2^s}
+#
+#   1. s = ceil(log2(max(‖A‖_F, 1))), clamped to [0, S_MAX], computed PER batch
+#      element as a tensor (reductions + log2 + ceil — no .item(), no branching).
+#      This scales A down so ‖A / 2^s‖ ≲ 1, where the Taylor series converges
+#      fast. Over-estimating the norm (Frobenius ≥ spectral) only adds squarings,
+#      never hurts accuracy, since the identity holds for any s.
+#   2. R = Σ_{k=0}^{ORDER} B^k / k!   with B = A / 2^s   (matmul + add only).
+#   3. Square S_MAX times, but make step i a no-op for batches that need fewer:
+#         R = R + (i < s) · (R @ R - R)
+#      so element b ends up squared exactly s_b times. Fully static: the loop
+#      trip count is the constant S_MAX; ``s`` only gates via an elementwise mask.
+#
+# Everything lowers natively (matmul, add, mul, sum, sqrt, log2, ceil, clamp,
+# exp2, comparison) and the whole thing is differentiable, so autograd for
+# matrix_exp comes for free. ORDER=10 / S_MAX=18 tracks the CPU kernel to
+# ≤1e-10 relative error across spectral scales up to ~300 (norms up to 2^18).
+# The ``.out`` overload rides along via functionalization → default.
+#
+# Cost note: this always runs S_MAX squarings rather than exactly s. For the
+# small matrices matrix_exp targets that is negligible; a dynamic_range NKI
+# kernel could do exactly s squarings if this ever needs to be tightened.
+@register_decomposition([aten.linalg_matrix_exp.default])
+def linalg_matrix_exp_decomposition(a, taylor_order: int = 10, s_max: int = 18):
+    """Decompose matrix_exp via masked, per-batch adaptive scaling-and-squaring."""
+    *batch, n, _ = a.shape
+    eye = torch.eye(n, dtype=a.dtype, device=a.device)  # broadcasts over batch
+
+    # Per-batch squaring count from the Frobenius norm (upper-bounds spectral).
+    fro = torch.sqrt((a * a).sum(dim=(-2, -1)))  # (*batch,)
+    s = torch.ceil(torch.log2(fro.clamp_min(1.0))).clamp(0, s_max)  # (*batch,)
+    B = a * torch.exp2(-s).reshape(*batch, 1, 1)
+
+    # Taylor series R = Σ B^k / k! for the scaled matrix.
+    term = eye.expand_as(a)  # B^0 / 0! = I
+    R = term
+    for k in range(1, taylor_order + 1):
+        term = torch.matmul(term, B) / k
+        R = R + term
+
+    # Undo the scaling: square s times, masking out steps a batch doesn't need.
+    for i in range(s_max):
+        mask = (i < s).to(a.dtype).reshape(*batch, 1, 1)
+        R = R + mask * (torch.matmul(R, R) - R)
+    return R
+
+
 # ``aten::_stack`` is the internal variant of ``stack`` (it assumes all inputs
 # already share a shape). Unlike ``aten::stack`` it ships no meta kernel, so
 # Dynamo can't trace it and it reaches the backend as an opaque ``torch.operator``

@@ -869,6 +869,422 @@ class TestBmmDtypeDecomposition:
         torch.testing.assert_close(result, expected)
 
 
+class TestOrmqrDecomposition:
+    """Test the ormqr decomposition (reflector reconstruction + matmul)."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.ormqr.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("batch", [(), (2,), (2, 3)])
+    @pytest.mark.parametrize("m,nref", [(5, 5), (6, 3), (4, 4)])
+    @pytest.mark.parametrize("left", [True, False])
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_ormqr_decomp_matches_reference(self, batch, m, nref, left, transpose):
+        torch.manual_seed(0)
+        ncols = 7
+        # Build valid Householder reflectors via geqrf.
+        A = torch.randn(*batch, m, nref, dtype=torch.float64)
+        reflectors, tau = torch.geqrf(A)
+        # Q is (m x m); C is (m x ncols) for left, (ncols x m) for right.
+        C = (
+            torch.randn(*batch, m, ncols, dtype=torch.float64)
+            if left
+            else torch.randn(*batch, ncols, m, dtype=torch.float64)
+        )
+        result = decompositions.ormqr_decomposition(
+            reflectors, tau, C, left=left, transpose=transpose
+        )
+        expected = torch.ormqr(reflectors, tau, C, left=left, transpose=transpose)
+        assert result.shape == expected.shape
+        torch.testing.assert_close(result, expected)
+
+
+class TestThnnFusedLstmCellDecomposition:
+    """Test the fused LSTM cell forward + backward decompositions.
+
+    The fused ATen kernels have no CPU implementation, so autograd through the
+    (elementwise) forward decomposition is used as the oracle for the analytic
+    backward decomposition.
+    """
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten._thnn_fused_lstm_cell.default in decompositions.neuron_decompositions
+        assert (
+            torch.ops.aten._thnn_fused_lstm_cell_backward_impl.default
+            in decompositions.neuron_decompositions
+        )
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_forward_shapes(self, has_bias):
+        torch.manual_seed(0)
+        N, Hd = 4, 5
+        ig = torch.randn(N, 4 * Hd, dtype=torch.float64)
+        hg = torch.randn(N, 4 * Hd, dtype=torch.float64)
+        cx = torch.randn(N, Hd, dtype=torch.float64)
+        ib = torch.randn(4 * Hd, dtype=torch.float64) if has_bias else None
+        hb = torch.randn(4 * Hd, dtype=torch.float64) if has_bias else None
+        hy, cy, ws = decompositions.thnn_fused_lstm_cell_decomposition(ig, hg, cx, ib, hb)
+        assert hy.shape == (N, Hd)
+        assert cy.shape == (N, Hd)
+        assert ws.shape == (N, 4 * Hd)
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    @pytest.mark.parametrize("use_grad_cy", [False, True])
+    def test_backward_matches_autograd(self, has_bias, use_grad_cy):
+        torch.manual_seed(0)
+        N, Hd = 4, 5
+        ig = torch.randn(N, 4 * Hd, dtype=torch.float64, requires_grad=True)
+        hg = torch.randn(N, 4 * Hd, dtype=torch.float64, requires_grad=True)
+        cx = torch.randn(N, Hd, dtype=torch.float64, requires_grad=True)
+        ib = torch.randn(4 * Hd, dtype=torch.float64, requires_grad=True) if has_bias else None
+        hb = torch.randn(4 * Hd, dtype=torch.float64, requires_grad=True) if has_bias else None
+
+        hy, cy, ws = decompositions.thnn_fused_lstm_cell_decomposition(ig, hg, cx, ib, hb)
+
+        grad_hy = torch.randn(N, Hd, dtype=torch.float64)
+        grad_cy = torch.randn(N, Hd, dtype=torch.float64) if use_grad_cy else None
+
+        outs = [hy] + ([cy] if use_grad_cy else [])
+        grads = [grad_hy] + ([grad_cy] if use_grad_cy else [])
+        inputs = [ig, hg, cx] + ([ib, hb] if has_bias else [])
+        ref = torch.autograd.grad(outs, inputs, grads)
+
+        grad_gates, grad_cx, grad_bias = (
+            decompositions.thnn_fused_lstm_cell_backward_impl_decomposition(
+                grad_hy, grad_cy, cx.detach(), cy.detach(), ws.detach(), has_bias
+            )
+        )
+
+        # grad w.r.t. input_gates and hidden_gates both equal grad_gates.
+        torch.testing.assert_close(grad_gates, ref[0])
+        torch.testing.assert_close(grad_gates, ref[1])
+        torch.testing.assert_close(grad_cx, ref[2])
+        if has_bias:
+            # Both input_bias and hidden_bias grads equal grad_bias.
+            assert grad_bias.shape == (4 * Hd,)
+            torch.testing.assert_close(grad_bias, ref[3])
+            torch.testing.assert_close(grad_bias, ref[4])
+        else:
+            assert grad_bias is None
+
+
+class TestThnnFusedGruCellDecomposition:
+    """Test the fused GRU cell forward + backward decompositions.
+
+    The fused ATen kernels ship no meta/CPU impl, so the forward is checked
+    against nn.GRUCell (independent, same math) and the backward against
+    autograd through the forward decomposition.
+    """
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten._thnn_fused_gru_cell.default in decompositions.neuron_decompositions
+        assert (
+            torch.ops.aten._thnn_fused_gru_cell_backward.default
+            in decompositions.neuron_decompositions
+        )
+
+    def test_forward_matches_gru_cell(self):
+        torch.manual_seed(0)
+        N, Hd, IN = 3, 5, 4
+        cell = nn.GRUCell(IN, Hd).double()
+        x = torch.randn(N, IN, dtype=torch.float64)
+        hx = torch.randn(N, Hd, dtype=torch.float64)
+        ref_hy = cell(x, hx)
+
+        input_gates = x @ cell.weight_ih.t()
+        hidden_gates = hx @ cell.weight_hh.t()
+        hy, ws = decompositions.thnn_fused_gru_cell_decomposition(
+            input_gates, hidden_gates, hx, cell.bias_ih, cell.bias_hh
+        )
+        assert hy.shape == (N, Hd)
+        assert ws.shape == (N, 5 * Hd)
+        torch.testing.assert_close(hy, ref_hy)
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_backward_matches_autograd(self, has_bias):
+        torch.manual_seed(0)
+        N, Hd = 3, 5
+        ig = torch.randn(N, 3 * Hd, dtype=torch.float64, requires_grad=True)
+        hg = torch.randn(N, 3 * Hd, dtype=torch.float64, requires_grad=True)
+        hx = torch.randn(N, Hd, dtype=torch.float64, requires_grad=True)
+        ib = torch.randn(3 * Hd, dtype=torch.float64, requires_grad=True) if has_bias else None
+        hb = torch.randn(3 * Hd, dtype=torch.float64, requires_grad=True) if has_bias else None
+
+        hy, ws = decompositions.thnn_fused_gru_cell_decomposition(ig, hg, hx, ib, hb)
+        grad_hy = torch.randn(N, Hd, dtype=torch.float64)
+        inputs = [ig, hg, hx] + ([ib, hb] if has_bias else [])
+        ref = torch.autograd.grad([hy], inputs, [grad_hy])
+
+        gig, ghg, ghx, gib, ghb = decompositions.thnn_fused_gru_cell_backward_decomposition(
+            grad_hy, ws.detach(), has_bias
+        )
+        torch.testing.assert_close(gig, ref[0])
+        torch.testing.assert_close(ghg, ref[1])
+        torch.testing.assert_close(ghx, ref[2])
+        if has_bias:
+            assert gib.shape == (3 * Hd,)
+            torch.testing.assert_close(gib, ref[3])
+            torch.testing.assert_close(ghb, ref[4])
+        else:
+            assert gib is None
+            assert ghb is None
+
+
+class TestLinalgMatrixExpDecomposition:
+    """Test the matrix_exp decomposition (masked adaptive scaling-and-squaring)
+    against the CPU torch.linalg.matrix_exp oracle across norm regimes."""
+
+    def test_registered_in_decomposition_table(self):
+        assert torch.ops.aten.linalg_matrix_exp.default in decompositions.neuron_decompositions
+
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 3.0, 10.0, 50.0, 300.0])
+    def test_matches_reference_across_scales(self, scale):
+        torch.manual_seed(0)
+        n = 6
+        A = torch.randn(3, n, n, dtype=torch.float64) * (scale / n**0.5)
+        got = decompositions.linalg_matrix_exp_decomposition(A)
+        expected = torch.linalg.matrix_exp(A)
+        torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+    def test_mixed_norm_batch(self):
+        torch.manual_seed(0)
+        A = torch.stack(
+            [
+                torch.randn(5, 5, dtype=torch.float64) * 0.05,
+                torch.randn(5, 5, dtype=torch.float64) * 2.0,
+                torch.randn(5, 5, dtype=torch.float64) * 20.0,
+                torch.randn(5, 5, dtype=torch.float64) * 100.0,
+            ]
+        )
+        got = decompositions.linalg_matrix_exp_decomposition(A)
+        expected = torch.linalg.matrix_exp(A)
+        torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+    def test_2d_input(self):
+        torch.manual_seed(0)
+        A = torch.randn(7, 7, dtype=torch.float64) * 4
+        got = decompositions.linalg_matrix_exp_decomposition(A)
+        expected = torch.linalg.matrix_exp(A)
+        torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestOrmqrDecompositionE2E:
+    """Compile ormqr end-to-end on Neuron and diff against the CPU kernel."""
+
+    @pytest.mark.parametrize("m,nref", [(5, 5), (6, 3)])
+    @pytest.mark.parametrize("left", [True, False])
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_ormqr_e2e(self, m, nref, left, transpose):
+        torch.manual_seed(0)
+        ncols = 4
+        A = torch.randn(m, nref)
+        reflectors, tau = torch.geqrf(A)
+        C = torch.randn(m, ncols) if left else torch.randn(ncols, m)
+
+        def fn(a, t, c):
+            return torch.ormqr(a, t, c, left=left, transpose=transpose)
+
+        # torch.ormqr has a CPU kernel — use it directly as the oracle.
+        expected = fn(reflectors, tau, C)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(reflectors.to("neuron"), tau.to("neuron"), C.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-3)
+
+
+def _lstm_cell_ref_forward(ig, hg, cx, ib=None, hb=None):
+    """Independent CPU reference for the fused LSTM cell forward (elementwise)."""
+    gates = ig + hg
+    if ib is not None:
+        gates = gates + ib
+    if hb is not None:
+        gates = gates + hb
+    i, f, c, o = gates.chunk(4, dim=1)
+    i = torch.sigmoid(i)
+    f = torch.sigmoid(f)
+    c = torch.tanh(c)
+    o = torch.sigmoid(o)
+    cy = f * cx + i * c
+    hy = o * torch.tanh(cy)
+    ws = torch.cat([i, f, c, o], dim=1)
+    return hy, cy, ws
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestThnnFusedLstmCellDecompositionE2E:
+    """Compile the fused LSTM cell fwd/bwd on Neuron and diff against a CPU
+    reference. The ATen fused kernels have no CPU impl, so the reference is an
+    independent elementwise implementation (and autograd through it for bwd)."""
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_lstm_cell_forward_e2e(self, has_bias):
+        torch.manual_seed(0)
+        N, Hd = 4, 5
+        ig = torch.randn(N, 4 * Hd)
+        hg = torch.randn(N, 4 * Hd)
+        cx = torch.randn(N, Hd)
+        ib = torch.randn(4 * Hd) if has_bias else None
+        hb = torch.randn(4 * Hd) if has_bias else None
+
+        ref_hy, ref_cy, _ = _lstm_cell_ref_forward(ig, hg, cx, ib, hb)
+
+        def fn(ig, hg, cx, ib, hb):
+            hy, cy, _ws = torch.ops.aten._thnn_fused_lstm_cell.default(ig, hg, cx, ib, hb)
+            return hy, cy
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        hy_n, cy_n = compiled(
+            ig.to("neuron"),
+            hg.to("neuron"),
+            cx.to("neuron"),
+            ib.to("neuron") if has_bias else None,
+            hb.to("neuron") if has_bias else None,
+        )
+        torch.testing.assert_close(hy_n.cpu(), ref_hy, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(cy_n.cpu(), ref_cy, rtol=1e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    @pytest.mark.parametrize("use_grad_cy", [False, True])
+    def test_lstm_cell_backward_impl_e2e(self, has_bias, use_grad_cy):
+        torch.manual_seed(0)
+        N, Hd = 4, 5
+        ig = torch.randn(N, 4 * Hd, requires_grad=True)
+        hg = torch.randn(N, 4 * Hd, requires_grad=True)
+        cx = torch.randn(N, Hd, requires_grad=True)
+        ib = torch.randn(4 * Hd, requires_grad=True) if has_bias else None
+        hb = torch.randn(4 * Hd, requires_grad=True) if has_bias else None
+
+        hy, cy, ws = _lstm_cell_ref_forward(ig, hg, cx, ib, hb)
+        grad_hy = torch.randn(N, Hd)
+        grad_cy = torch.randn(N, Hd) if use_grad_cy else None
+
+        # CPU oracle: autograd through the elementwise forward.
+        outs = [hy] + ([cy] if use_grad_cy else [])
+        grads = [grad_hy] + ([grad_cy] if use_grad_cy else [])
+        inputs = [ig, hg, cx] + ([ib, hb] if has_bias else [])
+        ref = torch.autograd.grad(outs, inputs, grads)
+        ref_gates, ref_cx = ref[0], ref[2]
+
+        cy_d, ws_d = cy.detach(), ws.detach()
+
+        def fn(ghy, gcy, cx, cy, ws):
+            return torch.ops.aten._thnn_fused_lstm_cell_backward_impl.default(
+                ghy, gcy, cx, cy, ws, has_bias
+            )
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        gg, gcx, gb = compiled(
+            grad_hy.to("neuron"),
+            grad_cy.to("neuron") if use_grad_cy else None,
+            cx.detach().to("neuron"),
+            cy_d.to("neuron"),
+            ws_d.to("neuron"),
+        )
+        torch.testing.assert_close(gg.cpu(), ref_gates, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(gcx.cpu(), ref_cx, rtol=1e-2, atol=1e-3)
+        if has_bias:
+            torch.testing.assert_close(gb.cpu(), ref[3], rtol=1e-2, atol=1e-3)
+
+
+def _gru_cell_ref_forward(ig, hg, hx, ib=None, hb=None):
+    """Independent CPU reference for the fused GRU cell forward (elementwise)."""
+    if ib is not None:
+        ig = ig + ib
+    if hb is not None:
+        hg = hg + hb
+    i_r, i_z, i_n = ig.chunk(3, dim=1)
+    h_r, h_z, h_n = hg.chunk(3, dim=1)
+    r = torch.sigmoid(i_r + h_r)
+    z = torch.sigmoid(i_z + h_z)
+    n = torch.tanh(i_n + r * h_n)
+    hy = (1 - z) * n + z * hx
+    ws = torch.cat([r, z, n, hx, h_n], dim=1)
+    return hy, ws
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestThnnFusedGruCellDecompositionE2E:
+    """Compile the fused GRU cell fwd/bwd on Neuron and diff against a CPU
+    reference (elementwise forward + autograd through it for backward)."""
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_gru_cell_forward_e2e(self, has_bias):
+        torch.manual_seed(0)
+        N, Hd = 3, 5
+        ig = torch.randn(N, 3 * Hd)
+        hg = torch.randn(N, 3 * Hd)
+        hx = torch.randn(N, Hd)
+        ib = torch.randn(3 * Hd) if has_bias else None
+        hb = torch.randn(3 * Hd) if has_bias else None
+
+        ref_hy, _ = _gru_cell_ref_forward(ig, hg, hx, ib, hb)
+
+        def fn(ig, hg, hx, ib, hb):
+            hy, _ws = torch.ops.aten._thnn_fused_gru_cell.default(ig, hg, hx, ib, hb)
+            return hy
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        hy_n = compiled(
+            ig.to("neuron"),
+            hg.to("neuron"),
+            hx.to("neuron"),
+            ib.to("neuron") if has_bias else None,
+            hb.to("neuron") if has_bias else None,
+        )
+        torch.testing.assert_close(hy_n.cpu(), ref_hy, rtol=1e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("has_bias", [False, True])
+    def test_gru_cell_backward_e2e(self, has_bias):
+        torch.manual_seed(0)
+        N, Hd = 3, 5
+        ig = torch.randn(N, 3 * Hd, requires_grad=True)
+        hg = torch.randn(N, 3 * Hd, requires_grad=True)
+        hx = torch.randn(N, Hd, requires_grad=True)
+        ib = torch.randn(3 * Hd, requires_grad=True) if has_bias else None
+        hb = torch.randn(3 * Hd, requires_grad=True) if has_bias else None
+
+        hy, ws = _gru_cell_ref_forward(ig, hg, hx, ib, hb)
+        grad_hy = torch.randn(N, Hd)
+
+        # CPU oracle: autograd through the elementwise forward.
+        inputs = [ig, hg, hx] + ([ib, hb] if has_bias else [])
+        ref = torch.autograd.grad([hy], inputs, [grad_hy])
+
+        ws_d = ws.detach()
+
+        def fn(ghy, ws):
+            return torch.ops.aten._thnn_fused_gru_cell_backward.default(ghy, ws, has_bias)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        gig, ghg, ghx, gib, ghb = compiled(grad_hy.to("neuron"), ws_d.to("neuron"))
+        torch.testing.assert_close(gig.cpu(), ref[0], rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(ghg.cpu(), ref[1], rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(ghx.cpu(), ref[2], rtol=1e-2, atol=1e-3)
+        if has_bias:
+            torch.testing.assert_close(gib.cpu(), ref[3], rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(ghb.cpu(), ref[4], rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestLinalgMatrixExpDecompositionE2E:
+    """Compile matrix_exp end-to-end on Neuron and diff against the CPU kernel."""
+
+    @pytest.mark.parametrize("scale", [1.0, 5.0, 20.0])
+    def test_matrix_exp_e2e(self, scale):
+        torch.manual_seed(0)
+        n = 6
+        A = torch.randn(2, n, n) * (scale / n**0.5)
+        expected = torch.linalg.matrix_exp(A)  # CPU kernel oracle
+
+        def fn(a):
+            return torch.linalg.matrix_exp(a)
+
+        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
+        result = compiled(A.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-3)
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestBmmDtypeOutDecompositionE2E:
     """Test bmm.dtype_out compiles end-to-end on Neuron via the fake impl +
