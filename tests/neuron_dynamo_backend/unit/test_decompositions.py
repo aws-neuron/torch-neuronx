@@ -7871,3 +7871,350 @@ class TestNativeDropoutDecompositionRNGRouting:
             _, mask = decompositions.native_dropout_decomposition(x, p=0.5, train=True)
         fake_rand.assert_not_called()
         assert mask.shape == x.shape and mask.dtype == torch.bool
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestAllAnyDimsOutDecompositionE2E:
+    """E2E tests for the all.dims / any.dims (and their .dims_out) decompositions.
+
+    PyTorch's ``all.dims`` decomp rewrites to ``logical_not(any(logical_not(a)))``,
+    emitting ``aten.any.dims`` — which torch-mlir marks illegal. Registering
+    ``any.dims`` in the neuron table lets it further decompose to
+    ``sum(...).ne(False)`` so both ops lower. The full-reduction ``dim=None``
+    case is the one that regressed before the fix, so it's covered here.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,dim,keepdim",
+        [
+            ((4, 8), None, False),
+            ((4, 8), None, True),
+            ((4, 8), [1], False),
+            ((4, 8), [0, 1], False),
+            ((4, 8), [0], True),
+            ((2, 3, 4), [1, 2], False),
+            ((2, 3, 4), [-1], True),
+            ((16,), [0], False),
+        ],
+    )
+    @pytest.mark.parametrize("reduce_op", [torch.all, torch.any])
+    def test_all_any_dims_e2e(self, reduce_op, shape, dim, keepdim):
+        """Functional torch.all / torch.any over dim list (routes to *.dims)."""
+        torch.manual_seed(0)
+        # Mixed zeros/ones so the reduction result is non-trivial.
+        x_cpu = (torch.rand(shape) > 0.3).to(torch.bool)
+
+        def fn(x):
+            if dim is None:
+                return reduce_op(x)
+            return reduce_op(x, dim=dim, keepdim=keepdim)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu))
+
+    @pytest.mark.parametrize(
+        "dim,keepdim",
+        [(None, False), (None, True), ([1], False), ([0, 1], False), ([-1], True)],
+    )
+    @pytest.mark.parametrize("reduce_op", [torch.all, torch.any])
+    def test_all_any_dims_out_e2e(self, reduce_op, dim, keepdim):
+        """Explicit ``out=`` variant, which functionalizes to *.dims_out -> *.dims."""
+        torch.manual_seed(0)
+        x_cpu = (torch.rand(4, 8) > 0.3).to(torch.bool)
+
+        # Compute the reference on CPU (bool result).
+        expected = reduce_op(x_cpu) if dim is None else reduce_op(x_cpu, dim=dim, keepdim=keepdim)
+
+        def neuron_fn(x):
+            out = torch.empty(expected.shape, dtype=torch.bool, device=x.device)
+            if dim is None:
+                return reduce_op(x, out=out)
+            return reduce_op(x, dim=dim, keepdim=keepdim, out=out)
+
+        compiled_fn = torch.compile(neuron_fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int32, torch.float32])
+    @pytest.mark.parametrize("reduce_op", [torch.all, torch.any])
+    def test_all_any_dims_dtypes_e2e(self, reduce_op, dtype):
+        """Non-bool inputs: all/any return bool except uint8 (returns uint8)."""
+        torch.manual_seed(0)
+        raw = (torch.rand(3, 5) > 0.4).to(dtype)
+
+        def fn(x):
+            return reduce_op(x, dim=None)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(raw.to("neuron"))
+        expected = fn(raw)
+        assert result.dtype == expected.dtype
+        torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestSortStableDecompositionE2E:
+    """E2E tests for the sort.stable decomposition.
+
+    ``sort.stable`` has no Neuron lowering; it is routed to ``sort.default``.
+    ``argsort.stable`` / ``argsort.stable_out`` and ``sort.values_stable`` all
+    reduce to ``sort.stable`` during tracing, so this one decomposition covers
+    them all. Inputs use distinct values (no ties) so the best-effort stability
+    doesn't affect the compared indices.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,dim,descending",
+        [
+            ((16,), -1, False),
+            ((16,), 0, True),
+            ((4, 8), -1, False),
+            ((4, 8), 0, False),
+            ((2, 3, 5), 2, True),
+        ],
+    )
+    def test_argsort_stable_e2e(self, shape, dim, descending):
+        """torch.argsort(..., stable=True) -> argsort.stable -> sort.stable."""
+        x_cpu = torch.randperm(int(torch.tensor(shape).prod())).reshape(shape).to(torch.float32)
+
+        def fn(x):
+            return torch.argsort(x, dim=dim, descending=descending, stable=True)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu))
+
+    @pytest.mark.parametrize("dim,descending", [(-1, False), (0, True), (1, False)])
+    def test_argsort_stable_out_e2e(self, dim, descending):
+        """Explicit out= variant: argsort.stable_out -> sort.stable."""
+        aten = torch.ops.aten
+        x_cpu = torch.randperm(24).reshape(4, 6).to(torch.float32)
+        expected = torch.argsort(x_cpu, dim=dim, descending=descending, stable=True)
+
+        def fn(x):
+            out = torch.empty(expected.shape, dtype=torch.long, device=x.device)
+            return aten.argsort.stable_out(x, stable=True, dim=dim, descending=descending, out=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize("dim,descending", [(-1, False), (0, True)])
+    def test_sort_stable_e2e(self, dim, descending):
+        """torch.sort(..., stable=True) returns (values, indices)."""
+        x_cpu = torch.randperm(24).reshape(4, 6).to(torch.float32)
+
+        def fn(x):
+            return torch.sort(x, dim=dim, descending=descending, stable=True)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        vals_n, idx_n = compiled_fn(x_cpu.to("neuron"))
+        vals_c, idx_c = fn(x_cpu)
+        torch.testing.assert_close(vals_n.cpu(), vals_c)
+        torch.testing.assert_close(idx_n.cpu(), idx_c)
+
+    def test_sort_values_stable_out_e2e(self):
+        """Explicit out= sort: sort.values_stable -> sort.stable."""
+        aten = torch.ops.aten
+        x_cpu = torch.randperm(24).reshape(4, 6).to(torch.float32)
+        vals_c, idx_c = torch.sort(x_cpu, dim=-1, stable=True)
+
+        def fn(x):
+            values = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            indices = torch.empty(x.shape, dtype=torch.long, device=x.device)
+            return aten.sort.values_stable(
+                x, stable=True, dim=-1, descending=False, values=values, indices=indices
+            )
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        vals_n, idx_n = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(vals_n.cpu(), vals_c)
+        torch.testing.assert_close(idx_n.cpu(), idx_c)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestModeDecompositionE2E:
+    """E2E tests for the mode decomposition.
+
+    ``aten.mode`` has no PyTorch reference decomposition and no torch-mlir
+    lowering; it is decomposed here into a pairwise-equality frequency count.
+    ``mode.values`` (out variant) functionalizes to ``mode.default``, so the
+    single decomposition covers it.
+
+    The returned *value* is unique, but the *index* is only reproducible when
+    the winning value's occurrences are contiguous — otherwise which
+    occurrence's index CPU returns depends on its internal unstable-sort
+    tie-order. Tests that compare indices use contiguous-majority inputs; the
+    rest compare values only.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,dim,keepdim",
+        [
+            ((7,), -1, False),
+            ((7,), 0, True),
+            ((4, 8), -1, False),
+            ((4, 8), 0, False),
+            ((3, 5), 1, True),
+            ((2, 3, 4), 2, False),
+            ((2, 3, 4), 1, True),
+        ],
+    )
+    def test_mode_values_only_e2e(self, shape, dim, keepdim):
+        """Compare only the mode values (indices are tie-order dependent)."""
+        torch.manual_seed(0)
+        # Small integer range -> frequent repeats so the mode is meaningful.
+        x_cpu = torch.randint(0, 3, shape)
+
+        def fn(x):
+            return torch.mode(x, dim=dim, keepdim=keepdim)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        vals_n, _ = compiled_fn(x_cpu.to("neuron"))
+        vals_c, _ = fn(x_cpu)
+        torch.testing.assert_close(vals_n.cpu(), vals_c)
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.float32])
+    def test_mode_value_and_index_unambiguous_e2e(self, dtype):
+        """When the mode value occurs contiguously, both value and index match.
+
+        Each row has a clear majority value in contiguous positions, so CPU's
+        sort keeps them ordered and returns the last occurrence — matching the
+        decomposition's last-occurrence rule.
+        """
+        # Row 0: value 5 at positions 0,1,2 (majority); row 1: value 2 at 2,3,4.
+        x_cpu = torch.tensor(
+            [
+                [5, 5, 5, 1, 9],
+                [7, 0, 2, 2, 2],
+            ],
+            dtype=dtype,
+        )
+        expected = torch.mode(x_cpu, dim=-1)
+
+        def fn(x):
+            return torch.mode(x, dim=-1)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        vals_n, idx_n = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(vals_n.cpu(), expected.values)
+        torch.testing.assert_close(idx_n.cpu(), expected.indices)
+
+    def test_mode_values_out_variant_e2e(self):
+        """mode.values (explicit out=) functionalizes to mode.default."""
+        aten = torch.ops.aten
+        torch.manual_seed(0)
+        x_cpu = torch.randint(0, 3, (4, 8))
+        vals_c, _ = torch.mode(x_cpu, dim=-1)
+
+        def fn(x):
+            values = torch.empty(x.shape[:-1], dtype=x.dtype, device=x.device)
+            indices = torch.empty(x.shape[:-1], dtype=torch.long, device=x.device)
+            return aten.mode.values(x, dim=-1, keepdim=False, values=values, indices=indices)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        vals_n, _ = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(vals_n.cpu(), vals_c)
+
+
+class TestMaskedScatterDecomposition:
+    """CPU unit tests for the masked_scatter decomposition.
+
+    These call ``decompositions.masked_scatter_decomposition`` directly and
+    compare against ``torch.masked_scatter`` on CPU, so they need no Neuron
+    hardware. The decomposition previously lived in torch-mlir's C++
+    ``DecomposeAtenMaskedScatterOp`` and keyed every intermediate off ``self``'s
+    shape; that broke the broadcast cases (``self`` smaller than the result),
+    which are the ones exercised most heavily here.
+    """
+
+    def test_registered(self):
+        assert torch.ops.aten.masked_scatter.default in decompositions.neuron_decompositions
+        assert callable(decompositions.neuron_decompositions[torch.ops.aten.masked_scatter.default])
+
+    @pytest.mark.parametrize(
+        "self_shape,mask_shape",
+        [
+            ((4,), (4,)),
+            ((4, 4), (4, 4)),
+            ((4,), (4, 4)),  # self smaller -> broadcast (the motivating bug)
+            ((1, 4), (3, 4)),
+            ((3, 1), (3, 4)),
+            ((2, 3, 4), (2, 3, 4)),
+            ((1,), (2, 3, 4)),  # scalar-ish self broadcast to 3D
+        ],
+    )
+    def test_matches_cpu_reference(self, self_shape, mask_shape):
+        torch.manual_seed(0)
+        self = torch.randn(self_shape)
+        mask = torch.rand(mask_shape) > 0.4
+        # source only needs at least as many elements as True positions.
+        source = torch.randn(int(mask.sum()) + 5)
+
+        expected = torch.masked_scatter(self, mask, source)
+        got = decompositions.masked_scatter_decomposition(self, mask, source)
+
+        assert got.shape == expected.shape
+        torch.testing.assert_close(got, expected)
+
+    def test_non_bool_mask(self):
+        """masked_scatter accepts an integer/byte mask; decomp casts to bool."""
+        torch.manual_seed(0)
+        self = torch.randn(4)
+        mask = (torch.rand(4, 4) > 0.4).to(torch.uint8)
+        source = torch.randn(int(mask.sum()) + 3)
+
+        expected = torch.masked_scatter(self, mask.to(torch.bool), source)
+        got = decompositions.masked_scatter_decomposition(self, mask, source)
+        torch.testing.assert_close(got, expected)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestMaskedScatterDecompositionE2E:
+    """E2E tests for the masked_scatter decomposition through the neuron backend.
+
+    The broadcast case (``self=[N]``, ``mask=[N, N]``) is what regressed with the
+    original torch-mlir C++ decomposition (a ``chlo.broadcast_add`` type-inference
+    failure); it is the primary case covered here.
+    """
+
+    @pytest.mark.parametrize(
+        "self_shape,mask_shape",
+        [
+            ((4,), (4,)),
+            ((4, 4), (4, 4)),
+            ((4,), (4, 4)),  # broadcast: self smaller than result
+            ((3, 1), (3, 4)),
+            ((2, 3, 4), (2, 3, 4)),
+        ],
+    )
+    def test_masked_scatter_e2e(self, self_shape, mask_shape):
+        torch.manual_seed(0)
+        self_cpu = torch.randn(self_shape)
+        mask_cpu = torch.rand(mask_shape) > 0.4
+        source_cpu = torch.randn(int(torch.tensor(mask_shape).prod()))
+
+        def fn(s, m, src):
+            return torch.masked_scatter(s, m, src)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(self_cpu.to("neuron"), mask_cpu.to("neuron"), source_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(self_cpu, mask_cpu, source_cpu))
+
+    def test_masked_scatter_out_variant_e2e(self):
+        """The .out variant functionalizes to masked_scatter.default."""
+        aten = torch.ops.aten
+        torch.manual_seed(0)
+        self_cpu = torch.randn(4, 4)
+        mask_cpu = torch.rand(4, 4) > 0.4
+        source_cpu = torch.randn(16)
+        expected = torch.masked_scatter(self_cpu, mask_cpu, source_cpu)
+
+        def fn(s, m, src):
+            out = torch.empty_like(s)
+            return aten.masked_scatter.out(s, m, src, out=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        result = compiled_fn(self_cpu.to("neuron"), mask_cpu.to("neuron"), source_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), expected)
