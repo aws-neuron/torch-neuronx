@@ -10,7 +10,13 @@ kernel, so ONE NEFF per (H, dtype) serves any M that tiles by 128. H is arbitrar
 
 import torch
 
-from ..adapter_utils import _TILE_M, _compile_or_load_neff, _num_tiles_tensor
+from ..adapter_utils import (
+    _TILE_M,
+    _ceil_to_tile,
+    _compile_or_load_neff,
+    _num_tiles_tensor,
+    _pad_rows_to,
+)
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 
@@ -23,7 +29,7 @@ def _can_handle_silu_bwd(grad_output, self, out=None) -> bool:
     if grad_output.shape != self.shape or grad_output.dtype != self.dtype:
         return False
     M, H = grad_output.shape  # noqa: N806
-    if M == 0 or M % _TILE_M != 0 or H == 0:  # noqa: SIM103  (H arbitrary)
+    if M == 0 or H == 0:  # noqa: SIM103  (any M > 0 — prepare_io pads rows; H arbitrary)
         return False
     return True
 
@@ -49,17 +55,20 @@ def _compile_silu_bwd(compile_key) -> tuple[bytes, str]:
 
 
 def _prepare_silu_bwd_io(grad_output, self, dest=None) -> tuple[tuple, tuple, int]:
+    """Pad both operands' rows up to M_ceil (next 128-multiple) so num_m_tiles
+    walks whole tiles; padded rows are sliced off in reshape_output."""
     M, H = grad_output.shape  # noqa: N806
+    M_ceil = _ceil_to_tile(M)  # noqa: N806
     device = grad_output.device
-    grad_2d = grad_output.contiguous()
-    inp_2d = self.contiguous()
-    num_m_tiles = _num_tiles_tensor(M // _TILE_M, device)
-    outputs = (torch.empty((M, H), dtype=grad_output.dtype, device=device),)
+    grad_2d = _pad_rows_to(grad_output.contiguous(), M_ceil)
+    inp_2d = _pad_rows_to(self.contiguous(), M_ceil)
+    num_m_tiles = _num_tiles_tensor(M_ceil // _TILE_M, device)
+    outputs = (torch.empty((M_ceil, H), dtype=grad_output.dtype, device=device),)
     return (grad_2d, inp_2d, num_m_tiles), outputs, M
 
 
 def _reshape_silu_bwd_output(outputs, original_args):
-    return outputs[0].reshape(original_args[0].shape)
+    return outputs[0][: original_args[0].shape[0]].reshape(original_args[0].shape)
 
 
 def register():

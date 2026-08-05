@@ -775,6 +775,7 @@ def main():
             "rms_norm",
             "rope",
             "mixtral_moe",
+            "moe_dynamic",
         ],
     )
     args_temp, _ = parser_temp.parse_known_args()
@@ -802,6 +803,7 @@ def main():
             "gpt_oss_transformer",
             "rope",
             "mixtral_moe",
+            "moe_dynamic",
         ],
         help="Block type to benchmark (default: llama)",
     )

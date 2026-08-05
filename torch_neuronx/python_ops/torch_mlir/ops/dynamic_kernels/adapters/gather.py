@@ -9,9 +9,10 @@ import torch
 from ..adapter_utils import (
     _SUPPORTED_DTYPES,
     _TILE_M,
+    _ceil_to_tile,
     _compile_or_load_neff,
     _num_tiles_tensor,
-    _pad_rows_to_source,
+    _pad_rows_to,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
@@ -45,10 +46,10 @@ def _can_handle_index(self, indices, out=None) -> bool:
     idx = _index_single_1d(indices)
     if idx is None:
         return False
-    # n rows gathered as whole 128-tiles (no padding); index padded to T so
-    # gather must stay within T rows.
+    # n rows gathered as ceil(n/128) whole 128-tiles; index padded to T, so the
+    # padded count ceil(n/128)*128 must still fit within T source rows.
     n = idx.numel()
-    if n == 0 or n % _TILE_M != 0 or n > T:  # noqa: SIM103
+    if n == 0 or _ceil_to_tile(n) > T:  # noqa: SIM103
         return False
     return True
 
@@ -80,15 +81,16 @@ def _prepare_index_io(self, indices, dest=None, **_) -> tuple[tuple, tuple, int]
 
     T (source rows) + H are baked, so the index is padded to the baked size
     [T, 1] (NOT n): first n real, rest ZERO (row 0 is a valid source row =>
-    in-bounds gather, sliced off). num_m_tiles = n // 128.
+    in-bounds gather, sliced off). num_m_tiles = ceil(n / 128) walks whole tiles;
+    rows n..ceil(n) read the zero-padded index (row 0) and are sliced off too.
     """
     T, H = self.shape  # noqa: N806
     device = self.device
     idx_1d = _index_single_1d(indices)
     n = idx_1d.numel()
     idx = idx_1d.reshape(n, 1).to(torch.int32)
-    idx = _pad_rows_to_source(idx, n, T)  # pad to baked source size T (zero-fill)
-    nm = _num_tiles_tensor(n // _TILE_M, device)
+    idx = _pad_rows_to(idx, T)  # pad to baked source size T (zero-fill)
+    nm = _num_tiles_tensor(_ceil_to_tile(n) // _TILE_M, device)
     inputs = (self.contiguous(), idx, nm)
     outputs = (torch.empty((T, H), dtype=self.dtype, device=device),)
     return inputs, outputs, n

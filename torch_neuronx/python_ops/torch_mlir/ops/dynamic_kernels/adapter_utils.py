@@ -32,19 +32,21 @@ def _num_tiles_tensor(num_tiles: int, device: torch.device) -> torch.Tensor:
     return t
 
 
-def _pad_rows_to_source(t_2d: torch.Tensor, n: int, T: int) -> torch.Tensor:  # noqa: N803
-    """Zero-pad [n, C] up to the baked source size [T, C] for gather/scatter.
+def _ceil_to_tile(n: int) -> int:
+    """Round n up to a multiple of _TILE_M (128). n already a multiple -> n."""
+    return -(-int(n) // _TILE_M) * _TILE_M
 
-    The gather/scatter NEFF bakes the index/data dim = T, so the n<T index and
-    data rows are padded to T. Padded rows are zeroed: a padded index points at
-    row 0 (in-bounds), and padded data adds 0 (no-op). NOT a compute-tile bridge
-    — this is structural to reusing one NEFF across varying n.
-    """
-    if n == T:
+
+def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
+    """Zero-pad [r, C] up to [target_rows, C] (r <= target_rows). Used to pad the
+    index/data to the baked source size T (gather/scatter) or the dynamic-M input
+    to a 128-multiple (mm/elementwise). No-op when r == target_rows."""
+    r = t_2d.shape[0]
+    if r == target_rows:
         return t_2d
     C = t_2d.shape[-1]  # noqa: N806
-    padded = torch.zeros(T, C, dtype=t_2d.dtype, device=t_2d.device)
-    padded[:n] = t_2d
+    padded = torch.zeros(target_rows, C, dtype=t_2d.dtype, device=t_2d.device)
+    padded[:r] = t_2d
     return padded
 
 
@@ -112,8 +114,9 @@ def _compile_or_load_neff(kernel, graph_name, example_inputs, outputs):
 
 def _can_handle_elementwise_2d(x) -> bool:
     """Shared predicate for the elementwise ops (silu/add/mul): 2D+ tensor on
-    neuron, supported dtype, M a 128-multiple. H is arbitrary — the kernels tile
-    the free dim at trace time (512-wide + a final short tile), so any H works."""
+    neuron, supported dtype, M > 0. Any M works — prepare_io pads rows up to the
+    next 128-multiple. H is arbitrary too — the kernels tile the free dim at trace
+    time (512-wide + a final short tile)."""
     if not isinstance(x, torch.Tensor):
         return False
     if x.device.type != "neuron":
@@ -124,7 +127,7 @@ def _can_handle_elementwise_2d(x) -> bool:
         return False
     H = x.shape[-1]  # noqa: N806
     M = x.numel() // H  # noqa: N806
-    if M == 0 or M % _TILE_M != 0 or H == 0:  # noqa: SIM103
+    if M == 0 or H == 0:  # noqa: SIM103
         return False
     return True
 
