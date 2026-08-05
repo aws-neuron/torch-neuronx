@@ -32,7 +32,9 @@ static bool PreprocessSingleTensor(at::Tensor& t, const torch::Device& target_de
   // silently relocated to Neuron by the 0-dim fast path below (masking the
   // mismatch, e.g. logsumexp(neuron, out=cpu-scalar)).
   if (is_write_output && !t.is_privateuseone()) {
-    TORCH_CHECK(false, "Output storage is not on Neuron device");
+    TORCH_CHECK(false,
+                "Expected all tensors to be on the same device, but the output tensor is on ",
+                t.device().str(), " and the operation was dispatched to the Neuron device");
   }
 
   // ════════════════════════════════════════════════════════════
