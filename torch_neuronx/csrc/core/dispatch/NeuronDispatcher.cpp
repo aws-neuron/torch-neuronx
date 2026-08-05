@@ -2593,6 +2593,26 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
   // ════════════════════════════════════════════════════════════
   TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] ENTER handling", " op=", op_name);
 
+  // An out= on a different device is an error even when there is nothing to
+  // compute. The outputs below are fabricated on the *input* device, so without
+  // this check a CPU out= is silently ignored instead of raising (upstream
+  // test_out asserts the raise for every op with an out= variant). This sits
+  // outside the try/catch below, which would otherwise swallow it and fall
+  // through to a confusing _copy_from_and_resize failure.
+  {
+    const auto& schema_args = schema.arguments();
+    auto in_device = ExtractDevice(args);
+    for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
+      if (!schema_args[i].kwarg_only()) continue;
+      if (!args[i].isTensor()) continue;
+      const auto& out_t = args[i].toTensor();
+      if (out_t.defined() && out_t.device() != in_device) {
+        TORCH_CHECK(false, "Expected out tensor to have device ", in_device, ", but got ",
+                    out_t.device(), " instead");
+      }
+    }
+  }
+
   try {
     auto device = ExtractDevice(args);
 
