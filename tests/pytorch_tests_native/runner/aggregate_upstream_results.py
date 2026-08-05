@@ -754,6 +754,13 @@ def main(argv: list | None = None) -> int:
         / f"dt={run_date}"
         / f"run_{run_id}.parquet"
     )
+    cache_metrics_parquet = (
+        parquet_root
+        / "cache_metrics"
+        / f"branch={branch}"
+        / f"dt={run_date}"
+        / f"run_{run_id}.parquet"
+    )
 
     if not results_dir.exists():
         logger.error(f"Results directory not found: {results_dir}")
@@ -787,12 +794,24 @@ def main(argv: list | None = None) -> int:
     from aggregate_panel import write_github_summary
     from write_parquet import (
         _resolve_run_timestamp,
+        collect_cache_metrics,
+        run_persistent_cache_present,
+        write_cache_metrics_parquet,
         write_run_metrics_parquet,
         write_test_aggregated_parquet,
         write_test_failures_parquet,
     )
 
-    write_run_metrics_parquet(result["test_rows"], run_metrics_parquet)
+    # Persistent-cache metrics come from per-node cache_metrics.json sidecars.
+    # Collect once: the run-level presence flag is stamped onto run_metrics, and
+    # the per-job rows go to the cache_metrics table. Both no-op (NULL / no
+    # table) on runs that didn't use the cache.
+    cache_sidecars = collect_cache_metrics(results_dir)
+    persistent_cache_present = run_persistent_cache_present(cache_sidecars)
+
+    write_run_metrics_parquet(
+        result["test_rows"], run_metrics_parquet, persistent_cache_present=persistent_cache_present
+    )
     write_test_failures_parquet(result["test_rows"], test_failures_parquet)
     write_test_aggregated_parquet(result["test_rows"], test_aggregated_parquet)
     write_github_summary(result)
@@ -810,6 +829,18 @@ def main(argv: list | None = None) -> int:
         _get_run_metadata(),
         _resolve_run_timestamp(),
         job_metadata_parquet,
+    )
+
+    # cache_metrics: one row per job with the persistent NEFF cache transfer stats
+    # (download/upload bytes + seconds, NEFF counts). Skips gracefully when no
+    # cache_metrics.json sidecars are present (run didn't use the cache). Reuses
+    # the sidecars already collected above (no second glob + parse).
+    write_cache_metrics_parquet(
+        results_dir,
+        _get_run_metadata(),
+        _resolve_run_timestamp(),
+        cache_metrics_parquet,
+        sidecars=cache_sidecars,
     )
 
     flatten_reports(results_dir)

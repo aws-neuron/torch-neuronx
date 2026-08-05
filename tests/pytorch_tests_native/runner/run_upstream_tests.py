@@ -365,6 +365,21 @@ Examples:
         help="Advisory suite: run and upload results, but always exit 0 so a "
         "failure does not block CI (run-but-don't-block).",
     )
+    parser.add_argument(
+        "--download-neff-cache",
+        action="store_true",
+        help="Hydrate the NEFF cache from the shared S3 store to local NVMe before "
+        "the run (and enable HLO-derived NEFF keying). Fail-open: an S3 error "
+        "degrades to a cold local compile, never blocks the run. The S3 prefix is "
+        "scoped per job, derived from the run's items + shard.",
+    )
+    parser.add_argument(
+        "--refresh-neff-cache",
+        action="store_true",
+        help="After the run, upload the local NEFF cache back to the shared store. "
+        "Only effective with --download-neff-cache AND on the main branch. Set by "
+        "the nightly seeding run; readers (merge-queue, dep-guard) leave it off.",
+    )
     parser.add_argument("items", nargs="+")
     args = parser.parse_args(argv)
 
@@ -506,6 +521,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     clone_upstream_tests(args.pytorch_fork_branch)
     print_run_summary(args)
 
+    # Persistent NEFF cache: hydrate from the shared S3 store to local NVMe before
+    # any compile happens, so the run reads warm entries instead of recompiling.
+    # hydrate() sets the cache env vars for the pytest children below. Fail-open —
+    # a miss or S3 error just means a cold compile. The job name (same stem as the
+    # report artifacts) scopes the S3 prefix, unique per matrix node across the
+    # full suite (not just the smoke set).
+    cache = None
+    if args.download_neff_cache:
+        # Late import: sibling runner module, resolved via the runner dir on
+        # sys.path at runtime (mirrors step_summary / job_metadata below).
+        from persistent_cache import PersistentNeffCache
+
+        cache = PersistentNeffCache(derive_safe_name(args.items, args.shard_id))
+        cache.hydrate()
+
     # Build the env-lock LD_PRELOAD shim once; both the main pass and the
     # retry pass preload it. See the "env-lock LD_PRELOAD shim" section.
     pytest_env = preload_env(build_env_lock_shim())
@@ -574,6 +604,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_versions_sidecar(args.output_dir, node_label=os.environ.get("NODE_LABEL"))
     except Exception as exc:
         print(f"WARNING: version sidecar capture failed (non-fatal): {exc}")
+
+    # Persistent cache: on --refresh-neff-cache, upload newly-compiled NEFFs back
+    # to S3 (upload() further restricts this to the main branch), then drop the
+    # cache_metrics file the aggregator collects. Non-fatal.
+    if cache is not None:
+        if args.refresh_neff_cache:
+            cache.upload()
+        cache.write_metrics(args.output_dir)
 
     if args.soft_fail and exit_code != 0:
         print(

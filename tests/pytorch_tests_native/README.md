@@ -50,6 +50,63 @@ pytest tests/pytorch_tests_native/test/distributed/algorithms/ddp_comm_hooks/tes
 
 Use `-rs` to show skip reasons in the summary. Use `-rx` to show xfail reasons.
 
+## Persistent NEFF cache (CI)
+
+NEFF compilation dominates the upstream suite wall-clock (a cold `test_ops`
+shard recompiles ~27K NEFFs, ~50 min). The internal-compute fleet offers a
+repo-scoped persistent cache for GitHub workloads, backed by S3: the runner
+hydrates it to local NVMe so runs reuse compiled NEFFs instead of recompiling
+from cold. It is fail-open: a missing label, missing env, or S3 error degrades
+to a cold local compile and never blocks the run. The whole feature lives in
+`runner/persistent_cache.py` (`PersistentNeffCache`); the runner just
+instantiates it.
+
+**How access works.** A job that carries the persistent-storage label
+`neuron.internal_compute.persistent-storage:read` (or `:write`), alongside the
+existing `neuron.internal_compute` label, gets the storage bucket and key-prefix
+env vars injected into the pod (their names are the `STORAGE_BUCKET_ENV` /
+`STORAGE_PREFIX_ENV` constants in `runner/persistent_cache.py`), pointing at this
+repo's isolated cache. `read` grants read; `write` grants read + write.
+`_upstream-tests.yml` adds this label automatically from the workflow inputs
+(`:write` when the run uploads, else `:read`). Cache entries auto-expire after 7
+days, so treat it as a reconstructible cache, not a source of truth.
+
+`run_upstream_tests.py` flags:
+
+| Flag | Effect |
+|------|--------|
+| `--download-neff-cache` | Before the run, download the NEFF cache to `/tmp/neff_cache` and enable HLO-derived NEFF keying (`TORCH_NEURONX_NEFF_KEY_FROM_HLO=1`), so NEFFs are reused whenever the lowered HLO is unchanged regardless of commit. |
+| `--refresh-neff-cache` | After the run, upload the local cache back. Only effective with `--download-neff-cache`, the `:write` label, AND the `main` branch (enforced in the runner). |
+
+Within the storage prefix the layout is keyed on compiler version and job name
+(Hive-partitioned), so a `neuronx-cc` bump invalidates the cache automatically
+and each shard owns its own prefix:
+
+```
+<storage-prefix>/version=<compiler>/<job_name>/neff_cache/
+```
+
+`<job_name>` is derived internally from the run's items + shard (the same stem
+used for report artifacts), so it is unique per matrix node across the full
+suite (no need to thread it in from the workflow). Nightly and the merge-queue
+gate run the same shard names, so a nightly seed is directly reusable.
+
+**Who reads vs writes.** Reads are on by default (`download-neff-cache: true`),
+so the merge-queue gate and dependency-guard hydrate the seeded cache with no
+extra config. Only nightly sets `refresh-neff-cache: true`, and the runner
+further refuses to upload unless the branch is `main`, so a queued PR, a
+dependency bump, or a nightly run on a custom branch can never write to the
+shared cache.
+
+Each job drops a `cache_metrics.json` sidecar (download/upload bytes + seconds,
+NEFF count before/after, `persistent_cache_present`) that the aggregator folds
+into the `cache_metrics` parquet table; `persistent_cache_present` is also
+stamped onto `run_metrics`.
+
+To bring up or verify S3 access on a small subset, dispatch
+`manual-upstream-tests.yml` with `download-neff-cache: true`. Manual runs read
+the cache but never upload (only nightly seeds).
+
 ## Skip/Xfail Registry
 
 `neuron_test_registry.py` is the single source of truth for all tests that need to be skipped or xfailed on Neuron. Applied automatically via `conftest.py` — no upstream patches needed.
