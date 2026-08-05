@@ -106,6 +106,24 @@ class TestUnaryOpsBackward:
         # Check that gradients match
         torch.testing.assert_close(x_neuron.grad.cpu(), x.grad, rtol=1e-4, atol=1e-4)
 
+    def test_abs_backward_negative(self):
+        """abs backward returns sign(x) * grad_output; exercise negative inputs."""
+        x = torch.tensor([-3.0, -1.0, 2.0, 4.0], requires_grad=True, dtype=torch.float32)
+        x_neuron = x.detach().clone().to("neuron")
+        x_neuron.requires_grad = True
+
+        with track_neuron_ops():
+            y = torch.abs(x)
+            y_neuron = torch.abs(x_neuron)
+
+            grad_output = torch.rand_like(x)
+            y.backward(grad_output)
+            y_neuron.backward(grad_output.to("neuron"))
+
+            assert_op_runs_on_neuron("aten::abs")
+
+        torch.testing.assert_close(x_neuron.grad.cpu(), x.grad, rtol=1e-4, atol=1e-4)
+
 
 class TestGradInputVariants:
     """Tests for .grad_input variant dispatch to Neuron."""
