@@ -76,6 +76,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Temporary parent xfail: unary min/max all-NaN backward produces incorrect " "gradients"
+        ),
+        tests=[
+            "test_autograd.py::TestAutogradDeviceTypeNEURON::test_min_max_aminmax_median_backprops_to_all_values_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "[accuracy.tensor_not_close] Element-wise difference"
             " exceeds tolerance due to float64→float32 precision loss"
         ),
@@ -121,6 +129,17 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="[error_not_raised.runtime_error] Expected RuntimeError not raised on Neuron",
         tests=x.ERROR_NOT_RAISED_RUNTIME_ERROR,
+    ),
+    SkipGroup(
+        reason=(
+            "Temporary parent xfail: advertised-unsupported dtypes allocate or convert "
+            "without raising"
+        ),
+        # TODO: Replace with per-subtest xfails and reject every dtype absent from
+        # torch.accelerator.get_device_capability()["supported_dtypes"].
+        tests=[
+            "test_accelerator.py::TestAccelerator::test_device_capability_supported_dtypes",
+        ],
     ),
     SkipGroup(
         reason="[error_not_raised.warning] Expected UserWarning not triggered on Neuron",
