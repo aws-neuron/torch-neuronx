@@ -9,6 +9,7 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.utils import TORCH_VERSION
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -48,9 +49,11 @@ class TestPad:
             assert result_neuron.grad_fn is not None, f"Neuron {mode} pad should have grad_fn"
 
             # Check that grad_fn names match (same autograd operation)
+            cpu_grad_fn = type(result_cpu.grad_fn).__name__
+            neuron_grad_fn = type(result_neuron.grad_fn).__name__
             assert (
-                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
-            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
+                cpu_grad_fn == neuron_grad_fn
+            ), f"grad_fn mismatch: CPU={cpu_grad_fn}, Neuron={neuron_grad_fn}"
 
             # Check that the specific decomposed operation runs, not aten::pad
             assert_op_runs_on_neuron(expected_op)
@@ -91,9 +94,11 @@ class TestPad:
             assert result_neuron.grad_fn is not None, f"Neuron {mode} pad should have grad_fn"
 
             # Check that grad_fn names match (same autograd operation)
+            cpu_grad_fn = type(result_cpu.grad_fn).__name__
+            neuron_grad_fn = type(result_neuron.grad_fn).__name__
             assert (
-                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
-            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
+                cpu_grad_fn == neuron_grad_fn
+            ), f"grad_fn mismatch: CPU={cpu_grad_fn}, Neuron={neuron_grad_fn}"
 
             assert_op_runs_on_neuron(expected_op)
 
@@ -121,9 +126,11 @@ class TestPad:
             assert result_neuron.grad_fn is not None, "Neuron constant pad should have grad_fn"
 
             # Check that grad_fn names match (same autograd operation)
+            cpu_grad_fn = type(result_cpu.grad_fn).__name__
+            neuron_grad_fn = type(result_neuron.grad_fn).__name__
             assert (
-                type(result_cpu.grad_fn).__name__ == type(result_neuron.grad_fn).__name__
-            ), f"grad_fn mismatch: CPU={type(result_cpu.grad_fn).__name__}, Neuron={type(result_neuron.grad_fn).__name__}"  # noqa E501
+                cpu_grad_fn == neuron_grad_fn
+            ), f"grad_fn mismatch: CPU={cpu_grad_fn}, Neuron={neuron_grad_fn}"
 
             assert_op_runs_on_neuron("aten::constant_pad_nd")
 
@@ -268,6 +275,76 @@ class TestPad:
         """Test error for unsupported padding mode"""
         x_neuron = torch.tensor([[1.0, 2.0]], device="neuron")
         torch.nn.functional.pad(x_neuron, (1, 1), mode="wrap")
+
+    @pytest.mark.parametrize(
+        "op,input_shape,padding",
+        [
+            pytest.param(
+                torch.ops.aten.reflection_pad1d,
+                (3, 3, 10, 10),
+                (2, 2),
+                id="pad1d-invalid-rank",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad2d,
+                (3, 3, 10, 10, 10),
+                (2, 2, 2, 2),
+                id="pad2d-invalid-rank",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (3, 3, 10, 10, 10, 10),
+                (2, 2, 2, 2, 2, 2),
+                id="pad3d-invalid-rank",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (3, 3, 10, 10, 10, 10),
+                (1,),
+                id="pad3d-invalid-rank-and-padding",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (1, 1, 3, 3, 3),
+                (1,),
+                id="pad3d-padding-length-1",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (1, 1, 3, 3, 3),
+                (),
+                id="pad3d-padding-length-0",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (1, 1, 3, 3, 3),
+                (1, 1, 1, 1, 1),
+                id="pad3d-padding-length-5",
+            ),
+            pytest.param(
+                torch.ops.aten.reflection_pad3d,
+                (1, 1, 3, 3, 3),
+                (1, 1, 1, 1, 1, 1, 1),
+                id="pad3d-padding-length-7",
+            ),
+        ],
+    )
+    def test_reflection_pad_invalid_input_matches_cpu(self, op, input_shape, padding):
+        input_cpu = torch.randn(input_shape)
+
+        with pytest.raises(RuntimeError) as neuron_exc:
+            op(input_cpu.to("neuron"), padding)
+
+        # PT2.12 reflection_pad3d reads padding[0:6] before validating an empty
+        # tuple and can SIGSEGV. PyTorch fixed this in 2.13 (pytorch/pytorch#185614).
+        if not padding and TORCH_VERSION.release[:2] < (2, 13):
+            assert str(neuron_exc.value) == "padding size is expected to be 6, but got: 0"
+            return
+
+        with pytest.raises(RuntimeError) as cpu_exc:
+            op(input_cpu, padding)
+
+        assert str(neuron_exc.value) == str(cpu_exc.value)
 
     @pytest.mark.parametrize(
         "shape,padding",

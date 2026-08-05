@@ -111,11 +111,29 @@ def torch_constant_pad_nd(input, pad, value=0):
     return torch.nn.functional.pad(input, pad, mode="constant", value=value)
 
 
+def _check_reflection_pad_dims(input, valid_dims, padding, expected_pad_len, out=None):
+    # A direct ``aten::reflection_padNd`` call must reject wrong-rank inputs and
+    # wrong-length padding with the same messages as eager (the nn.* module path
+    # is intercepted earlier by ``F.pad``'s own "Padding size N is not supported
+    # for MD input tensor" check, so this only fires on the direct-aten path).
+    if len(padding) != expected_pad_len:
+        raise RuntimeError(
+            f"padding size is expected to be {expected_pad_len}, but got: {len(padding)}"
+        )
+    if input.dim() not in valid_dims:
+        lo, hi = valid_dims
+        raise RuntimeError(
+            f"Expected {lo}D or {hi}D (batch mode) tensor with possibly 0 batch "
+            f"size and other non-zero dimensions for input, but got: {list(input.shape)}"
+        )
+
+
 @register_aten(
     ["aten::reflection_pad1d", "aten::reflection_pad1d.out"],
     static_argnums=(1,),
 )
 def torch_reflection_pad1d(input, padding, out=None):
+    _check_reflection_pad_dims(input, (2, 3), padding, 2)
     return torch.nn.functional.pad(input, padding, mode="reflect")
 
 
@@ -124,6 +142,7 @@ def torch_reflection_pad1d(input, padding, out=None):
     static_argnums=(1,),
 )
 def torch_reflection_pad2d(input, padding, out=None):
+    _check_reflection_pad_dims(input, (3, 4), padding, 4)
     return torch.nn.functional.pad(input, padding, mode="reflect")
 
 
@@ -132,6 +151,7 @@ def torch_reflection_pad2d(input, padding, out=None):
     static_argnums=(1,),
 )
 def torch_reflection_pad3d(input, padding, out=None):
+    _check_reflection_pad_dims(input, (4, 5), padding, 6)
     return torch.nn.functional.pad(input, padding, mode="reflect")
 
 
