@@ -156,6 +156,7 @@ class TestCompileApiContract:
             "neff",
             "stablehlo",
             "has_collectives",
+            "pass_mutations",
             "_mlir_module",
             "_lowering",
         }
@@ -185,6 +186,76 @@ class TestCompileApiContract:
 
         with pytest.raises(ImportError):
             importlib.import_module("torch_neuronx.compile")
+
+    def test_artifact_pass_mutations_defaults_to_empty_list(self):
+        a = CompilationArtifact(io_spec=IOSpec())
+        b = CompilationArtifact(io_spec=IOSpec())
+        assert a.pass_mutations == []
+        a.pass_mutations.append("sentinel")
+        assert b.pass_mutations == [], "default pass_mutations list must not be shared"
+
+    def test_make_artifact_carries_pass_mutations(self):
+        """The artifact projection must not drop the lowering's pass_mutations.
+
+        A dropped ADD mutation (e.g. ShardIndexInjection's vocab_shard_index)
+        leaves a caller-owned runtime handing the NEFF one input too few
+        (input448 / 449-vs-448 bound-input mismatch).
+        """
+        from types import SimpleNamespace
+
+        from torch_neuronx.compiler.api import _make_artifact
+        from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+            IOMutation,
+            MutationKind,
+            PassMutations,
+        )
+
+        mutations = [
+            PassMutations(
+                pass_name="ShardIndexInjection",
+                input_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ADD,
+                        indices=[448],
+                        transform_key="shard_index",
+                        transform_params={"shard_index": 3},
+                        pass_name="ShardIndexInjection",
+                    )
+                ],
+            )
+        ]
+        lowering = SimpleNamespace(
+            cache_key="key",
+            io_spec=SimpleNamespace(inputs=[], outputs=[]),
+            has_collectives=False,
+            pass_mutations=mutations,
+        )
+
+        artifact = _make_artifact(lowering)
+
+        assert artifact.pass_mutations == mutations
+        # The artifact owns a copy; appending to the lowering's list afterwards
+        # must not reach through. (lowering.pass_mutations IS `mutations`, so
+        # compare against a snapshot taken before the append.)
+        snapshot = list(mutations)
+        lowering.pass_mutations.append("late-append")
+        assert artifact.pass_mutations == snapshot
+
+    def test_make_artifact_tolerates_lowering_without_pass_mutations(self):
+        """Partial/legacy lowering objects (no pass_mutations attr) project to []."""
+        from types import SimpleNamespace
+
+        from torch_neuronx.compiler.api import _make_artifact
+
+        lowering = SimpleNamespace(
+            cache_key="key",
+            io_spec=SimpleNamespace(inputs=[], outputs=[]),
+            has_collectives=False,
+        )
+
+        artifact = _make_artifact(lowering)
+
+        assert artifact.pass_mutations == []
 
 
 @requires_compiler
