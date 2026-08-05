@@ -163,6 +163,7 @@ neuron_decompositions = get_decompositions(
         aten.isin,
         aten.std_mean.correction,
         aten.all.dims,
+        aten.any.dims,
         aten._addmm_activation,
         aten._chunk_cat,
         aten.batch_norm_backward,
@@ -2344,6 +2345,37 @@ def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
     return result_flat.reshape(input.shape)
 
 
+@register_decomposition([aten.masked_scatter.default])
+def masked_scatter_decomposition(self, mask, source):
+    """Decompose masked_scatter into flatten + prefix-sum gather + where.
+
+    ``self`` and ``mask`` broadcast to a common shape (the result shape), and
+    the ``i``-th ``True`` position of the broadcast mask is filled with the
+    ``i``-th element of ``source`` (read in row-major order). This mirrors the
+    algorithm torch-mlir's ``DecomposeAtenMaskedScatterOp`` uses, but keys every
+    intermediate off the broadcast result shape rather than ``self``'s shape.
+
+    Keying off ``self`` (as the C++ pattern originally did) is incorrect whenever
+    the broadcast result is larger than ``self`` (e.g. ``self=[N]``,
+    ``mask=[N, N]``): the ``mask + zeros_like(self)`` step is typed as ``self``'s
+    shape while actually broadcasting to the larger shape, which fails
+    ``chlo.broadcast_add`` type inference during StableHLO conversion. Doing the
+    decomposition in Python lets ordinary torch broadcasting define the result
+    shape, so the bug cannot occur and no torch-mlir patch is needed.
+    """
+    mask = mask.to(torch.bool)
+    shape = torch.broadcast_shapes(self.shape, mask.shape)  # == result shape
+    self_b = self.broadcast_to(shape)
+    mask_b = mask.broadcast_to(shape)
+
+    # prefix-sum over the flattened mask gives, at each True position, its
+    # 1-based rank among all True elements; subtract 1 (clamped) to index source.
+    prefix_sum = torch.cumsum(mask_b.flatten().to(torch.int64), dim=0)
+    gather_idx = torch.clamp(prefix_sum - 1, min=0)
+    picked = torch.index_select(source.flatten(), 0, gather_idx).reshape(shape)
+    return torch.where(mask_b, picked, self_b)
+
+
 @register_decomposition([aten._grouped_mm.default])
 def grouped_mm_decomposition(a, b, offs):
     """Decompose grouped matmul for torch.compile/MLIR paths.
@@ -3715,6 +3747,72 @@ def fractional_max_pool3d_decomposition(self, kernel_size, output_size, random_s
 def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     """Decompose argsort to sort"""
     return torch.sort(input, dim=dim, descending=descending, stable=stable)[1]
+
+
+@register_decomposition([aten.sort.stable])
+def sort_stable_decomposition(self, *, stable, dim=-1, descending=False):
+    """Route sort.stable to sort.default, which is the only sort overload that
+    lowers on Neuron (there is no stable-sort primitive). Stability is
+    best-effort; this matches the existing argsort.default path, which already
+    reaches sort.default. Also covers argsort.stable / argsort.stable_out and
+    sort.values_stable, which all reduce to sort.stable during tracing.
+    """
+    return aten.sort.default(self, dim=dim, descending=descending)
+
+
+@register_decomposition([aten.mode.default])
+def mode_decomposition(self, dim=-1, keepdim=False):
+    """Decompose mode (most-frequent value along dim) into primitive ops.
+
+    aten.mode has no PyTorch reference decomposition and no torch-mlir
+    lowering, so it reaches the backend as an unlegalizable ``torch.operator``.
+
+    Returns ``(values, indices)`` matching aten's semantics:
+    * ``values``: the value that occurs most often along ``dim``; ties are
+      broken by choosing the *smallest* such value (matches CPU, whose kernel
+      sorts and picks the first max-length run).
+    * ``indices``: the *last* position along ``dim`` at which that value occurs.
+
+    Implementation counts each element's frequency via a pairwise equality
+    matrix (O(N^2) along the reduced axis, like the searchsorted decomp). The
+    ``.values`` out-variant functionalizes to ``mode.default``, so this single
+    decomposition covers it too.
+    """
+    # 0-d: the scalar is its own mode at index 0.
+    if self.dim() == 0:
+        return self.clone(), torch.zeros((), dtype=torch.long, device=self.device)
+    if dim < 0:
+        dim += self.dim()
+
+    # Move the reduced axis last so the pairwise comparison is over the trailing
+    # dim; movedim preserves the order of the other axes, so the reduced shape
+    # already matches aten's "dim removed" layout.
+    xm = self.movedim(dim, -1)
+    n = xm.shape[-1]
+
+    # counts[..., i] = number of elements in the slice equal to xm[..., i].
+    counts = (xm.unsqueeze(-1) == xm.unsqueeze(-2)).sum(-1)
+    is_max = counts == counts.max(-1, keepdim=True).values
+
+    # Among the max-frequency positions, pick the smallest value. Fill the
+    # non-candidate positions with the per-slice max (a real value >= every
+    # element) so they can never win the min.
+    slice_max = xm.max(-1, keepdim=True).values
+    mode_val = torch.where(is_max, xm, slice_max).min(-1).values
+
+    # Index: last occurrence of mode_val along the reduced axis.
+    is_modeval = xm == mode_val.unsqueeze(-1)
+    idx_range = torch.arange(n, device=self.device)
+    mode_idx = (
+        torch.where(is_modeval, idx_range, torch.full_like(idx_range, -1))
+        .max(-1)
+        .values.to(torch.long)
+    )
+
+    if keepdim:
+        mode_val = mode_val.unsqueeze(dim)
+        mode_idx = mode_idx.unsqueeze(dim)
+    return mode_val, mode_idx
 
 
 @register_decomposition([aten.median.dim, aten.median.dim_values])

@@ -80,6 +80,9 @@ _OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
 _OPS_CORRECTNESS_OUTPUT_INDICES: dict[str, tuple[int, ...]] = {
     # _linalg_det returns (det, LU, pivots); only the determinant is unique.
     "_linalg_det": (0,),
+    # mode returns (values, indices); the value is unique but index may not
+    # match CPU unstable sort
+    "aten::mode": (0,),
 }
 
 # Ops that hang torch.compile due to 0d tensor inputs; skip entirely.
