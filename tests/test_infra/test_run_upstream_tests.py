@@ -9,6 +9,7 @@ exercised here; those are covered by CI smoke runs.
 from __future__ import annotations
 
 import ctypes
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -472,8 +473,6 @@ def test_main_chdir_lands_in_workspace_root(tmp_path, monkeypatch):
     # (CI's container did this), the runner must chdir to WORKSPACE_ROOT
     # before any relative paths get evaluated. Otherwise pytest writes its
     # JSON report to the wrong directory and upload-artifact finds nothing.
-    import os
-
     import run_upstream_tests as r
 
     monkeypatch.chdir(tmp_path)  # mimic CI launching from somewhere wrong.
@@ -901,3 +900,38 @@ int main(int argc, char **argv) {
     env = preload_env(shim)
     env["ENV_LOCK_BASELINE"] = "captured-before-tests"
     subprocess.run([str(binary)], env=env, check=True, timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# Persistent cache — argparse flags + job-name scoping (cache internals live in
+# test_persistent_cache.py alongside the persistent_cache module).
+# ---------------------------------------------------------------------------
+def test_parse_args_cache_flags_default_off():
+    args = parse_args(["test_ops.py"])
+    assert args.download_neff_cache is False
+    assert args.refresh_neff_cache is False
+
+
+def test_parse_args_cache_flags_set():
+    args = parse_args(["--download-neff-cache", "--refresh-neff-cache", "test_ops.py"])
+    assert args.download_neff_cache is True
+    assert args.refresh_neff_cache is True
+
+
+def test_cache_job_name_unique_across_full_suite():
+    """The cache prefix is derive_safe_name(items, shard) — it must stay unique
+    per matrix node for the WHOLE suite, not just the test_ops smoke subset, or
+    two shards would clobber each other's cache. Guards the choice to derive the
+    job name internally instead of passing it from the workflow."""
+    import json as _json
+
+    from distribution_config import expand_distribution_config
+
+    cfg = (
+        Path(__file__).resolve().parent.parent
+        / "pytorch_tests_native"
+        / "upstream_pytorch_test_distribution_config.json"
+    )
+    nodes = expand_distribution_config(_json.loads(cfg.read_text()))
+    names = [derive_safe_name(n["items"], n.get("shard_id")) for n in nodes]
+    assert len(set(names)) == len(names), "cache job names collide across the full suite"

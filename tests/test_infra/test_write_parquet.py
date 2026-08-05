@@ -7,7 +7,9 @@ the dev extras can still run the rest of the test suite. CI installs
 
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,9 @@ from write_parquet import (  # noqa: E402  (import-after-skip is intentional)
     _component_for,
     _normalize_signature,
     _normalize_status,
+    collect_cache_metrics,
+    run_persistent_cache_present,
+    write_cache_metrics_parquet,
     write_run_metrics_parquet,
     write_test_aggregated_parquet,
     write_test_failures_parquet,
@@ -630,3 +635,153 @@ def test_test_aggregated_empty_input_writes_schema_only_file(tmp_path, monkeypat
     table = pq.read_table(out)
     assert table.num_rows == 0
     assert "error_category" in table.schema.names
+
+
+# ---------------------------------------------------------------------------
+# persistent_cache_present on run_metrics
+# ---------------------------------------------------------------------------
+def test_run_metrics_persistent_cache_present_stamped_on_every_row(tmp_path, monkeypatch):
+    """When passed, the run-level flag lands on every component row."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::T::a", "passed")]
+    out = tmp_path / "rm.parquet"
+    write_run_metrics_parquet(rows, out, persistent_cache_present=True)
+
+    read = _read_parquet(out)
+    assert read, "expected at least one row"
+    assert all(row["persistent_cache_present"] is True for row in read)
+
+
+def test_run_metrics_persistent_cache_present_null_by_default(tmp_path, monkeypatch):
+    """Omitting the flag leaves the column NULL (feature-off / older run)."""
+    monkeypatch.setenv("GITHUB_SHA", "abc")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.setenv("TEST_RUN_TIMESTAMP", "20260521_120000")
+
+    rows = [_row("test_ops.py::T::a", "passed")]
+    out = tmp_path / "rm.parquet"
+    write_run_metrics_parquet(rows, out)
+
+    assert all(row["persistent_cache_present"] is None for row in _read_parquet(out))
+
+
+# ---------------------------------------------------------------------------
+# cache_metrics — sidecar collection + parquet
+# ---------------------------------------------------------------------------
+def _write_cache_sidecar(results_dir: Path, label: str, payload: dict) -> None:
+    node = results_dir / f"upstream-pytorch-{label}" / "artifacts"
+    node.mkdir(parents=True, exist_ok=True)
+    (node / "cache_metrics.json").write_text(json.dumps(payload))
+
+
+def test_collect_cache_metrics_reads_all_node_sidecars(tmp_path):
+    _write_cache_sidecar(tmp_path, "test_ops-shard0", {"job_name": "test_ops-shard0"})
+    _write_cache_sidecar(tmp_path, "test_ops-shard1", {"job_name": "test_ops-shard1"})
+    got = collect_cache_metrics(tmp_path)
+    assert {s["job_name"] for s in got} == {"test_ops-shard0", "test_ops-shard1"}
+
+
+def test_collect_cache_metrics_dedupes_by_job_name(tmp_path):
+    """The glob matches each sidecar twice — once in the per-node artifact and
+    once in the re-bundled ``upstream-results-bundle`` the aggregate job uploads.
+    collect must collapse to one entry per job so cache_metrics rows don't double."""
+    _write_cache_sidecar(tmp_path, "test_ops-shard0", {"job_name": "test_ops-shard0"})
+    # Same sidecar re-bundled under the convenience archive (real layout).
+    bundle = tmp_path / "upstream-pytorch-test_ops-shard0" / "upstream-results-bundle"
+    bundle.mkdir(parents=True, exist_ok=True)
+    (bundle / "cache_metrics.json").write_text(json.dumps({"job_name": "test_ops-shard0"}))
+
+    got = collect_cache_metrics(tmp_path)
+    assert len(got) == 1, "duplicate glob hits must collapse to one row per job"
+
+
+def test_collect_cache_metrics_empty_when_absent(tmp_path):
+    assert collect_cache_metrics(tmp_path) == []
+
+
+def test_run_persistent_cache_present_semantics():
+    # No sidecars -> None (feature off / older image), not a misleading False.
+    assert run_persistent_cache_present([]) is None
+    # Any job with a warm cache -> True.
+    assert (
+        run_persistent_cache_present(
+            [{"persistent_cache_present": False}, {"persistent_cache_present": True}]
+        )
+        is True
+    )
+    # Feature ran but every job came up empty -> False.
+    assert run_persistent_cache_present([{"persistent_cache_present": False}]) is False
+
+
+def test_write_cache_metrics_parquet_one_row_per_job(tmp_path):
+    results = tmp_path / "results"
+    _write_cache_sidecar(
+        results,
+        "test_ops-shard0",
+        {
+            "job_name": "test_ops-shard0",
+            "persistent_cache_present": True,
+            "download_bytes": 1700000000,
+            "download_seconds": 12.5,
+            "upload_bytes": 1710000000,
+            "upload_seconds": 8.0,
+            "neffs_before": 27000,
+            "neffs_after": 27141,
+        },
+    )
+    meta = {
+        "commit_sha": "abc",
+        "branch": "main",
+        "run_id": "1",
+        "workflow_type": "nightly",
+    }
+    out = tmp_path / "cm.parquet"
+    ret = write_cache_metrics_parquet(results, meta, datetime(2026, 5, 21, 12, 0, 0), out)
+    assert ret == out
+
+    table = pq.read_table(out)
+    assert table.num_rows == 1
+    row = {c: table.column(c).to_pylist()[0] for c in table.schema.names}
+    assert row["job_name"] == "test_ops-shard0"
+    assert row["download_bytes"] == 1700000000
+    assert row["neffs_after"] == 27141
+    assert row["persistent_cache_present"] is True
+    assert row["workflow_type"] == "nightly"
+
+
+def test_write_cache_metrics_parquet_skips_when_no_sidecars(tmp_path):
+    """No sidecars -> no table written, returns None (degrades gracefully)."""
+    meta = {"commit_sha": "abc", "branch": "main", "run_id": "1", "workflow_type": "nightly"}
+    out = tmp_path / "cm.parquet"
+    ret = write_cache_metrics_parquet(tmp_path / "empty", meta, datetime(2026, 5, 21), out)
+    assert ret is None
+    assert not out.exists()
+
+
+def test_write_cache_metrics_parquet_download_only_nulls_upload(tmp_path):
+    """A read-only run (no --cache-upload) has no upload_* keys -> NULL columns."""
+    results = tmp_path / "results"
+    _write_cache_sidecar(
+        results,
+        "test_ops-shard0",
+        {
+            "job_name": "test_ops-shard0",
+            "persistent_cache_present": True,
+            "download_bytes": 100,
+            "download_seconds": 1.0,
+            "neffs_before": 10,
+        },
+    )
+    meta = {"commit_sha": "abc", "branch": "main", "run_id": "1", "workflow_type": "pre_merge"}
+    out = tmp_path / "cm.parquet"
+    write_cache_metrics_parquet(results, meta, datetime(2026, 5, 21), out)
+    table = pq.read_table(out)
+    row = {c: table.column(c).to_pylist()[0] for c in table.schema.names}
+    assert row["upload_bytes"] is None
+    assert row["upload_seconds"] is None
+    assert row["neffs_after"] is None

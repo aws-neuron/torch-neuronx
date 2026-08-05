@@ -25,6 +25,7 @@ types defined here.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -41,6 +42,7 @@ from aggregate_upstream_results import (
     _file_from_row,
     _get_run_metadata,
 )
+from persistent_cache import CACHE_METRICS_FILE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +130,13 @@ def _component_aggregates(test_rows: list[dict]) -> dict[str, dict]:
     return agg
 
 
-def _stats_to_dict(stats: dict, component: str, metadata: dict, run_timestamp: str) -> dict:
+def _stats_to_dict(
+    stats: dict,
+    component: str,
+    metadata: dict,
+    run_timestamp: str,
+    persistent_cache_present: bool | None = None,
+) -> dict:
     """Build a single per-component row in the schema run_metrics expects."""
     row = {
         "commit_sha": metadata["commit_sha"],
@@ -137,6 +145,10 @@ def _stats_to_dict(stats: dict, component: str, metadata: dict, run_timestamp: s
         "workflow_type": metadata["workflow_type"],
         "run_timestamp": run_timestamp,
         "component": component,
+        # Run-level flag (same on every component row): did this run hydrate a
+        # non-empty persistent NEFF cache? NULL for runs/images without the
+        # cache feature, so history degrades gracefully (like workflow_type did).
+        "persistent_cache_present": persistent_cache_present,
     }
     # Per-status counts, defaulting to 0 for absent statuses so every
     # column is present in every row.
@@ -181,8 +193,25 @@ def _pass_rate_value(stats: dict) -> float | None:
     return float(rate)
 
 
+# The five run-identity columns every per-row table repeats. run_timestamp is a
+# datetime; the rest come from the run metadata dict.
+_RUN_METADATA_COLUMNS = ("commit_sha", "branch", "run_id", "workflow_type")
+
+
+def _append_run_metadata(
+    columnar: dict[str, list], metadata: dict, run_timestamp: datetime
+) -> None:
+    """Append the shared run-identity columns for one row."""
+    for col in _RUN_METADATA_COLUMNS:
+        columnar[col].append(metadata.get(col, "unknown"))
+    columnar["run_timestamp"].append(run_timestamp)
+
+
 def _make_run_metrics_table(
-    test_rows: list[dict], metadata: dict, run_timestamp: datetime
+    test_rows: list[dict],
+    metadata: dict,
+    run_timestamp: datetime,
+    persistent_cache_present: bool | None = None,
 ) -> pa.Table:
     """Build the run_metrics pyarrow Table with one row per component."""
     per_component = _component_aggregates(test_rows)
@@ -198,7 +227,11 @@ def _make_run_metrics_table(
             overall[k] += v
 
     rows: list[dict] = []
-    rows.append(_stats_to_dict(overall, "overall", metadata, run_timestamp.isoformat()))
+    rows.append(
+        _stats_to_dict(
+            overall, "overall", metadata, run_timestamp.isoformat(), persistent_cache_present
+        )
+    )
     # Emit a row for every defined real component, even when the run
     # hit zero tests in that component. Stable schema across runs lets
     # Grafana panels assume the row exists.
@@ -211,6 +244,7 @@ def _make_run_metrics_table(
                 component,
                 metadata,
                 run_timestamp.isoformat(),
+                persistent_cache_present,
             )
         )
 
@@ -222,6 +256,7 @@ def _make_run_metrics_table(
             ("workflow_type", pa.string()),
             ("run_timestamp", pa.timestamp("us")),
             ("component", pa.string()),
+            ("persistent_cache_present", pa.bool_()),
             *((field, pa.int64()) for field in _STATUS_FIELDS),
             ("total", pa.int64()),
             ("pass_rate_pct", pa.float64()),
@@ -285,11 +320,7 @@ def _make_test_failures_table(
         reason = (row.get("failure_reason") or "").strip()
         first_line = reason.splitlines()[0] if reason else ""
 
-        columnar["commit_sha"].append(metadata["commit_sha"])
-        columnar["branch"].append(metadata["branch"])
-        columnar["run_id"].append(metadata["run_id"])
-        columnar["workflow_type"].append(metadata["workflow_type"])
-        columnar["run_timestamp"].append(run_timestamp)
+        _append_run_metadata(columnar, metadata, run_timestamp)
         # ``component`` IS NOT derivable from test_id without re-running
         # the file→component mapping, so we keep it as its own column.
         columnar["component"].append(_component_for(_file_from_row(row)))
@@ -387,11 +418,7 @@ def _make_test_aggregated_table(
         signature = next((ln.strip() for ln in reason.split("\n") if ln.strip()), "")
         category = _normalize_signature(signature)
 
-        columnar["commit_sha"].append(metadata["commit_sha"])
-        columnar["branch"].append(metadata["branch"])
-        columnar["run_id"].append(metadata["run_id"])
-        columnar["workflow_type"].append(metadata["workflow_type"])
-        columnar["run_timestamp"].append(run_timestamp)
+        _append_run_metadata(columnar, metadata, run_timestamp)
         columnar["component"].append(_component_for(_file_from_row(row)))
         columnar["test_id"].append(row.get("test_id") or row.get("nodeid") or "")
         columnar["test_class"].append(row.get("test_class") or "")
@@ -405,14 +432,24 @@ def _make_test_aggregated_table(
     return pa.table(columnar, schema=schema)
 
 
-def write_run_metrics_parquet(test_rows: list[dict], output_path: Path) -> None:
+def write_run_metrics_parquet(
+    test_rows: list[dict],
+    output_path: Path,
+    persistent_cache_present: bool | None = None,
+) -> None:
     """Write the run_metrics parquet file.
 
     One row per component, plus one ``component='overall'`` roll-up row.
     Six rows per run with the current 5-bucket split.
+
+    ``persistent_cache_present`` is a run-level flag (True/False if the run used
+    the persistent NEFF cache, None if the feature wasn't active) stamped
+    onto every row.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    table = _make_run_metrics_table(test_rows, _get_run_metadata(), _resolve_run_timestamp())
+    table = _make_run_metrics_table(
+        test_rows, _get_run_metadata(), _resolve_run_timestamp(), persistent_cache_present
+    )
     pq.write_table(table, output_path, compression="snappy")
     logger.info(f"Run metrics parquet: {output_path} ({table.num_rows} rows)")
 
@@ -436,3 +473,103 @@ def write_test_aggregated_parquet(test_rows: list[dict], output_path: Path) -> N
     table = _make_test_aggregated_table(test_rows, _get_run_metadata(), _resolve_run_timestamp())
     pq.write_table(table, output_path, compression="snappy")
     logger.info(f"Test aggregated parquet: {output_path} ({table.num_rows} rows)")
+
+
+# Numeric fields carried from the sidecar. Absent keys default to NULL so a
+# download-only run (no upload_* keys) still writes a well-formed row.
+_CACHE_METRIC_INT_FIELDS = (
+    "download_bytes",
+    "upload_bytes",
+    "neffs_before",
+    "neffs_after",
+)
+_CACHE_METRIC_FLOAT_FIELDS = (
+    "download_seconds",
+    "upload_seconds",
+)
+
+
+def collect_cache_metrics(results_dir: Path) -> list[dict]:
+    """Read the per-job ``cache_metrics.json`` sidecars, deduplicated by job_name.
+
+    The glob matches each sidecar twice (per-node artifact + re-bundled dir), so
+    we keep one entry per job to avoid double-counting under a dashboard SUM.
+    Returns [] when none are present. Never raises.
+    """
+    by_job: dict[str, dict] = {}
+    for path in results_dir.glob(f"upstream-pytorch-*/**/{CACHE_METRICS_FILE_NAME}"):
+        try:
+            with open(path) as f:
+                sidecar = json.load(f)
+        except Exception as exc:
+            logger.warning("Could not read cache metrics sidecar %s: %s", path, exc)
+            continue
+        # Key on job_name (the shard's cache scope). Fall back to the path so a
+        # malformed sidecar without job_name still counts once rather than
+        # collapsing all such sidecars into a single entry.
+        by_job[sidecar.get("job_name") or str(path)] = sidecar
+    logger.info("Collected %d unique cache metrics sidecar(s)", len(by_job))
+    return list(by_job.values())
+
+
+def run_persistent_cache_present(sidecars: list[dict]) -> bool | None:
+    """Run-level ``persistent_cache_present`` from the per-job sidecars.
+
+    None when no sidecar was written (feature off) so run_metrics reads NULL
+    rather than a misleading False; else True if any job hydrated a non-empty cache.
+    """
+    if not sidecars:
+        return None
+    return any(bool(s.get("persistent_cache_present")) for s in sidecars)
+
+
+def write_cache_metrics_parquet(
+    results_dir: Path,
+    metadata: dict,
+    run_timestamp: datetime,
+    output_path: Path,
+    sidecars: list[dict] | None = None,
+) -> Path | None:
+    """Write the cache_metrics parquet (one row per job) from the per-job sidecars.
+
+    ``sidecars`` may be passed in to reuse an earlier collect; otherwise they are
+    collected from ``results_dir``. Returns the output path, or None when none
+    were found (the table is skipped for that run).
+    """
+    if sidecars is None:
+        sidecars = collect_cache_metrics(results_dir)
+    if not sidecars:
+        logger.warning("No cache_metrics.json sidecars found; skipping cache_metrics parquet")
+        return None
+
+    schema = pa.schema(
+        [
+            ("commit_sha", pa.string()),
+            ("branch", pa.string()),
+            ("run_id", pa.string()),
+            ("workflow_type", pa.string()),
+            ("run_timestamp", pa.timestamp("us")),
+            ("job_name", pa.string()),
+            ("persistent_cache_present", pa.bool_()),
+            *((field, pa.int64()) for field in _CACHE_METRIC_INT_FIELDS),
+            *((field, pa.float64()) for field in _CACHE_METRIC_FLOAT_FIELDS),
+        ]
+    )
+
+    columnar: dict[str, list] = {name: [] for name in schema.names}
+    for s in sidecars:
+        _append_run_metadata(columnar, metadata, run_timestamp)
+        columnar["job_name"].append(s.get("job_name") or "unknown")
+        columnar["persistent_cache_present"].append(bool(s.get("persistent_cache_present")))
+        for field in _CACHE_METRIC_INT_FIELDS:
+            v = s.get(field)
+            columnar[field].append(int(v) if v is not None else None)
+        for field in _CACHE_METRIC_FLOAT_FIELDS:
+            v = s.get(field)
+            columnar[field].append(float(v) if v is not None else None)
+
+    table = pa.table(columnar, schema=schema)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, output_path, compression="snappy")
+    logger.info(f"Cache metrics parquet: {output_path} ({table.num_rows} rows)")
+    return output_path
