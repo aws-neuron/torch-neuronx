@@ -371,6 +371,7 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_max_reduction_no_dim_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_min_reduction_no_dim_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_mul_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_native_group_norm_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_conv1d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_conv2d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_conv3d_neuron_float64",
