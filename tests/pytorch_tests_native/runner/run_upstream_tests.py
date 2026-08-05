@@ -85,11 +85,6 @@ POST_PROCESSING_BUFFER = 1200  # seconds reserved for HUD + CSV conversion
 # useful — we skip retry and surface the timeout instead.
 TIMEOUT_EXIT_CODES = {124, 130, 137}
 
-# Pytest exit code 5 = "no tests collected". With --last-failed it means the
-# cache was empty (shouldn't happen if main pytest exited with code 1, but
-# guard defensively — treat as success on retry).
-PYTEST_EXIT_NO_COLLECT = 5
-
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-testable)
@@ -148,6 +143,16 @@ def should_retry(exit_code: int) -> bool:
     (retry won't help).
     """
     return exit_code == 1
+
+
+def retry_fully_cleared(main_report: Path, retry_report: Path, retry_exit: int) -> bool:
+    """Whether a successful retry ran once per main-run failure."""
+    from convert_reports import extract_test_data_from_json
+
+    main_rows = extract_test_data_from_json(str(main_report))
+    retry_rows = extract_test_data_from_json(str(retry_report))
+    main_failure_count = sum(row.get("status") in ("failed", "error") for row in main_rows)
+    return retry_exit == 0 and main_failure_count > 0 and main_failure_count == len(retry_rows)
 
 
 def needs_process_isolation_flag(items: Sequence[str]) -> bool:
@@ -525,15 +530,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             extra=["--last-failed", "--last-failed-no-failures=none"],
         )
         retry_exit = run_with_timeout(retry_cmd, rpaths["log"], args.retry_timeout, env=pytest_env)
-        if retry_exit in (0, PYTEST_EXIT_NO_COLLECT):
-            # All previously-failing tests now pass — flip overall result to
-            # success. The aggregator surfaces passed_on_retry as a separate
-            # flakiness signal.
-            print("\n=== Retry SUCCESS: all previously-failing tests passed on retry ===")
+        if retry_fully_cleared(paths["report"], rpaths["report"], retry_exit):
+            print(
+                "\n=== Retry SUCCESS: all previously-failing tests re-ran and passed on retry ==="
+            )
             exit_code = 0
         else:
             print(
-                f"\n=== Retry incomplete: some tests still failing (retry exit: {retry_exit}) ==="
+                f"\n=== Retry incomplete: some tests still failing (retry exit: "
+                f"{retry_exit}). Also check the aggregator summary for all failing tests ==="
             )
 
     print_completion_summary(args.items, exit_code)
