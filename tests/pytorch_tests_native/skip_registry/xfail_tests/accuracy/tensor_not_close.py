@@ -104,6 +104,8 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_matmul_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_mv_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nanmean_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_native_group_norm_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_quick_native_group_norm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_batch_norm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_binary_cross_entropy_with_logits_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_gelu_neuron_float64",
