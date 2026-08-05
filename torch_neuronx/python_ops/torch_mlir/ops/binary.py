@@ -38,17 +38,22 @@ def _inplace_result(result, self_tensor):
 
 def _div_compute(x, y, rounding_mode=None):
     """Core division shared by the out-of-place and in-place div handlers."""
+    # Explicit casting for fp16 and bf16 to avoid accuracy mismatch
+    up = isinstance(x, torch.Tensor) and x.dtype in (torch.float16, torch.bfloat16)
+    xx = x.float() if up else x
+    yy = y.float() if (up and isinstance(y, torch.Tensor)) else y
+
     if rounding_mode is None:
-        return x / y
-    elif rounding_mode == "floor":
-        result = x // y
-    else:
-        result = torch.trunc(x / y)
+        result = xx / yy
+        return result.to(x.dtype) if up else result
 
-    if not isinstance(y, torch.Tensor):
-        y = torch.tensor(y, device=x.device, dtype=x.dtype)
+    result = xx // yy if rounding_mode == "floor" else torch.trunc(xx / yy)
 
-    return torch.where(y == 0, torch.sign(x) * float("inf"), result)
+    if not isinstance(yy, torch.Tensor):
+        yy = torch.tensor(yy, device=xx.device, dtype=xx.dtype)
+
+    result = torch.where(yy == 0, torch.sign(xx) * float("inf"), result)
+    return result.to(x.dtype) if up else result
 
 
 @register_aten(["aten::add.Tensor", "aten::add.out"], static_argnames=("alpha",))

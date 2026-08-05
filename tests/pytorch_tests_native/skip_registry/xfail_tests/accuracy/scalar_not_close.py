@@ -1,7 +1,6 @@
 ACCURACY_SCALAR_NOT_CLOSE = [
     "ReproTests::test_dont_dce_rand",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_floor_div_extremal_neuron_bfloat16",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_floor_div_extremal_neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_floor_div_extremal_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_dist_neuron_bfloat16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_dist_neuron_float64",
