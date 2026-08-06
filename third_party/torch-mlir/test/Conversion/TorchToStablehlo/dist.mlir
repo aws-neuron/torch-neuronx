@@ -212,3 +212,159 @@ func.func @torch.aten._pdist_forward$p2(%arg0: !torch.vtensor<[4,6],f32>) -> !to
     %0 = torch.aten._pdist_forward %arg0, %float2.000000e00 : !torch.vtensor<[4,6],f32>, !torch.float -> !torch.vtensor<[6],f32>
     return %0 : !torch.vtensor<[6],f32>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten._cdist_forward$dynamic(
+// CHECK-SAME:        %[[VAL_0:.*]]: !torch.vtensor<[?,4,3],f32>, %[[VAL_1:.*]]: !torch.vtensor<[?,5,3],f32>) -> !torch.vtensor<[?,4,5],f32> {
+// CHECK:           %[[X2:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[?,5,3],f32> -> tensor<?x5x3xf32>
+// CHECK:           %[[X1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,4,3],f32> -> tensor<?x4x3xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[X1]], %[[C0]] : tensor<?x4x3xf32>
+// CHECK:           %[[V2:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM_0:.*]] = tensor.dim %[[X1]], %[[C1]] : tensor<?x4x3xf32>
+// CHECK:           %[[V3:.*]] = arith.index_cast %[[DIM_0]] : index to i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM_1:.*]] = tensor.dim %[[X1]], %[[C2]] : tensor<?x4x3xf32>
+// CHECK:           %[[V4:.*]] = arith.index_cast %[[DIM_1]] : index to i64
+// CHECK:           %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:           %[[FE:.*]] = tensor.from_elements %[[V2]], %[[V3]], %[[C1_I64]], %[[V4]] : tensor<4xi64>
+// CHECK:           %[[V5:.*]] = stablehlo.dynamic_reshape %[[X1]], %[[FE]] : (tensor<?x4x3xf32>, tensor<4xi64>) -> tensor<?x4x1x3xf32>
+// CHECK:           %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM_3:.*]] = tensor.dim %[[X2]], %[[C0_2]] : tensor<?x5x3xf32>
+// CHECK:           %[[V6:.*]] = arith.index_cast %[[DIM_3]] : index to i64
+// CHECK:           %[[C1_4:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM_5:.*]] = tensor.dim %[[X2]], %[[C1_4]] : tensor<?x5x3xf32>
+// CHECK:           %[[V7:.*]] = arith.index_cast %[[DIM_5]] : index to i64
+// CHECK:           %[[FE_6:.*]] = tensor.from_elements %[[V6]], %[[C1_I64]], %[[V7]], %[[V4]] : tensor<4xi64>
+// CHECK:           %[[V8:.*]] = stablehlo.dynamic_reshape %[[X2]], %[[FE_6]] : (tensor<?x5x3xf32>, tensor<4xi64>) -> tensor<?x1x5x3xf32>
+// CHECK:           %[[V9:.*]] = chlo.broadcast_subtract %[[V5]], %[[V8]] : (tensor<?x4x1x3xf32>, tensor<?x1x5x3xf32>) -> tensor<?x4x5x3xf32>
+// CHECK:           %[[V10:.*]] = stablehlo.abs %[[V9]] : tensor<?x4x5x3xf32>
+// CHECK:           %[[CST:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+// CHECK:           %[[V11:.*]] = chlo.broadcast_power %[[V10]], %[[CST]] : (tensor<?x4x5x3xf32>, tensor<f32>) -> tensor<?x4x5x3xf32>
+// CHECK:           %[[CST_7:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+// CHECK:           %[[V12:.*]] = stablehlo.reduce(%[[V11]] init: %[[CST_7]]) applies stablehlo.add across dimensions = [3] : (tensor<?x4x5x3xf32>, tensor<f32>) -> tensor<?x4x5xf32>
+// CHECK:           %[[CST_8:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+// CHECK:           %[[V13:.*]] = chlo.broadcast_power %[[V12]], %[[CST_8]] : (tensor<?x4x5xf32>, tensor<f32>) -> tensor<?x4x5xf32>
+// CHECK:           %[[V14:.*]] = torch_c.from_builtin_tensor %[[V13]] : tensor<?x4x5xf32> -> !torch.vtensor<[?,4,5],f32>
+// CHECK:           return %[[V14]] : !torch.vtensor<[?,4,5],f32>
+func.func @torch.aten._cdist_forward$dynamic(%arg0: !torch.vtensor<[?,4,3],f32>, %arg1: !torch.vtensor<[?,5,3],f32>) -> !torch.vtensor<[?,4,5],f32> {
+    %float1 = torch.constant.float 1.000000e+00
+    %none = torch.constant.none
+    %0 = torch.aten._cdist_forward %arg0, %arg1, %float1, %none : !torch.vtensor<[?,4,3],f32>, !torch.vtensor<[?,5,3],f32>, !torch.float, !torch.none -> !torch.vtensor<[?,4,5],f32>
+    return %0 : !torch.vtensor<[?,4,5],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten._cdist_forward$dynamic_p2(
+// CHECK-SAME:        %[[VAL_0:.*]]: !torch.vtensor<[?,4,3],f32>, %[[VAL_1:.*]]: !torch.vtensor<[?,5,3],f32>) -> !torch.vtensor<[?,4,5],f32> {
+// CHECK:           %[[X2:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[?,5,3],f32> -> tensor<?x5x3xf32>
+// CHECK:           %[[X1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,4,3],f32> -> tensor<?x4x3xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[X1]], %[[C0]] : tensor<?x4x3xf32>
+// CHECK:           %[[V2:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM_0:.*]] = tensor.dim %[[X1]], %[[C1]] : tensor<?x4x3xf32>
+// CHECK:           %[[V3:.*]] = arith.index_cast %[[DIM_0]] : index to i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM_1:.*]] = tensor.dim %[[X1]], %[[C2]] : tensor<?x4x3xf32>
+// CHECK:           %[[V4:.*]] = arith.index_cast %[[DIM_1]] : index to i64
+// CHECK:           %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:           %[[FE:.*]] = tensor.from_elements %[[V2]], %[[V3]], %[[C1_I64]], %[[V4]] : tensor<4xi64>
+// CHECK:           %[[V5:.*]] = stablehlo.dynamic_reshape %[[X1]], %[[FE]] : (tensor<?x4x3xf32>, tensor<4xi64>) -> tensor<?x4x1x3xf32>
+// CHECK:           %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM_3:.*]] = tensor.dim %[[X2]], %[[C0_2]] : tensor<?x5x3xf32>
+// CHECK:           %[[V6:.*]] = arith.index_cast %[[DIM_3]] : index to i64
+// CHECK:           %[[C1_4:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM_5:.*]] = tensor.dim %[[X2]], %[[C1_4]] : tensor<?x5x3xf32>
+// CHECK:           %[[V7:.*]] = arith.index_cast %[[DIM_5]] : index to i64
+// CHECK:           %[[FE_6:.*]] = tensor.from_elements %[[V6]], %[[C1_I64]], %[[V7]], %[[V4]] : tensor<4xi64>
+// CHECK:           %[[V8:.*]] = stablehlo.dynamic_reshape %[[X2]], %[[FE_6]] : (tensor<?x5x3xf32>, tensor<4xi64>) -> tensor<?x1x5x3xf32>
+// CHECK:           %[[V9:.*]] = chlo.broadcast_subtract %[[V5]], %[[V8]] : (tensor<?x4x1x3xf32>, tensor<?x1x5x3xf32>) -> tensor<?x4x5x3xf32>
+// CHECK:           %[[V10:.*]] = stablehlo.multiply %[[V9]], %[[V9]] : tensor<?x4x5x3xf32>
+// CHECK:           %[[CST:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+// CHECK:           %[[V11:.*]] = stablehlo.reduce(%[[V10]] init: %[[CST]]) applies stablehlo.add across dimensions = [3] : (tensor<?x4x5x3xf32>, tensor<f32>) -> tensor<?x4x5xf32>
+// CHECK:           %[[V12:.*]] = stablehlo.sqrt %[[V11]] : tensor<?x4x5xf32>
+// CHECK:           %[[V13:.*]] = torch_c.from_builtin_tensor %[[V12]] : tensor<?x4x5xf32> -> !torch.vtensor<[?,4,5],f32>
+// CHECK:           return %[[V13]] : !torch.vtensor<[?,4,5],f32>
+func.func @torch.aten._cdist_forward$dynamic_p2(%arg0: !torch.vtensor<[?,4,3],f32>, %arg1: !torch.vtensor<[?,5,3],f32>) -> !torch.vtensor<[?,4,5],f32> {
+    %float2 = torch.constant.float 2.000000e+00
+    %none = torch.constant.none
+    %0 = torch.aten._cdist_forward %arg0, %arg1, %float2, %none : !torch.vtensor<[?,4,3],f32>, !torch.vtensor<[?,5,3],f32>, !torch.float, !torch.none -> !torch.vtensor<[?,4,5],f32>
+    return %0 : !torch.vtensor<[?,4,5],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten._pdist_forward$dynamic_p2(
+// CHECK-SAME:        %[[VAL_0:.*]]: !torch.vtensor<[?,8],f32>) -> !torch.vtensor<[?],f32> {
+// CHECK:           %[[X:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,8],f32> -> tensor<?x8xf32>
+// CHECK:           %[[X1:.*]] = stablehlo.dynamic_reshape %[[X]], {{.*}} : (tensor<?x8xf32>, tensor<3xi64>) -> tensor<?x1x8xf32>
+// CHECK:           %[[X2:.*]] = stablehlo.dynamic_reshape %[[X]], {{.*}} : (tensor<?x8xf32>, tensor<3xi64>) -> tensor<1x?x8xf32>
+// CHECK:           %[[DIFF:.*]] = chlo.broadcast_subtract %[[X1]], %[[X2]] : (tensor<?x1x8xf32>, tensor<1x?x8xf32>) -> tensor<?x?x8xf32>
+// CHECK:           %[[SQ:.*]] = stablehlo.multiply %[[DIFF]], %[[DIFF]] : tensor<?x?x8xf32>
+// CHECK:           %[[INIT:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+// CHECK:           %[[SUM:.*]] = stablehlo.reduce(%[[SQ]] init: %[[INIT]]) applies stablehlo.add across dimensions = [2] : (tensor<?x?x8xf32>, tensor<f32>) -> tensor<?x?xf32>
+// CHECK:           %[[SQRT:.*]] = stablehlo.sqrt %[[SUM]] : tensor<?x?xf32>
+// CHECK:           %[[FLAT_DIST:.*]] = stablehlo.dynamic_reshape %[[SQRT]], {{.*}} : (tensor<?x?xf32>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota {{.*}}, dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota {{.*}}, dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare  GT, %[[COL_IOTA]], %[[ROW_IOTA]],  SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[MASK_I32:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xi32>
+// CHECK:           %[[ONES:.*]] = stablehlo.constant dense<1> : tensor<i32>
+// CHECK:           %[[KEY:.*]] = chlo.broadcast_subtract %[[ONES]], %[[MASK_I32]] : (tensor<i32>, tensor<?x?xi32>) -> tensor<?x?xi32>
+// CHECK:           %[[FLAT_KEY:.*]] = stablehlo.dynamic_reshape %[[KEY]], {{.*}} : (tensor<?x?xi32>, tensor<1xi64>) -> tensor<?xi32>
+// CHECK:           %[[SORT:.*]]:2 = "stablehlo.sort"(%[[FLAT_KEY]], %[[FLAT_DIST]]) <{dimension = 0 : i64, is_stable = true}>
+// CHECK:           ^bb0(%[[A0:.*]]: tensor<i32>, %[[A1:.*]]: tensor<i32>, %[[A2:.*]]: tensor<f32>, %[[A3:.*]]: tensor<f32>):
+// CHECK:             %[[CMP:.*]] = stablehlo.compare  LT, %[[A0]], %[[A1]],  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+// CHECK:             stablehlo.return %[[CMP]] : tensor<i1>
+// CHECK:           }) : (tensor<?xi32>, tensor<?xf32>) -> (tensor<?xi32>, tensor<?xf32>)
+// CHECK:           %[[RESULT:.*]] = stablehlo.real_dynamic_slice %[[SORT]]#1, {{.*}}, {{.*}}, {{.*}} : (tensor<?xf32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?xf32> -> !torch.vtensor<[?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?],f32>
+// CHECK:         }
+func.func @torch.aten._pdist_forward$dynamic_p2(%arg0: !torch.vtensor<[?,8],f32>) -> !torch.vtensor<[?],f32> {
+    %float2 = torch.constant.float 2.000000e+00
+    %0 = torch.aten._pdist_forward %arg0, %float2 : !torch.vtensor<[?,8],f32>, !torch.float -> !torch.vtensor<[?],f32>
+    return %0 : !torch.vtensor<[?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten._pdist_forward$dynamic_p3(
+// CHECK-SAME:        %[[VAL_0:.*]]: !torch.vtensor<[?,6],f32>) -> !torch.vtensor<[?],f32> {
+// CHECK:           %[[X:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,6],f32> -> tensor<?x6xf32>
+// CHECK:           %[[X1:.*]] = stablehlo.dynamic_reshape %[[X]], {{.*}} : (tensor<?x6xf32>, tensor<3xi64>) -> tensor<?x1x6xf32>
+// CHECK:           %[[X2:.*]] = stablehlo.dynamic_reshape %[[X]], {{.*}} : (tensor<?x6xf32>, tensor<3xi64>) -> tensor<1x?x6xf32>
+// CHECK:           %[[DIFF:.*]] = chlo.broadcast_subtract %[[X1]], %[[X2]] : (tensor<?x1x6xf32>, tensor<1x?x6xf32>) -> tensor<?x?x6xf32>
+// CHECK:           %[[ABS:.*]] = stablehlo.abs %[[DIFF]] : tensor<?x?x6xf32>
+// CHECK:           %[[P_CST:.*]] = stablehlo.constant dense<3.000000e+00> : tensor<f32>
+// CHECK:           %[[POWERED:.*]] = chlo.broadcast_power %[[ABS]], %[[P_CST]] : (tensor<?x?x6xf32>, tensor<f32>) -> tensor<?x?x6xf32>
+// CHECK:           %[[INIT:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+// CHECK:           %[[SUM:.*]] = stablehlo.reduce(%[[POWERED]] init: %[[INIT]]) applies stablehlo.add across dimensions = [2] : (tensor<?x?x6xf32>, tensor<f32>) -> tensor<?x?xf32>
+// CHECK:           %[[INV_P:.*]] = stablehlo.constant dense<0.333333343> : tensor<f32>
+// CHECK:           %[[NORM:.*]] = chlo.broadcast_power %[[SUM]], %[[INV_P]] : (tensor<?x?xf32>, tensor<f32>) -> tensor<?x?xf32>
+// CHECK:           %[[FLAT_DIST:.*]] = stablehlo.dynamic_reshape %[[NORM]], {{.*}} : (tensor<?x?xf32>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota {{.*}}, dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota {{.*}}, dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare  GT, %[[COL_IOTA]], %[[ROW_IOTA]],  SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[MASK_I32:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xi32>
+// CHECK:           %[[ONES:.*]] = stablehlo.constant dense<1> : tensor<i32>
+// CHECK:           %[[KEY:.*]] = chlo.broadcast_subtract %[[ONES]], %[[MASK_I32]] : (tensor<i32>, tensor<?x?xi32>) -> tensor<?x?xi32>
+// CHECK:           %[[FLAT_KEY:.*]] = stablehlo.dynamic_reshape %[[KEY]], {{.*}} : (tensor<?x?xi32>, tensor<1xi64>) -> tensor<?xi32>
+// CHECK:           %[[SORT:.*]]:2 = "stablehlo.sort"(%[[FLAT_KEY]], %[[FLAT_DIST]]) <{dimension = 0 : i64, is_stable = true}>
+// CHECK:           ^bb0(%[[A0:.*]]: tensor<i32>, %[[A1:.*]]: tensor<i32>, %[[A2:.*]]: tensor<f32>, %[[A3:.*]]: tensor<f32>):
+// CHECK:             %[[CMP:.*]] = stablehlo.compare  LT, %[[A0]], %[[A1]],  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+// CHECK:             stablehlo.return %[[CMP]] : tensor<i1>
+// CHECK:           }) : (tensor<?xi32>, tensor<?xf32>) -> (tensor<?xi32>, tensor<?xf32>)
+// CHECK:           %[[RESULT:.*]] = stablehlo.real_dynamic_slice %[[SORT]]#1, {{.*}}, {{.*}}, {{.*}} : (tensor<?xf32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?xf32> -> !torch.vtensor<[?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?],f32>
+// CHECK:         }
+func.func @torch.aten._pdist_forward$dynamic_p3(%arg0: !torch.vtensor<[?,6],f32>) -> !torch.vtensor<[?],f32> {
+    %float3 = torch.constant.float 3.000000e+00
+    %0 = torch.aten._pdist_forward %arg0, %float3 : !torch.vtensor<[?,6],f32>, !torch.float -> !torch.vtensor<[?],f32>
+    return %0 : !torch.vtensor<[?],f32>
+}

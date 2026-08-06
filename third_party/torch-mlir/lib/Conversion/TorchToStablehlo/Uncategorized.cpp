@@ -298,11 +298,6 @@ LogicalResult validateDistanceInputs(RankedTensorType x1Type,
                                      SmallVector<int64_t> &batchDims,
                                      SmallVector<int64_t> &batchDimsIndices,
                                      std::string &errorMsg) {
-  if (!x1Type.hasStaticShape() || !x2Type.hasStaticShape()) {
-    errorMsg = "only static shapes supported";
-    return failure();
-  }
-
   auto x1Shape = x1Type.getShape();
   auto x2Shape = x2Type.getShape();
   rank = x1Shape.size();
@@ -316,14 +311,16 @@ LogicalResult validateDistanceInputs(RankedTensorType x1Type,
   m = x2Shape[rank - 2];
   d = x1Shape[rank - 1];
 
-  if (d != x2Shape[rank - 1]) {
+  if (d != ShapedType::kDynamic && x2Shape[rank - 1] != ShapedType::kDynamic &&
+      d != x2Shape[rank - 1]) {
     errorMsg = "feature dimensions must match";
     return failure();
   }
 
   batchDims.assign(x1Shape.begin(), x1Shape.end() - 2);
   for (int64_t i = 0; i < rank - 2; ++i) {
-    if (x1Shape[i] != x2Shape[i]) {
+    if (x1Shape[i] != ShapedType::kDynamic &&
+        x2Shape[i] != ShapedType::kDynamic && x1Shape[i] != x2Shape[i]) {
       errorMsg = "batch dimensions must match";
       return failure();
     }
@@ -374,40 +371,88 @@ public:
       return rewriter.notifyMatchFailure(op, errorMsg);
     }
 
+    auto elemTy = x1Type.getElementType();
+    bool hasStaticShapes =
+        x1Type.hasStaticShape() && x2Type.hasStaticShape();
+
     // Reshape x1 to [...batch, N, 1, D] and x2 to [...batch, 1, M, D]
+    Value x1Reshaped, x2Reshaped;
     SmallVector<int64_t> reshapeShape1(batchDims);
     reshapeShape1.append({n, 1, d});
     SmallVector<int64_t> reshapeShape2(batchDims);
     reshapeShape2.append({1, m, d});
-    auto reshapeType1 =
-        RankedTensorType::get(reshapeShape1, x1Type.getElementType());
-    auto reshapeType2 =
-        RankedTensorType::get(reshapeShape2, x2Type.getElementType());
+    auto reshapeType1 = RankedTensorType::get(reshapeShape1, elemTy);
+    auto reshapeType2 = RankedTensorType::get(reshapeShape2, elemTy);
 
-    Value x1Reshaped =
-        stablehlo::ReshapeOp::create(rewriter, loc, reshapeType1, x1);
-    Value x2Reshaped =
-        stablehlo::ReshapeOp::create(rewriter, loc, reshapeType2, x2);
+    if (hasStaticShapes) {
+      x1Reshaped = stablehlo::ReshapeOp::create(rewriter, loc, reshapeType1, x1);
+      x2Reshaped = stablehlo::ReshapeOp::create(rewriter, loc, reshapeType2, x2);
+    } else {
+      auto i64Ty = rewriter.getI64Type();
+      // Build shape tensor for x1: [...batch, N, 1, D]
+      SmallVector<Value> x1ShapeVals;
+      for (int64_t i = 0; i < rank - 2; ++i) {
+        Value dimVal = tensor::DimOp::create(rewriter, loc, x1, i);
+        x1ShapeVals.push_back(
+            arith::IndexCastOp::create(rewriter, loc, i64Ty, dimVal));
+      }
+      Value nVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Ty,
+          tensor::DimOp::create(rewriter, loc, x1, rank - 2));
+      Value dVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Ty,
+          tensor::DimOp::create(rewriter, loc, x1, rank - 1));
+      Value oneI64 = arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI64IntegerAttr(1));
+      x1ShapeVals.push_back(nVal);
+      x1ShapeVals.push_back(oneI64);
+      x1ShapeVals.push_back(dVal);
+      Value x1ShapeTensor = tensor::FromElementsOp::create(
+          rewriter, loc,
+          RankedTensorType::get({static_cast<int64_t>(x1ShapeVals.size())}, i64Ty),
+          x1ShapeVals);
+      x1Reshaped = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, reshapeType1, x1, x1ShapeTensor);
+
+      // Build shape tensor for x2: [...batch, 1, M, D]
+      SmallVector<Value> x2ShapeVals;
+      for (int64_t i = 0; i < rank - 2; ++i) {
+        Value dimVal = tensor::DimOp::create(rewriter, loc, x2, i);
+        x2ShapeVals.push_back(
+            arith::IndexCastOp::create(rewriter, loc, i64Ty, dimVal));
+      }
+      Value mVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Ty,
+          tensor::DimOp::create(rewriter, loc, x2, rank - 2));
+      x2ShapeVals.push_back(oneI64);
+      x2ShapeVals.push_back(mVal);
+      x2ShapeVals.push_back(dVal);
+      Value x2ShapeTensor = tensor::FromElementsOp::create(
+          rewriter, loc,
+          RankedTensorType::get({static_cast<int64_t>(x2ShapeVals.size())}, i64Ty),
+          x2ShapeVals);
+      x2Reshaped = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, reshapeType2, x2, x2ShapeTensor);
+    }
 
     // Broadcast subtract: [...batch, N, M, D]
     SmallVector<int64_t> diffShape(batchDims);
     diffShape.append({n, m, d});
-    auto diffType = RankedTensorType::get(diffShape, x1Type.getElementType());
+    auto diffType = RankedTensorType::get(diffShape, elemTy);
     Value diff = chlo::BroadcastSubOp::create(rewriter, loc, x1Reshaped,
                                               x2Reshaped, nullptr);
 
-    // Compute norm
+    // Compute norm — reduce along the last axis (D dimension, index = rank)
+    auto resultType = cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    auto scalarType = RankedTensorType::get({}, elemTy);
+
     Value result;
-    SmallVector<int64_t> resultShape(batchDims);
-    resultShape.append({n, m});
-    auto resultType =
-        RankedTensorType::get(resultShape, x1Type.getElementType());
-    auto scalarType = RankedTensorType::get({}, x1Type.getElementType());
     if (p == 2.0) {
       Value squared =
           stablehlo::MulOp::create(rewriter, loc, diffType, diff, diff);
       Value initValue = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getZeroAttr(x1Type.getElementType()));
+          rewriter, loc, rewriter.getZeroAttr(elemTy));
       stablehlo::ReduceOp sum = stablehlo::ReduceOp::create(
           rewriter, loc, resultType, ValueRange{squared}, ValueRange{initValue},
           rewriter.getDenseI64ArrayAttr({rank}));
@@ -423,11 +468,11 @@ public:
     } else {
       Value abs = stablehlo::AbsOp::create(rewriter, loc, diffType, diff);
       Value pConst = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getFloatAttr(x1Type.getElementType(), p));
+          rewriter, loc, rewriter.getFloatAttr(elemTy, p));
       Value powered =
           chlo::BroadcastPowOp::create(rewriter, loc, abs, pConst, nullptr);
       Value initValue = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getZeroAttr(x1Type.getElementType()));
+          rewriter, loc, rewriter.getZeroAttr(elemTy));
       stablehlo::ReduceOp sum = stablehlo::ReduceOp::create(
           rewriter, loc, resultType, ValueRange{powered}, ValueRange{initValue},
           rewriter.getDenseI64ArrayAttr({rank}));
@@ -440,8 +485,7 @@ public:
       stablehlo::ReturnOp::create(rewriter, loc, add);
       rewriter.setInsertionPointAfter(sum);
       Value invP = stablehlo::ConstantOp::create(
-          rewriter, loc,
-          rewriter.getFloatAttr(x1Type.getElementType(), 1.0 / p));
+          rewriter, loc, rewriter.getFloatAttr(elemTy, 1.0 / p));
       result = chlo::BroadcastPowOp::create(rewriter, loc, sum.getResults()[0],
                                             invP, nullptr);
     }
@@ -464,10 +508,7 @@ public:
 
     Value x = adaptor.getSelf();
     auto xType = cast<RankedTensorType>(x.getType());
-
-    if (!xType.hasStaticShape()) {
-      return rewriter.notifyMatchFailure(op, "only static shapes supported");
-    }
+    auto elemTy = xType.getElementType();
 
     double p;
     if (!matchPattern(op.getP(), m_TorchConstantFloat(&p))) {
@@ -479,42 +520,80 @@ public:
     int64_t n = xShape[rank - 2];
     int64_t d = xShape[rank - 1];
     SmallVector<int64_t> batchDims(xShape.begin(), xShape.end() - 2);
+    bool hasStaticShapes = xType.hasStaticShape();
+    auto i64Ty = rewriter.getI64Type();
+    auto i32Ty = rewriter.getI32Type();
 
     // Reshape x to [...batch, N, 1, D] and [...batch, 1, N, D]
     SmallVector<int64_t> reshapeShape1(batchDims);
     reshapeShape1.append({n, 1, d});
     SmallVector<int64_t> reshapeShape2(batchDims);
     reshapeShape2.append({1, n, d});
-    auto reshapeType1 =
-        RankedTensorType::get(reshapeShape1, xType.getElementType());
-    auto reshapeType2 =
-        RankedTensorType::get(reshapeShape2, xType.getElementType());
+    auto reshapeType1 = RankedTensorType::get(reshapeShape1, elemTy);
+    auto reshapeType2 = RankedTensorType::get(reshapeShape2, elemTy);
 
-    Value x1Reshaped =
-        stablehlo::ReshapeOp::create(rewriter, loc, reshapeType1, x);
-    Value x2Reshaped =
-        stablehlo::ReshapeOp::create(rewriter, loc, reshapeType2, x);
+    Value x1Reshaped, x2Reshaped;
+    if (hasStaticShapes) {
+      x1Reshaped = stablehlo::ReshapeOp::create(rewriter, loc, reshapeType1, x);
+      x2Reshaped = stablehlo::ReshapeOp::create(rewriter, loc, reshapeType2, x);
+    } else {
+      Value oneI64 = arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI64IntegerAttr(1));
+      SmallVector<Value> shapeVals;
+      for (int64_t i = 0; i < rank - 2; ++i) {
+        shapeVals.push_back(arith::IndexCastOp::create(
+            rewriter, loc, i64Ty,
+            tensor::DimOp::create(rewriter, loc, x, i)));
+      }
+      Value nVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Ty,
+          tensor::DimOp::create(rewriter, loc, x, rank - 2));
+      Value dVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Ty,
+          tensor::DimOp::create(rewriter, loc, x, rank - 1));
+
+      SmallVector<Value> shape1Vals(shapeVals);
+      shape1Vals.push_back(nVal);
+      shape1Vals.push_back(oneI64);
+      shape1Vals.push_back(dVal);
+      Value shape1Tensor = tensor::FromElementsOp::create(
+          rewriter, loc,
+          RankedTensorType::get({static_cast<int64_t>(shape1Vals.size())}, i64Ty),
+          shape1Vals);
+      x1Reshaped = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, reshapeType1, x, shape1Tensor);
+
+      SmallVector<Value> shape2Vals(shapeVals);
+      shape2Vals.push_back(oneI64);
+      shape2Vals.push_back(nVal);
+      shape2Vals.push_back(dVal);
+      Value shape2Tensor = tensor::FromElementsOp::create(
+          rewriter, loc,
+          RankedTensorType::get({static_cast<int64_t>(shape2Vals.size())}, i64Ty),
+          shape2Vals);
+      x2Reshaped = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, reshapeType2, x, shape2Tensor);
+    }
 
     // Broadcast subtract: [...batch, N, N, D]
     SmallVector<int64_t> diffShape(batchDims);
     diffShape.append({n, n, d});
-    auto diffType = RankedTensorType::get(diffShape, xType.getElementType());
+    auto diffType = RankedTensorType::get(diffShape, elemTy);
     Value diff = chlo::BroadcastSubOp::create(rewriter, loc, x1Reshaped,
                                               x2Reshaped, nullptr);
 
     // Compute norm for full NxN matrix
     SmallVector<int64_t> fullResultShape(batchDims);
     fullResultShape.append({n, n});
-    auto fullResultType =
-        RankedTensorType::get(fullResultShape, xType.getElementType());
-    auto scalarType = RankedTensorType::get({}, xType.getElementType());
+    auto fullResultType = RankedTensorType::get(fullResultShape, elemTy);
+    auto scalarType = RankedTensorType::get({}, elemTy);
 
     Value fullResult;
     if (p == 2.0) {
       Value squared =
           stablehlo::MulOp::create(rewriter, loc, diffType, diff, diff);
       Value initValue = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getZeroAttr(xType.getElementType()));
+          rewriter, loc, rewriter.getZeroAttr(elemTy));
       stablehlo::ReduceOp sum = stablehlo::ReduceOp::create(
           rewriter, loc, fullResultType, ValueRange{squared},
           ValueRange{initValue}, rewriter.getDenseI64ArrayAttr({rank}));
@@ -531,11 +610,11 @@ public:
     } else {
       Value abs = stablehlo::AbsOp::create(rewriter, loc, diffType, diff);
       Value pConst = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getFloatAttr(xType.getElementType(), p));
+          rewriter, loc, rewriter.getFloatAttr(elemTy, p));
       Value powered =
           chlo::BroadcastPowOp::create(rewriter, loc, abs, pConst, nullptr);
       Value initValue = stablehlo::ConstantOp::create(
-          rewriter, loc, rewriter.getZeroAttr(xType.getElementType()));
+          rewriter, loc, rewriter.getZeroAttr(elemTy));
       stablehlo::ReduceOp sum = stablehlo::ReduceOp::create(
           rewriter, loc, fullResultType, ValueRange{powered},
           ValueRange{initValue}, rewriter.getDenseI64ArrayAttr({rank}));
@@ -548,50 +627,155 @@ public:
       stablehlo::ReturnOp::create(rewriter, loc, add);
       rewriter.setInsertionPointAfter(sum);
       Value invP = stablehlo::ConstantOp::create(
-          rewriter, loc,
-          rewriter.getFloatAttr(xType.getElementType(), 1.0 / p));
-      fullResult = chlo::BroadcastPowOp::create(
-          rewriter, loc, sum.getResults()[0], invP, nullptr);
+          rewriter, loc, rewriter.getFloatAttr(elemTy, 1.0 / p));
+      fullResult = chlo::BroadcastPowOp::create(rewriter, loc,
+                                                sum.getResults()[0], invP,
+                                                nullptr);
     }
 
-    // Create constant indices for gathering upper triangular elements
-    int64_t condensedSize = n * (n - 1) / 2;
-    SmallVector<int64_t> gatherIndices;
-    for (int64_t i = 0; i < n; ++i) {
-      for (int64_t j = i + 1; j < n; ++j) {
-        gatherIndices.push_back(i * n + j);
+    // Extract upper-triangular elements
+    auto outTy = cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+
+    if (hasStaticShapes) {
+      // Static: compile-time constant gather indices
+      int64_t condensedSize = n * (n - 1) / 2;
+      SmallVector<int64_t> gatherIndices;
+      for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = i + 1; j < n; ++j) {
+          gatherIndices.push_back(i * n + j);
+        }
       }
+
+      Value flatResult = stablehlo::ReshapeOp::create(
+          rewriter, loc, RankedTensorType::get({n * n}, elemTy), fullResult);
+
+      Value indices = stablehlo::ConstantOp::create(
+          rewriter, loc,
+          DenseIntElementsAttr::get(
+              RankedTensorType::get({condensedSize, 1}, rewriter.getI64Type()),
+              ArrayRef<int64_t>(gatherIndices)));
+
+      auto dimsAttr = stablehlo::GatherDimensionNumbersAttr::get(
+          rewriter.getContext(),
+          /*offsetDims=*/{},
+          /*collapsedSliceDims=*/{0},
+          /*operandBatchingDims=*/{},
+          /*startIndicesBatchingDims=*/{},
+          /*startIndexMap=*/{0},
+          /*indexVecDim=*/1);
+
+      Value result = stablehlo::GatherOp::create(
+          rewriter, loc, outTy, flatResult, indices, dimsAttr,
+          rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
+      rewriter.replaceOp(op, result);
+    } else {
+      // Dynamic: sort-based upper-triangular extraction
+      // 1. Flatten NxN -> [N*N]
+      // 2. Build sort key: 0 for upper-tri (col > row), 1 otherwise
+      // 3. Stable sort by key — upper-tri first in row-major order
+      // 4. Slice first N*(N-1)/2 elements
+
+      Value nDimIdx = tensor::DimOp::create(
+          rewriter, loc, fullResult,
+          static_cast<int64_t>(fullResultShape.size() - 1));
+      Value nI64 = arith::IndexCastOp::create(rewriter, loc, i64Ty, nDimIdx);
+      Value nnI64 = arith::MulIOp::create(rewriter, loc, nI64, nI64);
+      Value oneI64 = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(1));
+      Value twoI64 = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(2));
+      Value nMinus1 = arith::SubIOp::create(rewriter, loc, nI64, oneI64);
+      Value nTimesNm1 = arith::MulIOp::create(rewriter, loc, nI64, nMinus1);
+      Value condensedSizeI64 =
+          arith::DivSIOp::create(rewriter, loc, nTimesNm1, twoI64);
+
+      // Flatten fullResult to [N*N]
+      auto flatType = RankedTensorType::get({ShapedType::kDynamic}, elemTy);
+      Value flatShapeTensor = tensor::FromElementsOp::create(
+          rewriter, loc, ValueRange{nnI64});
+      Value flatResult = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, flatType, fullResult, flatShapeTensor);
+
+      // Build sort key: col > row -> 0, else 1
+      Value nnShapeTensor = tensor::FromElementsOp::create(
+          rewriter, loc, ValueRange{nI64, nI64});
+      auto dynNxNI64 = RankedTensorType::get(
+          {ShapedType::kDynamic, ShapedType::kDynamic}, i64Ty);
+      Value rowIota = stablehlo::DynamicIotaOp::create(
+          rewriter, loc, dynNxNI64, nnShapeTensor,
+          rewriter.getI64IntegerAttr(0));
+      Value colIota = stablehlo::DynamicIotaOp::create(
+          rewriter, loc, dynNxNI64, nnShapeTensor,
+          rewriter.getI64IntegerAttr(1));
+
+      auto dynNxNI1 = RankedTensorType::get(
+          {ShapedType::kDynamic, ShapedType::kDynamic}, rewriter.getI1Type());
+      Value upperTriMask = stablehlo::CompareOp::create(
+          rewriter, loc, dynNxNI1, colIota, rowIota,
+          stablehlo::ComparisonDirectionAttr::get(
+              rewriter.getContext(), stablehlo::ComparisonDirection::GT),
+          stablehlo::ComparisonTypeAttr::get(
+              rewriter.getContext(), stablehlo::ComparisonType::SIGNED));
+
+      // mask=true -> 0, mask=false -> 1
+      auto dynNxNI32 = RankedTensorType::get(
+          {ShapedType::kDynamic, ShapedType::kDynamic}, i32Ty);
+      Value maskI32 = stablehlo::ConvertOp::create(rewriter, loc, dynNxNI32,
+                                                    upperTriMask);
+      Value onesScalar = stablehlo::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(1));
+      Value sortKey = chlo::BroadcastSubOp::create(rewriter, loc, onesScalar,
+                                                    maskI32, nullptr);
+
+      // Flatten sort key to [N*N]
+      auto flatI32Type = RankedTensorType::get({ShapedType::kDynamic}, i32Ty);
+      Value flatSortKey = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, flatI32Type, sortKey, flatShapeTensor);
+
+      // Stable sort by key ascending
+      stablehlo::SortOp sortOp = stablehlo::SortOp::create(
+          rewriter, loc, TypeRange{flatI32Type, flatType},
+          ValueRange{flatSortKey, flatResult},
+          rewriter.getI64IntegerAttr(0), rewriter.getBoolAttr(true));
+
+      Block &comparatorBlock = sortOp.getComparator().emplaceBlock();
+      auto scalarI32Type = RankedTensorType::get({}, i32Ty);
+      auto scalarElemType = RankedTensorType::get({}, elemTy);
+      comparatorBlock.addArgument(scalarI32Type, loc);
+      comparatorBlock.addArgument(scalarI32Type, loc);
+      comparatorBlock.addArgument(scalarElemType, loc);
+      comparatorBlock.addArgument(scalarElemType, loc);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(&comparatorBlock);
+        Value cmp = stablehlo::CompareOp::create(
+            rewriter, loc, RankedTensorType::get({}, rewriter.getI1Type()),
+            comparatorBlock.getArgument(0), comparatorBlock.getArgument(1),
+            stablehlo::ComparisonDirectionAttr::get(
+                rewriter.getContext(), stablehlo::ComparisonDirection::LT),
+            stablehlo::ComparisonTypeAttr::get(
+                rewriter.getContext(), stablehlo::ComparisonType::SIGNED));
+        stablehlo::ReturnOp::create(rewriter, loc, cmp);
+      }
+
+      Value sortedDistances = sortOp.getResults()[1];
+
+      // Slice first N*(N-1)/2 elements
+      Value zeroI64 = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(0));
+      Value startTensor = tensor::FromElementsOp::create(
+          rewriter, loc, ValueRange{zeroI64});
+      Value limitTensor = tensor::FromElementsOp::create(
+          rewriter, loc, ValueRange{condensedSizeI64});
+      Value stridesTensor = tensor::FromElementsOp::create(
+          rewriter, loc, ValueRange{oneI64});
+      Value result = stablehlo::RealDynamicSliceOp::create(
+          rewriter, loc, outTy, sortedDistances, startTensor, limitTensor,
+          stridesTensor);
+      rewriter.replaceOp(op, result);
     }
 
-    SmallVector<int64_t> condensedShape(batchDims);
-    condensedShape.push_back(condensedSize);
-    auto condensedType =
-        RankedTensorType::get(condensedShape, xType.getElementType());
-
-    Value flatResult = stablehlo::ReshapeOp::create(
-        rewriter, loc, RankedTensorType::get({n * n}, xType.getElementType()),
-        fullResult);
-
-    Value indices = stablehlo::ConstantOp::create(
-        rewriter, loc,
-        DenseIntElementsAttr::get(
-            RankedTensorType::get({condensedSize, 1}, rewriter.getI64Type()),
-            ArrayRef<int64_t>(gatherIndices)));
-
-    auto dimsAttr = stablehlo::GatherDimensionNumbersAttr::get(
-        rewriter.getContext(),
-        /*offsetDims=*/{},
-        /*collapsedSliceDims=*/{0},
-        /*operandBatchingDims=*/{},
-        /*startIndicesBatchingDims=*/{},
-        /*startIndexMap=*/{0},
-        /*indexVecDim=*/1);
-
-    Value result = stablehlo::GatherOp::create(
-        rewriter, loc, condensedType, flatResult, indices, dimsAttr,
-        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
-
-    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -720,9 +904,6 @@ public:
 
     Value input = adaptor.getSelf();
     auto inputType = cast<RankedTensorType>(input.getType());
-    if (!inputType.hasStaticShape()) {
-      return rewriter.notifyMatchFailure(op, "only static shapes supported");
-    }
 
     int64_t dim;
     if (!matchPattern(op.getDim(), m_TorchConstantInt(&dim))) {
@@ -737,8 +918,21 @@ public:
 
     auto indicesType =
         RankedTensorType::get(inputType.getShape(), rewriter.getI64Type());
-    Value indices = stablehlo::IotaOp::create(rewriter, loc, indicesType,
-                                              rewriter.getI64IntegerAttr(dim));
+    Value indices;
+    if (inputType.hasStaticShape()) {
+      indices = stablehlo::IotaOp::create(rewriter, loc, indicesType,
+                                          rewriter.getI64IntegerAttr(dim));
+    } else {
+      auto dimSizes =
+          hlo::getDimSizesOfTensor(rewriter, op, input, 64);
+      if (failed(dimSizes))
+        return failure();
+      Value shapeTensor =
+          tensor::FromElementsOp::create(rewriter, loc, *dimSizes);
+      indices = stablehlo::DynamicIotaOp::create(
+          rewriter, loc, indicesType, shapeTensor,
+          rewriter.getI64IntegerAttr(dim));
+    }
 
     // The default value for aten.sort op's `stable` parameter is `false`.
     // Refer: https://pytorch.org/docs/stable/generated/torch.sort.html

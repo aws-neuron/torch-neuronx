@@ -559,3 +559,107 @@ func.func @torch.aten.convolution$scalar_stride_dilation(%arg0: !torch.vtensor<[
   %out = torch.aten.convolution %arg0, %arg1, %none, %stride, %padding, %dilation, %false, %output_padding, %int1 : !torch.vtensor<[1,64,112,112],f32>, !torch.vtensor<[128,64,3,3],f32>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,128,56,56],f32>
   return %out : !torch.vtensor<[1,128,56,56],f32>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.convolution$dynamic_padding(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[1,3,8,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[16,3,3,3],f32>, %[[ARG2:.*]]: !torch.vtensor<[16],f32>, %[[ARG3:.*]]: !torch.int, %[[ARG4:.*]]: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+// CHECK:           %[[BIAS:.*]] = torch_c.to_builtin_tensor %[[ARG2]] : !torch.vtensor<[16],f32> -> tensor<16xf32>
+// CHECK:           %[[WEIGHT:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[16,3,3,3],f32> -> tensor<16x3x3x3xf32>
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[1,3,8,8],f32> -> tensor<1x3x8x8xf32>
+// CHECK:           %[[P0:.*]] = torch_c.to_i64 %[[ARG3]]
+// CHECK:           %[[P1:.*]] = torch_c.to_i64 %[[ARG4]]
+// CHECK:           %[[PAD_TENSOR:.*]] = tensor.from_elements %[[P0]], %[[P0]], %[[P1]], %[[P1]] : tensor<2x2xi64>
+// CHECK:           %[[CONV:.*]] = "stablehlo.dynamic_conv"(%[[INPUT]], %[[WEIGHT]], %[[PAD_TENSOR]]) <{batch_group_count = 1 : i64, dimension_numbers = #stablehlo.conv<[b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1]>, feature_group_count = 1 : i64, rhs_dilation = array<i64: 1, 1>, window_strides = array<i64: 1, 1>}> : (tensor<1x3x8x8xf32>, tensor<16x3x3x3xf32>, tensor<2x2xi64>) -> tensor<1x16x?x?xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[BIAS]], %[[C0]] : tensor<16xf32>
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIM]], %[[C1]], %[[C1]] : tensor<3xindex>
+// CHECK:           %[[BIAS_R:.*]] = stablehlo.dynamic_reshape %[[BIAS]], %[[SHAPE]] : (tensor<16xf32>, tensor<3xindex>) -> tensor<16x1x1xf32>
+// CHECK:           %[[RES:.*]] = chlo.broadcast_add %[[CONV]], %[[BIAS_R]] : (tensor<1x16x?x?xf32>, tensor<16x1x1xf32>) -> tensor<1x16x?x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RES]] : tensor<1x16x?x?xf32> -> !torch.vtensor<[1,16,?,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[1,16,?,?],f32>
+func.func @torch.aten.convolution$dynamic_padding(%arg0: !torch.vtensor<[1,3,8,8],f32>, %arg1: !torch.vtensor<[16,3,3,3],f32>, %arg2: !torch.vtensor<[16],f32>, %arg3: !torch.int, %arg4: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+  %false = torch.constant.bool false
+  %int1 = torch.constant.int 1
+  %int0 = torch.constant.int 0
+  %stride = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %padding = torch.prim.ListConstruct %arg3, %arg4 : (!torch.int, !torch.int) -> !torch.list<int>
+  %dilation = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %output_padding = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+  %groups = torch.constant.int 1
+  %0 = torch.aten.convolution %arg0, %arg1, %arg2, %stride, %padding, %dilation, %false, %output_padding, %groups : !torch.vtensor<[1,3,8,8],f32>, !torch.vtensor<[16,3,3,3],f32>, !torch.vtensor<[16],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,16,?,?],f32>
+  return %0 : !torch.vtensor<[1,16,?,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.convolution$dynamic_padding_no_bias(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[1,3,8,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[16,3,3,3],f32>, %[[ARG2:.*]]: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+// CHECK:           %[[WEIGHT:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[16,3,3,3],f32> -> tensor<16x3x3x3xf32>
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[1,3,8,8],f32> -> tensor<1x3x8x8xf32>
+// CHECK:           %[[P0:.*]] = torch_c.to_i64 %[[ARG2]]
+// CHECK:           %[[P1:.*]] = torch_c.to_i64 %[[ARG2]]
+// CHECK:           %[[PAD_TENSOR:.*]] = tensor.from_elements %[[P0]], %[[P0]], %[[P1]], %[[P1]] : tensor<2x2xi64>
+// CHECK:           %[[CONV:.*]] = "stablehlo.dynamic_conv"(%[[INPUT]], %[[WEIGHT]], %[[PAD_TENSOR]]) <{batch_group_count = 1 : i64, dimension_numbers = #stablehlo.conv<[b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1]>, feature_group_count = 1 : i64, rhs_dilation = array<i64: 1, 1>, window_strides = array<i64: 1, 1>}> : (tensor<1x3x8x8xf32>, tensor<16x3x3x3xf32>, tensor<2x2xi64>) -> tensor<1x16x?x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[CONV]] : tensor<1x16x?x?xf32> -> !torch.vtensor<[1,16,?,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[1,16,?,?],f32>
+func.func @torch.aten.convolution$dynamic_padding_no_bias(%arg0: !torch.vtensor<[1,3,8,8],f32>, %arg1: !torch.vtensor<[16,3,3,3],f32>, %arg3: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+  %false = torch.constant.bool false
+  %none = torch.constant.none
+  %int1 = torch.constant.int 1
+  %int0 = torch.constant.int 0
+  %stride = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %padding = torch.prim.ListConstruct %arg3, %arg3 : (!torch.int, !torch.int) -> !torch.list<int>
+  %dilation = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %output_padding = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+  %groups = torch.constant.int 1
+  %0 = torch.aten.convolution %arg0, %arg1, %none, %stride, %padding, %dilation, %false, %output_padding, %groups : !torch.vtensor<[1,3,8,8],f32>, !torch.vtensor<[16,3,3,3],f32>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,16,?,?],f32>
+  return %0 : !torch.vtensor<[1,16,?,?],f32>
+}
+
+// -----
+
+// Scalar padding broadcast: single dynamic pad value applied to both spatial dims.
+// CHECK-LABEL:   func.func @torch.aten.convolution$dynamic_scalar_padding(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[1,3,8,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[16,3,3,3],f32>, %[[ARG2:.*]]: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+// CHECK:           %[[WEIGHT:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[16,3,3,3],f32> -> tensor<16x3x3x3xf32>
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[1,3,8,8],f32> -> tensor<1x3x8x8xf32>
+// CHECK:           %[[P0:.*]] = torch_c.to_i64 %[[ARG2]]
+// CHECK:           %[[P1:.*]] = torch_c.to_i64 %[[ARG2]]
+// CHECK:           %[[PAD_TENSOR:.*]] = tensor.from_elements %[[P0]], %[[P0]], %[[P1]], %[[P1]] : tensor<2x2xi64>
+// CHECK:           %[[CONV:.*]] = "stablehlo.dynamic_conv"(%[[INPUT]], %[[WEIGHT]], %[[PAD_TENSOR]]) <{batch_group_count = 1 : i64, dimension_numbers = #stablehlo.conv<[b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1]>, feature_group_count = 1 : i64, rhs_dilation = array<i64: 1, 1>, window_strides = array<i64: 1, 1>}> : (tensor<1x3x8x8xf32>, tensor<16x3x3x3xf32>, tensor<2x2xi64>) -> tensor<1x16x?x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[CONV]] : tensor<1x16x?x?xf32> -> !torch.vtensor<[1,16,?,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[1,16,?,?],f32>
+// CHECK:         }
+func.func @torch.aten.convolution$dynamic_scalar_padding(%arg0: !torch.vtensor<[1,3,8,8],f32>, %arg1: !torch.vtensor<[16,3,3,3],f32>, %arg2: !torch.int) -> !torch.vtensor<[1,16,?,?],f32> {
+  %false = torch.constant.bool false
+  %none = torch.constant.none
+  %int1 = torch.constant.int 1
+  %int0 = torch.constant.int 0
+  %stride = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %padding = torch.prim.ListConstruct %arg2 : (!torch.int) -> !torch.list<int>
+  %dilation = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %output_padding = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+  %groups = torch.constant.int 1
+  %0 = torch.aten.convolution %arg0, %arg1, %none, %stride, %padding, %dilation, %false, %output_padding, %groups : !torch.vtensor<[1,3,8,8],f32>, !torch.vtensor<[16,3,3,3],f32>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,16,?,?],f32>
+  return %0 : !torch.vtensor<[1,16,?,?],f32>
+}
+
+// -----
+
+// Transposed convolution with dynamic padding is rejected.
+func.func @torch.aten.convolution$transposed_dynamic_padding_rejected(%arg0: !torch.vtensor<[1,2,7,7],f32>, %arg1: !torch.vtensor<[2,4,3,3],f32>, %arg2: !torch.int) -> !torch.vtensor<[1,4,?,?],f32> {
+  %true = torch.constant.bool true
+  %none = torch.constant.none
+  %int1 = torch.constant.int 1
+  %int0 = torch.constant.int 0
+  %stride = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %padding = torch.prim.ListConstruct %arg2, %arg2 : (!torch.int, !torch.int) -> !torch.list<int>
+  %dilation = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %output_padding = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+  %groups = torch.constant.int 1
+  // expected-error @+1 {{failed to legalize operation 'torch.aten.convolution' that was explicitly marked illegal}}
+  %0 = torch.aten.convolution %arg0, %arg1, %none, %stride, %padding, %dilation, %true, %output_padding, %groups : !torch.vtensor<[1,2,7,7],f32>, !torch.vtensor<[2,4,3,3],f32>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,4,?,?],f32>
+  return %0 : !torch.vtensor<[1,4,?,?],f32>
+}

@@ -723,6 +723,67 @@ public:
     return stablehloConvOp.getResult();
   }
 
+  Value convertNormalDynamicConv(AtenConvolutionOp op,
+                                 ConversionPatternRewriter &rewriter,
+                                 RankedTensorType outType, Value input,
+                                 Value weight, ArrayRef<int64_t> stride,
+                                 ArrayRef<int64_t> dilation,
+                                 ArrayRef<Value> padValues,
+                                 int64_t groups) const {
+    auto loc = op->getLoc();
+    int64_t nDims = outType.getRank();
+    int64_t nSpatialDims = nDims - 2;
+    auto i64Ty = rewriter.getI64Type();
+
+    // Broadcast scalar padding to all spatial dims if needed.
+    SmallVector<Value> expandedPadValues(padValues.begin(), padValues.end());
+    if (static_cast<int64_t>(expandedPadValues.size()) == 1 &&
+        nSpatialDims > 1) {
+      expandedPadValues.resize(nSpatialDims, expandedPadValues[0]);
+    }
+
+    SmallVector<Value> paddingTensorVals;
+    for (Value v : expandedPadValues) {
+      Value i64Val =
+          torch::TorchConversion::ToI64Op::create(rewriter, loc, v);
+      paddingTensorVals.push_back(i64Val);
+      paddingTensorVals.push_back(i64Val);
+    }
+    auto paddingTensorType =
+        RankedTensorType::get({nSpatialDims, 2}, i64Ty);
+    Value paddingTensor = tensor::FromElementsOp::create(
+        rewriter, loc, paddingTensorType, paddingTensorVals);
+
+    auto stablehloWindowStride = rewriter.getDenseI64ArrayAttr(stride);
+    auto stablehloRhsDilation = rewriter.getDenseI64ArrayAttr(dilation);
+
+    SmallVector<int64_t> spatialDimensions;
+    for (int64_t i = 2; i < nDims; i++)
+      spatialDimensions.push_back(i);
+
+    stablehlo::ConvDimensionNumbersAttr dimensionNumbers =
+        stablehlo::ConvDimensionNumbersAttr::get(
+            rewriter.getContext(), 0, 1, spatialDimensions, 1, 0,
+            spatialDimensions, 0, 1, spatialDimensions);
+
+    DenseI64ArrayAttr stablehloLhsDilation;
+    DenseBoolArrayAttr windowReversal;
+    ArrayAttr precisionConfig;
+
+    auto featureGroupCountAttr =
+        rewriter.getI64IntegerAttr(groups);
+    auto batchGroupCountAttr =
+        rewriter.getI64IntegerAttr(1);
+
+    auto dynamicConvOp = stablehlo::DynamicConvOp::create(
+        rewriter, loc, outType, input, weight, paddingTensor,
+        stablehloWindowStride, stablehloLhsDilation, stablehloRhsDilation,
+        windowReversal, dimensionNumbers, featureGroupCountAttr,
+        batchGroupCountAttr, precisionConfig);
+
+    return dynamicConvOp.getResult();
+  }
+
   LogicalResult
   matchAndRewrite(AtenConvolutionOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -746,11 +807,6 @@ public:
     if (!matchPattern(op.getStride(), m_TorchListOfConstantInts(stride))) {
       return rewriter.notifyMatchFailure(op,
                                          "non-const stride list unsupported");
-    }
-    SmallVector<int64_t> padding;
-    if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding))) {
-      return rewriter.notifyMatchFailure(op,
-                                         "non-const padding list unsupported");
     }
     SmallVector<int64_t> dilation;
     if (!matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilation))) {
@@ -785,10 +841,17 @@ public:
           "output padding attr is valid only in transposed convolution");
     }
 
+    auto nDims = inputTy.getRank();
+    auto nSpatialDims = nDims - 2;
+    auto weightShape = weightTy.getShape();
+
+    SmallVector<int64_t> padding;
+    bool hasConstantPadding =
+        matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding));
+
     // Broadcast scalar padding/stride/dilation to match spatial dimensions.
-    // PyTorch allows a single value that applies to all spatial dims.
-    auto nSpatialDimsExpected = static_cast<size_t>(inputTy.getRank()) - 2;
-    if (padding.size() == 1 && nSpatialDimsExpected > 1) {
+    auto nSpatialDimsExpected = static_cast<size_t>(nSpatialDims);
+    if (hasConstantPadding && padding.size() == 1 && nSpatialDimsExpected > 1) {
       padding.resize(nSpatialDimsExpected, padding[0]);
     }
     if (stride.size() == 1 && nSpatialDimsExpected > 1) {
@@ -798,32 +861,41 @@ public:
       dilation.resize(nSpatialDimsExpected, dilation[0]);
     }
 
-    assert(padding.size() == dilation.size() &&
-           padding.size() == stride.size() &&
-           padding.size() == nSpatialDimsExpected &&
-           inputTy.getRank() == weightTy.getRank());
-
-    auto nSpatialDims = padding.size();
-    auto nDims = inputTy.getRank();
-
-    // Kernel size must be constant.
-    auto weightShape = weightTy.getShape();
+    bool hasStaticKernel = true;
     for (int i = 2; i < nDims; ++i) {
       if (weightShape[i] == ShapedType::kDynamic) {
-        return rewriter.notifyMatchFailure(
-            op, "only constant kernel size is supported");
+        hasStaticKernel = false;
+        break;
       }
     }
 
     Value stablehloConvResult;
-    if (transposed) {
-      stablehloConvResult =
-          convertTransposedConv(op, rewriter, outTy, input, weight, stride,
-                                padding, dilation, outputPadding, groups);
+    if (hasConstantPadding && hasStaticKernel) {
+      assert(padding.size() == dilation.size() &&
+             padding.size() == stride.size() &&
+             padding.size() == static_cast<size_t>(nDims) - 2 &&
+             inputTy.getRank() == weightTy.getRank());
+      if (transposed) {
+        stablehloConvResult =
+            convertTransposedConv(op, rewriter, outTy, input, weight, stride,
+                                  padding, dilation, outputPadding, groups);
+      } else {
+        stablehloConvResult =
+            convertNormalConv(op, rewriter, outTy, input, weight, stride,
+                              padding, dilation, groups);
+      }
     } else {
-      stablehloConvResult =
-          convertNormalConv(op, rewriter, outTy, input, weight, stride, padding,
-                            dilation, groups);
+      if (transposed) {
+        return rewriter.notifyMatchFailure(
+            op, "dynamic padding/kernel not supported for transposed conv");
+      }
+      SmallVector<Value> padValues;
+      if (!getListConstructElements(op.getPadding(), padValues))
+        return rewriter.notifyMatchFailure(
+            op, "padding must be a ListConstruct");
+      stablehloConvResult = convertNormalDynamicConv(
+          op, rewriter, outTy, input, weight, stride, dilation, padValues,
+          groups);
     }
 
     auto bias = adaptor.getBias();

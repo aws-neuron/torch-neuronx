@@ -1266,3 +1266,41 @@ func.func @index_put_non_consecutive_4d(%arg0: !torch.vtensor<[2,3,4,5],f32>, %a
   %1 = torch.aten.index_put %arg0, %0, %arg3, %false : !torch.vtensor<[2,3,4,5],f32>, !torch.list<optional<vtensor>>, !torch.vtensor<[3,3,4],f32>, !torch.bool -> !torch.vtensor<[2,3,4,5],f32>
   return %1 : !torch.vtensor<[2,3,4,5],f32>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.randint.low$dynamic_bounds(
+// CHECK-SAME:        %[[LOW:.*]]: !torch.int, %[[HIGH:.*]]: !torch.int) -> !torch.vtensor<[3,4],si64> {
+// CHECK:           %[[FLOW:.*]] = torch.aten.Float.Scalar %[[LOW]] : !torch.int -> !torch.float
+// CHECK:           %[[FHIGH:.*]] = torch.aten.Float.Scalar %[[HIGH]] : !torch.int -> !torch.float
+// CHECK:           %[[EMPTY:.*]] = torch.aten.empty.memory_format
+// CHECK:           %[[UNIFORM:.*]] = torch.aten.uniform %[[EMPTY]], %[[FLOW]], %[[FHIGH]], %{{.*}} : !torch.vtensor<[3,4],f32>, !torch.float, !torch.float, !torch.none -> !torch.vtensor<[3,4],f32>
+// CHECK:           %[[RESULT:.*]] = torch.aten.to.dtype %[[UNIFORM]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[3,4],f32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3,4],si64>
+// CHECK:           return %[[RESULT]] : !torch.vtensor<[3,4],si64>
+func.func @torch.aten.randint.low$dynamic_bounds(%arg0: !torch.int, %arg1: !torch.int) -> !torch.vtensor<[3,4],si64> {
+  %none = torch.constant.none
+  %int3 = torch.constant.int 3
+  %int4 = torch.constant.int 4
+  %size = torch.prim.ListConstruct %int3, %int4 : (!torch.int, !torch.int) -> !torch.list<int>
+  %0 = torch.aten.randint.low %arg0, %arg1, %size, %none, %none, %none, %none : !torch.int, !torch.int, !torch.list<int>, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[3,4],si64>
+  return %0 : !torch.vtensor<[3,4],si64>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.randint.low$dynamic_bounds_f32(
+// CHECK-SAME:        %[[LOW:.*]]: !torch.int, %[[HIGH:.*]]: !torch.int) -> !torch.vtensor<[2,3],si32> {
+// CHECK:           %[[FLOW:.*]] = torch.aten.Float.Scalar %[[LOW]] : !torch.int -> !torch.float
+// CHECK:           %[[FHIGH:.*]] = torch.aten.Float.Scalar %[[HIGH]] : !torch.int -> !torch.float
+// CHECK:           %[[EMPTY:.*]] = torch.aten.empty.memory_format
+// CHECK:           %[[UNIFORM:.*]] = torch.aten.uniform %[[EMPTY]], %[[FLOW]], %[[FHIGH]], %{{.*}} : !torch.vtensor<[2,3],f32>, !torch.float, !torch.float, !torch.none -> !torch.vtensor<[2,3],f32>
+// CHECK:           %[[RESULT:.*]] = torch.aten.to.dtype %[[UNIFORM]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[2,3],f32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,3],si32>
+// CHECK:           return %[[RESULT]] : !torch.vtensor<[2,3],si32>
+func.func @torch.aten.randint.low$dynamic_bounds_f32(%arg0: !torch.int, %arg1: !torch.int) -> !torch.vtensor<[2,3],si32> {
+  %none = torch.constant.none
+  %int2 = torch.constant.int 2
+  %int3 = torch.constant.int 3
+  %size = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
+  %0 = torch.aten.randint.low %arg0, %arg1, %size, %none, %none, %none, %none : !torch.int, !torch.int, !torch.list<int>, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],si32>
+  return %0 : !torch.vtensor<[2,3],si32>
+}
