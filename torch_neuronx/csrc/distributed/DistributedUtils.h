@@ -22,6 +22,9 @@ inline const std::string& OpTypeToString(c10d::OpType op) {
       {c10d::OpType::BROADCAST, "broadcast"},
       {c10d::OpType::REDUCE, "reduce"},
       {c10d::OpType::BARRIER, "barrier"},
+      {c10d::OpType::SEND, "send"},
+      {c10d::OpType::RECV, "recv"},
+      {c10d::OpType::COALESCED, "coalesced"},
   };
   static const std::string kUnknown = "unknown";
   auto it = kMap.find(op);

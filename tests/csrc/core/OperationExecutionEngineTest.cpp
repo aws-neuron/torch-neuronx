@@ -787,7 +787,7 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  // Create a pending_signal op (event/hint — no NRT scheduling)
+  // Create a host op (event/hint — no NRT scheduling)
   auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
   ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kEvent));
   ON_CALL(*kernel, Schedule(_, _, _)).WillByDefault(Return(true));
@@ -800,7 +800,7 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
 
   engine.pending_async_ops_count_.store(1);
 
-  // Empty watermark — doesn't matter for pending_signal ops
+  // Empty watermark — doesn't matter for host ops
   XUCompletionState completed_seqs;
 
   engine.ProcessCompletions(stream.get(), completed_seqs);

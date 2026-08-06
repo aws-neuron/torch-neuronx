@@ -240,21 +240,23 @@ if is_building:
                         build_ext.run(self)
 
                 def _fix_rpath(self, so_path):
-                    """Fix RPATH to find torch libs at runtime.
+                    """Rewrite RPATH for the installed wheel layout.
 
-                    Bazel adds its internal cache paths to RUNPATH, which don't exist
-                    when the wheel is installed. We replace them with:
-                    - $ORIGIN: finds sibling .so files in _mlir_libs/
-                    - $ORIGIN/../../../../../torch_neuronx: source tree layout
-                    - $ORIGIN/../../torch_neuronx: installed wheel layout
-                    - $ORIGIN/../torch/lib: finds torch libs relative to _C.so
-                    - /opt/aws/neuron/lib: finds NRT libs at standard location
+                    patchelf --set-rpath REPLACES the RPATH, so every runtime
+                    dependency dir must be listed. EFA lib is included because _C.so
+                    has a hard DT_NEEDED on libfabric; matches LIBFABRIC_LOCAL_PATH in
+                    bazel/libfabric_extension.bzl.
                     """
+                    efa_lib = os.path.join(
+                        os.environ.get("LIBFABRIC_LOCAL_PATH", "/opt/amazon/efa"),
+                        "lib",
+                    )
                     new_rpath = (
                         "$ORIGIN"
                         ":$ORIGIN/../../../../../torch_neuronx"
                         ":$ORIGIN/../../torch_neuronx"
                         ":$ORIGIN/../torch/lib:/opt/aws/neuron/lib"
+                        f":{efa_lib}"
                     )
 
                     # Check if patchelf is available

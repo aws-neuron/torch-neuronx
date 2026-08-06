@@ -28,3 +28,7 @@ use_repo(torch_extension, "torch")
 # # NRT (Neuron Runtime) local dependency setup
 nrt_extension = use_extension("//bazel:nrt_extension.bzl", "nrt_extension")
 use_repo(nrt_extension, "nrt")
+
+# libfabric (EFA) local dependency setup
+libfabric_extension = use_extension("//bazel:libfabric_extension.bzl", "libfabric_extension")
+use_repo(libfabric_extension, "libfabric")

@@ -220,6 +220,20 @@ inline bool dispatch_debug_enabled() {
   return enabled;
 }
 
+// RDMA-specific logging (libfabric/EFA transport layer)
+#define TORCH_NEURONX_RDMA_ERROR(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::ERROR, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_WARN(...)                                                       \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::WARNING, torch_neuronx::LogCategory::GENERAL, \
+                    "[RDMA]", __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_INFO(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::INFO, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_DEBUG(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::DEBUG, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+
 // Function tracing macros
 #define TORCH_NEURONX_TRACE_FUNCTION() TORCH_NEURONX_DEBUG("TRACE:", __FUNCTION__)
 

@@ -2365,11 +2365,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<torch_neuronx::distributed::NeuronBackend, c10d::Backend,
              c10::intrusive_ptr<torch_neuronx::distributed::NeuronBackend>>(m, "NeuronBackend")
-      .def(py::init([](const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
+      .def(py::init([](const c10::intrusive_ptr<c10d::Store>& store,
+                       const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
                        int size, int global_world_size, py::object lower_callback) {
              return c10::make_intrusive<torch_neuronx::distributed::NeuronBackend>(
-                 options, rank, size, global_world_size, std::move(lower_callback));
+                 store, options, rank, size, global_world_size, std::move(lower_callback));
            }),
-           py::arg("options"), py::arg("rank"), py::arg("size"), py::arg("global_world_size"),
-           py::arg("lower_callback"));
+           py::arg("store"), py::arg("options"), py::arg("rank"), py::arg("size"),
+           py::arg("global_world_size"), py::arg("lower_callback"));
 }

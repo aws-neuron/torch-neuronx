@@ -58,6 +58,8 @@ class NeuronDistributedBase:
         if set_rt_visible_cores:
             core_start_index = get_core_start_index()
             os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
+        # P2P requires SHM transfer disabled for intra-node EFA
+        os.environ.setdefault("FI_EFA_ENABLE_SHM_TRANSFER", "0")
 
     @classmethod
     def _apply_patches(cls, exclude: list[str] | None = None):

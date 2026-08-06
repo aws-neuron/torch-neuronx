@@ -116,10 +116,14 @@ inline NRTReduceOp MapReduceOpToNRT(c10d::ReduceOp op) {
 
 // State for tracking async NRT operation scheduling.
 struct AsyncSchedulingState {
-  SequenceId sequence_id{0};                  // Sequence number from Schedule()
-  bool is_scheduled{false};                   // Whether async scheduling was called (in-flight)
-  bool is_pending_signal{false};              // kSignal event waiting for prior op to complete
+  SequenceId sequence_id{0};  // Sequence number from Schedule()
+  bool is_scheduled{false};   // Whether async scheduling was called (in-flight)
+  // Host-side op pending completion via a completion hook (not NRT device
+  // scheduling). Set for kEvent/kHint/kBarrier/kAlloc/kDealloc; all advance the
+  // stream cursor past themselves once scheduled.
+  bool is_pending_signal{false};
   std::atomic<bool> is_host_inflight{false};  // kHost: submitted to HostWorkerPool
+                                              // (incl. RDMA P2P batches)
 
   void Reset() {
     sequence_id = 0;
