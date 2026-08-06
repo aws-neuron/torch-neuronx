@@ -1,8 +1,99 @@
 """Unary operations."""
 
+import math
+import struct
+
 import torch
 
 from ..operation_registry import register_aten
+
+# Neuron's hardware exp and cos are inaccurate: measured max rel error on trn2
+# in fp32 is 1.0e-05 for exp and 5.9e-05 for cos, vs 8e-08 for sin/tanh (fp32
+# eps is 1.2e-07). That is above the 1.3e-6 tolerance the upstream tests use, so
+# cosh/sinh/tan below don't call the hardware ops directly -- they reduce the
+# argument to a small range and evaluate it accurately there. Both reductions
+# rely on argument reduction, which needs the Cody-Waite constant split below.
+
+
+def _cody_waite_split(constant, parts, keep_bits=8):
+    """Split a constant into ``parts`` fp32 chunks that sum to it, each holding
+    only its top ``keep_bits`` mantissa bits (the rest zeroed).
+
+    Both reductions below rewrite ``x = n*C + r`` and evaluate on the small
+    remainder ``r = x - n*C`` (C = pi for tan, ln2 for exp; the call sites say
+    why). ``r`` is only as accurate as ``n*C``: a single fp32 ``C`` has 24
+    mantissa bits, so for a large integer ``n`` the product ``n*C`` rounds and
+    the low bits of ``r`` -- exactly the bits we care about -- come out wrong.
+
+    Cody-Waite fixes this by splitting ``C = c0 + c1 + ...`` with each ``ci``'s
+    low mantissa bits zeroed. Because a zeroed-low chunk has few significant
+    bits, ``n*ci`` still lands in 24 bits *exactly* (no rounding) for
+    ``|n| < 2**(23 - keep_bits)``; subtracting the chunks one at a time then
+    peels the reduction off in exact steps.
+
+    Worked decimal analogue (3 significant digits, C = 3.14159):
+        split -> c0 = 3.14, c1 = 0.00159   (c0's low digits zeroed)
+        n = 50:  50*C = 157.0795, but 3-digit arithmetic rounds it to 157.
+                 50*c0 = 157.0 and 50*c1 = 0.0795 are each exact, so
+                 (x - 50*c0) - 50*c1 keeps the 0.0795 a lone 50*C would drop.
+    """
+    chunks = []
+    remainder = float(constant)
+    for _ in range(parts - 1):
+        raw = struct.unpack("<I", struct.pack("<f", remainder))[0]
+        raw &= ~((1 << (23 - keep_bits)) - 1) & 0xFFFFFFFF
+        hi = struct.unpack("<f", struct.pack("<I", raw))[0]
+        chunks.append(hi)
+        remainder -= hi
+    chunks.append(remainder)
+    return chunks
+
+
+# The reduction constants are the true math values (from the math library, not
+# hand-typed): tan reduces modulo pi because tan has period pi, and exp reduces
+# modulo ln2 because exp(k*ln2) = 2**k is an exact power of two to scale by.
+# Chunk count = how many exact pieces the largest n needs. tan handles inputs up
+# to ~1e20 (n huge), so pi needs 3 chunks to stay exact; exp's n = round(x/ln2)
+# is at most ~128 over the finite range, so ln2 needs only 2.
+_PI_HI, _PI_MID, _PI_LO = _cody_waite_split(math.pi, 3)
+_LN2_HI, _LN2_LO = _cody_waite_split(math.log(2.0), 2)
+
+# sinh's exp form cancels catastrophically near 0; its Taylor series degrades
+# past 1. Measured at x=1: Taylor 8.0e-08, exp 1.0e-07.
+_SINH_TAYLOR_LIMIT = 1.0
+
+
+def _exp_reduced(x, exp_bias=0):
+    """Accurate exp(x) * 2**exp_bias, sidestepping the hardware exp unit.
+
+    Uses the identity exp(x) = 2**k * exp(r), where k = round(x/ln2) and
+    r = x - k*ln2 with |r| <= ln2/2. The Taylor series exp(r) = 1 + r + r²/2!
+    + r³/3! + ... + r⁷/7! (the polynomial coefficients 1, 1, 1/2, 1/6, 1/24,
+    1/120, 1/720, 1/5040 are literally 1/n! for n = 0..7) converges quickly for
+    small |r|. The 2**k factor is an exact power-of-two scale. This avoids the
+    hardware exp's 1e-05 error, measuring 7e-08 instead.
+
+    exp_bias folds an extra power of two into 2**(k + exp_bias) so that callers
+    can absorb a constant multiplier without an extra pass. cosh/sinh use
+    exp_bias=-2 (i.e. dividing by 4 before the final combine), because at the
+    fp32 edge (x~89.4, cosh still finite on CPU) k = round(89.4/0.693) = 129 and
+    a bare 2**129 overflows fp32 (max is ~2**127.99). Biasing by -2 makes the
+    intermediate 2**127 which fits. The caller reconstructs the full value by
+    multiplying later (see the *2.0 in the cosh/sinh formulas).
+
+    The callers combine exp(|x|)/4 and its reciprocal into cosh/sinh:
+        cosh(|x|) = exp(|x|)/2 + exp(-|x|)/2
+                  = (exp(|x|)/4)*2 + 1/(exp(|x|)/4) * (1/16) * 2
+                  = quarter_e*2 + 0.0625/quarter_e * 2
+    where 0.0625 = 1/16 = (1/4)*(1/4) accounts for both the /4 in quarter_e and
+    the /4 in the reciprocal's denominator. The same logic gives sinh its sign.
+    """
+    k = torch.round(x / math.log(2.0))
+    r = (x - k * _LN2_HI) - k * _LN2_LO
+    poly = 1.0 + r * (
+        1.0 + r * (0.5 + r * (1 / 6 + r * (1 / 24 + r * (1 / 120 + r * (1 / 720 + r / 5040)))))
+    )
+    return poly * torch.pow(2.0, k + exp_bias)
 
 
 @register_aten(["aten::abs", "aten::abs.out"])
@@ -45,12 +136,12 @@ def torch_sin(x, out=None):
     return torch.sin(x)
 
 
-def _validate_acos(x, out=None):
+def _validate_float_promoting_out(x, out=None):
     """Reject an out= tensor whose dtype can't hold the float result.
 
     Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
     dispatch path skips (it would otherwise silently cast the result into out).
-    acos promotes integer/bool inputs to the default float dtype, so the
+    These ops promote integer/bool inputs to the default float dtype, so the
     expected out dtype is the input dtype only when it is already floating.
     """
     expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
@@ -61,134 +152,134 @@ def _validate_acos(x, out=None):
 
 
 @register_aten(
+    ["aten::cosh", "aten::cosh.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_cosh(x, out=None):
+    """Hyperbolic cosine as (e**x + e**-x)/2 over the reduced exp.
+
+    Measured max rel error 1.1e-07 in fp32 vs 9.3e-06 for the hardware cosh.
+    fp16/bf16 keep the hardware op: the polynomial's multiply-adds accumulate
+    more error in an 8-11 bit mantissa (1.5e-02 bf16) than the single op does.
+    Non-finite inputs also defer to it, since the reduction turns -inf into nan.
+    """
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    if x.dtype not in (torch.float32, torch.float64):
+        return torch.cosh(x)
+    # cosh is even, so reduce |x|: that keeps k positive and leaves overflow as
+    # the only failure direction (2**k underflowing to 0 for very negative x
+    # would make the reciprocal term inf and the product nan).
+    quarter_e = _exp_reduced(x.abs(), exp_bias=-2)
+    computed = (quarter_e + 0.0625 / quarter_e) * 2.0
+    return torch.where(torch.isfinite(x), computed, torch.cosh(x))
+
+
+@register_aten(
+    ["aten::sinh", "aten::sinh.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_sinh(x, out=None):
+    """Hyperbolic sine: Taylor near 0, else (e**x - e**-x)/2 over the reduced exp.
+
+    The exp form cancels catastrophically as x approaches 0 (4.6e-02 at 1e-6),
+    so small inputs use the series instead. Measured max rel error 1.0e-07 in
+    fp32 vs 1.7e-05 for the hardware sinh. fp16/bf16 and non-finite inputs keep
+    the hardware op, for the reasons in torch_cosh.
+    """
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    if x.dtype not in (torch.float32, torch.float64):
+        return torch.sinh(x)
+    # sinh is odd, so take the magnitude from |x| and restore the sign, for the
+    # same reason as torch_cosh. The series is already odd in x.
+    quarter_e = _exp_reduced(x.abs(), exp_bias=-2)
+    x2 = x * x
+    series = x * (1.0 + x2 * (1 / 6 + x2 * (1 / 120 + x2 * (1 / 5040 + x2 / 362880))))
+    large = torch.sign(x) * ((quarter_e - 0.0625 / quarter_e) * 2.0)
+    computed = torch.where(x.abs() < _SINH_TAYLOR_LIMIT, series, large)
+    return torch.where(torch.isfinite(x), computed, torch.sinh(x))
+
+
+@register_aten(
+    ["aten::tan", "aten::tan.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_tan(x, out=None):
+    """Tangent with the argument reduced into (-pi/2, pi/2) first.
+
+    The hardware reduces x mod pi in single precision, so error grows with |x|:
+    8.1e-02 over [-pi, pi] and 4.2e-01 over [1e3, 1e5]. Reducing first keeps it
+    at 3.3e-06 / 4.6e-04. The reduction runs in fp32 (upcasting fp16/bf16) so
+    the split-pi subtraction stays exact; casting back matches torch's own fp16
+    tan on every measured sample.
+    """
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    orig_dtype = x.dtype
+    xr = x.to(torch.float32) if orig_dtype in (torch.float16, torch.bfloat16) else x
+    n = torch.round(xr / math.pi)
+    r = ((xr - n * _PI_HI) - n * _PI_MID) - n * _PI_LO
+    return torch.tan(r).to(orig_dtype)
+
+
+@register_aten(
     ["aten::acos", "aten::acos.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_acos,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acos(x, out=None):
     """Inverse cosine (arccos) — elementwise transcendental."""
     return torch.acos(x)
 
 
-def _validate_acosh(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    acosh promotes integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::acosh", "aten::acosh.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_acosh,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acosh(x, out=None):
     """Inverse hyperbolic cosine — elementwise transcendental."""
     return torch.acosh(x)
 
 
-def _validate_asin(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    asin promotes integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::asin", "aten::asin.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_asin,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asin(x, out=None):
     """Inverse sine (arcsin) — elementwise transcendental."""
     return torch.asin(x)
 
 
-def _validate_asinh(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    asinh promotes integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::asinh", "aten::asinh.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_asinh,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asinh(x, out=None):
     """Inverse hyperbolic sine — elementwise transcendental."""
     return torch.asinh(x)
 
 
-def _validate_atan(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    atan promotes integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::atan", "aten::atan.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_atan,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atan(x, out=None):
     """Inverse tangent (arctan) — elementwise transcendental."""
     return torch.atan(x)
 
 
-def _validate_atanh(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    atanh promotes integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::atanh", "aten::atanh.out"],
     output_params=("out",),
-    validate_static_inputs=_validate_atanh,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atanh(x, out=None):
     """Inverse hyperbolic tangent — elementwise transcendental."""
