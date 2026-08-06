@@ -475,3 +475,61 @@ class TestForeachScalarListCompile:
         expected = aten._foreach_lerp.ScalarList(starts, ends, _SCALARS)
         for r, e in zip(compiled, expected, strict=True):
             torch.testing.assert_close(r, e, atol=1e-6, rtol=1e-6, equal_nan=True)
+
+
+class TestForeachAddcInplaceTensorCompile:
+    """``torch.compile(aot_eager)`` traces the in-place ``_.Tensor`` overloads.
+
+    ``_foreach_addc{div,mul}_.Tensor`` mutate a ``Tensor(a!)[] self`` in place
+    with a ``Tensor scalars`` argument. AOTAutograd's
+    ``run_functionalized_fw_and_collect_metadata`` runs the op under
+    FunctionalTensorMode, which bypasses the ``fake_impls.op_implementations_dict``
+    override and executes the CompositeExplicitAutograd meta kernel — whose
+    ``scalars.device == cpu`` assert fires on the meta scalar tensor:
+
+        RuntimeError: Expected scalars to be on CPU, got meta instead.
+
+    The canonical ``torch.library.register_fake`` (registered in
+    ``decompositions.py``) is honored by functionalization, so metadata
+    collection succeeds and the decomposition then lowers the math. Removing
+    that ``register_fake`` regresses these tests. (The functional ``.Tensor``
+    sibling is covered by ``test_torch_compile_traces_through_functional``.)
+    """
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            pytest.param(aten._foreach_addcdiv_.Tensor, id="_foreach_addcdiv_.Tensor"),
+            pytest.param(aten._foreach_addcmul_.Tensor, id="_foreach_addcmul_.Tensor"),
+        ],
+    )
+    def test_inplace_traces_and_matches_eager(self, op):
+        def fn(a0, a1, b0, b1, c0, c1, s):
+            self_list = [a0, a1]
+            op(self_list, [b0, b1], [c0, c1], s)
+            return self_list
+
+        torch.manual_seed(0)
+        base = (
+            torch.randn(4, 4),
+            torch.randn(4, 4),
+            torch.randn(4, 4),
+            torch.randn(4, 4),
+            torch.randn(4, 4) + 2.0,  # avoid div-by-zero for addcdiv
+            torch.randn(4, 4) + 2.0,
+            torch.tensor([0.5, 0.7]),
+        )
+        # Eager reference: mutate a clone of the two ``self`` tensors in place.
+        ref = [base[0].clone(), base[1].clone()]
+        op(ref, [base[2], base[3]], [base[4], base[5]], base[6])
+
+        # Compiled path: fresh clones so we compare a clean run.
+        compiled_inputs = (base[0].clone(), base[1].clone(), *base[2:])
+        out = torch.compile(fn, backend="aot_eager", fullgraph=True)(*compiled_inputs)
+        for r, e in zip(out, ref, strict=True):
+            torch.testing.assert_close(r, e)
+
+    def test_inplace_fake_registered(self):
+        """The canonical fake overrides exist (guards accidental deletion)."""
+        assert hasattr(decompositions, "_foreach_addcdiv_inplace_tensor_fake")
+        assert hasattr(decompositions, "_foreach_addcmul_inplace_tensor_fake")

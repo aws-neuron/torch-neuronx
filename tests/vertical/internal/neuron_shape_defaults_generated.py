@@ -473,7 +473,7 @@ def register_all_defaults(r):
         )
         r(
             f"aten::_foreach_pow{suffix}.ScalarList",
-            {"self": (256, 4096), "exponents": [2.0] * _N},
+            {"self": (256, 4096), "exponent": [2.0] * _N},
             source="builtin",
         )
     for suffix in ["", "_"]:
