@@ -100,7 +100,9 @@ int GetTargetDeviceId(const std::vector<at::Tensor>& inputs,
   // Check all output tensors
   for (const auto& output : outputs) {
     c10::Device device = output.storage().device();
-    TORCH_CHECK(IsNeuronDevice(device), "Output storage is not on Neuron device");
+    TORCH_CHECK(IsNeuronDevice(device),
+                "Expected all tensors to be on the same device, but the output tensor is on ",
+                device.str(), " and the operation was dispatched to the Neuron device");
     int current_device = device.index();
     if (!device_found) {
       device_id = current_device;
