@@ -9,6 +9,7 @@ This document provides an overview of the different environment variables availa
 | `TORCH_NEURONX_DEBUG_DIR` | str | `/tmp/neuron_backend_<uuid>` | Directory where compilation artifacts (FX graphs, StableHLO IR, NEFF files) are saved. |
 | `TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS` | bool | `False` | When `1`, keeps compilation artifacts after execution. Useful for debugging via IR inspection. |
 | `TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION` | bool | `False` | When `1`, disables CPU fallback on Neuron execution failure. Fails fast instead. |
+| `TORCH_NEURONX_COMPLEX_DECOMPOSE` | bool | `False` | Enables framework decomposition of complex operations before lowering. Requires PyTorch 2.13 or newer. When disabled, verified native complex operations use compiler lowering and other operations follow the existing fallback policy. |
 | `TORCH_NEURONX_RETAIN_DEVICE_MODE` | bool | `False` | When `1`, outputs retain original device placement instead of Neuron device. |
 | `TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY` | bool | `False` | When `1`, raises error if CPU tensors are passed as inputs instead of auto-copying to Neuron. |
 | `TORCH_NEURONX_ENABLE_LAZY_ALLOC` | bool | `False` | When `1`, defers NRT tensor allocation to execution time; otherwise allocates eagerly. |

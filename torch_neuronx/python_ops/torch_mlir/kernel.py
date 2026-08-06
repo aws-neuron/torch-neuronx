@@ -376,7 +376,13 @@ class TorchMlirKernel(BaseNeuronKernel):
         self._output_dtype_cache[cache_key] = result
         return result
 
-    def _generate_fx_graph(self, fake_inputs: tuple, compilation_kwargs: dict, torch_fn=None):
+    def _generate_fx_graph(
+        self,
+        fake_inputs: tuple,
+        compilation_kwargs: dict,
+        torch_fn=None,
+        use_complex_decomposition: bool = False,
+    ):
         """Generate fx graph using meta tensors.
 
         Args:
@@ -451,6 +457,14 @@ class TorchMlirKernel(BaseNeuronKernel):
 
             # NKI functionalization inserts non-functional copy_
             decomposed_gm = FunctionalizeCopyInplacePass()(decomposed_gm).graph_module
+
+        if use_complex_decomposition:
+            from torch_neuronx.neuron_dynamo_backend.fx.passes.complex_decomposition import (
+                eager_decompose_complex,
+            )
+
+            decomposed_gm = eager_decompose_complex(decomposed_gm, flat_args)
+
         return decomposed_gm
 
     def _generate_hlo(
@@ -458,6 +472,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         inputs: tuple,
         kwargs: dict,
         context: ExecutionContext | None = None,
+        use_complex_decomposition: bool = False,
     ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple, dict]:
         """Generate HLO from PyTorch function.
 
@@ -526,7 +541,12 @@ class TorchMlirKernel(BaseNeuronKernel):
                     self.torch_fn, inputs, set(packed_output_positions)
                 )
 
-        decomposed_gm = self._generate_fx_graph(fake_inputs, compilation_kwargs, torch_fn=trace_fn)
+        decomposed_gm = self._generate_fx_graph(
+            fake_inputs,
+            compilation_kwargs,
+            torch_fn=trace_fn,
+            use_complex_decomposition=use_complex_decomposition,
+        )
 
         # Capture original output nodes before any optimization
         original_output_node = list(decomposed_gm.graph.find_nodes(op="output"))[-1]
@@ -1099,6 +1119,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         context: ExecutionContext | None = None,
         *,
         dispatch_cache_key: str | None = None,
+        use_complex_decomposition: bool = False,
     ) -> tuple[bytes, list[int], list[int], tuple, tuple, str]:
         """Get HLO from cache or compile if needed.
 
@@ -1155,7 +1176,12 @@ class TorchMlirKernel(BaseNeuronKernel):
                         # Check existence (cheap) — another process may have written while we waited
                         backend = _C
                         if not backend._exists_hlo_cache(cache_key + "_meta"):
-                            result = self._generate_hlo(inputs, kwargs, context)
+                            result = self._generate_hlo(
+                                inputs,
+                                kwargs,
+                                context,
+                                use_complex_decomposition=use_complex_decomposition,
+                            )
                             # Drop cast_spec (index 2) for cache storage
                             disk_entry = result[:2] + result[3:]
                             _hlo_cache_put(cache_key, *disk_entry)
@@ -1165,7 +1191,12 @@ class TorchMlirKernel(BaseNeuronKernel):
                         disk_entry = _hlo_cache_get(cache_key)
                 else:
                     # Cache disabled — generate directly without coordination
-                    result = self._generate_hlo(inputs, kwargs, context)
+                    result = self._generate_hlo(
+                        inputs,
+                        kwargs,
+                        context,
+                        use_complex_decomposition=use_complex_decomposition,
+                    )
                     disk_entry = result[:2] + result[3:]
 
             (
@@ -1442,6 +1473,10 @@ class TorchMlirKernel(BaseNeuronKernel):
                 ctx_kwargs = dict(original_kwargs) if original_kwargs else kwargs.copy()
                 context = ExecutionContext(original_inputs=ctx_inputs, original_kwargs=ctx_kwargs)
 
+            use_complex_decomposition = getattr(
+                _tnx._dispatch_context, "use_complex_decomposition", False
+            )
+
             # C++ PreprocessArgs already did scalar→tensor, dtype conversion,
             # contiguous.  Just set static_argnums and use args directly.
             self.arg_processor._static_argnums = self._normalize_static_argnums(len(args))
@@ -1463,6 +1498,7 @@ class TorchMlirKernel(BaseNeuronKernel):
                 processed_kwargs,
                 context,
                 dispatch_cache_key=dispatch_cache_key,
+                use_complex_decomposition=use_complex_decomposition,
             )
 
             # ── Early exit for zero-sized outputs ──

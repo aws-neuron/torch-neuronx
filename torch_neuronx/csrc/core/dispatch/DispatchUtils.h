@@ -132,6 +132,9 @@ bool HasEmptyOutputTensor(const std::vector<c10::IValue>& args, const c10::Funct
  */
 bool HasComplexInput(const std::vector<c10::IValue>& args);
 
+/** Read TORCH_NEURONX_COMPLEX_DECOMPOSE on each call (default: false). */
+bool ComplexDecompositionEnabled();
+
 /**
  * Check if any *non-output* tensor argument has a complex dtype.
  * Skips tensors at schema positions whose AliasInfo indicates a write
@@ -154,6 +157,10 @@ bool HasComplexNonOutputInput(const std::vector<c10::IValue>& args,
               " received a complex-dtype input; complex dtypes are not supported natively "
               "on Neuron. Unset the env var to enable CPU fallback.");
 }
+
+bool HasNativeComplexLowering(const std::string& lookup_name);
+
+bool ShouldUseComplexDecomposition(bool has_lower_func);
 
 // ═══════════════════════════════════════════════════════════════
 //  64-bit Dtype Detection and Downcasting

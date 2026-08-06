@@ -255,7 +255,8 @@ class NeuronDispatcher {
    */
   std::shared_ptr<DispatchCacheEntry> GetOrLowerOperation(
       const std::string& cache_key, const OpRegistration& reg, const std::vector<c10::IValue>& args,
-      const std::vector<c10::IValue>& original_args, const c10::FunctionSchema& schema);
+      const std::vector<c10::IValue>& original_args, const c10::FunctionSchema& schema,
+      bool use_complex_decomposition = false);
 
   // ════════════════════════════════════════════════════
   //  Step 7: Output processing
@@ -416,7 +417,8 @@ class NeuronDispatcher {
       const c10::FunctionSchema& schema, const OpRegistration& reg, NeuronDispatcher& dispatcher,
       at::neuron::CPUFallbackContext fallback_ctx,
       const std::vector<c10::IValue>& original_args = {},
-      std::shared_ptr<DispatchCacheEntry>* out_entry = nullptr);
+      std::shared_ptr<DispatchCacheEntry>* out_entry = nullptr,
+      bool use_complex_decomposition = false);
 
   /**
    * Casting path: handles dtype downcasting/upcasting.
@@ -428,7 +430,8 @@ class NeuronDispatcher {
                                   torch::jit::Stack* stack, std::vector<c10::IValue>& args,
                                   const c10::FunctionSchema& schema, const OpRegistration& reg,
                                   NeuronDispatcher& dispatcher, const std::string& op_name,
-                                  const std::string& cache_key, bool skip_contiguous = false);
+                                  const std::string& cache_key, bool skip_contiguous = false,
+                                  bool use_complex_decomposition = false);
 
   /**
    * Try to handle an op with empty tensor inputs.

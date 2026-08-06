@@ -37,10 +37,16 @@ namespace dispatch {
 // threading.local context.  Guarantees cleanup on all exit paths.
 struct DispatchContextGuard {
   py::object ctx_;
-  DispatchContextGuard(py::object ctx, const std::string& key) : ctx_(std::move(ctx)) {
+  DispatchContextGuard(py::object ctx, const std::string& key,
+                       bool use_complex_decomposition = false)
+      : ctx_(std::move(ctx)) {
     ctx_.attr("cache_key") = py::cast(key);
+    ctx_.attr("use_complex_decomposition") = py::bool_(use_complex_decomposition);
   }
-  ~DispatchContextGuard() { ctx_.attr("cache_key") = py::none(); }
+  ~DispatchContextGuard() {
+    ctx_.attr("cache_key") = py::none();
+    ctx_.attr("use_complex_decomposition") = py::bool_(false);
+  }
 };
 
 // Flag: when set, ops that cannot run on Neuron raise an error instead of
@@ -68,7 +74,7 @@ void NeuronDispatcher::Cleanup() {
   op_registrations_.clear();
   dispatch_lib_.reset();
   dispatch_cache_.clear();
-  // Release cached Python callable before interpreter finalization.
+  // Release cached Python callables before interpreter finalization.
   if (g_hierarchy_fn) {
     if (Py_IsInitialized()) {
       py::gil_scoped_acquire gil;
@@ -1118,19 +1124,23 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
     return;
   }
 
-  // Complex dtype allowlist: only ops verified to lower and execute correctly
-  // with complex tensors are allowed through. All others fall back to CPU.
-  // With TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1, raise only when
-  // a complex tensor is at an input position (not just an out= tensor).
+  // Complex dtype routing:
+  //   - decomposition enabled: decompose before lowering;
+  //   - decomposition disabled: use verified native lowerings, otherwise fallback.
   if (HasComplexInput(args)) {
-    static const std::unordered_set<std::string> kComplexSupportedOps = {
-        "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_.Tensor",
-        "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
-    };
-    if (kComplexSupportedOps.find(lookup_name) == kComplexSupportedOps.end()) {
+    if (ShouldUseComplexDecomposition(!reg.lower_func.is_none())) {
+      std::string decomp_cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
+      decomp_cache_key += ":complex_decomp";
+      DispatchWithCasting(op, dispatch_keys, stack, args, schema, reg, dispatcher, op_name,
+                          decomp_cache_key, false, true);
+      return;
+    }
+
+    if (!HasNativeComplexLowering(lookup_name)) {
       if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
         RaiseComplexFallbackDisabled(op_name);
       }
+
       TORCH_NEURONX_DISPATCH_DEBUG(
           "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
           " op=", op_name);
@@ -1897,13 +1907,14 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack, std::vector<c10::IValue>& args,
     const c10::FunctionSchema& schema, const OpRegistration& reg, NeuronDispatcher& dispatcher,
     at::neuron::CPUFallbackContext fallback_ctx, const std::vector<c10::IValue>& original_args,
-    std::shared_ptr<DispatchCacheEntry>* out_entry) {
+    std::shared_ptr<DispatchCacheEntry>* out_entry, bool use_complex_decomposition) {
   TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] using cache_key", " op=", op_name,
                                " cache_key=", cache_key);
 
   LogArgs("[DispatchCore]", args);
 
-  auto entry = dispatcher.GetOrLowerOperation(cache_key, reg, args, original_args, schema);
+  auto entry = dispatcher.GetOrLowerOperation(cache_key, reg, args, original_args, schema,
+                                              use_complex_decomposition);
 
   if (out_entry) *out_entry = entry;
 
@@ -2027,7 +2038,7 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
                                            const c10::FunctionSchema& schema,
                                            const OpRegistration& reg, NeuronDispatcher& dispatcher,
                                            const std::string& op_name, const std::string& cache_key,
-                                           bool skip_contiguous) {
+                                           bool skip_contiguous, bool use_complex_decomposition) {
   try {
     // ── 1. Snapshot out tensors before any mutation ──
     auto original_out_tensors = SnapshotOutTensors(schema, args);
@@ -2076,9 +2087,9 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     // downcasted args (for HLO compilation) and original args (for dtype inference)
     // to the Python lower_func in a single GIL acquisition.
     std::shared_ptr<DispatchCacheEntry> cache_entry;
-    auto exec_outputs =
-        DispatchCore(op_name, cache_key, op, dispatch_keys, stack, args, schema, reg, dispatcher,
-                     std::move(fallback_ctx), original_args, &cache_entry);
+    auto exec_outputs = DispatchCore(op_name, cache_key, op, dispatch_keys, stack, args, schema,
+                                     reg, dispatcher, std::move(fallback_ctx), original_args,
+                                     &cache_entry, use_complex_decomposition);
 
     if (exec_outputs.empty()) {
       // DispatchCore already handled fallback and pushed to stack
@@ -2112,7 +2123,8 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
 
 std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
     const std::string& cache_key, const OpRegistration& reg, const std::vector<c10::IValue>& args,
-    const std::vector<c10::IValue>& original_args, const c10::FunctionSchema& schema) {
+    const std::vector<c10::IValue>& original_args, const c10::FunctionSchema& schema,
+    bool use_complex_decomposition) {
   TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] looking up cache", " cache_key=", cache_key,
                                " skip_cache=", reg.skip_cache);
 
@@ -2153,7 +2165,8 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
   // Set the dispatch cache key on Python threading.local so the lowering code
   // can reuse it.  RAII guard guarantees cleanup on all exit paths.
   py::module_ tnx = py::module_::import("torch_neuronx");
-  DispatchContextGuard dispatch_ctx_guard(tnx.attr("_dispatch_context"), cache_key);
+  DispatchContextGuard dispatch_ctx_guard(tnx.attr("_dispatch_context"), cache_key,
+                                          use_complex_decomposition);
 
   TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] calling Python lower_func",
                                " cache_key=", cache_key, " num_positional=", py_args.size(),

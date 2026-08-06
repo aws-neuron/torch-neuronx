@@ -89,6 +89,14 @@ bool HasComplexInput(const std::vector<c10::IValue>& args) {
   return found;
 }
 
+bool ComplexDecompositionEnabled() {
+  const char* value = std::getenv("TORCH_NEURONX_COMPLEX_DECOMPOSE");
+  if (value == nullptr) return false;
+  std::string normalized(value);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+  return normalized == "1" || normalized == "true" || normalized == "yes";
+}
+
 bool HasComplexNonOutputInput(const std::vector<c10::IValue>& args,
                               const c10::FunctionSchema& schema) {
   // Filter out out= params and delegate to HasComplexInput.
@@ -101,6 +109,22 @@ bool HasComplexNonOutputInput(const std::vector<c10::IValue>& args,
     inputs_only.push_back(args[i]);
   }
   return HasComplexInput(inputs_only);
+}
+
+static const std::unordered_set<std::string>& NativeComplexOpsAllowlist() {
+  static const std::unordered_set<std::string> kOps = {
+      "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_.Tensor",
+      "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
+  };
+  return kOps;
+}
+
+bool HasNativeComplexLowering(const std::string& lookup_name) {
+  return NativeComplexOpsAllowlist().count(lookup_name) > 0;
+}
+
+bool ShouldUseComplexDecomposition(bool has_lower_func) {
+  return ComplexDecompositionEnabled() && has_lower_func;
 }
 
 // ═══════════════════════════════════════════════════════════════

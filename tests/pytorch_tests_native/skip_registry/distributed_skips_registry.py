@@ -222,7 +222,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason=("Neuron does not support " "all_to_all for world_size 2 and odd " "split sizes"),
+        reason=("Neuron does not support all_to_all for world_size 2 and odd split sizes"),
         tests=[
             "test_c10d_spawn_nccl.py::TestDistributedNNFunctionsNccl::test_all_gather",
             "test_c10d_spawn_nccl.py::TestDistributedNNFunctionsNccl::test_all_to_all",
