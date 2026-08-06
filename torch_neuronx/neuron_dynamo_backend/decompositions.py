@@ -6577,6 +6577,21 @@ for _op in (
     _fake_impls.op_implementations_dict[_op] = _foreach_addc_tensor_fake_impl
 
 
+# For the in-place ``_.Tensor`` overloads only: the op_implementations_dict
+# entry above is FakeTensorMode-only, but AOTAutograd's functionalization
+# metadata pass bypasses it and runs the meta kernel (``scalars.device == cpu``
+# assert). A canonical ``register_fake`` is honored there; the decomposition
+# below still lowers the math.
+@_register_fake("aten::_foreach_addcdiv_.Tensor")
+def _foreach_addcdiv_inplace_tensor_fake(self, tensor1, tensor2, scalars):
+    return None
+
+
+@_register_fake("aten::_foreach_addcmul_.Tensor")
+def _foreach_addcmul_inplace_tensor_fake(self, tensor1, tensor2, scalars):
+    return None
+
+
 def _foreach_addcdiv_tensor_decomp(self, tensor1, tensor2, scalars):
     """``self_i + scalars[i] * (tensor1_i / tensor2_i)`` per index."""
     return [
