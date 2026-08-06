@@ -74,6 +74,8 @@ struct NeuronGuardImpl final : public c10::impl::DeviceGuardImplInterface {
         (1ULL << c10::kIndex_Double) |    // float64 (autocast to float32)
         (1ULL << c10::kIndex_Half) |      // float16
         (1ULL << c10::kIndex_BFloat16) |  // bfloat16
+        // (1ULL << c10::kIndex_ComplexFloat) |  // will be enabled with coverage
+        // (1ULL << c10::kIndex_ComplexDouble) | // will be enabled with coverage
         (1ULL << c10::kIndex_Bool);
     return cap;
   }

@@ -173,7 +173,7 @@ BLOCKLIST: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "TorchScript/JIT tests — legacy JIT compiler," " not used by PrivateUse1 eager backends"
+            "TorchScript/JIT tests — legacy JIT compiler, not used by PrivateUse1 eager backends"
         ),
         tests=[
             "jit",
@@ -367,7 +367,7 @@ BLOCKLIST: list[SkipGroup] = [
     # PENDING ONBOARDING and UNSUPPORTED FEATURES
     # =========================================================================
     SkipGroup(
-        reason="TODO: Directories/files pending onboarding, " "ensure to remove when onboarded.",
+        reason="TODO: Directories/files pending onboarding, ensure to remove when onboarded.",
         tests=[
             "distributed/test_composability.py",
         ],
@@ -375,9 +375,14 @@ BLOCKLIST: list[SkipGroup] = [
     SkipGroup(
         reason="Not supported in Beta — to be onboarded in a future release",
         tests=[
-            "functorch",
             "complex_tensor",
             "test_complex.py",
+        ],
+    ),
+    SkipGroup(
+        reason="Not supported in Beta — to be onboarded in a future release",
+        tests=[
+            "functorch",
             "custom_operator",
             "distributions",
             "higher_order_ops",

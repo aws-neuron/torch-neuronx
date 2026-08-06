@@ -384,6 +384,12 @@ def neuron_backend_fx_compiler(
         logger.debug("Trivial graph detected (graph break artifact), using passthrough")
         return make_boxed_func(gm.forward)
 
+    from torch_neuronx.neuron_dynamo_backend.fx.passes.complex_decomposition import (
+        maybe_decompose_complex,
+    )
+
+    gm = maybe_decompose_complex(gm, example_inputs)
+
     model_name = _resolve_model_name(options)
     pre_processing_analysis_info = (
         pre_processing_analysis_info if pre_processing_analysis_info else {}

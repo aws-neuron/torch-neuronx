@@ -182,7 +182,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Needs investigation: Skipping as these tests segfault causing " "pytest worker crashes"
+            "Needs investigation: Skipping as these tests segfault causing pytest worker crashes"
         ),
         tests=s.ATEN_SEGFAULT,
     ),
@@ -221,9 +221,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         tests=s.ATEN_FOREACH_WORKER_CRASH,
     ),
     SkipGroup(
-        reason=(
-            "Test hangs indefinitely - worker never reports back," " causing workload timeout."
-        ),
+        reason=("Test hangs indefinitely - worker never reports back, causing workload timeout."),
         tests=[
             "test_binary_op_list_error_cases__foreach_div_neuron_uint8",
             "test_comparison_ops_type_promotion_and_broadcasting_neuron_uint8_float16",

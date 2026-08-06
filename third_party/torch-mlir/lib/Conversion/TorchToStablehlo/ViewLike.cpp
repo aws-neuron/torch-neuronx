@@ -658,6 +658,79 @@ LogicalResult ConvertAtenOp<AtenViewAsRealOp>::matchAndRewrite(
   return success();
 }
 
+// aten.real: extract real part from complex tensor
+template <>
+LogicalResult ConvertAtenOp<AtenRealOp>::matchAndRewrite(
+    AtenRealOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto inputType = dyn_cast<RankedTensorType>(adaptor.getSelf().getType());
+  if (!inputType)
+    return op.emitError("only ranked tensor types are supported");
+
+  if (!isa<ComplexType>(inputType.getElementType()))
+    return op.emitError("input must have complex element type");
+
+  auto resultType =
+      dyn_cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  if (!resultType)
+    return op.emitError("failed to convert result type");
+
+  auto realResult =
+      stablehlo::RealOp::create(rewriter, op.getLoc(), resultType,
+                                adaptor.getSelf());
+  rewriter.replaceOp(op, realResult);
+  return success();
+}
+
+// aten.imag: extract imaginary part from complex tensor
+template <>
+LogicalResult ConvertAtenOp<AtenImagOp>::matchAndRewrite(
+    AtenImagOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto inputType = dyn_cast<RankedTensorType>(adaptor.getSelf().getType());
+  if (!inputType)
+    return op.emitError("only ranked tensor types are supported");
+
+  if (!isa<ComplexType>(inputType.getElementType()))
+    return op.emitError("input must have complex element type");
+
+  auto resultType =
+      dyn_cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  if (!resultType)
+    return op.emitError("failed to convert result type");
+
+  auto imagResult =
+      stablehlo::ImagOp::create(rewriter, op.getLoc(), resultType,
+                                adaptor.getSelf());
+  rewriter.replaceOp(op, imagResult);
+  return success();
+}
+
+// aten.complex: construct complex tensor from real and imaginary parts
+template <>
+LogicalResult ConvertAtenOp<AtenComplexOp>::matchAndRewrite(
+    AtenComplexOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto realType = dyn_cast<RankedTensorType>(adaptor.getReal().getType());
+  auto imagType = dyn_cast<RankedTensorType>(adaptor.getImag().getType());
+  if (!realType || !imagType)
+    return op.emitError("only ranked tensor types are supported");
+
+  auto resultType =
+      dyn_cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  if (!resultType)
+    return op.emitError("failed to convert result type");
+
+  if (!isa<ComplexType>(resultType.getElementType()))
+    return op.emitError("result must have complex element type");
+
+  auto complexResult =
+      stablehlo::ComplexOp::create(rewriter, op.getLoc(), resultType,
+                                   adaptor.getReal(), adaptor.getImag());
+  rewriter.replaceOp(op, complexResult);
+  return success();
+}
+
 template <>
 LogicalResult ConvertAtenOp<AtenDiagonalOp>::matchAndRewrite(
     AtenDiagonalOp op, OpAdaptor adaptor,
@@ -835,6 +908,9 @@ void mlir::torch::torch_to_stablehlo::populateViewLikeOpPatternsAndLegality(
   INSERT_ATENOP_PATTERN(AtenUnsqueezeOp);
   INSERT_ATENOP_PATTERN(AtenViewAsComplexOp);
   INSERT_ATENOP_PATTERN(AtenViewAsRealOp);
+  INSERT_ATENOP_PATTERN(AtenRealOp);
+  INSERT_ATENOP_PATTERN(AtenImagOp);
+  INSERT_ATENOP_PATTERN(AtenComplexOp);
   INSERT_ATENOP_PATTERN(AtenDiagonalOp);
   INSERT_ATENOP_PATTERN(PrimsCollapseOp);
   INSERT_ATENOP_PATTERN(PrimsSplitDimOp);
