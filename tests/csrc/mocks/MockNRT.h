@@ -70,6 +70,7 @@ class MockNRT {
   MOCK_METHOD(NRT_STATUS, nrt_inspect_config_set_neff_cache_dir,
               (nrt_inspect_config_t*, const char*));
   MOCK_METHOD(NRT_STATUS, nrt_inspect_begin_with_options, (nrt_inspect_config_t*));
+  MOCK_METHOD(NRT_STATUS, nrt_inspect_export, (uint32_t));
   MOCK_METHOD(NRT_STATUS, nrt_inspect_stop, ());
   // Barrier
   MOCK_METHOD(NRT_STATUS, nrt_barrier, (int32_t, uint32_t, uint32_t));

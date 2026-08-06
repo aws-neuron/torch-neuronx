@@ -521,6 +521,25 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "ContinuousExporterTest",
+    srcs = [
+        "profiler/ContinuousExporterTest.cpp",
+        "mocks/MockNRT.cpp",
+        "mocks/MockNRT.h",
+    ],
+    size = "small",
+    timeout = "short",
+    copts = ["-I.", "-fvisibility=default"],
+    deps = [
+        "//:profiler_test_lib",
+        "@nrt//:nrt",
+        "@torch//:headers",
+        "@torch//:libc10",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # SessionTest - Unit tests for NeuronActivityProfilerSession
 # Uses profiler_test_lib to avoid heavy runtime dependencies
 cc_test(

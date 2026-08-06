@@ -83,6 +83,7 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/TypeUtils.h"
 // Internal operations
 #include "torch_neuronx/csrc/ops/InternalOps.h"
+#include "torch_neuronx/csrc/profiler/ContinuousExporter.h"
 #include "torch_neuronx/csrc/profiler/Registration.h"
 
 // Neuron C++ Dispatcher
@@ -2214,6 +2215,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "_nrt_inspect_precache_enable", []() { at::neuron::nrt::PrecacheEnable(); },
       "Enable pre-caching of profile node info during wait iterations");
+
+  m.def(
+      "_nrt_inspect_export_now",
+      [](uint32_t mask) -> int {
+        // Pure passthrough: returns nrt_inspect_export's NRT_STATUS verbatim.
+        return static_cast<int>(at::neuron::exportNow(mask));
+      },
+      // The drain blocks on file I/O; release the GIL so only the calling
+      // thread waits.
+      py::call_guard<py::gil_scoped_release>(), py::arg("mask"),
+      "Synchronously export selected NRT inspect trace data; returns the NRT status");
+
+  m.def(
+      "_nrt_inspect_request_export",
+      [](uint32_t mask) -> int { return static_cast<int>(at::neuron::requestActiveExport(mask)); },
+      py::arg("mask"),
+      "Request an asynchronous NRT inspect export; returns a frontend ExportStatus");
 
   // Single cleanup capsule — explicit ordering, no dependency on attribute destruction order
   auto cleanup_capsule = py::capsule(module_cleanup_func);

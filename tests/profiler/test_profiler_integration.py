@@ -16,6 +16,7 @@ Tests are split into three groups:
 import json
 import os
 import shutil
+import time
 
 import pytest
 import torch
@@ -24,7 +25,16 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
 from torch_neuronx.kernels.cache_utils import get_nfs_cache_dir
-from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode, correlate_device_time
+from torch_neuronx.profiling import (
+    ContinuousExportConfig,
+    InspectExportMask,
+    NeuronConfig,
+    NeuronProfiler,
+    ProfileMode,
+    correlate_device_time,
+    export_now,
+    request_export,
+)
 
 
 @pytest.mark.skipif(
@@ -266,6 +276,67 @@ class TestNeuronProfilerIntegration:
             f"Phase types: {all_phs}, "
             f"Metadata names: {meta_names}"
         )
+
+    def _session_trace_dir(self, output_dir):
+        """Resolve the concrete NRT trace directory under a profiler output root.
+
+        NRT lays out artifacts as
+            {output_dir}/{instance_id}_pid_{pid}/{session_init_time_ns}/
+        Both the instance and the numeric timestamp subdirectory are created by
+        nrt_inspect_begin, so this only resolves while a session is (or has been)
+        active. Returns the innermost timestamp directory, where ntrace.pb, the
+        mid-session ntrace.nc<idx>.part files, and the monitoring .pb files land.
+        """
+        instance_subdirs = [
+            d
+            for d in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, d)) and "_pid_" in d
+        ]
+        assert (
+            len(instance_subdirs) == 1
+        ), f"Expected exactly one instance subdirectory, found: {instance_subdirs}"
+        instance_dir = os.path.join(output_dir, instance_subdirs[0])
+
+        numeric_subdirs = [
+            d
+            for d in os.listdir(instance_dir)
+            if os.path.isdir(os.path.join(instance_dir, d)) and d.isdigit()
+        ]
+        assert (
+            len(numeric_subdirs) >= 1
+        ), f"Expected a numeric session subdirectory in {instance_dir}, found: {numeric_subdirs}"
+        return os.path.join(instance_dir, numeric_subdirs[0])
+
+    @staticmethod
+    def _count_ntrace_records(path):
+        """Count events in an ntrace.pb and assert its framing is intact.
+
+        ntrace.pb is a headerless, footerless stream of back-to-back
+        ``[uint32 LE size][event bytes]`` records (write_event_proto_to_file in
+        KaenaRuntime nrt_inspect.cpp). Walking the length prefixes counts events
+        and validates framing without a protobuf dependency: a clean file is
+        consumed exactly, so a trailing partial record signals corruption.
+        """
+        with open(path, "rb") as f:
+            data = f.read()
+
+        count = 0
+        offset = 0
+        total = len(data)
+        while offset < total:
+            assert (
+                offset + 4 <= total
+            ), f"Truncated length prefix at byte {offset} of {total} in {path}"
+            size = int.from_bytes(data[offset : offset + 4], "little")
+            offset += 4
+            assert offset + size <= total, (
+                f"Record at byte {offset} claims {size} bytes but only "
+                f"{total - offset} remain in {path}"
+            )
+            offset += size
+            count += 1
+        assert offset == total, f"Trailing bytes after last record in {path}"
+        return count
 
     def test_no_activities(self):
         """Case 1: profile(activities=None) uses supported_activities() defaults.
@@ -918,6 +989,179 @@ class TestNeuronProfilerIntegration:
                 f"persistent_cache_key in trace {key_in_trace!r} does not match "
                 f"get_neff_info result {result[0]!r} for base key {base_key!r}"
             )
+
+    @staticmethod
+    def _part_files_size(trace_dir):
+        """Total bytes across the per-core mid-session part files in trace_dir.
+
+        Mid-session export appends each core's drained events to its own
+        ntrace.nc<idx>.part (KaenaRuntime export_events_to_parts). N exports do
+        NOT create N files -- each tick appends to the same per-core file -- so
+        the observable of "more was exported" is total bytes growing, not file
+        count. A core that drained nothing leaves no part file (lazy creation).
+        """
+        parts = [
+            f for f in os.listdir(trace_dir) if f.startswith("ntrace.nc") and f.endswith(".part")
+        ]
+        return sum(os.path.getsize(os.path.join(trace_dir, p)) for p in parts)
+
+    @pytest.mark.parametrize("export_api", ["sync", "async"])
+    def test_multi_step_export_accrues_parts_mid_session(self, export_api):
+        """Mid-session export drains events to disk incrementally, step by step.
+
+        This is the headline continuous-export capability: instead of a single
+        drain at session end, the workload calls export repeatedly during the
+        session and each call drains the rings to per-core part files. We assert
+        the part files accrue bytes across steps (so the rings never have to hold
+        the whole session), then that session stop merges the parts into a valid
+        ntrace.pb and leaves no part/tmp residue.
+
+        Parametrized over both export APIs (see the export_api fixture):
+          - "sync":  export_now(...)     -- drain is on disk when the call returns.
+          - "async": request_export(...) -- serviced by the background worker, so
+                     we poll (bounded) until the part bytes grow; the drain
+                     outcome is never reported back to Python.
+        """
+        is_async = export_api == "async"
+        exp_config = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            continuous_export=ContinuousExportConfig() if is_async else None,
+        )
+
+        num_steps = 4
+        poll_deadline_s = 5.0
+        poll_interval_s = 0.05
+        mask = InspectExportMask.SYSTEM_PROFILE
+
+        with profile(
+            activities=[ProfilerActivity.PrivateUse1],
+            experimental_config=exp_config,
+        ):
+            # The timestamped session dir only resolves while the session is live.
+            trace_dir = self._session_trace_dir(self.test_dir)
+
+            sizes = []
+            for _ in range(num_steps):
+                self._run_neuron_workload()
+                prev = self._part_files_size(trace_dir)
+                if is_async:
+                    request_export(mask)
+                    # The async drain lands on a background thread; wait for the
+                    # bytes to grow rather than racing the assertion against it.
+                    deadline = time.monotonic() + poll_deadline_s
+                    while self._part_files_size(trace_dir) <= prev and time.monotonic() < deadline:
+                        time.sleep(poll_interval_s)
+                else:
+                    export_now(mask)
+                sizes.append(self._part_files_size(trace_dir))
+
+            # Part files exist mid-session (before stop merges and deletes them).
+            assert any(
+                f.startswith("ntrace.nc") and f.endswith(".part") for f in os.listdir(trace_dir)
+            ), f"No ntrace.nc*.part files accrued mid-session in {trace_dir}"
+
+            # Appends only grow the parts, and multiple exports accrued more than
+            # the first. (Net growth + monotonicity, not strict step-wise growth:
+            # a step that happens to drain zero new events must not fail the test.)
+            assert sizes == sorted(sizes), f"Part-file bytes were not monotonic: {sizes}"
+            assert (
+                sizes[-1] > sizes[0]
+            ), f"Expected mid-session exports to accrue bytes across steps, got {sizes}"
+
+        # After stop: parts are merged into ntrace.pb and removed.
+        leftover_parts = [
+            f for f in os.listdir(trace_dir) if f.startswith("ntrace.nc") and f.endswith(".part")
+        ]
+        assert leftover_parts == [], f"Part files not consumed at stop: {leftover_parts}"
+        assert not os.path.exists(
+            os.path.join(trace_dir, "ntrace.pb.tmp")
+        ), "Unmerged ntrace.pb.tmp left behind after stop"
+
+        self._validate_nrt_output_files(self.test_dir, expect_ntrace=True)
+        assert (
+            self._count_ntrace_records(os.path.join(trace_dir, "ntrace.pb")) > 0
+        ), "Merged ntrace.pb has no records"
+
+    def test_export_never_vs_driven_produces_equivalent_output(self):
+        """Final on-disk output is equivalent whether export is driven or never.
+
+        The core guarantee: driving export N times mid-session must not change
+        the final trace versus never driving it -- the session-end merge sweeps
+        whatever the periodic ticks left behind. Byte-for-byte equality is not
+        achievable across two hardware runs (per-event timestamps/durations
+        differ), so we assert the invariants that must hold for the same workload:
+        identical output file set and count, identical event/record count (no
+        events lost or duplicated by mid-session draining), both files valid, and
+        no part/tmp residue in either run.
+        """
+        num_steps = 4
+        mask = InspectExportMask.SYSTEM_PROFILE
+
+        def run(subdir, *, drive_export):
+            output_dir = os.path.join(self.test_dir, subdir)
+            os.makedirs(output_dir, exist_ok=True)
+            exp_config = NeuronConfig(
+                modes=[ProfileMode.RUNTIME],
+                profile_output_dir=output_dir,
+            )
+            with profile(
+                activities=[ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+            ):
+                trace_dir = self._session_trace_dir(output_dir)
+                for _ in range(num_steps):
+                    self._run_neuron_workload()
+                    if drive_export:
+                        export_now(mask)
+            return trace_dir
+
+        # The FIRST profiled session in a process captures one-time runtime work
+        # -- NEFF load and device-memory setup (mem_handle / total_bytes /
+        # physical_address / hbm_idx events) -- that every later session reuses
+        # from cache. Measured on trn2: session 1 emits ~798 records and every
+        # session after it emits 368, whether or not export is driven. Comparing
+        # a first session against a second would therefore attribute that
+        # one-time work to mid-session export. Burn one throwaway session first
+        # so both measured runs are steady-state and differ only in export.
+        run("warmup", drive_export=False)
+
+        driven_dir = run("driven", drive_export=True)
+        never_dir = run("never", drive_export=False)
+
+        # .neff files are compilation artifacts, not profiling output: NRT dumps
+        # them only on first compilation in a process, so whichever run compiles
+        # the shape first gets them and the other reuses the cache. Exclude them
+        # from the equivalence comparison (same rationale as
+        # _validate_nrt_output_structure).
+        def profiling_output(trace_dir):
+            return sorted(f for f in os.listdir(trace_dir) if not f.endswith(".neff"))
+
+        driven_files = profiling_output(driven_dir)
+        never_files = profiling_output(never_dir)
+
+        # Same output file names and count.
+        assert (
+            driven_files == never_files
+        ), f"Output file set differs: driven={driven_files} never={never_files}"
+
+        # No mid-session residue survived stop in either run.
+        for label, files in (("driven", driven_files), ("never", never_files)):
+            assert not any(
+                f.startswith("ntrace.nc") and f.endswith(".part") for f in files
+            ), f"{label} run left part files behind: {files}"
+            assert "ntrace.pb.tmp" not in files, f"{label} run left ntrace.pb.tmp behind"
+
+        # Same event count, both valid framing, non-empty.
+        driven_records = self._count_ntrace_records(os.path.join(driven_dir, "ntrace.pb"))
+        never_records = self._count_ntrace_records(os.path.join(never_dir, "ntrace.pb"))
+        assert (
+            driven_records > 0 and never_records > 0
+        ), f"Empty trace: driven={driven_records} never={never_records}"
+        assert driven_records == never_records, (
+            "Mid-session export changed the event count: "
+            f"driven={driven_records} never={never_records}"
+        )
 
 
 class TestProfileMode:

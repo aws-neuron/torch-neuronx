@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "ContinuousExporter.h"
 #include "ProfilerEventBuffer.h"
 
 struct nrt_inspect_config;
@@ -54,6 +55,12 @@ class NeuronActivityProfilerSession : public libkineto::IActivityProfilerSession
   std::vector<std::string> errors_;
 
   nrt_inspect_config_t* nrtConfig_{nullptr};
+  // Host-side export settings parsed from custom_profiler_config (continuous_export key).
+  ExportConfig exportConfig_{};
+  // Async export worker; constructed in start() only when exportConfig_.enabled, published
+  // to the bridge, and stopped/reset before nrt_inspect_stop() in stop() and the dtor.
+  // Null for sessions that did not opt in.
+  std::unique_ptr<ContinuousExporter> continuousExporter_;
   int64_t profileStartTime_{0};
   int64_t profileEndTime_{0};
   int64_t clockDomainOffset_{0};  // system_clock_ns - steady_clock_ns (computed once at start)
@@ -89,6 +96,11 @@ class NeuronActivityProfilerSession : public libkineto::IActivityProfilerSession
   void initNrtConfig();
   void cleanupNrtConfig();
   void applyCustomConfig();
+  // Export teardown, shared by stop() and the destructor. Must run BEFORE
+  // nrt_inspect_stop(): unpublishes the bridge, then joins and destroys the exporter,
+  // so no async drain is in flight when the final flush runs. (Sync export_now drains
+  // are ordered against nrt_inspect_stop by NRT's own global_lock.)
+  void teardownContinuousExport();
 
   bool hasDeviceResource(int32_t device, int32_t id) const;
   void recordResource(int32_t device, int32_t id, const std::string& name);
