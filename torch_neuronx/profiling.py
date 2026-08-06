@@ -9,7 +9,7 @@ torch.profiler.profile(), offering profiling coverage for Neuron workloads.
 
 import logging
 import os
-from enum import Enum
+from enum import Enum, IntFlag
 from typing import ClassVar
 
 from torch._C._profiler import _ExperimentalConfig
@@ -31,6 +31,118 @@ class ProfileMode(Enum):
     RUNTIME = "runtime"
     CPU_UTIL = "cpu_util"
     HOST_MEMORY = "host_memory"
+
+
+class InspectExportMask(IntFlag):
+    """Selects what nrt_inspect_export exports.
+
+    Keep members and values in lock-step with at::neuron::InspectExportMask
+    (csrc/profiler/ContinuousExporter.h).
+    """
+
+    SYSTEM_PROFILE = 1
+
+
+class ExportStatus(Enum):
+    """Frontend gating status for the asynchronous request_export() path.
+
+    This domain is deliberately disjoint from NRT's status codes: the async
+    drain runs later on a background thread, so the only outcomes reportable
+    synchronously are frontend configuration checks. The synchronous
+    export_now() path instead surfaces NRT's own status verbatim (via
+    NRTProfilerError.status). Keep members and values in lock-step with
+    at::neuron::ExportStatus (csrc/profiler/ContinuousExporter.h).
+    """
+
+    # Successfully submitted and will be executed later. Async API.
+    SUBMITTED = 1
+
+    # Error suggesting that no profiling session is active.
+    NO_ACTIVE_SESSION = 2
+
+    # The intent to export is not specified at profiling session creation time.
+    # Therefore the machinery was not initialized and async export cannot be
+    # requested.
+    EXPORT_NOT_ENABLED = 3
+
+    # The mask input must be a member of `InspectExportMask`.
+    UNSUPPORTED_MASK = 4
+
+
+class ContinuousExportConfig:
+    """Config that expresses the user-intent that the profile data export
+    might be requested by the user code. The default is NO-EXPORT outside
+    of session end.
+
+    Enables the background exporter thread used by request_export(); it
+    configures no automatic export policy.
+    """
+
+    def _to_config_parts(self) -> list[str]:
+        return ["continuous_export:true"]
+
+
+def _export_mask_to_int(mask: InspectExportMask) -> int:
+    if not isinstance(mask, InspectExportMask):
+        raise TypeError(f"Expected InspectExportMask, got {type(mask).__name__}: {mask}")
+    return int(mask)
+
+
+_NRT_SUCCESS = 0
+
+
+def export_now(mask: InspectExportMask) -> None:
+    """Synchronously export the currently captured profiled events to disk.
+
+    This can be used to empty the profile event buffers so that they can be reused.
+    This lets you capture more events in the same session with the same buffer sizes.
+    This is a synchronous, blocking API; consider the async `request_export`.
+
+    A pure passthrough to nrt_inspect_export: with no active session NRT no-ops
+    successfully, and any NRT failure is surfaced verbatim.
+
+    Raises:
+        NRTProfilerError: nrt_inspect_export returned non-success; the `status`
+            attribute carries NRT's status code verbatim.
+    """
+
+    status = _C._nrt_inspect_export_now(_export_mask_to_int(mask))
+    if status != _NRT_SUCCESS:
+        error = NRTProfilerError(f"nrt_inspect_export failed. StatusCode: {status}")
+        error.status = status
+        raise error
+
+
+def request_export(mask: InspectExportMask) -> None:
+    """Request an asynchronous export of the currently captured profile data to disk.
+
+    This can be used to empty the profile event buffers so that they can be reused.
+    This lets you capture more events in the same session with the same buffer sizes.
+
+    Configuration and gating errors are raised immediately so there is no
+    expectation mismatch. The export itself runs later on a background thread;
+    its outcome is not reported back -- failures appear in the Neuron logs.
+
+    Raises:
+        NRTProfilerError: the request was not accepted (no active session,
+            continuous export not enabled, or unsupported mask); the `status`
+            attribute carries the corresponding ExportStatus member.
+    """
+
+    submit_status = _C._nrt_inspect_request_export(_export_mask_to_int(mask))
+    try:
+        status = ExportStatus(submit_status)
+    except ValueError:
+        # A status the C++ ExportStatus enum can return but this (possibly older)
+        # Python layer does not know. Surface it as NRTProfilerError -- never let a
+        # raw ValueError escape the documented contract.
+        error = NRTProfilerError(f"request_export returned unknown status: {submit_status}")
+        error.status = submit_status
+        raise error from None
+    if status is not ExportStatus.SUBMITTED:
+        error = NRTProfilerError(f"request_export was not accepted: {status.name}")
+        error.status = status
+        raise error
 
 
 class NeuronConfig(_ExperimentalConfig):
@@ -56,6 +168,9 @@ class NeuronConfig(_ExperimentalConfig):
         correlate_device_time: When True, NeuronProfiler.export_trace()
             automatically correlates device execution times into FunctionEvents
             so key_averages() shows NEURON device time columns. Default: False.
+        continuous_export: Optional ContinuousExportConfig. Enables the
+            background export worker used by request_export(); configures no
+            automatic export policy but forthcoming..
     """
 
     _DEFAULT_MODES: ClassVar[list[ProfileMode]] = [ProfileMode.DEVICE, ProfileMode.RUNTIME]
@@ -69,6 +184,7 @@ class NeuronConfig(_ExperimentalConfig):
         precache_node_info: bool = True,
         neff_cache_dir: str | None = None,
         correlate_device_time: bool = False,
+        continuous_export: ContinuousExportConfig | None = None,
     ):
         if modes is None:
             modes = self._DEFAULT_MODES
@@ -79,6 +195,14 @@ class NeuronConfig(_ExperimentalConfig):
         for mode in modes:
             if not isinstance(mode, ProfileMode):
                 raise TypeError(f"Expected ProfileMode, got {type(mode).__name__}: {mode}")
+
+        if continuous_export is not None and not isinstance(
+            continuous_export, ContinuousExportConfig
+        ):
+            raise TypeError(
+                "continuous_export must be a ContinuousExportConfig, "
+                f"got {type(continuous_export).__name__}"
+            )
 
         # by default, check if the user explicitly specified the cache,
         # if not neff_cache_dir remains None
@@ -97,12 +221,15 @@ class NeuronConfig(_ExperimentalConfig):
             parts.append(f"profile_output_dir:{profile_output_dir}")
         if neff_cache_dir is not None:
             parts.append(f"neff_cache_dir:{neff_cache_dir}")
+        if continuous_export is not None:
+            parts.extend(continuous_export._to_config_parts())
         config_str = ";".join(parts)
         super().__init__(custom_profiler_config=config_str)
         self.custom_profiler_config = config_str
         self.profile_output_dir = profile_output_dir
         self.neff_cache_dir = neff_cache_dir
         self.correlate_device_time = correlate_device_time
+        self.continuous_export = continuous_export
 
         # Pre-cache profile node info during warmup iterations so that the
         # actively profiled iteration doesn't pay the cost of collecting

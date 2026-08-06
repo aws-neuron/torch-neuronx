@@ -144,6 +144,7 @@ cc_library(
         "torch_neuronx/csrc/ops/InternalOps.cpp",
         "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.cpp",
         "torch_neuronx/csrc/profiler/Profiler.cpp",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.cpp",
         "torch_neuronx/csrc/profiler/Session.cpp",
         "torch_neuronx/csrc/profiler/Registration.cpp",
         "torch_neuronx/csrc/profiler/TorchStubs.cpp",
@@ -185,6 +186,7 @@ cc_library(
         "torch_neuronx/csrc/core/metrics/NeuronMetrics.h",
         "torch_neuronx/csrc/profiler/Registration.h",
         "torch_neuronx/csrc/profiler/Profiler.h",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.h",
         "torch_neuronx/csrc/profiler/Session.h",
         "torch_neuronx/csrc/profiler/LogWrapper.h",
         "torch_neuronx/csrc/profiler/NConfigParser.h",
@@ -237,6 +239,7 @@ cc_library(
     name = "profiler_test_lib",
     srcs = [
         "torch_neuronx/csrc/profiler/Profiler.cpp",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.cpp",
         "torch_neuronx/csrc/profiler/Session.cpp",
         "torch_neuronx/csrc/profiler/NConfigParser.cpp",
         "torch_neuronx/csrc/profiler/ProfilerEventBuffer.cpp",
@@ -245,6 +248,7 @@ cc_library(
     ],
     hdrs = [
         "torch_neuronx/csrc/profiler/Profiler.h",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.h",
         "torch_neuronx/csrc/profiler/Session.h",
         "torch_neuronx/csrc/profiler/NConfigParser.h",
         "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h",
@@ -273,6 +277,7 @@ test_suite(
         "//tests/csrc:ProfilerTest",
         "//tests/csrc:ProfilerEventBufferTest",
         "//tests/csrc:CorrelationTrackerTest",
+        "//tests/csrc:ContinuousExporterTest",
     ],
     visibility = ["//visibility:public"],
 )

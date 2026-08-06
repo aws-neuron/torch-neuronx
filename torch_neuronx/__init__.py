@@ -189,7 +189,16 @@ from .neuron_dynamo_backend.metrics import get_dynamo_metrics, reset_dynamo_metr
 
 # Import NKI kernel support
 from .nki_hop import nki_op, wrap_nki
-from .profiling import NeuronProfiler
+from .profiling import (
+    ContinuousExportConfig,
+    ExportStatus,
+    InspectExportMask,
+    NeuronConfig,
+    NeuronProfiler,
+    ProfileMode,
+    export_now,
+    request_export,
+)
 
 # Import stream and event classes
 from .streams import Event, Stream

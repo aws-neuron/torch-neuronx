@@ -270,6 +270,13 @@ NRT_STATUS nrt_inspect_begin_with_options(nrt_inspect_config_t* config) {
   return NRT_FAILURE;
 }
 
+NRT_STATUS nrt_inspect_export(uint32_t export_mask) {
+  if (g_mocks_initialized) {
+    return torch_neuronx::testing::MockNRT::GetInstance()->nrt_inspect_export(export_mask);
+  }
+  return NRT_FAILURE;
+}
+
 NRT_STATUS nrt_inspect_stop() {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrt_inspect_stop();

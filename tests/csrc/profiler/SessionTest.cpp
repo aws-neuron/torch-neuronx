@@ -3,7 +3,9 @@
 #include <libkineto.h>
 #include <output_base.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <set>
 #include <thread>
 #include <vector>
@@ -21,6 +23,8 @@ using ::testing::StrEq;
 namespace at::neuron {
 namespace {
 
+constexpr uint32_t kSystemProfile = static_cast<uint32_t>(InspectExportMask::SystemProfile);
+
 // Fake nrt_inspect_config for testing
 struct FakeNrtInspectConfig {
   int dummy;
@@ -35,6 +39,7 @@ class SessionTest : public ::testing::Test {
 
   void TearDown() override {
     setActiveProfilerBuffer(nullptr);
+    clearActiveExportBridgeForSession();
     mock_session_.reset();
   }
 
@@ -69,6 +74,26 @@ class SessionTest : public ::testing::Test {
   // Helper: expect stop
   void expectStop() { EXPECT_CALL(*mock_nrt_, nrt_inspect_stop()).WillOnce(Return(NRT_SUCCESS)); }
 
+  // Helper: set the custom_profiler_config string on a Config (not movable, so
+  // the caller owns the object and we mutate in place).
+  static void setCustomConfig(libkineto::Config& config, const std::string& customConfig) {
+    std::string value = customConfig;
+    config.handleOption("CUSTOM_CONFIG", value);
+  }
+
+  // Helper: the invariant expectation prefix for a runtime-mode session start
+  // (config allocation, baseline all-off, system_profile on, begin). beginStatus
+  // lets the begin-failure test reuse the prefix; per-test expectations (export
+  // calls, sequences, stop) stay inline.
+  void expectRuntimeStart(NRT_STATUS beginStatus = NRT_SUCCESS) {
+    expectConfigAllocation();
+    EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
+        .WillOnce(Return(NRT_SUCCESS));
+    EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
+        .WillOnce(Return(NRT_SUCCESS));
+    EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(beginStatus));
+  }
+
   std::unique_ptr<torch_neuronx::testing::MockNRTSession> mock_session_;
   torch_neuronx::testing::MockNRT* mock_nrt_;
   FakeNrtInspectConfig fake_config_;
@@ -89,11 +114,210 @@ TEST_F(SessionTest, StartStopSuccess) {
   EXPECT_TRUE(session.errors().empty());
 }
 
-TEST_F(SessionTest, NeuronProfileDeviceOnlyEnablesDeviceProfile) {
+TEST_F(SessionTest, RequestExportWithoutContinuousExportReturnsExportNotEnabled) {
+  // Opt-in boundary: a session without continuous_export publishes a null exporter,
+  // so async requests are rejected (and nrt_inspect_export is never called).
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
+
+  expectRuntimeStart();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(_)).Times(0);
+  expectStop();
+  expectCleanup();
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::ExportNotEnabled);
+
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_F(SessionTest, ContinuousExportConfigDoesNotRequireRuntimeMode) {
+  // Capture modes and export opt-in are independent: a device-only session with
+  // continuous_export:true still runs the async worker, and the requested mask is
+  // forwarded to nrt_inspect_export verbatim (Runtime decides what it yields).
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:device;continuous_export:true");
+
+  expectConfigAllocation();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("device_profile"), true))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_inspect_device_profile_mode(
+                              _, NRT_INSPECT_DEVICE_PROFILE_MODE_SESSION))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
+      .Times(0);
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+
+  std::promise<void> exportCalled;
+  auto exportFuture = exportCalled.get_future();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&exportCalled](uint32_t) {
+    exportCalled.set_value();
+    return NRT_SUCCESS;
+  });
+  expectStop();
+  expectCleanup();
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_F(SessionTest, ContinuousExportBeginFailureLeavesNoActiveSession) {
+  // If nrt_inspect_begin fails, the session never publishes the bridge: no exporter
+  // exists and async requests report NoActiveSession (not ExportNotEnabled).
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;continuous_export:true");
+
+  expectRuntimeStart(NRT_FAILURE);
+  expectCleanup();
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::NoActiveSession);
+  EXPECT_FALSE(session.errors().empty());
+}
+
+TEST_F(SessionTest, ContinuousExportDuplicateStartDoesNotCreateSecondExporter) {
+  // Session::start() is idempotent (isActive_ guard): the second start must not
+  // construct a second exporter/thread; the single worker keeps servicing requests.
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;continuous_export:true");
+
+  expectRuntimeStart();
+
+  std::promise<void> exportCalled;
+  auto exportFuture = exportCalled.get_future();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&exportCalled](uint32_t) {
+    exportCalled.set_value();
+    return NRT_SUCCESS;
+  });
+  expectStop();
+  expectCleanup();
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+  session.start();
+
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_F(SessionTest, ContinuousExportSecondActiveSessionDoesNotCreateExporter) {
+  // Process-wide single-session guard (s_sessionActive): a second session starting
+  // while the first is active fails, and must not touch the bridge or spawn a
+  // second exporter (nrt_inspect_export .Times(0)).
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;continuous_export:true");
+
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_allocate(_))
+      .Times(2)
+      .WillRepeatedly(
+          DoAll(SetArgPointee<0>(reinterpret_cast<nrt_inspect_config_t*>(&fake_config_)),
+                Return(NRT_SUCCESS)));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_defaults(_))
+      .Times(2)
+      .WillRepeatedly(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_enable_inspect(_, true))
+      .Times(2)
+      .WillRepeatedly(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
+      .Times(2)
+      .WillRepeatedly(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
+      .Times(2)
+      .WillRepeatedly(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(_)).Times(0);
+  expectStop();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_free(_)).Times(2).WillRepeatedly(Return(NRT_SUCCESS));
+
+  NeuronActivityProfilerSession firstSession(activityTypes, config);
+  NeuronActivityProfilerSession secondSession(activityTypes, config);
+
+  firstSession.start();
+  secondSession.start();
+
+  EXPECT_FALSE(secondSession.errors().empty());
+
+  firstSession.stop();
+}
+
+TEST_F(SessionTest, ContinuousExportDestructorJoinsExporterBeforeStop) {
+  // Teardown ordering on the dtor path (session destroyed without stop()): the
+  // exporter is joined BEFORE nrt_inspect_stop(), so the final flush never races an
+  // in-flight async drain. The gated mock holds the drain while the dtor runs.
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;continuous_export:true");
+
+  expectRuntimeStart();
+
+  std::promise<void> exportStarted;
+  auto exportStartedFuture = exportStarted.get_future();
+  std::promise<void> allowExport;
+  auto allowExportFuture = allowExport.get_future().share();
+  std::atomic<bool> exportCompleted{false};
+  std::atomic<bool> stopCalled{false};
+  std::atomic<bool> stopBeforeExportCompleted{false};
+
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&](uint32_t) {
+    exportStarted.set_value();
+    allowExportFuture.wait();
+    exportCompleted.store(true, std::memory_order_release);
+    return NRT_SUCCESS;
+  });
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_stop()).WillOnce([&] {
+    stopBeforeExportCompleted.store(!exportCompleted.load(std::memory_order_acquire),
+                                    std::memory_order_release);
+    stopCalled.store(true, std::memory_order_release);
+    return NRT_SUCCESS;
+  });
+  expectCleanup();
+
+  std::thread releaser;
+  {
+    NeuronActivityProfilerSession session(activityTypes, config);
+    session.start();
+    EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+    EXPECT_EQ(exportStartedFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    releaser = std::thread([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      allowExport.set_value();
+    });
+  }
+  releaser.join();
+
+  EXPECT_TRUE(exportCompleted.load(std::memory_order_acquire));
+  EXPECT_TRUE(stopCalled.load(std::memory_order_acquire));
+  EXPECT_FALSE(stopBeforeExportCompleted.load(std::memory_order_acquire));
+}
+
+TEST_F(SessionTest, NeuronProfileDeviceOnlyAllowsSynchronousExport) {
+  // Two claims: (a) device-only config enables exactly device_profile (no
+  // system_profile); (b) export_now needs no opt-in or runtime mode — it is a
+  // passthrough available in any session, forwarding the mask to NRT verbatim.
+  std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:device");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -104,26 +328,28 @@ TEST_F(SessionTest, NeuronProfileDeviceOnlyEnablesDeviceProfile) {
                               _, NRT_INSPECT_DEVICE_PROFILE_MODE_SESSION))
       .WillOnce(Return(NRT_SUCCESS));
 
-  // Ensure system_profile is NOT enabled
+  // Capture configuration remains device-only.
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
       .Times(0);
 
   EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce(Return(NRT_SUCCESS));
   expectStop();
   expectCleanup();
 
   NeuronActivityProfilerSession session(activityTypes, config);
   session.start();
-  session.stop();
 
+  EXPECT_EQ(exportNow(kSystemProfile), NRT_SUCCESS);
+
+  session.stop();
   EXPECT_TRUE(session.errors().empty());
 }
 
 TEST_F(SessionTest, NeuronProfileRuntimeOnlyEnablesSystemProfile) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -149,8 +375,7 @@ TEST_F(SessionTest, NeuronProfileRuntimeOnlyEnablesSystemProfile) {
 TEST_F(SessionTest, NeuronProfileDeviceAndRuntimeEnablesBoth) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device,runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:device,runtime");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -177,8 +402,7 @@ TEST_F(SessionTest, NeuronProfileDeviceAndRuntimeEnablesBoth) {
 TEST_F(SessionTest, NeuronProfileCpuUtilEnablesCpuUtil) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:cpu_util";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:cpu_util");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -200,8 +424,7 @@ TEST_F(SessionTest, NeuronProfileCpuUtilEnablesCpuUtil) {
 TEST_F(SessionTest, NeuronProfileHostMemoryEnablesHostMemory) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:host_memory";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:host_memory");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -223,8 +446,7 @@ TEST_F(SessionTest, NeuronProfileHostMemoryEnablesHostMemory) {
 TEST_F(SessionTest, NeuronProfileAllModesEnablesAll) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device,runtime,cpu_util,host_memory";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:device,runtime,cpu_util,host_memory");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -357,8 +579,7 @@ TEST_F(SessionTest, StartWithCustomConfigProfileOutputDir) {
   // Custom config profile_output_dir should call nrt_inspect_config_set_output_dir.
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "profile_output_dir:/tmp/neuron_traces";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "profile_output_dir:/tmp/neuron_traces");
 
   expectConfigAllocation();
   expectActivityTypeSetup();
@@ -381,8 +602,7 @@ TEST_F(SessionTest, NeuronProfileWithExtraConfig) {
   // neuron_profile key combined with other config keys
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device;max_events_per_nc:50000";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:device;max_events_per_nc:50000");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -411,8 +631,7 @@ TEST_F(SessionTest, StartWithCustomConfigCaptureEnabledForNc) {
   // for each expanded index.
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "capture_enabled_for_nc:0,2-4";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "capture_enabled_for_nc:0,2-4");
 
   expectConfigAllocation();
   expectActivityTypeSetup();
@@ -443,8 +662,7 @@ TEST_F(SessionTest, NeuronProfileDeviceActivityFailureContinues) {
   // continue processing remaining modes and the session should still start.
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device,runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:device,runtime");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -476,8 +694,7 @@ TEST_F(SessionTest, NeuronProfileUnknownModeIgnored) {
   // Unknown modes in neuron_profile should be silently ignored (logged as warning).
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:unknown_mode";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:unknown_mode");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
@@ -604,15 +821,9 @@ TEST_F(SessionTest, DestructorClearsGlobalBuffer) {
 TEST_F(SessionTest, ProcessTraceDrainsBufferAndPopulatesActivities) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -700,15 +911,9 @@ TEST_F(SessionTest, ProcessTraceDrainsBufferAndPopulatesActivities) {
 TEST_F(SessionTest, ProcessTraceMultipleOperations) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -752,15 +957,9 @@ TEST_F(SessionTest, ProcessTraceMultipleOperations) {
 TEST_F(SessionTest, ProcessTraceLinkedCpuActivity) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -915,8 +1114,7 @@ TEST_F(SessionTest, CustomConfigCpuUtilEnablesActivity) {
   // cpu_util should be configurable via custom config, not via activity types.
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "cpu_util:true";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "cpu_util:true");
 
   expectConfigAllocation();
   expectActivityTypeSetup();
@@ -938,15 +1136,9 @@ TEST_F(SessionTest, CustomConfigCpuUtilEnablesActivity) {
 TEST_F(SessionTest, ProcessTraceFiltersCaptureWindow) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -1031,15 +1223,9 @@ TEST_F(SessionTest, ProcessTraceFiltersCaptureWindow) {
 TEST_F(SessionTest, ProcessTraceCaptureWindowBoundaryOverlap) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -1108,15 +1294,9 @@ TEST_F(SessionTest, ProcessTraceCaptureWindowBoundaryOverlap) {
 TEST_F(SessionTest, GetDeviceInfoReflectsPrimaryDevice) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -1156,15 +1336,9 @@ TEST_F(SessionTest, GetDeviceInfoReflectsPrimaryDevice) {
 TEST_F(SessionTest, ProcessTraceSyncOverloadUsesFullCaptureWindow) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -1212,15 +1386,9 @@ TEST_F(SessionTest, ProcessTraceSyncOverloadUsesFullCaptureWindow) {
 TEST_F(SessionTest, GetTraceBufferConsumedOnSecondCall) {
   std::set<libkineto::ActivityType> activityTypes = {libkineto::ActivityType::PRIVATEUSE1_RUNTIME};
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:runtime";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:runtime");
 
-  expectConfigAllocation();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
-      .WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectRuntimeStart();
   expectStop();
   expectCleanup();
 
@@ -1707,8 +1875,7 @@ TEST_F(SessionTest, NeffCacheDirSetViaCustomConfig) {
   // nrt_inspect_config_set_neff_cache_dir with the configured path.
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
-  std::string customConfig = "neuron_profile:device;neff_cache_dir:/tmp/neff_cache";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
+  setCustomConfig(config, "neuron_profile:device;neff_cache_dir:/tmp/neff_cache");
 
   expectConfigAllocation();
   EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("all"), false))

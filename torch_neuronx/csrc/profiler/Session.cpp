@@ -38,9 +38,18 @@ inline const char* GetXUTypeName(int32_t xu_type) {
   }
 }
 
+struct ParseContext {
+  nrt_inspect_config_t* nrtConfig{nullptr};
+  ExportConfig* exportConfig{nullptr};
+};
+
 // Helper to cast context to NRT config
 inline nrt_inspect_config_t* toNrtConfig(void* ctx) {
-  return static_cast<nrt_inspect_config_t*>(ctx);
+  return static_cast<ParseContext*>(ctx)->nrtConfig;
+}
+
+inline ExportConfig* toExportConfig(void* ctx) {
+  return static_cast<ParseContext*>(ctx)->exportConfig;
 }
 
 ConfigRegistry createNeuronConfigRegistry() {
@@ -164,6 +173,16 @@ ConfigRegistry createNeuronConfigRegistry() {
          NPROF_INFO("  Set neff_cache_dir:", std::get<std::string>(v));
          return true;
        }},
+
+      {"continuous_export", NConfigParser::parseBool,
+       [](void* ctx, const ConfigValue& v) {
+         bool enabled = std::get<bool>(v);
+         if (auto* exportConfig = toExportConfig(ctx)) {
+           exportConfig->enabled = enabled;
+         }
+         NPROF_INFO("  Set continuous_export:", enabled ? "enabled" : "disabled");
+         return true;
+       }},
   };
 }
 
@@ -205,6 +224,7 @@ void NeuronActivityProfilerSession::initNrtConfig() {
   nrt_inspect_config_set_enable_inspect(nrtConfig_, true);
   nrt_inspect_config_set_activity(nrtConfig_, "all", false);  // baseline: all off
 
+  exportConfig_ = ExportConfig{};
   // neuron_profile config key selectively enables requested modes
   applyCustomConfig();
 }
@@ -223,7 +243,8 @@ void NeuronActivityProfilerSession::applyCustomConfig() {
   NPROF_INFO("  Custom config:", customConfig);
 
   static const auto registry = createNeuronConfigRegistry();
-  torch_neuronx::profiler::NConfigParser::parseAndApply(customConfig, registry, nrtConfig_);
+  ParseContext parseContext{nrtConfig_, &exportConfig_};
+  torch_neuronx::profiler::NConfigParser::parseAndApply(customConfig, registry, &parseContext);
 }
 
 NeuronActivityProfilerSession::~NeuronActivityProfilerSession() {
@@ -235,6 +256,7 @@ NeuronActivityProfilerSession::~NeuronActivityProfilerSession() {
     if (isActive_) {
       setActiveProfilerBuffer(nullptr);
       eventBuffer_.deactivate();
+      teardownContinuousExport();
       nrt_inspect_stop();
       isActive_ = false;
       status_ = libkineto::TraceStatus::PROCESSING;
@@ -248,6 +270,14 @@ void NeuronActivityProfilerSession::cleanupNrtConfig() {
   if (nrtConfig_) {
     nrt_inspect_config_free(nrtConfig_);
     nrtConfig_ = nullptr;
+  }
+}
+
+void NeuronActivityProfilerSession::teardownContinuousExport() {
+  clearActiveExportBridgeForSession();
+  if (continuousExporter_) {
+    continuousExporter_->stop();
+    continuousExporter_.reset();
   }
 }
 
@@ -296,6 +326,23 @@ void NeuronActivityProfilerSession::start() {
   eventBuffer_.activate();
   setActiveProfilerBuffer(&eventBuffer_);
 
+  if (exportConfig_.enabled) {
+    // The profiler is an observer: a failure to spin up the async export worker
+    // (e.g. std::thread throwing under resource pressure) must not abort the
+    // profiling session. Degrade to no continuous export and keep going.
+    try {
+      continuousExporter_ = std::make_unique<ContinuousExporter>();
+      continuousExporter_->start();
+    } catch (const std::exception& e) {
+      NPROF_WARN("Failed to start continuous exporter:", e.what(), "- continuing without it");
+      continuousExporter_.reset();
+    } catch (...) {
+      NPROF_WARN("Failed to start continuous exporter (unknown) - continuing without it");
+      continuousExporter_.reset();
+    }
+  }
+  setActiveExportBridgeForSession(continuousExporter_.get());
+
   isActive_ = true;
   status_ = libkineto::TraceStatus::RECORDING;
   NPROF_INFO("Session started.");
@@ -312,8 +359,13 @@ void NeuronActivityProfilerSession::stop() {
   setActiveProfilerBuffer(nullptr);
   eventBuffer_.deactivate();
 
+  // Stamp the capture window as soon as event capture stops. Joining the export
+  // thread below can wait out an in-flight drain, which is dead time that must
+  // not inflate the reported Kineto span.
   // Convert to system_clock domain to match profileStartTime_ and Kineto's capture window.
   profileEndTime_ = toNs(std::chrono::steady_clock::now()) + clockDomainOffset_;
+
+  teardownContinuousExport();
 
   // Stop profiling first - this writes trace data to the output directory
   NRT_STATUS status = nrt_inspect_stop();

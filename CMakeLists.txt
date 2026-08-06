@@ -240,6 +240,7 @@ set(EXTENSION_SOURCES
     torch_neuronx/csrc/amp/autocast_mode.cpp
     # Profiler sources (compiled directly to ensure proper linking)
     torch_neuronx/csrc/profiler/Profiler.cpp
+    torch_neuronx/csrc/profiler/ContinuousExporter.cpp
     torch_neuronx/csrc/profiler/Session.cpp
     torch_neuronx/csrc/profiler/Registration.cpp
     torch_neuronx/csrc/profiler/TorchStubs.cpp

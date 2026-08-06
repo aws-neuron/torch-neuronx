@@ -34,6 +34,7 @@ build/docs/
 *.a
 *.dylib
 *.dll
+*.log
 
 # Bazel
 bazel-*
