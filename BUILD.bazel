@@ -1,5 +1,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_uv//uv:pip.bzl", "pip_compile")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 
 # Common compiler options for all targets in this package
 # -Werror is scoped to this package only, not applied to external dependencies
@@ -445,6 +447,39 @@ cc_library(
     alwayslink = True,
 )
 
+# RDMA transfer descriptor protobuf — peer-to-peer descriptor exchange between RDMA endpoints.
+proto_library(
+    name = "transfer_descriptor_proto",
+    srcs = ["torch_neuronx/csrc/core/rdma/TransferDescriptor.proto"],
+)
+
+cc_proto_library(
+    name = "transfer_descriptor_cc_proto",
+    deps = [":transfer_descriptor_proto"],
+)
+
+cc_library(
+    name = "rdma",
+    srcs = [
+        "torch_neuronx/csrc/core/rdma/RdmaManager.cc",
+    ],
+    hdrs = [
+        "torch_neuronx/csrc/core/rdma/RdmaManager.h",
+    ],
+    copts = PACKAGE_COPTS + ["-I.", "-fvisibility=default"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":runtime",
+        ":transfer_descriptor_cc_proto",
+        "@libfabric//:libfabric",
+        "@nrt//:nrt",
+        "@torch//:headers",
+        "@torch//:runtime_headers",
+        "@torch//:libtorch",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
 cc_library(
     name = "non_temporal_memcpy",
     srcs = ["torch_neuronx/csrc/core/utils/NonTemporalMemcpy.cpp"],
@@ -568,6 +603,7 @@ cc_library(
         ":runtime",
         ":torch_neuronx_core",
         ":distributed",
+        ":rdma",
         "@nrt//:nrt",
         "@torch//:headers",
         "@torch//:runtime_headers",

@@ -1,8 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
+#include <vector>
 
 #include "torch_neuronx/csrc/core/dispatch/NeuronDispatcher.h"
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
@@ -13,7 +16,8 @@ namespace distributed {
 
 class NeuronBackend : public c10d::Backend {
  public:
-  NeuronBackend(const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank, int size,
+  NeuronBackend(const c10::intrusive_ptr<c10d::Store>& store,
+                const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank, int size,
                 int global_world_size, pybind11::object lower_callback);
   ~NeuronBackend() override;
 
@@ -22,6 +26,11 @@ class NeuronBackend : public c10d::Backend {
   static void Cleanup();
 
   const std::string getBackendName() const override { return "neuron"; }
+
+  // Advertise that this backend implements startCoalescing / endCoalescing.
+  // Without this, dist.batch_isend_irecv falls through to per-op dispatch and
+  // deadlocks the single engine thread on per-op Store I/O.
+  bool supportsCoalescing() const override { return true; }
 
   // ── Core collectives ──
   c10::intrusive_ptr<c10d::Work> allreduce(
@@ -90,6 +99,20 @@ class NeuronBackend : public c10d::Backend {
       std::vector<at::Tensor>& outputs, std::vector<at::Tensor>& inputs,
       const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
 
+  // ── Point-to-point (RDMA over EFA) ──
+  // Single-tensor send/recv. tag is a user-provided int that combines with
+  // (rank, peer) to form the c10d::Store key for descriptor exchange.
+  c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors, int dstRank,
+                                      int tag) override;
+  c10::intrusive_ptr<c10d::Work> recv(std::vector<at::Tensor>& tensors, int srcRank,
+                                      int tag) override;
+
+  // batch_isend_irecv coalescing: queues send/recv ops between start/end, then
+  // submits them with a single Store multi-set/multi-get round-trip and detects
+  // same-rank pairs (V-shaped schedules e.g. ZBV) for local copy short-circuit.
+  void startCoalescing() override;
+  c10::intrusive_ptr<c10d::Work> endCoalescing() override;
+
  private:
   // Create NeuronWork, stash tensors, record event, enqueue to watchdog.
   c10::intrusive_ptr<NeuronWork> CreateWork(const std::vector<at::Tensor>& outputs,
@@ -137,6 +160,17 @@ class NeuronBackend : public c10d::Backend {
   // and leaves tensors untouched.
   int ResolveReduceOp(const c10d::ReduceOp& reduce_op, std::vector<at::Tensor>& tensors);
 
+  // Get the global rank of a group-local rank. Mirrors Python's
+  // `dist.get_process_group_ranks(self)[group_rank]`. RDMA keys (rdma_ep_<global>,
+  // rdma_<src>_<dst>_<tag>_<seq>) are always indexed by global rank.
+  int ToGlobal(int group_rank) const { return group_ranks_[group_rank]; }
+
+  // Per-PG one-time setup: walk PrefixStore -> root and hand it + this PG's
+  // global rank to RdmaManager. Libfabric init, local-endpoint publish, and
+  // peer AV inserts run lazily on the engine thread inside PrepareBatch.
+  // Caller must hold p2p_mutex_.
+  void EnsureRdmaInit(at::Tensor& tensor, int peer_global);
+
   std::string pg_uid_;
   int64_t timeout_ms_;
   bool enable_timing_ = false;
@@ -144,6 +178,30 @@ class NeuronBackend : public c10d::Backend {
 
   std::vector<int> group_ranks_;
   int global_world_size_;
+
+  // Global rank of THIS PG member (equal to group_ranks_[rank()]).
+  // Stored explicitly because RDMA send/recv keys (rdma_<src>_<dst>_<tag>_<seq>)
+  // distinguish "self" (this member) from "peer" (resolved via ToGlobal).
+  int global_rank_{0};
+
+  // Store carried into NeuronBackend so RDMA send/recv can publish and resolve
+  // descriptor keys via c10d::Store. Typically a PrefixStore wrapping the world
+  // TCPStore; EnsureRdmaInit walks getUnderlyingNonPrefixStore() to obtain the
+  // root for cross-PG agreement on rdma_ep_<global> keys.
+  c10::intrusive_ptr<c10d::Store> store_;
+
+  // Per-PG P2P state. RdmaManager itself is process-global. Guarded by
+  // p2p_mutex_; lock is dropped before submitting ops to the engine.
+  bool rdma_setup_done_{false};
+  bool coalescing_{false};
+  struct CoalescedOp {
+    c10d::OpType op;  // SEND or RECV
+    at::Tensor tensor;
+    int peer_global;
+    int tag;
+  };
+  std::vector<CoalescedOp> coalesced_ops_;
+  mutable std::mutex p2p_mutex_;
 
   NeuronWatchdog watchdog_;
 

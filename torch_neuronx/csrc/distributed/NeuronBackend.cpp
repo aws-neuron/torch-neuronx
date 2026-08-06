@@ -3,19 +3,29 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
+#include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <string>
+#include <thread>
+#include <torch/csrc/distributed/c10d/PrefixStore.hpp>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronBarrier.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
+#include "torch_neuronx/csrc/core/OperationExecutionEngine.h"  // kHostWorkerThreads
 #include "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/rdma/RdmaManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/distributed/DistributedUtils.h"
 
@@ -31,9 +41,10 @@ namespace distributed {
 // Static shared callback — same function for all NeuronBackend instances
 py::object NeuronBackend::lower_callback_;
 
-NeuronBackend::NeuronBackend(const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
+NeuronBackend::NeuronBackend(const c10::intrusive_ptr<c10d::Store>& store,
+                             const c10::intrusive_ptr<c10d::Backend::Options>& options, int rank,
                              int size, int global_world_size, py::object lower_callback)
-    : c10d::Backend(rank, size), timeout_ms_(options->timeout.count()) {
+    : c10d::Backend(rank, size), timeout_ms_(options->timeout.count()), store_(store) {
   static std::atomic<uint64_t> uid_counter{0};
   pg_uid_ = std::to_string(uid_counter.fetch_add(1));
 
@@ -50,6 +61,9 @@ NeuronBackend::NeuronBackend(const c10::intrusive_ptr<c10d::Backend::Options>& o
     std::iota(group_ranks_.begin(), group_ranks_.end(), 0);
     global_world_size_ = size;
   }
+  // Cache global rank for RDMA P2P key indexing (rdma_ep_<global>,
+  // rdma_<src>_<dst>_<tag>_<seq>). See send/recv overrides.
+  global_rank_ = group_ranks_[rank];
   watchdog_.start();
 }
 
@@ -67,8 +81,11 @@ c10::intrusive_ptr<NeuronWork> NeuronBackend::CreateWork(const std::vector<at::T
   } else if (!inputs.empty()) {
     device_idx = inputs[0].device().index();
   } else {
-    TORCH_CHECK(op_type == c10d::OpType::BARRIER,
-                "CreateWork called with empty inputs and outputs for non-barrier op");
+    // BARRIER and COALESCED legitimately have no tensors (BARRIER never;
+    // COALESCED when every op in the batch was an intra-rank pair resolved via
+    // tensor.copy_). Fall back to the calling thread's current device.
+    TORCH_CHECK(op_type == c10d::OpType::BARRIER || op_type == c10d::OpType::COALESCED,
+                "CreateWork called with empty inputs and outputs for non-barrier/non-coalesced op");
     device_idx = c10_neuron::current_device();
   }
   auto stream = at::neuron::getCurrentNeuronStream(device_idx);
@@ -324,6 +341,291 @@ void NeuronBackend::FinishWork(c10::intrusive_ptr<NeuronWork>& work, bool async_
   work->recordEndEvent(stream, async_op);
   work->registerWithTensors();
   watchdog_.enqueueWork(work);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Point-to-point (RDMA over EFA)
+// ─────────────────────────────────────────────────────────────────────────
+namespace {
+
+// Sub-PGs (TP/DP/PP) wrap the same world TCPStore in distinct PrefixStores;
+// RdmaManager is process-global, so all PGs must agree on rdma_ep_<global>
+// keys. Walk PrefixStore -> root once.
+c10::intrusive_ptr<c10d::Store> UnwrapToRootStore(c10::intrusive_ptr<c10d::Store> s) {
+  if (auto* prefix = dynamic_cast<c10d::PrefixStore*>(s.get())) {
+    return prefix->getUnderlyingNonPrefixStore();
+  }
+  return s;
+}
+
+// Submit an RDMA P2P batch as a kHost op. efa-direct has no usable CQ wait fd,
+// so completions are busy-polled; running the whole exchange (PrepareBatch plus
+// the DrainAndPending poll loop) on the HostWorkerPool keeps both the network
+// round-trip and the spin off the engine RuntimeWorker.
+//
+// A single host worker (static_assert below) is load-bearing: RdmaManager's
+// mutable state (av_cache_, seq_counters_, registered_memory_, send_contexts_,
+// completed_recv_ids_, libfabric handles) is then touched by one thread and
+// needs no lock. findTensor (in PrepareBatch) is safe off the engine because the
+// producing AllocBind is ordered before this op's enqueue (per-stream FIFO, or
+// the caller's event/wait cross-stream) and Submit→WorkerLoop is a
+// release/acquire edge, so the bind happens-before the read; NeuronWork holds
+// the tensor's ref until the op retires, so it stays alive across the transfer.
+static_assert(at::neuron::kHostWorkerThreads == 1,
+              "RDMA P2P relies on a single-threaded host pool to serialize RdmaManager's "
+              "unguarded state; add locking before allowing >1 host worker.");
+void SubmitP2POp(std::vector<::neuron::P2PEntry> entries, int device_idx, int64_t timeout_ms) {
+  auto entries_owned = std::make_shared<std::vector<::neuron::P2PEntry>>(std::move(entries));
+  const auto timeout = std::chrono::milliseconds(timeout_ms);
+
+  // Host closure: PrepareBatch once (resolve VAs, exchange descriptors via the
+  // Store, post fi_writedata), then poll DrainAndPending until every entry
+  // completes. efa-direct gives the receiver no fabric event when a sender dies,
+  // so a per-batch deadline (armed on the first pending poll; timeout == 0
+  // disables it) bounds the poll. On expiry it throws: the WorkerLoop try/catch
+  // still fires AdvanceHostCompletion so a gated device op unblocks, and the
+  // error surfaces at the next Synchronize. In-flight SendContexts are left in
+  // the pool on throw — libfabric may still deliver their completions (carrying
+  // SendContext* as op_context), so freeing here would be a use-after-free; they
+  // are reclaimed in ~RdmaManager.
+  at::neuron::HostKernelExecution::HostFn drain_fn =
+      [entries_owned, timeout](const std::vector<at::neuron::TensorDataRef>&,
+                               const std::vector<at::neuron::TensorDataRef>&) {
+        auto& mgr = ::neuron::RdmaManager::Instance();
+        mgr.PrepareBatch(*entries_owned);  // idempotent; early-returns once prepared
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        while (true) {
+          if (!mgr.DrainAndPending(*entries_owned)) return;  // all entries done
+          if (timeout.count() > 0) {
+            if (!deadline) deadline = std::chrono::steady_clock::now() + timeout;
+            if (std::chrono::steady_clock::now() > *deadline) {
+              // Name the unfinished transfers so a cross-rank hang is
+              // diagnosable without re-running with traces.
+              std::string stuck;
+              for (const auto& e : *entries_owned) {
+                bool unfinished = (e.kind == ::neuron::P2PEntry::Kind::kRecv)
+                                      ? !e.recv_consumed
+                                      : (e.send_ctx != nullptr);
+                if (!unfinished) continue;
+                if (!stuck.empty()) stuck += ", ";
+                stuck += (e.kind == ::neuron::P2PEntry::Kind::kRecv ? "recv<-" : "send->") +
+                         std::to_string(e.peer) + " tag=" + std::to_string(e.tag);
+              }
+              throw std::runtime_error("RDMA P2P timeout after " + std::to_string(timeout.count()) +
+                                       "ms; unfinished transfers [" + stuck +
+                                       "] (peer may have failed)");
+            }
+          }
+          // No CQ wait fd on efa-direct; yield to avoid a 100% hot spin.
+          std::this_thread::yield();
+        }
+      };
+
+  auto kernel = std::make_unique<at::neuron::HostKernelExecution>(
+      "p2p::batch", std::vector<at::neuron::TensorDataRef>{},
+      std::vector<at::neuron::TensorDataRef>{}, std::move(drain_fn), device_idx);
+
+  auto context = std::make_unique<at::neuron::OperationContext>(std::move(kernel), "");
+  auto stream = at::neuron::getCurrentNeuronStream(device_idx);
+  at::neuron::SubmitOperationContext(stream, std::move(context));
+}
+
+}  // namespace
+
+void NeuronBackend::EnsureRdmaInit(at::Tensor& /*tensor*/, int /*peer_global*/) {
+  // Caller holds p2p_mutex_. Just hand RdmaManager the root store + this PG's
+  // global rank once; libfabric init, local-endpoint publish, and peer AV
+  // inserts all run on the host worker thread inside PrepareBatch where we have
+  // a real HBM VA (resolved via findTensor + nrt_tensor_get_va) needed to query
+  // NRT for the attached EFA BDF.
+  if (rdma_setup_done_) return;
+  auto& mgr = ::neuron::RdmaManager::Instance();
+  auto root = UnwrapToRootStore(store_);
+  TORCH_NEURONX_RDMA_INFO("EnsureRdmaInit: pg_uid=", pg_uid_, " global_rank=", global_rank_,
+                          " group_size=", group_ranks_.size(), " root_store=", root.get(), " (was ",
+                          store_.get(), ")");
+  mgr.SetStore(root);
+  mgr.SetRank(global_rank_);
+  rdma_setup_done_ = true;
+}
+
+c10::intrusive_ptr<c10d::Work> NeuronBackend::send(std::vector<at::Tensor>& tensors, int dstRank,
+                                                   int tag) {
+  TORCH_CHECK(tensors.size() == 1, "NeuronBackend::send takes exactly one tensor");
+  auto& tensor = tensors[0];
+  TORCH_CHECK(tensor.is_contiguous(), "NeuronBackend::send requires a contiguous tensor");
+  ValidateNeuronDevice(tensors, "send");
+
+  const int dst_global = ToGlobal(dstRank);
+  TORCH_NEURONX_RDMA_INFO(
+      "send: pg_uid=", pg_uid_, " self_global=", global_rank_, " dst_group=", dstRank,
+      " dst_global=", dst_global, " tag=", tag, " tensor.device=", tensor.device(),
+      " tensor.data_ptr=", tensor.data_ptr(), " bytes=", tensor.numel() * tensor.element_size(),
+      " coalescing=", coalescing_);
+
+  // Single critical section: coalescing-flag check + lazy AV setup. Closes a
+  // TOCTOU window with concurrent startCoalescing. Same-rank P2P is allowed
+  // inside coalescing (endCoalescing pairs SEND/RECV via at::Tensor::copy_)
+  // but rejected on the direct path — eager dist.send to self has no peer.
+  {
+    std::lock_guard<std::mutex> lock(p2p_mutex_);
+    if (coalescing_) {
+      coalesced_ops_.push_back({c10d::OpType::SEND, tensor, dst_global, tag});
+      return nullptr;
+    }
+    TORCH_CHECK(dst_global != global_rank_,
+                "NeuronBackend::send to self is not supported outside batch_isend_irecv. "
+                "Use batch_isend_irecv (which pairs SEND/RECV via at::Tensor::copy_) "
+                "or call tensor.copy_() directly.");
+    EnsureRdmaInit(tensor, dst_global);
+  }
+
+  std::vector<::neuron::P2PEntry> entries{
+      {::neuron::P2PEntry::Kind::kSend, tensor.data_ptr(),
+       static_cast<size_t>(tensor.numel() * tensor.element_size()), dst_global, tag}};
+
+  auto work = CreateWork(/*outputs=*/{tensor}, /*inputs=*/{tensor}, c10d::OpType::SEND,
+                         /*async_op=*/true);
+  SubmitP2POp(std::move(entries), tensor.device().index(), timeout_ms_);
+  FinishWork(work, /*async_op=*/true);
+  return work;
+}
+
+c10::intrusive_ptr<c10d::Work> NeuronBackend::recv(std::vector<at::Tensor>& tensors, int srcRank,
+                                                   int tag) {
+  TORCH_CHECK(tensors.size() == 1, "NeuronBackend::recv takes exactly one tensor");
+  auto& tensor = tensors[0];
+  TORCH_CHECK(tensor.is_contiguous(), "NeuronBackend::recv requires a contiguous tensor");
+  ValidateNeuronDevice(tensors, "recv");
+
+  const int src_global = ToGlobal(srcRank);
+  TORCH_NEURONX_RDMA_INFO(
+      "recv: pg_uid=", pg_uid_, " self_global=", global_rank_, " src_group=", srcRank,
+      " src_global=", src_global, " tag=", tag, " tensor.device=", tensor.device(),
+      " tensor.data_ptr=", tensor.data_ptr(), " bytes=", tensor.numel() * tensor.element_size(),
+      " coalescing=", coalescing_);
+
+  // Same-rank P2P is allowed inside coalescing (endCoalescing pairs SEND/RECV
+  // via at::Tensor::copy_) but rejected on the direct path.
+  {
+    std::lock_guard<std::mutex> lock(p2p_mutex_);
+    if (coalescing_) {
+      coalesced_ops_.push_back({c10d::OpType::RECV, tensor, src_global, tag});
+      return nullptr;
+    }
+    TORCH_CHECK(src_global != global_rank_,
+                "NeuronBackend::recv from self is not supported outside batch_isend_irecv. "
+                "Use batch_isend_irecv (which pairs SEND/RECV via at::Tensor::copy_) "
+                "or call tensor.copy_() directly.");
+    EnsureRdmaInit(tensor, src_global);
+  }
+
+  std::vector<::neuron::P2PEntry> entries{
+      {::neuron::P2PEntry::Kind::kRecv, tensor.data_ptr(),
+       static_cast<size_t>(tensor.numel() * tensor.element_size()), src_global, tag}};
+
+  auto work = CreateWork(/*outputs=*/{tensor}, /*inputs=*/{tensor}, c10d::OpType::RECV,
+                         /*async_op=*/true);
+  SubmitP2POp(std::move(entries), tensor.device().index(), timeout_ms_);
+  FinishWork(work, /*async_op=*/true);
+  return work;
+}
+
+void NeuronBackend::startCoalescing() {
+  std::lock_guard<std::mutex> lock(p2p_mutex_);
+  TORCH_NEURONX_RDMA_INFO("startCoalescing: pg_uid=", pg_uid_, " self_global=", global_rank_);
+  coalescing_ = true;
+  coalesced_ops_.clear();
+}
+
+c10::intrusive_ptr<c10d::Work> NeuronBackend::endCoalescing() {
+  std::vector<CoalescedOp> ops;
+  {
+    std::lock_guard<std::mutex> lock(p2p_mutex_);
+    coalescing_ = false;
+    ops = std::move(coalesced_ops_);
+    coalesced_ops_.clear();
+  }
+  TORCH_NEURONX_RDMA_INFO("endCoalescing: pg_uid=", pg_uid_, " self_global=", global_rank_,
+                          " ops=", ops.size());
+  for (size_t i = 0; i < ops.size(); ++i) {
+    const auto& op = ops[i];
+    TORCH_NEURONX_RDMA_DEBUG(
+        "endCoalescing:   op[", i, "] kind=", (op.op == c10d::OpType::SEND ? "SEND" : "RECV"),
+        " peer_global=", op.peer_global, " tag=", op.tag, " tensor.device=", op.tensor.device(),
+        " tensor.data_ptr=", op.tensor.data_ptr());
+  }
+
+  // Same-rank (peer == self) pairs in V-shaped schedules (e.g. ZBV) become
+  // local copies; never reach RdmaManager. Match by tag since peer collapses.
+  std::unordered_map<int, at::Tensor> local_sends;
+  std::vector<::neuron::P2PEntry> remote_entries;
+  remote_entries.reserve(ops.size());
+  std::vector<at::Tensor> remote_tensors;
+
+  for (const auto& op : ops) {
+    if (op.op == c10d::OpType::SEND && op.peer_global == global_rank_) {
+      // Two same-rank sends sharing a tag would silently drop one (emplace is a
+      // no-op on collision). That is a caller bug — fail loudly rather than
+      // lose data.
+      auto [unused, inserted] = local_sends.emplace(op.tag, op.tensor);
+      (void)unused;
+      TORCH_CHECK(inserted, "NeuronBackend::endCoalescing: duplicate same-rank send tag ", op.tag,
+                  " in one batch; tags must be unique per coalesced group");
+    }
+  }
+  for (const auto& op : ops) {
+    if (op.op == c10d::OpType::RECV && op.peer_global == global_rank_) {
+      auto it = local_sends.find(op.tag);
+      // A same-rank recv with no matching same-rank send at this tag would
+      // leave the recv tensor with stale data — surface it as a caller bug.
+      TORCH_CHECK(it != local_sends.end(), "NeuronBackend::endCoalescing: same-rank recv tag ",
+                  op.tag, " has no matching same-rank send in this batch");
+      auto recv_tensor = op.tensor;
+      recv_tensor.copy_(it->second);
+      local_sends.erase(it);
+      continue;
+    }
+    if (op.peer_global == global_rank_) continue;  // SEND with same-peer (paired above)
+
+    remote_entries.push_back({op.op == c10d::OpType::SEND ? ::neuron::P2PEntry::Kind::kSend
+                                                          : ::neuron::P2PEntry::Kind::kRecv,
+                              op.tensor.data_ptr(),
+                              static_cast<size_t>(op.tensor.numel() * op.tensor.element_size()),
+                              op.peer_global, op.tag});
+    remote_tensors.push_back(op.tensor);
+  }
+
+  // Every same-rank send must have been consumed by a matching recv above; a
+  // leftover means a send-to-self with no receiver in this group (caller bug).
+  TORCH_CHECK(local_sends.empty(), "NeuronBackend::endCoalescing: ", local_sends.size(),
+              " same-rank send(s) had no matching same-rank recv in this batch");
+
+  TORCH_NEURONX_RDMA_INFO("endCoalescing: partitioned ops=", ops.size(),
+                          " -> remote_entries=", remote_entries.size(),
+                          " local_pairs_resolved=", (ops.size() - remote_entries.size()) / 2);
+
+  if (remote_entries.empty()) {
+    auto work = CreateWork({}, {}, c10d::OpType::COALESCED, /*async_op=*/true);
+    FinishWork(work, /*async_op=*/true);
+    return work;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(p2p_mutex_);
+    for (size_t i = 0; i < remote_entries.size(); ++i) {
+      EnsureRdmaInit(remote_tensors[i], remote_entries[i].peer);
+    }
+  }
+
+  const int device_idx = remote_tensors.front().device().index();
+  TORCH_NEURONX_RDMA_INFO("endCoalescing: submitting batched kP2P op (", remote_entries.size(),
+                          " entries, device_idx=", device_idx, ")");
+  auto work = CreateWork(remote_tensors, remote_tensors, c10d::OpType::COALESCED,
+                         /*async_op=*/true);
+  SubmitP2POp(std::move(remote_entries), device_idx, timeout_ms_);
+  FinishWork(work, /*async_op=*/true);
+  return work;
 }
 
 std::vector<at::Tensor> NeuronBackend::ReduceScatterSubmit(

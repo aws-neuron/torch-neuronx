@@ -37,7 +37,10 @@ def _create_neuron_process_group(dist_backend_opts, pg_options):
         options.global_ranks_in_group = list(global_ranks_in_group)
     else:
         options.global_ranks_in_group = list(range(size))
-    return create_neuron_cpp_backend(options, rank, size, _WORLD_SIZE)
+    # For subgroups, `size` is the group size; `_WORLD_SIZE` is the true world size.
+    # `prefix_store` is threaded through so the C++ backend can publish/resolve
+    # RDMA descriptors via Store.set/get keyed by global rank.
+    return create_neuron_cpp_backend(prefix_store, options, rank, size, _WORLD_SIZE)
 
 
 def _register_neuron_backend():

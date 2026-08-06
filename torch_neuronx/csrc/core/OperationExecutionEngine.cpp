@@ -1188,6 +1188,7 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
       return false;
     }
     op->nrt_async_state_.is_pending_signal = true;
+    op->nrt_status_ = NRT_SUCCESS;  // Host ops have no NRT failure mode at schedule time
     pending_async_ops_count_.fetch_add(1);
     stream->AdvanceToNextOperation(op);
     return true;
@@ -1339,8 +1340,12 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
   // Complete operations
   for (auto* op : ops_to_complete) {
     if (op->nrt_async_state_.is_pending_signal) {
+      // Capture kernel_type BEFORE CompleteOperation (which destroys op).
+      const KernelTypeEnum kernel_type = op->GetKernelType();
       try {
-        if (op->GetKernelType() != KernelTypeEnum::kAlloc) {
+        // kAlloc is already scheduled in ScheduleAllocOperation; all other
+        // pending-signal host ops (events, hints, barriers, deallocs) Schedule here.
+        if (kernel_type != KernelTypeEnum::kAlloc) {
           op->execute_start = std::chrono::steady_clock::now();
           op->neuron_stream_os_tid = getOsTid();
           op->kernel_execution->Schedule(&op->nrt_status_, &op->nrt_async_state_.sequence_id,

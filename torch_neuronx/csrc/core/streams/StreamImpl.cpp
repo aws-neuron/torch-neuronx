@@ -545,7 +545,8 @@ bool StreamImpl::FrontOpInFlightWithLockHeld() const {
   }
 
   auto& front_op = runtime_queue_.front();
-  // Front op is in flight if directly scheduled, pending, or running on the host pool.
+  // Front op is in flight if directly scheduled, pending (events/barriers/
+  // allocs/deallocs), or running on the host pool (incl. RDMA P2P batches).
   if (front_op->nrt_async_state_.is_scheduled || front_op->nrt_async_state_.is_pending_signal ||
       front_op->nrt_async_state_.is_host_inflight.load(std::memory_order_acquire)) {
     return true;

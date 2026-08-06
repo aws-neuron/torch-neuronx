@@ -1,0 +1,17 @@
+{
+  "test_configurations": [
+    {
+      "class": "ScheduleTest",
+      "file": "distributed/pipelining/test_schedule_multiproc.py",
+      "skip_tests": [
+        {
+          "reason": "ScheduleDualPipeV needs 5+ stages, exceeds 4 ranks",
+          "tests": [
+            "test_custom_function_callback"
+          ]
+        }
+      ],
+      "xfail": []
+    }
+  ]
+}

@@ -120,6 +120,16 @@ def lower_collective_hlo(op_type, inputs, replica_groups, reduce_op, kwargs):
     return lower_fn(inputs, replica_groups, reduce_op, kwargs)
 
 
-def create_neuron_cpp_backend(options, rank, size, global_world_size):
-    """Create a C++ NeuronBackend process group."""
-    return NeuronBackend(options, rank, size, global_world_size, lower_collective_hlo)
+def create_neuron_cpp_backend(store, options, rank, size, global_world_size):
+    """Create a C++ NeuronBackend process group.
+
+    Args:
+        store: c10d.Store handed to the PG (typically a PrefixStore wrapping the
+            world TCPStore). Carried into NeuronBackend so RDMA P2P can publish
+            descriptors via Store.set/get keyed by global rank.
+        options: c10d.Backend.Options.
+        rank: group-local rank.
+        size: group size.
+        global_world_size: world size (across all PGs).
+    """
+    return NeuronBackend(store, options, rank, size, global_world_size, lower_collective_hlo)
