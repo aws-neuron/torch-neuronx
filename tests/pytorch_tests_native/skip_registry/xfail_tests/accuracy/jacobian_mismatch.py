@@ -424,4 +424,14 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_autograd.py::TestAutogradFunctional::test_vhp_create_graph_base_tensor",
     "test_autograd.py::TestAutogradFunctional::test_vhp_create_graph_logging_tensor",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_instance_norm_neuron_float64",
+    # aten::cosh / aten::sinh / aten::tan — gradcheck uses a float64 reference but
+    # Neuron computes in fp32, so the Jacobian can't meet the fp64 tolerance.
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_cosh_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_sinh_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_tan_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_tan_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_cosh_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_tan_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_cosh_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_cosh_neuron_float64",
 ]
