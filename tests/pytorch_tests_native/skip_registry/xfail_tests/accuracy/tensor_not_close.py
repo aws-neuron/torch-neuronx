@@ -166,6 +166,8 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_quick_softmax_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_tanh_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_var_mean_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_rnn_decomp_module_nn_LSTM_eval_mode_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_rnn_decomp_module_nn_LSTM_train_mode_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_rnn_decomp_module_nn_RNN_eval_mode_neuron_float64",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_add_fastpath_inplace_neuron_bfloat16",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_add_fastpath_inplace_neuron_float16",

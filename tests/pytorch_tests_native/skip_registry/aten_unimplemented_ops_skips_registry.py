@@ -195,8 +195,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*__prelu_kernel_backward_neuron*",
             "*__thnn_fused_gru_cell_neuron*",
             "*__thnn_fused_gru_cell_backward_neuron*",
-            "*__thnn_fused_lstm_cell_neuron*",
-            "*__thnn_fused_lstm_cell_backward_impl_neuron*",
             "*__upsample_bicubic2d_aa_neuron*",
             "*__upsample_bicubic2d_aa_backward_neuron*",
             "*__upsample_bilinear2d_aa_neuron*",
@@ -253,9 +251,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             " before failing."
         ),
         patterns=[
-            "*nn_LSTM*neuron*",
             "*nn_GRU*neuron*",
-            "*_LSTM_grad_and_gradgrad_neuron*",
             "*_GRU_grad_and_gradgrad_neuron*",
             "*_rnn_retain_variables_neuron*",
             "*_variable_sequence_neuron*",
