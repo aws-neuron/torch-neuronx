@@ -3,11 +3,13 @@
 Temporary workaround until upstream tests are refactored to be backend-agnostic.
 These patches require confirmation from the PyTorch WorkGroup
 
-Patches torch.compile, torch.allclose, and TestCase.assertEqual to handle
-device-agnostic test execution on Neuron without modifying upstream test files.
+Patches torch.compile, torch.allclose, torch.equal, and TestCase.assertEqual to
+handle device-agnostic test execution on Neuron without modifying upstream test
+files.
 
 - torch.compile: redirects standard backends (eager, inductor, etc.) to "neuron"
-- torch.allclose / assertEqual: moves tensors to the same device before comparison
+- torch.allclose / torch.equal / assertEqual: move tensors to the same device
+  before comparison
 """
 
 import torch
@@ -32,6 +34,38 @@ def _cross_device_allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False
     if input.device != other.device:
         other = other.to(input.device)
     return _original_allclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
+
+
+_original_equal = torch.equal
+
+
+def _cross_device_equal(input, other):
+    """Patch torch.equal to handle cross-device comparison (neuron vs cpu).
+
+    Upstream dynamo tests build a CPU reference and compare it against a
+    compiled result that the redirected ``backend="neuron"`` path returns on
+    ``neuron:0`` (e.g. ``test_exceptions.py::test_autocast_with_exception``).
+    The real ``aten::equal`` kernel refuses cross-device operands by contract,
+    so — as with ``allclose``/``assertEqual`` above — co-locate before
+    comparing. Non-tensor operands fall through to the original.
+
+    The body runs under ``DisableTorchFunction`` so ``TorchFunctionMode``
+    harnesses never intercept the inner call. ``test_meta.py`` keys its
+    ``meta_function_skips`` table by function identity at import time — after
+    this patch is applied — so the table holds *this shim* while the meta
+    crossref mode intercepts the *original* builtin, misses the skip entry,
+    and crashes (``aten::equal`` has no meta kernel on any backend). Hiding
+    the inner call reproduces the skip semantics upstream already mandates
+    for ``torch.equal`` across all dtypes.
+    """
+    with torch._C.DisableTorchFunction():
+        if (
+            isinstance(input, torch.Tensor)
+            and isinstance(other, torch.Tensor)
+            and input.device != other.device
+        ):
+            other = other.to(input.device)
+        return _original_equal(input, other)
 
 
 _original_assert_equal = _common_utils.TestCase.assertEqual
@@ -143,6 +177,7 @@ def apply_patches():
     """Apply all Neuron test patches."""
     torch.compile = _neuron_compile
     torch.allclose = _cross_device_allclose
+    torch.equal = _cross_device_equal
     _common_utils.TestCase.assertEqual = _cross_device_assert_equal
     override_gradcheck_defaults()
     _enable_neuron_attention_flags()

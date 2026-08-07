@@ -17,7 +17,8 @@
         "test_unary_ufuncs.py",
         "test_binary_ufuncs.py",
         "test_linalg.py",
-        "test_reductions.py"
+        "test_reductions.py",
+        "dynamo"
       ],
       "kind": "items"
     },
