@@ -98,3 +98,71 @@ func.func @torch.aten.normal_functional(%arg0: !torch.vtensor<[32, 64], f64>) ->
   %0 = torch.aten.normal_functional %arg0, %mean, %std, %none : !torch.vtensor<[32, 64], f64>, !torch.float, !torch.float, !torch.none -> !torch.vtensor<[32, 64], f64>
   return %0 : !torch.vtensor<[32, 64],f64>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.uniform$dynamic(
+// CHECK-SAME:                                    %[[ARG_0:.*]]: !torch.vtensor<[?,64],f64>) -> !torch.vtensor<[?,64],f64> {
+// CHECK:           %[[SELF:.*]] = torch_c.to_builtin_tensor %[[ARG_0]] : !torch.vtensor<[?,64],f64> -> tensor<?x64xf64>
+// CHECK:           %[[NONE:.*]] = torch.constant.none
+// CHECK:           %[[FLOAT_0:.*]] = torch.constant.float 0.000000e+00
+// CHECK:           %[[VAL_0:.*]] = torch_c.to_f64 %[[FLOAT_0]]
+// CHECK:           %[[FLOAT_1:.*]] = torch.constant.float 1.000000e+00
+// CHECK:           %[[VAL_1:.*]] = torch_c.to_f64 %[[FLOAT_1]]
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[SELF]], %[[C0]] : tensor<?x64xf64>
+// CHECK:           %[[DIM0_I64:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[SELF]], %[[C1]] : tensor<?x64xf64>
+// CHECK:           %[[DIM1_I64:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIM0_I64]], %[[DIM1_I64]] : tensor<2xi64>
+// CHECK:           %[[ELEM_0:.*]] = tensor.from_elements %[[VAL_0]] : tensor<1xf64>
+// CHECK:           %[[VAL_3:.*]] = stablehlo.convert %[[ELEM_0]] : tensor<1xf64>
+// CHECK:           %[[VAL_4:.*]] = stablehlo.reshape %[[VAL_3]] : (tensor<1xf64>) -> tensor<f64>
+// CHECK:           %[[ELEM_1:.*]] = tensor.from_elements %[[VAL_1]] : tensor<1xf64>
+// CHECK:           %[[VAL_5:.*]] = stablehlo.convert %[[ELEM_1]] : tensor<1xf64>
+// CHECK:           %[[VAL_6:.*]] = stablehlo.reshape %[[VAL_5]] : (tensor<1xf64>) -> tensor<f64>
+// CHECK:           %[[VAL_7:.*]] = stablehlo.rng %[[VAL_4]], %[[VAL_6]], %[[SHAPE]], distribution =  UNIFORM : (tensor<f64>, tensor<f64>, tensor<2xi64>) -> tensor<?x64xf64>
+// CHECK:           %[[VAL_8:.*]] = torch_c.from_builtin_tensor %[[VAL_7]] : tensor<?x64xf64> -> !torch.vtensor<[?,64],f64>
+// CHECK:           return %[[VAL_8]] : !torch.vtensor<[?,64],f64>
+func.func @torch.aten.uniform$dynamic(%arg0: !torch.vtensor<[?, 64],f64>) -> !torch.vtensor<[?, 64],f64> {
+  %none = torch.constant.none
+  %float0 = torch.constant.float 0.0
+  %float1 = torch.constant.float 1.0
+  %0 = torch.aten.uniform %arg0, %float0, %float1, %none : !torch.vtensor<[?, 64],f64>, !torch.float, !torch.float, !torch.none -> !torch.vtensor<[?, 64],f64>
+  return %0 : !torch.vtensor<[?, 64],f64>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.uniform$fully_dynamic(
+// CHECK-SAME:                                    %[[ARG_0:.*]]: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,?],f32> {
+// CHECK:           %[[SELF:.*]] = torch_c.to_builtin_tensor %[[ARG_0]] : !torch.vtensor<[?,?],f32> -> tensor<?x?xf32>
+// CHECK:           %[[NONE:.*]] = torch.constant.none
+// CHECK:           %[[FLOAT_0:.*]] = torch.constant.float -1.000000e+00
+// CHECK:           %[[VAL_0:.*]] = torch_c.to_f64 %[[FLOAT_0]]
+// CHECK:           %[[FLOAT_1:.*]] = torch.constant.float 1.000000e+00
+// CHECK:           %[[VAL_1:.*]] = torch_c.to_f64 %[[FLOAT_1]]
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[SELF]], %[[C0]] : tensor<?x?xf32>
+// CHECK:           %[[DIM0_I64:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[SELF]], %[[C1]] : tensor<?x?xf32>
+// CHECK:           %[[DIM1_I64:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIM0_I64]], %[[DIM1_I64]] : tensor<2xi64>
+// CHECK:           %[[ELEM_0:.*]] = tensor.from_elements %[[VAL_0]] : tensor<1xf64>
+// CHECK:           %[[VAL_3:.*]] = stablehlo.convert %[[ELEM_0]] : (tensor<1xf64>) -> tensor<1xf32>
+// CHECK:           %[[VAL_4:.*]] = stablehlo.reshape %[[VAL_3]] : (tensor<1xf32>) -> tensor<f32>
+// CHECK:           %[[ELEM_1:.*]] = tensor.from_elements %[[VAL_1]] : tensor<1xf64>
+// CHECK:           %[[VAL_5:.*]] = stablehlo.convert %[[ELEM_1]] : (tensor<1xf64>) -> tensor<1xf32>
+// CHECK:           %[[VAL_6:.*]] = stablehlo.reshape %[[VAL_5]] : (tensor<1xf32>) -> tensor<f32>
+// CHECK:           %[[VAL_7:.*]] = stablehlo.rng %[[VAL_4]], %[[VAL_6]], %[[SHAPE]], distribution =  UNIFORM : (tensor<f32>, tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           %[[VAL_8:.*]] = torch_c.from_builtin_tensor %[[VAL_7]] : tensor<?x?xf32> -> !torch.vtensor<[?,?],f32>
+// CHECK:           return %[[VAL_8]] : !torch.vtensor<[?,?],f32>
+func.func @torch.aten.uniform$fully_dynamic(%arg0: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,?],f32> {
+  %none = torch.constant.none
+  %float_neg1 = torch.constant.float -1.0
+  %float1 = torch.constant.float 1.0
+  %0 = torch.aten.uniform %arg0, %float_neg1, %float1, %none : !torch.vtensor<[?,?],f32>, !torch.float, !torch.float, !torch.none -> !torch.vtensor<[?,?],f32>
+  return %0 : !torch.vtensor<[?,?],f32>
+}

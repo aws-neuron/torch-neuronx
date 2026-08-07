@@ -10557,20 +10557,10 @@ public:
           op, "expected result type to have a dtype");
     }
 
-    int64_t cstLow, cstHigh;
-    if (!matchPattern(op.getLow(), m_TorchConstantInt(&cstLow)))
-      return rewriter.notifyMatchFailure(
-          op, "unimplemented: low must be a constant integer");
-    if (!matchPattern(op.getHigh(), m_TorchConstantInt(&cstHigh)))
-      return rewriter.notifyMatchFailure(
-          op, "unimplemented: high must be a constant integer");
-
     Value none = ConstantNoneOp::create(rewriter, loc);
     Value cstFalse = ConstantBoolOp::create(rewriter, loc, false);
-    Value low = Torch::ConstantFloatOp::create(
-        rewriter, loc, rewriter.getF64FloatAttr((double)cstLow));
-    Value high = Torch::ConstantFloatOp::create(
-        rewriter, loc, rewriter.getF64FloatAttr((double)cstHigh));
+    Value low = AtenFloatScalarOp::create(rewriter, loc, op.getLow());
+    Value high = AtenFloatScalarOp::create(rewriter, loc, op.getHigh());
 
     BaseTensorType floatResultType =
         cast<BaseTensorType>(resultTensorType.getWithSizesAndDtype(

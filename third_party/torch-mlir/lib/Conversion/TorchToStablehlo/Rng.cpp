@@ -11,6 +11,7 @@
 
 #include "./PopulatePatterns.h"
 
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "torch-mlir/Conversion/TorchToStablehlo/StablehloLegalizeUtils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
@@ -34,14 +35,24 @@ LogicalResult ConvertAtenOp<AtenUniformOp>::matchAndRewrite(
         op, "The generator has to be None because only global default "
             "generator is supported");
 
-  auto elements = cast<RankedTensorType>(self.getType()).getShape();
-  if (llvm::any_of(elements,
-                   [](int64_t dim) { return dim == ShapedType::kDynamic; }))
-    return rewriter.notifyMatchFailure(op, "Dynamic shape support TBD");
-  auto shape_tensor = stablehlo::ConstantOp::create(
-      rewriter, loc, rewriter.getI64TensorAttr(elements));
+  auto selfType = cast<RankedTensorType>(self.getType());
+  auto elements = selfType.getShape();
   auto outTy = getTypeConverter()->convertType(op.getType());
   auto outElemTy = cast<RankedTensorType>(outTy).getElementType();
+
+  Value shape_tensor;
+  if (llvm::any_of(elements,
+                   [](int64_t dim) { return dim == ShapedType::kDynamic; })) {
+    auto dimSizes = hlo::getDimSizesOfTensor(rewriter, op, self,
+                                             options.dimSizeIndexBits);
+    if (failed(dimSizes))
+      return failure();
+    shape_tensor = tensor::FromElementsOp::create(rewriter, loc, *dimSizes);
+  } else {
+    shape_tensor = stablehlo::ConstantOp::create(
+        rewriter, loc, rewriter.getI64TensorAttr(elements));
+  }
+
   Value from =
       hlo::scalarToStablehloTensor(rewriter, op, adaptor.getFrom(), outElemTy);
   Value to =
