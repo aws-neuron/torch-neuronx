@@ -37,6 +37,15 @@ int64_t _fused_sdp_choice_neuron(const at::Tensor& query, const at::Tensor& key,
     return SDPBackend_math;
   }
 
+  // Zero-size inputs (e.g. a zero-length query/key head dim, as in
+  // scaled_dot_product_attention with an empty embedding dim) cannot be handled
+  // by the fused NKI/MLIR kernels behind the overrideable backend. The math
+  // backend decomposes to matmul + softmax, which handle empty tensors
+  // correctly (matching CPU/CUDA), so route these edge cases there.
+  if (query.numel() == 0 || key.numel() == 0 || value.numel() == 0) {
+    return SDPBackend_math;
+  }
+
   // For now, use the overrideable backend whenever we're on Neuron device
   // and have the right tensor shapes. Our Python implementation will
   // handle the actual execution and can raise errors if it encounters
