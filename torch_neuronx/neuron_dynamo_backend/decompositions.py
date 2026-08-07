@@ -4010,6 +4010,51 @@ def randn_like_decomp(
     return _standard_normal(self, self.shape, dtype if dtype is not None else self.dtype)
 
 
+@register_decomposition([aten.rand.generator])
+def rand_generator_decomp(
+    size, *, generator=None, dtype=None, layout=None, device=None, pin_memory=None
+):
+    if generator is not None:
+        return NotImplemented
+    return aten.rand.default(size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+
+@register_decomposition([aten.randint.generator])
+def randint_generator_decomp(
+    high, size, *, generator=None, dtype=torch.long, layout=None, device=None, pin_memory=None
+):
+    if generator is not None:
+        return NotImplemented
+    return aten.randint.default(
+        high, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+@register_decomposition([aten.randint.generator_out])
+def randint_generator_out_decomp(high, size, *, generator=None, out):
+    if generator is not None:
+        return NotImplemented
+    return aten.randint.out(high, size, out=out)
+
+
+@register_decomposition([aten.randint.low_generator])
+def randint_low_generator_decomp(
+    low, high, size, *, generator=None, dtype=torch.long, layout=None, device=None, pin_memory=None
+):
+    if generator is not None:
+        return NotImplemented
+    return aten.randint.low(
+        low, high, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+@register_decomposition([aten.randint.low_generator_out])
+def randint_low_generator_out_decomp(low, high, size, *, generator=None, out):
+    if generator is not None:
+        return NotImplemented
+    return aten.randint.low_out(low, high, size, out=out)
+
+
 @register_decomposition([aten.uniform.default])
 def uniform_decomp(self, from_=0.0, to=1.0, *, generator=None):
     """Functional ``uniform`` (what ``uniform_`` is functionalized into)."""

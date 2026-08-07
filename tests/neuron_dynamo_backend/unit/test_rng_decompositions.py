@@ -325,3 +325,116 @@ class TestRandomInplaceDecompositionE2E:
         r = torch.compile(fn, backend="neuron", fullgraph=True)(x).cpu()
         assert r.min().item() >= 0
         assert r.max().item() < upper
+
+
+class TestRandGeneratorDecomposition:
+    """Unit tests for the ``rand``/``randint`` ``.generator`` overloads.
+
+    Currently expects real Generator inputs to assert NotImplemented
+    since that path is still not supported.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_cpu_rng(self, monkeypatch):
+        monkeypatch.setattr(decompositions, "_has_nki_rng", False)
+
+    def test_all_variants_registered(self):
+        for op in [
+            torch.ops.aten.rand.generator,
+            torch.ops.aten.randint.generator,
+            torch.ops.aten.randint.generator_out,
+            torch.ops.aten.randint.low_generator,
+            torch.ops.aten.randint.low_generator_out,
+        ]:
+            assert (
+                op in decompositions.neuron_decompositions
+            ), f"{op} missing from neuron_decompositions"
+
+    def test_rand_generator_shape_dtype_range(self):
+        r = decompositions.rand_generator_decomp([8, 8])
+        assert r.shape == (8, 8)
+        assert r.dtype == torch.float32
+        assert r.min().item() >= 0.0 and r.max().item() < 1.0
+
+    def test_randint_generator_shape_dtype_range(self):
+        r = decompositions.randint_generator_decomp(10, [8, 8])
+        assert r.shape == (8, 8)
+        assert r.dtype == torch.long
+        assert int(r.min().item()) >= 0 and int(r.max().item()) < 10
+
+    def test_randint_low_generator_shape_dtype_range(self):
+        r = decompositions.randint_low_generator_decomp(2, 10, [8, 8])
+        assert r.shape == (8, 8)
+        assert r.dtype == torch.long
+        assert int(r.min().item()) >= 2 and int(r.max().item()) < 10
+
+    def test_out_variants_write_and_return_out(self):
+        out = torch.empty(8, 8, dtype=torch.long)
+        r = decompositions.randint_generator_out_decomp(10, [8, 8], out=out)
+        assert r.data_ptr() == out.data_ptr()
+        assert int(out.min().item()) >= 0 and int(out.max().item()) < 10
+
+        out2 = torch.empty(8, 8, dtype=torch.long)
+        r2 = decompositions.randint_low_generator_out_decomp(2, 10, [8, 8], out=out2)
+        assert r2.data_ptr() == out2.data_ptr()
+        assert int(out2.min().item()) >= 2 and int(out2.max().item()) < 10
+
+    def test_generator_kwarg_returns_notimplemented(self):
+        """A user-supplied generator falls through to PyTorch's kernel."""
+        gen = torch.Generator()
+        out = torch.empty(4, dtype=torch.long)
+        assert decompositions.rand_generator_decomp([4], generator=gen) is NotImplemented
+        assert decompositions.randint_generator_decomp(10, [4], generator=gen) is NotImplemented
+        assert (
+            decompositions.randint_low_generator_decomp(2, 10, [4], generator=gen) is NotImplemented
+        )
+        assert (
+            decompositions.randint_generator_out_decomp(10, [4], generator=gen, out=out)
+            is NotImplemented
+        )
+        assert (
+            decompositions.randint_low_generator_out_decomp(2, 10, [4], generator=gen, out=out)
+            is NotImplemented
+        )
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestRandGeneratorDecompositionE2E:
+    """E2E: ``torch.compile(backend='neuron')`` traces the ``.generator``
+    overloads through our decompositions and executes them on-device.
+    """
+
+    def test_rand_generator_e2e(self):
+        def fn():
+            return torch.ops.aten.rand.generator([8, 8], generator=None, device="neuron")
+
+        r = torch.compile(fn, backend="neuron", fullgraph=True)().cpu()
+        assert r.shape == (8, 8)
+        assert r.min().item() >= 0.0 and r.max().item() < 1.0
+
+    def test_randint_generator_e2e(self):
+        def fn():
+            return torch.ops.aten.randint.generator(10, [8, 8], generator=None, device="neuron")
+
+        r = torch.compile(fn, backend="neuron", fullgraph=True)().cpu()
+        assert r.shape == (8, 8)
+        assert int(r.min().item()) >= 0 and int(r.max().item()) < 10
+
+    def test_randint_low_generator_e2e(self):
+        def fn():
+            return torch.ops.aten.randint.low_generator(
+                2, 10, [8, 8], generator=None, device="neuron"
+            )
+
+        r = torch.compile(fn, backend="neuron", fullgraph=True)().cpu()
+        assert r.shape == (8, 8)
+        assert int(r.min().item()) >= 2 and int(r.max().item()) < 10
+
+    def test_randint_generator_out_e2e(self):
+        def fn(o):
+            return torch.ops.aten.randint.generator_out(10, [8, 8], generator=None, out=o)
+
+        out = torch.empty(8, 8, dtype=torch.long, device="neuron")
+        r = torch.compile(fn, backend="neuron", fullgraph=True)(out).cpu()
+        assert r.shape == (8, 8)
+        assert int(r.min().item()) >= 0 and int(r.max().item()) < 10
