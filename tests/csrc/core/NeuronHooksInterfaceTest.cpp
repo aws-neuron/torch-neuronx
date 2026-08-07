@@ -67,7 +67,10 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
             });
 
     // Set up mock expectations for tensor operations
-    EXPECT_CALL(*mock_nrt_, nrt_tensor_free(_)).WillRepeatedly(Return());
+    // Frees can be issued by allocator cleanup after the fixture's required
+    // expectations have been verified, so this is a default action rather
+    // than an expected call count.
+    ON_CALL(*mock_nrt_, nrt_tensor_free(_)).WillByDefault(Return());
     EXPECT_CALL(*mock_nrt_, nrt_tensor_get_size(_)).WillRepeatedly(Return(1024));
     EXPECT_CALL(*mock_nrt_, nrt_tensor_get_va(_))
         .WillRepeatedly(::testing::Invoke([](const nrt_tensor* tensor) -> void* {
@@ -112,7 +115,6 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
       at::neuron::synchronize(device);
     }
     c10_neuron::NeuronCachingAllocator::emptyCache();
-    ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
     mock_session_.reset();
   }
 
