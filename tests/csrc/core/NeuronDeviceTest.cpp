@@ -177,6 +177,10 @@ TEST_F(NeuronDeviceTest, ThreadLocalCurrentDevice) {
   EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
       .WillRepeatedly(DoAll(SetArgPointee<0>(4), Return(NRT_SUCCESS)));
 
+  // Seed the process-wide default before worker threads compete to set their
+  // thread-local devices. New workers are required to begin on device 0.
+  c10_neuron::set_device(0);
+
   const int num_threads = 4;
   std::vector<std::thread> threads;
   std::vector<int> results(num_threads);
