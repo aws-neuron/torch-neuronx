@@ -5779,6 +5779,122 @@ def special_log_ndtr_decomp(x):
     return _special_upcast(_log_ndtr_impl)(x)
 
 
+# ── Regularized incomplete gamma (igamma / igammac / gammainc / gammaincc) ───
+# There is no CHLO op and no primitive breakdown (PyTorch's _refs.igamma just
+# calls the leaf ``prims.igamma``), so torch-mlir sees an opaque
+# ``torch.operator``. Implement the standard Numerical-Recipes / Cephes split
+# that PyTorch's own kernel uses: a power series for the lower branch
+# (x < a+1) and a continued fraction (modified Lentz) for the upper branch
+# (x >= a+1). Both are unrolled to a fixed iteration count so the graph stays
+# static, both branches are always evaluated, and the natively-accurate one is
+# selected per element with torch.where. ``lgamma``/``exp``/``log`` all lower.
+#
+#   igamma(a, x)  == special_gammainc(a, x)   = P(a, x)  (lower, regularized)
+#   igammac(a, x) == special_gammaincc(a, x)  = Q(a, x)  = 1 - P(a, x)
+#
+# ITMAX=100 matches Numerical Recipes and reaches fp32 accuracy across the
+# a,x domain exercised here; FPMIN guards the continued fraction against a
+# zero pivot (modified-Lentz).
+_IGAMMA_ITERS = 100
+_IGAMMA_FPMIN = 1e-30
+
+
+def _igamma_series_lower(a, x):
+    """Lower regularized incomplete gamma P(a, x) via the power series
+    (accurate for x < a+1), unrolled ``_IGAMMA_ITERS`` terms.
+
+    P(a,x) = exp(a*ln(x) - x - lgamma(a)) * sum_{n>=0} x^n / (a(a+1)...(a+n)).
+    At x == 0 the prefactor is 0 so P = 0 (handled explicitly to avoid 0*inf).
+    """
+    safe_x = torch.where(x > 0, x, torch.ones_like(x))
+    pref = torch.exp(a * torch.log(safe_x) - x - torch.lgamma(a))
+    pref = torch.where(x > 0, pref, torch.zeros_like(x))
+    ap = a
+    term = 1.0 / a
+    total = term
+    for _ in range(_IGAMMA_ITERS):
+        ap = ap + 1.0
+        term = term * x / ap
+        total = total + term
+    return pref * total
+
+
+def _igammac_cf_upper(a, x):
+    """Upper regularized incomplete gamma Q(a, x) via the continued fraction
+    (modified Lentz, accurate for x >= a+1), unrolled ``_IGAMMA_ITERS`` steps."""
+    pref = torch.exp(a * torch.log(x) - x - torch.lgamma(a))
+    fpmin = _IGAMMA_FPMIN
+    b = x + 1.0 - a
+    c = torch.full_like(x, 1.0 / fpmin)
+    d = 1.0 / torch.where(torch.abs(b) < fpmin, torch.full_like(b, fpmin), b)
+    h = d
+    for i in range(1, _IGAMMA_ITERS + 1):
+        an = -i * (i - a)
+        b = b + 2.0
+        d = an * d + b
+        d = torch.where(torch.abs(d) < fpmin, torch.full_like(d, fpmin), d)
+        c = b + an / c
+        c = torch.where(torch.abs(c) < fpmin, torch.full_like(c, fpmin), c)
+        d = 1.0 / d
+        h = h * (d * c)
+    return pref * h
+
+
+def _igamma_impl(a, x, *, upper):
+    """Return Q(a,x) (``upper``) or P(a,x), selecting the natively-accurate
+    branch per element and matching eager's NaN domain exactly. bf16/fp16
+    inputs are computed in fp32 and cast back.
+
+    Eager NaN domain (verified against torch.igamma):
+      a>0, x>=0  -> finite in [0,1]
+      a==0, x>0  -> P=1, Q=0   (limit as a->0+)
+      a<0, or x<0, or (a==0 & x==0) -> NaN
+    """
+    result_dtype = torch.promote_types(a.dtype, x.dtype)
+    compute = torch.float32 if result_dtype in (torch.float16, torch.bfloat16) else result_dtype
+    a = a.to(compute)
+    x = x.to(compute)
+
+    # Evaluate the series/CF on a domain-safe a>0 so ``1/a`` and ``lgamma(a)``
+    # never see a<=0; out-of-domain lanes are overwritten by the mask below.
+    a_safe = torch.where(a > 0, a, torch.ones_like(a))
+    use_cf = x >= (a_safe + 1.0)
+    lower_P = _igamma_series_lower(a_safe, x)
+    upper_Q = _igammac_cf_upper(a_safe, x)
+    P = torch.where(use_cf, 1.0 - upper_Q, lower_P)
+    Q = torch.where(use_cf, upper_Q, 1.0 - lower_P)
+    out = Q if upper else P
+
+    # a==0, x>0 boundary: P=1, Q=0.
+    a0 = (a == 0) & (x > 0)
+    out = torch.where(a0, torch.zeros_like(out) if upper else torch.ones_like(out), out)
+
+    finite_domain = ((a > 0) & (x >= 0)) | a0
+    # Defensive: a device transcendental (exp/log/lgamma) can overflow to
+    # inf/nan at an extreme saturated input where the CPU kernel stays finite.
+    # On the finite domain replace any non-finite result with the saturated
+    # bound (P->1 when x dominates a, else 0; Q is the complement) so we never
+    # emit a one-sided NaN vs eager.
+    sat_lower = (x >= a_safe).to(out.dtype)
+    sat = (1.0 - sat_lower) if upper else sat_lower
+    out = torch.where(finite_domain & ~torch.isfinite(out), sat, out)
+
+    out = torch.where(finite_domain, out, torch.full_like(out, float("nan")))
+    return out.to(result_dtype)
+
+
+@register_decomposition([aten.igamma.default, aten.special_gammainc.default])
+def igamma_decomp(a, x):
+    """P(a, x) — regularized lower incomplete gamma (a=self, x=other)."""
+    return _igamma_impl(a, x, upper=False)
+
+
+@register_decomposition([aten.igammac.default, aten.special_gammaincc.default])
+def igammac_decomp(a, x):
+    """Q(a, x) = 1 - P(a, x) — regularized upper incomplete gamma."""
+    return _igamma_impl(a, x, upper=True)
+
+
 def _laguerre_impl(x, n):
     """L_n(x) via the 3-term recurrence, unrolled since n is compile-time."""
     if n == 0:
@@ -5794,8 +5910,8 @@ def _laguerre_impl(x, n):
 def _extract_int_scalar(n):
     """Return n as a Python int only if it's already a Python scalar; else None.
 
-    Tensor n (including 0-d) returns None so the caller bails to NotImplemented.
-    .item() on a FakeTensor during trace raises DataDependentOutputException;
+    Tensor n (including 0-d) returns None so the caller routes to the tensor-n
+    path. .item() on a FakeTensor during trace raises DataDependentOutputException;
     keeping decomp behavior explicit is cleaner than relying on that exception.
     """
     if isinstance(n, int | float):
@@ -5803,15 +5919,67 @@ def _extract_int_scalar(n):
     return None
 
 
+# Fixed order cap for the per-element (tensor n) Laguerre path. The effective
+# order is trunc(n), which is tiny in practice (sample n in [-5,5] -> orders
+# 0..4); 16 covers all realistic orders with a small graph and no fp32 overflow
+# for x in the tested range. Exact for trunc(n) <= this cap; higher orders are
+# out of contract and return NaN (see _laguerre_tensor_n_impl) — supporting them
+# would need a data-dependent loop length (dynamic shapes, NCF-1791).
+_LAGUERRE_MAX_ORDER = 16
+
+
+def _laguerre_tensor_n_impl(x, n):
+    """L_n(x) for a per-element tensor order ``n``, matching eager's kernel
+    semantics exactly (verified against laguerre_polynomial_l_forward):
+
+      * effective order m = trunc(n)  (round toward zero; the kernel casts n to
+        int64), so e.g. n=2.7 -> L_2 and n=-0.5 -> L_0=1;
+      * m < 0 (i.e. n <= -1) returns 0;
+      * otherwise the standard 3-term recurrence, with L_n(0)=1 falling out.
+
+    Evaluated with a fixed-depth (``_LAGUERRE_MAX_ORDER``) unrolled recurrence
+    plus a per-element select, since a data-dependent loop length can't be
+    traced under static shapes. x and n broadcast against each other. bf16/fp16
+    inputs are computed in fp32 and cast back.
+
+    Orders above ``_LAGUERRE_MAX_ORDER`` are out of contract (the unroll doesn't
+    reach them). Such lanes are set to NaN rather than left holding the last
+    computed ``L_MAX_ORDER`` value: the loop's ``m == k`` selects only fire for
+    ``k <= _LAGUERRE_MAX_ORDER``, so without this an order-17+ element would
+    silently return a plausible-but-wrong finite number. NaN makes the
+    out-of-range failure detectable instead. ``n`` is a runtime tensor, so this
+    can't be a trace-time error; the mask is the compile-safe equivalent.
+    """
+    orig = x.dtype
+    compute = torch.float32 if orig in (torch.float16, torch.bfloat16) else orig
+    x = x.to(compute)
+    m = torch.trunc(n.to(compute))  # integer-valued order (toward zero)
+
+    L0 = torch.ones_like(x)
+    L1 = 1.0 - x
+    result = torch.where(m == 0, L0, L1)  # m==0 -> L0; m>=1 tentatively L1
+    Lkm1, Lk = L0, L1
+    for k in range(2, _LAGUERRE_MAX_ORDER + 1):
+        Lkp1 = ((2.0 * (k - 1) + 1.0 - x) * Lk - (k - 1) * Lkm1) / k
+        result = torch.where(m == float(k), Lkp1, result)
+        Lkm1, Lk = Lk, Lkp1
+    result = torch.where(m < 0, torch.zeros_like(result), result)  # n<=-1 -> 0
+    # Out-of-contract orders (m > cap): the unroll never selected them, so emit
+    # NaN instead of the stale L_MAX_ORDER carried in ``result``.
+    result = torch.where(m > _LAGUERRE_MAX_ORDER, torch.full_like(result, float("nan")), result)
+    return result.to(orig)
+
+
 @register_decomposition([aten.special_laguerre_polynomial_l.default])
 def laguerre_polynomial_l_default_decomp(x, n):
     n_int = _extract_int_scalar(n)
-    if n_int is None or n_int < 0:
-        # n must be a compile-time int to unroll the recurrence; tensor n
-        # (incl. 0-d) can't be extracted during FakeTensor tracing, and
-        # negative n is outside the Laguerre polynomial domain.
-        return NotImplemented
-    return _special_upcast(_laguerre_impl)(x, n_int)
+    if n_int is not None:
+        # Compile-time scalar order: exact unroll (any order); n<0 -> 0.
+        if n_int < 0:
+            return torch.zeros_like(x)
+        return _special_upcast(_laguerre_impl)(x, n_int)
+    # Per-element tensor order.
+    return _laguerre_tensor_n_impl(x, n)
 
 
 @register_decomposition([aten.special_laguerre_polynomial_l.n_scalar])
@@ -5821,12 +5989,10 @@ def laguerre_polynomial_l_n_scalar_decomp(x, n):
 
 @register_decomposition([aten.special_laguerre_polynomial_l.x_scalar])
 def laguerre_polynomial_l_x_scalar_decomp(x, n):
-    n_int = _extract_int_scalar(n)
-    if n_int is None or n_int < 0:
-        # Same as .default: tensor n can't be unrolled, negative n is invalid.
-        return NotImplemented
-    x_t = torch.tensor(float(x), dtype=torch.get_default_dtype())
-    return _special_upcast(_laguerre_impl)(x_t, n_int)
+    # x is a Python scalar; n is a per-element tensor of orders. Broadcast x to
+    # n's shape (as fp32) and reuse the tensor-n recurrence.
+    x_t = torch.full_like(n, float(x), dtype=torch.float32)
+    return _laguerre_tensor_n_impl(x_t, n)
 
 
 @register_decomposition([aten.polygamma.default])
