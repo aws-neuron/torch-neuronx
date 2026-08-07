@@ -468,6 +468,49 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
     }
   }
 
+  // Cross-device out= guard. A write-aliased (out=/inplace) tensor on a device
+  // different from the Neuron inputs is the same-device violation PyTorch
+  // reports up front. Without this, at::native::cpu_fallback proceeds and later
+  // fails in _copy_from_and_resize when copying the Neuron result into a
+  // non-Neuron out (e.g. linalg cholesky/qr/svd with a CPU out=).
+  {
+    const auto& schema = op.schema();
+    const auto n_args = schema.arguments().size();
+    if (stack->size() >= n_args) {
+      const auto args_begin = stack->size() - n_args;
+      // Device of the Neuron inputs (first non-write PrivateUse1 tensor).
+      c10::optional<c10::Device> in_dev;
+      for (size_t i = 0; i < n_args && !in_dev.has_value(); ++i) {
+        const auto& info = schema.arguments()[i].alias_info();
+        const bool is_write = info != nullptr && info->isWrite();
+        const auto& v = (*stack)[args_begin + i];
+        if (!is_write && v.isTensor()) {
+          const auto& t = v.toTensor();
+          if (t.defined() && t.device().type() == c10::DeviceType::PrivateUse1) {
+            in_dev = t.device();
+          }
+        }
+      }
+      if (in_dev.has_value()) {
+        for (size_t i = 0; i < n_args; ++i) {
+          const auto& info = schema.arguments()[i].alias_info();
+          const bool is_write = info != nullptr && info->isWrite();
+          if (!is_write) continue;
+          const auto& v = (*stack)[args_begin + i];
+          if (v.isTensor()) {
+            const auto& t = v.toTensor();
+            if (t.defined() && t.device() != *in_dev) {
+              TORCH_CHECK(false,
+                          "Expected all tensors to be on the same device, but the output tensor"
+                          " is on ",
+                          t.device().str(), " and the inputs are on ", in_dev->str());
+            }
+          }
+        }
+      }
+    }
+  }
+
   at::native::cpu_fallback(op, stack);
 }
 
