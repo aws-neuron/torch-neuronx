@@ -36,6 +36,25 @@ class TestCpuFallback:
         expected = torch.ops.aten._test_optional_intlist(x_cpu, None)
         assert torch.allclose(y.cpu(), expected)
 
+    @assert_raises(RuntimeError, match="Expected all tensors to be on the same device")
+    def test_cross_device_out_raises_same_device_error(self):
+        """A CPU-fallback op with an out= on a different device than the Neuron
+        inputs raises PyTorch's standard same-device error up front, rather than
+        failing later in the fallback's _copy_from_and_resize copy-back step
+        (which can't copy a CPU result into a CPU out via a PrivateUse1-only op).
+        cholesky is a CPU-fallback linalg op that exercises this path.
+        """
+        a = torch.eye(3, dtype=torch.float32, device="neuron")
+        cpu_out = torch.empty(0, dtype=torch.float32, device="cpu")
+        torch.linalg.cholesky(a, out=cpu_out)
+
+    def test_same_device_out_fills_correctly(self):
+        """Same-device out= for a CPU-fallback linalg op is still filled correctly."""
+        a = torch.eye(3, dtype=torch.float32, device="neuron")
+        out = torch.empty(0, dtype=torch.float32, device="neuron")
+        torch.linalg.cholesky(a, out=out)
+        torch.testing.assert_close(out.cpu(), torch.linalg.cholesky(a).cpu())
+
     @assert_raises(
         RuntimeError,
         match="torch.histogram: input tensor and hist tensor should have the same dtype, "
