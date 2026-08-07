@@ -44,6 +44,18 @@ def _div_compute(x, y, rounding_mode=None):
     yy = y.float() if (up and isinstance(y, torch.Tensor)) else y
 
     if rounding_mode is None:
+        # Lower bool true division directly. Converting an expanded bool input
+        # during dispatch can otherwise lose the distinction between 0/0 and 1/0.
+        if (
+            isinstance(x, torch.Tensor)
+            and isinstance(y, torch.Tensor)
+            and x.dtype == torch.bool
+            and y.dtype == torch.bool
+        ):
+            x_float = x.to(torch.get_default_dtype())
+            inf = torch.full_like(x_float, float("inf"))
+            nan = torch.full_like(x_float, float("nan"))
+            return torch.where(y, x_float, torch.where(x, inf, nan))
         result = xx / yy
         return result.to(x.dtype) if up else result
 

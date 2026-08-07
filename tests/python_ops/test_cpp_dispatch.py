@@ -60,6 +60,40 @@ class TestCppDispatchRegistration:
             ce_ops == []
         ), f"cross_entropy_loss should be skipped from dispatch registration, found: {ce_ops}"
 
+    def test_preprocessing_validation_uses_original_inputs_first(self):
+        """Validation sees logical dtypes before preprocessing sees downcasted inputs."""
+        from torch_neuronx.python_ops.torch_mlir.operation_registry import (
+            _make_preprocessing_lower,
+        )
+
+        events = []
+
+        def validate(tensors):
+            events.append(("validate", tensors[0].dtype))
+
+        def preprocess(tensors):
+            events.append(("preprocess", tensors[0].dtype))
+            return lambda: None, (), {}
+
+        lower = _make_preprocessing_lower(
+            preprocess,
+            "aten::_test_preprocessing_validation",
+            output_params=None,
+            static_argnums=None,
+            static_argnames=None,
+            validate_fn=validate,
+        )
+        lower(
+            [torch.ones(1, dtype=torch.int32)],
+            original_args=([torch.ones(1, dtype=torch.int8)],),
+            original_kwargs={},
+        )
+
+        assert events == [
+            ("validate", torch.int8),
+            ("preprocess", torch.int32),
+        ]
+
 
 # ============================================================================
 # 2. LoweringResult (C++ bound class) tests

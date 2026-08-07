@@ -70,6 +70,24 @@ def _check_tensors_scalars(tensors, scalars):
         raise RuntimeError("Tensor list must have same number of elements as scalar list.")
 
 
+def _check_broadcastable_shapes(t1, t2):
+    if t1.shape == t2.shape:
+        return
+    try:
+        torch.broadcast_shapes(t1.shape, t2.shape)
+    except RuntimeError:
+        for dim in range(max(t1.ndim, t2.ndim)):
+            d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
+            d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
+            if d1 != d2 and d1 != 1 and d2 != 1:
+                actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
+                raise RuntimeError(
+                    f"The size of tensor a ({d1}) must match the size of "
+                    f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
+                ) from None
+        raise
+
+
 def _check_tensors_tensors(tensors1, tensors2):
     _check_tensors(tensors1)
     _check_tensors(tensors2)
@@ -80,21 +98,7 @@ def _check_tensors_tensors(tensors1, tensors2):
             f"got {len(tensors1)} and {len(tensors2)}"
         )
     for t1, t2 in zip(tensors1, tensors2, strict=False):
-        if t1.numel() == 0 or t2.numel() == 0 or t1.shape == t2.shape:
-            continue
-        try:
-            torch.broadcast_shapes(t1.shape, t2.shape)
-        except RuntimeError:
-            for dim in range(max(t1.ndim, t2.ndim)):
-                d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
-                d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
-                if d1 != d2 and d1 != 1 and d2 != 1:
-                    actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
-                    raise RuntimeError(
-                        f"The size of tensor a ({d1}) must match the size of "
-                        f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
-                    ) from None
-            raise
+        _check_broadcastable_shapes(t1, t2)
 
 
 def _cast_results(op, results):
@@ -105,15 +109,60 @@ def _cast_results(op, results):
 
 
 def _check_div_inplace_dtype(op, tensors):
-    """Raise if inplace div on integer tensors, matching CPU behavior."""
+    """Raise if inplace div would produce a dtype that cannot be stored."""
     if op != "div":
         return
     for t in tensors:
         if not t.dtype.is_floating_point:
+            result_dtype = torch.true_divide(
+                torch.ones(1, dtype=t.dtype),
+                torch.ones(1, dtype=t.dtype),
+            ).dtype
             raise RuntimeError(
-                "result type Float can't be cast to the desired output type "
-                f"{str(t.dtype).replace('torch.', '').capitalize()}"
+                f"result type {result_dtype} can't be cast to the desired output type {t.dtype}"
             )
+
+
+def _make_div_inplace_validator(variant):
+    """Preserve schema error ordering before preprocessing changes dtypes."""
+
+    def validate(tensors, other, *args, **kwargs):
+        # Keep this preprocessor validation pure: device normalization belongs
+        # to the operation factory and must not mutate inputs before an error.
+        if variant == "tensor":
+            _check_scalar_tensor(other)
+
+        if not tensors:
+            raise RuntimeError("Tensor list must have at least one tensor.")
+
+        if variant == "list":
+            if not other:
+                raise RuntimeError("Tensor list must have at least one tensor.")
+            if len(tensors) != len(other):
+                raise RuntimeError(
+                    f"Tensor lists must have the same number of tensors, "
+                    f"got {len(tensors)} and {len(other)}"
+                )
+            for tensor, other_tensor in zip(tensors, other, strict=False):
+                _check_broadcastable_shapes(tensor, other_tensor)
+        elif variant == "scalarlist":
+            if len(tensors) != len(other):
+                raise RuntimeError("Tensor list must have same number of elements as scalar list.")
+
+        _check_div_inplace_dtype("div", tensors)
+
+    return validate
+
+
+def _check_bool_sub(op, *tensor_lists):
+    """Match Tensor.sub's rejection of subtraction involving bool tensors."""
+    if op != "sub":
+        return
+    if any(t.dtype == torch.bool for tensors in tensor_lists for t in tensors):
+        raise RuntimeError(
+            "Subtraction, the `-` operator, with two bool tensors is not supported. "
+            "Use the `^` or `logical_xor()` operator instead."
+        )
 
 
 _DTYPE_NAMES = {}
@@ -215,6 +264,28 @@ def _promote_inside(op, tensors, scalars=None):
         else:
             out.append(t.to(rt))
     return out
+
+
+def _promote_div_pairs(tensors1, tensors2, *, empty_only=False):
+    """Promote tensor-list division operands to each pair's result dtype."""
+    promoted1 = []
+    promoted2 = []
+    for t1, t2 in zip(tensors1, tensors2, strict=False):
+        result_dtype = torch.result_type(t1, t2)
+        if not result_dtype.is_floating_point:
+            result_dtype = torch.get_default_dtype()
+
+        pair = []
+        for tensor in (t1, t2):
+            if tensor.dtype == result_dtype or (empty_only and tensor.numel() != 0):
+                pair.append(tensor)
+            elif tensor.numel() == 0:
+                pair.append(torch.empty(tensor.shape, dtype=result_dtype, device=tensor.device))
+            else:
+                pair.append(tensor.to(result_dtype))
+        promoted1.append(pair[0])
+        promoted2.append(pair[1])
+    return promoted1, promoted2
 
 
 def _replace_empty(tensors, op=""):
@@ -339,18 +410,18 @@ def _make_list_op(op):
 
     def fn(tensors1, tensors2, *args, out=None, alpha=1):
         _check_tensors_tensors(tensors1, tensors2)
+        _check_bool_sub(op, tensors1, tensors2)
         # Both operands are tensors, so cross-dtype promotion is traced
-        # natively; only div needs the float32 empty placeholders (NCC_ISPP060).
+        # inside compute_fn. Div empties are promoted here because the compiler
+        # rejects dtype conversion on zero-size tensors (NCC_ISPP060).
         if is_div:
-            tensors1 = _replace_empty_promoted(tensors1, torch.float32)
-            tensors2 = _replace_empty_promoted(tensors2, torch.float32)
+            tensors1, tensors2 = _promote_div_pairs(tensors1, tensors2, empty_only=True)
         else:
             tensors1 = _replace_empty(tensors1)
 
         def compute_fn(tensors1, tensors2, **kwargs):
             if is_div:
-                tensors1 = [t.float() if not t.dtype.is_floating_point else t for t in tensors1]
-                tensors2 = [t.float() if not t.dtype.is_floating_point else t for t in tensors2]
+                tensors1, tensors2 = _promote_div_pairs(tensors1, tensors2)
             if has_alpha:
                 results = nki_fn(tensors1, tensors2, kwargs.get("alpha", 1))
             else:
@@ -378,6 +449,7 @@ def _make_list_inplace_op(op):
 
     def fn(tensors1, tensors2, *args, out=None, alpha=1):
         _check_tensors_tensors(tensors1, tensors2)
+        _check_bool_sub(op, tensors1, tensors2)
         _check_div_inplace_dtype(op, tensors1)
         non_empty_t1 = [t for t in tensors1 if t.numel() > 0]
         non_empty_t2 = [t2 for t1, t2 in zip(tensors1, tensors2, strict=False) if t1.numel() > 0]
@@ -908,9 +980,25 @@ for _aten_names, _fn in _OP_REGISTRATIONS:
     _is_div = any("_foreach_div" in n for n in _aten_names)
     _is_scalarlist = any("ScalarList" in n for n in _aten_names)
     _is_scalar = any(n.endswith(".Scalar") or n.endswith(".Scalar_out") for n in _aten_names)
+    _validator_variant = (
+        "scalarlist"
+        if _is_scalarlist
+        else "list"
+        if any(".List" in n for n in _aten_names)
+        else "tensor"
+        if any(".Tensor" in n for n in _aten_names)
+        else "scalar"
+    )
     _prep = (
         Preprocessing.SHAPE_ONLY
         if (not _is_inplace and not _is_div and not _is_scalarlist and not _is_scalar)
         else Preprocessing.VALUE_DEPENDENT
     )
-    register_aten(_aten_names, preprocessing=_prep)(_fn)
+    _validate = (
+        _make_div_inplace_validator(_validator_variant) if (_is_inplace and _is_div) else None
+    )
+    register_aten(
+        _aten_names,
+        preprocessing=_prep,
+        validate_static_inputs=_validate,
+    )(_fn)
