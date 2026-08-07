@@ -1134,3 +1134,67 @@ def test_sdpa_backward_stride0_kv_from_expand_reshape(q_heads, kv_heads, seq_len
     assert q.grad.stride() == q_cpu.grad.stride(), (q.grad.stride(), q_cpu.grad.stride())
     assert k.grad.stride() == k_cpu.grad.stride(), (k.grad.stride(), k_cpu.grad.stride())
     assert v.grad.stride() == v_cpu.grad.stride(), (v.grad.stride(), v_cpu.grad.stride())
+
+
+def test_scaled_dot_product_attention_zero_qk_head_dim():
+    """Zero-size query/key head dim (embedding dim == 0).
+
+    The fused NKI/MLIR kernels behind the 'overrideable' backend cannot handle
+    empty inputs, so `_fused_sdp_choice_neuron` routes this to the math backend
+    (matmul + softmax), which handles empty tensors like CPU/CUDA. Regression
+    test for the "Expected Tensor but got InvalidTag" corruption on head_dim=0.
+    """
+    torch.manual_seed(0)
+    device = torch.device("neuron", 0)
+    for value_dim in (1, 8):
+        for scale in (1.0, None):
+            q = torch.empty((1, 16, 16, 0), device=device)
+            k = torch.empty((1, 16, 16, 0), device=device)
+            v = torch.randn((1, 16, 16, value_dim), device=device)
+
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale)
+            ref = F.scaled_dot_product_attention(
+                q.cpu(), k.cpu(), v.cpu(), dropout_p=0.0, scale=scale
+            )
+
+            assert out.shape == (1, 16, 16, value_dim)
+            assert out.device.type == "neuron"
+            torch.testing.assert_close(out.cpu(), ref)
+
+
+def test_scaled_dot_product_attention_empty_value():
+    """Empty value tensor: head_dim_v == 0 (Q/K non-empty) and seq_k == 0.
+
+    These are the empty-V edge cases. head_dim_v == 0 is caught only by the
+    `value.numel() == 0` branch of `_fused_sdp_choice_neuron` (Q and K are
+    non-empty there), so this guards that specific routing. The math backend
+    produces the CPU-matching empty / all-zero output; the fused NKI/MLIR
+    kernels reject empty inputs.
+    """
+    torch.manual_seed(0)
+    device = torch.device("neuron", 0)
+
+    # (label, q_shape, k_shape, v_shape) — expected out shape is q_shape[:-1] + (v_shape[-1],)
+    cases = [
+        ("head_dim_v=0", (1, 4, 10, 8), (1, 4, 10, 8), (1, 4, 10, 0)),
+        ("seq_k=0", (1, 4, 10, 8), (1, 4, 0, 8), (1, 4, 0, 8)),
+    ]
+    for label, q_shape, k_shape, v_shape in cases:
+        q = torch.randn(*q_shape, device=device, requires_grad=True)
+        k = torch.randn(*k_shape, device=device, requires_grad=True)
+        v = torch.randn(*v_shape, device=device, requires_grad=True)
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+
+        expected_shape = (*q_shape[:-1], v_shape[-1])
+        assert out.shape == expected_shape, label
+        assert out.device.type == "neuron"
+
+        ref = F.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu(), dropout_p=0.0)
+        torch.testing.assert_close(out.cpu(), ref)
+
+        # Backward must produce input-shaped grads (matches upstream test_sdpa_zero_output).
+        out.sum().backward()
+        assert q.grad.shape == q.shape, label
+        assert k.grad.shape == k.shape, label
+        assert v.grad.shape == v.shape, label
