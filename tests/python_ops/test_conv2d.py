@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
@@ -210,3 +211,22 @@ class TestConv2dRegistration:
             msg=f"Tensor-likes are not close for dtype: {dtype}!",
         )
         torch_neuronx.clear_op_tracking()
+
+    def test_conv2d_dtype_mismatch_raises(self):
+        """conv2d must raise when input/weight/bias dtypes differ (matches PyTorch)."""
+        inp = torch.randn(2, 3, 8, 8, dtype=torch.float32, device="neuron")
+        weight_f32 = torch.randn(4, 3, 3, 3, dtype=torch.float32, device="neuron")
+        weight_f64 = torch.randn(4, 3, 3, 3, dtype=torch.float64, device="neuron")
+        bias_f64 = torch.randn(4, dtype=torch.float64, device="neuron")
+
+        # float32 input, float64 weight -> mismatch
+        with pytest.raises(RuntimeError):
+            F.conv2d(inp, weight_f64)
+
+        # float32 input/weight, float64 bias -> mismatch
+        with pytest.raises(RuntimeError):
+            F.conv2d(inp, weight_f32, bias_f64)
+
+        # matching dtypes -> no error
+        output = F.conv2d(inp, weight_f32)
+        assert output.device.type == "neuron"

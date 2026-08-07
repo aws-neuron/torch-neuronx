@@ -15,6 +15,7 @@ def _expand_param_if_needed(param, num_spatial_dims):
 def _validate_convolution_inputs(
     input,
     weight,
+    bias,
     stride,
     padding,
     dilation,
@@ -23,6 +24,15 @@ def _validate_convolution_inputs(
     groups,
 ):
     """Common validation for convolution operations using PyTorch-style checks."""
+    if weight.dtype != input.dtype:
+        raise RuntimeError(
+            f"Input type ({input.dtype}) and weight type ({weight.dtype}) should be the same"
+        )
+    if bias is not None and bias.dtype != input.dtype:
+        raise RuntimeError(
+            f"Input type ({input.dtype}) and bias type ({bias.dtype}) should be the same"
+        )
+
     k = input.ndim
     weight_dim = weight.ndim
     dim = weight_dim - 2
@@ -105,7 +115,7 @@ def torch_convolution(
     output_padding = _expand_param_if_needed(output_padding, num_spatial_dims)
 
     _validate_convolution_inputs(
-        input, weight, stride, padding, dilation, transposed, output_padding, groups
+        input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
     )
 
     def conv_kernel(inp, wgt, bias, stride, padding, dilation, transposed, output_padding, groups):
