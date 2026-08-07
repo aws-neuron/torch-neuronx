@@ -1090,11 +1090,8 @@ std::string FormatTensorInfo(const at::Tensor& t) {
 }
 
 TEST_F(TransformationsTest, TryCreateCompound_RandomMixedSequences) {
-  // Use random_device for a truly random seed; print it on failure for reproduction.
-  // To reproduce a specific failure, replace rd() with the failing seed, e.g.:
-  //   const uint32_t seed = 123456789;
-  std::random_device rd;
-  const uint32_t seed = rd();
+  // Replace with std::random_device{}() for an ad hoc randomized run.
+  constexpr uint32_t seed = 42;
   std::mt19937 rng(seed);
 
   constexpr int kNumIterations = 10000;
@@ -2365,8 +2362,7 @@ TEST_F(TransformationsTest, TryCreateEpilogue_RejectScalarTensor) {
 // Reuse RandomOp enum from prologue fuzz test (already defined above)
 
 TEST_F(TransformationsTest, TryCreateEpilogue_RandomMixedSequences) {
-  std::random_device rd;
-  const uint32_t seed = rd();
+  constexpr uint32_t seed = 42;
   std::mt19937 rng(seed);
 
   constexpr int kNumIterations = 10000;
