@@ -9,6 +9,9 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.python_ops.torch_mlir.ops.foreach_ops import (
+    _make_div_inplace_validator,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +94,72 @@ def test_foreach_list(op_name, tensor_dtype, other_dtype):
 
     for t_cpu, t_neuron in zip(tensors_cpu_copy, tensors_neuron_copy, strict=False):
         torch.testing.assert_close(t_neuron.cpu(), t_cpu, rtol=1e-3, atol=1e-4)
+
+
+def test_foreach_list_bool_division_by_zero():
+    """Bool foreach division agrees with ordinary bool division."""
+    tensor = torch.tensor([[False, True], [True, False]], dtype=torch.bool)
+    other = torch.tensor([False], dtype=torch.bool).expand_as(tensor)
+    tensors_cpu = [tensor]
+    other_cpu = [other]
+    tensors_neuron = [t.to("neuron") for t in tensors_cpu]
+    other_neuron = [
+        torch.tensor([False], dtype=torch.bool, device="neuron").expand_as(tensors_neuron[0])
+    ]
+
+    actual = torch._foreach_div(tensors_neuron, other_neuron)
+    expected = torch._foreach_div(tensors_cpu, other_cpu)
+
+    torch.testing.assert_close(actual[0].cpu(), expected[0], equal_nan=True)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize(
+    "lhs_dtype,rhs_dtype",
+    [
+        (torch.bool, torch.float16),
+        (torch.float16, torch.bool),
+        (torch.bool, torch.bfloat16),
+        (torch.bfloat16, torch.bool),
+        (torch.int32, torch.float16),
+        (torch.float16, torch.int32),
+        (torch.int32, torch.bfloat16),
+        (torch.bfloat16, torch.int32),
+    ],
+)
+def test_foreach_list_div_mixed_integral_float_dtype(lhs_dtype, rhs_dtype, empty):
+    """List division uses pairwise PyTorch promotion, including empty tensors."""
+
+    def make_tensor(dtype, denominator=False):
+        if empty:
+            return torch.empty(0, dtype=dtype)
+        if dtype == torch.bool:
+            values = [True, True, True] if denominator else [False, True, False]
+        else:
+            values = [1, 2, 4]
+        return torch.tensor(values, dtype=dtype)
+
+    lhs = make_tensor(lhs_dtype)
+    rhs = make_tensor(rhs_dtype, denominator=True)
+    expected = torch._foreach_div([lhs], [rhs])[0]
+
+    with track_neuron_ops():
+        actual = torch._foreach_div([lhs.to("neuron")], [rhs.to("neuron")])[0]
+        assert_op_runs_on_neuron("_foreach_div")
+
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_foreach_list_bool_subtraction_raises(inplace):
+    """Bool foreach subtraction rejects the same inputs as Tensor.sub."""
+    tensors = [torch.tensor([False, True], dtype=torch.bool, device="neuron")]
+    other = [torch.tensor([True, False], dtype=torch.bool, device="neuron")]
+    op = torch._foreach_sub_ if inplace else torch._foreach_sub
+
+    with pytest.raises(RuntimeError, match="Subtraction, the `-` operator"):
+        op(tensors, other)
 
 
 @pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])
@@ -440,12 +509,117 @@ def test_foreach_mixed_empty_dtype_promotion(op_name, second_arg_fn):
         pytest.param(lambda t: torch.tensor(3, device=t[0].device), id="tensor"),
     ],
 )
-@assert_raises(RuntimeError, match="result type Float can't be cast to the desired output type Int")
+@assert_raises(RuntimeError, match="can't be cast to the desired output type")
 def test_foreach_div_inplace_int_raises(second_arg_fn):
     """Test that inplace foreach_div_ on integer tensors raises, matching CPU."""
     t = [torch.tensor([4, 6], dtype=torch.int32, device="neuron")]
     with track_neuron_ops():
         torch._foreach_div_(t, second_arg_fn(t))
+
+
+def test_foreach_div_inplace_validation_preserves_scalarlist_length_error():
+    """Structural validation precedes integral division errors."""
+    validate = _make_div_inplace_validator("scalarlist")
+    tensors = [torch.tensor([4, 6], dtype=torch.int32)]
+
+    with pytest.raises(
+        RuntimeError,
+        match="Tensor list must have same number of elements as scalar list",
+    ):
+        validate(tensors, [])
+
+
+def test_foreach_div_inplace_validation_preserves_list_length_error():
+    validate = _make_div_inplace_validator("list")
+    tensors = [torch.tensor([4, 6], dtype=torch.int32)]
+
+    with pytest.raises(
+        RuntimeError,
+        match="Tensor lists must have the same number of tensors, got 1 and 2",
+    ):
+        validate(tensors, [torch.ones(1), torch.ones(1)])
+
+
+def test_foreach_div_inplace_validation_preserves_broadcast_error():
+    validate = _make_div_inplace_validator("list")
+    tensors = [torch.zeros(10, 10, dtype=torch.int32)]
+    other = [torch.ones(11, 11)]
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"The size of tensor a \(10\) must match the size of tensor b \(11\) "
+            r"at non-singleton dimension 1"
+        ),
+    ):
+        validate(tensors, other)
+
+
+def test_foreach_div_inplace_validation_preserves_empty_broadcast_error():
+    validate = _make_div_inplace_validator("list")
+    tensors = [torch.empty(0, 10, dtype=torch.int32)]
+    other = [torch.empty(0, 11)]
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"The size of tensor a \(10\) must match the size of tensor b \(11\) "
+            r"at non-singleton dimension 1"
+        ),
+    ):
+        validate(tensors, other)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bool, torch.int8, torch.int16, torch.int32, torch.int64],
+)
+def test_foreach_div_inplace_dispatch_preserves_scalarlist_length_error(dtype):
+    tensors = [torch.ones(2, dtype=dtype, device="neuron")]
+
+    with pytest.raises(
+        RuntimeError,
+        match="Tensor list must have same number of elements as scalar list",
+    ):
+        torch._foreach_div_(tensors, [])
+
+
+def test_foreach_div_inplace_validation_checks_tensor_scalar_first():
+    validate = _make_div_inplace_validator("tensor")
+    tensors = [torch.tensor([4, 6], dtype=torch.int32)]
+
+    with pytest.raises(RuntimeError, match="scalar tensor expected to be 0 dim"):
+        validate(tensors, torch.ones(2))
+
+
+def test_foreach_div_inplace_validation_does_not_mutate_inputs():
+    validate = _make_div_inplace_validator("list")
+    tensors = [torch.tensor([4, 6], dtype=torch.int32)]
+    other = [torch.ones((), device="meta", dtype=torch.int32)]
+    original = other[0]
+
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        validate(tensors, other)
+
+    assert other[0] is original
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64],
+)
+def test_foreach_div_inplace_validation_uses_backend_dtype_names(dtype):
+    tensors = [torch.ones(2, dtype=dtype)]
+    other = [torch.ones(2, dtype=dtype)]
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"result type {torch.get_default_dtype()} can't be cast to "
+            rf"the desired output type {dtype}"
+        ),
+    ):
+        _make_div_inplace_validator("list")(tensors, other)
 
 
 @pytest.mark.parametrize("op_name", ["add", "mul", "sub", "div"])

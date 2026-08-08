@@ -443,6 +443,13 @@ def _make_preprocessing_lower(
 
     @torch._dynamo.disable
     def lower(*args, original_args=None, original_kwargs=None, **kwargs):
+        # Validate against the logical schema inputs before preprocessing can
+        # reshape, filter, or downcast them.
+        if validate_fn is not None:
+            validation_args = original_args if original_args is not None else args
+            validation_kwargs = original_kwargs if original_kwargs is not None else kwargs
+            validate_fn(*validation_args, **validation_kwargs)
+
         # Run preprocessing on the downcasted args
         result = torch_fn(*args, **kwargs)
         if len(result) == 4:
@@ -505,8 +512,6 @@ def _make_preprocessing_lower(
                 static_argnums=static_argnums,
                 static_argnames=static_argnames,
             )
-            if validate_fn is not None:
-                kernel.validate_static_inputs_func = validate_fn
             _kernel_cache[fn_key] = kernel
 
         # C++ DispatchImpl already ran PreprocessArgs (scalar→tensor, int64→int32,

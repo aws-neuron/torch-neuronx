@@ -89,6 +89,18 @@ class TestDiv:
             # The in-place operation div_ is being handled by the div/div.out variant
             assert_op_runs_on_neuron("aten::div")
 
+    def test_div_bool_by_zero(self):
+        """Bool true division follows CPU NaN/Inf semantics."""
+        a_cpu = torch.tensor([[False, True], [True, False]], dtype=torch.bool)
+        b_cpu = torch.tensor([False], dtype=torch.bool).expand_as(a_cpu)
+        a_neuron = a_cpu.to("neuron")
+        b_neuron = torch.tensor([False], dtype=torch.bool, device="neuron").expand_as(a_neuron)
+
+        actual = torch.div(a_neuron, b_neuron).cpu()
+        expected = torch.div(a_cpu, b_cpu)
+
+        torch.testing.assert_close(actual, expected, equal_nan=True)
+
     def test_div_broadcast(self):
         """Test division with broadcasting"""
         with track_neuron_ops():
