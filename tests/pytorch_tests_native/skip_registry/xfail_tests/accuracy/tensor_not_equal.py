@@ -168,5 +168,10 @@ ACCURACY_TENSOR_NOT_EQUAL = [
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_nonfinite_neuron_float64",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_neuron_int32",
     "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_neuron_int64",
+    # Neuron's topk compares integers via a float32 sort path, so wide integer
+    # ranges (values beyond float32's 24-bit mantissa, ~2^24) get mis-ordered.
+    # Small-range integer topk matches CPU; full int32/int64-range does not.
+    "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_warp_sort_path_neuron_int32",
+    "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_integral_warp_sort_path_neuron_int64",
     "test_type_promotion.py::TestTypePromotionNEURON::test_comparison_ops_with_type_promotion_neuron",
 ]
