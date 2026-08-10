@@ -288,20 +288,18 @@ def _promote_div_pairs(tensors1, tensors2, *, empty_only=False):
     return promoted1, promoted2
 
 
-def _replace_empty(tensors, op=""):
-    """Replace empty tensors with new empty tensors (passthrough for dynamo).
-    For div, use float32 dtype to match PyTorch int/int -> float semantics.
+def _replace_empty(tensors):
+    """Return the list with each empty tensor swapped for a fresh empty of the same
+    shape/dtype (a passthrough for dynamo), leaving non-empty tensors untouched.
+
+    ``t.to(t.dtype)`` on a non-empty tensor returns the same object, so object
+    identity is preserved — the factory ``out=`` tuple and its positional inputs
+    stay the same objects, which the buffer-donation aliasing relies on. Dtype
+    promotion for empties (e.g. div's int->float) is handled separately by
+    ``_replace_empty_promoted``; this function never changes dtype.
     """
-
-    def _tensor_dtype(t):
-        if op == "div" and not t.dtype.is_floating_point:
-            return torch.float32
-        return t.dtype
-
     return [
-        torch.empty(t.shape, dtype=_tensor_dtype(t), device=t.device)
-        if t.numel() == 0
-        else t.to(_tensor_dtype(t))
+        torch.empty(t.shape, dtype=t.dtype, device=t.device) if t.numel() == 0 else t
         for t in tensors
     ]
 
@@ -390,14 +388,17 @@ def _make_scalar_inplace_op(op):
         _check_tensors(tensors)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalar)
-        non_empty = [t for t in tensors if t.numel() > 0]
+        # Keep the list full-length: replace each empty with a fresh empty
+        # placeholder (same dtype/shape) instead of filtering it out. The NKI
+        # wrapper returns empties unchanged, so they become FX passthrough nodes
+        # that capture_backend drops before the compiler sees them, while the
+        # kept output/input indices stay aligned with the raw args (no remap).
+        tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalar):
             return nki_fn(tensors, scalar)
 
-        if not non_empty:
-            return compute_fn, (), {}, _void_postprocess
-        return compute_fn, (non_empty, scalar), {"out": tuple(non_empty)}, _void_postprocess
+        return compute_fn, (tensors, scalar), {"out": tuple(tensors)}, _void_postprocess
 
     return fn
 
@@ -451,21 +452,19 @@ def _make_list_inplace_op(op):
         _check_tensors_tensors(tensors1, tensors2)
         _check_bool_sub(op, tensors1, tensors2)
         _check_div_inplace_dtype(op, tensors1)
-        non_empty_t1 = [t for t in tensors1 if t.numel() > 0]
-        non_empty_t2 = [t2 for t1, t2 in zip(tensors1, tensors2, strict=False) if t1.numel() > 0]
+        # Keep both lists full-length (see _make_scalar_inplace_op): empties become
+        # FX passthroughs that capture_backend drops, so no filtered-index remap.
+        tensors1 = _replace_empty(tensors1)
 
         def compute_fn(tensors1, tensors2, **kwargs):
             if has_alpha:
                 return nki_fn(tensors1, tensors2, kwargs.get("alpha", 1))
             return nki_fn(tensors1, tensors2)
 
-        if not non_empty_t1:
-            return compute_fn, (), {}, _void_postprocess
-
-        kwargs = {"out": tuple(non_empty_t1)}
+        kwargs = {"out": tuple(tensors1)}
         if has_alpha:
             kwargs["alpha"] = alpha
-        return compute_fn, (non_empty_t1, non_empty_t2), kwargs, _void_postprocess
+        return compute_fn, (tensors1, tensors2), kwargs, _void_postprocess
 
     return fn
 
@@ -504,20 +503,17 @@ def _make_scalarlist_inplace_op(op):
         _check_tensors_scalars(tensors, scalars)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalars)
-        non_empty = [(t, s) for t, s in zip(tensors, scalars, strict=False) if t.numel() > 0]
-        non_empty_t = [t for t, s in non_empty]
-        non_empty_s = [s for t, s in non_empty]
+        # Keep the list full-length (see _make_scalar_inplace_op). scalars stays
+        # paired 1:1 with tensors; the NKI wrapper skips empty slots.
+        tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalars):
             return nki_fn(tensors, scalars)
 
-        if not non_empty_t:
-            return compute_fn, (), {}, _void_postprocess
-
         return (
             compute_fn,
-            (non_empty_t, non_empty_s),
-            {"out": tuple(non_empty_t)},
+            (tensors, scalars),
+            {"out": tuple(tensors)},
             _void_postprocess,
         )
 
@@ -561,18 +557,17 @@ def _make_tensor_inplace_op(op):
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
         _check_div_inplace_dtype(op, tensors)
-        non_empty = [t for t in tensors if t.numel() > 0]
+        # Keep the list full-length (see _make_scalar_inplace_op).
+        tensors = _replace_empty(tensors)
         effective_tensor = tensor * alpha if has_alpha else tensor
 
         def compute_fn(tensors, tensor):
             return nki_fn(tensors, tensor)
 
-        if not non_empty:
-            return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
-            (non_empty, effective_tensor),
-            {"out": tuple(non_empty)},
+            (tensors, effective_tensor),
+            {"out": tuple(tensors)},
             _void_postprocess,
         )
 
@@ -619,11 +614,9 @@ def torch_foreach_sqrt(tensors, out=None):
 @register_aten(["aten::_foreach_sqrt_"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_sqrt_inplace(tensors, out=None):
     _check_tensors(tensors)
-    non_empty = [t for t in tensors if t.numel() > 0]
-
-    if not non_empty:
-        return foreach_sqrt_nki, (), {}, _void_postprocess
-    return foreach_sqrt_nki, (non_empty,), {"out": tuple(non_empty)}, _void_postprocess
+    # Keep the list full-length (see _make_scalar_inplace_op).
+    tensors = _replace_empty(tensors)
+    return foreach_sqrt_nki, (tensors,), {"out": tuple(tensors)}, _void_postprocess
 
 
 # --- foreach_addcdiv / foreach_addcmul (ternary) ---
@@ -688,20 +681,18 @@ def _make_addcop_scalar_inplace(nki_fn):
         if self and self[0].dtype == torch.bool:
             raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, value)
-        non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
-        ne_self = [self[i] for i in non_empty_idx]
-        ne_t1 = [tensor1[i] for i in non_empty_idx]
-        ne_t2 = [tensor2[i] for i in non_empty_idx]
+        # Keep all three lists full-length (see _make_scalar_inplace_op): empties
+        # become FX passthroughs that capture_backend drops, so self[i]/tensor1[i]/
+        # tensor2[i] stay paired and no filtered-index remap is needed.
+        self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, value):
             return nki_fn(self, tensor1, tensor2, value)
 
-        if not ne_self:
-            return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
-            (ne_self, ne_t1, ne_t2, value),
-            {"out": tuple(ne_self)},
+            (self, tensor1, tensor2, value),
+            {"out": tuple(self)},
             _void_postprocess,
         )
 
@@ -738,18 +729,19 @@ def _make_addcop_scalarlist_inplace(nki_fn):
         if self and self[0].dtype == torch.bool:
             raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, scalars)
-        non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
-        ne_self = [self[i] for i in non_empty_idx]
-        ne_t1 = [tensor1[i] for i in non_empty_idx]
-        ne_t2 = [tensor2[i] for i in non_empty_idx]
-        ne_s = [scalars[i] for i in non_empty_idx]
+        # Keep all lists full-length (see _make_scalar_inplace_op); scalars stays
+        # paired 1:1 with self.
+        self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_fn(self, tensor1, tensor2, scalars)
 
-        if not ne_self:
-            return compute_fn, (), {}, _void_postprocess
-        return compute_fn, (ne_self, ne_t1, ne_t2, ne_s), {"out": tuple(ne_self)}, _void_postprocess
+        return (
+            compute_fn,
+            (self, tensor1, tensor2, scalars),
+            {"out": tuple(self)},
+            _void_postprocess,
+        )
 
     return fn
 
@@ -780,29 +772,24 @@ def _make_addcop_tensor(nki_scalarlist_fn):
 
 def _make_addcop_tensor_inplace(nki_scalarlist_fn):
     """Inplace tensor variant of _make_addcop_tensor (same scalars-as-tensor
-    handling). Empty tensors are dropped from the 3 lists; _make_preprocessing_lower
-    reconstructs them to full length before lowering, so list[i] still pairs with
-    scalars[i].
+    handling). The lists are kept full-length: empties become FX passthroughs
+    that capture_backend drops, so list[i] still pairs with scalars[i] and no
+    filtered-index remap is needed.
     """
 
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         if self and self[0].dtype == torch.bool:
             raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
-        non_empty_idx = [i for i, t in enumerate(self) if t.numel() > 0]
-        ne_self = [self[i] for i in non_empty_idx]
-        ne_t1 = [tensor1[i] for i in non_empty_idx]
-        ne_t2 = [tensor2[i] for i in non_empty_idx]
+        self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
 
-        if not ne_self:
-            return compute_fn, (), {}, _void_postprocess
         return (
             compute_fn,
-            (ne_self, ne_t1, ne_t2, scalars),
-            {"out": tuple(ne_self)},
+            (self, tensor1, tensor2, scalars),
+            {"out": tuple(self)},
             _void_postprocess,
         )
 
@@ -868,18 +855,16 @@ def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
 @register_aten(["aten::_foreach_lerp_.Scalar"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
-    non_empty_s = [s for s in self if s.numel() > 0]
-    non_empty_t = [t for s, t in zip(self, tensors1, strict=False) if s.numel() > 0]
+    # Keep both lists full-length (see _make_scalar_inplace_op).
+    self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalar_nki(self, tensors1, weight)
 
-    if not non_empty_s:
-        return compute_fn, (), {}, _void_postprocess
     return (
         compute_fn,
-        (non_empty_s, non_empty_t, weight),
-        {"out": tuple(non_empty_s)},
+        (self, tensors1, weight),
+        {"out": tuple(self)},
         _void_postprocess,
     )
 
@@ -905,17 +890,13 @@ def torch_foreach_lerp_list(self, tensors1, weights, out=None):
 def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
-    non_empty_idx = [i for i, s in enumerate(self) if s.numel() > 0]
-    ne_s = [self[i] for i in non_empty_idx]
-    ne_t = [tensors1[i] for i in non_empty_idx]
-    ne_w = [weights[i] for i in non_empty_idx]
+    # Keep all three lists full-length (see _make_scalar_inplace_op).
+    self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weights):
         return foreach_lerp_list_nki(self, tensors1, weights)
 
-    if not ne_s:
-        return compute_fn, (), {}, _void_postprocess
-    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, _void_postprocess
+    return compute_fn, (self, tensors1, weights), {"out": tuple(self)}, _void_postprocess
 
 
 @register_aten(
@@ -939,17 +920,14 @@ def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
 def torch_foreach_lerp_scalarlist_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
-    non_empty_idx = [i for i, s in enumerate(self) if s.numel() > 0]
-    ne_s = [self[i] for i in non_empty_idx]
-    ne_t = [tensors1[i] for i in non_empty_idx]
-    ne_w = [weight[i] for i in non_empty_idx]
+    # Keep all lists full-length (see _make_scalar_inplace_op); weight (scalar
+    # list) stays paired 1:1 with self.
+    self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
         return foreach_lerp_scalarlist_nki(self, tensors1, weight)
 
-    if not ne_s:
-        return compute_fn, (), {}, _void_postprocess
-    return compute_fn, (ne_s, ne_t, ne_w), {"out": tuple(ne_s)}, _void_postprocess
+    return compute_fn, (self, tensors1, weight), {"out": tuple(self)}, _void_postprocess
 
 
 # --- Register all binary elementwise foreach ops ---
