@@ -289,105 +289,6 @@ def _maybe_register_autograd(aten_name):
     _AUTOGRAD_LIBS[aten_name] = lib
 
 
-def _compute_preprocessing_index_map(original_args, preprocessed_args):
-    """Compute mapping from preprocessed tensor positions to original tensor positions.
-
-    When preprocessing filters tensors (e.g., removes empties from a list),
-    the positions in the preprocessed arg list don't match the original.
-    This function builds a map: preprocessed_flat_idx → original_flat_idx.
-
-    Used to remap kept_input_indices (which are relative to preprocessed args)
-    back to positions in the original args (which C++ FlattenAndFilterInputs uses).
-
-    Returns None if no remapping is needed (lists are same length).
-    """
-
-    # Flatten both arg lists to get individual tensors
-    def flatten_tensors(args):
-        flat = []
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                flat.append(arg)
-            elif isinstance(arg, list | tuple):
-                for item in arg:
-                    if isinstance(item, torch.Tensor):
-                        flat.append(item)
-        return flat
-
-    orig_flat = flatten_tensors(original_args)
-    prep_flat = flatten_tensors(preprocessed_args)
-
-    # If same length, no filtering happened — no remapping needed
-    if len(orig_flat) == len(prep_flat):
-        return None
-
-    # Build map: for each tensor in prep_flat, find its position in orig_flat
-    # We match by object identity (same tensor object)
-    index_map = []
-    for prep_tensor in prep_flat:
-        for orig_idx, orig_tensor in enumerate(orig_flat):
-            if prep_tensor is orig_tensor:
-                index_map.append(orig_idx)
-                break
-        else:
-            # Tensor not found in original — shouldn't happen, but fall back to identity
-            index_map.append(len(index_map))
-
-    return index_map
-
-
-def _reconstruct_full_args_for_lowering(original_args, filtered_args, filtered_kwargs, aten_name):
-    """Reconstruct full-length args when preprocessing filtered tensors.
-
-    For inplace foreach ops that filter empty tensors, the filtered list is
-    shorter than the original. This reconstructs the full-length list using
-    _replace_empty so that output indices align with C++ SnapshotOutTensors.
-
-    Returns (full_args, full_kwargs) or None if reconstruction is not applicable.
-    """
-    from .ops.foreach_ops import _replace_empty
-
-    # Don't pass op="div" here — that would cast int tensors to float32 during
-    # reconstruction, but on cache hit C++ provides original (int32) tensors.
-    # The NKI kernel handles div dtype promotion internally via _cast_results.
-    op = ""
-
-    full_args = list(filtered_args)
-    found_replacement = False
-
-    for i, (orig_a, filt_a) in enumerate(zip(original_args, filtered_args, strict=False)):
-        if not isinstance(orig_a, list | tuple):
-            continue
-        if not isinstance(filt_a, list | tuple):
-            continue
-        if len(filt_a) >= len(orig_a):
-            continue
-
-        orig_tensors = [t for t in orig_a if isinstance(t, torch.Tensor)]
-        if orig_tensors and len(orig_tensors) == len(orig_a):
-            full_args[i] = _replace_empty(list(orig_a), op)
-            found_replacement = True
-        else:
-            full_args[i] = list(orig_a)
-            found_replacement = True
-
-    if not found_replacement:
-        return None
-
-    full_kwargs = dict(filtered_kwargs)
-    if "out" in full_kwargs:
-        out_val = full_kwargs["out"]
-        if isinstance(out_val, tuple | list):
-            for orig_a in original_args:
-                if isinstance(orig_a, list | tuple):
-                    orig_tensors = [t for t in orig_a if isinstance(t, torch.Tensor)]
-                    if orig_tensors and any(t.numel() == 0 for t in orig_tensors):
-                        full_kwargs["out"] = tuple(_replace_empty(list(orig_a), op))
-                        break
-
-    return tuple(full_args), full_kwargs
-
-
 def _is_scalar_list(arg):
     """True if arg is a non-empty list/tuple of raw Python scalars (no tensors)."""
     return (
@@ -427,10 +328,12 @@ def _make_preprocessing_lower(
     preprocessing ``torch_fn`` to obtain ``(compute_fn, new_args, new_kwargs)``,
     builds a ``TorchMlirKernel`` for ``compute_fn``, and calls its ``lower``.
 
-    Preprocessing may filter the input list (for example, dropping empty
-    tensors). When it does, ``kept_input_indices`` are remapped to positions in
-    the original, unfiltered argument list so that ``FlattenAndFilterInputs``
-    selects the correct tensors on a cache hit.
+    Preprocessing keeps tensor lists full-length: empty tensors are replaced with
+    fresh empty placeholders (see ``foreach_ops._replace_empty``), not filtered
+    out. The NKI wrappers pass those placeholders through unchanged, so
+    ``capture_backend`` drops them as FX passthroughs before the compiler runs.
+    Because nothing is filtered, the flattened preprocessed and raw argument index
+    spaces stay identical and ``kept_input_indices`` need no remap on a cache hit.
 
     Returns:
         A ``LoweringResult``, as required by the C++ dispatcher.
@@ -467,20 +370,6 @@ def _make_preprocessing_lower(
                 stablehlo_bytes=b"",
             )
 
-        # Compute index mapping: preprocessed positions → original positions.
-        # Needed when preprocessing filters tensors (e.g. foreach empty-tensor
-        # removal). When the lists are the same length, this returns None.
-        preprocess_index_map = _compute_preprocessing_index_map(args, new_args)
-
-        # When preprocessing filtered the tensor list (e.g. foreach empty-tensor
-        # removal), reconstruct full-length args so output indices align with C++
-        # SnapshotOutTensors/ReconstructOutputs.
-        if preprocess_index_map is not None:
-            full_args = _reconstruct_full_args_for_lowering(args, new_args, new_kwargs, aten_name)
-            if full_args is not None:
-                new_args, new_kwargs = full_args
-                preprocess_index_map = None
-
         # Preprocess original (pre-downcast) args for dtype inference.
         orig_new_args = None
         orig_new_kwargs = None
@@ -490,16 +379,6 @@ def _make_preprocessing_lower(
             if orig_result[1]:
                 orig_new_args = orig_result[1]
                 orig_new_kwargs = orig_result[2]
-                # Also reconstruct original args if we reconstructed the main args
-                if (
-                    preprocess_index_map is None
-                    and _compute_preprocessing_index_map(original_args, orig_new_args) is not None
-                ):
-                    orig_full = _reconstruct_full_args_for_lowering(
-                        original_args, orig_new_args, orig_new_kwargs, aten_name
-                    )
-                    if orig_full is not None:
-                        orig_new_args, orig_new_kwargs = orig_full
 
         # Get or create cached kernel
         fn_key = id(getattr(compute_fn, "__code__", compute_fn))
@@ -528,24 +407,24 @@ def _make_preprocessing_lower(
             convert_int64=not is_native_int64_enabled(),
         )
 
+        # In-place factory ops (foreach, fused optimizers) name their mutated buffers
+        # in out=; hand that tuple and the pre-preprocess inputs to lower() for
+        # buffer-donation aliasing (see _build_input_output_aliases).
+        alias_out_tensors = None
+        alias_flat_inputs = None
+        out_kwarg = new_kwargs.get("out")
+        if kernel._is_inplace_op() and isinstance(out_kwarg, tuple | list) and out_kwarg:
+            alias_out_tensors = list(out_kwarg)
+            alias_flat_inputs = kernel._flatten_tensors(new_args)
+
         lowering_result = kernel.lower(
             *processed_new_args,
             original_args=orig_new_args,
             original_kwargs=orig_new_kwargs,
+            alias_out_tensors=alias_out_tensors,
+            alias_flat_inputs=alias_flat_inputs,
             **new_kwargs,
         )
-
-        # Remap kept_input_indices from preprocessed positions to original positions.
-        # kernel.lower() produces indices relative to the PREPROCESSED arg list.
-        # C++ FlattenAndFilterInputs applies them to the ORIGINAL (unfiltered) list.
-        # Without remapping, C++ picks wrong tensors when preprocessing filters.
-        if preprocess_index_map is not None and lowering_result is not None:
-            original_kept = lowering_result.kept_input_indices
-            if original_kept:
-                remapped = [
-                    preprocess_index_map[i] for i in original_kept if i < len(preprocess_index_map)
-                ]
-                lowering_result.kept_input_indices = remapped
 
         return lowering_result
 

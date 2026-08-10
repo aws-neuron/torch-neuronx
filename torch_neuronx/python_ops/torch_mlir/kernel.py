@@ -1226,7 +1226,10 @@ class TorchMlirKernel(BaseNeuronKernel):
     # ═══════════════════════════════════════════════════════════════
 
     def _is_inplace_op(self) -> bool:
-        """Check if this op is an inplace operation (e.g., add_, mul_)."""
+        """True for an in-place op: a trailing ``_`` on the base name, covering the
+        default overload (``relu_``) and suffixed overloads (``add_.Tensor``,
+        ``_foreach_mul_.Scalar``). A plain ``endswith("_")`` misses the suffixed forms.
+        """
         name = self.op_name
         if name.startswith("aten::"):
             name = name[6:]
@@ -1394,36 +1397,64 @@ class TorchMlirKernel(BaseNeuronKernel):
                 )
         return input_specs, kw_input_specs
 
-    def _build_input_output_aliases(self, kept_input_indices, num_outputs):
-        """Build (ir_param_idx, output_idx) aliases telling the NEFF to write each
-        output back into an input buffer (so inplace ops mutate in place, no copy).
+    def _build_input_output_aliases(
+        self,
+        kept_input_indices,
+        num_outputs,
+        out_tensors=None,
+        flat_inputs=None,
+        kept_output_indices=None,
+    ):
+        """Compute (param_index, output_index) buffer-donation aliases so an in-place op
+        writes each output into an input's storage instead of copying back. param_index
+        indexes the NEFF params (kept_input_indices); output_index is the HLO output.
 
-        - Foreach inplace ops have one TensorList where input i and output i are
-        the same tensor, so output[i] aliases input[i] for all N (avoids N-1
-        copy_ ops).
-
-        - Other inplace ops alias output[0] to input[0] only. In ops like
-        fused_adam, input i and output i may correspond to different tensors, and
-        a 1:1 alias would cause value corruption.
+        Factory ops (foreach, fused optimizers) pass out_tensors, the buffers they write
+        in output order; each output donates to the input backing its buffer, matched by
+        object identity against the pre-preprocess flat_inputs (int64-safe, since
+        preprocessing copies packed int64). This is the only signal separating
+        fused_adam's updated params from its read-only grads, and reduces to i -> i for
+        foreach. Ops with no out= (add_, relu_) donate output 0 to self.
         """
-        if not self._is_inplace_op() or not kept_input_indices:
+        if not self._is_inplace_op() or not kept_input_indices or num_outputs == 0:
             return []
 
-        # Foreach ops: single TensorList self arg, outputs map 1:1 to list tensors.
-        if "_foreach_" in self.op_name and num_outputs > 0:
-            num_ir_params = len(kept_input_indices)
-            return [(i, i) for i in range(min(num_outputs, num_ir_params))]
+        if out_tensors and flat_inputs is not None:
+            # buffer_index_per_output[j] = the out= slot output j writes; remap via
+            # kept_output_indices when capture dropped outputs, else positional, else bail.
+            if kept_output_indices and len(kept_output_indices) == num_outputs:
+                buffer_index_per_output = kept_output_indices
+            elif len(out_tensors) == num_outputs:
+                buffer_index_per_output = range(num_outputs)
+            else:
+                return []
+            input_index_from_id = {id(t): i for i, t in enumerate(flat_inputs)}
+            param_index_from_input = {i: p for p, i in enumerate(kept_input_indices)}
+            aliases = []
+            for output_index, buffer_index in enumerate(buffer_index_per_output):
+                buffer = out_tensors[buffer_index]
+                input_index = input_index_from_id.get(id(buffer))
+                param_index = param_index_from_input.get(input_index)
+                if param_index is not None:  # skip buffers the NEFF never reads
+                    aliases.append((param_index, output_index))
+            return aliases
 
-        # All other inplace ops alias only the first output to the "self" tensor.
         if 0 in kept_input_indices:
-            ir_param_idx = list(kept_input_indices).index(0)
-            return [(ir_param_idx, 0)]
+            return [(kept_input_indices.index(0), 0)]
         return []
 
     # ── lower() entry point ───────────────────────────────────────
 
     @torch._dynamo.disable
-    def lower(self, *args, original_args=None, original_kwargs=None, **kwargs):
+    def lower(
+        self,
+        *args,
+        original_args=None,
+        original_kwargs=None,
+        alias_out_tensors=None,
+        alias_flat_inputs=None,
+        **kwargs,
+    ):
         """Lower the operation to StableHLO without executing.
 
         Called by C++ NeuronDispatcher on cache miss. Produces a LoweringResult
@@ -1434,6 +1465,8 @@ class TorchMlirKernel(BaseNeuronKernel):
             original_args: Original (pre-downcast) positional args as a tuple,
                 passed by C++ for dtype inference at original precision.
             original_kwargs: Original (pre-downcast) keyword args as a dict.
+            alias_out_tensors, alias_flat_inputs: Buffer-donation hints for in-place
+                factory ops; see ``_build_input_output_aliases``. None otherwise.
             **kwargs: Downcasted/preprocessed keyword args.
         """
         from torch_neuronx.python_ops.lowering_result import LoweringResult
@@ -1541,7 +1574,11 @@ class TorchMlirKernel(BaseNeuronKernel):
                 is_inplace=self._is_inplace_op(),
                 has_collectives=self.has_collectives,
                 input_output_aliases=self._build_input_output_aliases(
-                    kept_input_indices, len(io_spec.outputs) if io_spec else 0
+                    kept_input_indices,
+                    len(io_spec.outputs) if io_spec else 0,
+                    out_tensors=alias_out_tensors,
+                    flat_inputs=alias_flat_inputs,
+                    kept_output_indices=kept_output_indices,
                 ),
                 inferred_output_dtypes=inferred_output_dtypes,
             )
