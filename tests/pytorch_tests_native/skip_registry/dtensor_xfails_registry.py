@@ -112,12 +112,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Device index out of range",
-        tests=[
-            "test_ring_attention_sdpa",
-        ],
-    ),
-    SkipGroup(
         reason="Non-scalar tensor kwarg lr is on cpu device, expected neuron",
         tests=[
             "test_adam_1d_sharding",

@@ -310,6 +310,7 @@ def compute_attention_backward(
     value: torch.Tensor,
     attn_bias: torch.Tensor,
     dropout_mask: torch.Tensor,
+    out: torch.Tensor,
     lse: torch.Tensor,
     scale: float,
     is_causal: bool,
@@ -323,6 +324,7 @@ def compute_attention_backward(
     query = query.to(acc_dtype)
     key = key.to(acc_dtype)
     value = value.to(acc_dtype)
+    out = out.to(acc_dtype)
     lse = lse.to(acc_dtype)
     if attn_bias is not None:
         attn_bias = attn_bias.to(acc_dtype)
@@ -354,7 +356,12 @@ def compute_attention_backward(
 
     grad_v = probs.transpose(-2, -1) @ grad_out
     grad_out_v = grad_out @ value.transpose(-2, -1)
-    sum_reduction = (grad_out_v * probs).sum(dim=-1, keepdim=True)
+    # Preserve the full-context reduction order while adding contributions
+    # from other ring/CP blocks through the global output residual.
+    local_out = probs @ value
+    sum_reduction = (grad_out_v * probs).sum(dim=-1, keepdim=True) + (
+        grad_out * (out - local_out)
+    ).sum(dim=-1, keepdim=True)
     ds = probs * (grad_out_v - sum_reduction) * scale
 
     if is_causal:
@@ -383,7 +390,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
         self.kernel = TorchMlirKernel(
             compute_attention_backward,
             op_name,
-            static_argnums=(7, 8, 9, 10),  # scale, is_causal, dropout_p, mixed_precision
+            static_argnums=(8, 9, 10, 11),  # scale, is_causal, dropout_p, mixed_precision
         )
         self.op_name = op_name
 
@@ -487,6 +494,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
                 value,
                 attn_bias,
                 dropout_mask,
+                out,
                 logsumexp,
                 scale,
                 is_causal,
@@ -555,6 +563,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
                 value,
                 attn_bias,
                 dropout_mask,
+                out,
                 logsumexp,
                 scale,
                 is_causal,

@@ -1403,6 +1403,7 @@ def compute_attention_backward_decomposition(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_bias: torch.Tensor,
+    out: torch.Tensor,
     lse: torch.Tensor,
     scale: float,
     is_causal: bool,
@@ -1418,6 +1419,9 @@ def compute_attention_backward_decomposition(
         key (torch.Tensor): Key tensor of shape (B, H, S, E).
         value (torch.Tensor): Value tensor of shape (B, H, S, E).
         attn_bias (torch.Tensor): Attention bias tensor.
+        out (torch.Tensor): Forward pass output (full/global). Used for the
+            flash-attention softmax-Jacobian identity so the result is correct
+            for ring/CP per-block calls, not only full-context calls.
         lse (torch.Tensor): Logsumexp from forward pass.
         scale (float): Attention scale factor.
         is_causal (bool): Whether to apply causal masking.
@@ -1435,6 +1439,7 @@ def compute_attention_backward_decomposition(
     query = query.to(acc_dtype)
     key = key.to(acc_dtype)
     value = value.to(acc_dtype)
+    out = out.to(acc_dtype)
     lse = lse.to(acc_dtype)
     if attn_bias.numel() > 1:
         attn_bias = attn_bias.to(acc_dtype)
@@ -1471,7 +1476,12 @@ def compute_attention_backward_decomposition(
         else:
             grad_out_mask = grad_out_v * dropout_mask * (1 / (1 - dropout_p))
 
-    sum_reduction = (grad_out_mask * probs).sum(dim=-1, keepdim=True)
+    # Preserve the full-context reduction order while adding contributions
+    # from other ring/CP blocks through the global output residual.
+    local_out = masked_probs @ value
+    sum_reduction = (grad_out_mask * probs).sum(dim=-1, keepdim=True) + (
+        grad_out * (out - local_out)
+    ).sum(dim=-1, keepdim=True)
     ds = probs * (grad_out_mask - sum_reduction) * scale
 
     if is_causal:
@@ -1635,6 +1645,7 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
         key,
         value,
         attn_bias,
+        out,
         logsumexp,
         scale,
         is_causal,

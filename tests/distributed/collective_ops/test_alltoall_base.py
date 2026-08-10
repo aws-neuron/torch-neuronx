@@ -322,3 +322,48 @@ class TestAllToAllBase(BaseCollectiveOpTest):
     def test_5gb_tensor(self):
         """Test alltoall_base with 5GB tensor."""
         self.distributed_tester.run_test(run_5gb_tensor_test)
+
+
+class TestAllToAllBaseWorldSize2(BaseCollectiveOpTest):
+    """alltoall_base over a 2-rank group.
+
+    Exercises the smallest collective group size. The runtime historically
+    accepted only sizes 4, 8, 16, or multiples of 32; these cases confirm a
+    2-rank group works end-to-end for even, async, and uneven (permute-style)
+    exchanges.
+    """
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def test_basic_alltoall_base(self):
+        """Test basic alltoall_base functionality with world size 2."""
+        self.distributed_tester.run_test(run_basic_alltoall_base_test)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float16, torch.int32, torch.int64, torch.bfloat16],
+    )
+    def test_different_dtypes_alltoall_base(self, dtype):
+        """Test alltoall_base with different data types with world size 2."""
+        self.distributed_tester.run_test(run_different_dtype_alltoall_base_test, dtype=dtype)
+
+    @pytest.mark.parametrize("chunk_size", [1, 3, 5, 10])
+    def test_different_shapes_alltoall_base(self, chunk_size):
+        """Test alltoall_base with different chunk sizes with world size 2."""
+        self.distributed_tester.run_test(
+            run_different_shape_alltoall_base_test, chunk_size=chunk_size
+        )
+
+    def test_async_operation_alltoall_base(self):
+        """Test asynchronous alltoall_base operation with world size 2."""
+        self.distributed_tester.run_test(run_async_alltoall_base_test)
+
+    def test_split_sizes_alltoall_base(self):
+        """Test alltoall_base with split sizes (all 1s) with world size 2."""
+        self.distributed_tester.run_test(run_split_sizes_alltoall_base_test)
+
+    def test_uneven_split_sizes_alltoall_base(self):
+        """Test alltoall_base with uneven split sizes (permute_tensor pattern) with world size 2."""
+        self.distributed_tester.run_test(run_uneven_split_sizes_alltoall_base_test)
