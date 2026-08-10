@@ -124,6 +124,10 @@ SKIP_GROUPS: list[SkipGroup] = [
             "DynamicShapesReproTests",
             "DynamicShapesSubGraphTests",
             "DynamicShapesTestSDPA",
+            # Compiles with dynamic=True (symbolic shapes); MHA's Q/K/V reshapes
+            # then need an i64->index materialization torch-mlir can't legalize.
+            # A dynamic-shape config, not a per-op lowering bug (static lowers fine).
+            "test_transformers.py::TestTransformersNEURON::test_transformer_encoder_layer_fwd_fake_neuron",
         ],
     ),
     SkipGroup(

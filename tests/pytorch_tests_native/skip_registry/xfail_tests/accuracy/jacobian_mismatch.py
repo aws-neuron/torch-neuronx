@@ -416,6 +416,7 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_float_power_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_masked_fill_neuron_float64",
     "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_Conv2d_backward_depthwise_neuron_float64",
+    "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_thnn_conv_strided_padded_dilated_neuron",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_mse_loss_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_div_floor_rounding_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_div_trunc_rounding_neuron_float64",

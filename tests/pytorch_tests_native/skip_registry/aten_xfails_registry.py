@@ -207,6 +207,15 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "LU without pivoting (pivot=False) is CUDA-only; Neuron's CPU-LAPACK"
+            " fallback raises 'LU without pivoting is not implemented on the CPU'"
+        ),
+        tests=[
+            "test_linalg.py::TestLinalgNEURON::test_linalg_lu_family_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "SDPA sharding strategy arg mismatch:"
             " aten._scaled_dot_product_fused_attention_overrideable.default"
             " passes 3 args but Neuron strategy unpacks ≥4"
