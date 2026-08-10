@@ -426,6 +426,23 @@ def torch_sign(x, out=None):
     return torch.sign(x)
 
 
+@register_aten(
+    ["aten::angle", "aten::angle.out"],
+    output_params=("out",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_angle(x, out=None):
+    """Phase angle of a real input.
+
+    torch-mlir has no StableHLO legalization for aten::angle, so it is decomposed
+    into where/isnan (0 for x >= 0, pi for x < 0, nan for nan) by
+    ``angle_decomp`` in neuron_dynamo_backend/decompositions.py. That decomposition
+    table is applied on both the eager (make_fx) and torch.compile paths, so this
+    handler just calls torch.angle and lets the shared decomposition lower it.
+    """
+    return torch.angle(x)
+
+
 @register_aten(["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"])
 def torch_reciprocal(a, out=None):
     """Elementwise reciprocal (1/x).

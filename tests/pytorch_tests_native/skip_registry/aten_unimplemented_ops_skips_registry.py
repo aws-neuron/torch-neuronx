@@ -50,7 +50,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*__rshift___neuron*",
             "*_addbmm_neuron*",
             "*_addbmm__neuron*",
-            "*_angle_neuron*",
             "*_atan2_neuron*",
             "*_baddbmm_neuron*",
             "*_celu_neuron*",
