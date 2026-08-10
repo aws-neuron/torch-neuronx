@@ -1090,9 +1090,10 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall(std::vector<at::Tensor>& 
   // For alltoall, we need global replica groups
   auto replica_groups = CreateGlobalReplicaGroups(global_world_size_, current_ranks);
 
-  TORCH_CHECK(group_size == 4 || group_size == 8 || group_size == 16 || group_size % 32 == 0,
+  TORCH_CHECK(group_size == 2 || group_size == 4 || group_size == 8 || group_size == 16 ||
+                  group_size % 32 == 0,
               "unsupported world size ", group_size,
-              ", supported sizes: 4, 8, 16, or multiples of 32");
+              ", supported sizes: 2, 4, 8, 16, or multiples of 32");
   // Each replica group start rank must be a multiple of group size.
   for (size_t i = 0; i < replica_groups.size(); ++i) {
     const auto& g = replica_groups[i];

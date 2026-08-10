@@ -54,6 +54,17 @@ SKIP_GROUPS: list[SkipGroup] = [
         tests=s.DTENSOR_ALLTOALL_WORLD_SIZE_2_UNSUPPORTED,
     ),
     SkipGroup(
+        reason=(
+            "CP + FlexAttention compiles flex_attention through Inductor, which has"
+            " no Neuron lowering: 'NotImplementedError: No interface for device neuron'."
+            " CP is wired for the SDPA (overrideable) op, not the flex path."
+        ),
+        tests=[
+            "test_cp_flex_attention_causal_mask",
+            "test_cp_flex_attention_document_mask",
+        ],
+    ),
+    SkipGroup(
         reason="Test explicitly uses Inductor backend which has no Neuron codegen support",
         tests=[
             "test_compile_bernoulli",

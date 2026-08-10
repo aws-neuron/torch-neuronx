@@ -46,13 +46,12 @@ def scaled_dot_product_fused_attention_overrideable_strategy(op_schema: OpSchema
     mesh = op_schema.get_mesh_from_args()
 
     # Parse arguments based on the signature
-    (
-        query_strategy,  # query
-        _,  # key
-        _,  # value
-        attn_bias_strategy,  # attn_bias (optional)
-        *rest_args,  # dropout_p, is_causal, return_debug_mask, scale
-    ) = op_schema.args_schema
+    query_strategy = op_schema.args_schema[0]  # query
+    # skip `key` and `value` at position 1 and 2
+    attn_bias_strategy = (
+        op_schema.args_schema[3] if len(op_schema.args_schema) > 3 else None
+    )  # avoid out of bonadary error
+    rest_args = op_schema.args_schema[4:]  # dropout_p, is_causal, return_debug_mask, scale
 
     # Extract boolean flags from rest_args
     return_debug_mask = len(rest_args) >= 3 and rest_args[2]  # return_debug_mask
@@ -146,8 +145,10 @@ def scaled_dot_product_fused_attention_overrideable_strategy(op_schema: OpSchema
         None,  # cum_seq_k
         None,  # max_q
         None,  # max_k
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        # None, not Replicate(): under compile the fwd decomposition emits philox=None
+        # at dropout_p=0, and a non-None placement would demand a TensorMeta that isn't there.
+        None,  # philox_seed
+        None,  # philox_offset
         debug_attn_mask_sharding_cp,  # debug_attn_mask
         cp_sharding,  # q
         cp_sharding,  # k
@@ -183,6 +184,20 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
     # Check if attn_bias exists (input 4)
     has_attn_bias = op_schema.args_schema[4] is not None
 
+    # philox_seed (14) / philox_offset (15): placement only when the arg is a real tensor
+    # (OpStrategy). Under compile philox_seed may be None (dropout_p=0); a non-None placement
+    # would over-count vs expand_to_full_mesh_op_strategy's OpStrategy-arg count and raise.
+    def _philox_placement(idx: int) -> Placement | None:
+        return (
+            Replicate()
+            if idx < len(op_schema.args_schema)
+            and isinstance(op_schema.args_schema[idx], OpStrategy)
+            else None
+        )
+
+    philox_seed_p = _philox_placement(14)
+    philox_offset_p = _philox_placement(15)
+
     single_mesh_dim_strategies = []
 
     # Strategy 1: Full replication
@@ -210,8 +225,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k (SymInt)
         None,  # dropout_p (float)
         None,  # is_causal (bool)
-        Replicate(),  # philox_seed (tensor)
-        Replicate(),  # philox_offset (tensor)
+        philox_seed_p,  # philox_seed (tensor)
+        philox_offset_p,  # philox_offset (tensor)
     ]
 
     # Add scale if present (optional)
@@ -246,8 +261,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k
         None,  # dropout_p
         None,  # is_causal
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
     ]
 
     if len(op_schema.args_schema) > 16:
@@ -281,8 +296,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k
         None,  # dropout_p
         None,  # is_causal
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
     ]
 
     if len(op_schema.args_schema) > 16:
@@ -290,6 +305,44 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
 
     batch_strategy: PlacementList = batch_out + batch_inp
     single_mesh_dim_strategies.append(batch_strategy)
+
+    # Strategy 4: Context parallelism (shard on sequence dim)
+    # Required so the CP ring handler's `not needs_redistribute` assert passes
+    # for Shard(2) inputs. The handler computes gradients via ring attention;
+    # this strategy only declares the placement spec used to wrap results.
+    cp_sharding = Shard(2)
+
+    cp_out: PlacementList = [
+        cp_sharding,  # grad_query
+        cp_sharding,  # grad_key
+        cp_sharding,  # grad_value
+        cp_sharding if has_attn_bias else None,  # grad_attn_bias
+    ]
+
+    cp_inp: PlacementList = [
+        cp_sharding,  # grad_out
+        cp_sharding,  # query
+        cp_sharding,  # key
+        cp_sharding,  # value
+        cp_sharding if has_attn_bias else None,  # attn_bias
+        None,  # grad_input_mask
+        cp_sharding,  # out
+        cp_sharding,  # logsumexp
+        None,  # cum_seq_q
+        None,  # cum_seq_k
+        None,  # max_q
+        None,  # max_k
+        None,  # dropout_p
+        None,  # is_causal
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
+    ]
+
+    if len(op_schema.args_schema) > 16:
+        cp_inp.append(None)  # scale
+
+    cp_strategy: PlacementList = cp_out + cp_inp
+    single_mesh_dim_strategies.append(cp_strategy)
 
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=4

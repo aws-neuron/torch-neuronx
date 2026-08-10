@@ -207,6 +207,12 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Neuron permanently registers the sequence-dim Shard(2)->Shard(2)"
+            " SDPA strategy (required so the CP ring handler's not-needs-redistribute"
+            " assert holds), so SDPA on seq-sharded DTensors without CP still yields"
+            " Shard(2) output. Upstream expects seq sharding to be unsupported without"
+            " CP (it registers cp sharding rules only transiently), so the test's"
+            " assertNotEqual(out.placements[0], Shard(2)) fails."
             "LU without pivoting (pivot=False) is CUDA-only; Neuron's CPU-LAPACK"
             " fallback raises 'LU without pivoting is not implemented on the CPU'"
         ),

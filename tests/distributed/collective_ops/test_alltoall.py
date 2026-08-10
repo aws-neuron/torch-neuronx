@@ -440,19 +440,6 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
             partial_group=partial_group,
         )
 
-    @assert_raises(
-        RuntimeError,
-        match=r".*unsupported world size.*supported sizes.*",
-    )
-    def test_alltoall_partial_group_unsupported_world_size(self):
-        """Test alltoall with unsupported world size."""
-        partial_group = [0, 1]
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
-        self.distributed_tester.run_test(
-            run_partial_group_alltoall_test,
-            partial_group=partial_group,
-        )
-
     @pytest.mark.parametrize(
         "group_config",
         [

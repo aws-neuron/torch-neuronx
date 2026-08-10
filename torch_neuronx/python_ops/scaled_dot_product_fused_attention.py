@@ -168,6 +168,7 @@ def _sdpa_bwd_traceable(
         key,
         value,
         attn_bias,
+        out,
         logsumexp,
         scale_val,
         is_causal,
