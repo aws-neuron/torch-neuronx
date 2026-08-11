@@ -87,3 +87,43 @@ func.func @torch.aten.complex(%arg0: !torch.vtensor<[2,4,8],f32>, %arg1: !torch.
   %0 = torch.aten.complex %arg0, %arg1 : !torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,8],f32> -> !torch.vtensor<[2,4,8],complex<f32>>
   return %0 : !torch.vtensor<[2,4,8],complex<f32>>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.real$dynamic(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?,8],complex<f32>>) -> !torch.vtensor<[?,?,8],f32> {
+// CHECK:         %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,8],complex<f32>> -> tensor<?x?x8xcomplex<f32>>
+// CHECK:         %[[T1:.*]] = stablehlo.real %[[T0]] : (tensor<?x?x8xcomplex<f32>>) -> tensor<?x?x8xf32>
+// CHECK:         %[[T2:.*]] = torch_c.from_builtin_tensor %[[T1]] : tensor<?x?x8xf32> -> !torch.vtensor<[?,?,8],f32>
+// CHECK:         return %[[T2]] : !torch.vtensor<[?,?,8],f32>
+func.func @torch.aten.real$dynamic(%arg0: !torch.vtensor<[?,?,8],complex<f32>>) -> !torch.vtensor<[?,?,8],f32> {
+  %0 = torch.aten.real %arg0 : !torch.vtensor<[?,?,8],complex<f32>> -> !torch.vtensor<[?,?,8],f32>
+  return %0 : !torch.vtensor<[?,?,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.imag$dynamic(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?,8],complex<f32>>) -> !torch.vtensor<[?,?,8],f32> {
+// CHECK:         %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,8],complex<f32>> -> tensor<?x?x8xcomplex<f32>>
+// CHECK:         %[[T1:.*]] = stablehlo.imag %[[T0]] : (tensor<?x?x8xcomplex<f32>>) -> tensor<?x?x8xf32>
+// CHECK:         %[[T2:.*]] = torch_c.from_builtin_tensor %[[T1]] : tensor<?x?x8xf32> -> !torch.vtensor<[?,?,8],f32>
+// CHECK:         return %[[T2]] : !torch.vtensor<[?,?,8],f32>
+func.func @torch.aten.imag$dynamic(%arg0: !torch.vtensor<[?,?,8],complex<f32>>) -> !torch.vtensor<[?,?,8],f32> {
+  %0 = torch.aten.imag %arg0 : !torch.vtensor<[?,?,8],complex<f32>> -> !torch.vtensor<[?,?,8],f32>
+  return %0 : !torch.vtensor<[?,?,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.complex$dynamic(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[?,?,8],f32>) -> !torch.vtensor<[?,?,8],complex<f32>> {
+// CHECK:         %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[?,?,8],f32> -> tensor<?x?x8xf32>
+// CHECK:         %[[T1:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,8],f32> -> tensor<?x?x8xf32>
+// CHECK:         %[[T2:.*]] = stablehlo.complex %[[T1]], %[[T0]] : tensor<?x?x8xcomplex<f32>>
+// CHECK:         %[[T3:.*]] = torch_c.from_builtin_tensor %[[T2]] : tensor<?x?x8xcomplex<f32>> -> !torch.vtensor<[?,?,8],complex<f32>>
+// CHECK:         return %[[T3]] : !torch.vtensor<[?,?,8],complex<f32>>
+func.func @torch.aten.complex$dynamic(%arg0: !torch.vtensor<[?,?,8],f32>, %arg1: !torch.vtensor<[?,?,8],f32>) -> !torch.vtensor<[?,?,8],complex<f32>> {
+  %0 = torch.aten.complex %arg0, %arg1 : !torch.vtensor<[?,?,8],f32>, !torch.vtensor<[?,?,8],f32> -> !torch.vtensor<[?,?,8],complex<f32>>
+  return %0 : !torch.vtensor<[?,?,8],complex<f32>>
+}
