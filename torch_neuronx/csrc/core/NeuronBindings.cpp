@@ -57,6 +57,7 @@
 // Metrics
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 // Include Distributed Work and Watchdog (for async collective completion tracking)
+#include "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h"
 #include "torch_neuronx/csrc/distributed/NeuronBackend.h"
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
@@ -2058,6 +2059,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("graph_name"), py::arg("cache_key"), py::arg("inputs"), py::arg("outputs"),
       py::arg("has_collectives"), py::arg("input_names") = std::vector<std::string>{},
       py::arg("output_names") = std::vector<std::string>{});
+
+  // Dynamic multi-tier AllGather tiling plan — test/parity utility exposing
+  // the C++ ComputePlan so a Python test can assert it matches
+  // dynamic_allgather.plan_dynamic_allgather (the two implementations must stay in lock-step).
+  m.def(
+      "_allgather_compute_plan",
+      [](int64_t numel, int64_t ranks, int64_t nprg, int64_t dtype_size,
+         const std::string& platform) {
+        std::string plat = platform.empty() ? at::neuron::utils::GetPlatformTarget() : platform;
+        auto p = torch_neuronx::distributed::ag_tiling::ComputePlan(numel, ranks, nprg, dtype_size,
+                                                                    plat);
+        return py::make_tuple(p.large, p.medium, p.small, p.trace_numel, p.eligible, p.unroll);
+      },
+      "Compute the AllGather tiling plan -> (large, medium, small, trace_numel, eligible, "
+      "unroll). platform defaults to the runtime platform target when empty.",
+      py::arg("numel"), py::arg("ranks"), py::arg("nprg"), py::arg("dtype_size"),
+      py::arg("platform") = "");
 
   // torch.compile MegaCache: write NEFF to persistent cache.
   m.def(

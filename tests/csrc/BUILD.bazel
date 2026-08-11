@@ -632,6 +632,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "DynamicAllGatherTilingTest",
+    srcs = ["core/distributed/DynamicAllGatherTilingTest.cpp"],
+    deps = ["//:distributed"],
+)
+
+torch_neuronx_cc_test(
     name = "ShelvesCleanupTest",
     srcs = ["core/allocator/ShelvesCleanupTest.cpp"],
     deps = ["//:runtime"],

@@ -60,6 +60,20 @@ class CacheKeyGenerator {
                                         const std::vector<std::vector<int>>& replica_groups,
                                         int reduce_op, bool slice_output = false);
 
+  // Bucketed key for a dynamic multi-tier collective (allgather / reduce-scatter / …).
+  // Encodes the NEFF's identity dims — the collective family (op_type), the trace_numel floor,
+  // the (large, medium, small) element tiles the NEFF is baked with, dtype, the replica-group
+  // partition, the tiling unroll factor, and (for reduce collectives) the reduce_op — and
+  // deliberately NOT the runtime numel, so every numel served by the same NEFF shares one
+  // dispatch-cache entry (=> after the first lowering the dispatch stays in C++).
+  // unroll is part of the NEFF identity (u1/u2/u4 are distinct NEFFs). reduce_op is appended only
+  // when >= 0 (pass -1 for non-reducing collectives like allgather). The "dynamic" tag keeps
+  // these keys disjoint from native (GenerateCollective) keys.
+  static std::string GenerateDynamicCollectiveKey(
+      const std::string& op_type, int64_t trace_numel, int64_t large_tile, int64_t medium_tile,
+      int64_t small_tile, const std::vector<std::vector<int>>& replica_groups,
+      c10::ScalarType dtype, int64_t unroll, int reduce_op = -1);
+
  private:
   // ── Shared type formatters ──
   // Each type has exactly ONE formatting function. Both AppendIValue (C++ path)
