@@ -59,6 +59,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "TestProfiler::test_user_annotation",
+            "TestProfilerDeviceNEURON::test_user_annotation_neuron",
         ],
     ),
     SkipGroup(
