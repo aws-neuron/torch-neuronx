@@ -677,3 +677,185 @@ func.func @torch.aten.slice.strided_static$slice_like(%arg0: !torch.vtensor<[100
   %0 = torch.aten.slice.Tensor %arg0, %int0, %int0, %int50, %int2 : !torch.vtensor<[100,64],bf16>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[25,64],bf16>
   return %0 : !torch.vtensor<[25,64],bf16>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.view.dtype$narrow_dynamic(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,8],f32>) -> !torch.vtensor<[?,32],ui8> {
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,8],f32> -> tensor<?x8xf32>
+// CHECK:           %[[BITCAST:.*]] = stablehlo.bitcast_convert %[[T0]] : (tensor<?x8xf32>) -> tensor<?x8x4xui8>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[BITCAST]], %[[C0]] : tensor<?x8x4xui8>
+// CHECK:           %[[D0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[BITCAST]], %[[C1]] : tensor<?x8x4xui8>
+// CHECK:           %[[D1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM2:.*]] = tensor.dim %[[BITCAST]], %[[C2]] : tensor<?x8x4xui8>
+// CHECK:           %[[D2:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:           %[[LAST:.*]] = arith.muli %[[D1]], %[[D2]] : i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[D0]], %[[LAST]] : tensor<2xi64>
+// CHECK:           %[[RESULT:.*]] = stablehlo.dynamic_reshape %[[BITCAST]], %[[SHAPE]] : (tensor<?x8x4xui8>, tensor<2xi64>) -> tensor<?x32xui8>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x32xui8> -> !torch.vtensor<[?,32],ui8>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?,32],ui8>
+// CHECK:         }
+func.func @torch.aten.view.dtype$narrow_dynamic(%arg0: !torch.vtensor<[?,8],f32>) -> !torch.vtensor<[?,32],ui8> {
+  %int0 = torch.constant.int 0
+  %0 = torch.aten.view.dtype %arg0, %int0 : !torch.vtensor<[?,8],f32>, !torch.int -> !torch.vtensor<[?,32],ui8>
+  return %0 : !torch.vtensor<[?,32],ui8>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.view.dtype$widen_dynamic(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,4],ui8>) -> !torch.vtensor<[?,1],f32> {
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,4],ui8> -> tensor<?x4xui8>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[T0]], %[[C0]] : tensor<?x4xui8>
+// CHECK:           %[[D0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[T0]], %[[C1]] : tensor<?x4xui8>
+// CHECK:           %[[D1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:           %[[C4_I64:.*]] = arith.constant 4 : i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[D0]], %[[C1_I64]], %[[C4_I64]] : tensor<3xi64>
+// CHECK:           %[[RESHAPED:.*]] = stablehlo.dynamic_reshape %[[T0]], %[[SHAPE]] : (tensor<?x4xui8>, tensor<3xi64>) -> tensor<?x1x4xui8>
+// CHECK:           %[[RESULT:.*]] = stablehlo.bitcast_convert %[[RESHAPED]] : (tensor<?x1x4xui8>) -> tensor<?x1xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x1xf32> -> !torch.vtensor<[?,1],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?,1],f32>
+// CHECK:         }
+func.func @torch.aten.view.dtype$widen_dynamic(%arg0: !torch.vtensor<[?,4],ui8>) -> !torch.vtensor<[?,1],f32> {
+  %int6 = torch.constant.int 6
+  %0 = torch.aten.view.dtype %arg0, %int6 : !torch.vtensor<[?,4],ui8>, !torch.int -> !torch.vtensor<[?,1],f32>
+  return %0 : !torch.vtensor<[?,1],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.view.dtype$widen_dynamic_larger(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,8],ui8>) -> !torch.vtensor<[?,2],f32> {
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,8],ui8> -> tensor<?x8xui8>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[T0]], %[[C0]] : tensor<?x8xui8>
+// CHECK:           %[[D0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[T0]], %[[C1]] : tensor<?x8xui8>
+// CHECK:           %[[D1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C2_I64:.*]] = arith.constant 2 : i64
+// CHECK:           %[[C4_I64:.*]] = arith.constant 4 : i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[D0]], %[[C2_I64]], %[[C4_I64]] : tensor<3xi64>
+// CHECK:           %[[RESHAPED:.*]] = stablehlo.dynamic_reshape %[[T0]], %[[SHAPE]] : (tensor<?x8xui8>, tensor<3xi64>) -> tensor<?x2x4xui8>
+// CHECK:           %[[RESULT:.*]] = stablehlo.bitcast_convert %[[RESHAPED]] : (tensor<?x2x4xui8>) -> tensor<?x2xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x2xf32> -> !torch.vtensor<[?,2],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?,2],f32>
+// CHECK:         }
+func.func @torch.aten.view.dtype$widen_dynamic_larger(%arg0: !torch.vtensor<[?,8],ui8>) -> !torch.vtensor<[?,2],f32> {
+  %int6 = torch.constant.int 6
+  %0 = torch.aten.view.dtype %arg0, %int6 : !torch.vtensor<[?,8],ui8>, !torch.int -> !torch.vtensor<[?,2],f32>
+  return %0 : !torch.vtensor<[?,2],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.diagonal$dynamic(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,?,4],f32>) -> !torch.vtensor<[4,?],f32> {
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,4],f32> -> tensor<?x?x4xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[T0]], %[[C0]] : tensor<?x?x4xf32>
+// CHECK:           %[[D0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[T0]], %[[C1]] : tensor<?x?x4xf32>
+// CHECK:           %[[D1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C0_I64:.*]] = arith.constant 0 : i64
+// CHECK:           %[[D1_MINUS_OFF:.*]] = arith.subi %[[D1]], %[[C0_I64]] : i64
+// CHECK:           %[[DIAGSIZE:.*]] = arith.minsi %[[D0]], %[[D1_MINUS_OFF]] : i64
+// CHECK:           %[[IOTA_SHAPE:.*]] = tensor.from_elements %[[DIAGSIZE]] : tensor<1xi64>
+// CHECK:           %[[IOTA:.*]] = stablehlo.dynamic_iota %[[IOTA_SHAPE]], dim = 0 : (tensor<1xi64>) -> tensor<?xi32>
+// CHECK:           %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:           %[[IOTA_DIM:.*]] = tensor.dim %[[IOTA]], %[[C0_2]] : tensor<?xi32>
+// CHECK:           %[[IOTA_SIZE:.*]] = arith.index_cast %[[IOTA_DIM]] : index to i64
+// CHECK:           %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:           %[[RESHAPE_SHAPE:.*]] = tensor.from_elements %[[IOTA_SIZE]], %[[C1_I64]] : tensor<2xi64>
+// CHECK:           %[[IDX1:.*]] = stablehlo.dynamic_reshape %[[IOTA]], %[[RESHAPE_SHAPE]] : (tensor<?xi32>, tensor<2xi64>) -> tensor<?x1xi32>
+// CHECK:           %[[IDX2:.*]] = stablehlo.dynamic_reshape %[[IOTA]], %[[RESHAPE_SHAPE]] : (tensor<?xi32>, tensor<2xi64>) -> tensor<?x1xi32>
+// CHECK:           %[[INDICES:.*]] = stablehlo.concatenate %[[IDX1]], %[[IDX2]], dim = 1 : (tensor<?x1xi32>, tensor<?x1xi32>) -> tensor<?x2xi32>
+// CHECK:           %[[SS0:.*]] = arith.constant 1 : i64
+// CHECK:           %[[SS1:.*]] = arith.constant 1 : i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM2:.*]] = tensor.dim %[[T0]], %[[C2]] : tensor<?x?x4xf32>
+// CHECK:           %[[SS2:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:           %[[SLICE_SIZES:.*]] = tensor.from_elements %[[SS0]], %[[SS1]], %[[SS2]] : tensor<3xi64>
+// CHECK:           %[[RESULT:.*]] = "stablehlo.dynamic_gather"(%[[T0]], %[[INDICES]], %[[SLICE_SIZES]]) <{dimension_numbers = #stablehlo.gather<offset_dims = [0], collapsed_slice_dims = [0, 1], start_index_map = [0, 1], index_vector_dim = 1>, indices_are_sorted = false}> : (tensor<?x?x4xf32>, tensor<?x2xi32>, tensor<3xi64>) -> tensor<4x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<4x?xf32> -> !torch.vtensor<[4,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[4,?],f32>
+// CHECK:         }
+func.func @torch.aten.diagonal$dynamic(%arg0: !torch.vtensor<[?,?,4],f32>) -> !torch.vtensor<[4,?],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %0 = torch.aten.diagonal %arg0, %int0, %int0, %int1 : !torch.vtensor<[?,?,4],f32>, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[4,?],f32>
+  return %0 : !torch.vtensor<[4,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.diagonal$dynamic_neg_offset(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?],f32> {
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?],f32> -> tensor<?x?xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[T0]], %[[C0]] : tensor<?x?xf32>
+// CHECK:           %[[D0:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[T0]], %[[C1]] : tensor<?x?xf32>
+// CHECK:           %[[D1:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C1_I64:.*]] = arith.constant 1 : i64
+// CHECK:           %[[D0_MINUS_OFF:.*]] = arith.subi %[[D0]], %[[C1_I64]] : i64
+// CHECK:           %[[DIAGSIZE:.*]] = arith.minsi %[[D0_MINUS_OFF]], %[[D1]] : i64
+// CHECK:           %[[IOTA_SHAPE:.*]] = tensor.from_elements %[[DIAGSIZE]] : tensor<1xi64>
+// CHECK:           %[[IOTA:.*]] = stablehlo.dynamic_iota %[[IOTA_SHAPE]], dim = 0 : (tensor<1xi64>) -> tensor<?xi32>
+// CHECK:           %[[OFF_CONST:.*]] = stablehlo.constant dense<1> : tensor<i32>
+// CHECK:           %[[IDX1:.*]] = chlo.broadcast_add %[[IOTA]], %[[OFF_CONST]] : (tensor<?xi32>, tensor<i32>) -> tensor<?xi32>
+// CHECK:           %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:           %[[IOTA_DIM:.*]] = tensor.dim %[[IDX1]], %[[C0_2]] : tensor<?xi32>
+// CHECK:           %[[IOTA_SIZE:.*]] = arith.index_cast %[[IOTA_DIM]] : index to i64
+// CHECK:           %[[C1_I64_2:.*]] = arith.constant 1 : i64
+// CHECK:           %[[RESHAPE_SHAPE:.*]] = tensor.from_elements %[[IOTA_SIZE]], %[[C1_I64_2]] : tensor<2xi64>
+// CHECK:           %[[IDX1_R:.*]] = stablehlo.dynamic_reshape %[[IDX1]], %[[RESHAPE_SHAPE]] : (tensor<?xi32>, tensor<2xi64>) -> tensor<?x1xi32>
+// CHECK:           %[[IDX2_R:.*]] = stablehlo.dynamic_reshape %[[IOTA]], %[[RESHAPE_SHAPE]] : (tensor<?xi32>, tensor<2xi64>) -> tensor<?x1xi32>
+// CHECK:           %[[INDICES:.*]] = stablehlo.concatenate %[[IDX1_R]], %[[IDX2_R]], dim = 1 : (tensor<?x1xi32>, tensor<?x1xi32>) -> tensor<?x2xi32>
+// CHECK:           %[[SS0:.*]] = arith.constant 1 : i64
+// CHECK:           %[[SS1:.*]] = arith.constant 1 : i64
+// CHECK:           %[[SLICE_SIZES:.*]] = tensor.from_elements %[[SS0]], %[[SS1]] : tensor<2xi64>
+// CHECK:           %[[RESULT:.*]] = "stablehlo.dynamic_gather"(%[[T0]], %[[INDICES]], %[[SLICE_SIZES]]) <{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [0, 1], start_index_map = [0, 1], index_vector_dim = 1>, indices_are_sorted = false}> : (tensor<?x?xf32>, tensor<?x2xi32>, tensor<2xi64>) -> tensor<?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?xf32> -> !torch.vtensor<[?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?],f32>
+// CHECK:         }
+func.func @torch.aten.diagonal$dynamic_neg_offset(%arg0: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %neg1 = torch.constant.int -1
+  %0 = torch.aten.diagonal %arg0, %neg1, %int0, %int1 : !torch.vtensor<[?,?],f32>, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?],f32>
+  return %0 : !torch.vtensor<[?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @prims.split_dim$dynamic_outer(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,12],f32>, %[[ARG1:.*]]: !torch.int) -> !torch.vtensor<[?,?,?],f32> {
+// CHECK:           %[[OUTER:.*]] = torch_c.to_i64 %[[ARG1]]
+// CHECK:           %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,12],f32> -> tensor<?x12xf32>
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[DIM0:.*]] = tensor.dim %[[T0]], %[[C0]] : tensor<?x12xf32>
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[T0]], %[[C1]] : tensor<?x12xf32>
+// CHECK:           %[[OUTER_IDX:.*]] = arith.index_cast %[[OUTER]] : i64 to index
+// CHECK:           %[[INNER:.*]] = arith.divsi %[[DIM1]], %[[OUTER_IDX]] : index
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIM0]], %[[OUTER_IDX]], %[[INNER]] : tensor<3xindex>
+// CHECK:           %[[RESULT:.*]] = stablehlo.dynamic_reshape %[[T0]], %[[SHAPE]] : (tensor<?x12xf32>, tensor<3xindex>) -> tensor<?x?x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x?x?xf32> -> !torch.vtensor<[?,?,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?,?,?],f32>
+// CHECK:         }
+func.func @prims.split_dim$dynamic_outer(%arg0: !torch.vtensor<[?,12],f32>, %arg1: !torch.int) -> !torch.vtensor<[?,?,?],f32> {
+  %int1 = torch.constant.int 1
+  %0 = torch.prims.split_dim %arg0, %int1, %arg1 : !torch.vtensor<[?,12],f32>, !torch.int, !torch.int -> !torch.vtensor<[?,?,?],f32>
+  return %0 : !torch.vtensor<[?,?,?],f32>
+}

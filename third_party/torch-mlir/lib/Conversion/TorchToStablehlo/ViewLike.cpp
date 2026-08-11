@@ -241,50 +241,114 @@ public:
       auto self = adaptor.getSelf();
       auto baseResultTy = dyn_cast<BaseTensorType>(op.getType());
 
-      // infer the result shape
       auto operandElt = rankType.getElementType();
       auto targetElt = baseResultTy.getDtype();
       auto operandEltBitWidth = getBitWidth(operandElt);
       auto targetEltBitWidth = getBitWidth(targetElt);
       auto operandSizes = rankType.getShape();
-      SmallVector<int64_t> castShape(operandSizes);
-      if (operandEltBitWidth > targetEltBitWidth) {
-        int64_t last_size = operandEltBitWidth / targetEltBitWidth;
-        castShape.push_back(last_size);
-      } else if (operandEltBitWidth < targetEltBitWidth) {
-        int64_t last_size = targetEltBitWidth / operandEltBitWidth;
-        if (!ShapedType::isDynamic(castShape.back()) and
-            last_size != castShape.back()) {
-          return rewriter.notifyMatchFailure(
-              op, "The last dim size is not equal to targetEltBitWidth / "
-                  "operandEltBitWidth.");
-        } else {
-          castShape.pop_back();
-        }
-      }
+      int64_t inputRank = rankType.getRank();
 
       auto resultType =
           OpConversionPattern<AtenOpT>::getTypeConverter()->convertType(
               baseResultTy);
-      if (!dyn_cast<ShapedType>(resultType).hasStaticShape()) {
-        return rewriter.notifyMatchFailure(
-            op, "Currently only support static output shape.");
+      auto resultRankedType = dyn_cast<RankedTensorType>(resultType);
+
+      if (operandEltBitWidth == targetEltBitWidth) {
+        // Same bitwidth: just bitcast_convert, no shape change.
+        rewriter.replaceOpWithNewOp<stablehlo::BitcastConvertOp>(
+            op, resultType, self);
+        return success();
+      } else if (operandEltBitWidth > targetEltBitWidth) {
+        // Narrow (e.g., f32 -> u8):
+        //   bitcast_convert adds trailing dim: [*, D] -> [*, D, ratio]
+        //   reshape merges last two dims:      [*, D, ratio] -> [*, D*ratio]
+        int64_t ratio = operandEltBitWidth / targetEltBitWidth;
+        SmallVector<int64_t> bitcastShape(operandSizes);
+        bitcastShape.push_back(ratio);
+        auto bitcastType = RankedTensorType::get(
+            bitcastShape, resultRankedType.getElementType());
+        Value bitcast = stablehlo::BitcastConvertOp::create(
+            rewriter, loc, bitcastType, self);
+
+        if (resultRankedType.hasStaticShape()) {
+          rewriter.replaceOpWithNewOp<stablehlo::ReshapeOp>(op, resultType,
+                                                            bitcast);
+          return success();
+        }
+
+        // Dynamic: compute output shape by merging last two bitcast dims.
+        auto dimSizes =
+            hlo::getDimSizesOfTensor(rewriter, op, bitcast, 64);
+        if (failed(dimSizes))
+          return failure();
+        int64_t bitcastRank = bitcastShape.size();
+        SmallVector<Value, 4> outputDims;
+        for (int64_t i = 0; i < bitcastRank - 2; ++i)
+          outputDims.push_back((*dimSizes)[i]);
+        Value lastDim = arith::MulIOp::create(
+            rewriter, loc, (*dimSizes)[bitcastRank - 2],
+            (*dimSizes)[bitcastRank - 1]);
+        outputDims.push_back(lastDim);
+
+        Value shapeTensor =
+            tensor::FromElementsOp::create(rewriter, loc, outputDims);
+        rewriter.replaceOpWithNewOp<stablehlo::DynamicReshapeOp>(
+            op, resultType, bitcast, shapeTensor);
+        return success();
+      } else {
+        // Widen (e.g., u8 -> f32):
+        //   reshape splits last dim:         [*, D] -> [*, D/ratio, ratio]
+        //   bitcast_convert removes last dim: [*, D/ratio, ratio] -> [*, D/ratio]
+        int64_t ratio = targetEltBitWidth / operandEltBitWidth;
+        int64_t lastDim = operandSizes[inputRank - 1];
+
+        if (ShapedType::isDynamic(lastDim)) {
+          return rewriter.notifyMatchFailure(
+              op, "last dim must be static for widening view(dtype) "
+                  "(must be divisible by targetBitWidth / operandBitWidth)");
+        }
+        if (lastDim % ratio != 0) {
+          return rewriter.notifyMatchFailure(
+              op, "last dim must be divisible by targetBitWidth / "
+                  "operandBitWidth for widening view(dtype)");
+        }
+
+        // Build the intermediate shape: [*, lastDim/ratio, ratio]
+        SmallVector<int64_t> reshapedShape(operandSizes.begin(),
+                                          operandSizes.end() - 1);
+        reshapedShape.push_back(lastDim / ratio);
+        reshapedShape.push_back(ratio);
+        auto reshapedType = RankedTensorType::get(
+            reshapedShape, rankType.getElementType());
+
+        Value reshaped;
+        if (rankType.hasStaticShape()) {
+          reshaped = stablehlo::ReshapeOp::create(rewriter, loc, reshapedType,
+                                                  self);
+        } else {
+          auto dimSizes =
+              hlo::getDimSizesOfTensor(rewriter, op, self, 64);
+          if (failed(dimSizes))
+            return failure();
+          auto intType = rewriter.getI64Type();
+          SmallVector<Value, 4> reshapeDims;
+          for (int64_t i = 0; i < inputRank - 1; ++i)
+            reshapeDims.push_back((*dimSizes)[i]);
+          reshapeDims.push_back(arith::ConstantOp::create(
+              rewriter, loc, rewriter.getIntegerAttr(intType, lastDim / ratio)));
+          reshapeDims.push_back(arith::ConstantOp::create(
+              rewriter, loc, rewriter.getIntegerAttr(intType, ratio)));
+          Value shapeTensor =
+              tensor::FromElementsOp::create(rewriter, loc, reshapeDims);
+          reshaped = stablehlo::DynamicReshapeOp::create(
+              rewriter, loc, reshapedType, self, shapeTensor);
+        }
+
+        // bitcast_convert consumes the trailing ratio dim.
+        rewriter.replaceOpWithNewOp<stablehlo::BitcastConvertOp>(
+            op, resultType, reshaped);
+        return success();
       }
-
-      auto castType =
-          baseResultTy.getWithSizesAndDtype(castShape, baseResultTy.getDtype());
-      auto cast = stablehlo::BitcastConvertOp::create(
-          rewriter, loc,
-          OpConversionPattern<AtenOpT>::getTypeConverter()->convertType(
-              castType),
-          self);
-
-      auto reshape =
-          stablehlo::ReshapeOp::create(rewriter, loc, resultType, cast);
-
-      rewriter.replaceOp(op, reshape);
-
-      return success();
     }
 
     // collect Value of dims
@@ -737,6 +801,7 @@ LogicalResult ConvertAtenOp<AtenDiagonalOp>::matchAndRewrite(
     ConversionPatternRewriter &rewriter) const {
   auto self = adaptor.getSelf();
   auto selfTy = cast<RankedTensorType>(self.getType());
+  auto loc = op.getLoc();
 
   int64_t offset, dim1, dim2;
   if (!matchPattern(op.getOffset(), m_TorchConstantInt(&offset)) ||
@@ -751,81 +816,159 @@ LogicalResult ConvertAtenOp<AtenDiagonalOp>::matchAndRewrite(
 
   if (!isValidDim(dim1, inputRank) || !isValidDim(dim2, inputRank) ||
       dim1 == dim2)
-    return rewriter.notifyMatchFailure(op, "imvalid diagonal dims");
+    return rewriter.notifyMatchFailure(op, "invalid diagonal dims");
 
   auto shape = selfTy.getShape();
-  if (llvm::any_of(shape, [](int64_t s) { return s == ShapedType::kDynamic; }))
-    return rewriter.notifyMatchFailure(op,
-                                       "currently only support static shapes");
+  auto i32Type = rewriter.getI32Type();
+  bool hasAnyDynamic =
+      llvm::any_of(shape, [](int64_t s) { return s == ShapedType::kDynamic; });
 
-  // Calculate diagonal size
-  int64_t diagSize;
-  if (offset >= 0) {
-    diagSize = std::min(shape[dim1], shape[dim2] - offset);
+  // Build iota of length diagSize and compute idx1/idx2
+  Value iota;
+  if (!hasAnyDynamic) {
+    int64_t diagSize;
+    if (offset >= 0) {
+      diagSize = std::min(shape[dim1], shape[dim2] - offset);
+    } else {
+      diagSize = std::min(shape[dim1] + offset, shape[dim2]);
+    }
+    if (diagSize <= 0)
+      return rewriter.notifyMatchFailure(op, "diagonal size must be positive");
+
+    auto iotaType = RankedTensorType::get({diagSize}, i32Type);
+    iota = stablehlo::IotaOp::create(rewriter, loc, iotaType,
+                                     rewriter.getI64IntegerAttr(0));
   } else {
-    diagSize = std::min(shape[dim1] + offset, shape[dim2]);
+    auto i64Ty = rewriter.getI64Type();
+    Value dim1Size = arith::IndexCastOp::create(
+        rewriter, loc, i64Ty,
+        tensor::DimOp::create(rewriter, loc, self, dim1));
+    Value dim2Size = arith::IndexCastOp::create(
+        rewriter, loc, i64Ty,
+        tensor::DimOp::create(rewriter, loc, self, dim2));
+
+    Value diagSizeI64;
+    if (offset >= 0) {
+      Value offsetConst = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(offset));
+      Value dim2MinusOffset =
+          arith::SubIOp::create(rewriter, loc, dim2Size, offsetConst);
+      diagSizeI64 =
+          arith::MinSIOp::create(rewriter, loc, dim1Size, dim2MinusOffset);
+    } else {
+      Value offsetConst = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(-offset));
+      Value dim1MinusOffset =
+          arith::SubIOp::create(rewriter, loc, dim1Size, offsetConst);
+      diagSizeI64 =
+          arith::MinSIOp::create(rewriter, loc, dim1MinusOffset, dim2Size);
+    }
+
+    Value iotaShape = tensor::FromElementsOp::create(rewriter, loc,
+                                                      ValueRange{diagSizeI64});
+    auto dynIotaType = RankedTensorType::get({ShapedType::kDynamic}, i32Type);
+    iota = stablehlo::DynamicIotaOp::create(
+        rewriter, loc, dynIotaType, iotaShape, rewriter.getI64IntegerAttr(0));
   }
 
-  if (diagSize <= 0)
-    return rewriter.notifyMatchFailure(op, "diagonal size must be positive");
-
-  // Create gather indices using iota
-  auto iotaType = RankedTensorType::get({diagSize}, rewriter.getI32Type());
-  Value iota = stablehlo::IotaOp::create(rewriter, op.getLoc(), iotaType,
-                                         rewriter.getI64IntegerAttr(0));
-
+  // Compute idx1 and idx2 from iota + offset
   Value idx1, idx2;
   if (offset < 0) {
     Value offsetConst = stablehlo::ConstantOp::create(
-        rewriter, op.getLoc(), rewriter.getI32IntegerAttr(-offset));
-    idx1 = chlo::BroadcastAddOp::create(rewriter, op.getLoc(), iota,
-                                        offsetConst, nullptr);
+        rewriter, loc, rewriter.getI32IntegerAttr(-offset));
+    idx1 = chlo::BroadcastAddOp::create(rewriter, loc, iota, offsetConst,
+                                        nullptr);
     idx2 = iota;
   } else if (offset > 0) {
     Value offsetConst = stablehlo::ConstantOp::create(
-        rewriter, op.getLoc(), rewriter.getI32IntegerAttr(offset));
+        rewriter, loc, rewriter.getI32IntegerAttr(offset));
     idx1 = iota;
-    idx2 = chlo::BroadcastAddOp::create(rewriter, op.getLoc(), iota,
-                                        offsetConst, nullptr);
+    idx2 = chlo::BroadcastAddOp::create(rewriter, loc, iota, offsetConst,
+                                        nullptr);
   } else {
     idx1 = idx2 = iota;
   }
 
-  Value startIndices = stablehlo::ConcatenateOp::create(
-      rewriter, op.getLoc(),
-      ValueRange{
-          stablehlo::ReshapeOp::create(
-              rewriter, op.getLoc(),
-              RankedTensorType::get({diagSize, 1}, rewriter.getI32Type()),
-              idx1),
-          stablehlo::ReshapeOp::create(
-              rewriter, op.getLoc(),
-              RankedTensorType::get({diagSize, 1}, rewriter.getI32Type()),
-              idx2)},
-      rewriter.getI64IntegerAttr(1));
-
-  // Setup gather attributes
-  SmallVector<int64_t> offsetDimsVec, collapsedSliceDimsVec, startIndexMapVec;
-  int64_t outputDim = 0;
-  for (int64_t i = 0; i < inputRank; ++i) {
-    if (i != dim1 && i != dim2) {
-      offsetDimsVec.push_back(outputDim++);
-    }
+  // Reshape idx1/idx2 from [diagSize] to [diagSize, 1] and concatenate to
+  // [diagSize, 2]
+  auto idx1Ty = cast<RankedTensorType>(idx1.getType());
+  int64_t diagDim = idx1Ty.getShape()[0];
+  Value startIndices;
+  if (!hasAnyDynamic) {
+    Value idx1Reshaped = stablehlo::ReshapeOp::create(
+        rewriter, loc, RankedTensorType::get({diagDim, 1}, i32Type), idx1);
+    Value idx2Reshaped = stablehlo::ReshapeOp::create(
+        rewriter, loc, RankedTensorType::get({diagDim, 1}, i32Type), idx2);
+    startIndices = stablehlo::ConcatenateOp::create(
+        rewriter, loc, RankedTensorType::get({diagDim, 2}, i32Type),
+        ValueRange{idx1Reshaped, idx2Reshaped},
+        rewriter.getI64IntegerAttr(1));
+  } else {
+    Value diagSizeI64 = arith::IndexCastOp::create(
+        rewriter, loc, rewriter.getI64Type(),
+        tensor::DimOp::create(
+            rewriter, loc, idx1,
+            arith::ConstantIndexOp::create(rewriter, loc, 0)));
+    Value oneI64 = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(1));
+    Value reshapeShape = tensor::FromElementsOp::create(
+        rewriter, loc, ValueRange{diagSizeI64, oneI64});
+    auto dynNx1Type =
+        RankedTensorType::get({ShapedType::kDynamic, 1}, i32Type);
+    Value idx1Reshaped = stablehlo::DynamicReshapeOp::create(
+        rewriter, loc, dynNx1Type, idx1, reshapeShape);
+    Value idx2Reshaped = stablehlo::DynamicReshapeOp::create(
+        rewriter, loc, dynNx1Type, idx2, reshapeShape);
+    auto dynNx2Type =
+        RankedTensorType::get({ShapedType::kDynamic, 2}, i32Type);
+    startIndices = stablehlo::ConcatenateOp::create(
+        rewriter, loc, dynNx2Type, ValueRange{idx1Reshaped, idx2Reshaped},
+        rewriter.getI64IntegerAttr(1));
   }
-  collapsedSliceDimsVec = {std::min(dim1, dim2), std::max(dim1, dim2)};
-  startIndexMapVec = {std::min(dim1, dim2), std::max(dim1, dim2)};
 
-  SmallVector<int64_t> sliceSizes(shape.begin(), shape.end());
-  sliceSizes[dim1] = sliceSizes[dim2] = 1;
+  // Gather dimension numbers (shared between static and dynamic)
+  SmallVector<int64_t> offsetDimsVec(inputRank - 2);
+  std::iota(offsetDimsVec.begin(), offsetDimsVec.end(), 0);
+  SmallVector<int64_t> collapsedSliceDimsVec = {std::min(dim1, dim2),
+                                                 std::max(dim1, dim2)};
+  SmallVector<int64_t> startIndexMapVec = {std::min(dim1, dim2),
+                                            std::max(dim1, dim2)};
 
   auto gatherDims = stablehlo::GatherDimensionNumbersAttr::get(
       rewriter.getContext(), offsetDimsVec, collapsedSliceDimsVec, {}, {},
       startIndexMapVec, 1);
 
-  Value result = stablehlo::GatherOp::create(
-      rewriter, op.getLoc(), getTypeConverter()->convertType(op.getType()),
-      self, startIndices, gatherDims,
-      DenseI64ArrayAttr::get(rewriter.getContext(), sliceSizes));
+  auto outTy =
+      cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+  // Emit GatherOp (static) or DynamicGatherOp (dynamic)
+  Value result;
+  if (!hasAnyDynamic) {
+    SmallVector<int64_t> sliceSizes(shape.begin(), shape.end());
+    sliceSizes[dim1] = sliceSizes[dim2] = 1;
+    result = stablehlo::GatherOp::create(
+        rewriter, loc, outTy, self, startIndices, gatherDims,
+        DenseI64ArrayAttr::get(rewriter.getContext(), sliceSizes));
+  } else {
+    SmallVector<Value> sliceSizeValues;
+    for (int64_t i = 0; i < inputRank; ++i) {
+      if (i == dim1 || i == dim2) {
+        sliceSizeValues.push_back(arith::ConstantOp::create(
+            rewriter, loc, rewriter.getI64IntegerAttr(1)));
+      } else {
+        Value dimVal = tensor::DimOp::create(rewriter, loc, self, i);
+        sliceSizeValues.push_back(arith::IndexCastOp::create(
+            rewriter, loc, rewriter.getI64Type(), dimVal));
+      }
+    }
+    auto sliceSizesTensorType =
+        RankedTensorType::get({inputRank}, rewriter.getI64Type());
+    Value sliceSizesTensor = tensor::FromElementsOp::create(
+        rewriter, loc, sliceSizesTensorType, sliceSizeValues);
+    result = stablehlo::DynamicGatherOp::create(
+        rewriter, loc, outTy, self, startIndices, sliceSizesTensor,
+        gatherDims);
+  }
 
   rewriter.replaceOp(op, result);
   return success();
@@ -876,21 +1019,56 @@ LogicalResult ConvertAtenOp<PrimsSplitDimOp>::matchAndRewrite(
     return rewriter.notifyMatchFailure(
         op, "the rank of tensor must be greater than 0");
 
-  int64_t dim, outerLength;
+  int64_t dim;
   if (!matchPattern(op.getDim(), m_TorchConstantInt(&dim)))
     return rewriter.notifyMatchFailure(
         op, "only constant dim is currently supported");
-  if (!matchPattern(op.getOuterLength(), m_TorchConstantInt(&outerLength)))
-    return rewriter.notifyMatchFailure(
-        op, "only constant outerLength is currently supported");
 
-  auto splitTensorInfo =
-      hlo::splitTensor(rewriter, op, adaptor.getA(), dim, outerLength);
+  int64_t outerLength;
+  if (matchPattern(op.getOuterLength(), m_TorchConstantInt(&outerLength))) {
+    auto splitTensorInfo =
+        hlo::splitTensor(rewriter, op, adaptor.getA(), dim, outerLength);
+    if (failed(splitTensorInfo))
+      return rewriter.notifyMatchFailure(op, "failed to create split tensor");
+    rewriter.replaceOp(op, *splitTensorInfo);
+    return success();
+  }
 
-  if (failed(splitTensorInfo))
-    return rewriter.notifyMatchFailure(op, "failed to create split tensor");
+  auto loc = op->getLoc();
+  auto rankTy = cast<RankedTensorType>(adaptor.getA().getType());
+  auto oldShape = rankTy.getShape();
+  int64_t inputRank = rankTy.getRank();
+  dim = toPositiveDim(dim, inputRank);
 
-  rewriter.replaceOp(op, *splitTensorInfo);
+  auto outTy = cast<RankedTensorType>(
+      OpConversionPattern<PrimsSplitDimOp>::getTypeConverter()->convertType(
+          op.getType()));
+
+  auto dimSizesInfo = hlo::getDimIndexOfTensor(rewriter, op, adaptor.getA());
+  if (failed(dimSizesInfo))
+    return failure();
+  auto dimSizes = *dimSizesInfo;
+
+  Value outerVal = adaptor.getOuterLength();
+  if (!outerVal.getType().isIndex())
+    outerVal = arith::IndexCastOp::create(rewriter, loc,
+                                          rewriter.getIndexType(), outerVal);
+
+  Value innerVal =
+      arith::DivSIOp::create(rewriter, loc, dimSizes[dim], outerVal);
+
+  SmallVector<Value> newDimSizes;
+  for (int64_t k = 0; k < dim; ++k)
+    newDimSizes.push_back(dimSizes[k]);
+  newDimSizes.push_back(outerVal);
+  newDimSizes.push_back(innerVal);
+  for (int64_t k = dim + 1; k < inputRank; ++k)
+    newDimSizes.push_back(dimSizes[k]);
+
+  Value shapeTensor =
+      tensor::FromElementsOp::create(rewriter, loc, newDimSizes);
+  rewriter.replaceOpWithNewOp<stablehlo::DynamicReshapeOp>(
+      op, outTy, adaptor.getA(), shapeTensor);
   return success();
 }
 
