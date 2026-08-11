@@ -126,7 +126,8 @@ class NeuronBackend : public c10d::Backend {
   void SubmitInNeffCollective(c10d::OpType op_type, const std::vector<at::Tensor>& inputs,
                               const std::vector<at::Tensor>& outputs,
                               const std::vector<std::vector<int>>& replica_groups, int reduce_op,
-                              bool slice_output = false);
+                              bool slice_output = false,
+                              const std::string& cache_key_override = "");
 
   // Submit via hostCC path
   void SubmitHostCCCollective(c10d::OpType op_type, const std::vector<at::Tensor>& inputs,
@@ -153,6 +154,13 @@ class NeuronBackend : public c10d::Backend {
                         const std::vector<at::Tensor>& outputs,
                         const std::vector<std::vector<int>>& replica_groups, int reduce_op,
                         bool slice_output = false);
+
+  // Attempt the dynamic multi-tier NKI all-gather (gated by NEURON_DYN_NKI_COLLECTIVES).
+  // On an eligible call it binds {input[numel,1], numel} to the NEFF and
+  // returns true; returns false when dynami all-gather is ineligible.
+  bool TryDynamicAllgather(at::Tensor& input_tensor, at::Tensor& output_tensor,
+                           const std::vector<std::vector<int>>& replica_groups, int world_size,
+                           c10::intrusive_ptr<NeuronWork>& work);
 
   // Resolve a `c10d::ReduceOp` to the integer reduce code used by the submit path.
   // For `PREMUL_SUM`, scales the provided tensors in-place by the supplement's factor

@@ -93,6 +93,7 @@ These variables affect eager execution (non-compiled operations).
 | `NEURON_USE_SPLIT_REDUCE_SCATTER` | bool | `True` | Enables split-based reduce_scatter implementation. |
 | `COLLECTIVE_BUCKETSIZE_IN_MB` | int | `512` | Maximum bucket size (MB) for collective operations. |
 | `COLLECTIVE_MIN_BUCKETS` | int | `0` | Minimum buckets for collectives. When > 1, forces splitting small tensors. |
+| `NEURON_DYN_NKI_COLLECTIVES` | bool | `False` | When `1`, routes eligible collective calls through the dynamic NKI kernel implementation. |
 
 ## Neuron Memory Allocator Configuration
 

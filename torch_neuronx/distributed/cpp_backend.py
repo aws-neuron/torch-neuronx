@@ -1,5 +1,8 @@
 """C++ NeuronBackend integration — Python HLO callback and PG creation."""
 
+import os
+
+import torch
 from torch._C._distributed_c10d import OpType
 
 from torch_neuronx._C import NeuronBackend
@@ -77,9 +80,34 @@ def _lower_all_to_all_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
     return kernel.lower(list(inputs), group_size=group_size, group_name=group_name)
 
 
+def is_dynamic_allgather_inputs(inputs) -> bool:
+    """True when the C++ NeuronBackend injected the runtime numel scalar
+    for the dynamic allgather
+    """
+    return (
+        len(inputs) == 2
+        and isinstance(inputs[1], torch.Tensor)
+        and inputs[1].dtype == torch.int32
+        and inputs[1].numel() == 1
+    )
+
+
 def _lower_all_gather_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
-    """ALLGATHER → torch-mlir trace of `_c10d_functional.all_gather_into_tensor`."""
+    """ALLGATHER → torch-mlir trace of `_c10d_functional.all_gather_into_tensor`.
+
+    Dynamic path: when the C++ NeuronBackend injects a runtime numel scalar,
+    route to the dynamic all-gather kernel lowering path.
+    """
     del reduce_op
+
+    # C++ only injects the numel scalar when the dynamic allgather is enabled
+    if os.environ.get("NEURON_DYN_NKI_COLLECTIVES") == "1" and is_dynamic_allgather_inputs(inputs):
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dynamic_collectives import (
+            lower_dynamic_allgather,
+        )
+
+        return lower_dynamic_allgather(inputs, replica_groups)
+
     slice_output = kwargs.get("slice_output", False)
     group_name = _format_replica_groups(replica_groups)
     group_size = len(replica_groups[0])

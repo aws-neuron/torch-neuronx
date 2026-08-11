@@ -360,3 +360,69 @@ TEST_F(CacheKeyDtypeAutoStaticTest, KeepdimBoolDiffers) {
 //  The Python pybind path (GenerateFromPython, AppendPyObject) is tested
 //  via _C._generate_cache_key() from Python pytest instead.
 // ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Suite: GenerateDynamicCollectiveKey (dynamic multi-tier collective cache key)
+// ═══════════════════════════════════════════════════════════════
+
+TEST_F(CacheKeyGeneratorTest, DynamicCollectiveKeyEncodesIdentityDims) {
+  // Signature: (op_type, trace_numel, large, medium, small, replica_groups, dtype, unroll,
+  // [reduce_op]).
+  auto k = CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 1024, 512,
+                                                           {{0, 1, 2, 3}}, c10::kBFloat16,
+                                                           /*unroll=*/2);
+  EXPECT_NE(k.find("allgather"), std::string::npos);
+  EXPECT_NE(k.find("dynamic"), std::string::npos);
+  EXPECT_NE(k.find("trace_numel=2048"), std::string::npos);
+  EXPECT_NE(k.find("tiles=2048,1024,512"), std::string::npos);
+  EXPECT_NE(k.find("|u=2"), std::string::npos);
+  // Distinct across each identity dim (op_type / trace_numel / tiles / dtype / partition / unroll)
+  auto rg = std::vector<std::vector<int>>{{0, 1, 2, 3}};
+  EXPECT_NE(k, CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 128, 128, 64, 32, rg,
+                                                               c10::kBFloat16, 2));
+  EXPECT_NE(k, CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 1024, 512,
+                                                               rg, c10::kFloat, 2));
+  EXPECT_NE(k, CacheKeyGenerator::GenerateDynamicCollectiveKey(
+                   "allgather", 2048, 2048, 1024, 512, {{0, 1}, {2, 3}}, c10::kBFloat16, 2));
+  // op_type disambiguates the collective family.
+  EXPECT_NE(k, CacheKeyGenerator::GenerateDynamicCollectiveKey("reduce_scatter", 2048, 2048, 1024,
+                                                               512, rg, c10::kBFloat16, 2));
+  // unroll is part of the NEFF identity (u1/u2/u4 are distinct NEFFs).
+  EXPECT_NE(k, CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 1024, 512,
+                                                               rg, c10::kBFloat16, /*unroll=*/4));
+}
+
+TEST_F(CacheKeyGeneratorTest, DynamicCollectiveKeyDistinctTilesSameTraceNumel) {
+  // Two regimes can emit the same trace_numel (2048) with DIFFERENT tiles. Keying on the tiles
+  // (alongside trace_numel) keeps the NEFFs distinct, so no cross-regime aliasing.
+  auto rg = std::vector<std::vector<int>>{{0, 1, 2, 3}};
+  auto a = CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 1024, 512, rg,
+                                                           c10::kBFloat16, 2);
+  auto b = CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 512, 256, rg,
+                                                           c10::kBFloat16, 2);
+  EXPECT_NE(a, b);
+}
+
+TEST_F(CacheKeyGeneratorTest, DynamicCollectiveKeyReduceOpDistinctAndOmittedForAllgather) {
+  auto rg = std::vector<std::vector<int>>{{0, 1, 2, 3}};
+  // reduce_op omitted (default -1) for allgather => no "red=" token.
+  auto ag = CacheKeyGenerator::GenerateDynamicCollectiveKey("allgather", 2048, 2048, 1024, 512, rg,
+                                                            c10::kBFloat16, /*unroll=*/2);
+  EXPECT_EQ(ag.find("red="), std::string::npos);
+  // A reducing collective encodes reduce_op, and distinct reduce_ops => distinct keys.
+  auto rs0 = CacheKeyGenerator::GenerateDynamicCollectiveKey(
+      "reduce_scatter", 2048, 2048, 1024, 512, rg, c10::kBFloat16, 2, /*reduce_op=*/0);
+  auto rs1 = CacheKeyGenerator::GenerateDynamicCollectiveKey(
+      "reduce_scatter", 2048, 2048, 1024, 512, rg, c10::kBFloat16, 2, /*reduce_op=*/1);
+  EXPECT_NE(rs0.find("red=0"), std::string::npos);
+  EXPECT_NE(rs0, rs1);
+}
+
+TEST_F(CacheKeyGeneratorTest, DynamicCollectiveKeyDisjointFromNativeAllgather) {
+  // The "dynamic" tag keeps the bucketed key from colliding with a native allgather key.
+  auto dynamic_key = CacheKeyGenerator::GenerateDynamicCollectiveKey(
+      "allgather", 2048, 2048, 1024, 512, {{0, 1, 2, 3}}, c10::kBFloat16, /*unroll=*/2);
+  auto native = CacheKeyGenerator::GenerateCollective(
+      "allgather", {torch::zeros({2048, 4096}, torch::kBFloat16)}, {{0, 1, 2, 3}}, 0, false);
+  EXPECT_NE(dynamic_key, native);
+}

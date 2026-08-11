@@ -392,4 +392,26 @@ std::string CacheKeyGenerator::GenerateCollective(
   return key.str();
 }
 
+std::string CacheKeyGenerator::GenerateDynamicCollectiveKey(
+    const std::string& op_type, int64_t trace_numel, int64_t large_tile, int64_t medium_tile,
+    int64_t small_tile, const std::vector<std::vector<int>>& replica_groups, c10::ScalarType dtype,
+    int64_t unroll, int reduce_op) {
+  std::ostringstream key;
+  key << "coll|" << op_type << "|dynamic|trace_numel=" << trace_numel << "|tiles=" << large_tile
+      << "," << medium_tile << "," << small_tile << "|dt=";
+  AppendScalarType(key, dtype);
+  key << "|rg[";
+  for (size_t i = 0; i < replica_groups.size(); ++i) {
+    if (i > 0) key << ",";
+    AppendIntList(key, replica_groups[i]);
+  }
+  key << "]";
+  if (reduce_op >= 0) {
+    key << "|red=" << reduce_op;
+  }
+  // distinct NEFF per unroll variant
+  key << "|u=" << unroll;
+  return key.str();
+}
+
 }  // namespace at::neuron

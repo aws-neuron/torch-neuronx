@@ -67,6 +67,10 @@ def _lower_custom_nki(
     _global_nki_op.kernel.operand_output_aliases = aliases
     result = _global_nki_op.kernel.lower(*tensor_args, **nki_params)
 
+    # Preserve the collective flag from the config: the NKI frontend sets
+    # has_collectives when the kernel emits ncc.* ops (FrameworkConfig.has_collectives)
+    result.has_collectives = dconfig.has_collectives
+
     # Attach config so C++ can cache it in DispatchCacheEntry
     result.nki_return_types = return_types_of(dconfig)
     result.nki_operand_output_aliases = dconfig.operand_output_aliases

@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -27,7 +28,9 @@
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 #include "torch_neuronx/csrc/core/rdma/RdmaManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
+#include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/distributed/DistributedUtils.h"
+#include "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h"
 
 namespace py = pybind11;
 
@@ -164,6 +167,31 @@ bool UseSplitReduceScatter() {
   return UseSplitDefaultForCurrentStream();
 }
 
+// Dynamic multi-tier AllGather gate
+bool UseDynamicNkiCollectives() {
+  static const int env = ReadSplitEnvOnce("NEURON_DYN_NKI_COLLECTIVES");
+  return env == 1;
+}
+
+// Cache of runtime scalar tensors ([1,1] int32) keyed by (value, device index).
+// This skips the host fill + 4-byte H2D on repeated/recurring shapes
+at::Tensor GetOrCreateRuntimeScalar(int64_t value, const at::Device& device) {
+  static std::mutex mtx;
+  static std::unordered_map<std::string, at::Tensor> cache;
+  static constexpr size_t kMaxEntries = 256;
+  const std::string key =
+      std::to_string(value) + "@" + std::to_string(static_cast<int>(device.index()));
+  std::lock_guard<std::mutex> lock(mtx);
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+  // Build on the HOST (CPU fill, no dispatch) and transfer to the device
+  at::Tensor scalar =
+      torch::full({1, 1}, value, torch::TensorOptions().dtype(torch::kInt32)).to(device);
+  if (cache.size() >= kMaxEntries) cache.clear();  // in-flight users keep their own ref via stash
+  cache.emplace(key, scalar);
+  return scalar;
+}
+
 std::vector<std::vector<int>> CreateGlobalReplicaGroups(
     int world_size, const std::vector<int>& current_group_ranks) {
   return torch_neuronx::distributed::CreateGlobalReplicaGroups(world_size, current_group_ranks);
@@ -178,7 +206,8 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
                                            const std::vector<at::Tensor>& inputs,
                                            const std::vector<at::Tensor>& outputs,
                                            const std::vector<std::vector<int>>& replica_groups,
-                                           int reduce_op, bool slice_output) {
+                                           int reduce_op, bool slice_output,
+                                           const std::string& cache_key_override) {
   const std::vector<at::Tensor> original_outputs = outputs;
   std::vector<at::Tensor> working_inputs = inputs;
   std::vector<at::Tensor> working_outputs = outputs;
@@ -187,8 +216,13 @@ void NeuronBackend::SubmitInNeffCollective(c10d::OpType op_type,
   (void)inputs_downcasted;  // Input downcast is permanent for this call; no copy-back.
 
   const auto& op_str = OpTypeToString(op_type);
-  auto cache_key = at::neuron::CacheKeyGenerator::GenerateCollective(
-      op_str, working_inputs, replica_groups, reduce_op, slice_output);
+  // A non-empty override (dynamic allgather) supplies a BUCKETED key so
+  // every runtime numel in the same bucket (trace_numel x unroll) reuses one dispatch-cache
+  // entry; otherwise the key is shape-specific (default collective behavior).
+  auto cache_key = cache_key_override.empty()
+                       ? at::neuron::CacheKeyGenerator::GenerateCollective(
+                             op_str, working_inputs, replica_groups, reduce_op, slice_output)
+                       : cache_key_override;
   auto entry = dispatch::NeuronDispatcher::Instance().GetOrLowerCollectiveOperation(
       cache_key, lower_callback_, op_type, working_inputs, working_outputs, replica_groups,
       reduce_op, slice_output);
@@ -740,6 +774,41 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::allreduce(std::vector<at::Tensor>&
   return work;
 }
 
+// Attempt dynamic multi-tier NKI all-gather
+bool NeuronBackend::TryDynamicAllgather(at::Tensor& input_tensor, at::Tensor& output_tensor,
+                                        const std::vector<std::vector<int>>& replica_groups,
+                                        int world_size, c10::intrusive_ptr<NeuronWork>& work) {
+  if (!UseDynamicNkiCollectives()) return false;
+  int64_t numel = input_tensor.numel();
+  int64_t dsize = input_tensor.element_size();
+  int lnc = std::atoi(at::neuron::utils::GetLogicalNeuronCores().c_str());  // = nprg (kernel grid)
+  int64_t nprg = lnc >= 1 ? lnc : 1;
+  auto plan = ag_tiling::ComputePlan(numel, world_size, nprg, dsize,
+                                     at::neuron::utils::GetPlatformTarget());
+  bool contig = input_tensor.is_contiguous() && output_tensor.is_contiguous();
+  // Eligibility: (1) every rank-major element offset must fit a signed int32 which
+  // requires world_size * numel < 2^31; (2) dtype is bf16/fp16/fp32.
+  auto st = input_tensor.scalar_type();
+  bool native_dtype = (st == at::kBFloat16 || st == at::kHalf || st == at::kFloat);
+  constexpr int64_t kInt32Extent = int64_t{1} << 31;
+  bool offsets_fit = world_size > 0 && numel <= (kInt32Extent - 1) / world_size;
+  if (!(plan.eligible && contig && native_dtype && offsets_fit)) return false;
+  // Bind the shard flat
+  at::Tensor input_bound = input_tensor.reshape({numel, 1});
+  at::Tensor output_bound = output_tensor.reshape({world_size * numel, 1});
+  auto scalar = GetOrCreateRuntimeScalar(numel, input_tensor.device());
+  work->stash({scalar});  // keep alive until the collective completes
+  // Bucketed key (NEFF identity, not runtime numel) so the whole bucket reuses one NEFF: keyed on
+  // trace_numel (rung) + tiles (regime) -- both are needed for a unique NEFF (see the header).
+  auto cache_key = at::neuron::CacheKeyGenerator::GenerateDynamicCollectiveKey(
+      "allgather", plan.trace_numel, plan.large, plan.medium, plan.small, replica_groups,
+      input_bound.scalar_type(), plan.unroll);
+  SubmitInNeffCollective(c10d::OpType::ALLGATHER, {input_bound, scalar}, {output_bound},
+                         replica_groups, /*reduce_op=*/0, /*slice_output=*/false,
+                         /*cache_key_override=*/cache_key);
+  return true;
+}
+
 c10::intrusive_ptr<c10d::Work> NeuronBackend::_allgather_base(at::Tensor& output_tensor,
                                                               at::Tensor& input_tensor,
                                                               const c10d::AllgatherOptions& opts) {
@@ -801,7 +870,9 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::_allgather_base(at::Tensor& output
 
   auto work = CreateWork({output_tensor}, {input_tensor}, c10d::OpType::_ALLGATHER_BASE, async_op);
   try {
-    SubmitCollective(c10d::OpType::ALLGATHER, {input_tensor}, {output_tensor}, replica_groups, 0);
+    if (!TryDynamicAllgather(input_tensor, output_tensor, replica_groups, world_size, work)) {
+      SubmitCollective(c10d::OpType::ALLGATHER, {input_tensor}, {output_tensor}, replica_groups, 0);
+    }
   } catch (...) {
     work->setException(std::current_exception());
     FinishWork(work, async_op);
