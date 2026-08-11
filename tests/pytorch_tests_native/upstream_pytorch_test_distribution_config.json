@@ -78,11 +78,7 @@
     {
       "items": [
         "test_linalg.py",
-        "nn"
-      ]
-    },
-    {
-      "items": [
+        "nn",
         "test_reductions.py",
         "test_torch.py"
       ]
