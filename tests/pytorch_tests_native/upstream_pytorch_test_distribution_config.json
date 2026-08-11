@@ -45,32 +45,22 @@
       "items": [
         "test_ops.py"
       ],
-      "num_shards": 5
+      "num_shards": 2
     },
     {
       "items": [
         "test_meta.py"
-      ],
-      "num_shards": 3
+      ]
     },
     {
       "items": [
         "test_decomp.py"
       ],
-      "num_shards": 3
+      "num_shards": 2
     },
     {
       "items": [
-        "test_ops_gradients.py"
-      ]
-    },
-    {
-      "items": [
-        "test_modules.py"
-      ]
-    },
-    {
-      "items": [
+        "test_ops_gradients.py",
         "test_ops_fwd_gradients.py"
       ]
     },
@@ -81,14 +71,9 @@
     },
     {
       "items": [
-        "test_unary_ufuncs.py"
-      ]
-    },
-    {
-      "items": [
+        "test_unary_ufuncs.py",
         "test_binary_ufuncs.py"
-      ],
-      "num_shards": 2
+      ]
     },
     {
       "items": [
@@ -105,7 +90,8 @@
     {
       "items": [
         "test_nn.py",
-        "test_optim.py"
+        "test_optim.py",
+        "test_modules.py"
       ]
     },
     {
