@@ -34,6 +34,24 @@ def _can_handle_add(x, y, alpha=1, out=None) -> bool:
     return _can_handle_elementwise_2d(x) and x.shape == y.shape and y.dtype == x.dtype
 
 
+def _can_handle_sub(x, y, alpha=1, out=None) -> bool:
+    if alpha != 1:  # the a-b kernel can't honor alpha
+        return False
+    if not isinstance(y, torch.Tensor):
+        return False
+    return _can_handle_elementwise_2d(x) and x.shape == y.shape and y.dtype == x.dtype
+
+
+def _can_handle_sigmoid_backward(grad_output, output, out=None) -> bool:
+    if not isinstance(output, torch.Tensor):
+        return False
+    return (
+        _can_handle_elementwise_2d(grad_output)
+        and grad_output.shape == output.shape
+        and output.dtype == grad_output.dtype
+    )
+
+
 def _can_handle_mul(x, y, out=None) -> bool:
     if not isinstance(y, torch.Tensor):
         return False
@@ -111,7 +129,9 @@ _ELEMENTWISE_OPS = [
     ("log", _can_handle_unary, 1),
     ("neg", _can_handle_unary, 1),
     ("add", _can_handle_add, 2),
+    ("sub", _can_handle_sub, 2),
     ("mul", _can_handle_mul, 2),
+    ("sigmoid_backward", _can_handle_sigmoid_backward, 2),
 ]
 
 

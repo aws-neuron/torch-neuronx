@@ -101,6 +101,24 @@ def _binary_spec(name, fn, **flags):
     return OpSpec(name, build, lambda x, y: fn(x, y), **flags)
 
 
+def _sigmoid_backward_spec(**flags):
+    """sigmoid_backward(grad_output, output): grad_input = grad_output * output * (1 - output).
+    output is a valid sigmoid activation (in (0, 1)); reference is the aten op."""
+
+    def build(dtype, *, rows=512, h=2048):
+        go = torch.randn(1, rows, h, dtype=dtype) / 8
+        out = torch.sigmoid(torch.randn(1, rows, h, dtype=dtype) / 8)
+        ref = torch.ops.aten.sigmoid_backward(go, out)
+        return (go.to("neuron"), out.to("neuron")), ref
+
+    return OpSpec(
+        "sigmoid_backward",
+        build,
+        lambda go, out: torch.ops.aten.sigmoid_backward(go, out),
+        **flags,
+    )
+
+
 def _mm_spec():
     """mm is bf16-only; K=2048, N=4096 (both % 1024 == 0), M % 128 == 0."""
 
@@ -150,8 +168,13 @@ _OP_SPECS = [
     _unary_spec("exp", torch.exp, arbitrary_h=True, compile_once=True),
     _unary_spec("sin", torch.sin, arbitrary_h=True, compile_once=True),
     _unary_spec("cos", torch.cos, arbitrary_h=True, compile_once=True),
-    _binary_spec("add", torch.add),
+    _unary_spec("sigmoid", torch.sigmoid, arbitrary_h=True, compile_once=True),
+    _log_spec(arbitrary_h=True, compile_once=True),
+    _unary_spec("neg", torch.neg, arbitrary_h=True, compile_once=True),
+    _binary_spec("add", torch.add, compile_once=True),
+    _binary_spec("sub", torch.sub, compile_once=True),
     _binary_spec("mul", torch.mul),
+    _sigmoid_backward_spec(compile_once=True),
     _mm_spec(),
     _index_spec(arbitrary_h=True),
     _scatter_add_spec(arbitrary_h=True),
@@ -290,6 +313,25 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_ran("add"):
             torch.add(x, y, out=buf)
         torch.testing.assert_close(buf.cpu(), x.cpu() + y.cpu(), rtol=1e-2, atol=1e-2)
+
+    # These two assert bit-exactness (rtol=atol=0): a single bf16 subtract of the
+    # same two bf16 inputs is one correctly-rounded op on both CPU and Neuron, so
+    # there is no accumulation to accrue error. A tolerance here would only mask a
+    # real dispatch/indexing bug (e.g. a mis-tiled or partially-written result).
+    def test_dynamic_nki_sub_alpha_declines(self):
+        # alpha != 1 can't be honored by the a-b kernel -> can_handle rejects -> fallback.
+        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
+        with _assert_dynamic_skipped("sub"):
+            out = torch.sub(x, y, alpha=2).cpu()
+        torch.testing.assert_close(out, x.cpu() - 2 * y.cpu(), rtol=0, atol=0)
+
+    def test_dynamic_nki_sub_out_writes_in_place(self):
+        # out= is the destination buffer; dynamic path writes into it.
+        x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
+        buf = torch.empty_like(x)
+        with _assert_dynamic_ran("sub"):
+            torch.sub(x, y, out=buf)
+        torch.testing.assert_close(buf.cpu(), x.cpu() - y.cpu(), rtol=0, atol=0)
 
     # ── E2E MoE forward: no recompiles as routing (token counts) change ──
     # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.

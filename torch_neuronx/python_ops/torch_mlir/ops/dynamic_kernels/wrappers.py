@@ -17,10 +17,12 @@ from .exp_kernel import exp_kernel
 from .gather_kernel import gather_kernel
 from .mul_kernel import mul_kernel
 from .scatter_add_kernel import scatter_add_kernel
+from .sigmoid_backward_kernel import sigmoid_backward_kernel
 from .sigmoid_kernel import sigmoid_kernel
 from .silu_bwd_kernel import silu_bwd_kernel
 from .silu_kernel import silu_kernel
 from .sin_kernel import sin_kernel
+from .sub_kernel import sub_kernel
 
 # Grid must match logical_neuron_cores so the compiler emits identical code on
 # every core (NCC_IXGM002 fires on basic-block-count mismatch otherwise). The
@@ -29,6 +31,8 @@ from .sin_kernel import sin_kernel
 _GRID = (int(get_logical_neuron_cores()),)
 
 _wrapped_add = wrap_nki(add_kernel)
+_wrapped_sub = wrap_nki(sub_kernel)
+_wrapped_sigmoid_backward = wrap_nki(sigmoid_backward_kernel)
 _wrapped_silu = wrap_nki(silu_kernel)
 _wrapped_exp = wrap_nki(exp_kernel)
 _wrapped_cos = wrap_nki(cos_kernel)
@@ -46,6 +50,20 @@ def dynamic_add_nki(
     input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_add[_GRID](input_a, input_b, num_m_tiles)
+
+
+@nki_op("dynamic_nki::sub", mutates_args={})
+def dynamic_sub_nki(
+    input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
+) -> torch.Tensor:
+    return _wrapped_sub[_GRID](input_a, input_b, num_m_tiles)
+
+
+@nki_op("dynamic_nki::sigmoid_backward", mutates_args={})
+def dynamic_sigmoid_backward_nki(
+    grad_output: torch.Tensor, output: torch.Tensor, num_m_tiles: torch.Tensor
+) -> torch.Tensor:
+    return _wrapped_sigmoid_backward[_GRID](grad_output, output, num_m_tiles)
 
 
 @nki_op("dynamic_nki::silu", mutates_args={})
