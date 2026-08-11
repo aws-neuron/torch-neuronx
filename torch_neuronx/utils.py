@@ -415,7 +415,10 @@ def cast_dtype_if_needed(tensor: torch.Tensor, target_dtype: torch.dtype | None)
 
 
 def is_float8_e4m3_supported():
-    return get_platform_target() == "trn2"
+    # NKI casts torch.float8_e4m3fn to nl.float8_e4m3 at the input boundary when
+    # UNSAFE_FP8FNCAST is set; allow the same cast on the output boundary so a
+    # kernel returning nl.float8_e4m3 maps back to torch.float8_e4m3fn.
+    return os.environ.get("UNSAFE_FP8FNCAST", "").lower() in ("1", "true", "yes", "on")
 
 
 def is_float8_e4m3fn_supported():
