@@ -50,6 +50,19 @@ def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
     return padded
 
 
+def _pad_or_contig(t_2d: torch.Tensor, M_ceil: int) -> torch.Tensor:  # noqa: N803
+    """Return a contiguous [M_ceil, C] buffer for the kernel DMA.
+
+    On the pad path (M_ceil > rows) ``_pad_rows_to`` allocates a fresh contiguous
+    zeros buffer and reads ``t_2d`` (possibly a strided view, e.g. a ``.chunk()``
+    output) directly into it — so a separate ``.contiguous()`` first would be a
+    redundant copy that also recompiles per token count. Contiguify only when no
+    pad happens (rows == M_ceil), where the view is passed to the kernel as-is."""
+    if t_2d.shape[0] == M_ceil:
+        return t_2d.contiguous()
+    return _pad_rows_to(t_2d, M_ceil)
+
+
 def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
     """Return the [M, H] output buffer for the NEFF to write into.
 

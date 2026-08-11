@@ -15,7 +15,7 @@ from ..adapter_utils import (
     _ceil_to_tile,
     _compile_or_load_neff,
     _num_tiles_tensor,
-    _pad_rows_to,
+    _pad_or_contig,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
@@ -60,8 +60,8 @@ def _prepare_silu_bwd_io(grad_output, self, dest=None) -> tuple[tuple, tuple, in
     M, H = grad_output.shape  # noqa: N806
     M_ceil = _ceil_to_tile(M)  # noqa: N806
     device = grad_output.device
-    grad_2d = _pad_rows_to(grad_output.contiguous(), M_ceil)
-    inp_2d = _pad_rows_to(self.contiguous(), M_ceil)
+    grad_2d = _pad_or_contig(grad_output, M_ceil)
+    inp_2d = _pad_or_contig(self, M_ceil)
     num_m_tiles = _num_tiles_tensor(M_ceil // _TILE_M, device)
     outputs = (torch.empty((M_ceil, H), dtype=grad_output.dtype, device=device),)
     return (grad_2d, inp_2d, num_m_tiles), outputs, M
