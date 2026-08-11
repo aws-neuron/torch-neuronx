@@ -114,7 +114,8 @@ class TestStarfishDtypeStringComparison:
         assert _patched.map_external_dtype_to_torch(_fresh_str("float8_e5m2")) is torch.float8_e5m2
 
     def test_float8_e4m3_string_matches_on_trn2(self, _patched, monkeypatch):
-        """The reported bug: nl.float8_e4m3 output on trn2 must map to torch.float8_e4m3fn."""
+        """nl.float8_e4m3 output must map to torch.float8_e4m3fn if user forces
+        non-ocp type (trn2 or trn3)."""
         monkeypatch.setattr(_patched, "is_float8_e4m3_supported", lambda: True)
         result = _patched.map_external_dtype_to_torch(_fresh_str("float8_e4m3"))
         assert result is torch.float8_e4m3fn
@@ -138,3 +139,24 @@ class TestStarfishDtypeStringComparison:
         monkeypatch.setattr(_patched, "is_float8_e8m0fnu_supported", lambda: True)
         result = _patched.map_external_dtype_to_torch(_fresh_str("float8_e8m0fnu"))
         assert result is torch.float8_e8m0fnu
+
+
+class TestUnsafeFp8FnCast:
+    """``is_float8_e4m3_supported`` gates the nl.float8_e4m3 -> torch.float8_e4m3fn
+    output cast on the ``UNSAFE_FP8FNCAST`` env var, mirroring the input-boundary
+    cast NKI performs for the same flag (so a kernel returning nl.float8_e4m3
+    round-trips on any platform, including trn3, when the flag is set)."""
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_enabled_when_flag_truthy(self, monkeypatch, value):
+        monkeypatch.setenv("UNSAFE_FP8FNCAST", value)
+        assert utils.is_float8_e4m3_supported() is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+    def test_disabled_when_flag_falsy(self, monkeypatch, value):
+        monkeypatch.setenv("UNSAFE_FP8FNCAST", value)
+        assert utils.is_float8_e4m3_supported() is False
+
+    def test_disabled_when_flag_unset(self, monkeypatch):
+        monkeypatch.delenv("UNSAFE_FP8FNCAST", raising=False)
+        assert utils.is_float8_e4m3_supported() is False
