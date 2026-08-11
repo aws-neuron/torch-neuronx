@@ -263,6 +263,30 @@ def bmm_dtype(self, mat2, out_dtype):
     return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
 
 
+@register_decomposition([aten.angle])
+def angle_decomp(x):
+    """Decompose real-valued aten::angle; torch-mlir has no StableHLO lowering.
+
+    Registered here (not just as an eager op handler) so the eager and
+    torch.compile paths share one implementation — both trace through this
+    decomposition table. For a real tensor torch.angle is a piecewise constant:
+    pi on the negative side (including -inf) and 0 on the non-negative side
+    (including +0.0, -0.0, +inf). Integer/bool inputs promote to the default
+    float dtype, so the pi/0 constants are built in the promoted dtype; nan is
+    restored with an isnan mask (``x < 0`` is False for nan).
+
+    Complex inputs return NotImplemented so this real-only branch does not hijack
+    them; they fall through to the framework complex-decomposition path
+    (TORCH_NEURONX_COMPLEX_DECOMPOSE), which owns complex angle.
+    """
+    if x.is_complex():
+        return NotImplemented
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    result = torch.where(x < 0, torch.full_like(x, math.pi), torch.zeros_like(x))
+    return torch.where(torch.isnan(x), x, result)
+
+
 def _zero_result(shape, a, b):
     """Build a zero-filled tensor with the standard matmul promoted dtype."""
     return torch.zeros(shape, dtype=torch.promote_types(a.dtype, b.dtype), device=a.device)
