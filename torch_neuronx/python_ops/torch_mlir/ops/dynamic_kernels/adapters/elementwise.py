@@ -15,7 +15,7 @@ from ..adapter_utils import (
     _dest_buffer,
     _hidden_compile_key,
     _num_tiles_tensor,
-    _pad_rows_to,
+    _pad_or_contig,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
@@ -93,8 +93,10 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
         device = x.device
 
         def to_2d(t):
-            # reshape alone can keep a non-contiguous view; kernel DMA needs contiguous.
-            return _pad_rows_to(t.reshape(-1, H).contiguous(), M_ceil)
+            # _pad_or_contig avoids a redundant .contiguous() on the pad path (the
+            # pad-assign reads a strided view directly), killing the per-shape
+            # aten::contiguous recompiles on strided (e.g. .chunk()) inputs.
+            return _pad_or_contig(t.reshape(-1, H), M_ceil)
 
         ins = tuple(to_2d(tensors[i]) for i in range(arity))
         nm = _num_tiles_tensor(M_ceil // _TILE_M, device)

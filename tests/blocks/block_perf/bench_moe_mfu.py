@@ -6,14 +6,16 @@ step time + MFU.
 
 - fixed: identical routing every step -> both paths cache-hit -> the median gap is the
   dynamic per-op overhead.
-- varying: new routing each step -> the dynamic kernels reuse one NEFF (recompile-free)
-  while static recompiles per shape, so the gap is the recompile cost. Use mixtral-tiny
-  to keep static's per-shape compiles tractable.
+- varying: new routing each step -> the dynamic kernels (mm/silu/mul/gather/scatter)
+  reuse one NEFF per op while static recompiles them per shape, so dynamic is faster.
+  The dynamic_recompiling_ops column lists the ops that still recompile.
+  Use mixtral-tiny to keep static's per-shape compiles tractable.
 
   python bench_moe_mfu.py --preset mixtral-tiny --seq_len 512 --steps 6 --warmup 2
 """
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -21,8 +23,28 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 
 _DYN_CC_FLAG = "--disable-internal-gather-scatter-bound-check"
+
+# One row per shape_mode, static + dynamic paired, for the dashboard parquet.
+# fixed row answers "dynamic overhead at static shapes"; varying row answers
+# "dynamic vs static incl. static's recompile cost" (dynamic_recompiling_ops names the
+# ops that still recompile on the dynamic path).
+CSV_COLUMNS = [
+    "preset",
+    "seq_len",
+    "mode",  # fwd | fwd+bwd
+    "shape_mode",  # fixed | varying
+    "static_median_ms",
+    "dynamic_median_ms",
+    "static_mfu",
+    "dynamic_mfu",
+    "mfu_delta_pts",  # dynamic_mfu - static_mfu
+    "overhead_ratio",  # dynamic_median_ms / static_median_ms
+    "dynamic_recompiling_ops",  # "op:files;..." ops that still recompile on the dynamic path
+    "last_updated",
+]
 
 
 def _worker(preset, seq_len, batch, steps, warmup, out_json, shape_mode="varying", fwd_only=True):
@@ -62,12 +84,10 @@ def _worker(preset, seq_len, batch, steps, warmup, out_json, shape_mode="varying
     for s in range(warmup):
         one_step(1000 if shape_mode == "fixed" else s)
 
-    # Compiled-NEFF count after warmup; if it doesn't grow across timed steps the
-    # dynamic kernels are recompile-free (0 for the static run — registry unused).
-    dyn_neffs_after_warmup = _dynamic_neff_count()
-
     times = sorted(one_step(1000 + s) for s in range(steps))
-    dyn_recompiles = _dynamic_neff_count() - dyn_neffs_after_warmup
+
+    # Un-timed pass: which ops recompile per new shape (0 growth = NEFF reused).
+    recompiling_ops = _attribute_recompiles(_neff_cache_dir(), one_step, shape_mode)
 
     fwd_flops = m.count_flops(cfg, active_tokens=cfg["num_experts_per_tok"] * T)
     flops = fwd_flops if fwd_only else fwd_flops * 3  # bwd ~= 2x fwd
@@ -81,18 +101,58 @@ def _worker(preset, seq_len, batch, steps, warmup, out_json, shape_mode="varying
                 "tflops": tflops,
                 "mfu": calculate_mfu_trn2(tflops)["mfu_percent"],
                 "times": times,
-                "dyn_recompiles": dyn_recompiles,
+                "recompiling_ops": recompiling_ops,
             },
             f,
         )
 
 
-def _dynamic_neff_count():
-    """Total compiled-NEFF count across all registered dynamic-kernel entries. 0 when
-    the dynamic path is off (static run) — the registry is empty/unused there."""
-    from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import _registry
+def _neff_cache_dir():
+    import tempfile as _t
 
-    return sum(len(e._compiled) for e in _registry.values())
+    default = os.path.join(_t.gettempdir(), "neff_cache")
+    return os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", default)
+
+
+def _attribute_recompiles(cache_dir, one_step, shape_mode):
+    """Run two more steps with TorchMlirKernel.lower hooked, attributing NEFF-cache-file
+    growth to each op_name. Returns "op:files;..." (most-recompiled first), or "" if none.
+
+    Syncs after each lower() so the compile's cache write completes before diffing —
+    otherwise the write is still in flight and growth reads as 0 (false recompile-free).
+    Uses fresh seeds (2000+) so the ops face shapes not compiled in warmup/timed. For
+    fixed mode both extra steps are the same shape, so nothing should recompile."""
+    import glob
+    from collections import Counter
+
+    import torch
+
+    from torch_neuronx.python_ops.torch_mlir import kernel as kmod
+
+    def nfiles():
+        return len(glob.glob(os.path.join(cache_dir, "**", "*"), recursive=True))
+
+    grow = Counter()
+    orig = kmod.TorchMlirKernel.lower
+
+    def traced(kernel_self, *a, **k):
+        before = nfiles()
+        out = orig(kernel_self, *a, **k)
+        torch.neuron.synchronize()  # flush the compile's cache write before diffing
+        d = nfiles() - before
+        if d > 0:
+            grow[getattr(kernel_self, "op_name", "?")] += d
+        return out
+
+    # Prime one fresh shape unhooked (so first-time compiles here aren't miscounted),
+    # then hook and run another fresh shape — its growth is per-shape recompilation.
+    one_step(2000 if shape_mode == "varying" else 1000)
+    kmod.TorchMlirKernel.lower = traced
+    try:
+        one_step(2001 if shape_mode == "varying" else 1000)
+    finally:
+        kmod.TorchMlirKernel.lower = orig
+    return ";".join(f"{op}:{n}" for op, n in grow.most_common())
 
 
 def _run(mode, shape_mode, args):
@@ -148,6 +208,7 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--shapes", default="both", choices=["fixed", "varying", "both"])
     p.add_argument("--fwd-only", action="store_true", help="forward-only (default: fwd+loss+bwd)")
+    p.add_argument("--csv", default=None, help="write one paired row per shape_mode to this CSV")
     args = p.parse_args()
     mode_str = "fwd" if args.fwd_only else "fwd+bwd"
 
@@ -177,15 +238,52 @@ def main():
             )
         if s and d and sm == "varying":
             # static recompiles per shape, dynamic reuses one NEFF -> the gap is the
-            # recompile cost dynamic avoids; dyn_recompiles==0 confirms it stayed warm.
+            # recompile cost dynamic avoids on its covered kernels (glue ops still recompile).
             print(
                 f"  => dynamic recompile benefit: {s['median_ms'] - d['median_ms']:+.1f} "
-                f"ms/step faster, MFU {d['mfu'] - s['mfu']:+.2f} pts"
+                f"ms/step faster ({d['median_ms']/s['median_ms']:.2f}x)"
             )
+            ops = d.get("recompiling_ops", "")
             print(
-                f"     dynamic recompiles across {args.steps} varying steps: "
-                f"{d.get('dyn_recompiles', '?')} (0 = recompile-free)"
+                f"     ops still recompiling on the dynamic path: {ops or 'NONE (recompile-free)'}"
             )
+
+    if args.csv:
+        _write_csv(args.csv, args, mode_str, shape_modes, res)
+
+
+def _write_csv(path, args, mode_str, shape_modes, res):
+    """One paired row per shape_mode (static+dynamic side-by-side). A shape_mode
+    with either side failed is skipped."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for sm in shape_modes:
+        s, d = res.get((sm, "static")), res.get((sm, "dynamic"))
+        if not (s and d):
+            continue
+        rows.append(
+            {
+                "preset": args.preset,
+                "seq_len": args.seq_len,
+                "mode": mode_str,
+                "shape_mode": sm,
+                "static_median_ms": round(s["median_ms"], 3),
+                "dynamic_median_ms": round(d["median_ms"], 3),
+                "static_mfu": round(s["mfu"], 3),
+                "dynamic_mfu": round(d["mfu"], 3),
+                "mfu_delta_pts": round(d["mfu"] - s["mfu"], 3),
+                "overhead_ratio": round(d["median_ms"] / s["median_ms"], 3)
+                if s["median_ms"]
+                else "",
+                "dynamic_recompiling_ops": d.get("recompiling_ops", ""),
+                "last_updated": now,
+            }
+        )
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\n[csv] wrote {len(rows)} rows -> {path}", flush=True)
 
 
 if __name__ == "__main__":

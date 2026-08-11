@@ -20,12 +20,14 @@ class ExpertFFN(nn.Module):
 
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
-        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_up_w = nn.Parameter(torch.empty(hidden_size, 2 * intermediate_size))
+        self.down_w = nn.Parameter(torch.empty(intermediate_size, hidden_size))
+        nn.init.normal_(self.gate_up_w, std=0.02)
+        nn.init.normal_(self.down_w, std=0.02)
 
     def forward(self, x):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        gate, up = torch.mm(x, self.gate_up_w).chunk(2, dim=-1)
+        return torch.mm(F.silu(gate) * up, self.down_w)
 
 
 class SparseMoE(nn.Module):
