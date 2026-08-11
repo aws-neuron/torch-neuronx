@@ -4,7 +4,6 @@ Unlike most ATen ops, ``equal(Tensor self, Tensor other) -> bool`` returns a
 Python bool, not a tensor, so it cannot go through the MLIR lowering path.
 Instead it composes host-side checks with device work:
 
-- names mismatch   -> False, with no device dispatch
 - device mismatch  -> RuntimeError (see "Why the device check is here" below)
 - shape mismatch   -> False, with no device dispatch
 - empty tensors    -> True, with no device dispatch
@@ -40,9 +39,7 @@ op would give.
 Other semantics
 ---------------
 Mixed dtypes are promoted to the common dtype before comparison, because
-``torch.equal`` compares values and does not differentiate dtypes. A names
-mismatch short-circuits to False ahead of the device check, matching the
-ordering in the ``cpu_equal`` of the torch version this repo pins.
+``torch.equal`` compares values and does not differentiate dtypes.
 
 NaN handling is version-sensitive and deliberately left to ``==``: elementwise
 comparison makes ``torch.equal(nan_tensor, other_nan_tensor)`` False. Note that
@@ -57,11 +54,6 @@ import torch
 def equal_neuron(self: torch.Tensor, other: torch.Tensor) -> bool:
     """Neuron implementation of ``aten::equal``."""
     import torch_neuronx
-
-    # Ordered ahead of the device check to match cpu_equal, which compares names
-    # first and returns False rather than raising when they differ.
-    if self.names != other.names:
-        return False
 
     if self.device != other.device:
         raise RuntimeError(
