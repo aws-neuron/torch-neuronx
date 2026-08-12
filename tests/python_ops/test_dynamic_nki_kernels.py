@@ -64,6 +64,35 @@ def _assert_dynamic_skipped(op_name):
     assert e._exec_count == before, f"{op_name}: dynamic kernel ran but should have declined"
 
 
+def _op_of_cache_key(key):
+    """Op name from a compilation-cache key."""
+    import re
+
+    head = re.split(r"__[0-9a-f]{6,}", key.split("--")[0])[0].split(":")[0].replace("aten::", "")
+    m = re.search(r"([a-z_]+_kernel)", head)
+    return m.group(1) if m else head.split(".")[0]
+
+
+def _recompiling_ops(step_fn, warm_seed, probe_seeds):
+    """Set of ops that compile a new NEFF as routing changes, via a compilation-cache
+    entry diff — path-complete (sees C++-dispatched and glue ops, not just registry
+    kernels). step_fn(seed) runs one MoE step at that routing."""
+    import torch_neuronx._C as _C
+
+    def keys():
+        return {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+
+    step_fn(warm_seed)
+    recompiled = set()
+    prev = keys()
+    for s in probe_seeds:
+        step_fn(s)
+        now = keys()
+        recompiled |= {_op_of_cache_key(k) for k in now - prev}
+        prev = now
+    return recompiled
+
+
 # ── per-op specification table ───────────────────────────────────────────────
 # One row per dynamic op. build(dtype, *, rows, h) -> (run_args, cpu_ref), where
 # run_args are neuron operands; run(*run_args) invokes the op on neuron. `rows` is
@@ -117,6 +146,19 @@ def _sigmoid_backward_spec(**flags):
         lambda go, out: torch.ops.aten.sigmoid_backward(go, out),
         **flags,
     )
+
+
+def _sum_spec(**flags):
+    """Free-dim sum over a 2-D [rows, h] input -> [rows, 1] (keepdim). Reference
+    accumulates in fp32 then casts back, matching the kernel's fp32 accumulator +
+    single output cast (a bf16 running sum would drift far more than the kernel)."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(rows, h, dtype=dtype) / 8
+        ref = x.float().sum(dim=1, keepdim=True).to(dtype)
+        return (x.to("neuron"),), ref
+
+    return OpSpec("sum", build, lambda x: x.sum(dim=1, keepdim=True), **flags)
 
 
 def _mm_spec():
@@ -175,6 +217,7 @@ _OP_SPECS = [
     _binary_spec("sub", torch.sub, compile_once=True),
     _binary_spec("mul", torch.mul),
     _sigmoid_backward_spec(compile_once=True),
+    _sum_spec(arbitrary_h=True, compile_once=True),
     _mm_spec(),
     _index_spec(arbitrary_h=True),
     _scatter_add_spec(arbitrary_h=True),
@@ -332,6 +375,78 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_ran("sub"):
             torch.sub(x, y, out=buf)
         torch.testing.assert_close(buf.cpu(), x.cpu() - y.cpu(), rtol=0, atol=0)
+
+    # ── sum-specific: N-D last-dim reduce flattens leading dims; non-last / dtype
+    # / all-reduce decline to the default lowering ──
+    @pytest.mark.parametrize("shape", [(256, 2048), (2, 256, 2048), (1, 128, 2048)])
+    @pytest.mark.parametrize("keepdim", [True, False])
+    def test_dynamic_nki_sum_last_dim_nd(self, shape, keepdim):
+        # last-dim reduce of a 2-D+ input: leading dims flatten to M, kernel runs,
+        # output shape matches torch (fp32-accumulated ref to match the kernel).
+        x = torch.randn(*shape, dtype=torch.bfloat16) / 8
+        ref = x.float().sum(dim=-1, keepdim=keepdim).to(torch.bfloat16)
+        with _assert_dynamic_ran("sum"):
+            got = x.to("neuron").sum(dim=-1, keepdim=keepdim).cpu()
+        assert got.shape == ref.shape, f"{got.shape} != {ref.shape}"
+        torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+
+    def test_dynamic_nki_sum_non_last_dim_declines(self):
+        # reducing a non-last dim isn't the [M, H] free-dim reduce -> fallback.
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("sum"):
+            got = x.sum(dim=0).cpu()
+        torch.testing.assert_close(got, x.cpu().float().sum(dim=0).bfloat16(), rtol=1e-2, atol=1e-2)
+
+    def test_dynamic_nki_sum_all_reduce_declines(self):
+        # dim=None (reduce every dim) isn't a single free-dim reduce -> fallback.
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("sum"):
+            x.sum()
+
+    # ── cat-specific: 2-input last-dim concat (backward of .chunk(2, -1)). Runs
+    # dynamically and matches torch; N-D flattens leading dims; unequal widths OK;
+    # >2 tensors / non-last-dim / dtype-or-lead mismatch decline. ──
+    @pytest.mark.parametrize(
+        "shape_a,shape_b",
+        [
+            ((256, 2048), (256, 2048)),  # equal widths (the .chunk(2) case)
+            ((256, 2048), (256, 1024)),  # unequal widths
+            ((2, 256, 1024), (2, 256, 1024)),  # 3-D: leading dims flatten
+        ],
+    )
+    def test_dynamic_nki_cat_last_dim(self, shape_a, shape_b):
+        a = torch.randn(*shape_a, dtype=torch.bfloat16) / 8
+        b = torch.randn(*shape_b, dtype=torch.bfloat16) / 8
+        ref = torch.cat([a, b], dim=-1)
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat([a.to("neuron"), b.to("neuron")], dim=-1).cpu()
+        assert got.shape == ref.shape, f"{got.shape} != {ref.shape}"
+        # concat is pure data movement — bit-exact, no accumulation.
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("rows", [256, 129, 383])
+    def test_dynamic_nki_cat_non_128_count(self, rows):
+        # M padded to a 128-multiple inside prepare_io, sliced back after.
+        a = torch.randn(rows, 1024, dtype=torch.bfloat16) / 8
+        b = torch.randn(rows, 1024, dtype=torch.bfloat16) / 8
+        ref = torch.cat([a, b], dim=-1)
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat([a.to("neuron"), b.to("neuron")], dim=-1).cpu()
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_three_tensors_declines(self):
+        # kernel concatenates exactly two operands -> 3-tensor cat falls back.
+        ts = [torch.randn(256, 1024, dtype=torch.bfloat16).to("neuron") for _ in range(3)]
+        with _assert_dynamic_skipped("cat"):
+            got = torch.cat(ts, dim=-1).cpu()
+        torch.testing.assert_close(got, torch.cat([t.cpu() for t in ts], dim=-1), rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_non_last_dim_declines(self):
+        # concat over dim 0 isn't the free-dim concat -> fallback.
+        a = (torch.randn(256, 1024, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(128, 1024, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("cat"):
+            torch.cat([a, b], dim=0)
 
     # ── E2E MoE forward: no recompiles as routing (token counts) change ──
     # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.
@@ -579,3 +694,50 @@ class TestDynamicNkiKernels:
             assert (
                 len(e._compiled) == compiled_after_warmup[name]
             ), f"{name}: recompiled on routing change"
+
+    # Ops still expected to recompile per token count (not yet covered). The test fails
+    # if the real set diverges either way: a NEW op recompiles, or a listed op stops
+    # (cover it, then remove it here).
+    MOE_BWD_EXPECTED_RECOMPILES: ClassVar = set()
+
+    def test_dynamic_nki_moe_backward_recompile_set(self):
+        """Path-complete recompile check over the fwd+bwd MoE loop (cache-key diff): sees
+        every op, not just the ported registry kernels, so it catches recompiling glue
+        (cat/sum/index_put) the _compiled-based assertion is blind to."""
+        T, E, H, H4 = self.MOE_T, self.MOE_E, self.MOE_H, self.MOE_H4  # noqa: N806
+
+        def _mk(device, g):
+            def mk(*s):
+                return (
+                    (torch.randn(*s, dtype=torch.bfloat16, generator=g) / 64)
+                    .to(device)
+                    .detach()
+                    .requires_grad_(True)
+                )
+
+            return (
+                [mk(H, H4) for _ in range(E)],
+                [mk(H, H4) for _ in range(E)],
+                [mk(H4, H) for _ in range(E)],
+            )
+
+        def _step(route_seed):
+            g = torch.Generator().manual_seed(0)
+            w1, w2, w3 = _mk("neuron", g)
+            x = (
+                (torch.randn(T, H, dtype=torch.bfloat16, generator=g) / 8)
+                .to("neuron")
+                .detach()
+                .requires_grad_(True)
+            )
+            idx = [i.to("neuron") for i in self._moe_routing_128(route_seed)]
+            out = self._moe_expert_loop_autograd(x, w1, w2, w3, idx, T, H, E)
+            (out * out).sum().backward()
+            torch_neuronx.synchronize()
+
+        got = _recompiling_ops(_step, warm_seed=1, probe_seeds=(5, 9, 13))
+        exp = self.MOE_BWD_EXPECTED_RECOMPILES
+        assert got == exp, (
+            f"recompiling-op set changed: got {sorted(got)}, expected {sorted(exp)}. "
+            f"New op -> cover it or add here; missing op -> a gap closed, remove it."
+        )

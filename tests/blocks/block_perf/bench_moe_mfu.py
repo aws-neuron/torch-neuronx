@@ -87,7 +87,7 @@ def _worker(preset, seq_len, batch, steps, warmup, out_json, shape_mode="varying
     times = sorted(one_step(1000 + s) for s in range(steps))
 
     # Un-timed pass: which ops recompile per new shape (0 growth = NEFF reused).
-    recompiling_ops = _attribute_recompiles(_neff_cache_dir(), one_step, shape_mode)
+    recompiling_ops = _attribute_recompiles(one_step, shape_mode)
 
     fwd_flops = m.count_flops(cfg, active_tokens=cfg["num_experts_per_tok"] * T)
     flops = fwd_flops if fwd_only else fwd_flops * 3  # bwd ~= 2x fwd
@@ -107,51 +107,36 @@ def _worker(preset, seq_len, batch, steps, warmup, out_json, shape_mode="varying
         )
 
 
-def _neff_cache_dir():
-    import tempfile as _t
+def _op_of_cache_key(key):
+    """Op name from a compilation-cache key. Keys are '<op>--...' / 'aten::<op>...' /
+    'nki_<n>_..._<kernel>__<hash>...'. Collapse to a clean op name."""
+    import re
 
-    default = os.path.join(_t.gettempdir(), "neff_cache")
-    return os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", default)
+    head = re.split(r"__[0-9a-f]{6,}", key.split("--")[0])[0].split(":")[0].replace("aten::", "")
+    m = re.search(r"([a-z_]+_kernel)", head)
+    return m.group(1) if m else head.split(".")[0]
 
 
-def _attribute_recompiles(cache_dir, one_step, shape_mode):
-    """Run two more steps with TorchMlirKernel.lower hooked, attributing NEFF-cache-file
-    growth to each op_name. Returns "op:files;..." (most-recompiled first), or "" if none.
+def _attribute_recompiles(one_step, shape_mode):
+    """Per-op recompile counts over fresh shapes, PATH-COMPLETE: diffs the compilation
+    cache entry set (torch_neuronx._C._get_compilation_cache_entries) across steps and
+    attributes each new NEFF to its op. Unlike a TorchMlirKernel.lower hook this also sees
+    ops compiled via the C++ @register_aten path (mm/mul/silu) and framework glue
+    (cat/sum/index_put), so it does not undercount. Returns "op:count;..." (most first), "".
 
-    Syncs after each lower() so the compile's cache write completes before diffing —
-    otherwise the write is still in flight and growth reads as 0 (false recompile-free).
-    Uses fresh seeds (2000+) so the ops face shapes not compiled in warmup/timed. For
-    fixed mode both extra steps are the same shape, so nothing should recompile."""
-    import glob
+    Primes one fresh shape unhooked, then counts the next fresh shape's new NEFFs. Fixed
+    mode reuses one shape, so nothing should recompile."""
     from collections import Counter
 
-    import torch
+    import torch_neuronx._C as _C
 
-    from torch_neuronx.python_ops.torch_mlir import kernel as kmod
+    def keys():
+        return {e["cache_key"] for e in _C._get_compilation_cache_entries()}
 
-    def nfiles():
-        return len(glob.glob(os.path.join(cache_dir, "**", "*"), recursive=True))
-
-    grow = Counter()
-    orig = kmod.TorchMlirKernel.lower
-
-    def traced(kernel_self, *a, **k):
-        before = nfiles()
-        out = orig(kernel_self, *a, **k)
-        torch.neuron.synchronize()  # flush the compile's cache write before diffing
-        d = nfiles() - before
-        if d > 0:
-            grow[getattr(kernel_self, "op_name", "?")] += d
-        return out
-
-    # Prime one fresh shape unhooked (so first-time compiles here aren't miscounted),
-    # then hook and run another fresh shape — its growth is per-shape recompilation.
     one_step(2000 if shape_mode == "varying" else 1000)
-    kmod.TorchMlirKernel.lower = traced
-    try:
-        one_step(2001 if shape_mode == "varying" else 1000)
-    finally:
-        kmod.TorchMlirKernel.lower = orig
+    before = keys()
+    one_step(2001 if shape_mode == "varying" else 1000)
+    grow = Counter(_op_of_cache_key(k) for k in keys() - before)
     return ";".join(f"{op}:{n}" for op, n in grow.most_common())
 
 

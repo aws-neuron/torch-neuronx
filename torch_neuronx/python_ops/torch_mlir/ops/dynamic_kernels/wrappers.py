@@ -10,6 +10,7 @@ from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
 
 from .add_kernel import add_kernel
+from .cat_kernel import cat_kernel
 from .cos_kernel import cos_kernel
 from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
 from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
@@ -23,6 +24,7 @@ from .silu_bwd_kernel import silu_bwd_kernel
 from .silu_kernel import silu_kernel
 from .sin_kernel import sin_kernel
 from .sub_kernel import sub_kernel
+from .sum_kernel import sum_kernel
 
 # Grid must match logical_neuron_cores so the compiler emits identical code on
 # every core (NCC_IXGM002 fires on basic-block-count mismatch otherwise). The
@@ -38,6 +40,8 @@ _wrapped_exp = wrap_nki(exp_kernel)
 _wrapped_cos = wrap_nki(cos_kernel)
 _wrapped_sin = wrap_nki(sin_kernel)
 _wrapped_mul = wrap_nki(mul_kernel)
+_wrapped_sum = wrap_nki(sum_kernel)
+_wrapped_cat = wrap_nki(cat_kernel)
 _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
 _wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
 _wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
@@ -91,6 +95,18 @@ def dynamic_mul_nki(
     input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_mul[_GRID](input_a, input_b, num_m_tiles)
+
+
+@nki_op("dynamic_nki::sum", mutates_args={})
+def dynamic_sum_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_sum[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::cat", mutates_args={})
+def dynamic_cat_nki(
+    input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
+) -> torch.Tensor:
+    return _wrapped_cat[_GRID](input_a, input_b, num_m_tiles)
 
 
 @nki_op("dynamic_nki::matmul", mutates_args={})
