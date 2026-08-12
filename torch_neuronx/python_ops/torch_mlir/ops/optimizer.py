@@ -83,6 +83,19 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
             grad = -grads[i] if maximize else grads[i]
             meas = max_exp_avg_sqs[i] if amsgrad else params[i]
 
+            # Zero-numel param shard (e.g. FSDPv2 last-rank shard with shape
+            # [0, N]): the Adam update has no elements to compute, and the NKI
+            # kernel cannot allocate a zero-size tile ("shape must be a tuple of
+            # positive integers"). Pass the buffers through unchanged so the
+            # output count still lines up with the out= tuple for aliasing.
+            if params[i].numel() == 0:
+                results_p.append(params[i])
+                results_ea.append(exp_avgs[i])
+                results_eas.append(exp_avg_sqs[i])
+                if amsgrad:
+                    results_meas.append(max_exp_avg_sqs[i])
+                continue
+
             # NKI kernel requires at least 1-dimensional tensors; fall back to
             # elementwise math for scalar (0-dim) params (e.g. CLIP logit_scale).
             if params[i].ndim == 0:
@@ -153,6 +166,18 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
         updated_max_exp_avg_sqs = []
 
         for i in range(len(params)):
+            # Zero-numel param shard (e.g. FSDPv2 last-rank [0, N] shard): no
+            # elements to update. Pass the buffers through unchanged, matching
+            # the NKI compute_fn, so the output count lines up with the out=
+            # tuple for aliasing.
+            if params[i].numel() == 0:
+                updated_params.append(params[i])
+                updated_exp_avgs.append(exp_avgs[i])
+                updated_exp_avg_sqs.append(exp_avg_sqs[i])
+                if amsgrad:
+                    updated_max_exp_avg_sqs.append(max_exp_avg_sqs[i])
+                continue
+
             param_new, exp_avg_new, exp_avg_sq_new, max_exp_avg_sq_new = _adam_step_mlir(
                 params[i],
                 grads[i],
@@ -194,12 +219,13 @@ def _register_fused_adam(op_names, decoupled_wd):
 
     @register_aten(
         op_names,
-        preprocessing=Preprocessing.VALUE_DEPENDENT,
+        preprocessing=Preprocessing.SHAPE_ONLY,
         static_argnums=static_args,
-        # Multi-arg in-place op: the kept inputs interleave read-only tensors
-        # (gradients) with mutated state, so outputs do not map one-to-one onto
-        # IR parameters as the C++ cached aliasing assumes. Not yet onboarded.
-        python_dispatch=True,
+        # C++ cached path. The lowering depends only on shapes, dtypes, and the
+        # bool flags, all of which are in the cache key, so it replays on a hit.
+        # lr is a non-static float kwarg, so PreprocessArgs makes it a runtime
+        # NEFF input: one NEFF serves every learning rate (no recompile per LR
+        # step). Mutated state is donated back in place via the out= tuple below.
     )
     def fused_adam_impl(
         params,
@@ -221,32 +247,26 @@ def _register_fused_adam(op_names, decoupled_wd):
     ):
         compute_fn = _make_adam_compute_fn(amsgrad, maximize, decoupled_wd)
 
-        # Filter out zero-numel params
-        non_empty_idx = [i for i, p in enumerate(params) if p.numel() > 0]
-        ne_params = [params[i] for i in non_empty_idx]
-        ne_grads = [grads[i] for i in non_empty_idx]
-        ne_exp_avgs = [exp_avgs[i] for i in non_empty_idx]
-        ne_exp_avg_sqs = [exp_avg_sqs[i] for i in non_empty_idx]
-        ne_max_exp_avg_sqs = [max_exp_avg_sqs[i] for i in non_empty_idx] if amsgrad else []
-        ne_state_steps = [state_steps[i] for i in non_empty_idx]
-
-        if not ne_params:
+        if not params:
             return compute_fn, (), {}, lambda results: None
 
+        # Keep lists full-length (do not filter zero-numel shards): the cached
+        # path relies on kept-full-length inputs so cache-hit indices stay valid,
+        # and the out= tuple below must line up 1:1 with the compute_fn outputs.
         if amsgrad:
-            out_tensors = tuple(ne_params + ne_exp_avgs + ne_exp_avg_sqs + ne_max_exp_avg_sqs)
+            out_tensors = tuple(params + exp_avgs + exp_avg_sqs + max_exp_avg_sqs)
         else:
-            out_tensors = tuple(ne_params + ne_exp_avgs + ne_exp_avg_sqs)
+            out_tensors = tuple(params + exp_avgs + exp_avg_sqs)
 
         return (
             compute_fn,
             (
-                ne_params,
-                ne_grads,
-                ne_exp_avgs,
-                ne_exp_avg_sqs,
-                ne_max_exp_avg_sqs,
-                ne_state_steps,
+                params,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs if amsgrad else [],
+                state_steps,
                 lr,
                 beta1,
                 beta2,
