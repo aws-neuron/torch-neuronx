@@ -1594,6 +1594,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       "Get compilation cache statistics from metrics arena");
 
+  // CompilationCache is otherwise only ever constructed as a side effect of
+  // the first compile a process submit
+  // ensure_compilation_service() lets a caller force that construction
+  // explicitly
+  m.def(
+      "ensure_compilation_service",
+      []() {
+        // Constructing/touching CompilationCache is enough
+        // No compile is submitted.
+        at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
+      },
+      "Ensure the shared compilation service is set up in this process. "
+      "Idempotent -- safe to call from any process, any number of times. "
+      "Call this from a long-lived process BEFORE forking short-lived "
+      "children, so the forked children never become the service's owner.");
+
   m.def(
       "_clear_compilation_cache",
       []() {
