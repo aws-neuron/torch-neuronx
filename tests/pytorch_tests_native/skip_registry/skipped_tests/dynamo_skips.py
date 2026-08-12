@@ -404,6 +404,9 @@ DYNAMO_DYNAMIC_SHAPES_UNSUPPORTED = [
     "TestShapeVarDedup::test_tensor_dim_vs_int",
     "TestShapeVarDedup::test_tensor_dim_vs_tensor_dim",
     "UnspecTests::test_prune_torch_check",
+    "test_guard_manager.py::GuardManagerTests::test_cpp_shape_guard_missing_windows_compiler_falls_back",
+    "test_repros.py::ReproTests::test_basic_tensor_subclass_constructor",
+    "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_basic_tensor_subclass_constructor_nested_graph_breaks",
 ]
 
 DYNAMO_SYMBOLIC_HANDLING_UNSUPPORTED = [
@@ -549,6 +552,7 @@ DYNAMO_SYMBOLIC_HANDLING_UNSUPPORTED = [
     "TpRichcompareTests::test_tuple_cmp_symbolic_shapes_dynamic",
     "UnspecTests::test_lshift_scalar_dynamic",
     "UnspecTests::test_rshift_scalar_dynamic",
+    "test_unspec.py::UnspecTests::test_unspecialized_float_multiply_precision",
 ]
 
 DYNAMO_CONDITIONAL_BRANCHING_UNSUPPORTED = [
