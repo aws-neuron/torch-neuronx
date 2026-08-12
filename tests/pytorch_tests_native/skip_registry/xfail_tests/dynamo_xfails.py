@@ -208,6 +208,12 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "DynamicShapesFuncTorchHigherOrderOpTests::test_vmap_previous_illegal_op_no_graph_break_dynamic_shapes",
     "ReproTests::test_grad_references_cleared",
     "ReproTests::test_optim_state_references_cleared",
+    "TestNbLshift::test_lshift_tensor_and_int",
+    "TestNbLshift::test_lshift_tensor_and_tensor",
+    "MiscTests::test_param_autograd_grad_in_forward",
+    "MiscTests::test_torch_distributions_gamma_dynamic",
+    "NestedGraphBreaksMiscTests::test_param_autograd_grad_in_forward_nested_graph_breaks",
+    "NestedGraphBreaksMiscTests::test_torch_distributions_gamma_dynamic_nested_graph_breaks",
 ]
 
 DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
@@ -396,6 +402,10 @@ DYNAMO_NUMERICAL_PRECISION_INPLACE_OPS = [
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_remainder_neuron_float16",
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
     "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
+    "TestNbAdd::test_iadd_tensor_and_scalar",
+    "TestNbAdd::test_iadd_tensor_and_tensor",
+    "TestNbAnd::test_inplace_and_tensor",
+    "TestNbXor::test_inplace_xor_tensor",
 ]
 
 DYNAMO_TO_COPY_DISPATCH_FAILURE = [
@@ -411,6 +421,8 @@ DYNAMO_TO_COPY_DISPATCH_FAILURE = [
     "SubclassTests::test_torch_function_subclass_with_mode",
     "SubclassTests::test_user_overridden_property_unsupported",
     "TorchFunctionModeTests::test_torch_function_mode_disable",
+    "DefaultsTests::test_full_with_tensor_subclass_fill_value",
+    "NestedGraphBreaksDefaultsTests::test_full_with_tensor_subclass_fill_value_nested_graph_breaks",
 ]
 
 DYNAMO_ERROR_LOG_FORMAT_MISMATCH = [
@@ -431,6 +443,15 @@ DYNAMO_NUMERICAL_PRECISION_NON_INPLACE = [
     "ReproTests::test_output_aliases_intermediate",
     "TestDefaultBackend::test_set_default_backend",
     "ReproTests::test_clone_not_memory_dense",
+    "CtxManagerTests::test_functorch_low_level_jvp_gb_True",
+    "CtxManagerTestsDeviceNEURON::test_stream_compared_with_stream_neuron",
+    "TestForwardLossBackward::test_tensor_backward_preserves_existing_grad_reference",
+    "TestNbRshift::test_rshift_int_and_tensor",
+    "ReproTests::test_interpolate_nearest_5d_channels_last_stride_backend_aot_eager",
+    "ReproTests::test_interpolate_nearest_5d_channels_last_stride_backend_inductor",
+    "NestedGraphBreaksCtxManagerTests::test_functorch_low_level_jvp_gb_True_nested_graph_breaks",
+    "NestedGraphBreaksReproTests::test_interpolate_nearest_5d_channels_last_stride_backend_aot_eager_nested_graph_breaks",
+    "NestedGraphBreaksReproTests::test_interpolate_nearest_5d_channels_last_stride_backend_inductor_nested_graph_breaks",
 ]
 
 DYNAMO_VMAP_RECOMPILE_GUARD = [

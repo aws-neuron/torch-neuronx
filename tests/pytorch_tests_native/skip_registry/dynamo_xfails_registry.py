@@ -44,6 +44,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Test output includes device='neuron:0' in string " "representation"),
         tests=[
             "ReorderLogsTests::test_constant_mutation",
+            "TpReprTests::test_structseq_repr_with_tensor_graph_breaks",
         ],
     ),
     # TODO: Upstream fix needed - test input/output devices will mismatch
@@ -270,6 +271,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "AOTAutogradCacheTests::test_invoke_subgraph",
             "GraphDededuplicationTests::test_param_transfer_to_submodule",
             "GraphDededuplicationTests::test_tuple_return",
+            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_distinct_per_invoke_subgraph_raises_neuron",
+            "RegionalInductorInvokeSubgraphTests::test_invoke_subgraph_functionalize_schema_cache",
         ],
     ),
     SkipGroup(
@@ -467,6 +470,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Unsupported: Attempt to trace generator",
         tests=[
             "HooksTests::test_post_acc_grad_hook",
+            "ActivationCheckpointingViaTagsTestsNEURON::test_tags_must_save_tensor_that_has_backward_hook_neuron",
         ],
     ),
     SkipGroup(
@@ -480,6 +484,9 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Distributed rank not set",
         tests=[
             "FxGraphRunnableTest::test_all_reduce_collective",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_0",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_1_view_path",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_2_chunk_cat_path",
         ],
     ),
     SkipGroup(
@@ -498,6 +505,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Expected RuntimeError not raised on Neuron",
         tests=[
             "ReproTests::test_one_hot_bounds_check_compiled",
+            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_conflict_raises_neuron",
+            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_partial_annotation_raises_neuron",
         ],
     ),
     SkipGroup(
@@ -539,6 +548,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "NbFloatTests::test_tensor_dunder_float",
             "NbFloatTests::test_tensor_int_dtype",
             "NbIntTests::test_tensor_float_dtype",
+            "ReproTests::test_fp8_qdq_repeated_modules_no_recompile",
+            "NestedGraphBreaksReproTests::test_fp8_qdq_repeated_modules_no_recompile_nested_graph_breaks",
+            "MiscTests::test_mutable_mapping_dict_access_pattern",
+            "NestedGraphBreaksMiscTests::test_nan_nested_graph_breaks",
         ],
     ),
     SkipGroup(
@@ -636,6 +649,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "SubclassTests::test_subclass_dont_invoke_torch_function_on_overridden_method",
             "TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
+            "ActivationCheckpointingViaTagsTestsNEURON::test_frozen_dataclass_pytree_output_neuron",
         ],
     ),
     SkipGroup(
@@ -646,6 +660,95 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Complex dtype (complex64) unsupported on the Neuron StableHLO"
+            " backend. torch-mlir marks the complex-producing/consuming op illegal"
+            " ('failed to legalize operation torch.operator'); conj/neg alias hit"
+            " aten.ones_like dispatch failure. No complex support in the backend."
+        ),
+        tests=[
+            "test_complex.py::ComplexTests::test_simple",
+            "test_complex.py::ComplexTests::test_list_out",
+            "test_complex.py::ComplexTests::test_aliasing_semantics",
+            "test_complex.py::ComplexTests::test_view_as_real",
+            "test_complex.py::ComplexTests::test_rope",
+            "test_complex.py::ComplexTests::test_conj_alias",
+            "test_complex.py::ComplexTests::test_neg_alias",
+            "test_repros.py::ReproTests::test_issue183886_istft_length_pads_in_fake_tensor",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_issue183886_istft_length_pads_in_fake_tensor_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] pad_sequence with a mixed-dtype padding value produces a"
+            " constant whose dtype the importer cannot handle: 'LLVM ERROR:"
+            " unhandled type for getConstantWithGivenDtypeAndValue'."
+        ),
+        tests=[
+            "test_repros.py::ReproTests::test_pad_sequence_mixed_dtype_padding_value",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_sequence_mixed_dtype_padding_value_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=("[PT2.13] HOP 'with_effects' not implemented in the FxImporter"),
+        tests=[
+            "test_repros.py::ReproTests::test_linalg_inv_singular_aot_eager_raises",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_linalg_inv_singular_aot_eager_raises_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] aten::_thnn_fused_gru_cell not implemented for the Neuron"
+            " backend (pad_packed_sequence graph break after packed GRU)."
+        ),
+        tests=[
+            "test_repros.py::ReproTests::test_pad_packed_sequence_graph_break_after_packed_gru",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_packed_sequence_graph_break_after_packed_gru_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] torch._dynamo.exc.Unsupported: Unsupported functorch tracing" " attempt."
+        ),
+        tests=[
+            "test_ctx_manager.py::CtxManagerTests::test_functorch_get_dynamic_layer_stack_depth",
+            "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_compile_vmap_compiled_fn_jacrev_has_aux",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_get_dynamic_layer_stack_depth_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] functorch low-level / autocast decorator: expected behavior"
+            " not observed on Neuron ('False is not true')."
+        ),
+        tests=[
+            "test_ctx_manager.py::CtxManagerTests::test_functorch_low_level_gb_True",
+            "test_ctx_manager.py::CtxManagerTests::test_functorch_low_level_gb_False",
+            "test_ctx_manager.py::CtxManagerTestsDeviceNEURON::test_autocast_decorator_neuron",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_True_nested_graph_breaks",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_False_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Default-device factory functions under TorchFunctionMode:"
+            " output device is 'neuron' but test asserts 'cpu'."
+        ),
+        tests=[
+            "test_modes.py::TorchFunctionModeTests::test_default_device_factory_functions",
+            "test_modes.py::TorchFunctionModeTests::test_default_device_factory_functions_priority",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Functionalization error 'x must not already be a functional"
+            " tensor' when compiling under a functorch higher-order op."
+        ),
+        tests=[
+            "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_functionalize_compiled_fn_does_not_copy_dynamo_attrs",
         ],
     ),
 ]
