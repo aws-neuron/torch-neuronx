@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from torch_neuronx.python_ops import io_tensor
+from torch_neuronx.python_ops.schema_utils import is_inplace_op
 from torch_neuronx.utils import move_pytree_to_cpu
 
 from .handlers import BaseEmptyTensorHandler
@@ -574,9 +575,8 @@ class Operation(ABC):
 
     @property
     def is_inplace(self) -> bool:
-        """Check if this is an in-place operation based on the operation name."""
-        op_name = self.op_name
-        return "_." in op_name or (op_name.endswith("_") and "." not in op_name)
+        """Check if this is an in-place operation, per the op's ATen schema."""
+        return is_inplace_op(getattr(self, "_actual_aten_name", self.op_name))
 
     @property
     @abstractmethod

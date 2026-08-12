@@ -101,6 +101,18 @@ def run_bitwise_shift_op(op_name, x, y):
     """
     op = getattr(torch, op_name)
 
+    # Shifts type-promote like any other binary op, so the result dtype comes
+    # from both operands -- e.g. int8 >> int64 is int64 and uint8 >> int8 is
+    # int16 on CPU. Using x.dtype here would silently narrow the result.
+    #
+    # This must be computed from the ORIGINAL arguments, before the scalar ->
+    # tensor conversions below: result_type treats a Python int as a weak scalar
+    # (int32 >> 3 stays int32) but a 0-dim int64 tensor as a real operand
+    # (int32 >> tensor(3) promotes to int64). Computing it after the conversion
+    # widened 0-dim scalar shifts to int64, which broke the packed-int64 paths
+    # that build their high word with bitwise_right_shift(low, 31).
+    result_dtype = torch.result_type(x, y)
+
     if not isinstance(y, torch.Tensor):
         y = torch.tensor(y)
     if not isinstance(x, torch.Tensor):
@@ -110,7 +122,6 @@ def run_bitwise_shift_op(op_name, x, y):
     if x.dim() == 0 and y.dim() > 0:
         x = x.expand_as(y)
 
-    result_dtype = x.dtype
     x = x.to(torch.int32)
     if isinstance(y, torch.Tensor):
         y = y.to(torch.int32)
@@ -143,6 +154,36 @@ def torch_bitwise_left_shift(x, y, out=None):
     ],
 )
 def torch_bitwise_right_shift(x, y, out=None):
+    return run_bitwise_shift_op("bitwise_right_shift", x, y)
+
+
+# aten::__lshift__ and aten::__rshift__ are the Python operator-form overloads
+# of the bitwise shifts (`x << y` and `x >> y`). They are semantically
+# identical to bitwise_left_shift / bitwise_right_shift for integer tensors,
+# so we delegate to the same implementation. All four schema variants are
+# registered -- leaving the `_out` ones unregistered sends them through the
+# fallback path, which aliases `self` to `out` and corrupts `self`.
+@register_aten(
+    [
+        "aten::__lshift__.Tensor",
+        "aten::__lshift__.Scalar",
+        "aten::__lshift__.Tensor_out",
+        "aten::__lshift__.Scalar_out",
+    ],
+)
+def torch___lshift__(x, y, out=None):
+    return run_bitwise_shift_op("bitwise_left_shift", x, y)
+
+
+@register_aten(
+    [
+        "aten::__rshift__.Tensor",
+        "aten::__rshift__.Scalar",
+        "aten::__rshift__.Tensor_out",
+        "aten::__rshift__.Scalar_out",
+    ],
+)
+def torch___rshift__(x, y, out=None):
     return run_bitwise_shift_op("bitwise_right_shift", x, y)
 
 
