@@ -55,6 +55,16 @@ def seed_and_reset_dynamo():
     torch._dynamo.reset()
 
 
+# StableHLO reference interpreter cannot evaluate ops with data-dependent dynamic
+# shapes (e.g. when SymInt parameters produce dynamic_iota/dynamic_broadcast).
+# Error: "LLVM ERROR: dynamic result types are not supported at the moment"
+# This is a hard process abort so xfail cannot catch it — must skip.
+skip_data_dependent_dynamic = pytest.mark.skip(
+    reason="StableHLO interpreter: data-dependent dynamic shapes not supported "
+    "(LLVM ERROR: dynamic result types are not supported at the moment)"
+)
+
+
 @pytest.fixture
 def compile_and_compare():
     """Fixture that compiles a model, runs it, and compares against CPU."""
