@@ -168,10 +168,10 @@ def _patched_init_process_groups(
 ) -> list:
     """Wrapper that registers replica groups after PG creation."""
     group_names = _original_init_process_groups(layout, rank_map, mesh_dim_names, backend_override)
+    world_size = rank_map.numel()
     for dim_idx, pg_name in enumerate(group_names):
         try:
-            pg_ranks_by_dim = layout[dim_idx].nest().remap_to_tensor(rank_map)
-            groups = [row.tolist() for row in pg_ranks_by_dim]
+            groups = layout[dim_idx].global_ranks(world_size)
             _register_replica_groups(pg_name, groups)
             logger.debug(f"Registered mesh PG '{pg_name}' -> {len(groups)} groups")
         except Exception as e:
