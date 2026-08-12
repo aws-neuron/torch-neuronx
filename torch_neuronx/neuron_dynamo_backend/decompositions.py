@@ -535,6 +535,63 @@ def thnn_fused_gru_cell_backward_decomposition(grad_hy, workspace, has_bias):
     return grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias, grad_hidden_bias
 
 
+# ── Fused Adam/AdamW tensor_lr overloads ────────────────────────────────────
+#
+# PyTorch's _meta_registrations.py registers meta kernels for
+# ``_fused_adam_.default`` and ``_fused_adamw_.default`` (float lr), but omits
+# the ``tensor_lr`` overloads introduced in 2.13 where ``lr`` is a 0-d tensor
+# instead of a float.  Without a fake impl the fallback path tries to run the
+# op against meta tensors and crashes with:
+#   NotImplementedError: aten::_fused_adamw_.tensor_lr: attempted to run this
+#   operator with Meta tensors, but there was no fake impl or Meta kernel
+#   registered.
+# Both overloads are in-place (return ()) so the fake impl is a no-op.
+
+
+@_register_fake("aten::_fused_adamw_.tensor_lr")
+def _fused_adamw_tensor_lr_fake(
+    self,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    max_exp_avg_sqs,
+    state_steps,
+    *,
+    lr,
+    beta1,
+    beta2,
+    weight_decay,
+    eps,
+    amsgrad,
+    maximize,
+    grad_scale=None,
+    found_inf=None,
+):
+    pass  # in-place, returns ()
+
+
+@_register_fake("aten::_fused_adam_.tensor_lr")
+def _fused_adam_tensor_lr_fake(
+    self,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    max_exp_avg_sqs,
+    state_steps,
+    *,
+    lr,
+    beta1,
+    beta2,
+    weight_decay,
+    eps,
+    amsgrad,
+    maximize,
+    grad_scale=None,
+    found_inf=None,
+):
+    pass  # in-place, returns ()
+
+
 # ── Matrix exponential ──────────────────────────────────────────────
 #
 # ``aten::linalg_matrix_exp`` has no StableHLO lowering and reaches the backend
