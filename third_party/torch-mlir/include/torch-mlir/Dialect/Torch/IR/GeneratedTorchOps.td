@@ -1790,6 +1790,30 @@ def Torch_AtenDivTensorOp : Torch_Op<"aten.div.Tensor", [
   }];
 }
 
+def Torch_AtenTrueDivideTensorOp : Torch_Op<"aten.true_divide.Tensor", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Generated op for `aten::true_divide.Tensor : (Tensor, Tensor) -> (Tensor)`";
+  let arguments = (ins
+    AnyTorchTensorType:$self,
+    AnyTorchTensorType:$other
+  );
+  let results = (outs
+    AnyTorchOptionalTensorType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult AtenTrueDivideTensorOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 2, 1);
+    }
+    void AtenTrueDivideTensorOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 2, 1);
+    }
+  }];
+}
+
 def Torch_AtenDiv_TensorOp : Torch_Op<"aten.div_.Tensor", [
     IsTrailingUnderscoreInplaceVariant,
     AllowsTypeRefinement
@@ -17587,6 +17611,30 @@ def Torch_AtenPowIntFloatOp : Torch_Op<"aten.pow.int_float", [
     }
   }];
   let hasFolder = 1;
+}
+
+def Torch_AtenPowIntOp : Torch_Op<"aten.pow.int", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Generated op for `aten::pow.int : (int, int) -> (int)`";
+  let arguments = (ins
+    Torch_IntType:$a,
+    Torch_IntType:$b
+  );
+  let results = (outs
+    Torch_IntType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult AtenPowIntOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 2, 1);
+    }
+    void AtenPowIntOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 2, 1);
+    }
+  }];
 }
 
 def Torch_Aten__And__BoolOp : Torch_Op<"aten.__and__.bool", [

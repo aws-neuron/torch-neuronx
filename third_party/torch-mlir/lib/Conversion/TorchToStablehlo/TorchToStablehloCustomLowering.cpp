@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Quant/IR/Quant.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -1048,6 +1049,22 @@ public:
   }
 };
 
+class ConvertMathIPowIOp : public OpConversionPattern<math::IPowIOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  using OpAdaptor = typename math::IPowIOp::Adaptor;
+  LogicalResult
+  matchAndRewrite(math::IPowIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    auto type = getTypeConverter()->convertType(op.getType());
+    auto lhs = adaptor.getLhs();
+    auto rhs = adaptor.getRhs();
+    rewriter.replaceOpWithNewOp<stablehlo::PowOp>(op, type, lhs, rhs);
+    return success();
+  }
+};
+
 class ConvertTensorDimOp : public OpConversionPattern<tensor::DimOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -1832,6 +1849,7 @@ public:
     registry.insert<Torch::TorchDialect>();
     registry.insert<tensor::TensorDialect>();
     registry.insert<arith::ArithDialect>();
+    registry.insert<math::MathDialect>();
     registry.insert<shape::ShapeDialect>();
     registry.insert<func::FuncDialect>();
     TorchConversion::getBackendTypeConversionDependentDialects(registry);
@@ -2052,6 +2070,9 @@ public:
 
       target.addIllegalOp<arith::XOrIOp>();
       patterns.add<ConvertArithXOrIOp>(typeConverter, context);
+
+      target.addIllegalOp<math::IPowIOp>();
+      patterns.add<ConvertMathIPowIOp>(typeConverter, context);
 
       // Convert function signatures so scalar i64/f64 args become tensor<i64>/tensor<f64>.
       populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(

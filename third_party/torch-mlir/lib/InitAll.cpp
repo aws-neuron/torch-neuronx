@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
@@ -53,7 +54,7 @@ void mlir::torch::registerAllExtensions(mlir::DialectRegistry &registry) {
 void mlir::torch::registerOptionalInputDialects(
     mlir::DialectRegistry &registry) {
   registry.insert<complex::ComplexDialect, linalg::LinalgDialect,
-                  memref::MemRefDialect, scf::SCFDialect,
+                  math::MathDialect, memref::MemRefDialect, scf::SCFDialect,
                   shape::ShapeDialect, sparse_tensor::SparseTensorDialect,
                   tensor::TensorDialect>();
 }
