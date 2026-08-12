@@ -142,13 +142,12 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     // ════════════════════════════════════════════════════════════
     // A. Scalar arguments (raw int / double / bool IValues, NOT tensors)
     //
-    // Positional scalar args: always convert to 0-dim tensor on target device.
-    // Kwarg-only scalar args: convert to 0-dim tensor ONLY when the schema
-    //   type is NumberType (Scalar), so the value becomes a runtime input to
-    //   the compiled NEFF rather than a compile-time constant. This allows
-    //   the same NEFF to be reused with different scalar values (e.g.
-    //   addcmul's `value` kwarg). Other kwarg types (int for dtype, bool
-    //   for pin_memory, etc.) are left as-is.
+    // Positional scalar args: always convert to a 0-dim tensor on the target
+    //   device. Kwarg-only scalar args: convert only when the schema type is
+    //   NumberType (Scalar) or FloatType, so the value becomes a runtime NEFF
+    //   input reusable across values (e.g. addcmul's `value`, a fused
+    //   optimizer's `lr` — an LR scheduler does not recompile). Other kwarg
+    //   types (int dtype, bool flags) are left as-is and go into the cache key.
     // ════════════════════════════════════════════════════════════
     // NOTE: We create scalar tensors on CPU first, then .to(device).
     // torch::tensor(val, opts.device(neuron)) internally calls
@@ -159,7 +158,9 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     //
     // This matches Python torch.tensor() which creates on CPU then .to(device)
     // (see tensor_new.cpp internal_new_from_data lines 437-465).
-    bool is_number_kwarg = is_kwarg && schema_args[i].type()->kind() == c10::TypeKind::NumberType;
+    auto kwarg_kind = schema_args[i].type()->kind();
+    bool is_number_kwarg = is_kwarg && (kwarg_kind == c10::TypeKind::NumberType ||
+                                        kwarg_kind == c10::TypeKind::FloatType);
     bool convert_scalar = !is_kwarg || is_number_kwarg;
 
     if (arg.isInt() && convert_scalar) {
