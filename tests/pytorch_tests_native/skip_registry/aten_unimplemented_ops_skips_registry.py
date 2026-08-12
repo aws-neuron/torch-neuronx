@@ -1,6 +1,6 @@
 """Skip registry for ATen ops not natively lowered on Neuron (CPU fallback).
 
-These 232 ATen ops do not have a native Neuron lowering. When invoked on
+These 231 ATen ops do not have a native Neuron lowering. When invoked on
 neuron tensors they bounce through CPU fallback, producing correct
 results but providing no signal about Neuron's dispatch or execution
 path. Running their OpInfo tests wastes ~61h per full suite run and
@@ -21,7 +21,7 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 
 SKIP_GROUPS: list[SkipGroup] = [
     # ═══════════════════════════════════════════════════════════════
-    # Elementwise ops not natively lowered on Neuron (125 ops).
+    # Elementwise ops not natively lowered on Neuron (124 ops).
     # ═══════════════════════════════════════════════════════════════
     # Includes trig/hyperbolic (acos, acosh, asin, asinh, atan, atan2,
     # atanh, cosh, sinh, tan), special functions (bessel, entr, erfc,
@@ -31,7 +31,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     # hardswish, hardtanh, leaky_relu, mish, selu, celu, elu, glu,
     # softshrink, rrelu, relu6, prelu), rounding/floor (floor, round,
     # frac, nan_to_num, fmod), log/exp variants (exp2, expm1, log10/1p/2,
-    # logaddexp, logaddexp2), bitwise/integer-only (__rshift__, gcd, lcm,
+    # logaddexp, logaddexp2), bitwise/integer-only (gcd, lcm,
     # hash_tensor), and misc (copysign, fmax, fmin, heaviside, hypot,
     # ldexp, nextafter, angle, isposinf, isin, sinc, addbmm, baddbmm,
     # logit, col2im, im2col, max_unpool2d/3d, kl_div, pairwise_distance,
@@ -46,8 +46,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             " through CPU fallback, providing no Neuron signal."
         ),
         patterns=[
-            "*___rshift___neuron*",
-            "*__rshift___neuron*",
             "*_addbmm_neuron*",
             "*_addbmm__neuron*",
             "*_atan2_neuron*",

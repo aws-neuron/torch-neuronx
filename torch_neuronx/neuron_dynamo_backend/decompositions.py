@@ -2414,6 +2414,17 @@ def rshift_scalar_decomp(x, shift):
     return torch.div(x, divisor, rounding_mode="floor").to(x.dtype)
 
 
+# aten::__lshift__ is the operator form (`x << y`) of bitwise_left_shift and is
+# semantically identical to it. Only aten::__rshift__.Tensor has a StableHLO
+# conversion pattern, so route the left shifts to bitwise_left_shift, whose
+# pattern (stablehlo.shift_left) already exists — otherwise `x << y` under
+# torch.compile fails to lower while `x >> y` succeeds.
+@register_decomposition([aten.__lshift__.Tensor, aten.__lshift__.Scalar])
+def lshift_decomp(x, shift):
+    """Decompose left shift into the equivalent bitwise_left_shift"""
+    return torch.bitwise_left_shift(x, shift)
+
+
 @register_decomposition([aten.as_strided_scatter.default])
 def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
     """Decompose as_strided_scatter to index_copy"""

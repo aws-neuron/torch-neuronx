@@ -39,6 +39,7 @@ from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
 from torch_neuronx.python_ops.nki_kernels.stride2_gather import packed_gather_nki
+from torch_neuronx.python_ops.schema_utils import is_inplace_op
 from torch_neuronx.python_ops.shared import (
     CompilationConfig,
     ExecutionContext,
@@ -1226,14 +1227,12 @@ class TorchMlirKernel(BaseNeuronKernel):
     # ═══════════════════════════════════════════════════════════════
 
     def _is_inplace_op(self) -> bool:
-        """True for an in-place op: a trailing ``_`` on the base name, covering the
-        default overload (``relu_``) and suffixed overloads (``add_.Tensor``,
-        ``_foreach_mul_.Scalar``). A plain ``endswith("_")`` misses the suffixed forms.
+        """True for an in-place op: the op's ATen schema annotates its first
+        argument as written (``Tensor(a!) self``), covering the default overload
+        (``relu_``) and suffixed overloads (``add_.Tensor``, ``_foreach_mul_.Scalar``)
+        while excluding the pure operator-form dunders (``__rshift__.Tensor``).
         """
-        name = self.op_name
-        if name.startswith("aten::"):
-            name = name[6:]
-        return "_." in name or (name.endswith("_") and "." not in name)
+        return is_inplace_op(self.op_name)
 
     # ── lower() helpers ──────────────────────────────────────────
     #
