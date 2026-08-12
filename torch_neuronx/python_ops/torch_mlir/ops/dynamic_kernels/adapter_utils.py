@@ -50,6 +50,22 @@ def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
     return padded
 
 
+def _index_to_int32(idx: torch.Tensor) -> torch.Tensor:
+    """Narrow an int64 index operand to int32 (the kernels' vector_offset DMA needs int32).
+
+    ``idx.to(torch.int32)`` on device materializes via the packed-int64 unpack, which is keyed
+    on the element count and recompiles per count. The low-word alias is a strided view with the
+    same value (int64->int32 is low-32-bit truncation) but no kernel and no recompile.
+    """
+    if idx.dtype == torch.int32:
+        return idx
+    if idx.dtype == torch.int64:
+        from torch_neuronx.packed_storage import packed_int64_execution_view
+
+        return packed_int64_execution_view(idx, contiguous=False)
+    return idx.to(torch.int32)
+
+
 def _pad_or_contig(t_2d: torch.Tensor, M_ceil: int) -> torch.Tensor:  # noqa: N803
     """Return a contiguous [M_ceil, C] buffer for the kernel DMA.
 

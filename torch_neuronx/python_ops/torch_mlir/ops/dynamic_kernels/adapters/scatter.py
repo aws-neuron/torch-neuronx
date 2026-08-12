@@ -16,6 +16,7 @@ from ..adapter_utils import (
     _TILE_M,
     _ceil_to_tile,
     _compile_or_load_neff,
+    _index_to_int32,
     _num_tiles_tensor,
     _pad_rows_to,
 )
@@ -102,6 +103,66 @@ def _reshape_scatter_add_output(outputs, original_args):
     return outputs[1]
 
 
+# ── index_put: self[idx] += values (dim 0), same kernel as scatter_add ──
+# aten::_index_put_impl_(self, indices: Tensor?[], values, accumulate, unsafe). Handles the
+# MoE pattern only: single 1-D dim-0 index, accumulate=True, unique targets (see UNIQUE note
+# above). Reuses _compile_scatter_add; only the arg marshaling differs.
+def _index_put_index_1d(indices):
+    """The single 1-D dim-0 index tensor from an index_put `indices` list, else None."""
+    if not isinstance(indices, list | tuple) or len(indices) != 1:
+        return None
+    idx = indices[0]
+    if not isinstance(idx, torch.Tensor) or idx.dim() != 1:
+        return None
+    if idx.dtype not in (torch.int32, torch.int64):
+        return None
+    return idx
+
+
+def _can_handle_index_put(self, indices, values, accumulate=False, **_) -> bool:
+    if not accumulate:  # non-accumulate index_put is overwrite, not scatter-add
+        return False
+    if not isinstance(self, torch.Tensor) or not isinstance(values, torch.Tensor):
+        return False
+    if self.device.type != "neuron" or self.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if values.dtype != self.dtype:
+        return False
+    if self.dim() != 2 or values.dim() != 2:
+        return False
+    idx = _index_put_index_1d(indices)
+    if idx is None:
+        return False
+    T, H = self.shape  # noqa: N806
+    if H == 0:
+        return False
+    n = values.shape[0]
+    if n == 0 or _ceil_to_tile(n) > T or idx.numel() != n:  # noqa: SIM103
+        return False
+    return True
+
+
+def _index_put_compile_key(self, indices, values, accumulate=False, **_):
+    """compile_key = (T, H, dtype) — same NEFF as scatter_add."""
+    return (int(self.shape[0]), int(self.shape[1]), self.dtype)
+
+
+def _prepare_index_put_io(self, indices, values, accumulate=False, dest=None, **_):
+    """Marshal index_put args to the scatter_add kernel I/O; self is the in-place target."""
+    T, H = self.shape  # noqa: N806
+    device = self.device
+    n = values.shape[0]
+
+    idx_1d = _index_to_int32(_index_put_index_1d(indices)).reshape(n, 1)
+    idx = _pad_rows_to(idx_1d, T)
+    data = _pad_rows_to(values.contiguous(), T)
+    nm = _num_tiles_tensor(_ceil_to_tile(n) // _TILE_M, device)
+
+    outbuf = self  # in-place target (alias {2:0})
+    fresh = torch.empty(T, H, dtype=self.dtype, device=device)
+    return (data, idx, outbuf, nm), (fresh, outbuf), n
+
+
 def register():
     for _sa_name in ("scatter_add", "scatter_add_"):
         register_dynamic_nki(
@@ -114,3 +175,13 @@ def register():
                 compile_key_fn=_scatter_add_compile_key,
             ),
         )
+    register_dynamic_nki(
+        "_index_put_impl_",
+        DynamicNkiEntry(
+            compile_fn=_compile_scatter_add,
+            can_handle=_can_handle_index_put,
+            prepare_io=_prepare_index_put_io,
+            reshape_output=_reshape_scatter_add_output,
+            compile_key_fn=_index_put_compile_key,
+        ),
+    )
