@@ -64,7 +64,32 @@ python -m pytest "tests/vertical/test_dynamic_aten_ops.py::TestDynamicAtenOps::t
 
 ```
 
-neuron-profile artifacts (ntff + NEFFs) are written under each test's pytest tmp dir: `/tmp/pytest-of-<user>/pytest-<N>/`.
+neuron-profile artifacts (ntff + NEFFs) are written under `aten_profiles/<cell>/` in the working directory (override with `AOP_PROFILE_DIR`); the path is recorded per row in the CSV's `profile_rel_path` column.
+
+
+## Running Dynamic Collectives Tests
+
+Distributed all-gather benchmark. Each cell is one `(config, shape)` swept in both **dynamic** (NKI kernel, `NEURON_DYN_NKI_COLLECTIVES=1`) and **torch** (native) modes, each in its own cold `torchrun` job. Configs are defined in `_CONFIGS`: `tp` (contiguous group, nproc=4) and `fsdp` (stride-TP group, nproc=64).
+
+```sh
+
+# Run all cells (both configs). fsdp launches 64 ranks, so run serially (no -n):
+python -m pytest tests/vertical/test_dynamic_collectives.py -v -s
+
+# Run only the tp config (nproc=4) in parallel; each xdist worker owns a disjoint
+# block of AG_CORE_BLOCK cores. Keep -n * AG_CORE_BLOCK within the logical-core
+# budget (64 on TRN2 at LNC=2):
+AG_CORE_BLOCK=4 python -m pytest tests/vertical/test_dynamic_collectives.py -k tp -n 4 -v -s
+
+# Run a single cell (id is <config>-<h>x<w>)
+python -m pytest "tests/vertical/test_dynamic_collectives.py::test_dynamic_allgather[tp-8192x4096]" -v -s
+
+# or directly as a driver (launches the torchruns itself):
+NEURON_LOGICAL_NC_CONFIG=2 AG_CSV=/tmp/ag.csv python3 tests/vertical/test_dynamic_collectives.py
+
+```
+
+neuron-profile artifacts (ntff + NEFFs) are written under `c10d_profiles/<h>x<w>/<mode>/` in the working directory (override with `AG_PROFILE_DIR`).
 
 ## ATen Ops Coverage CSV
 
@@ -101,11 +126,35 @@ Per-op rows are merged into one timestamped `dynamic_aten_ops_<timestamp>.csv`. 
 | `dynamic_time_to_first_ms` / `static_time_to_first_ms` | Cold time-to-first (compile + load + execute), per mode |
 | `dynamic_e2e_time_us` / `static_e2e_time_us` | Warm wall-clock latency incl. host overhead, per mode |
 | `e2e_ratio` | `dynamic_e2e / static_e2e` (>1 ⇒ dynamic slower) |
-| `dynamic_device_time_us` / `static_device_time_us` | On-device busy time (neuron-profile `total_exec_time`), per mode |
+| `dynamic_device_time_us` / `static_device_time_us` | On-device wall-clock time (neuron-profile `total_time`), per mode |
 | `device_ratio` | `dynamic_device / static_device` |
 | `correctness_test` | `pass` / `fail` — device output vs CPU reference |
 | `last_updated` | Timestamp |
 | `error` | Error message, or an informational note (e.g. `fell back` when the dynamic kernel declined and the op ran via the default lowering) |
+
+## Dynamic Collectives CSV
+
+Per-cell rows are merged into one timestamped `dynamic_collectives_<timestamp>.csv`. Each row is one `(config, shape)` all-gather cell profiled in both **dynamic** (NKI kernel) and **torch** (native) modes. Tiling columns (`regime`, `*_tile_h`, `n_*`, `unroll`) are mode-independent and taken from the dynamic worker's on-device plan.
+
+| Column | Description |
+|--------|-------------|
+| `op_name` | Collective op (`all_gather`) |
+| `total_mib` | Gathered size in MiB (`world * h * w * elem_size / 2^20`) |
+| `input_h` / `input_w` | Per-rank shard shape (`h` = seq, `w` = last dim) |
+| `replica_group` | Ranks in this cell's all-gather group (== `replica_groups[0]`); stride-TP for fsdp (e.g. `[0, 4, ..., 60]`), contiguous otherwise |
+| `regime` | Tiling regime name, or `native-fallback` when the plan is ineligible |
+| `large_tile_h` / `medium_tile_h` / `small_tile_h` | Element tile sizes (pow2) the NEFF is baked with |
+| `n_large` / `n_medium` / `n_small` / `n_rem` | Tile counts on the flat numel (`n_rem` = single small tail, 0 or 1) |
+| `remainder_row_count` | Leftover elements below one small tile |
+| `unroll` | Unroll variant (1/2/4) auto-picked from the tile count; `0` = native |
+| `dynamic_e2e_us` / `torch_e2e_us` | Warm wall-clock latency incl. host overhead, per mode |
+| `e2e_ratio` | `dynamic_e2e / torch_e2e` (>1 ⇒ dynamic slower) |
+| `dynamic_device_us` / `torch_device_us` | On-device wall-clock time (neuron-profile `total_time`), per mode |
+| `device_ratio` | `dynamic_device / torch_device` |
+| `dynamic_cc_us` / `torch_cc_us` | On-device collective time (neuron-profile `cc_op_time`), per mode |
+| `dynamic_bus_bw_gbps` / `torch_bus_bw_gbps` | Bus bandwidth (GiB/s) derived from device time (`busbw = algbw * (n-1)/n`) |
+| `correctness_test` | `pass` / `fail` — gathered output vs locally-reconstructed reference |
+| `last_updated` | Timestamp |
 
 ## Input Source Priority
 

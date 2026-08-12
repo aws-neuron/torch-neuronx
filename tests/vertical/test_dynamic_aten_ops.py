@@ -70,6 +70,7 @@ _TOL = {
 
 _CSV_COLUMNS = [
     "op_name",
+    "platform",
     "input_shape",
     "dtype",
     "input_size_mb",  # total input size in MiB
@@ -194,11 +195,12 @@ def _run_summary(cmd: list[str]):
     except (FileNotFoundError, OSError):
         return None
     out = r.stdout or ""
-    # total_exec_time = actual device busy execution (sum over the executed NEFFs),
-    # not the total_time. For a multi-NEFF op, total_time is the profiled-window wall span,
-    # inflated by host gaps between the cold NEFF compiles, whereas
-    # total_exec_time is the on-device time. They coincide for single-NEFF ops.
-    m = re.search(r"^\s*total_exec_time\s+([-+0-9.eE]+)", out, re.M)
+    # total_time = on-device wall-clock span for the run (excludes host<->device and host
+    # runtime/framework overhead). Preferred over total_exec_time for benchmarking, since
+    # total_exec_time is just the first->last executed-instruction span and is contaminated by
+    # where idle/rendezvous bubbles land. NOTE: for a multi-NEFF op, total_time can include host
+    # gaps between cold NEFF compiles; they coincide for single-NEFF ops.
+    m = re.search(r"^\s*total_time\s+([-+0-9.eE]+)", out, re.M)
     return float(m.group(1)) if m else None
 
 
@@ -262,6 +264,7 @@ def _is_worker() -> bool:
 
 def worker() -> None:
     from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
+    from torch_neuronx.utils import get_platform_target
 
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(_CORE_START)
 
@@ -281,6 +284,7 @@ def worker() -> None:
 
     result = {
         "mode": mode,
+        "platform": get_platform_target(),
         "ttf_ms": -1.0,
         "e2e_us": -1.0,
         "device_us": -1.0,
@@ -480,6 +484,7 @@ def _run_op_cells(op: str, profile_dir: str, env_base: dict, now: str) -> list[d
             rows.append(
                 {
                     "op_name": _OPS[op],
+                    "platform": d.get("platform") or s.get("platform", ""),
                     "input_shape": shape_s,
                     "dtype": _DTYPES[dtype],
                     "input_size_mb": _entry_mb(entry.arg_shapes, dtype),
