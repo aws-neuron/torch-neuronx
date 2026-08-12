@@ -844,3 +844,15 @@ func.func @func_sig_index_arg(%arg0: index) -> tensor<i64> {
   %0 = stablehlo.constant dense<0> : tensor<i64>
   return %0 : tensor<i64>
 }
+
+// -----
+
+// CHECK-LABEL: func.func @math_ipowi
+// CHECK-SAME:  (%[[ARG0:[a-zA-Z0-9_]+]]: tensor<i64>, %[[ARG1:[a-zA-Z0-9_]+]]: tensor<i64>) -> tensor<i64> {
+// CHECK:         %[[RES:.*]] = stablehlo.power %[[ARG0]], %[[ARG1]] : tensor<i64>
+// CHECK:         return %[[RES]] : tensor<i64>
+// CHECK:       }
+func.func @math_ipowi(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+  %0 = math.ipowi %arg0, %arg1 : tensor<i64>
+  return %0 : tensor<i64>
+}

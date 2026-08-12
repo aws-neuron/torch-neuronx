@@ -551,6 +551,9 @@ public:
     target.addIllegalOp<AtenSqrtIntOp>();
     patterns.add<ConvertAtenUnaryOpToFloatMathOp<AtenSqrtIntOp, math::SqrtOp>>(
         typeConverter, context);
+    target.addIllegalOp<AtenPowIntOp>();
+    patterns.add<ConvertAtenBinaryOp<AtenPowIntOp, math::IPowIOp>>(
+        typeConverter, context);
     target.addIllegalOp<AtenAnyBoolOp, AtenAllBoolOp>();
     patterns.add<ConvertAtenAnyOp>(typeConverter, context);
     patterns.add<ConvertAtenAllOp>(typeConverter, context);

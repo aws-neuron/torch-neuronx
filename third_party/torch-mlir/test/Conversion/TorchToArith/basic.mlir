@@ -273,3 +273,17 @@ func.func @int_bool(%arg0: !torch.bool) -> !torch.int {
   %0 = torch.aten.Int.bool %arg0 : !torch.bool -> !torch.int
   return %0 : !torch.int
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @pow_int(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.int, %[[ARG1:.*]]: !torch.int) -> !torch.int {
+// CHECK:           %[[B:.*]] = torch_c.to_i64 %[[ARG1]]
+// CHECK:           %[[A:.*]] = torch_c.to_i64 %[[ARG0]]
+// CHECK:           %[[RES:.*]] = math.ipowi %[[A]], %[[B]] : i64
+// CHECK:           %[[OUT:.*]] = torch_c.from_i64 %[[RES]]
+// CHECK:           return %[[OUT]] : !torch.int
+func.func @pow_int(%arg0: !torch.int, %arg1: !torch.int) -> !torch.int {
+  %0 = torch.aten.pow.int %arg0, %arg1 : !torch.int, !torch.int -> !torch.int
+  return %0 : !torch.int
+}

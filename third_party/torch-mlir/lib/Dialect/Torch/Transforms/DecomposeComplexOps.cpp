@@ -10129,46 +10129,33 @@ class DecomposeAtenNumpyTOp : public OpRewritePattern<AtenNumpyTOp> {
 };
 } // namespace
 
+// Decomposes variance into: sum((x - mean(x, dims))^2, dims) / (N - correction)
+// Accepts a runtime correction Value (can be dynamic).
+// When correctionValue is null and correction == 0.0, uses mean directly (biased).
 template <typename OpTy>
 static LogicalResult calculateVariance(OpTy op, PatternRewriter &rewriter,
-                                       bool unbiased, double correction) {
+                                       Value correctionValue) {
   Location loc = op.getLoc();
   Value self = op.getSelf();
   Value dimList = op.getDim();
   Value keepDim = op.getKeepdim();
   BaseTensorType inputTensorTy = cast<BaseTensorType>(self.getType());
-  Type outputType = op.getType();
-  BaseTensorType outputTensorType = cast<BaseTensorType>(outputType);
-  if (!outputTensorType.hasDtype()) {
+  BaseTensorType outputTensorType = cast<BaseTensorType>(op.getType());
+
+  if (!outputTensorType.hasDtype())
     return rewriter.notifyMatchFailure(op,
                                        "expected result type to have a dtype");
-  }
-  Type newOutputType = outputTensorType.getWithSizesAndDtype(
-      outputTensorType.getSizes(), rewriter.getF64Type());
   if (!inputTensorTy.hasDtype() ||
-      !isa<mlir::FloatType>(inputTensorTy.getDtype())) {
+      !isa<mlir::FloatType>(inputTensorTy.getDtype()))
     return rewriter.notifyMatchFailure(
         op, "support floating-point type input only");
-  }
 
-  // Upcasting the input tensor to a double-bitwidth dtype for higher precision
-  // during the computation of the result.
-  unsigned bitwidth = inputTensorTy.getDtype().getIntOrFloatBitWidth();
-  if (bitwidth != 64) {
-    Type targetTy = rewriter.getF64Type();
-    if (bitwidth == 8)
-      targetTy = rewriter.getBF16Type();
-    else if (bitwidth == 16)
-      targetTy = rewriter.getF32Type();
-    self = convertTensorToDtype(rewriter, loc, self, rewriter.getF64Type());
-    inputTensorTy = cast<BaseTensorType>(self.getType());
-  }
-
+  // Determine the reduction dimensions.
   std::optional<unsigned> maybeInputRank = getTensorRank(self);
-  if (!maybeInputRank) {
+  if (!maybeInputRank)
     return rewriter.notifyMatchFailure(op, "expected input to have a rank");
-  }
   unsigned inputRank = *maybeInputRank;
+
   SmallVector<Value> dimListElements;
   bool isNoneOrEmpty = true;
   if (!isa<Torch::NoneType>(dimList.getType())) {
@@ -10187,67 +10174,62 @@ static LogicalResult calculateVariance(OpTy op, PatternRewriter &rewriter,
         Torch::ListType::get(Torch::IntType::get(op.getContext())),
         dimListElements);
   }
+
+  // Compute the type for the keepdim=true intermediate (needed for broadcast).
   Type meanDimResultType = inputTensorTy;
   for (unsigned i = 0; i < dimListElements.size(); i++)
     meanDimResultType = computeReductionType(
         rewriter, op, cast<BaseTensorType>(meanDimResultType),
-        dimListElements[i],
-        /*keepDim=*/true);
+        dimListElements[i], /*keepDim=*/true);
 
+  // Step 1: Compute mean along reduction dims (keepdim=true for broadcast).
   Value constantNone = ConstantNoneOp::create(rewriter, loc);
   Value constantTrue = ConstantBoolOp::create(rewriter, loc, true);
   Value meanAlongDims = AtenMeanDimOp::create(
-      rewriter, loc, meanDimResultType, self, dimList, /*keepDim=*/constantTrue,
-      /*dtype=*/constantNone);
+      rewriter, loc, meanDimResultType, self, dimList,
+      /*keepDim=*/constantTrue, /*dtype=*/constantNone);
+
+  // Step 2: Compute squared deviations: (x - mean)^2
   Value subMean =
       createTensorSub(rewriter, loc, inputTensorTy, self, meanAlongDims);
   Value square = AtenSquareOp::create(rewriter, loc, inputTensorTy, subMean);
 
-  if (!unbiased) {
-    Value result =
-        AtenMeanDimOp::create(rewriter, loc, newOutputType, square, dimList,
-                              keepDim, /*dtype=*/constantNone);
-    result = convertTensorToDtype(rewriter, loc, result,
-                                  outputTensorType.getDtype());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-  // Divide the square sum by productDimSize - correction.
-  Value squareSum =
-      AtenSumDimIntListOp::create(rewriter, loc, newOutputType, square, dimList,
-                                  keepDim, /*dtype=*/constantNone);
+  // Step 3: Sum the squared deviations along reduction dims.
+  Value squareSum = AtenSumDimIntListOp::create(
+      rewriter, loc, outputTensorType, square, dimList, keepDim,
+      /*dtype=*/constantNone);
 
-  // `productDimSize` is product of sizes of dimensions to be reduced.
-  Value constantOne = Torch::ConstantIntOp::create(
+  // Step 4: Compute N (product of reduction dimension sizes).
+  Value constantOneInt = Torch::ConstantIntOp::create(
       rewriter, loc, rewriter.getI64IntegerAttr(1));
-  Value productDimSize = constantOne;
+  Value productDimSize = constantOneInt;
   for (Value dim : dimListElements) {
     Value dimSize = AtenSizeIntOp::create(rewriter, loc, self, dim);
     productDimSize =
         AtenMulIntOp::create(rewriter, loc, productDimSize, dimSize);
   }
-  productDimSize = AtenFloatScalarOp::create(rewriter, loc, productDimSize);
-  constantOne = Torch::ConstantFloatOp::create(rewriter, loc,
-                                               rewriter.getF64FloatAttr(1.0));
-  Value cstCorrection = Torch::ConstantFloatOp::create(
-      rewriter, loc, rewriter.getF64FloatAttr(correction));
-  // The `correction` value should be less than or equal to `productDimSize +
-  // 1`.
-  if (!isAssumingStrictSymbolicShapes(rewriter)) {
-    Value productDimSizePlusOne = AtenAddOp::create(
-        rewriter, loc, productDimSize.getType(), productDimSize, constantOne);
-    Value cond = AtenGeFloatOp::create(rewriter, loc, productDimSizePlusOne,
-                                       cstCorrection);
-    RuntimeAssertOp::create(
-        rewriter, loc, cond,
-        "correction value should be less than or equal to productDimSize + 1");
+
+  // Step 5: Compute denominator = N - correction, then divide.
+  // Convert correction to int if needed and subtract from N.
+  Value denominator;
+  if (correctionValue) {
+    // Dynamic correction: N - correction (both as ints)
+    if (isa<Torch::FloatType>(correctionValue.getType())) {
+      Value nFloat =
+          AtenFloatScalarOp::create(rewriter, loc, productDimSize);
+      denominator = AtenSubFloatOp::create(rewriter, loc, nFloat,
+                                           correctionValue);
+    } else {
+      denominator = AtenSubIntOp::create(rewriter, loc, productDimSize,
+                                         correctionValue);
+    }
+  } else {
+    // No correction (correction=0): denominator = N
+    denominator = productDimSize;
   }
-  Value productDimSizeSubCorrection =
-      AtenSubFloatOp::create(rewriter, loc, productDimSize, cstCorrection);
-  Value result = AtenDivScalarOp::create(
-      rewriter, loc, newOutputType, squareSum, productDimSizeSubCorrection);
-  result =
-      convertTensorToDtype(rewriter, loc, result, outputTensorType.getDtype());
+
+  Value result = AtenDivScalarOp::create(rewriter, loc, outputTensorType,
+                                         squareSum, denominator);
   rewriter.replaceOp(op, result);
   return success();
 }
@@ -10270,9 +10252,12 @@ public:
       return rewriter.notifyMatchFailure(
           op, "Only support constant unbiased for aten.var");
     }
-    double correction = unbiased ? 1.0 : 0.0;
-    if (failed(calculateVariance<AtenVarDimOp>(op, rewriter, unbiased,
-                                               correction)))
+    Value correctionValue = nullptr;
+    if (unbiased) {
+      correctionValue = Torch::ConstantIntOp::create(
+          rewriter, op.getLoc(), rewriter.getI64IntegerAttr(1));
+    }
+    if (failed(calculateVariance<AtenVarDimOp>(op, rewriter, correctionValue)))
       return rewriter.notifyMatchFailure(op, "invalid variance parameters");
     return success();
   }
@@ -10290,32 +10275,19 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(AtenVarCorrectionOp op,
                                 PatternRewriter &rewriter) const override {
-    int64_t correctionValInt;
-    double correctionValFloat = 1.0;
-    if (!isa<Torch::NoneType>(op.getCorrection().getType())) {
-      if (isa<Torch::FloatType>(op.getCorrection().getType())) {
-        if (!matchPattern(op.getCorrection(),
-                          m_TorchConstantFloat(&correctionValFloat)))
-          return rewriter.notifyMatchFailure(
-              op, "Only support constant int or float correction value for "
-                  "aten.var");
-      } else if (isa<Torch::IntType>(op.getCorrection().getType())) {
-        if (!matchPattern(op.getCorrection(),
-                          m_TorchConstantInt(&correctionValInt)))
-          return rewriter.notifyMatchFailure(
-              op, "Only support constant int or float correction value for "
-                  "aten.var");
-        correctionValFloat = (double)correctionValInt;
-      } else {
-        return rewriter.notifyMatchFailure(
-            op, "unimplemented: correction value should be only constant int "
-                "or float for aten.var");
-      }
+    Value correction = op.getCorrection();
+
+    // None means default correction=1.
+    Value correctionValue;
+    if (isa<Torch::NoneType>(correction.getType())) {
+      correctionValue = Torch::ConstantIntOp::create(
+          rewriter, op.getLoc(), rewriter.getI64IntegerAttr(1));
+    } else {
+      correctionValue = correction;
     }
 
-    bool unbiased = correctionValFloat == 0.0 ? false : true;
-    if (failed(calculateVariance<AtenVarCorrectionOp>(op, rewriter, unbiased,
-                                                      correctionValFloat)))
+    if (failed(calculateVariance<AtenVarCorrectionOp>(op, rewriter,
+                                                      correctionValue)))
       return rewriter.notifyMatchFailure(op, "invalid variance parameters");
     return success();
   }
@@ -10398,6 +10370,19 @@ class DecomposeAtenLiftFreshCopyOp
     Value constantNone = ConstantNoneOp::create(rewriter, op.getLoc());
     rewriter.replaceOpWithNewOp<AtenCloneOp>(op, op.getType(), op.getSelf(),
                                              /*memoryFormat=*/constantNone);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+class DecomposeAtenTrueDivideTensorOp
+    : public OpRewritePattern<AtenTrueDivideTensorOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenTrueDivideTensorOp op,
+                                PatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<AtenDivTensorOp>(op, op.getType(), op.getSelf(),
+                                                 op.getOther());
     return success();
   }
 };
@@ -13903,6 +13888,7 @@ public:
       addPatternIfTargetOpIsIllegal<DecomposeAtenGluOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAten_EmbeddingBagOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenLiftFreshCopyOp>(patterns);
+      addPatternIfTargetOpIsIllegal<DecomposeAtenTrueDivideTensorOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenMseLossOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenL1LossOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenNormScalarOptDimOp>(patterns);

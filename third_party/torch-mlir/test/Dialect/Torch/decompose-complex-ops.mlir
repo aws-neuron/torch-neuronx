@@ -1304,3 +1304,42 @@ func.func @torch.aten.randint.low$dynamic_bounds_f32(%arg0: !torch.int, %arg1: !
   %0 = torch.aten.randint.low %arg0, %arg1, %size, %none, %none, %none, %none : !torch.int, !torch.int, !torch.list<int>, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],si32>
   return %0 : !torch.vtensor<[2,3],si32>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @true_divide_tensor(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[4,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[4,8],f32>) -> !torch.vtensor<[4,8],f32> {
+// CHECK:           %[[RES:.*]] = torch.aten.div.Tensor %[[ARG0]], %[[ARG1]] : !torch.vtensor<[4,8],f32>, !torch.vtensor<[4,8],f32> -> !torch.vtensor<[4,8],f32>
+// CHECK:           return %[[RES]] : !torch.vtensor<[4,8],f32>
+func.func @true_divide_tensor(%arg0: !torch.vtensor<[4,8],f32>, %arg1: !torch.vtensor<[4,8],f32>) -> !torch.vtensor<[4,8],f32> {
+  %0 = torch.aten.true_divide.Tensor %arg0, %arg1 : !torch.vtensor<[4,8],f32>, !torch.vtensor<[4,8],f32> -> !torch.vtensor<[4,8],f32>
+  return %0 : !torch.vtensor<[4,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @var_correction_dynamic(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[?,8],f32>, %[[ARG1:.*]]: !torch.int) -> !torch.vtensor<[?],f32> {
+// CHECK:           %[[FLOAT1:.*]] = torch.constant.float 1.000000e+00
+// CHECK:           %[[INT8:.*]] = torch.constant.int 8
+// CHECK:           %[[TRUE:.*]] = torch.constant.bool true
+// CHECK:           %[[NONE:.*]] = torch.constant.none
+// CHECK:           %[[INT1:.*]] = torch.constant.int 1
+// CHECK:           %[[FALSE:.*]] = torch.constant.bool false
+// CHECK:           %[[DIMS:.*]] = torch.prim.ListConstruct %[[INT1]] : (!torch.int) -> !torch.list<int>
+// CHECK:           %[[SUM1:.*]] = torch.aten.sum.dim_IntList %[[ARG0]], %[[DIMS]], %[[TRUE]], %[[NONE]] : !torch.vtensor<[?,8],f32>, !torch.list<int>, !torch.bool, !torch.none -> !torch.vtensor<[?,1],f32>
+// CHECK:           %[[MEAN:.*]] = torch.aten.div.Scalar %[[SUM1]], %[[INT8]] : !torch.vtensor<[?,1],f32>, !torch.int -> !torch.vtensor<[?,1],f32>
+// CHECK:           %[[SUB:.*]] = torch.aten.sub.Tensor %[[ARG0]], %[[MEAN]], %[[FLOAT1]] : !torch.vtensor<[?,8],f32>, !torch.vtensor<[?,1],f32>, !torch.float -> !torch.vtensor<[?,8],f32>
+// CHECK:           %[[SQ:.*]] = torch.aten.mul.Tensor %[[SUB]], %[[SUB]] : !torch.vtensor<[?,8],f32>, !torch.vtensor<[?,8],f32> -> !torch.vtensor<[?,8],f32>
+// CHECK:           %[[SQSUM:.*]] = torch.aten.sum.dim_IntList %[[SQ]], %[[DIMS]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[?,8],f32>, !torch.list<int>, !torch.bool, !torch.none -> !torch.vtensor<[?],f32>
+// CHECK:           %[[DENOM:.*]] = torch.aten.sub.int %[[INT8]], %[[ARG1]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[RES:.*]] = torch.aten.div.Scalar %[[SQSUM]], %[[DENOM]] : !torch.vtensor<[?],f32>, !torch.int -> !torch.vtensor<[?],f32>
+// CHECK:           return %[[RES]] : !torch.vtensor<[?],f32>
+// CHECK:         }
+func.func @var_correction_dynamic(%arg0: !torch.vtensor<[?,8],f32>, %arg1: !torch.int) -> !torch.vtensor<[?],f32> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %dims = torch.prim.ListConstruct %int1 : (!torch.int) -> !torch.list<int>
+  %0 = torch.aten.var.correction %arg0, %dims, %arg1, %false : !torch.vtensor<[?,8],f32>, !torch.list<int>, !torch.int, !torch.bool -> !torch.vtensor<[?],f32>
+  return %0 : !torch.vtensor<[?],f32>
+}
