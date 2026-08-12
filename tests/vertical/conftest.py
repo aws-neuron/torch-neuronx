@@ -62,6 +62,11 @@ _DYNAMIC_METRICS_DIR = (
     / "neuron_dynamic_metrics"
 )
 
+_COLLECTIVES_METRICS_DIR = (
+    Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
+    / "neuron_collectives_metrics"
+)
+
 COVERAGE_FIELDS = [
     "op_name",
     "op_group",
@@ -172,6 +177,9 @@ def pytest_sessionstart(session):
     if _DYNAMIC_METRICS_DIR.exists():
         for f in _DYNAMIC_METRICS_DIR.glob("*.json"):
             f.unlink()
+    if _COLLECTIVES_METRICS_DIR.exists():
+        for f in _COLLECTIVES_METRICS_DIR.glob("*.json"):
+            f.unlink()
     os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -190,6 +198,7 @@ def pytest_sessionfinish(session, exitstatus):
     _aggregate_metrics(_COVERAGE_DIR, "target_ops_coverage")
     _aggregate_metrics(_COMPILE_COVERAGE_DIR, "target_ops_compile_coverage")
     _aggregate_dynamic_metrics(_DYNAMIC_METRICS_DIR, "dynamic_aten_ops")
+    _aggregate_dynamic_metrics(_COLLECTIVES_METRICS_DIR, "dynamic_collectives")
 
 
 def _aggregate_metrics(metrics_dir: Path, prefix: str):
