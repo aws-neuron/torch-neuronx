@@ -3,6 +3,7 @@ Neuron backend implementation for torch.compile
 """
 
 import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -15,8 +16,9 @@ from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
+from torch.utils._filelock import FileLock
 
-from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
+from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job, get_lock_timeout
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
 from torch_neuronx.neuron_dynamo_backend.compile_only import build_compile_only_handle
 
@@ -175,6 +177,8 @@ class _Lowering:
     """
 
     gm: torch.fx.GraphModule  # post-FX-pass graph
+    # A live MLIR module from a fresh lowering, or serialized MLIR bytes when
+    # resumed from the StableHLO cache.
     stablehlo_mlir: object
     io_spec: object
     cast_spec: object
@@ -186,6 +190,13 @@ class _Lowering:
     # Ordered per-pass IO mutations; alias_buffer_map derived from these.
     pass_mutations: list[PassMutations] = field(default_factory=list)
     alias_buffer_map: dict[int, int] = field(default_factory=dict)
+
+
+def _make_graph_name(model_name: str) -> str:
+    """Per-run graph name: `{model_name}_{compile_id}` from the AOT graph name."""
+    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
+    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
+    return f"{model_name}_{compile_id}"
 
 
 def _lower_fx_to_stablehlo(
@@ -251,9 +262,7 @@ def _lower_fx_to_stablehlo(
     pass_mutations = pass_analysis.get("pass_mutations", [])
     alias_buffer_map = get_alias_output_buffer_map(pass_mutations)
 
-    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
-    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
-    graph_name = f"{model_name}_{compile_id}"
+    graph_name = _make_graph_name(model_name)
     segment_id = job.timestamp
 
     has_collectives = _has_collectives_in_graph(gm)
@@ -292,6 +301,9 @@ def _lower_stablehlo_to_neff(analysis: _Lowering, *, model_name: str, options=No
     `stablehlo_mlir` populated), runs `CompileGraph.compile()`, and sets
     `cache_key` in place. Shared by `backend="neuron"`, `fx_to_neff`, and
     `stablehlo_to_neff` so they submit the identical StableHLO to neuronx-cc.
+
+    `stablehlo_mlir` may be a live module or the serialized bytes a cache hit
+    carries; `CompileGraph` accepts either.
     """
     use_tensorizer_backend = options.get("use_tensorizer_backend", False) if options else False
     compile_graph = CompileGraph(
@@ -325,16 +337,191 @@ def _lower_fx_to_neff(
     `stablehlo_to_neff` use — so all entry points share one implementation and
     produce the same NEFF (same passes, same cache key). Raises `_StableHLOError`
     if FX→StableHLO conversion fails.
+
+    The front half goes through `_lower_fx_to_stablehlo_cached`: with
+    `TORCH_NEURONX_HLO_COMPILE_CACHE=1` a cache hit skips FX→StableHLO and resumes
+    directly at `_lower_stablehlo_to_neff`.
     """
-    analysis = _lower_fx_to_stablehlo(
+    analysis = _lower_fx_to_stablehlo_cached(
         gm,
         example_inputs,
         job,
         model_name=model_name,
         pre_processing_analysis_info=pre_processing_analysis_info,
         run_fx_passes=run_fx_passes,
+        use_tensorizer=(options or {}).get("use_tensorizer_backend", False),
     )
     return _lower_stablehlo_to_neff(analysis, model_name=model_name, options=options)
+
+
+def _pass_mutations_fingerprint(pass_mutations) -> str:
+    """Stable text for a caller-supplied `pass_mutations` list.
+
+    Order is preserved rather than sorted: `get_alias_output_buffer_map` translates
+    each alias through the mutations that follow it, so the same entries in a
+    different order can yield a different alias map. ADD/REMOVE entries are included
+    for the same reason -- they shift the indices an alias resolves to.
+    """
+    entries = []
+    for pm in pass_mutations or ():
+        for direction, mutations in (
+            ("in", getattr(pm, "input_mutations", None) or ()),
+            ("out", getattr(pm, "output_mutations", None) or ()),
+        ):
+            for m in mutations:
+                kind = getattr(getattr(m, "kind", None), "value", None)
+                entries.append(
+                    (
+                        direction,
+                        kind,
+                        tuple(getattr(m, "indices", None) or ()),
+                        tuple(getattr(m, "alias_input_indices", None) or ()),
+                        getattr(m, "is_mutation", None),
+                        getattr(m, "transform_key", None),
+                    )
+                )
+    return repr(entries)
+
+
+def _alias_fingerprint(pre_processing_analysis_info) -> str:
+    """Stable text for the aliasing a caller supplies via analysis info.
+
+    Each key is serialized by its declared shape; an unrecognized value contributes
+    only its type name.
+    """
+    # pre_aot_pass_mutations is omitted: it is derived from gm by AliasingAnalysis,
+    # so the graph hash already discriminates it.
+    info = pre_processing_analysis_info or {}
+    parts = []
+    for name in (
+        "aliasing_analysis",
+        "mutation_info",
+        "pass_mutations",
+    ):
+        value = info.get(name)
+        if value is None:
+            continue
+        if name == "pass_mutations":
+            parts.append(f"{name}={_pass_mutations_fingerprint(value)}")
+        elif (aliases := getattr(value, "aliases", None)) is not None:
+            pairs = sorted(
+                (getattr(a, "parameter_number", None), getattr(a, "output_index", None))
+                for a in aliases
+            )
+            parts.append(f"{name}={pairs}")
+        else:
+            # Unknown shape: contribute the type, not repr's memory address.
+            parts.append(f"{name}=<{type(value).__name__}>")
+    return "|".join(parts)
+
+
+def _lower_fx_to_stablehlo_cached(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    job,
+    *,
+    model_name: str,
+    pre_processing_analysis_info=None,
+    run_fx_passes: bool = True,
+    use_tensorizer: bool = False,
+) -> _Lowering:
+    """`_lower_fx_to_stablehlo` with the FX-keyed StableHLO cache in front.
+
+    Returns an uncached lowering when the cache is off, the tensorizer is in use, or
+    the key cannot be computed.
+    On a cache hit the result's `stablehlo_mlir` holds serialized bytes rather than a live module.
+    On a miss, a per-key file lock lets one rank lower and store while the others wait
+    and resume from the stored entry, so co-launched ranks do not all repeat the work.
+    """
+    from torch_neuronx.python_ops.compilation import hlo_cache
+
+    def lower():
+        return _lower_fx_to_stablehlo(
+            gm,
+            example_inputs,
+            job,
+            model_name=model_name,
+            pre_processing_analysis_info=pre_processing_analysis_info,
+            run_fx_passes=run_fx_passes,
+        )
+
+    # Caching disabled
+    if not hlo_cache.cache_enabled(compile_mode=True):
+        return lower()
+
+    # TODO: support caching the tensorizer path.
+    if use_tensorizer:
+        return lower()
+
+    try:
+        key = hlo_cache.compute_fx_cache_key(
+            gm,
+            run_fx_passes=run_fx_passes,
+            alias_fingerprint=_alias_fingerprint(pre_processing_analysis_info),
+            use_tensorizer=use_tensorizer,
+        )
+    except Exception as exc:
+        logger.warning("StableHLO cache key failed (%s); lowering uncached", exc)
+        return lower()
+
+    def resume(cached: hlo_cache.CachedHLO) -> _Lowering:
+        return _Lowering(
+            gm=None,
+            stablehlo_mlir=cached.hlo_bytes,
+            io_spec=cached.io_spec,
+            cast_spec=cached.cast_spec,
+            cache_key="",
+            graph_name=_make_graph_name(model_name),
+            segment_id=job.timestamp,
+            has_collectives=cached.has_collectives,
+            alias_buffer_map=cached.alias_buffer_map,
+            pass_mutations=cached.pass_mutations,
+        )
+
+    def lower_and_store() -> _Lowering:
+        analysis = lower()
+        try:
+            hlo_bytes = CompileGraph(
+                analysis.stablehlo_mlir,
+                model_name,
+                analysis.segment_id,
+                analysis.graph_name,
+                analysis.has_collectives,
+            ).serialize()
+            hlo_cache.put(
+                key,
+                hlo_cache.CachedHLO(
+                    hlo_bytes=hlo_bytes,
+                    io_spec=analysis.io_spec,
+                    cast_spec=analysis.cast_spec,
+                    has_collectives=analysis.has_collectives,
+                    alias_buffer_map=analysis.alias_buffer_map,
+                    pass_mutations=analysis.pass_mutations,
+                ),
+                compile_mode=True,
+            )
+        except Exception as exc:
+            logger.warning("StableHLO cache store failed (%s)", exc)
+        return analysis
+
+    cached = hlo_cache.get(key, compile_mode=True)
+    if cached is not None:
+        logger.info("StableHLO cache HIT (key=%s); skipping FX->StableHLO", key[:12])
+        return resume(cached)
+
+    # Miss. Serialize lowering across ranks so only one does the FX->StableHLO work
+    # for a given key; the rest wait on the lock and resume from the stored entry.
+    # Mirrors the eager path (torch_mlir/kernel.py) and nki_kernel.py.
+    lock_path = os.path.join(
+        hlo_cache.CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".fx.lock"
+    )
+    with FileLock(lock_path, timeout=get_lock_timeout()):
+        # Another rank may have stored the entry while we waited for the lock.
+        cached = hlo_cache.get(key, compile_mode=True)
+        if cached is not None:
+            logger.info("StableHLO cache HIT after lock (key=%s)", key[:12])
+            return resume(cached)
+        return lower_and_store()
 
 
 def _make_fallback_fn(
