@@ -280,6 +280,18 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Torch-MLIR cannot legalize _c10d_functional_autograd compatibility "
+            "collective operators retained in AOT forward graphs, even after making "
+            "the test backend agnostic; xfail until fixed."
+        ),
+        tests=[
+            "test_functional_differentials.py::TestFunctionalDifferentialsWithCompileNEURON::test_all_gather_into_tensor_autograd_compile_neuron",
+            "test_functional_differentials.py::TestFunctionalDifferentialsWithCompileNEURON::test_all_to_all_single_autograd_compile_neuron",
+            "test_functional_differentials.py::TestFunctionalDifferentialsWithCompileNEURON::test_reduce_scatter_tensor_autograd_compile_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Eager conv backward hang. Strided/downsampling conv backward dispatches"
             " an all_reduce on a non-contiguous gradient layout."
         ),
