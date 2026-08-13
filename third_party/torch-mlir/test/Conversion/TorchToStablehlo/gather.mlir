@@ -256,3 +256,76 @@ func.func @torch.aten.index_select$rank0(%arg0: !torch.vtensor<[],f32>, %arg1: !
   %0 = torch.aten.index_select %arg0, %int0, %arg1 : !torch.vtensor<[],f32>, !torch.int, !torch.vtensor<[],si64> -> !torch.vtensor<[],f32>
   return %0 : !torch.vtensor<[],f32>
 }
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.index.Tensor_hacked_twin$dynamic_trailing(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[4,?,8],f32>, %[[ARG1:.*]]: !torch.vtensor<[2],si64>) -> !torch.vtensor<[2,?,8],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[4,?,8],f32> -> tensor<4x?x8xf32>
+// CHECK:           %[[IDX:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[2],si64> -> tensor<2xi64>
+// CHECK:           %[[RESHAPE:.*]] = stablehlo.reshape %[[IDX]] : (tensor<2xi64>) -> tensor<2x1xi64>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[INPUT]], %[[C1]] : tensor<4x?x8xf32>
+// CHECK:           %[[DIM1_I64:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM2:.*]] = tensor.dim %[[INPUT]], %[[C2]] : tensor<4x?x8xf32>
+// CHECK:           %[[DIM2_I64:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:           %[[SLICE_SIZES:.*]] = tensor.from_elements %[[ONE]], %[[DIM1_I64]], %[[DIM2_I64]] : tensor<3xi64>
+// CHECK:           %[[RESULT:.*]] = "stablehlo.dynamic_gather"(%[[INPUT]], %[[RESHAPE]], %[[SLICE_SIZES]])
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<2x?x8xf32> -> !torch.vtensor<[2,?,8],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[2,?,8],f32>
+func.func @torch.aten.index.Tensor_hacked_twin$dynamic_trailing(%arg0: !torch.vtensor<[4,?,8],f32>, %arg1: !torch.vtensor<[2],si64>) -> !torch.vtensor<[2,?,8],f32> {
+  %0 = torch.prim.ListConstruct %arg1 : (!torch.vtensor<[2],si64>) -> !torch.list<vtensor>
+  %1 = torch.aten.index.Tensor_hacked_twin %arg0, %0 : !torch.vtensor<[4,?,8],f32>, !torch.list<vtensor> -> !torch.vtensor<[2,?,8],f32>
+  return %1 : !torch.vtensor<[2,?,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.index.Tensor_hacked_twin$dynamic_all_trailing(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[4,?,?],f32>, %[[ARG1:.*]]: !torch.vtensor<[3],si64>) -> !torch.vtensor<[3,?,?],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[4,?,?],f32> -> tensor<4x?x?xf32>
+// CHECK:           %[[IDX:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[3],si64> -> tensor<3xi64>
+// CHECK:           %[[RESHAPE:.*]] = stablehlo.reshape %[[IDX]] : (tensor<3xi64>) -> tensor<3x1xi64>
+// CHECK:           %[[ONE:.*]] = arith.constant 1 : i64
+// CHECK:           %[[C1:.*]] = arith.constant 1 : index
+// CHECK:           %[[DIM1:.*]] = tensor.dim %[[INPUT]], %[[C1]] : tensor<4x?x?xf32>
+// CHECK:           %[[DIM1_I64:.*]] = arith.index_cast %[[DIM1]] : index to i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM2:.*]] = tensor.dim %[[INPUT]], %[[C2]] : tensor<4x?x?xf32>
+// CHECK:           %[[DIM2_I64:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:           %[[SLICE_SIZES:.*]] = tensor.from_elements %[[ONE]], %[[DIM1_I64]], %[[DIM2_I64]] : tensor<3xi64>
+// CHECK:           %[[RESULT:.*]] = "stablehlo.dynamic_gather"(%[[INPUT]], %[[RESHAPE]], %[[SLICE_SIZES]])
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<3x?x?xf32> -> !torch.vtensor<[3,?,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[3,?,?],f32>
+func.func @torch.aten.index.Tensor_hacked_twin$dynamic_all_trailing(%arg0: !torch.vtensor<[4,?,?],f32>, %arg1: !torch.vtensor<[3],si64>) -> !torch.vtensor<[3,?,?],f32> {
+  %0 = torch.prim.ListConstruct %arg1 : (!torch.vtensor<[3],si64>) -> !torch.list<vtensor>
+  %1 = torch.aten.index.Tensor_hacked_twin %arg0, %0 : !torch.vtensor<[4,?,?],f32>, !torch.list<vtensor> -> !torch.vtensor<[3,?,?],f32>
+  return %1 : !torch.vtensor<[3,?,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.index.Tensor_hacked_twin$multi_index_dynamic(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[4,4,?],f32>, %[[ARG1:.*]]: !torch.vtensor<[2],si64>, %[[ARG2:.*]]: !torch.vtensor<[2],si64>) -> !torch.vtensor<[2,?],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[4,4,?],f32> -> tensor<4x4x?xf32>
+// CHECK:           %[[IDX0:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[2],si64> -> tensor<2xi64>
+// CHECK:           %[[IDX1:.*]] = torch_c.to_builtin_tensor %[[ARG2]] : !torch.vtensor<[2],si64> -> tensor<2xi64>
+// CHECK:           %[[IDX0_R:.*]] = stablehlo.reshape %[[IDX0]] : (tensor<2xi64>) -> tensor<2x1xi64>
+// CHECK:           %[[IDX1_R:.*]] = stablehlo.reshape %[[IDX1]] : (tensor<2xi64>) -> tensor<2x1xi64>
+// CHECK:           %[[INDICES:.*]] = stablehlo.concatenate %[[IDX0_R]], %[[IDX1_R]], dim = 1 : (tensor<2x1xi64>, tensor<2x1xi64>) -> tensor<2x2xi64>
+// CHECK:           %[[C1:.*]] = arith.constant 1 : i64
+// CHECK:           %[[C2:.*]] = arith.constant 2 : index
+// CHECK:           %[[DIM2:.*]] = tensor.dim %[[INPUT]], %[[C2]] : tensor<4x4x?xf32>
+// CHECK:           %[[DIM2_I64:.*]] = arith.index_cast %[[DIM2]] : index to i64
+// CHECK:           %[[SLICE_SIZES:.*]] = tensor.from_elements %[[C1]], %[[C1]], %[[DIM2_I64]] : tensor<3xi64>
+// CHECK:           %[[RESULT:.*]] = "stablehlo.dynamic_gather"(%[[INPUT]], %[[INDICES]], %[[SLICE_SIZES]]) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0, 1], start_index_map = [0, 1], index_vector_dim = 1>, indices_are_sorted = false}> : (tensor<4x4x?xf32>, tensor<2x2xi64>, tensor<3xi64>) -> tensor<2x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<2x?xf32> -> !torch.vtensor<[2,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[2,?],f32>
+// CHECK:         }
+func.func @torch.aten.index.Tensor_hacked_twin$multi_index_dynamic(%arg0: !torch.vtensor<[4,4,?],f32>, %arg1: !torch.vtensor<[2],si64>, %arg2: !torch.vtensor<[2],si64>) -> !torch.vtensor<[2,?],f32> {
+  %0 = torch.prim.ListConstruct %arg1, %arg2 : (!torch.vtensor<[2],si64>, !torch.vtensor<[2],si64>) -> !torch.list<vtensor>
+  %1 = torch.aten.index.Tensor_hacked_twin %arg0, %0 : !torch.vtensor<[4,4,?],f32>, !torch.list<vtensor> -> !torch.vtensor<[2,?],f32>
+  return %1 : !torch.vtensor<[2,?],f32>
+}

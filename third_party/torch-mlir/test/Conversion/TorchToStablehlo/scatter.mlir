@@ -324,3 +324,207 @@ func.func @test_scatter_reduce_sum_rank0_no_include_self(%arg0: !torch.vtensor<[
   %0 = torch.aten.scatter_reduce.two %arg0, %int0, %arg2, %arg1, %str, %false : !torch.vtensor<[],f32>, !torch.int, !torch.vtensor<[],si64>, !torch.vtensor<[],f32>, !torch.str, !torch.bool -> !torch.vtensor<[],f32>
   return %0 : !torch.vtensor<[],f32>
 }
+
+// -----
+
+// Static input, static src, constant start/end/step
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$all_static(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[8,4],f32>, %[[SRC:.*]]: !torch.vtensor<[2,4],f32>) -> !torch.vtensor<[8,4],f32>
+// CHECK:         %[[INDICES:.*]] = stablehlo.constant dense<{{\[\[}}2], [3]]> : tensor<2x1xi64>
+// CHECK:         "stablehlo.scatter"(%{{.*}}, %[[INDICES]], %{{.*}})
+func.func @torch.aten.slice_scatter$all_static(%arg0: !torch.vtensor<[8,4],f32>, %arg1: !torch.vtensor<[2,4],f32>) -> !torch.vtensor<[8,4],f32> {
+  %int0 = torch.constant.int 0
+  %int2 = torch.constant.int 2
+  %int4 = torch.constant.int 4
+  %int1 = torch.constant.int 1
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %int2, %int4, %int1 : !torch.vtensor<[8,4],f32>, !torch.vtensor<[2,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[8,4],f32>
+  return %0 : !torch.vtensor<[8,4],f32>
+}
+
+// -----
+
+// Static input, static src, constant start/end with step=2
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$static_step2(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[8,4],f32>, %[[SRC:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[8,4],f32>
+// CHECK:         %[[INDICES:.*]] = stablehlo.constant dense<{{\[\[}}0], [2], [4]]> : tensor<3x1xi64>
+// CHECK:         "stablehlo.scatter"(%{{.*}}, %[[INDICES]], %{{.*}})
+func.func @torch.aten.slice_scatter$static_step2(%arg0: !torch.vtensor<[8,4],f32>, %arg1: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[8,4],f32> {
+  %int0 = torch.constant.int 0
+  %int0_start = torch.constant.int 0
+  %int6 = torch.constant.int 6
+  %int2 = torch.constant.int 2
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %int0_start, %int6, %int2 : !torch.vtensor<[8,4],f32>, !torch.vtensor<[3,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[8,4],f32>
+  return %0 : !torch.vtensor<[8,4],f32>
+}
+
+// -----
+
+// Dynamic input, static src, dynamic start, step=1
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$dynamic_input_dynamic_start(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[?,4],f32>, %[[SRC:.*]]: !torch.vtensor<[1,4],f32>, %[[START:.*]]: !torch.int) -> !torch.vtensor<[?,4],f32>
+// CHECK:         stablehlo.iota dim = 0 : tensor<1xi64>
+// CHECK:         chlo.broadcast_mul
+// CHECK:         chlo.broadcast_add
+// CHECK:         stablehlo.reshape
+// CHECK:         "stablehlo.scatter"
+func.func @torch.aten.slice_scatter$dynamic_input_dynamic_start(%arg0: !torch.vtensor<[?,4],f32>, %arg1: !torch.vtensor<[1,4],f32>, %arg2: !torch.int) -> !torch.vtensor<[?,4],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %arg2, %int9223372036854775807, %int1 : !torch.vtensor<[?,4],f32>, !torch.vtensor<[1,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?,4],f32>
+  return %0 : !torch.vtensor<[?,4],f32>
+}
+
+// -----
+
+// Dynamic input, dynamic src, dynamic start, step=1
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$all_dynamic_step1(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[?,?],f32>, %[[SRC:.*]]: !torch.vtensor<[?,?],f32>, %[[START:.*]]: !torch.int) -> !torch.vtensor<[?,?],f32>
+// CHECK:         stablehlo.dynamic_iota
+// CHECK:         chlo.broadcast_mul
+// CHECK:         chlo.broadcast_add
+// CHECK:         stablehlo.dynamic_reshape
+// CHECK:         "stablehlo.scatter"
+func.func @torch.aten.slice_scatter$all_dynamic_step1(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],f32>, %arg2: !torch.int) -> !torch.vtensor<[?,?],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %arg2, %int9223372036854775807, %int1 : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?,?],f32>
+  return %0 : !torch.vtensor<[?,?],f32>
+}
+
+// -----
+
+// Dynamic input, dynamic src, dynamic start, step=2
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$all_dynamic_step2(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[?,?],f32>, %[[SRC:.*]]: !torch.vtensor<[?,?],f32>, %[[START:.*]]: !torch.int) -> !torch.vtensor<[?,?],f32>
+// CHECK:         stablehlo.dynamic_iota
+// CHECK:         chlo.broadcast_mul
+// CHECK:         chlo.broadcast_add
+// CHECK:         stablehlo.dynamic_reshape
+// CHECK:         "stablehlo.scatter"
+func.func @torch.aten.slice_scatter$all_dynamic_step2(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],f32>, %arg2: !torch.int) -> !torch.vtensor<[?,?],f32> {
+  %int0 = torch.constant.int 0
+  %int2 = torch.constant.int 2
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %arg2, %int9223372036854775807, %int2 : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?,?],f32>
+  return %0 : !torch.vtensor<[?,?],f32>
+}
+
+// -----
+
+// Static input, static src, dynamic start, dim=1
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$dynamic_start_dim1(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[4,8],f32>, %[[SRC:.*]]: !torch.vtensor<[4,3],f32>, %[[START:.*]]: !torch.int) -> !torch.vtensor<[4,8],f32>
+// CHECK:         stablehlo.iota dim = 0 : tensor<3xi64>
+// CHECK:         chlo.broadcast_mul
+// CHECK:         chlo.broadcast_add
+// CHECK:         stablehlo.reshape
+// CHECK:         "stablehlo.scatter"
+func.func @torch.aten.slice_scatter$dynamic_start_dim1(%arg0: !torch.vtensor<[4,8],f32>, %arg1: !torch.vtensor<[4,3],f32>, %arg2: !torch.int) -> !torch.vtensor<[4,8],f32> {
+  %int1 = torch.constant.int 1
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int1, %arg2, %int9223372036854775807, %int1 : !torch.vtensor<[4,8],f32>, !torch.vtensor<[4,3],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[4,8],f32>
+  return %0 : !torch.vtensor<[4,8],f32>
+}
+
+// -----
+
+// Dynamic start and step, dynamic src dim
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$dynamic_start_and_step(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[8,4],f32>, %[[SRC:.*]]: !torch.vtensor<[?,4],f32>, %[[START:.*]]: !torch.int, %[[STEP:.*]]: !torch.int) -> !torch.vtensor<[8,4],f32>
+// CHECK:         %[[STEP_I64:.*]] = torch_c.to_i64 %[[STEP]]
+// CHECK:         %[[START_I64:.*]] = torch_c.to_i64 %[[START]]
+// CHECK:         %[[SRC_T:.*]] = torch_c.to_builtin_tensor %[[SRC]] : !torch.vtensor<[?,4],f32> -> tensor<?x4xf32>
+// CHECK:         %[[INPUT_T:.*]] = torch_c.to_builtin_tensor %[[INPUT]] : !torch.vtensor<[8,4],f32> -> tensor<8x4xf32>
+// CHECK:         %[[C0:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0:.*]] = tensor.dim %[[SRC_T]], %[[C0]] : tensor<?x4xf32>
+// CHECK:         %[[N:.*]] = arith.index_cast %[[DIM0]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[N]] : tensor<1xi64>
+// CHECK:         %[[IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<1xi64>) -> tensor<?xi64>
+// CHECK:         %[[STEP_SCALAR:.*]] = tensor.from_elements %[[STEP_I64]] : tensor<i64>
+// CHECK:         %[[SCALED:.*]] = chlo.broadcast_multiply %[[IOTA]], %[[STEP_SCALAR]] : (tensor<?xi64>, tensor<i64>) -> tensor<?xi64>
+// CHECK:         %[[IS_NEG:.*]] = arith.cmpi slt, %[[START_I64]], %{{.*}} : i64
+// CHECK:         %[[INPUT_DIM:.*]] = tensor.dim %[[INPUT_T]], %{{.*}} : tensor<8x4xf32>
+// CHECK:         %[[DIM_I64:.*]] = arith.index_cast %[[INPUT_DIM]] : index to i64
+// CHECK:         %[[ADD:.*]] = arith.addi %[[START_I64]], %[[DIM_I64]] : i64
+// CHECK:         %[[START_NORM:.*]] = arith.select %[[IS_NEG]], %[[ADD]], %[[START_I64]] : i64
+// CHECK:         %[[START_SCALAR:.*]] = tensor.from_elements %[[START_NORM]] : tensor<i64>
+// CHECK:         %[[INDICES:.*]] = chlo.broadcast_add %[[SCALED]], %[[START_SCALAR]] : (tensor<?xi64>, tensor<i64>) -> tensor<?xi64>
+// CHECK:         %[[C0_2:.*]] = arith.constant 0 : index
+// CHECK:         %[[DIM0_2:.*]] = tensor.dim %[[INDICES]], %[[C0_2]] : tensor<?xi64>
+// CHECK:         %[[N2:.*]] = arith.index_cast %[[DIM0_2]] : index to i64
+// CHECK:         %[[C1:.*]] = arith.constant 1 : i64
+// CHECK:         %[[RESHAPE_SHAPE:.*]] = tensor.from_elements %[[N2]], %[[C1]] : tensor<2xi64>
+// CHECK:         %[[SCATTER_IDX:.*]] = stablehlo.dynamic_reshape %[[INDICES]], %[[RESHAPE_SHAPE]] : (tensor<?xi64>, tensor<2xi64>) -> tensor<?x1xi64>
+// CHECK:         %[[RESULT:.*]] = "stablehlo.scatter"(%[[INPUT_T]], %[[SCATTER_IDX]], %[[SRC_T]])
+// CHECK:         %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<8x4xf32> -> !torch.vtensor<[8,4],f32>
+// CHECK:         return %[[OUT]] : !torch.vtensor<[8,4],f32>
+func.func @torch.aten.slice_scatter$dynamic_start_and_step(%arg0: !torch.vtensor<[8,4],f32>, %arg1: !torch.vtensor<[?,4],f32>, %arg2: !torch.int, %arg3: !torch.int) -> !torch.vtensor<[8,4],f32> {
+  %int0 = torch.constant.int 0
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %arg2, %int9223372036854775807, %arg3 : !torch.vtensor<[8,4],f32>, !torch.vtensor<[?,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[8,4],f32>
+  return %0 : !torch.vtensor<[8,4],f32>
+}
+
+// -----
+
+// Constant start/end/step but dynamic input dim — must use runtime iota path
+// (without this guard, end=INT64_MAX would cause an unbounded loop)
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$const_params_dynamic_dim(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[?,4],f32>, %[[SRC:.*]]: !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>
+// CHECK:         %[[SRC_T:.*]] = torch_c.to_builtin_tensor %[[SRC]] : !torch.vtensor<[?,4],f32> -> tensor<?x4xf32>
+// CHECK:         %[[INPUT_T:.*]] = torch_c.to_builtin_tensor %[[INPUT]] : !torch.vtensor<[?,4],f32> -> tensor<?x4xf32>
+// CHECK:         %[[DIM:.*]] = tensor.dim %[[SRC_T]], %{{.*}} : tensor<?x4xf32>
+// CHECK:         %[[N:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:         %[[SHAPE:.*]] = tensor.from_elements %[[N]] : tensor<1xi64>
+// CHECK:         %[[IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<1xi64>) -> tensor<?xi64>
+// CHECK:         %[[STEP:.*]] = tensor.from_elements %{{.*}} : tensor<i64>
+// CHECK:         %[[SCALED:.*]] = chlo.broadcast_multiply %[[IOTA]], %[[STEP]] : (tensor<?xi64>, tensor<i64>) -> tensor<?xi64>
+// CHECK:         %[[IS_NEG:.*]] = arith.cmpi slt, %{{.*}}, %{{.*}} : i64
+// CHECK:         %[[INPUT_DIM:.*]] = tensor.dim %[[INPUT_T]], %{{.*}} : tensor<?x4xf32>
+// CHECK:         %[[DIM_I64:.*]] = arith.index_cast %[[INPUT_DIM]] : index to i64
+// CHECK:         %[[START_NORM:.*]] = arith.select %[[IS_NEG]], %{{.*}}, %{{.*}} : i64
+// CHECK:         %[[START_T:.*]] = tensor.from_elements %[[START_NORM]] : tensor<i64>
+// CHECK:         %[[INDICES:.*]] = chlo.broadcast_add %[[SCALED]], %[[START_T]] : (tensor<?xi64>, tensor<i64>) -> tensor<?xi64>
+// CHECK:         %[[SCATTER_IDX:.*]] = stablehlo.dynamic_reshape %[[INDICES]], %{{.*}} : (tensor<?xi64>, tensor<2xi64>) -> tensor<?x1xi64>
+// CHECK:         %[[RESULT:.*]] = "stablehlo.scatter"(%[[INPUT_T]], %[[SCATTER_IDX]], %[[SRC_T]])
+// CHECK:         %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x4xf32> -> !torch.vtensor<[?,4],f32>
+// CHECK:         return %[[OUT]] : !torch.vtensor<[?,4],f32>
+func.func @torch.aten.slice_scatter$const_params_dynamic_dim(%arg0: !torch.vtensor<[?,4],f32>, %arg1: !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %int0, %int9223372036854775807, %int1 : !torch.vtensor<[?,4],f32>, !torch.vtensor<[?,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?,4],f32>
+  return %0 : !torch.vtensor<[?,4],f32>
+}
+
+// -----
+
+// Negative start with dynamic input dim — start normalization applied at runtime
+// CHECK-LABEL: func.func @torch.aten.slice_scatter$negative_start_dynamic_dim(
+// CHECK-SAME:      %[[INPUT:.*]]: !torch.vtensor<[?,4],f32>, %[[SRC:.*]]: !torch.vtensor<[2,4],f32>) -> !torch.vtensor<[?,4],f32>
+// CHECK:         %[[SRC_T:.*]] = torch_c.to_builtin_tensor %[[SRC]] : !torch.vtensor<[2,4],f32> -> tensor<2x4xf32>
+// CHECK:         %[[INPUT_T:.*]] = torch_c.to_builtin_tensor %[[INPUT]] : !torch.vtensor<[?,4],f32> -> tensor<?x4xf32>
+// CHECK:         %[[IOTA:.*]] = stablehlo.iota dim = 0 : tensor<2xi64>
+// CHECK:         %[[STEP:.*]] = tensor.from_elements %{{.*}} : tensor<i64>
+// CHECK:         %[[SCALED:.*]] = chlo.broadcast_multiply %[[IOTA]], %[[STEP]] : (tensor<2xi64>, tensor<i64>) -> tensor<2xi64>
+// CHECK:         %[[IS_NEG:.*]] = arith.cmpi slt, %{{.*}}, %{{.*}} : i64
+// CHECK:         %[[INPUT_DIM:.*]] = tensor.dim %[[INPUT_T]], %{{.*}} : tensor<?x4xf32>
+// CHECK:         %[[DIM_I64:.*]] = arith.index_cast %[[INPUT_DIM]] : index to i64
+// CHECK:         %[[ADD:.*]] = arith.addi %{{.*}}, %[[DIM_I64]] : i64
+// CHECK:         %[[START_NORM:.*]] = arith.select %[[IS_NEG]], %[[ADD]], %{{.*}} : i64
+// CHECK:         %[[START_T:.*]] = tensor.from_elements %[[START_NORM]] : tensor<i64>
+// CHECK:         %[[INDICES:.*]] = chlo.broadcast_add %[[SCALED]], %[[START_T]] : (tensor<2xi64>, tensor<i64>) -> tensor<2xi64>
+// CHECK:         %[[SCATTER_IDX:.*]] = stablehlo.reshape %[[INDICES]] : (tensor<2xi64>) -> tensor<2x1xi64>
+// CHECK:         %[[RESULT:.*]] = "stablehlo.scatter"(%[[INPUT_T]], %[[SCATTER_IDX]], %[[SRC_T]])
+// CHECK:         %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x4xf32> -> !torch.vtensor<[?,4],f32>
+// CHECK:         return %[[OUT]] : !torch.vtensor<[?,4],f32>
+func.func @torch.aten.slice_scatter$negative_start_dynamic_dim(%arg0: !torch.vtensor<[?,4],f32>, %arg1: !torch.vtensor<[2,4],f32>) -> !torch.vtensor<[?,4],f32> {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int9223372036854775807 = torch.constant.int 9223372036854775807
+  %int_neg2 = torch.constant.int -2
+  %0 = torch.aten.slice_scatter %arg0, %arg1, %int0, %int_neg2, %int9223372036854775807, %int1 : !torch.vtensor<[?,4],f32>, !torch.vtensor<[2,4],f32>, !torch.int, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[?,4],f32>
+  return %0 : !torch.vtensor<[?,4],f32>
+}
