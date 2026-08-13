@@ -37,7 +37,7 @@ from torch_neuronx.packed_storage import (
 )
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
-from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR
+from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR, CachedHLO
 from torch_neuronx.python_ops.nki_kernels.stride2_gather import packed_gather_nki
 from torch_neuronx.python_ops.schema_utils import is_inplace_op
 from torch_neuronx.python_ops.shared import (
@@ -474,7 +474,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         kwargs: dict,
         context: ExecutionContext | None = None,
         use_complex_decomposition: bool = False,
-    ) -> tuple[bytes, object, object, list[int], list[int], tuple, tuple, dict]:
+    ) -> "CachedHLO":
         """Generate HLO from PyTorch function.
 
         Args:
@@ -483,8 +483,9 @@ class TorchMlirKernel(BaseNeuronKernel):
             context: Execution context with original inputs
 
         Returns:
-            Tuple of (HLO bytes, io_spec, cast_spec, kept_input_indices, kept_output_indices,
-                        downcasted_outputs, original_outputs, passthrough_mappings)
+            A CachedHLO carrying the same fields the previous tuple did: HLO bytes,
+            io_spec, cast_spec, kept_input_indices, kept_output_indices,
+            downcasted_outputs, original_outputs, passthrough_mappings.
         """
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
@@ -677,15 +678,14 @@ class TorchMlirKernel(BaseNeuronKernel):
         if self._is_pure_input_passthrough(
             passthrough_mappings, kept_output_indices, original_outputs
         ):
-            return (
-                b"",  # no HLO
-                None,  # no io_spec
-                None,  # no cast_spec
-                kept_input_indices,
-                kept_output_indices,  # empty
-                None,  # downcasted_outputs
-                original_outputs,
-                passthrough_mappings,
+            return CachedHLO(
+                hlo_bytes=b"",
+                io_spec=None,
+                kept_input_indices=kept_input_indices,
+                kept_output_indices=kept_output_indices,
+                downcasted_outputs=None,
+                original_outputs=original_outputs,
+                passthrough_mappings=passthrough_mappings,
             )
 
         # Convert to StableHLO
@@ -710,15 +710,15 @@ class TorchMlirKernel(BaseNeuronKernel):
                 torch.empty(spec.shape, dtype=spec.dtype, device="meta") for spec in io_spec.outputs
             )
 
-        return (
-            str(stablehlo_module).encode(),
-            io_spec,
-            cast_spec,
-            kept_input_indices,
-            kept_output_indices,
-            downcasted_outputs,
-            original_outputs,
-            passthrough_mappings,
+        return CachedHLO(
+            hlo_bytes=str(stablehlo_module).encode(),
+            io_spec=io_spec,
+            cast_spec=cast_spec,
+            kept_input_indices=kept_input_indices,
+            kept_output_indices=kept_output_indices,
+            downcasted_outputs=downcasted_outputs,
+            original_outputs=original_outputs,
+            passthrough_mappings=passthrough_mappings,
         )
 
     def _reconstruct_outputs(
@@ -1208,85 +1208,54 @@ class TorchMlirKernel(BaseNeuronKernel):
             )
 
         if cache_key in self.hlo_cache:
-            (
-                hlo_bytes,
-                io_spec,
-                kept_input_indices,
-                kept_output_indices,
-                downcasted_outputs,
-                original_outputs,
-                passthrough_mappings,
-            ) = self.hlo_cache[cache_key]
+            entry = self.hlo_cache[cache_key]
         else:
             # Check persistent disk cache
             from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
             from torch_neuronx.python_ops.compilation.hlo_cache import get as _hlo_cache_get
             from torch_neuronx.python_ops.compilation.hlo_cache import put as _hlo_cache_put
 
-            disk_entry = _hlo_cache_get(cache_key)
-            if disk_entry is None:
-                if _hlo_cache_mod._enabled:
-                    # Use file lock so only one process traces/lowers for a given cache key.
-                    # Other processes wait on the lock, then read from disk.
-
+            entry = _hlo_cache_get(cache_key)
+            if entry is None:
+                if _hlo_cache_mod.cache_enabled(compile_mode=False):
+                    # One process lowers per key; the rest wait on the lock and read
+                    # the entry it stored.
                     lock_path = os.path.join(
                         CACHE_DIR, hashlib.sha256(cache_key.encode()).hexdigest() + ".lock"
                     )
 
                     with FileLock(lock_path, timeout=1800):
-                        # Check existence (cheap) — another process may have written while we waited
-                        backend = _C
-                        if not backend._exists_hlo_cache(cache_key + "_meta"):
-                            result = self._generate_hlo(
+                        entry = _hlo_cache_get(cache_key)
+                        if entry is None:
+                            entry = self._generate_hlo(
                                 inputs,
                                 kwargs,
                                 context,
                                 use_complex_decomposition=use_complex_decomposition,
                             )
-                            # Drop cast_spec (index 2) for cache storage
-                            disk_entry = result[:2] + result[3:]
                             # Pure input passthrough has no HLO, only a trace, which the
                             # process-local hlo_cache below already covers.
-                            if disk_entry[0]:
-                                _hlo_cache_put(cache_key, *disk_entry)
-
-                    if disk_entry is None:
-                        # Losers read from disk after lock is released (parallel).
-                        disk_entry = _hlo_cache_get(cache_key)
-                        if disk_entry is None:
-                            # _meta can exist while the entry is unreadable (empty HLO passthrough),
-                            # which skipped the generate above. Trace here rather than unpack None.
-                            result = self._generate_hlo(inputs, kwargs, context)
-                            disk_entry = result[:2] + result[3:]
+                            if entry.hlo_bytes:
+                                _hlo_cache_put(cache_key, entry)
                 else:
                     # Cache disabled — generate directly without coordination
-                    result = self._generate_hlo(
+                    entry = self._generate_hlo(
                         inputs,
                         kwargs,
                         context,
                         use_complex_decomposition=use_complex_decomposition,
                     )
-                    disk_entry = result[:2] + result[3:]
 
-            (
-                hlo_bytes,
-                io_spec,
-                kept_input_indices,
-                kept_output_indices,
-                downcasted_outputs,
-                original_outputs,
-                passthrough_mappings,
-            ) = disk_entry
-            self.hlo_cache[cache_key] = disk_entry
+            self.hlo_cache[cache_key] = entry
 
         return (
-            hlo_bytes,
-            io_spec,
-            kept_input_indices,
-            kept_output_indices,
-            downcasted_outputs,
-            original_outputs,
-            passthrough_mappings,
+            entry.hlo_bytes,
+            entry.io_spec,
+            entry.kept_input_indices,
+            entry.kept_output_indices,
+            entry.downcasted_outputs,
+            entry.original_outputs,
+            entry.passthrough_mappings,
             cache_key,
         )
 

@@ -1,7 +1,8 @@
 """Tests for HLO generation file lock in TorchMlirKernel._get_or_compile_hlo.
 
-Verifies that only one process traces/lowers HLO on a cache miss,
-while other processes wait and read from disk after the lock is released.
+Verifies that only one process traces/lowers HLO on a cache miss, while the others
+wait on the lock and read the entry it stored. This holds even when an entry is
+already on disk in a form the reader declines.
 """
 
 import os
@@ -13,7 +14,6 @@ import pytest
 import torch
 
 from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
-from torch_neuronx.python_ops.compilation.hlo_cache import get as _hlo_cache_get
 from torch_neuronx.python_ops.compilation.hlo_cache import put as _hlo_cache_put
 
 
@@ -40,29 +40,26 @@ def _enable_hlo_cache(tmp_path, monkeypatch):
 
 
 def _make_dummy_entry():
+    """A CachedHLO matching _generate_hlo's return, also accepted by hlo_cache.put."""
     from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
+    from torch_neuronx.python_ops.compilation.hlo_cache import CachedHLO
 
-    hlo_bytes = b"module @test { func.func @main(%arg0: tensor<4x8xf32>) -> tensor<4x8xf32> }"
-    io_spec = FunctionIO(
-        inputs=(TensorSpec(shape=(4, 8), dtype=torch.float32),),
-        outputs=(TensorSpec(shape=(4, 8), dtype=torch.float32),),
+    return CachedHLO(
+        hlo_bytes=b"module @test { func.func @main(%arg0: tensor<4x8xf32>) -> tensor<4x8xf32> }",
+        io_spec=FunctionIO(
+            inputs=(TensorSpec(shape=(4, 8), dtype=torch.float32),),
+            outputs=(TensorSpec(shape=(4, 8), dtype=torch.float32),),
+        ),
+        kept_input_indices=[0],
+        kept_output_indices=[0],
+        downcasted_outputs=torch.empty(4, 8, dtype=torch.float32, device="meta"),
+        original_outputs=torch.empty(4, 8, dtype=torch.float32, device="meta"),
+        passthrough_mappings={},
     )
-    return (
-        hlo_bytes,
-        io_spec,
-        [0],
-        [0],
-        torch.empty(4, 8, dtype=torch.float32, device="meta"),
-        torch.empty(4, 8, dtype=torch.float32, device="meta"),
-        {},
-    )
 
 
-def _make_generate_hlo_result():
-    """Return an 8-tuple matching _generate_hlo output (includes cast_spec)."""
-    entry = _make_dummy_entry()
-    # Insert cast_spec=None at index 2
-    return entry[:2] + (None,) + entry[2:]
+# _generate_hlo and hlo_cache.put now take the same type.
+_make_generate_hlo_result = _make_dummy_entry
 
 
 def _make_kernel():
@@ -147,7 +144,7 @@ class TestHloFileLockSingleGeneration:
         entry = _make_dummy_entry()
 
         # Pre-populate disk cache
-        _hlo_cache_put(cache_key, *entry)
+        _hlo_cache_put(cache_key, entry)
 
         # Clear in-memory cache
         kernel.hlo_cache.clear()
@@ -155,7 +152,8 @@ class TestHloFileLockSingleGeneration:
         with (
             patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
             patch.object(kernel, "_generate_hlo") as mock_generate,
-            patch("torch.utils._filelock.FileLock") as mock_filelock,
+            # kernel binds FileLock at import, so patch the name it actually calls.
+            patch("torch_neuronx.python_ops.torch_mlir.kernel.FileLock") as mock_filelock,
         ):
             result = kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
 
@@ -167,10 +165,9 @@ class TestHloFileLockSingleGeneration:
         """When in-memory cache has the entry, nothing else is called."""
         kernel = _make_kernel()
         cache_key = "test_mem_hit_key"
-        entry = _make_dummy_entry()
 
-        # Pre-populate in-memory cache
-        kernel.hlo_cache[cache_key] = entry
+        # Pre-populate in-memory cache with a CachedHLO, as _get_or_compile_hlo stores.
+        kernel.hlo_cache[cache_key] = _make_generate_hlo_result()
 
         with (
             patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
@@ -183,24 +180,97 @@ class TestHloFileLockSingleGeneration:
         mock_disk_get.assert_not_called()
         assert result is not None
 
-    def test_winner_does_not_read_from_disk(self):
-        """The process that generates HLO should not do a redundant disk read."""
+    def test_read_is_repeated_under_the_lock(self):
+        """A miss re-reads inside the lock before generating.
+
+        The unlocked read can only be stale: another process may store the entry
+        between it and the lock being acquired.
+        """
         kernel = _make_kernel()
-        cache_key = "test_winner_no_read_key"
+        cache_key = "test_reread_under_lock_key"
         generate_result = _make_generate_hlo_result()
 
         kernel.hlo_cache.clear()
 
         with (
             patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
-            patch.object(kernel, "_generate_hlo", return_value=generate_result),
+            patch.object(kernel, "_generate_hlo", return_value=generate_result) as mock_generate,
             patch("torch_neuronx.python_ops.compilation.hlo_cache.get") as mock_get,
             patch("torch_neuronx.python_ops.compilation.hlo_cache.put"),
         ):
-            # First call returns None (miss), should not be called again for winner
             mock_get.return_value = None
 
             kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
 
-        # _hlo_cache_get called once (initial check), not twice
-        assert mock_get.call_count == 1
+        assert mock_get.call_count == 2
+        assert mock_generate.call_count == 1
+
+    def test_stored_entry_is_read_by_a_later_call(self):
+        """What the generating call stores under the lock is readable, so a later
+        call reads it instead of lowering again."""
+        kernel = _make_kernel()
+        cache_key = "test_second_reader_key"
+        generate_result = _make_generate_hlo_result()
+
+        kernel.hlo_cache.clear()
+
+        with (
+            patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
+            patch.object(kernel, "_generate_hlo", return_value=generate_result) as mock_generate,
+        ):
+            kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
+            # Drop the in-memory entry so the second call has to consult the disk.
+            kernel.hlo_cache.clear()
+            kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
+
+        assert mock_generate.call_count == 1
+
+    def test_unreadable_entry_still_generates_once(self):
+        """An entry the reader will not accept costs one lowering, not one per caller.
+
+        Such a blob used to send every caller down an unsynchronized fallback, so N
+        processes lowered the same graph concurrently on every run.
+        """
+        kernel = _make_kernel()
+        cache_key = "test_declined_entry_key"
+        generate_result = _make_generate_hlo_result()
+        generate_count = 0
+        generate_lock = threading.Lock()
+
+        _hlo_cache_put(cache_key, _make_dummy_entry())
+
+        def slow_generate_hlo(*args, **kwargs):
+            nonlocal generate_count
+            with generate_lock:
+                generate_count += 1
+            time.sleep(0.2)
+            return generate_result
+
+        kernel.hlo_cache.clear()
+        errors = [None] * 5
+        threads = []
+
+        with (
+            patch.object(_hlo_cache_mod, "_SCHEMA_VERSION", 999),
+            patch.object(kernel, "_generate_unified_cache_key", return_value=cache_key),
+            patch.object(kernel, "_generate_hlo", side_effect=slow_generate_hlo),
+        ):
+            for i in range(5):
+
+                def target(idx=i):
+                    try:
+                        kernel.hlo_cache.clear()
+                        kernel._get_or_compile_hlo((torch.empty(4, 8, device="meta"),), {}, None)
+                    except Exception as e:
+                        errors[idx] = e
+
+                t = threading.Thread(target=target)
+                threads.append(t)
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+        for i, err in enumerate(errors):
+            assert err is None, f"Thread {i} raised: {err}"
+        assert generate_count == 1

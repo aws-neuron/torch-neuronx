@@ -102,7 +102,7 @@ class NeuronOutputCode(OutputCode):
                     "The Dynamo precompile cache references HLO artifacts that no longer exist. "
                     "Clear the Dynamo cache and recompile."
                 )
-            hlo_bytes = entry[0]
+            hlo_bytes = entry.hlo_bytes
 
         # compile_graph is async but will hit the NEFF persistent cache
         torch_neuronx._C.compile_graph(

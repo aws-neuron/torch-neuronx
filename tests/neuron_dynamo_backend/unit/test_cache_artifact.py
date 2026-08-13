@@ -126,12 +126,19 @@ class TestNeuronOutputCode:
             mock_hlo_get.assert_not_called()
 
     def test_ensure_neff_loaded_falls_back_to_hlo_cache(self):
-        """_ensure_neff_loaded should fall back to HLO cache when hlo_bytes is empty."""
+        """_ensure_neff_loaded should fall back to HLO cache when hlo_bytes is empty.
+
+        `hlo_cache.get` returns a `CachedHLO` dataclass (not the old 7-tuple), so the
+        fallback must read `entry.hlo_bytes`, not `entry[0]` — the dataclass is not
+        subscriptable.
+        """
+        from torch_neuronx.python_ops.compilation.hlo_cache import CachedHLO
+
         oc = self._make_output_code(cache_key="key123", hlo_bytes=b"")
         with (
             patch(
                 "torch_neuronx.python_ops.compilation.hlo_cache.get",
-                return_value=(b"from_cache", None, None, None, None, None, None),
+                return_value=CachedHLO(hlo_bytes=b"from_cache"),
             ),
             patch("torch_neuronx._C.compile_graph") as mock_compile,
         ):

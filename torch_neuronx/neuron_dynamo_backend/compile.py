@@ -141,7 +141,10 @@ class CompileGraph:
         """Initialize compilation context.
 
         Args:
-            mlir (Module): StableHLO MLIR module to compile.
+            mlir (Module | bytes): StableHLO MLIR module to compile, or already
+                serialized MLIR. Bytes are taken as canonical (as produced by
+                `serialize()`) and submitted unchanged; the tensorizer path needs
+                the in-process module and rejects them.
             model_name (str): Model name for logging.
             segment_id (str): Segment ID for statistics tracking.
             has_collectives (bool): Whether graph contains collective operations.
@@ -155,6 +158,17 @@ class CompileGraph:
         self.use_tensorizer = use_tensorizer
         self.graph_name = graph_name
 
+    def serialize(self) -> bytes:
+        """Return the exact bytes `compile()` would submit to the compiler.
+
+        Lets a caller persist the serialized MLIR (e.g. into the HLO cache) and
+        later hand those bytes back to `CompileGraph`, producing the same NEFF key
+        as compiling the live module would have.
+        """
+        if isinstance(self.mlir, bytes | bytearray):
+            return bytes(self.mlir)
+        return _serialize_mlir_module(self.mlir, use_tensorizer=self.use_tensorizer)
+
     def compile(self) -> str:
         """Compile MLIR to NEFF.
 
@@ -166,9 +180,13 @@ class CompileGraph:
         """
         logger.debug(f"CompileGraph.compile() called: model={self.model_name}")
 
-        mlir_bytes = _serialize_mlir_module(self.mlir, use_tensorizer=self.use_tensorizer)
+        if isinstance(self.mlir, bytes | bytearray) and self.use_tensorizer:
+            raise ValueError(
+                "Serialized MLIR does not support use_tensorizer=True; the "
+                "tensorizer path requires the in-process MLIR module."
+            )
         return _submit_mlir_bytes(
-            mlir_bytes,
+            self.serialize(),
             has_collectives=self.has_collectives,
             use_tensorizer=self.use_tensorizer,
         )
