@@ -21,6 +21,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "TestProfiler::test_profile_all_threads",
+            "TestProfilerDeviceNEURON::test_profile_all_threads_neuron",
         ],
     ),
     SkipGroup(
@@ -69,6 +70,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "TestProfiler::test_event_list",
+            "TestProfilerDeviceNEURON::test_event_list_neuron",
         ],
     ),
 ]
