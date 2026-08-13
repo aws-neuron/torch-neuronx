@@ -13,6 +13,10 @@ from torch_mlir.ir import Module
 
 from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.neuron_dynamo_backend.config import get_model_name
+from torch_neuronx.neuron_dynamo_backend.fx.dynamic_dim_constraints import (
+    DynamicDimConstraints,
+    build_dynamic_dim_constraints,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
@@ -123,6 +127,38 @@ def _set_module_alias(module: Module, alias_buffer_map: dict[int, int] | None) -
         module.operation.attributes["mhlo.input_output_alias"] = final_attr
 
 
+def _set_dynamic_dim_constraints(module: Module, constraints: DynamicDimConstraints) -> None:
+    """Attach dynamic dimension constraint metadata as MLIR attributes on the module.
+
+    Encodes two attributes:
+      - "neuron.dynamic_dim_symbols": DictAttr {symbol_name -> IntegerAttr(arg_index)}
+      - "neuron.dynamic_dim_exprs": DictAttr {arg_index -> DictAttr {dim_index -> StringAttr(expr)}}
+
+    These survive lowering as module-level attributes and inform the downstream
+    compiler which runtime scalar args provide dynamic dimension sizes.
+    """
+    with module.context:
+        # Symbol-to-arg-index mapping: {"s0": 0, "s1": 3, ...}
+        i64 = mlir_ir.IntegerType.get_signless(64)
+        symbol_dict = {
+            name: mlir_ir.IntegerAttr.get(i64, idx)
+            for name, idx in constraints.symbol_to_arg_index.items()
+        }
+        module.operation.attributes["neuron.dynamic_dim_symbols"] = mlir_ir.DictAttr.get(
+            symbol_dict
+        )
+
+        # Tensor-dim expressions: {arg_idx: {dim_idx: expr_str}}
+        outer_dict = {}
+        for arg_idx, dim_map in constraints.tensor_dim_exprs.items():
+            inner_dict = {
+                str(dim_idx): mlir_ir.StringAttr.get(expr_str)
+                for dim_idx, expr_str in dim_map.items()
+            }
+            outer_dict[str(arg_idx)] = mlir_ir.DictAttr.get(inner_dict)
+        module.operation.attributes["neuron.dynamic_dim_exprs"] = mlir_ir.DictAttr.get(outer_dict)
+
+
 def convert_fx_to_stablehlo(
     gm: torch.fx.GraphModule,
     example_inputs,
@@ -228,6 +264,10 @@ def convert_fx_to_stablehlo(
         raw_module.operation.attributes["stablehlo.hierarchy_splitter_compatible"] = (
             mlir_ir.StringAttr.get("true", raw_module.context)
         )
+    # Attach dynamic dimension constraint metadata
+    dynamic_dim_constraints = build_dynamic_dim_constraints(gm.graph)
+    if dynamic_dim_constraints is not None:
+        _set_dynamic_dim_constraints(raw_module, dynamic_dim_constraints)
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
     return raw_module, io_spec, cast_spec
