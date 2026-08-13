@@ -195,12 +195,11 @@ def _run_summary(cmd: list[str]):
     except (FileNotFoundError, OSError):
         return None
     out = r.stdout or ""
-    # total_time = on-device wall-clock span for the run (excludes host<->device and host
-    # runtime/framework overhead). Preferred over total_exec_time for benchmarking, since
-    # total_exec_time is just the first->last executed-instruction span and is contaminated by
-    # where idle/rendezvous bubbles land. NOTE: for a multi-NEFF op, total_time can include host
-    # gaps between cold NEFF compiles; they coincide for single-NEFF ops.
-    m = re.search(r"^\s*total_time\s+([-+0-9.eE]+)", out, re.M)
+    # total_exec_time = actual device busy execution (sum over the executed NEFFs),
+    # not total_time. For a multi-NEFF op, total_time is the profiled-window wall span,
+    # inflated by host gaps between the cold NEFF compiles, whereas
+    # total_exec_time is the on-device time. They coincide for single-NEFF ops.
+    m = re.search(r"^\s*total_exec_time\s+([-+0-9.eE]+)", out, re.M)
     return float(m.group(1)) if m else None
 
 
