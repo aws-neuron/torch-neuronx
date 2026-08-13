@@ -802,47 +802,105 @@ LogicalResult ConvertAtenOp<AtenSliceScatterOp>::matchAndRewrite(
 
   auto inputShape = inputType.getShape();
   auto dimSize = inputShape[dim];
-  int64_t step;
-  if (!matchPattern(op.getStep(), m_TorchConstantInt(&step))) {
-    return op->emitError("unimplemented: step is not constant");
-  }
 
-  int64_t start;
-  if (!matchPattern(op.getStart(), m_TorchConstantInt(&start))) {
-    return op->emitError("unimplemented: start is not constant");
-  } else if (ShapedType::isDynamic(dimSize) and start < 0) {
-    return op->emitError("unimplemented: not support dynamic dimSize when "
-                         "start smaller than 0.");
-  }
-  start = start >= 0 ? start : dimSize + start;
+  int64_t step, start, end;
+  bool stepIsConst = matchPattern(op.getStep(), m_TorchConstantInt(&step));
+  bool startIsConst = matchPattern(op.getStart(), m_TorchConstantInt(&start));
+  bool endIsConst = matchPattern(op.getEnd(), m_TorchConstantInt(&end));
 
-  int64_t end;
-  if (!matchPattern(op.getEnd(), m_TorchConstantInt(&end))) {
-    return op->emitError("unimplemented: end is not constant");
-  } else if (ShapedType::isDynamic(dimSize) and end < 0) {
-    return op->emitError(
-        "unimplemented: not support dynamic dimSize when end smaller than 0.");
-  }
-  // Python allows users to set the range end to be larger than dimsize.
-  end = end > dimSize ? dimSize : end;
-  end = end >= 0 ? end : dimSize + end;
+  Value scatterIndices;
+  if (stepIsConst && startIsConst && endIsConst && !ShapedType::isDynamic(dimSize)) {
+    if (start < 0)
+      start = dimSize + start;
+    if (end < 0)
+      end = dimSize + end;
+    if (end > dimSize)
+      end = dimSize;
 
-  int64_t size = 0;
-  std::vector<int64_t> indicesVec;
-  for (int64_t i = start; i < end; i += step) {
-    indicesVec.push_back(i);
-    ++size;
+    int64_t size = 0;
+    std::vector<int64_t> indicesVec;
+    for (int64_t i = start; i < end; i += step) {
+      indicesVec.push_back(i);
+      ++size;
+    }
+    auto constType = RankedTensorType::get({size, 1}, rewriter.getI64Type());
+    auto constAttr = DenseElementsAttr::get(constType,
+                                            ArrayRef<int64_t>(indicesVec));
+    scatterIndices =
+        stablehlo::ConstantOp::create(rewriter, loc, constType, constAttr)
+            .getResult();
+  } else {
+    // Generate scatter indices at runtime: iota(numElements) * step + start
+    // numElements = src.shape[dim]
+    if (isa<RankedTensorType>(adaptor.getStart().getType()) ||
+        isa<RankedTensorType>(adaptor.getEnd().getType()) ||
+        isa<RankedTensorType>(adaptor.getStep().getType()))
+      return rewriter.notifyMatchFailure(
+          op, "expected start/end/step to be scalar integers");
+
+    Value src = adaptor.getSrc();
+    auto srcType = cast<RankedTensorType>(src.getType());
+    auto srcDimSize = srcType.getDimSize(dim);
+
+    auto i64Type = rewriter.getI64Type();
+    Value iota;
+    if (srcDimSize == ShapedType::kDynamic) {
+      Value srcDimVal = arith::IndexCastOp::create(
+          rewriter, loc, i64Type,
+          tensor::DimOp::create(rewriter, loc, src, dim));
+      Value shapeTensor = tensor::FromElementsOp::create(
+          rewriter, loc, RankedTensorType::get({1}, i64Type), srcDimVal);
+      iota = stablehlo::DynamicIotaOp::create(
+          rewriter, loc, RankedTensorType::get({ShapedType::kDynamic}, i64Type),
+          shapeTensor, static_cast<uint64_t>(0));
+    } else {
+      iota = stablehlo::IotaOp::create(
+          rewriter, loc, RankedTensorType::get({srcDimSize}, i64Type), 0);
+    }
+
+    Value stepVal = tensor::FromElementsOp::create(
+        rewriter, loc, RankedTensorType::get({}, i64Type), adaptor.getStep());
+    Value scaled = chlo::BroadcastMulOp::create(
+        rewriter, loc, iota, stepVal, nullptr);
+
+    // Normalize negative start: start < 0 ? start + dimSize : start
+    Value startVal = adaptor.getStart();
+    Value zero = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(i64Type, 0));
+    Value isNeg = arith::CmpIOp::create(
+        rewriter, loc, arith::CmpIPredicate::slt, startVal, zero);
+    Value inputDimVal = arith::IndexCastOp::create(
+        rewriter, loc, i64Type,
+        tensor::DimOp::create(rewriter, loc, input, dim));
+    Value startPlusDim =
+        arith::AddIOp::create(rewriter, loc, startVal, inputDimVal);
+    startVal = arith::SelectOp::create(rewriter, loc, isNeg, startPlusDim,
+                                       startVal);
+    Value startTensor = tensor::FromElementsOp::create(
+        rewriter, loc, RankedTensorType::get({}, i64Type), startVal);
+    Value indices = chlo::BroadcastAddOp::create(
+        rewriter, loc, scaled, startTensor, nullptr);
+
+    // Reshape to [N, 1] for scatter
+    auto indicesType = cast<RankedTensorType>(indices.getType());
+    auto reshapedType =
+        RankedTensorType::get({indicesType.getDimSize(0), 1}, i64Type);
+    if (indicesType.getDimSize(0) == ShapedType::kDynamic) {
+      Value n = arith::IndexCastOp::create(
+          rewriter, loc, i64Type,
+          tensor::DimOp::create(rewriter, loc, indices, (int64_t)0));
+      Value one = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getIntegerAttr(i64Type, 1));
+      Value reshapeShape = tensor::FromElementsOp::create(
+          rewriter, loc, RankedTensorType::get({2}, i64Type),
+          ValueRange{n, one});
+      scatterIndices = stablehlo::DynamicReshapeOp::create(
+          rewriter, loc, reshapedType, indices, reshapeShape);
+    } else {
+      scatterIndices =
+          stablehlo::ReshapeOp::create(rewriter, loc, reshapedType, indices);
+    }
   }
-  ArrayRef<int64_t> indices(indicesVec);
-  std::vector<int64_t> tmp_shape = {size, 1};
-  ArrayRef<int64_t> shape(tmp_shape);
-  RankedTensorType constType =
-      RankedTensorType::get(shape, rewriter.getIntegerType(64));
-  auto constAttr = DenseElementsAttr::get(
-      RankedTensorType::get(shape, rewriter.getIntegerType(64)), indices);
-  auto const_op =
-      stablehlo::ConstantOp::create(rewriter, loc, constType, constAttr);
-  Value scatterIndices = const_op.getResult();
 
   SmallVector<int64_t> updateWindowDims;
   for (int64_t i = 0; i < inputType.getRank(); ++i) {
@@ -1338,19 +1396,42 @@ LogicalResult ConvertAtenOp<AtenIndexTensorHackedTwinOp>::matchAndRewrite(
       /*startIndexMap=*/startIndexMap,
       /*indexVecDim=*/indexVecDim);
 
-  SmallVector<int64_t> sliceSizes;
-  auto inputShape = makeShapeTorchCompatible(inputTensorType.getShape());
-  for (int64_t i = 0; i < inputTensorType.getRank(); ++i) {
-    if (i < numIndicesDim) {
-      sliceSizes.push_back(1);
-    } else {
-      sliceSizes.push_back(inputShape[i]);
-    }
-  }
+  auto inputShape = inputTensorType.getShape();
+  bool hasDynamicSliceDim = llvm::any_of(
+      llvm::seq<int64_t>(numIndicesDim, inputTensorType.getRank()),
+      [&](int64_t i) { return inputShape[i] == ShapedType::kDynamic; });
 
-  rewriter.replaceOpWithNewOp<stablehlo::GatherOp>(
-      op, outType, input, gatherIndices, dimsAttr,
-      rewriter.getDenseI64ArrayAttr(sliceSizes));
+  if (hasDynamicSliceDim) {
+    Type intType = rewriter.getIntegerType(options.dimSizeIndexBits);
+    Value one = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(intType, 1));
+    SmallVector<Value> sliceSizeValues;
+    for (int64_t i = 0; i < inputTensorType.getRank(); ++i) {
+      if (i < numIndicesDim) {
+        sliceSizeValues.push_back(one);
+      } else {
+        sliceSizeValues.push_back(arith::IndexCastOp::create(
+            rewriter, loc, intType,
+            tensor::DimOp::create(rewriter, loc, input, i)));
+      }
+    }
+    auto sliceSizesTensor =
+        tensor::FromElementsOp::create(rewriter, loc, sliceSizeValues);
+    rewriter.replaceOpWithNewOp<stablehlo::DynamicGatherOp>(
+        op, outType, input, gatherIndices, sliceSizesTensor, dimsAttr);
+  } else {
+    SmallVector<int64_t> sliceSizes;
+    for (int64_t i = 0; i < inputTensorType.getRank(); ++i) {
+      if (i < numIndicesDim) {
+        sliceSizes.push_back(1);
+      } else {
+        sliceSizes.push_back(inputShape[i]);
+      }
+    }
+    rewriter.replaceOpWithNewOp<stablehlo::GatherOp>(
+        op, outType, input, gatherIndices, dimsAttr,
+        rewriter.getDenseI64ArrayAttr(sliceSizes));
+  }
   return success();
 }
 
