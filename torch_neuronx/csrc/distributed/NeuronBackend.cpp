@@ -616,7 +616,13 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::endCoalescing() {
       TORCH_CHECK(it != local_sends.end(), "NeuronBackend::endCoalescing: same-rank recv tag ",
                   op.tag, " has no matching same-rank send in this batch");
       auto recv_tensor = op.tensor;
-      recv_tensor.copy_(it->second);
+      // NoGradGuard required, since a grad-requiring leaf recv tensor cannot be used in an in-place
+      // operation. Raw P2P data movement, not a differentiable op: pipeline autograd flows through
+      // the explicit send/recv backward.
+      {
+        torch::NoGradGuard no_grad;
+        recv_tensor.copy_(it->second);
+      }
       local_sends.erase(it);
       continue;
     }
