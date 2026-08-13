@@ -332,6 +332,14 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
   return upcasted;
 }
 
+bool IsPureInputPassthrough(const DispatchCacheEntry& entry) {
+  if (entry.passthrough_mappings.empty()) return false;
+  // The lowering removed every placeholder output from the IR.
+  if (!entry.output_specs.empty()) return false;
+  // Guard against a partially-populated entry.
+  return entry.passthrough_mappings.size() == entry.original_output_specs.size();
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  ReconstructOutputs
 // ═══════════════════════════════════════════════════════════════
@@ -348,24 +356,38 @@ std::vector<torch::Tensor> ReconstructOutputs(const std::vector<torch::Tensor>& 
     return exec_outputs;
   }
 
-  if (num_original_outputs == 1 && exec_outputs.size() == 1) {
+  // Single-output fast path, only when no passthrough
+  if (num_original_outputs == 1 && exec_outputs.size() == 1 && entry.passthrough_mappings.empty()) {
     return exec_outputs;
   }
 
   // Build full output vector
   std::vector<torch::Tensor> full_outputs(num_original_outputs);
 
-  // Step 1: Place execution outputs at their original positions
+  // Step 1: Place execution outputs at their original positions.
+  // An output slot with a passthrough mapping must reach Step 2 with its slot
+  // still undefined, so Step 2 substitutes the real input tensor. For
+  // identity-shaped ops, FX tracing/decomposition reduces the graph
+  // to "output = input", so the traced graph has no compute node and the compiled
+  // NEFF does not store anything in the pre-allocated exec output buffer,
+  // which is a never written torch::empty allocation. Placing exec_outputs[i]
+  // for such a slot here hands callers this never written allocation:
+  // a recycled, non-zeroed caching-allocator memory block.
   for (size_t exec_idx = 0; exec_idx < exec_outputs.size(); ++exec_idx) {
     if (exec_idx < entry.kept_output_indices.size()) {
       int orig_idx = entry.kept_output_indices[exec_idx];
-      if (orig_idx >= 0 && static_cast<size_t>(orig_idx) < num_original_outputs) {
+      if (orig_idx >= 0 && static_cast<size_t>(orig_idx) < num_original_outputs &&
+          entry.passthrough_mappings.find(orig_idx) == entry.passthrough_mappings.end()) {
         full_outputs[orig_idx] = exec_outputs[exec_idx];
       }
     }
   }
 
-  // Step 2: Fill passthrough slots from input tensors
+  // Step 2: Fill passthrough slots from input tensors.
+  // Always a copy, never the input tensor itself: PyTorch rejects an op that returns
+  // one of its own inputs, and returning it would let callers mutate the argument.
+  // For in-place and out= ops, Dispatch's UpcastExecutionOutputs -> CopyBackOutTensors
+  // copies into the snapshotted out/self tensor and substitutes it back as the return.
   auto flat_inputs = ExtractTensorInputs(args);
   for (const auto& [out_idx, in_idx] : entry.passthrough_mappings) {
     if (out_idx >= 0 && static_cast<size_t>(out_idx) < num_original_outputs &&
@@ -375,7 +397,7 @@ std::vector<torch::Tensor> ReconstructOutputs(const std::vector<torch::Tensor>& 
         if (input_tensor.device() != device) {
           input_tensor = input_tensor.to(device);
         }
-        full_outputs[out_idx] = input_tensor.numel() == 0 ? input_tensor.clone() : input_tensor;
+        full_outputs[out_idx] = input_tensor.clone();
       }
     }
   }

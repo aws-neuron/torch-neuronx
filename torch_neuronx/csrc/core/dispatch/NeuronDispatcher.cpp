@@ -1731,6 +1731,16 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
     return {{}, {}, device, true};
   }
 
+  // Identity op: no HLO and no output buffer. Satisfy it from
+  // the inputs rather than executing a NEFF.
+  if (IsPureInputPassthrough(*entry)) {
+    auto device = ExtractDevice(args);
+    auto outputs = ReconstructOutputs(/*exec_outputs=*/{}, *entry, args, device);
+    PushOutputsToStack(stack, outputs, schema);
+    logOperationExecuted(op_name);
+    return {{}, {}, device, true};
+  }
+
   // Execute
   auto device = ExtractDevice(args);
   auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
@@ -1958,6 +1968,13 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
       }
     }
     return empty_outputs;
+  }
+
+  // Identity op: lowering emitted no HLO and no output buffer. Return the (cloned) inputs.
+  if (IsPureInputPassthrough(*entry)) {
+    logOperationExecuted(op_name);
+    auto device = ExtractDevice(args);
+    return ReconstructOutputs(/*exec_outputs=*/{}, *entry, args, device);
   }
 
   TORCH_CHECK(!entry->stablehlo_bytes.empty(),

@@ -55,6 +55,13 @@ std::vector<torch::Tensor> ReconstructOutputs(const std::vector<torch::Tensor>& 
                                               const torch::Device& device);
 
 /**
+ * True when the lowered graph computes nothing: every output is an input
+ * passthrough, so there is no HLO to compile and no buffer to allocate.
+ * Callers must satisfy the op from its inputs via ReconstructOutputs instead of executing a NEFF.
+ */
+bool IsPureInputPassthrough(const DispatchCacheEntry& entry);
+
+/**
  * Push output tensors onto the PyTorch JIT stack.
  * Handles single-return, multi-return, TensorList-return, and void-return schemas.
  */
