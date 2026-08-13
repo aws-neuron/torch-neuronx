@@ -1,5 +1,6 @@
 #include "CopyUtils.h"
 
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/util/Logging.h>
 
 #include <algorithm>
@@ -210,6 +211,88 @@ void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   at::neuron::SubmitOperationContext(stream, std::move(context));
 }
 
+namespace {
+
+// Return S if `t` has a uniform stride-S layout over its storage: strides ==
+// S * contiguous_strides(shape) with S >= 2 (S is the innermost stride), i.e.
+// its elements sit at offsets base, base+S, base+2S, ... — exactly what the NKI
+// stride-S gather/scatter kernel treats as a group-stream. Returns 0 otherwise
+// (contiguous, overlapping, or non-uniform, e.g. an odd-row-strided slice).
+// Size-1 dims are ignored. Mirrors _uniform_stride in nki_strided_copy_op.py.
+int64_t UniformStride(const at::Tensor& t) {
+  if (t.dim() == 0) return 0;
+  const int64_t stride = t.stride(-1);
+  if (stride < 2) return 0;
+  int64_t expected = stride;
+  for (int64_t d = t.dim() - 1; d >= 0; --d) {
+    const int64_t n = t.size(d);
+    if (n == 1) continue;  // stride immaterial for a size-1 dim
+    if (t.stride(d) != expected) return 0;
+    expected *= n;
+  }
+  return stride;
+}
+
+// Whether this copy is a uniform stride-S gather/scatter the on-device kernel
+// handles: one side contiguous, the other a uniform stride-S (S>=2) lane view.
+// Any stride is SBUF-safe (the kernel bounds its loaded staging independently of
+// stride) and any storage span is safe (the kernel reads the last, possibly
+// truncated, group only up to the lane), so there is no stride cap or full-group
+// requirement. Must stay a subset of what nki_strided_copy_ handles so the op
+// never falls back into copy_strided (no recursion).
+// Dtypes the strided-copy kernel handles correctly — fixed-width 1/2/4-byte int
+// and float types.
+//
+// Deliberately a SEPARATE list from IsSupportedDtype (DispatchUtils.cpp): it
+// includes Bool/ComplexFloat and EXCLUDES the narrow ints (Short/Char/Byte)
+// because the compiler mishandles arithmetic on them — but this kernel is pure
+// data movement (byte copy, no compute), so narrow ints are safe here. What must
+// NOT go through the kernel: bool/float64/complex (fail to lower), and int64
+// (lowers WITHOUT error but the Vector-Engine lane-select copy is not bit-exact
+// beyond ~2^24 — it SILENTLY CORRUPTS large int64). Mirrors
+// _STRIDED_COPY_KERNEL_DTYPES in nki_strided_copy_op.py.
+//
+// TODO: strided-copy-specific allowlist; remove once a shared copy-supported-
+// dtype helper covers exactly these types.
+bool StridedCopyKernelSupportsDtype(c10::ScalarType dt) {
+  switch (dt) {
+    case c10::ScalarType::Float:
+    case c10::ScalarType::Half:
+    case c10::ScalarType::BFloat16:
+    case c10::ScalarType::Int:
+    case c10::ScalarType::Short:
+    case c10::ScalarType::Char:
+    case c10::ScalarType::Byte:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsNkiStridedCopyEligible(const at::Tensor& src, const at::Tensor& dst) {
+  // Only dtypes the strided-copy kernel handles correctly take the kernel path;
+  // everything else (bool, float64, int64, complex, ...) stays on per-element.
+  if (!StridedCopyKernelSupportsDtype(src.scalar_type())) return false;
+  if (src.is_contiguous() && !dst.is_contiguous()) {
+    return UniformStride(dst) >= 2;
+  }
+  if (dst.is_contiguous() && !src.is_contiguous()) {
+    return UniformStride(src) >= 2;
+  }
+  return false;
+}
+
+// Invoke the Python-registered NKI stride-S gather/scatter op. Mirrors
+// run_nki_strided_copy in PackedInt64Utils.cpp (typed handle resolved once).
+void RunNkiStridedCopy(const at::Tensor& src, at::Tensor& dst) {
+  static const auto op = c10::Dispatcher::singleton()
+                             .findSchemaOrThrow("neuron::nki_strided_copy_", "")
+                             .typed<at::Tensor(const at::Tensor&, at::Tensor&)>();
+  op.call(src, dst);
+}
+
+}  // namespace
+
 void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
               "copy_strided: expected src to be a neuron tensor");
@@ -222,6 +305,16 @@ void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
               "copy_strided: src and dst must be on the same Neuron core");
 
   if (src.numel() == 0) {
+    return;
+  }
+
+  // Fast path: a uniform stride-S gather/scatter (one side contiguous, the other
+  // a uniform stride-S lane view) runs on-device via the NKI kernel in a single
+  // coalesced, stream-ordered launch — instead of the per-element, host-blocking
+  // nrt_tensor_copy loop below. Only kernel-eligible patterns are routed, so
+  // the op never falls back into this function (no recursion).
+  if (IsNkiStridedCopyEligible(src, dst)) {
+    RunNkiStridedCopy(src, dst);
     return;
   }
 

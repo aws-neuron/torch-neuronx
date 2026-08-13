@@ -1,10 +1,13 @@
 """Tests for contiguous operation on Neuron device"""
 
+import typing
+
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+import torch_neuronx._C as _C
+from tests.utils.neuron_test_utils import track_neuron_ops
 
 from .view_test_utils import (
     assert_storage_shared,
@@ -389,6 +392,107 @@ class TestNrtStridedCopy:
 
         with pytest.raises(RuntimeError):
             _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+
+
+class TestStridedCopyStrideS:
+    """Uniform stride-S neuron->neuron copies run on-device (no host bounce).
+
+    A contiguous <-> stride-S lane view (any supported dtype — e.g. an
+    object-collective uint8 buffer, or a ``[:, k]`` column of an ``(N, S)``
+    tensor) is routed by ``copy_strided_neuron_to_neuron`` to the NKI
+    gather/scatter kernel instead of a per-element / host round-trip (PR #1458 /
+    MFU-415). These pin correctness (copied values + untouched lanes preserved)
+    and that no CPU-bounce fallback fires. ``_C._nrt_copy_strided_neuron_to_neuron``
+    is the direct binding for ``copy_strided_neuron_to_neuron``; it's called
+    directly because a plain ``dst.copy_(src)`` of a supported dtype is served by
+    the MLIR epilogue and never reaches this path.
+
+    ``rows`` covers both tiling paths: < P_MAX (tail) and >= P_MAX (main tile).
+    """
+
+    _CPU_BOUNCE_FALLBACKS: typing.ClassVar = {
+        "aten::copy_[noncontiguous_scatter_cpu_bounce]",
+        "aten::copy_[strided_span_bound_cpu_bounce]",
+    }
+
+    # dtypes the kernel moves bit-exactly. Excludes bool (NKI rejects it) and
+    # int64 (packed-int64 special case, covered by the packed suites).
+    _DTYPES: typing.ClassVar = [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+    ]
+
+    @staticmethod
+    def _values(n, dtype):
+        """Distinct test values in an explicit range that fits every tested dtype.
+
+        ``[0, 100)`` sits inside int8's [-128, 127] and uint8's [0, 255]. A local
+        seeded generator keeps the values deterministic (reproducible failures)
+        without touching the global RNG that other tests in the process share.
+        """
+        gen = torch.Generator().manual_seed(0)
+        return torch.randint(0, 100, (n,), generator=gen, dtype=torch.int64).to(dtype)
+
+    def _assert_no_bounce(self, fallbacks):
+        hit = set(fallbacks) & self._CPU_BOUNCE_FALLBACKS
+        assert not hit, f"strided copy took a host round-trip: {sorted(hit)}"
+
+    def _check_scatter(self, dtype, stride, rows, lane):
+        """Contiguous src -> lane ``lane`` of an (rows, stride) dst; other lanes kept."""
+        base = torch.zeros((rows, stride), dtype=dtype, device="neuron")
+        other_lanes = {}  # lanes the copy must leave untouched
+        for other in range(stride):
+            if other == lane:
+                continue
+            fill = int(((other + 3) * 7) % 100)
+            base[:, other] = fill
+            other_lanes[other] = fill
+
+        src = self._values(rows, dtype).to("neuron")
+        dst = base[:, lane]  # (rows,), stride (stride,) — rows single-element spans
+        assert not dst.is_contiguous()
+
+        with track_neuron_ops():
+            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+            fallbacks = torch_neuronx.get_fallback_ops()
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        for other, fill in other_lanes.items():
+            torch.testing.assert_close(base[:, other].cpu(), torch.full((rows,), fill, dtype=dtype))
+        self._assert_no_bounce(fallbacks)
+
+    def _check_gather(self, dtype, stride, rows, lane):
+        """Lane ``lane`` of an (rows, stride) src -> contiguous dst."""
+        base = torch.zeros((rows, stride), dtype=dtype, device="neuron")
+        base[:, lane] = self._values(rows, dtype).to("neuron")
+        src = base[:, lane]  # stride (stride,)
+        dst = torch.empty(rows, dtype=dtype, device="neuron")
+        assert not src.is_contiguous()
+
+        with track_neuron_ops():
+            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+            fallbacks = torch_neuronx.get_fallback_ops()
+
+        torch.testing.assert_close(dst.cpu(), base[:, lane].cpu())
+        self._assert_no_bounce(fallbacks)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_dtype_roundtrip(self, dtype):
+        """Every supported dtype scatters/gathers bit-exactly (main-tile + tail)."""
+        self._check_scatter(dtype, stride=3, rows=200, lane=1)
+        self._check_gather(dtype, stride=3, rows=200, lane=1)
+
+    @pytest.mark.parametrize("stride,lane", [(2, 0), (2, 1), (3, 0), (3, 2), (4, 3)])
+    @pytest.mark.parametrize("rows", [8, 256])
+    def test_shapes_and_lanes(self, stride, lane, rows):
+        """Strides, lane offsets, and both tiling paths (tail: 8, main: 256)."""
+        self._check_scatter(torch.float32, stride, rows, lane)
+        self._check_gather(torch.float32, stride, rows, lane)
 
 
 class TestChannelsLastCopyCount:

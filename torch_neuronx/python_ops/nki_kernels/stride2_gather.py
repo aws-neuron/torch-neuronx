@@ -9,7 +9,7 @@ Balanced flat tiling
 --------------------
 Gather/scatter is purely element-wise over a flat contiguous int32 pair-stream,
 so the logical tensor shape is irrelevant to correctness. We exploit that to
-flatten the stream to ``numel`` pairs and tile it as balanced ``[P_MAX, F_SIZE]``
+flatten the stream to ``numel`` groups and tile it as balanced ``[P_MAX, groups_per_tile]``
 blocks via NKI access patterns (``.ap``), regardless of the logical shape. This
 keeps the partition dimension full (128) for the bulk of any tensor, fixing the
 shape-dependent under-utilization of a logical-shape factorization (e.g. a
@@ -23,7 +23,7 @@ Per tile:
   1. burst-load the contiguous packed block ``[P_MAX, 2F]`` HBM -> SBUF via
      ``.ap`` (free stride 1, so HBM reads coalesce into bursts),
   2. select the parity lane on chip (SBUF -> SBUF), then
-  3. burst-store the contiguous result ``[P_MAX, F_SIZE]`` SBUF -> HBM via ``.ap``.
+  3. burst-store the contiguous result ``[P_MAX, groups_per_tile]`` SBUF -> HBM via ``.ap``.
 
 On-chip lane select engine:
   - The gather selects the lane with ``nisa.tensor_copy`` on the **Vector
@@ -50,7 +50,8 @@ Constraints, learned empirically:
     preferred.
 
 Naming follows the NKI partition/free convention: ``P_MAX`` is the partition
-dimension (hardware-parallel, == 128) and ``F_SIZE`` is the free-dimension tile width.
+dimension (hardware-parallel, == 128) and the free-dimension tile width per tile
+is ``groups_per_tile``, chosen so the loaded staging stays within ``MAX_STAGE_ELEMS``.
 """
 
 from __future__ import annotations
@@ -65,10 +66,14 @@ from torch_neuronx.utils import get_logical_neuron_cores
 
 # Partition dimension: the hardware partition count.
 P_MAX = 128
-# Free-dimension tile width, in *pairs*, for the SCATTER kernel (dma_copy-based
-# lane write). Bounds the SBUF staging buffer to P_MAX * 2 * F_SIZE int32 elements.
-# Performance is insensitive above ~512; 2048 keeps the launch count low.
-F_SIZE = 2048
+# Max elements staged in SBUF per partition per tile. The gather/scatter
+# burst-loads `stride*groups` elements to select one lane, so bounding the
+# LOADED size (rather than the group count) keeps SBUF use independent of
+# `stride`: a large stride just yields fewer groups/tile and more tiles, never an
+# overflow. 4096 int32 (16 KB/partition) is well within SBUF and matches the
+# original stride-2 tile (2048 pairs); performance is insensitive above ~512, so
+# the launch count stays low.
+MAX_STAGE_ELEMS = 4096
 
 LNC = int(get_logical_neuron_cores())
 
@@ -78,19 +83,22 @@ def div_ceil(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-def _flat_gather_lane(packed_in, out, parity):
-    """Gather lane ``parity`` of a flat packed pair-stream into ``out``.
+def _flat_gather_lane(grouped_in, out, stride=2, lane=0):
+    """Gather ``lane`` of a flat stride-``stride`` group-stream into ``out``.
 
-    Shared tiling for the in-place (``stride2_flat_gather_kernel_``) and
-    out-of-place (``stride2_flat_gather_kernel``) entry points — a plain function
-    that emits NKI ops into the caller's kernel trace (mirrors the helper
-    pattern in ``nonzero.py``). ``numel`` is taken from ``out.shape[0]``.
+    Shared tiling for the in-place / out-of-place gather entry points — a plain
+    function that emits NKI ops into the caller's kernel trace (mirrors the
+    helper pattern in ``nonzero.py``). ``numel`` is taken from ``out.shape[0]``.
+    The input stream is ``stride*numel`` elements laid out as ``numel`` groups of
+    ``stride``; element ``lane`` of each group is selected. ``stride=2, lane=p``
+    is the packed-int64 low/high-word gather.
 
     Balanced flat tiling: SPMD split into P_MAX-aligned per-program slices, then
-    [P_MAX, F_SIZE] pair blocks with a <P_MAX tail. Each tile burst-loads packed
-    pairs, selects lane ``parity`` on the Vector Engine (``tensor_copy`` is a
-    bit-accurate int32 copy, unlike Scalar-Engine ``nl.copy`` which casts through
-    fp32), and burst-stores contiguous words.
+    [P_MAX, groups_per_tile] group blocks (loaded staging stride*groups bounded by
+    MAX_STAGE_ELEMS) with a <P_MAX tail. Each tile burst-loads
+    groups, selects ``lane`` on the Vector Engine (``tensor_copy`` is a
+    bit-accurate copy for matching dtypes, unlike Scalar-Engine ``nl.copy`` which
+    casts through fp32), and burst-stores contiguous words.
     """
     numel = out.shape[0]
 
@@ -101,100 +109,61 @@ def _flat_gather_lane(packed_in, out, parity):
     core_n = min(per_prog, numel - core_base)
     core_n = max(core_n, 0)
 
-    n_aligned = (core_n // P_MAX) * P_MAX
-    tile_pairs = P_MAX * F_SIZE
-    num_tiles = div_ceil(n_aligned, tile_pairs) if n_aligned > 0 else 0
+    # Leave the last group for the tail (n_aligned <= core_n-1) so no full-group
+    # main-tile read can touch a truncated last group; the tail reads only up to
+    # the lane. (For a P_MAX-aligned count this moves the final P_MAX groups to
+    # the tail — a small, bounded portion.)
+    n_aligned = (max(core_n - 1, 0) // P_MAX) * P_MAX
+    # Bound the LOADED staging (stride*groups) per partition, not the group count,
+    # so SBUF use is independent of `stride` (see MAX_STAGE_ELEMS).
+    groups_per_tile = max(1, MAX_STAGE_ELEMS // stride)
+    tile_groups = P_MAX * groups_per_tile
+    num_tiles = div_ceil(n_aligned, tile_groups) if n_aligned > 0 else 0
     tail = core_n - n_aligned
 
     for i in nl.affine_range(num_tiles):
-        t0 = core_base + i * tile_pairs  # first pair index in this tile
-        masked_f = min(F_SIZE, (n_aligned - i * tile_pairs) // P_MAX)
-        # 1. contiguous burst-load [P_MAX, 2*masked_f] packed pairs (free stride 1)
-        pk = nl.ndarray((P_MAX, 2 * masked_f), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pk, src=packed_in.ap([[2 * masked_f, P_MAX], [1, 2 * masked_f]], 2 * t0))
-        # 2. on-chip lane select on the Vector Engine: read strided src[:, parity::2]
-        #    (bit-accurate int32 copy), write contiguous result.
-        sel = nl.ndarray((P_MAX, masked_f), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=sel, src=pk[:, parity : 2 * masked_f : 2], engine=nisa.engine.vector)
+        t0 = core_base + i * tile_groups  # first group index in this tile
+        masked_f = min(groups_per_tile, (n_aligned - i * tile_groups) // P_MAX)
+        # 1. contiguous burst-load [P_MAX, stride*masked_f] groups (free stride 1)
+        pk = nl.ndarray((P_MAX, stride * masked_f), dtype=grouped_in.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=pk,
+            src=grouped_in.ap([[stride * masked_f, P_MAX], [1, stride * masked_f]], stride * t0),
+        )
+        # 2. on-chip lane select on the Vector Engine: read strided src[:, lane::stride]
+        #    (bit-accurate copy), write contiguous result.
+        sel = nl.ndarray((P_MAX, masked_f), dtype=grouped_in.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=sel, src=pk[:, lane : stride * masked_f : stride], engine=nisa.engine.vector
+        )
         # 3. contiguous burst-store [P_MAX, masked_f] -> HBM
         nisa.dma_copy(dst=out.ap([[masked_f, P_MAX], [1, masked_f]], t0), src=sel)
 
     if tail > 0:
         t0 = core_base + n_aligned
-        pk = nl.ndarray((tail, 2), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pk, src=packed_in.ap([[2, tail], [1, 2]], 2 * t0))
-        sel = nl.ndarray((tail, 1), dtype=packed_in.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=sel, src=pk[:, parity : parity + 1], engine=nisa.engine.vector)
+        # Read only elements 0..lane of each tail group, never the trailing
+        # (lane+1 .. stride-1). The lane element is the last valid element of a
+        # minimal-span view, so this never over-reads a truncated last group.
+        pk = nl.ndarray((tail, lane + 1), dtype=grouped_in.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pk, src=grouped_in.ap([[stride, tail], [1, lane + 1]], stride * t0))
+        sel = nl.ndarray((tail, 1), dtype=grouped_in.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=sel, src=pk[:, lane : lane + 1], engine=nisa.engine.vector)
         nisa.dma_copy(dst=out.ap([[1, tail], [1, 1]], t0), src=sel)
 
     return out
 
 
-@nki.jit
-def stride2_flat_gather_kernel_(packed_in, out, parity):
-    """Gather one lane of a flat packed pair-stream into a contiguous buffer.
+def _flat_scatter_lane(grouped_io, vals, stride=2, lane=0):
+    """Scatter contiguous ``vals`` into ``lane`` of a flat stride-``stride`` stream.
 
-    Args:
-        packed_in: flat int32 [2*numel] contiguous packed pairs ``[lo,hi,...]``,
-            rebased so element ``parity`` of each pair is the requested lane.
-        out: flat int32 [numel] contiguous output.
-        parity: lane to gather — 0 = low word, 1 = high word.
-
-    Returns:
-        out (written in place; also returned per NKI convention).
-
-    Notes:
-        Balanced flat tiling: the stream is tiled as [P_MAX, F_SIZE] pair-blocks
-        independent of logical shape, so the partition dim is always full for
-        the bulk. A <P_MAX remainder is handled by a separate tail tile.
-
-        Lane select uses nisa.tensor_copy on the Vector Engine, reading the
-        strided SBUF source ``pk[:, parity::2]`` and writing a contiguous tile.
-        On the Vector Engine tensor_copy is a bit-accurate copy when src/dst
-        dtypes match (int32==int32), so unlike nl.copy (Scalar Engine, which
-        casts through fp32 and corrupts int32) it preserves all 32 bits. The
-        Vector Engine does the on-chip select while the DMA engines overlap the
-        HBM bursts, and it is ~2x faster than the GpSimd nc_n_gather select and
-        ~4x faster than a strided dma_copy select.
-
-        (Vector tensor_copy has no multi-tile size limit — it is correct at
-        F=2048 across the full shape sweep. This is unlike nc_n_gather, which
-        decomposes into ceil(elems/512) ISA groups and corrupts later tiles when
-        chained at >1 group; ticket V2245128914.)
-
-        SPMD: when launched with LNC2 the stream is split across the two
-        programs (P_MAX-aligned per-program slice). With LNC1 there is a single
-        program over the whole stream.
-    """
-    return _flat_gather_lane(packed_in, out, parity)
-
-
-@nki.jit
-def stride2_flat_scatter_kernel(packed_io, vals, parity):
-    """Scatter a contiguous buffer into one lane of a flat packed pair-stream.
-
-    Args:
-        packed_io: flat int32 [2*numel] contiguous packed pairs (read+write),
-            rebased so element ``parity`` of each pair is the lane being written.
-        vals: flat int32 [numel] contiguous source values.
-        parity: lane to write — 0 = low word, 1 = high word.
-
-    Returns:
-        packed_io (written in place; also returned per NKI convention).
-
-    Notes:
-        Burst-loads each packed block (to preserve the lane we are not writing),
-        burst-loads the source values, writes them into the parity lane on chip,
-        then burst-stores the full packed block back.
-
-        SPMD: when launched with LNC2 the stream is split across the two
-        programs (P_MAX-aligned per-program slice), so both cores' DMA engines
-        run in parallel. With LNC1 there is a single program over the whole
-        stream.
+    The inverse of :func:`_flat_gather_lane`: burst-loads each group block (to
+    preserve the lanes not being written), writes ``vals`` into element ``lane``
+    of each group on-chip, and burst-stores the block back. ``numel`` is taken
+    from ``vals.shape[0]``. ``stride=2, lane=p`` is the packed-int64 low/high
+    word scatter.
     """
     numel = vals.shape[0]
 
-    # SPMD split — see stride2_flat_gather_kernel_ for the rationale.
     num_progs = nl.num_programs(0)
     prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
@@ -202,79 +171,120 @@ def stride2_flat_scatter_kernel(packed_io, vals, parity):
     core_n = min(per_prog, numel - core_base)
     core_n = max(core_n, 0)
 
-    n_aligned = (core_n // P_MAX) * P_MAX
-    tile_pairs = P_MAX * F_SIZE
-    num_tiles = div_ceil(n_aligned, tile_pairs) if n_aligned > 0 else 0
+    n_aligned = (max(core_n - 1, 0) // P_MAX) * P_MAX
+    # Bound the LOADED staging (stride*groups) per partition — see gather core.
+    groups_per_tile = max(1, MAX_STAGE_ELEMS // stride)
+    tile_groups = P_MAX * groups_per_tile
+    num_tiles = div_ceil(n_aligned, tile_groups) if n_aligned > 0 else 0
     tail = core_n - n_aligned
 
     for i in nl.affine_range(num_tiles):
-        t0 = core_base + i * tile_pairs
-        masked_f = min(F_SIZE, (n_aligned - i * tile_pairs) // P_MAX)
-        # 1. burst-load the packed block (preserves the other lane)
-        pk = nl.ndarray((P_MAX, 2 * masked_f), dtype=packed_io.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pk, src=packed_io.ap([[2 * masked_f, P_MAX], [1, 2 * masked_f]], 2 * t0))
+        t0 = core_base + i * tile_groups
+        masked_f = min(groups_per_tile, (n_aligned - i * tile_groups) // P_MAX)
+        # 1. burst-load the group block (preserves the other lanes)
+        pk = nl.ndarray((P_MAX, stride * masked_f), dtype=grouped_io.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=pk,
+            src=grouped_io.ap([[stride * masked_f, P_MAX], [1, stride * masked_f]], stride * t0),
+        )
         # 2. burst-load the contiguous source values
         v = nl.ndarray((P_MAX, masked_f), dtype=vals.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=v, src=vals.ap([[masked_f, P_MAX], [1, masked_f]], t0))
-        # 3. write values into the parity lane on chip (SBUF -> SBUF)
-        nisa.dma_copy(dst=pk[:, parity : 2 * masked_f : 2], src=v)
-        # 4. burst-store the full packed block back -> HBM
-        nisa.dma_copy(dst=packed_io.ap([[2 * masked_f, P_MAX], [1, 2 * masked_f]], 2 * t0), src=pk)
+        # 3. write values into element `lane` of each group on chip (SBUF -> SBUF)
+        nisa.dma_copy(dst=pk[:, lane : stride * masked_f : stride], src=v)
+        # 4. burst-store the full group block back -> HBM
+        nisa.dma_copy(
+            dst=grouped_io.ap([[stride * masked_f, P_MAX], [1, stride * masked_f]], stride * t0),
+            src=pk,
+        )
 
     if tail > 0:
         t0 = core_base + n_aligned
-        pk = nl.ndarray((tail, 2), dtype=packed_io.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pk, src=packed_io.ap([[2, tail], [1, 2]], 2 * t0))
+        # Read/write only elements 0..lane of each tail group; the trailing
+        # (lane+1 .. stride-1) is never touched — preserved if present, and never
+        # over-read/written for a truncated last group (minimal-span storage).
+        pk = nl.ndarray((tail, lane + 1), dtype=grouped_io.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pk, src=grouped_io.ap([[stride, tail], [1, lane + 1]], stride * t0))
         v = nl.ndarray((tail, 1), dtype=vals.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=v, src=vals.ap([[1, tail], [1, 1]], t0))
-        nisa.dma_copy(dst=pk[:, parity : parity + 1], src=v)
-        nisa.dma_copy(dst=packed_io.ap([[2, tail], [1, 2]], 2 * t0), src=pk)
+        nisa.dma_copy(dst=pk[:, lane : lane + 1], src=v)
+        nisa.dma_copy(dst=grouped_io.ap([[stride, tail], [1, lane + 1]], stride * t0), src=pk)
 
-    return packed_io
+    return grouped_io
 
 
-def run_stride2_gather(src_tensor, dst_tensor, *, parity: int = 0):
-    """Run stride-2 gather on the last dimension.
+@nki.jit
+def strided_flat_gather_kernel_(grouped_in, out, stride, lane):
+    """Gather lane ``lane`` of a flat stride-``stride`` group-stream (in place).
+
+    In-place stride-S gather (writes into the caller's ``out``) — used by
+    copy_strided to move a uniform stride-S lane view (e.g. a ``[:, lane]``
+    column of an ``(N, stride)`` tensor) into a contiguous buffer on-device,
+    instead of a per-element / host round-trip. ``stride=2`` is the packed-int64
+    low/high-word gather. Delegates to the shared ``_flat_gather_lane`` core.
+    """
+    return _flat_gather_lane(grouped_in, out, stride, lane)
+
+
+@nki.jit
+def strided_flat_scatter_kernel(grouped_io, vals, stride, lane):
+    """Scatter contiguous ``vals`` into lane ``lane`` of a flat stride-``stride`` stream.
+
+    In-place stride-S scatter; preserves the other lanes of each group
+    (burst-load / on-chip write / burst-store). ``stride=2`` is the packed-int64
+    scatter. Delegates to the shared ``_flat_scatter_lane`` core.
+    """
+    return _flat_scatter_lane(grouped_io, vals, stride, lane)
+
+
+def run_strided_gather(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
+    """Gather a uniform stride-S lane view into a contiguous destination.
 
     Args:
-        src_tensor: source tensor with stride-2 on last dim (a packed lane alias).
+        src_tensor: source with uniform stride ``stride`` over its storage (a
+            lane view; ``storage_offset % stride == lane``).
         dst_tensor: contiguous destination of the same logical shape.
-        parity: 0 for low words (lane 0), 1 for high words (lane 1).
+        stride: group size S (the uniform element stride of ``src_tensor``).
+        lane: which element of each group to gather (== storage_offset % stride).
     """
     numel = int(dst_tensor.numel())
     if numel == 0:
         return
-
-    # The lane alias shares the int32 pair-stream storage. Rebase to the even
-    # (pair) boundary; the kernel re-selects lane `parity` within each pair.
-    base_off = int(src_tensor.storage_offset()) - parity
+    base_off = int(src_tensor.storage_offset()) - lane
     if base_off < 0:
         base_off = 0
-
-    packed = src_tensor.as_strided((2 * numel,), (1,), storage_offset=base_off)
+    # Span only the valid storage from base_off — a minimal-span strided view
+    # (e.g. x[:, ::2] copied to device) stops right after its last element, so
+    # stride*numel would overshoot. The kernel reads at most stride*(numel-1)+lane
+    # (< this span) and reads the last group only up to the lane.
+    span = src_tensor.untyped_storage().nbytes() // src_tensor.element_size() - base_off
+    grouped = src_tensor.as_strided((span,), (1,), storage_offset=base_off)
     out_flat = dst_tensor.reshape(numel)
-    stride2_flat_gather_kernel_[LNC](packed, out_flat, int(parity))
+    strided_flat_gather_kernel_[LNC](grouped, out_flat, int(stride), int(lane))
 
 
-def run_stride2_scatter(src_tensor, dst_tensor, *, parity: int = 0):
-    """Run stride-2 scatter on the last dimension.
+def run_strided_scatter(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
+    """Scatter a contiguous source into a uniform stride-S lane view.
 
     Args:
-        src_tensor: contiguous source tensor.
-        dst_tensor: destination tensor with stride-2 on last dim (a packed lane alias).
-        parity: 0 for low word positions (lane 0), 1 for high word positions (lane 1).
+        src_tensor: contiguous source.
+        dst_tensor: destination with uniform stride ``stride`` over its storage
+            (a lane view; ``storage_offset % stride == lane``). Other lanes are
+            preserved.
+        stride: group size S (the uniform element stride of ``dst_tensor``).
+        lane: which element of each group to write (== storage_offset % stride).
     """
     numel = int(src_tensor.numel())
     if numel == 0:
         return
-
-    base_off = int(dst_tensor.storage_offset()) - parity
+    base_off = int(dst_tensor.storage_offset()) - lane
     if base_off < 0:
         base_off = 0
-
-    packed = dst_tensor.as_strided((2 * numel,), (1,), storage_offset=base_off)
+    # Span only the valid storage from base_off (see run_strided_gather).
+    span = dst_tensor.untyped_storage().nbytes() // dst_tensor.element_size() - base_off
+    grouped = dst_tensor.as_strided((span,), (1,), storage_offset=base_off)
     src_flat = src_tensor.reshape(numel)
-    stride2_flat_scatter_kernel[LNC](packed, src_flat, int(parity))
+    strided_flat_scatter_kernel[LNC](grouped, src_flat, int(stride), int(lane))
 
 
 @nki.jit
@@ -294,12 +304,11 @@ def stride2_flat_gather_kernel(packed_in, parity: int = 0):
     ``output_operand_aliases``, and the identically-shaped ``torch.empty``
     buffers get CSE'd into a single constant — so the gathers alias and clobber
     each other. Allocating the output internally gives each call an independent
-    result. Shares the tiling with ``stride2_flat_gather_kernel_`` via
-    ``_flat_gather_lane``.
+    result. Shares the balanced tiling via ``_flat_gather_lane``.
     """
     numel = packed_in.shape[0] // 2
     out = nl.ndarray((numel,), dtype=nl.int32, buffer=nl.shared_hbm)
-    return _flat_gather_lane(packed_in, out, parity)
+    return _flat_gather_lane(packed_in, out, 2, parity)
 
 
 _wrapped_flat_gather = wrap_nki(stride2_flat_gather_kernel)
