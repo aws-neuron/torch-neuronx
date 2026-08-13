@@ -220,13 +220,19 @@ TEST(ReconstructOutputsTest, KeptOutputIndicesReorder) {
 }
 
 TEST(ReconstructOutputsTest, PassthroughMapping) {
+  // Not an identity op: a NEFF writes output 0 while output 1 is a passthrough.
+  // A passthrough slot is still one of the op's returns, so it must hold a copy
+  // rather than the input itself. An op shaped like `return input, mask` would
+  // otherwise hand back its own argument.
   DispatchCacheEntry entry;
   entry.original_output_specs = {
       {{2}, c10::ScalarType::Float},
       {{3}, c10::ScalarType::Float},
   };
+  entry.output_specs = {{{2}, c10::ScalarType::Float}};
   entry.kept_output_indices = {0};        // exec[0] → orig[0]
   entry.passthrough_mappings = {{1, 0}};  // orig[1] = input[0]
+  ASSERT_FALSE(IsPureInputPassthrough(entry));
 
   auto exec_out = torch::ones({2});
   auto input_tensor = torch::zeros({3});
@@ -234,8 +240,10 @@ TEST(ReconstructOutputsTest, PassthroughMapping) {
 
   auto result = ReconstructOutputs({exec_out}, entry, args, kCPU);
   ASSERT_EQ(result.size(), 2u);
+  // Output 0 is still the NEFF's own buffer, handed through untouched.
   EXPECT_EQ(result[0].data_ptr(), exec_out.data_ptr());
-  EXPECT_EQ(result[1].data_ptr(), input_tensor.data_ptr());
+  EXPECT_TRUE(torch::equal(result[1], input_tensor));
+  EXPECT_FALSE(result[1].is_alias_of(input_tensor));
 }
 
 TEST(ReconstructOutputsTest, UndefinedOutputForNoneDtype) {
@@ -249,6 +257,106 @@ TEST(ReconstructOutputsTest, UndefinedOutputForNoneDtype) {
   ASSERT_EQ(result.size(), 2u);
   EXPECT_TRUE(result[0].defined());
   EXPECT_FALSE(result[1].defined());  // Undefined = None output
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  IsPureInputPassthrough
+// ═══════════════════════════════════════════════════════════════
+
+TEST(IsPureInputPassthroughTest, FullCoverageSingleOutput) {
+  // The only output is a bare placeholder, so nothing survived
+  // capture and no NEFF exists to write an output buffer.
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {{{2}, c10::ScalarType::Float}};
+  entry.passthrough_mappings = {{0, 0}};
+  EXPECT_TRUE(IsPureInputPassthrough(entry));
+}
+
+TEST(IsPureInputPassthroughTest, FullCoverageMultipleOutputs) {
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {
+      {{2}, c10::ScalarType::Float},
+      {{3}, c10::ScalarType::Float},
+  };
+  entry.passthrough_mappings = {{0, 0}, {1, 1}};
+  EXPECT_TRUE(IsPureInputPassthrough(entry));
+}
+
+TEST(IsPureInputPassthroughTest, PartialCoverageRejected) {
+  // Output 0 is a bare placeholder; output 1 is a None (masked backward grad)
+  // that carries no mapping. Treating this as a pure passthrough would return
+  // an input clone for a slot that still needs real compute, so it must be
+  // rejected and fall through to normal execution.
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {
+      {{2}, c10::ScalarType::Float},
+      {{}, c10::ScalarType::Undefined},
+  };
+  entry.passthrough_mappings = {{0, 0}};
+  EXPECT_FALSE(IsPureInputPassthrough(entry));
+}
+
+TEST(IsPureInputPassthroughTest, NoMappingsRejected) {
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {{{2}, c10::ScalarType::Float}};
+  EXPECT_FALSE(IsPureInputPassthrough(entry));
+}
+
+TEST(IsPureInputPassthroughTest, SurvivingOutputSpecsRejected) {
+  // A NEFF exists and writes output_specs[0], so this is a normal op that
+  // happens to also pass an input through, not a pure passthrough.
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {
+      {{2}, c10::ScalarType::Float},
+      {{3}, c10::ScalarType::Float},
+  };
+  entry.output_specs = {{{2}, c10::ScalarType::Float}};
+  entry.kept_output_indices = {0};
+  entry.passthrough_mappings = {{1, 0}};
+  EXPECT_FALSE(IsPureInputPassthrough(entry));
+}
+
+TEST(IsPureInputPassthroughTest, ReconstructOutputsClonesMappedInput) {
+  // End-to-end for the identity case: with no exec outputs, every slot is
+  // served from its mapped input rather than an unwritten buffer.
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {{{3}, c10::ScalarType::Float}};
+  entry.passthrough_mappings = {{0, 0}};
+  ASSERT_TRUE(IsPureInputPassthrough(entry));
+
+  auto input_tensor = torch::ones({3});
+  std::vector<c10::IValue> args = {input_tensor};
+  auto result = ReconstructOutputs(/*exec_outputs=*/{}, entry, args, kCPU);
+
+  ASSERT_EQ(result.size(), 1u);
+  ASSERT_TRUE(result[0].defined());
+  EXPECT_TRUE(torch::equal(result[0], input_tensor));
+  // A copy, not the input itself: PyTorch rejects an op that returns one of its
+  // own inputs, comparing storages rather than tensor identity.
+  EXPECT_FALSE(result[0].is_alias_of(input_tensor));
+}
+
+TEST(IsPureInputPassthroughTest, ReconstructOutputsClonesEachMappedInput) {
+  // Multi-output identity: no slot may alias its input, and the two outputs
+  // must not alias each other either (the same check covers both).
+  DispatchCacheEntry entry;
+  entry.original_output_specs = {
+      {{2}, c10::ScalarType::Float},
+      {{2}, c10::ScalarType::Float},
+  };
+  entry.passthrough_mappings = {{0, 0}, {1, 1}};
+  ASSERT_TRUE(IsPureInputPassthrough(entry));
+
+  auto in0 = torch::ones({2});
+  auto in1 = torch::zeros({2});
+  std::vector<c10::IValue> args = {in0, in1};
+  auto result = ReconstructOutputs(/*exec_outputs=*/{}, entry, args, kCPU);
+
+  ASSERT_EQ(result.size(), 2u);
+  EXPECT_TRUE(torch::equal(result[0], in0));
+  EXPECT_TRUE(torch::equal(result[1], in1));
+  EXPECT_FALSE(result[0].is_alias_of(in0));
+  EXPECT_FALSE(result[1].is_alias_of(in1));
 }
 
 // ═══════════════════════════════════════════════════════════════

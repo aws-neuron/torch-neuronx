@@ -576,20 +576,22 @@ class TorchMlirKernel(BaseNeuronKernel):
             if not isinstance(output_args, tuple):
                 output_args = (output_args,)
 
-            # Remove empty tensor pass-throughs from output
+            # Remove input passthroughs from the output list.
+            #
+            # An output node that is a placeholder carries no computation, so the
+            # compiled NEFF would have no store for it and the buffer the
+            # dispatcher pre-allocates for that slot would never be written.
+            # Dropping it here keeps kept_output_indices/output_specs describing
+            # only slots the NEFF actually writes; passthrough_mappings (built
+            # from the pre-optimization graph) tells the dispatcher to return the
+            # input tensor for the dropped slots instead.
+            #
+            # Unlike the outputs, the placeholder itself may still be needed as an
+            # IR input (other nodes may use it); the unused-placeholder sweep
+            # below erases only the ones that lost all users.
             placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-            new_output_args = []
-            for out_arg in output_args:
-                if out_arg in placeholders:
-                    p_idx = placeholders.index(out_arg)
-                    if p_idx < len(example_inputs):
-                        inp = example_inputs[p_idx]
-                        if isinstance(inp, torch.Tensor) and inp.numel() == 0:
-                            continue  # Skip empty tensor pass-through
-                new_output_args.append(out_arg)
-
-            if new_output_args:
-                output_node.args = (tuple(new_output_args),)
+            new_output_args = [out_arg for out_arg in output_args if out_arg not in placeholders]
+            output_node.args = (tuple(new_output_args),)
 
             # Remove unused placeholders (empty pass-throughs now have no users)
             used_placeholder_indices = []
@@ -668,6 +670,24 @@ class TorchMlirKernel(BaseNeuronKernel):
         #         parameter_number=ir_param_idx, parameter_index=[], output_index=0
         #     )
 
+        # Pure input passthrough: every output was a bare placeholder,
+        # so capture_backend removed them all. convert_fx_to_stablehlo rejects a
+        # zero-output module, so short-circuit before lowering: emit no HLO and no io_spec.
+        # passthrough_mappings carries everything the dispatcher needs.
+        if self._is_pure_input_passthrough(
+            passthrough_mappings, kept_output_indices, original_outputs
+        ):
+            return (
+                b"",  # no HLO
+                None,  # no io_spec
+                None,  # no cast_spec
+                kept_input_indices,
+                kept_output_indices,  # empty
+                None,  # downcasted_outputs
+                original_outputs,
+                passthrough_mappings,
+            )
+
         # Convert to StableHLO
         from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
 
@@ -725,8 +745,11 @@ class TorchMlirKernel(BaseNeuronKernel):
         for exec_idx, orig_idx in enumerate(kept_output_indices):
             result[orig_idx] = exec_tuple[exec_idx]
 
-        if context and context.has_original_inputs:
-            flattened_original_inputs = self._flatten_all_inputs(context.original_inputs)
+        if context and context.has_original_inputs():
+            # Tensor-only order: the space passthrough_mappings indexes into.
+            flattened_original_inputs = self._flatten_tensor_inputs(
+                context.original_inputs, context.original_kwargs
+            )
         # Handle optimized-away outputs using pass-through mappings
         for idx, tensor in enumerate(result):
             if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
@@ -739,7 +762,9 @@ class TorchMlirKernel(BaseNeuronKernel):
                 ):
                     input_idx = passthrough_mappings[idx]
                     passthrough_tensor = flattened_original_inputs[input_idx]
-                    result[idx] = passthrough_tensor.to("neuron")
+                    # Clone for the same reason the pure-passthrough path does: a
+                    # return must not be one of the op's own inputs.
+                    result[idx] = passthrough_tensor.to("neuron").clone()
                 else:
                     result[idx] = torch.empty(tensor.shape, dtype=tensor.dtype, device="neuron")
 
@@ -749,22 +774,54 @@ class TorchMlirKernel(BaseNeuronKernel):
             return result[0]
 
     def _detect_passthrough_mappings(self, gm, original_output_args):
-        """Detect which inputs are passed through as outputs in the FX graph."""
+        """Detect which inputs are passed through as outputs in the FX graph.
+
+        Placeholder position is deliberately not used: placeholders cover every
+        pytree leaf of (fake_inputs, compilation_kwargs), non-tensors
+        included, so an op whose signature puts a scalar before a passed-through
+        tensor would resolve to the wrong leaf or to a non-tensor. The two
+        orders coincide only when every tensor precedes every non-tensor.
+
+        Returns {output_idx: input_idx} where input_idx is a position in
+        the tensor-only flattened input order. This is the space consumed by C++
+        ExtractTensorInputs and by _flatten_tensor_inputs on the Python path.
+        """
         passthrough_mappings = {}
 
-        # Get input nodes (placeholders)
-        input_nodes = [node for node in gm.graph.nodes if node.op == "placeholder"]
+        # Placeholders in graph order, each paired with its tensor-only index.
+        # meta["val"] holds the traced value: a FakeTensor for tensor placeholders.
+        input_nodes = []
+        tensor_idx = 0
+        for node in gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            if isinstance(node.meta.get("val"), torch.Tensor):
+                input_nodes.append((node.name, tensor_idx))
+                tensor_idx += 1
 
         # For each original output, check if it's a direct input passthrough
         for orig_idx, orig_out in enumerate(original_output_args):
             if hasattr(orig_out, "name"):
                 # Check if this output name matches any input node name
-                for input_idx, input_node in enumerate(input_nodes):
-                    if input_node.name == orig_out.name:
+                for name, input_idx in input_nodes:
+                    if name == orig_out.name:
                         passthrough_mappings[orig_idx] = input_idx
                         break
 
         return passthrough_mappings
+
+    @staticmethod
+    def _is_pure_input_passthrough(passthrough_mappings, kept_output_indices, original_outputs):
+        """Whether the lowered graph computes nothing and is satisfied by its inputs.
+
+        Mirror of C++ IsPureInputPassthrough, which governs the default dispatch path
+        while this one governs the pure Python path. No output slot survived capture,
+        every original output slot has a mapping.
+        """
+        if not passthrough_mappings or kept_output_indices:
+            return False
+        num_outputs = len(original_outputs) if isinstance(original_outputs, tuple | list) else 1
+        return len(passthrough_mappings) == num_outputs
 
     def _create_output_tensors_from_original(self, original_outputs, device):
         """Create output tensors based on original_outputs structure."""
@@ -1091,18 +1148,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         return all(_is_zero_shape(out) for out in original_outputs if out is not None)
 
     @staticmethod
-    def _flatten_all_inputs(inputs):
-        """Flatten all inputs including non-tensors for passthrough mapping."""
-        flattened = []
-        for inp in inputs:
-            if isinstance(inp, list | tuple):
-                flattened.extend(TorchMlirKernel._flatten_all_inputs(inp))
-            else:
-                # Include tensor and non-tensor inputs
-                flattened.append(inp)
-        return flattened
-
-    @staticmethod
     def _flatten_tensors(inputs):
         """Flatten nested tensor structures for execution."""
         flattened = []
@@ -1111,6 +1156,21 @@ class TorchMlirKernel(BaseNeuronKernel):
                 flattened.append(inp)
             elif isinstance(inp, list | tuple):
                 flattened.extend(TorchMlirKernel._flatten_tensors(inp))
+        return flattened
+
+    @classmethod
+    def _flatten_tensor_inputs(cls, inputs, kwargs=None):
+        """Flatten inputs into the tensor-only order that passthrough indices use.
+
+        Positional tensors (recursing into lists/tuples) followed by tensor
+        kwargs — the order C++ ``ExtractTensorInputs`` produces over
+        schema-ordered args, and the space ``_detect_passthrough_mappings``
+        indexes into.
+        """
+        flattened = cls._flatten_tensors(inputs)
+        for value in (kwargs or {}).values():
+            if isinstance(value, torch.Tensor):
+                flattened.append(value)
         return flattened
 
     def _get_or_compile_hlo(
@@ -1185,11 +1245,19 @@ class TorchMlirKernel(BaseNeuronKernel):
                             )
                             # Drop cast_spec (index 2) for cache storage
                             disk_entry = result[:2] + result[3:]
-                            _hlo_cache_put(cache_key, *disk_entry)
+                            # Pure input passthrough has no HLO, only a trace, which the
+                            # process-local hlo_cache below already covers.
+                            if disk_entry[0]:
+                                _hlo_cache_put(cache_key, *disk_entry)
 
-                    # Losers read from disk after lock is released (parallel)
                     if disk_entry is None:
+                        # Losers read from disk after lock is released (parallel).
                         disk_entry = _hlo_cache_get(cache_key)
+                        if disk_entry is None:
+                            # _meta can exist while the entry is unreadable (empty HLO passthrough),
+                            # which skipped the generate above. Trace here rather than unpack None.
+                            result = self._generate_hlo(inputs, kwargs, context)
+                            disk_entry = result[:2] + result[3:]
                 else:
                     # Cache disabled — generate directly without coordination
                     result = self._generate_hlo(
@@ -1543,6 +1611,26 @@ class TorchMlirKernel(BaseNeuronKernel):
                     inferred_output_dtypes=inferred_output_dtypes,
                 )
 
+            # ── Early exit for pure input pass-through ──
+            # _generate_hlo returned no io_spec because every output was a bare
+            # placeholder. No NEFF: output_specs stays empty and passthrough_mappings
+            # covers every output. DispatchCore detects this and satisfies the op from its inputs.
+            if self._is_pure_input_passthrough(
+                passthrough_mappings, kept_output_indices, original_outputs
+            ):
+                return LoweringResult(
+                    op_name=self.op_name,
+                    stablehlo_bytes=b"",
+                    kept_input_indices=list(kept_input_indices) if kept_input_indices else [],
+                    kept_output_indices=[],
+                    output_specs=[],
+                    original_output_specs=self._build_original_output_specs(original_outputs),
+                    passthrough_mappings=dict(passthrough_mappings),
+                    is_inplace=self._is_inplace_op(),
+                    has_collectives=self.has_collectives,
+                    inferred_output_dtypes=inferred_output_dtypes,
+                )
+
             # ── Assemble LoweringResult via helpers ──
             # Use original (pre-preprocessing) args for provenance mapping,
             # since kept_input_indices were generated against this structure.
@@ -1696,6 +1784,45 @@ class TorchMlirKernel(BaseNeuronKernel):
         ):
             _C._log_executed_op(self.op_name)
             return original_outputs
+
+        # Pure input passthrough: no io_spec/HLO produced. Satisfy each output from
+        # its mapped input rather than io_spec.outputs (None) or executing a NEFF.
+        # Counterpart to the C++ IsPureInputPassthrough branch in DispatchCore.
+        if self._is_pure_input_passthrough(
+            passthrough_mappings, kept_output_indices, original_outputs
+        ):
+            _C._log_executed_op(self.op_name)
+            orig_inputs = (
+                context.original_inputs
+                if context and context.has_original_inputs()
+                else processed_inputs
+            )
+            orig_kwargs = (
+                context.original_kwargs
+                if context and context.has_original_kwargs()
+                else processed_kwargs
+            )
+            flat_inputs = self._flatten_tensor_inputs(orig_inputs, orig_kwargs)
+            is_multi = isinstance(original_outputs, tuple | list)
+            outs = list(original_outputs) if is_multi else [None]
+            for out_idx in range(len(outs)):
+                # Total coverage is guaranteed by _is_pure_input_passthrough.
+                in_idx = passthrough_mappings[out_idx]
+                # Clone to honor out-of-place semantics:
+                # prevent callers from mutating the op's argument.
+                outs[out_idx] = flat_inputs[in_idx].to("neuron").clone()
+            result = tuple(outs) if is_multi else outs[0]
+
+            # Honor out=/inplace destinations, as the C++ path does via
+            # UpcastExecutionOutputs -> CopyBackOutTensors.
+            provided_output = self.output_handler.extract_output_params(kwargs, self.output_params)
+            if provided_output is not None:
+                self._copy_to_provided_output(result, provided_output)
+                result = provided_output
+
+            if target_device is not None:
+                result = self._transfer_to_device(result, target_device)
+            return result
 
         # Check for zero-sized outputs - skip execution if all outputs are zero-sized
         if self._all_outputs_zero_sized(original_outputs):
