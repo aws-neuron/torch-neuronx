@@ -15,6 +15,7 @@ import logging
 import os
 from collections.abc import Callable, Iterable
 from math import prod
+from typing import ClassVar
 
 import torch
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput, _dispatch_dtypes
@@ -353,6 +354,29 @@ def _probe_out_specs(op, sample) -> list[tuple[torch.Size, torch.dtype]] | None:
     return None
 
 
+def _shape_of(spec) -> list:
+    """Shape list from a tuple/list or dict spec."""
+    if isinstance(spec, dict):
+        return list(spec.get("shape", []))
+    if isinstance(spec, list | tuple):
+        return list(spec)
+    return []
+
+
+def _has_index_into_size1(arg_shapes: dict) -> bool:
+    """True if any indices[i] targets a size-1 dim of self (only 0 is valid)."""
+    self_shape = _shape_of(arg_shapes.get("self"))
+    indices = arg_shapes.get("indices")
+    # NeuronShapeRegistry.register normalizes list values to tuples on ingest,
+    # so accept either.
+    if not isinstance(indices, list | tuple):
+        return False
+    return any(
+        idx is not None and i < len(self_shape) and self_shape[i] == 1
+        for i, idx in enumerate(indices)
+    )
+
+
 class NeuronOpInfo(OpInfo):
     """Extends OpInfo with the Neuron shape registry as primary input source.
 
@@ -426,6 +450,32 @@ class NeuronOpInfo(OpInfo):
     )
     _SLOW_COMPILE_MAX_SHAPES = 5
 
+    # Per-op predicates that drop model-traced entries whose random-fill would
+    # violate a value-level constraint (alignment, bounds, sum). Keyed by base
+    # op name so one entry covers all overloads. Builtin defaults encode the
+    # required metadata and pass unchanged.
+    _ENTRY_VALIDATORS: ClassVar[dict[str, Callable[[dict], bool]]] = {
+        # offs must be sorted + multiple of 128 (NKI tile alignment).
+        "_grouped_mm": lambda s: not (
+            isinstance(s.get("offs"), dict) and "multiple_of" not in s["offs"]
+        ),
+        # index into a size-1 dim: only value 0 is valid.
+        "index": lambda s: not _has_index_into_size1(s),
+        # output_size must equal sum(repeats); random repeats rarely match.
+        "repeat_interleave": lambda s: (
+            s.get("output_size") is None
+            or not isinstance(s.get("repeats"), dict)
+            or "low" in s["repeats"]
+        ),
+    }
+
+    @classmethod
+    def _entry_is_valid(cls, op_name: str, arg_shapes: dict) -> bool:
+        """Drop model-traced entries that violate op-specific preconditions."""
+        base = op_name.replace("aten::", "").split(".")[0]
+        validator = cls._ENTRY_VALIDATORS.get(base)
+        return validator(arg_shapes) if validator else True
+
     def _registry_entries(self) -> list:
         """Registry entries for this op. Propagation at registry-load time
         (see NeuronShapeRegistry.propagate_to_compatible_overloads) already
@@ -456,6 +506,12 @@ class NeuronOpInfo(OpInfo):
                 for e in entries
                 if max_tensor_elems(e.arg_shapes, self.op_name) <= self._MAX_TENSOR_ELEMS
             ]
+
+        # Drop entries that violate op-specific value-level preconditions
+        # (alignment, bounds, consistency) that the cache-key parser cannot
+        # capture — only shapes/dtypes are recorded, not tensor values.
+        if entries:
+            entries = [e for e in entries if self._entry_is_valid(self.op_name, e.arg_shapes)]
 
         max_per_op = int(os.environ.get("NEURON_MAX_SHAPES_PER_OP", "10"))
         if self.op_name in self._SLOW_COMPILE_OPS:
