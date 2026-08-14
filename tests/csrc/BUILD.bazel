@@ -638,6 +638,16 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "RdmaManagerTest",
+    srcs = ["core/rdma/RdmaManagerTest.cpp"],
+    copts = ["-Wno-deprecated-declarations"],
+    deps = [
+        "//:rdma",
+        "//:transfer_descriptor_cc_proto",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "ShelvesCleanupTest",
     srcs = ["core/allocator/ShelvesCleanupTest.cpp"],
     deps = ["//:runtime"],
