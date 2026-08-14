@@ -12,7 +12,6 @@ import torch
 from neuronxcc.starfish.support.dtype import is_float_type
 
 import torch_neuronx
-from torch_neuronx.utils import is_sync_mode_enabled
 
 
 @contextmanager
@@ -264,10 +263,7 @@ def get_core_start_index():
     return get_pytest_worker_index() * get_total_core_count() // get_pytest_worker_count()
 
 
-def get_cache_size(kernel):
-    if is_sync_mode_enabled():
-        return kernel.cache.size()
-
+def get_cache_size():
     torch.neuron.synchronize()
     return torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
 
