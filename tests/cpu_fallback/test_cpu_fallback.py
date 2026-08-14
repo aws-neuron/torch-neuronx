@@ -55,6 +55,18 @@ class TestCpuFallback:
         torch.linalg.cholesky(a, out=out)
         torch.testing.assert_close(out.cpu(), torch.linalg.cholesky(a).cpu())
 
+    @pytest.mark.parametrize("use_out", [False, True])
+    @assert_raises(RuntimeError, match="Expected all tensors to be on the same device")
+    def test_householder_cross_device_tau_raises_same_device_error(self, use_out):
+        reflectors = torch.randn(5, 3, device="neuron")
+        tau = torch.randn(3)
+
+        if use_out:
+            out = torch.empty_like(reflectors)
+            torch.linalg.householder_product(reflectors, tau, out=out)
+        else:
+            torch.linalg.householder_product(reflectors, tau)
+
     @assert_raises(
         RuntimeError,
         match="torch.histogram: input tensor and hist tensor should have the same dtype, "
