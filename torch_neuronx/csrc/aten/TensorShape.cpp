@@ -24,9 +24,6 @@ static at::Tensor alias_with_sizes_and_strides(const at::Tensor& self, at::IntAr
   impl->set_storage_offset(self.storage_offset());
   impl->set_sizes_and_strides(sizes, strides);
 
-  // Propagate names if any
-  at::namedinference::propagate_names(result, self);
-
   return result;
 }
 
@@ -88,7 +85,6 @@ at::Tensor as_strided_neuron(const at::Tensor& self, at::IntArrayRef size, at::I
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(), self.dtype());
 
   at::native::setStrided(result, size, stride, storage_offset);
-  at::namedinference::propagate_names(result, self);
 
   return result;
 }
