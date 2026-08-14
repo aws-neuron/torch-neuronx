@@ -66,26 +66,27 @@ SKIP_GROUPS: list[SkipGroup] = [
             " tensor shapes symbolic. "
         ),
         tests=[
-            "DecoratorTests::test_nonstrict_trace_tuple_and_sym_int_output",
+            "*DecoratorTests::test_nonstrict_trace_tuple_and_sym_int_output*",
             "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg",
             "ExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph",
             "ExportTests::test_dupes_and_bypass_with_non_tensor_arg",
             "ExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph",
             "ExportTests::test_dupes_and_bypass_with_non_tensor_output",
             "ExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph",
-            "FunctionTests::test_pos",
+            "*FunctionTests::test_pos*",
             "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_inline_and_install",
             "InlineAndInstallExportTests::test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph_inline_and_install",
             "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_inline_and_install",
             "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph_inline_and_install",
             "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_inline_and_install",
             "InlineAndInstallExportTests::test_dupes_and_bypass_with_non_tensor_output_with_aten_graph_inline_and_install",
-            "MiscTests::test_dynamic_shapes_as_strided",
-            "MiscTests::test_make_contiguous_strides_for_under_compile",
-            "ReproTests::test_add_sub_alpha_out",
-            "ReproTests::test_addr_alpha_beta_out",
-            "ReproTests::test_dynamic_shape_disable_duck_size",
+            "*MiscTests::test_dynamic_shapes_as_strided*",
+            "*MiscTests::test_make_contiguous_strides_for_under_compile*",
+            "*ReproTests::test_add_sub_alpha_out*",
+            "*ReproTests::test_addr_alpha_beta_out*",
+            "*ReproTests::test_dynamic_shape_disable_duck_size*",
             "SubclassTests::test_tensor_subclass_TwoTensor_nested",
+            "TestTwoTensorSubclass::test_tensor_subclass_TwoTensor_nested",
         ],
     ),
     SkipGroup(
@@ -94,11 +95,11 @@ SKIP_GROUPS: list[SkipGroup] = [
             " changes across calls, triggering recompilation with a symbolic int)."
         ),
         tests=[
-            "DictTests::test_dict_tag_guard",
-            "DictTests::test_mapping_proxy_existing",
-            "FunctionTests::test_dict_tuple_lazy_guard",
-            "MiscTests::test_itertools_infinite_count",
-            "ReproTests::test_guard_with_tuple_mutation",
+            "*DictTests::test_dict_tag_guard*",
+            "*DictTests::test_mapping_proxy_existing*",
+            "*FunctionTests::test_dict_tuple_lazy_guard*",
+            "*MiscTests::test_itertools_infinite_count*",
+            "*ReproTests::test_guard_with_tuple_mutation*",
         ],
     ),
     SkipGroup(
@@ -115,7 +116,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             " Neuron and crashes the worker."
         ),
         tests=[
-            "test_repros.py::ReproTests::test_guard_tag_safe_tensor_metadata_segfault",
+            "test_repros.py::*ReproTests::test_guard_tag_safe_tensor_metadata_segfault*",
         ],
     ),
 ]

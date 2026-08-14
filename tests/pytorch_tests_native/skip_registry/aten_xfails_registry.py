@@ -27,7 +27,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_frexp_assert_raises_neuron",
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_float_power_exceptions_neuron",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_float_power_exceptions_neuron",
             "test_nn.py::TestNNDeviceTypeNEURON::test_invalid_reduction_strings_neuron",
             "test_ops.py::TestCommonNEURON::test_errors_masked_fill_neuron",
         ],
@@ -138,7 +138,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         # TODO: Replace with per-subtest xfails and reject every dtype absent from
         # torch.accelerator.get_device_capability()["supported_dtypes"].
         tests=[
-            "test_accelerator.py::TestAccelerator::test_device_capability_supported_dtypes",
+            "test_accelerator.py::TestAccelerator*::test_device_capability_supported_dtypes*",
         ],
     ),
     SkipGroup(

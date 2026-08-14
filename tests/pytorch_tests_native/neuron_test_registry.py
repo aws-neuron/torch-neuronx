@@ -46,12 +46,22 @@ class SkipGroup:
         self._simple_tests: set[str] = set()
         # Index qualified entries by first component for fast filtering
         self._qualified_by_first: dict[str, list[list[str]]] = {}
+        # Entries that contain a glob wildcard — bypass both exact-match shortcuts
+        # and always run through _is_contiguous_match.
+        self._glob_tests: list[list[str]] = []
         for t in self.tests:
+            has_glob = any(c in t for c in ("*", "?", "["))
             if "::" not in t and "/" not in t:
-                self._simple_tests.add(t)
+                if has_glob:
+                    self._glob_tests.append(_split_nodeid(t))
+                else:
+                    self._simple_tests.add(t)
             else:
                 parts = _split_nodeid(t)
-                self._qualified_by_first.setdefault(parts[0], []).append(parts)
+                if has_glob:
+                    self._glob_tests.append(parts)
+                else:
+                    self._qualified_by_first.setdefault(parts[0], []).append(parts)
 
 
 # =============================================================================
@@ -81,9 +91,23 @@ _load_skip_registry()
 
 
 def _is_contiguous_match(skip_entry: list, pytest_nodeid: list) -> bool:
-    """Check if skip_entry appears as a contiguous subsequence in pytest_nodeid."""
+    """Check if skip_entry appears as a contiguous subsequence in pytest_nodeid.
+
+    Parts containing ``*`` or ``?`` are matched with fnmatch glob rather than
+    exact equality. Glob entries are routed through ``_glob_tests`` in
+    ``__post_init__`` so they bypass both exact-match shortcuts in ``_match``
+    (the ``_simple_tests`` set and ``_qualified_by_first`` dict lookup).
+    This means wildcards work correctly in any position — first, middle, last,
+    or as a bare single-component entry.
+    """
+
+    def _parts_match(entry_parts: list, nodeid_slice: list) -> bool:
+        return all(
+            fnmatch.fnmatchcase(n, e) for e, n in zip(entry_parts, nodeid_slice, strict=False)
+        )
+
     return any(
-        pytest_nodeid[i : i + len(skip_entry)] == skip_entry
+        _parts_match(skip_entry, pytest_nodeid[i : i + len(skip_entry)])
         for i in range(len(pytest_nodeid) - len(skip_entry) + 1)
     )
 
@@ -119,6 +143,10 @@ def _match(
             for e in entries:
                 if _is_contiguous_match(e, parts):
                     return True
+    # Glob entries bypass the exact-match shortcuts above
+    for e in group._glob_tests:
+        if _is_contiguous_match(e, parts):
+            return True
     if group.match_target == "test_class":
         class_name = parts[-2] if len(parts) >= 2 else func_name
         return any(fnmatch.fnmatch(class_name, p) for p in group.patterns)

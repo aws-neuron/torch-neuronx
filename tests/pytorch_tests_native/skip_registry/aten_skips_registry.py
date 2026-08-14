@@ -249,7 +249,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             " cascading failures to all subsequent tests on the same worker"
         ),
         tests=[
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_remainder_overflow_neuron",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_remainder_overflow_neuron",
             "test_ops.py::TestCommonNEURON::test_dtypes___rmod___neuron",
         ],
     ),
@@ -264,10 +264,10 @@ SKIP_GROUPS: list[SkipGroup] = [
             " aten::abs, or aten::contiguous."
         ),
         tests=[
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float64",
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_batch_vs_slicing_polar_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float32",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float32",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float64",
             "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float32",
             "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float64",
             "test_ops.py::TestCommonNEURON::test_out_linalg_eig_neuron_float32",

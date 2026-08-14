@@ -124,6 +124,70 @@ def test_pattern_does_not_match_class_name():
     assert not _group_matches(g, FSDP_NODEID)
 
 
+# -- Glob wildcards in tests entries --
+
+
+def test_glob_in_middle_component_matches():
+    """Wildcard in class component matches both PT2.12 and PT2.13 class names."""
+    g = SkipGroup(reason="x", tests=["test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_foo"])
+    assert _group_matches(g, "test/test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_foo")
+    assert _group_matches(g, "test/test_binary_ufuncs.py::TestBinaryUfuncsDeviceNEURON::test_foo")
+
+
+def test_glob_in_last_component_matches():
+    """Wildcard in method component matches method with and without suffix."""
+    g = SkipGroup(reason="x", tests=["TestAccelerator*::test_memory_stats*"])
+    assert _group_matches(g, "test/test_accelerator.py::TestAccelerator::test_memory_stats")
+    assert _group_matches(
+        g, "test/test_accelerator.py::TestAcceleratorNEURON::test_memory_stats_neuron"
+    )
+
+
+def test_glob_in_first_component_matches():
+    """Wildcard in first (class) component is NOT silently skipped."""
+    g = SkipGroup(reason="x", tests=["*CtxManagerTests::test_foo*"])
+    assert _group_matches(g, "test/dynamo/test_ctx_manager.py::CtxManagerTests::test_foo")
+    assert _group_matches(
+        g,
+        "test/dynamo/test_nested_graph_breaks_wrapped.py"
+        "::NestedGraphBreaksCtxManagerTests::test_foo_nested_graph_breaks",
+    )
+
+
+def test_glob_bare_single_component_matches():
+    """Bare glob entry (no :: or /) is NOT silently ignored."""
+    g = SkipGroup(reason="x", tests=["test_foo*"])
+    assert _group_matches(g, "test/test_ops.py::TestOps::test_foo_bar")
+    assert not _group_matches(g, "test/test_ops.py::TestOps::test_bar")
+
+
+def test_glob_does_not_match_different_file():
+    """File-scoped glob does not leak to other files."""
+    g = SkipGroup(reason="x", tests=["test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_foo"])
+    assert not _group_matches(g, "test/test_other.py::TestBinaryUfuncsDeviceNEURON::test_foo")
+
+
+def test_glob_is_case_sensitive():
+    """fnmatchcase: TestFooNEURON does NOT match testfooneuron."""
+    g = SkipGroup(reason="x", tests=["TestBinaryUfuncs*NEURON::test_foo"])
+    assert _group_matches(g, "test/test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_foo")
+    assert not _group_matches(g, "test/test_binary_ufuncs.py::testbinaryufuncsneuron::test_foo")
+
+
+def test_glob_bracket_pattern():
+    """[seq] bracket globs are supported."""
+    g = SkipGroup(reason="x", tests=["test_[abc]oo"])
+    assert _group_matches(g, "test/test_ops.py::TestOps::test_boo")
+    assert not _group_matches(g, "test/test_ops.py::TestOps::test_doo")
+
+
+def test_glob_literal_still_matches():
+    """Literals still work correctly — fnmatchcase reduces to equality for plain strings."""
+    g = SkipGroup(reason="x", tests=["CtxManagerTests::test_foo"])
+    assert _group_matches(g, "test/dynamo/test_ctx_manager.py::CtxManagerTests::test_foo")
+    assert not _group_matches(g, "test/dynamo/test_ctx_manager.py::CtxManagerTests::test_bar")
+
+
 # -- Empty group matches nothing --
 
 

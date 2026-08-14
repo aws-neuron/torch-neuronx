@@ -10,5 +10,5 @@ before.
 """
 
 PT211_BF16_RECIPROCAL_REGRESSION = [
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_div_rounding_modes_neuron_bfloat16",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_modes_neuron_bfloat16",
 ]
