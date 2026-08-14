@@ -17,13 +17,17 @@ def add_kernel(input_a, input_b, num_m_tiles):
     Args:
         input_a: [m_static, hidden] bf16 on HBM
         input_b: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32
+        num_m_tiles: [1, 1] int32, number of 128-row tiles per program
     Returns:
         output: [m_static, hidden] bf16 on HBM
     """
     m_static, hidden = input_a.shape
 
     tile_size_m = 128
+    # Programs process interleaved row tiles; the adapter equalizes loop counts.
+    num_programs = nl.num_programs(axes=0)
+    program_id = nl.program_id(axis=0)
+    program_row_offset = program_id * tile_size_m * hidden
     # Free-dim tile width ~4 KB/partition (DMA saturation knee): bf16/fp16 -> 2048,
     # fp32 -> 1024. H compile-time constant -> resolved at trace time; tile_size_h-
     # wide tiles plus a final short tile of `hidden % tile_size_h` — arbitrary H.
@@ -56,7 +60,7 @@ def add_kernel(input_a, input_b, num_m_tiles):
                 dst=a_tile[0:tile_size_m, 0:h_width],
                 src=input_a.ap(
                     pattern=[[hidden, tile_size_m], [1, h_width]],
-                    offset=h_start,
+                    offset=program_row_offset + h_start,
                     scalar_offset=m_tile_start,
                     indirect_dim=0,
                 ),
@@ -67,7 +71,7 @@ def add_kernel(input_a, input_b, num_m_tiles):
                 dst=b_tile[0:tile_size_m, 0:h_width],
                 src=input_b.ap(
                     pattern=[[hidden, tile_size_m], [1, h_width]],
-                    offset=h_start,
+                    offset=program_row_offset + h_start,
                     scalar_offset=m_tile_start,
                     indirect_dim=0,
                 ),
@@ -84,13 +88,13 @@ def add_kernel(input_a, input_b, num_m_tiles):
             nisa.dma_copy(
                 dst=result.ap(
                     pattern=[[hidden, tile_size_m], [1, h_width]],
-                    offset=h_start,
+                    offset=program_row_offset + h_start,
                     scalar_offset=m_tile_start,
                     indirect_dim=0,
                 ),
                 src=out_tile[0:tile_size_m, 0:h_width],
             )
 
-        nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
+        nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m * num_programs)
 
     return result

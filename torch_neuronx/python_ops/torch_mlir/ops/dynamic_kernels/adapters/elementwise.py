@@ -1,16 +1,18 @@
 """Elementwise dynamic NKI adapters (silu / exp / sin / cos / add / mul).
 
-All share one shape scheme — a [128, H] NEFF per (H, dtype), M dynamic — differing
-only in name and operand count. ``make_elementwise_entry`` builds the shared
-``compile_fn`` + ``prepare_io``; each op keeps its own ``can_handle``.
+All share one shape scheme with M dynamic, differing only in name and operand
+count. ``make_elementwise_entry`` builds the shared ``compile_fn`` +
+``prepare_io``; each op keeps its own ``can_handle``. Binary add/sub/mul pad M
+to one row tile per LNC program for row-interleaved sharding.
 """
 
 import torch
 
+from torch_neuronx.utils import get_logical_neuron_cores
+
 from ..adapter_utils import (
     _TILE_M,
     _can_handle_elementwise_2d,
-    _ceil_to_tile,
     _compile_or_load_neff,
     _dest_buffer,
     _hidden_compile_key,
@@ -63,9 +65,12 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
     """Build a DynamicNkiEntry for an elementwise op. ``arity`` is the operand
     count (1 unary, 2 binary); ``can_handle`` is supplied per op."""
     graph_name = f"dynamic_nki_{name}"
+    lnc_sharded = name in {"add", "sub", "mul"}
+    num_programs = int(get_logical_neuron_cores()) if lnc_sharded else 1
+    row_group = _TILE_M * num_programs
 
     def compile_fn(compile_key):
-        """Compile at [128, H] for a (H, dtype) — H + dtype baked, M dynamic."""
+        """Compile one row tile per LNC program; H + dtype are baked."""
         from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
         from .. import wrappers
@@ -77,19 +82,19 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
         # config, not the example-input device.
         H, dtype = compile_key  # noqa: N806
         wrapper = getattr(wrappers, f"dynamic_{name}_nki")
-        ins = tuple(torch.empty(_TILE_M, H, dtype=dtype, device="meta") for _ in range(arity))
+        ins = tuple(torch.empty(row_group, H, dtype=dtype, device="meta") for _ in range(arity))
         nm = torch.tensor([[1]], dtype=torch.int32, device="meta")
-        out = torch.empty(_TILE_M, H, dtype=dtype, device="meta")
+        out = torch.empty(row_group, H, dtype=dtype, device="meta")
 
         kernel = TorchMlirKernel(torch_fn=wrapper, op_name=graph_name)
         return _compile_or_load_neff(kernel, graph_name, (*ins, nm), out)
 
     def prepare_io(*tensors, dest=None, **_):
-        """Pad the M rows up to a 128-multiple (M_ceil); sliced back in reshape_output."""
+        """Pad M so every LNC program executes the same number of row tiles."""
         x = tensors[0]
         H = x.shape[-1]  # noqa: N806
         M = x.numel() // H  # noqa: N806
-        M_ceil = _ceil_to_tile(M)  # noqa: N806
+        M_ceil = -(-M // row_group) * row_group  # noqa: N806
         device = x.device
 
         def to_2d(t):
@@ -99,7 +104,7 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
             return _pad_or_contig(t.reshape(-1, H), M_ceil)
 
         ins = tuple(to_2d(tensors[i]) for i in range(arity))
-        nm = _num_tiles_tensor(M_ceil // _TILE_M, device)
+        nm = _num_tiles_tensor(M_ceil // row_group, device)
         # Output buffer is M_ceil rows; a caller dest= (M*H) can only back it unpadded.
         dest_buf = dest if M_ceil == M else None
         outputs = (_dest_buffer(dest_buf, M_ceil, H, x.dtype, device),)
