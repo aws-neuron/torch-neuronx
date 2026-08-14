@@ -2025,6 +2025,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             std::make_unique<at::neuron::OperationContext>(std::move(compile_kernel), "");
 
         // Submit for compilation via proper stream infrastructure
+        torch_neuronx::maybe_lazy_init();
         auto stream = at::neuron::getCurrentNeuronStream();
         at::neuron::SubmitOperationContext(stream, std::move(context));
         return cache_key;

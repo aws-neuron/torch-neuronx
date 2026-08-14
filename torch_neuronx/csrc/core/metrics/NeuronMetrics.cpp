@@ -675,8 +675,10 @@ void RecordOOMFailure(int device_id, size_t requested_size, c10::StreamId stream
 // =============================================================================
 
 DeviceMemoryStatsRegistry& DeviceMemoryStatsRegistry::Instance() {
-  static DeviceMemoryStatsRegistry instance;
-  return instance;
+  // Intentionally process-lifetime: segment-pool teardown can record metrics during static
+  // destruction. This matches NeuronMetricsArena.
+  static DeviceMemoryStatsRegistry* instance = new DeviceMemoryStatsRegistry();
+  return *instance;
 }
 
 DeviceMemoryStats& DeviceMemoryStatsRegistry::GetDeviceStats(int device_index) {
