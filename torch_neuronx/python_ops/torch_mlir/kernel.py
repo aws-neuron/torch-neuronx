@@ -22,7 +22,6 @@ from torch.utils._filelock import FileLock
 from torch_neuronx import _C
 from torch_neuronx.int64_policy import is_packed_int64_mode
 from torch_neuronx.kernels.base import BaseNeuronKernel
-from torch_neuronx.kernels.compiler_config import CompilerConfig
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
     FunctionalizeCopyInplacePass,
@@ -36,7 +35,6 @@ from torch_neuronx.packed_storage import (
     packed_physical_view,
 )
 from torch_neuronx.python_ops import io_tensor
-from torch_neuronx.python_ops.compilation import CompilationCache, HloCompiler
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR, CachedHLO
 from torch_neuronx.python_ops.nki_kernels.stride2_gather import packed_gather_nki
 from torch_neuronx.python_ops.schema_utils import is_inplace_op
@@ -152,7 +150,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         op_name: str,
         static_argnums: tuple[int, ...] | None = None,
         static_argnames: tuple[str, ...] | None = None,
-        compiler_config: CompilerConfig | None = None,
         output_params: tuple[str, ...] | None = None,
         has_collectives: bool = False,
     ):
@@ -172,8 +169,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         # Initialize components
         self.mlir_compiler = TorchMlirCompiler()
-        self.hlo_compiler = HloCompiler(compiler_config)
-        self.cache = CompilationCache()
         self.hlo_cache = {}
         self.arg_processor = ArgumentProcessor(static_argnames)
         self.output_handler = BaseOutputHandler()

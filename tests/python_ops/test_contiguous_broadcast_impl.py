@@ -283,9 +283,9 @@ class TestContiguousBroadcast:
             kernel = orig_get_kernel(self)
 
             def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size(kernel)
+                orig_cache_size = get_cache_size()
                 result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size(kernel)
+                updated_cache_size = get_cache_size()
                 if updated_cache_size > orig_cache_size:
                     compile_called["count"] += 1
                 return result

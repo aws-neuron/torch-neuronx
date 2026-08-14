@@ -10,7 +10,7 @@ directory management.
 > graphs of this package, ask codegraph (it returns current verbatim source —
 > never stale):
 > `codegraph_explore "BaseNeuronKernel CompilerSubprocess get_or_compile NEFFCacheKey CompilationJob neuronx_cc_wrapper"`.
-> The `kernels/` file tree, the `execute_neff` / `get_or_compile` step flows,
+> The `kernels/` file tree, the `get_or_compile` step flow,
 > the `CompilerConfig` dataclass fields, and the `CompilationJob` artifact-path
 > table are all recoverable that way. This doc keeps only what codegraph can't
 > express: defaults, gated behaviors, multi-process invariants, and which human
@@ -50,8 +50,9 @@ live in the dataclass.
 
 Three lowering paths converge on the same NEFF cache:
 - **Eager / torch_mlir** — `python_ops/torch_mlir/kernel.py::TorchMlirKernel`
-  subclasses `BaseNeuronKernel`; `_get_or_compile_neff` builds a
-  `CompilationJob`, calls `CompilerSubprocess`, stashes in `_neff_cache`.
+  subclasses `BaseNeuronKernel` and `lower()`s the op to StableHLO, then submits
+  it to the C++ `OperationExecutionEngine`, which drives compilation and NEFF
+  caching through the C++ `CompilationCache` (see `AI-csrc.md`).
 - **Dynamo** — `CompileGraph.compile` computes its own content key and calls
   `_C.compile_graph`; the C++ `CompilationCache` → `LocalCompilationBackend`
   runs `neuronx-cc` via the wrapper.
@@ -85,5 +86,5 @@ NEFF cache: stores StableHLO bytes + IO spec so AOTAutograd's
 - [AI-dynamo-backend.md](AI-dynamo-backend.md) — `CompileGraph` entry point.
 - [AI-csrc.md](AI-csrc.md) — C++ `CompilationCache`, `LocalCompilationBackend`,
   `PersistentCacheBackend` this layer sits on.
-- [AI-runtime-api.md](AI-runtime-api.md) — the `_C._nrt_*` bindings
-  `execute_neff` calls.
+- [AI-runtime-api.md](AI-runtime-api.md) — the `_C._nrt_*` runtime bindings the
+  C++ execution engine drives.
