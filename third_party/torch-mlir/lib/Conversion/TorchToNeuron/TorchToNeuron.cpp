@@ -1960,6 +1960,11 @@ public:
     if (inputRank != 4)
       return rewriter.notifyMatchFailure(op, "expected 4D input tensor");
 
+    if (inputShape[2] == Torch::kUnknownSize ||
+        inputShape[3] == Torch::kUnknownSize)
+      return rewriter.notifyMatchFailure(
+          op, "dynamic spatial dimensions not supported in im2col decomposition");
+
     SmallVector<int64_t> kernelSize, stride, padding, dilation;
     bool ceilMode;
 
@@ -2245,8 +2250,21 @@ public:
       target.addIllegalOp<Torch::AtenQuantizeMxOp>();
       patterns.add<ConvertNeuronQuantizeMxOp>(typeConverter, context);
 
-      // Decomposition patterns
-      target.addIllegalOp<Torch::AtenMaxPool2dWithIndicesOp>();
+      // Decomposition patterns:
+      // - Static shapes are decomposed here via the im2col lowering
+      // - Dynamic spatial dimensions are left legal so they
+      //   fall through to the default Torch->Stablehlo decomposition
+      target.addDynamicallyLegalOp<Torch::AtenMaxPool2dWithIndicesOp>(
+          [](Torch::AtenMaxPool2dWithIndicesOp op) {
+            auto inputTy = cast<BaseTensorType>(op.getSelf().getType());
+            if (!inputTy.hasSizes())
+              return true;
+            auto inputShape = inputTy.getSizes();
+            if (inputShape.size() != 4)
+              return true;
+            return inputShape[2] == Torch::kUnknownSize ||
+                   inputShape[3] == Torch::kUnknownSize;
+          });
       patterns.add<DecomposeAtenMaxPool2dWithIndicesOp>(context);
 
       result =
