@@ -941,6 +941,74 @@ def adaptive_avg_pool3d_backward_decomp(grad_output, self):
     return _adaptive_avg_pool3d_backward_impl(grad_output, self)
 
 
+def _is_static_contiguous_access(size, stride, storage_offset):
+    """True when `stride` is concrete and effectively the row-major stride of `size`.
+
+    Such an access is one contiguous span, so a write is a concat. Symbolic values report
+    False: comparing one would plant a shape guard or raise on an unbacked symint.
+    """
+    if not all(isinstance(v, int) for v in (storage_offset, *size, *stride)):
+        return False
+    sizes = list(size)
+    row_major = [math.prod(sizes[d + 1 :]) for d in range(len(sizes))]
+    # A size-1 dim's only index is 0, so its stride never reaches an address.
+    return all(st == rm or sz == 1 for st, rm, sz in zip(stride, row_major, sizes, strict=False))
+
+
+def _strided_runs_plan(size, stride, storage_offset, numel):
+    """Plan an access as a reshape to `shape` plus a `run`-long slice of its last axis, or None.
+
+    A size-1 dim's only index is 0, so its stride is dropped before the layout is classified.
+    """
+    if not all(isinstance(v, int) for v in (storage_offset, *size, *stride)) or 0 in size:
+        return None
+    sizes = [s for s in size if s != 1]
+    strides = [t for s, t in zip(size, stride, strict=False) if s != 1]
+    if any(s < 0 for s in strides):
+        return None
+    if not sizes:
+        return [1], 1
+    row_major = [math.prod(sizes[d + 1 :]) for d in range(len(sizes))]
+    # Split after the last non-row-major dim, which leaves the inner run as long as possible.
+    split = max((d + 1 for d in range(len(sizes)) if strides[d] != row_major[d]), default=1)
+    run, pitch = row_major[split - 1], strides[split - 1]
+    shape = [*sizes[:split], pitch]
+    # A pitch under run would overlap consecutive runs; outer strides must be the block's own.
+    expected = [math.prod([*sizes[d + 1 : split], pitch]) for d in range(split)]
+    if pitch < run or strides[:split] != expected or storage_offset + math.prod(shape) > numel:
+        return None
+    return shape, run
+
+
+def _flatten_in_storage_order(t):
+    """Flatten `t` in storage order, returning (flat, base_shape, inverse_perm)."""
+    sizes, strides = list(t.shape), list(t.stride())
+    perm = None
+    if all(isinstance(v, int) for v in (*sizes, *strides)) and 0 not in sizes:
+        candidate = sorted(range(len(sizes)), key=lambda d: -strides[d])
+        # Dense: each stride is the product of the extents inside it; a size-1 dim carries any.
+        dense, packed = True, 1
+        for d in reversed(candidate):
+            if sizes[d] == 1:
+                continue
+            if strides[d] != packed:
+                dense = False
+                break
+            packed *= sizes[d]
+        if dense:
+            perm = candidate
+
+    # An identity perm would emit a permute pair that cancels; contiguous() suffices.
+    if perm is None or perm == list(range(len(perm))):
+        return torch.reshape(t.contiguous(), (-1,)), t.shape, None
+
+    inverse = [0] * len(perm)
+    for position, dim in enumerate(perm):
+        inverse[dim] = position
+    base = t.permute(perm)
+    return torch.reshape(base, (-1,)), base.shape, inverse
+
+
 @register_decomposition([aten.as_strided.default])
 def as_strided(input_tensor, size, stride, storage_offset=0):
     """
@@ -951,6 +1019,9 @@ def as_strided(input_tensor, size, stride, storage_offset=0):
 
     The pattern computes indices for each dimension and accumulates them to create
     the final indexing pattern, then uses advanced indexing to gather elements.
+
+    That costs one int64 index per output element, so a contiguous reinterpretation of
+    a large buffer is served by narrow + reshape instead.
 
     Args:
         input_tensor: Input tensor to stride
@@ -964,9 +1035,23 @@ def as_strided(input_tensor, size, stride, storage_offset=0):
     # Get the device from the input tensor to ensure all intermediate tensors
     # are created on the same device
     device = input_tensor.device
+    if storage_offset is None:
+        storage_offset = 0
 
-    # Step 1: Flatten input tensor
-    input_flat = torch.reshape(input_tensor, (-1,))
+    # The read addresses storage, not logical order; see _flatten_in_storage_order.
+    input_flat, _, _ = _flatten_in_storage_order(input_tensor)
+
+    # Fast path: an access made of contiguous runs is a slice, so it needs no gather.
+    plan = _strided_runs_plan(size, stride, storage_offset, input_flat.numel())
+    if plan is not None:
+        shape, run = plan
+        block = input_flat
+        # A full-range narrow still lowers to dynamic_slice, so reshape alone is cheaper.
+        if storage_offset or math.prod(shape) != input_flat.numel():
+            block = torch.narrow(input_flat, 0, storage_offset, math.prod(shape))
+        if run != shape[-1]:
+            block = torch.narrow(torch.reshape(block, shape), -1, 0, run)
+        return torch.reshape(block, size)
 
     # Step 2: Initialize index tensor (will accumulate indices for each dimension)
     # Start with zeros in the shape of the output, on the same device as input
@@ -2427,11 +2512,35 @@ def lshift_decomp(x, shift):
 
 @register_decomposition([aten.as_strided_scatter.default])
 def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
-    """Decompose as_strided_scatter to index_copy"""
-    # Ensure contiguous to match clone() semantics
-    input = input.contiguous()
-    input_flat = input.flatten()
-    src_flat = src.flatten()
+    """Decompose as_strided_scatter to a concat of the spans around src.
+
+    A contiguous write needs no index tensor, just a concat of src with the spans it does
+    not touch. Everything else falls back to index_copy, one index per written element.
+    """
+    if storage_offset is None:
+        storage_offset = 0
+
+    # The write addresses storage, not logical order; see _flatten_in_storage_order.
+    input_flat, base_shape, inverse = _flatten_in_storage_order(input)
+
+    if _is_static_contiguous_access(size, stride, storage_offset):
+        numel_out = math.prod(size)
+        # Defensive: a view past the end of storage is invalid per aten anyway.
+        if storage_offset + numel_out <= input_flat.numel():
+            # A rank-1 slice_scatter lowers to one DMA descriptor per written element; concat
+            # avoids that. Spans are conditional so no zero-size node lands in the trace.
+            spans = []
+            if storage_offset:
+                spans.append(torch.narrow(input_flat, 0, 0, storage_offset))
+            spans.append(torch.reshape(src, (-1,)).to(input_flat.dtype))
+            tail = input_flat.numel() - storage_offset - numel_out
+            if tail:
+                spans.append(torch.narrow(input_flat, 0, storage_offset + numel_out, tail))
+            result = spans[0] if len(spans) == 1 else torch.cat(spans)
+            out = torch.reshape(result, base_shape)
+            return out if inverse is None else out.permute(inverse)
+
+    src_flat = src.flatten().to(input_flat.dtype)
 
     # Compute linear indices for strided view
     idx = input.new_zeros(size, dtype=torch.long)
@@ -2444,8 +2553,8 @@ def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
 
     flat_indices = idx.flatten() + storage_offset
 
-    result_flat = input_flat.index_copy(0, flat_indices, src_flat)
-    return result_flat.reshape(input.shape)
+    out = input_flat.index_copy(0, flat_indices, src_flat).reshape(base_shape)
+    return out if inverse is None else out.permute(inverse)
 
 
 @register_decomposition([aten.masked_scatter.default])
