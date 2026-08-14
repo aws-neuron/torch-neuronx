@@ -851,10 +851,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
             _,  # q_indices,
             _,  # full_q_num_blocks,
             _,  # full_q_indices,
-            q_block_size,
-            kv_block_size,
-            mask_fn_node,
-        ) = block_mask_node
+        ) = block_mask_node[:10]
+        # PT2.12: (q_block_size, kv_block_size, mask_mod) at [-3], [-2], [-1]
+        # PT2.13: added dq_write_order, dq_write_order_full, dq_kv_order, dq_kv_order_spt
+        #         before block sizes, so block sizes/mask_mod are still at [-3], [-2], [-1]
+        q_block_size = block_mask_node[-3]
+        kv_block_size = block_mask_node[-2]
+        mask_fn_node = block_mask_node[-1]
         if q_block_size != 128 or kv_block_size not in [128, 256, 512]:
             logger.warning(
                 f"Unsupported block size: [{q_block_size}, {kv_block_size}]."
@@ -1084,10 +1087,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
             _,  # q_indices
             _,  # full_q_num_blocks
             _,  # full_q_indices
-            q_block_size,
-            kv_block_size,
-            mask_fn_node,
-        ) = block_mask_node
+        ) = block_mask_node[:10]
+        # PT2.12: (q_block_size, kv_block_size, mask_mod) at [-3], [-2], [-1]
+        # PT2.13: added dq_write_order, dq_write_order_full, dq_kv_order, dq_kv_order_spt
+        #         before block sizes, so block sizes/mask_mod are still at [-3], [-2], [-1]
+        q_block_size = block_mask_node[-3]
+        kv_block_size = block_mask_node[-2]
+        mask_fn_node = block_mask_node[-1]
         self.tile_shape = [q_block_size, kv_block_size]
         if q_block_size != 128 or kv_block_size not in [128, 256, 512]:
             logger.warning(
