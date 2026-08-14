@@ -161,7 +161,9 @@ class TestIndexSelect:
         assert not out.is_contiguous()
         torch.index_select(x, 1, index, out=out)
 
-    @assert_raises(TypeError, match=r"received an invalid combination of arguments")
+    @assert_raises(
+        TypeError, match=r"received an invalid combination of arguments|argument 'dim' must be int"
+    )
     def test_index_select_with_incorrect_value(self):
         """Test index select with index dtype float"""
 
