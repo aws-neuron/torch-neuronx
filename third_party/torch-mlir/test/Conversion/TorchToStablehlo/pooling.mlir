@@ -1114,3 +1114,299 @@ func.func @aten.im2col$uneven_kernel(%arg0: !torch.vtensor<[1,3,32,64],f32>) -> 
     %4 = torch.aten.im2col %arg0, %0, %1, %2, %3 : !torch.vtensor<[1,3,32,64],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.list<int> -> !torch.vtensor<[1,24,594],f32>
     return %4 : !torch.vtensor<[1,24,594],f32>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$static_last_dim(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
+// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[INPUT]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<3x4xf32>, tensor<4x4xf32>) -> tensor<3x4xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<3x4xf32> -> !torch.vtensor<[3,4],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[3,4],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$static_last_dim(%arg0: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+    %int1 = torch.constant.int 1
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int1, %none : !torch.vtensor<[3,4],f32>, !torch.int, !torch.none -> !torch.vtensor<[3,4],f32>
+    return %0 : !torch.vtensor<[3,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$static_non_last_dim(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
+// CHECK:           %[[TRANSPOSED:.*]] = stablehlo.transpose %[[INPUT]], dims = [1, 0] : (tensor<3x4xf32>) -> tensor<4x3xf32>
+// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[TRANSPOSED]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<4x3xf32>, tensor<3x3xf32>) -> tensor<4x3xf32>
+// CHECK:           %[[RESULT:.*]] = stablehlo.transpose %[[DOT]], dims = [1, 0] : (tensor<4x3xf32>) -> tensor<3x4xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<3x4xf32> -> !torch.vtensor<[3,4],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[3,4],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$static_non_last_dim(%arg0: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[3,4],f32>, !torch.int, !torch.none -> !torch.vtensor<[3,4],f32>
+    return %0 : !torch.vtensor<[3,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$dynamic_last_dim(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[3,?],f32>) -> !torch.vtensor<[3,?],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[3,?],f32> -> tensor<3x?xf32>
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[INPUT]], %{{.*}} : tensor<3x?xf32>
+// CHECK:           %[[DIMI64:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIMI64]], %[[DIMI64]] : tensor<2xi64>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[INPUT]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<3x?xf32>, tensor<?x?xf32>) -> tensor<3x?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<3x?xf32> -> !torch.vtensor<[3,?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[3,?],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$dynamic_last_dim(%arg0: !torch.vtensor<[3,?],f32>) -> !torch.vtensor<[3,?],f32> {
+    %int1 = torch.constant.int 1
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int1, %none : !torch.vtensor<[3,?],f32>, !torch.int, !torch.none -> !torch.vtensor<[3,?],f32>
+    return %0 : !torch.vtensor<[3,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$dynamic_non_last_dim(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,4],f32> -> tensor<?x4xf32>
+// CHECK:           %[[TRANSPOSED:.*]] = stablehlo.transpose %[[INPUT]], dims = [1, 0] : (tensor<?x4xf32>) -> tensor<4x?xf32>
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[TRANSPOSED]], %{{.*}} : tensor<4x?xf32>
+// CHECK:           %[[DIMI64:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIMI64]], %[[DIMI64]] : tensor<2xi64>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[TRANSPOSED]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<4x?xf32>, tensor<?x?xf32>) -> tensor<4x?xf32>
+// CHECK:           %[[RESULT:.*]] = stablehlo.transpose %[[DOT]], dims = [1, 0] : (tensor<4x?xf32>) -> tensor<?x4xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<?x4xf32> -> !torch.vtensor<[?,4],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?,4],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$dynamic_non_last_dim(%arg0: !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[?,4],f32>, !torch.int, !torch.none -> !torch.vtensor<[?,4],f32>
+    return %0 : !torch.vtensor<[?,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$static_int(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[5],si32>) -> !torch.vtensor<[5],si64> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[5],si32> -> tensor<5xi32>
+// CHECK:           %[[PROMOTED:.*]] = stablehlo.convert %[[INPUT]] : (tensor<5xi32>) -> tensor<5xi64>
+// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[PROMOTED]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<5xi64>, tensor<5x5xi64>) -> tensor<5xi64>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<5xi64> -> !torch.vtensor<[5],si64>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[5],si64>
+// CHECK:         }
+func.func @torch.aten.cumsum$static_int(%arg0: !torch.vtensor<[5],si32>) -> !torch.vtensor<[5],si64> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[5],si32>, !torch.int, !torch.none -> !torch.vtensor<[5],si64>
+    return %0 : !torch.vtensor<[5],si64>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$rank1_dynamic(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?],f32> -> tensor<?xf32>
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[INPUT]], %{{.*}} : tensor<?xf32>
+// CHECK:           %[[DIMI64:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIMI64]], %[[DIMI64]] : tensor<2xi64>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[INPUT]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<?xf32>, tensor<?x?xf32>) -> tensor<?xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<?xf32> -> !torch.vtensor<[?],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$rank1_dynamic(%arg0: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[?],f32>, !torch.int, !torch.none -> !torch.vtensor<[?],f32>
+    return %0 : !torch.vtensor<[?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$rank3_middle_dim_dynamic(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[2,?,4],f32>) -> !torch.vtensor<[2,?,4],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[2,?,4],f32> -> tensor<2x?x4xf32>
+// CHECK:           %[[TRANSPOSED:.*]] = stablehlo.transpose %[[INPUT]], dims = [0, 2, 1] : (tensor<2x?x4xf32>) -> tensor<2x4x?xf32>
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[TRANSPOSED]], %{{.*}} : tensor<2x4x?xf32>
+// CHECK:           %[[DIMI64:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIMI64]], %[[DIMI64]] : tensor<2xi64>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xf32>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[TRANSPOSED]], %[[TRIL]], contracting_dims = [2] x [0] : (tensor<2x4x?xf32>, tensor<?x?xf32>) -> tensor<2x4x?xf32>
+// CHECK:           %[[RESULT:.*]] = stablehlo.transpose %[[DOT]], dims = [0, 2, 1] : (tensor<2x4x?xf32>) -> tensor<2x?x4xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<2x?x4xf32> -> !torch.vtensor<[2,?,4],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[2,?,4],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$rank3_middle_dim_dynamic(%arg0: !torch.vtensor<[2,?,4],f32>) -> !torch.vtensor<[2,?,4],f32> {
+    %int1 = torch.constant.int 1
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int1, %none : !torch.vtensor<[2,?,4],f32>, !torch.int, !torch.none -> !torch.vtensor<[2,?,4],f32>
+    return %0 : !torch.vtensor<[2,?,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$dynamic_int(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[?],si32>) -> !torch.vtensor<[?],si64> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?],si32> -> tensor<?xi32>
+// CHECK:           %[[PROMOTED:.*]] = stablehlo.convert %[[INPUT]] : (tensor<?xi32>) -> tensor<?xi64>
+// CHECK:           %[[DIM:.*]] = tensor.dim %[[PROMOTED]], %{{.*}} : tensor<?xi64>
+// CHECK:           %[[DIMI64:.*]] = arith.index_cast %[[DIM]] : index to i64
+// CHECK:           %[[SHAPE:.*]] = tensor.from_elements %[[DIMI64]], %[[DIMI64]] : tensor<2xi64>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 1 : (tensor<2xi64>) -> tensor<?x?xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<?x?xi64>, tensor<?x?xi64>) -> tensor<?x?xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<?x?xi1>) -> tensor<?x?xi64>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[PROMOTED]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<?xi64>, tensor<?x?xi64>) -> tensor<?xi64>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<?xi64> -> !torch.vtensor<[?],si64>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[?],si64>
+// CHECK:         }
+func.func @torch.aten.cumsum$dynamic_int(%arg0: !torch.vtensor<[?],si32>) -> !torch.vtensor<[?],si64> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[?],si32>, !torch.int, !torch.none -> !torch.vtensor<[?],si64>
+    return %0 : !torch.vtensor<[?],si64>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.aten.cumsum$dtype_promotion(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[4],f16>) -> !torch.vtensor<[4],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4],f16> -> tensor<4xf16>
+// CHECK:           %[[PROMOTED:.*]] = stablehlo.convert %[[INPUT]] : (tensor<4xf16>) -> tensor<4xf32>
+// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[PROMOTED]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<4xf32>, tensor<4x4xf32>) -> tensor<4xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<4xf32> -> !torch.vtensor<[4],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[4],f32>
+// CHECK:         }
+func.func @torch.aten.cumsum$dtype_promotion(%arg0: !torch.vtensor<[4],f16>) -> !torch.vtensor<[4],f32> {
+    %int0 = torch.constant.int 0
+    %int6 = torch.constant.int 6
+    %0 = torch.aten.cumsum %arg0, %int0, %int6 : !torch.vtensor<[4],f16>, !torch.int, !torch.int -> !torch.vtensor<[4],f32>
+    return %0 : !torch.vtensor<[4],f32>
+}
+
+// -----
+// CHECK-LABEL:   func.func @aten.im2col$dynamic_spatial(
+// CHECK-SAME:      %[[VAL_0:.*]]: !torch.vtensor<[1,3,?,?],f32>) -> !torch.vtensor<[1,27,?],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[1,3,?,?],f32> -> tensor<1x3x?x?xf32>
+// CHECK:           stablehlo.pad
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           chlo.broadcast_multiply
+// CHECK:           chlo.broadcast_multiply
+// CHECK:           chlo.broadcast_add
+// CHECK:           chlo.broadcast_multiply
+// CHECK:           chlo.broadcast_multiply
+// CHECK:           chlo.broadcast_add
+// CHECK:           stablehlo.dynamic_reshape
+// CHECK:           stablehlo.dynamic_reshape
+// CHECK:           stablehlo.concatenate
+// CHECK:           "stablehlo.dynamic_gather"
+// CHECK:           stablehlo.dynamic_reshape
+// CHECK:         }
+func.func @aten.im2col$dynamic_spatial(%arg0: !torch.vtensor<[1,3,?,?],f32>) -> !torch.vtensor<[1,27,?],f32> {
+    %int3 = torch.constant.int 3
+    %int1 = torch.constant.int 1
+    %0 = torch.prim.ListConstruct %int3, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
+    %1 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %2 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %3 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %4 = torch.aten.im2col %arg0, %0, %1, %2, %3 : !torch.vtensor<[1,3,?,?],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.list<int> -> !torch.vtensor<[1,27,?],f32>
+    return %4 : !torch.vtensor<[1,27,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @aten.im2col$dynamic_spatial_with_padding(
+// CHECK-SAME:      %[[VAL_0:.*]]: !torch.vtensor<[?,?,?,?],f32>) -> !torch.vtensor<[?,?,?],f32> {
+// CHECK:           stablehlo.pad
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           "stablehlo.dynamic_gather"
+// CHECK:           stablehlo.dynamic_reshape
+// CHECK:         }
+func.func @aten.im2col$dynamic_spatial_with_padding(%arg0: !torch.vtensor<[?,?,?,?],f32>) -> !torch.vtensor<[?,?,?],f32> {
+    %int2 = torch.constant.int 2
+    %int1 = torch.constant.int 1
+    %0 = torch.prim.ListConstruct %int2, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
+    %1 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %2 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %3 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %4 = torch.aten.im2col %arg0, %0, %1, %2, %3 : !torch.vtensor<[?,?,?,?],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.list<int> -> !torch.vtensor<[?,?,?],f32>
+    return %4 : !torch.vtensor<[?,?,?],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @aten.im2col$dynamic_spatial_stride2(
+// CHECK-SAME:      %[[VAL_0:.*]]: !torch.vtensor<[1,4,?,?],f32>) -> !torch.vtensor<[1,16,?],f32> {
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_iota
+// CHECK:           stablehlo.dynamic_broadcast_in_dim
+// CHECK:           chlo.broadcast_multiply
+// CHECK:           chlo.broadcast_add
+// CHECK:           "stablehlo.dynamic_gather"
+// CHECK:           stablehlo.dynamic_reshape
+// CHECK:         }
+func.func @aten.im2col$dynamic_spatial_stride2(%arg0: !torch.vtensor<[1,4,?,?],f32>) -> !torch.vtensor<[1,16,?],f32> {
+    %int2 = torch.constant.int 2
+    %int0 = torch.constant.int 0
+    %int1 = torch.constant.int 1
+    %0 = torch.prim.ListConstruct %int2, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
+    %1 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %2 = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+    %3 = torch.prim.ListConstruct %int2, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
+    %4 = torch.aten.im2col %arg0, %0, %1, %2, %3 : !torch.vtensor<[1,4,?,?],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.list<int> -> !torch.vtensor<[1,16,?],f32>
+    return %4 : !torch.vtensor<[1,16,?],f32>
+}
+
+// -----
+
+// Verify MaxPool2dWithIndices with dynamic spatial dims lowers via ReduceWindow
+// (the TorchToNeuron decomposition bails out, so it falls through to TorchToStablehlo).
+// CHECK-LABEL:   func.func @torch.aten.max_pool2d_with_indices$dynamic_spatial(
+// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[1,1,?,?],f32>) -> (!torch.vtensor<[1,1,?,?],f32>, !torch.vtensor<[1,1,?,?],si64>) {
+// CHECK:           stablehlo.reduce_window
+// CHECK:         }
+func.func @torch.aten.max_pool2d_with_indices$dynamic_spatial(%arg0: !torch.vtensor<[1,1,?,?],f32>) -> (!torch.vtensor<[1,1,?,?],f32>, !torch.vtensor<[1,1,?,?],si64>) {
+    %int2 = torch.constant.int 2
+    %int0 = torch.constant.int 0
+    %int1 = torch.constant.int 1
+    %false = torch.constant.bool false
+    %0 = torch.prim.ListConstruct %int2, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
+    %1 = torch.prim.ListConstruct %int2, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
+    %2 = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+    %3 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+    %result0, %result1 = torch.aten.max_pool2d_with_indices %arg0, %0, %1, %2, %3, %false : !torch.vtensor<[1,1,?,?],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool -> !torch.vtensor<[1,1,?,?],f32>, !torch.vtensor<[1,1,?,?],si64>
+    return %result0, %result1 : !torch.vtensor<[1,1,?,?],f32>, !torch.vtensor<[1,1,?,?],si64>
+}
+
+// -----
+
