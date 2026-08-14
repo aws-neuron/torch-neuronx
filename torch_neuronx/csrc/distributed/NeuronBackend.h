@@ -162,6 +162,22 @@ class NeuronBackend : public c10d::Backend {
                            const std::vector<std::vector<int>>& replica_groups, int world_size,
                            c10::intrusive_ptr<NeuronWork>& work);
 
+  // Submit a variable-split (uneven) all-to-all via the native NKI all_to_all_v kernel.
+  // Enforces the world-size / replica-group start-rank / LNC=2 guards, then invokes the
+  // Python driver, which sends exactly the per-rank row counts in `input_split_sizes` and
+  // receives `output_split_sizes` (no send-side padding). `input_tensor` must be contiguously
+  // packed by destination rank along dim 0. The output may be one rank-ordered tensor or the
+  // caller's per-rank output list.
+  // Throws on guard failure or kernel error; does NOT create or finish the Work. Shared by
+  // both `alltoall` (list form, unequal chunks) and `alltoall_base` (uneven splits).
+  void SubmitNkiAllToAllV(at::Tensor& output_tensor, at::Tensor& input_tensor,
+                          const std::vector<int64_t>& output_split_sizes,
+                          const std::vector<int64_t>& input_split_sizes);
+  void SubmitNkiAllToAllV(std::vector<at::Tensor>& output_tensors, at::Tensor& input_tensor,
+                          const std::vector<int64_t>& output_split_sizes,
+                          const std::vector<int64_t>& input_split_sizes);
+  std::vector<std::vector<int>> ValidateNkiAllToAllV();
+
   // Resolve a `c10d::ReduceOp` to the integer reduce code used by the submit path.
   // For `PREMUL_SUM`, scales the provided tensors in-place by the supplement's factor
   // and returns `SUM`. For all other ops, returns the underlying `RedOpType` unchanged

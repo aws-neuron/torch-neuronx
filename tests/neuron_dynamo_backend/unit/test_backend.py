@@ -1287,3 +1287,100 @@ class TestResolveModelName:
         result = backend._resolve_model_name({self._MODEL_NAME_KEY: ""})
         assert result == _MOCK_GLOBAL_MODEL_NAME
         mock_get_model_name.assert_called_once()
+
+
+class TestHasCollectivesInGraph:
+    @staticmethod
+    def _graph_with_call(target, kwargs=None):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        node = graph.call_function(target, args=(x,), kwargs=kwargs or {})
+        graph.output(node)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    def test_collective_nki_hop_promotes_graph(self):
+        from torch_neuronx.nki_hop import nki_kernel_wrapper
+
+        gm = self._graph_with_call(nki_kernel_wrapper, {"has_collectives": True})
+
+        assert backend._has_collectives_in_graph(gm) is True
+
+    def test_proxy_trace_derives_hop_metadata_from_nki_config(self, monkeypatch):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        import torch_neuronx.nki_hop as nki_hop
+
+        dconfig = MagicMock(
+            backend_config_b64=b"",
+            has_collectives=True,
+            operand_output_aliases={},
+        )
+        output_spec = MagicMock(dtype=torch.float32, shape=(2,))
+        dconfig.output_specs = [output_spec]
+
+        kernel = MagicMock()
+        kernel.__name__ = "collective_kernel"
+        kernel_idx = 0
+        monkeypatch.setattr(nki_hop.kernel_registry, "get_kernel", lambda _: kernel)
+        monkeypatch.setattr(nki_hop, "get_kernel_config", lambda *args, **kwargs: dconfig)
+
+        def fn(x):
+            return nki_hop.nki_kernel_wrapper(
+                kernel_idx=kernel_idx,
+                grid=(),
+                backend_config="",
+                operand_output_aliases={},
+                args=(x,),
+                arg_names=("x",),
+                constant_args_key=-1,
+            )
+
+        gm = make_fx(fn, tracing_mode="fake")(torch.randn(2))
+
+        hop = next(node for node in gm.graph.nodes if node.target is nki_hop.nki_kernel_wrapper)
+        assert hop.kwargs["has_collectives"] is True
+
+    def test_functionalization_refreshes_hop_metadata_from_nki_config(self, monkeypatch):
+        import contextlib
+
+        import torch_neuronx.nki_hop as nki_hop
+
+        dconfig = MagicMock(
+            backend_config_b64=b"",
+            has_collectives=True,
+            operand_output_aliases={},
+        )
+        hop = MagicMock(return_value=torch.empty(2))
+        monkeypatch.setattr(nki_hop, "get_kernel_config", lambda *args, **kwargs: dconfig)
+        monkeypatch.setattr(nki_hop, "nki_kernel_wrapper", hop)
+
+        ctx = MagicMock()
+        ctx.unwrap_tensors.side_effect = lambda tensor: tensor
+        ctx.redispatch_to_next.return_value = contextlib.nullcontext()
+        ctx.wrap_tensors.side_effect = lambda tensors: tensors
+
+        nki_hop.nki_kernel_wrapper_functionalize(
+            ctx,
+            kernel_idx=0,
+            grid=(),
+            backend_config="",
+            operand_output_aliases={},
+            args=(torch.randn(2),),
+            arg_names=("x",),
+            constant_args_key=-1,
+            has_collectives=False,
+        )
+
+        assert hop.call_args.kwargs["has_collectives"] is True
+
+    def test_noncollective_nki_hop_does_not_promote_graph(self):
+        from torch_neuronx.nki_hop import nki_kernel_wrapper
+
+        gm = self._graph_with_call(nki_kernel_wrapper, {"has_collectives": False})
+
+        assert backend._has_collectives_in_graph(gm) is False
+
+    def test_c10d_collective_still_promotes_graph(self):
+        gm = self._graph_with_call(torch.ops._c10d_functional.all_reduce.default)
+
+        assert backend._has_collectives_in_graph(gm) is True

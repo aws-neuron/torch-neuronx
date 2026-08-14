@@ -4,10 +4,14 @@
 #include <memory>
 #include <vector>
 
+#include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
+#include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
@@ -21,6 +25,16 @@ class NRTHandlerTest : public ::testing::Test {
  protected:
   void SetUp() override {
     mock_session_ = std::make_unique<MockNRTSession>();
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
+    c10_neuron::reset_distributed_state();
+    c10_neuron::set_world_size(4);
+    c10_neuron::set_rank(1);
+    NeuronResourceManager::Instance().GetModelHandleCache().Clear();
 
     // Create test tensors
     input_tensor_ = create_test_tensor({2, 3});
@@ -32,7 +46,15 @@ class NRTHandlerTest : public ::testing::Test {
     neff_bytes_ = {0x4E, 0x45, 0x46, 0x46, 0x01, 0x02, 0x03, 0x04};
   }
 
-  void TearDown() override { mock_session_.reset(); }
+  void TearDown() override {
+    NeuronResourceManager::Instance().GetModelHandleCache().Clear();
+    c10_neuron::reset_distributed_state();
+    mock_session_.reset();
+  }
+
+  void AttachCachedNeff(at::neuron::CompilableKernelExecution& kernel) {
+    kernel.SetCachedNeff(NeffBytesPtr(&neff_bytes_, CacheEntryGuard{}));
+  }
 
   std::unique_ptr<MockNRTSession> mock_session_;
   torch::Tensor input_tensor_;
@@ -52,10 +74,35 @@ TEST_F(NRTHandlerTest, ExecutionConfigConstruction) {
   EXPECT_EQ(config2.num_cores, 4);
 }
 
-// Note: Full integration tests for ExecuteCompilableKernel would require
-// mocking NeuronResourceManager and the full tensor allocation stack.
-// These tests focus on the ExecutionResult and ExecutionConfig structures.
-// For full coverage, integration tests with actual NRT would be needed.
+TEST_F(NRTHandlerTest, PlainKernelUsesPlainModelLoader) {
+  MockCompilableKernelExecution kernel("plain_kernel", "", "", false);
+  AttachCachedNeff(kernel);
+  auto* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
+
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, neff_bytes_.size(), 0, 1, _))
+      .WillOnce(DoAll(SetArgPointee<4>(fake_model), Return(NRT_SUCCESS)));
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load_collectives(_, _, _, _, _, _, _)).Times(0);
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
+
+  auto model = NRTHandler::GetOrLoadModel(kernel, NRTHandler::ExecutionConfig(0, 1));
+
+  EXPECT_EQ(model.get(), fake_model);
+}
+
+TEST_F(NRTHandlerTest, CollectiveKernelUsesCollectiveModelLoader) {
+  MockCompilableKernelExecution kernel("collective_kernel", "", "", true);
+  AttachCachedNeff(kernel);
+  auto* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xBCDE);
+
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_load_collectives(_, neff_bytes_.size(), 0, 1, 1, 4, _))
+      .WillOnce(DoAll(SetArgPointee<6>(fake_model), Return(NRT_SUCCESS)));
+  EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
+
+  auto model = NRTHandler::GetOrLoadModel(kernel, NRTHandler::ExecutionConfig(0, 1));
+
+  EXPECT_EQ(model.get(), fake_model);
+}
 
 TEST_F(NRTHandlerTest, ExecutionConfigCopy) {
   NRTHandler::ExecutionConfig config1(1, 2);
