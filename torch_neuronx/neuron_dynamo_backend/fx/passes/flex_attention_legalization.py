@@ -749,12 +749,13 @@ class FlexAttentionLegalization(NeuronFXPass):
             forward_score_mod_module = getattr(gm, forward_score_mod_name, None)
 
         # Get mask_mod from block_mask if present
+        # mask_mod is always the last element: index 12 in PT2.12, index 16 in PT2.13
         if (
             isinstance(block_mask_node, tuple)
-            and len(block_mask_node) > 12
-            and hasattr(block_mask_node[12], "target")
+            and len(block_mask_node) >= 13
+            and hasattr(block_mask_node[-1], "target")
         ):
-            mask_fn_node = block_mask_node[12]
+            mask_fn_node = block_mask_node[-1]
             forward_mask_mod_module = getattr(gm, mask_fn_node.target, None)
 
         # Get shape information
