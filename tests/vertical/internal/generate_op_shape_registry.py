@@ -508,6 +508,87 @@ def collect_from_cache_keys_file(path: str) -> list[ParsedCacheKey]:
     return results
 
 
+# ── Per-op annotators ───────────────────────────────────────────────────────
+#
+# Cache keys record only [shape]:dtype:S(strides) — never tensor values (see
+# AppendTensor in torch_neuronx/csrc/core/cache/CacheKeyGenerator.cpp). Ops
+# whose implementations impose value-level constraints (alignment, bounds,
+# consistency) can't be safely sampled from a bare shape/dtype spec: the test
+# would generate random values that violate the constraint.
+#
+# Annotators inject the missing value-generation metadata into arg_shapes so
+# _tensor_from_spec produces valid samples. Keyed by base op name so one entry
+# covers every overload. Register a new annotator here when an op fails the
+# coverage sweep with an error the shape parser structurally cannot avoid.
+
+
+def _annotate_grouped_mm(arg_shapes: dict) -> dict:
+    """offs must be sorted + multiple of 128 (NKI tile alignment)."""
+    offs = arg_shapes.get("offs")
+    if not isinstance(offs, dict) or "multiple_of" in offs:
+        return arg_shapes
+    self_spec = arg_shapes.get("self")
+    self_shape = self_spec.get("shape") if isinstance(self_spec, dict) else self_spec
+    if not isinstance(self_shape, list | tuple) or not self_shape:
+        return arg_shapes
+    # `offs * 128` must land in [0, self.shape[0]]; generate uniform in
+    # [0, self.shape[0] // 128 + 1) so the sorted, x128 result fits.
+    t_dim = int(self_shape[0])
+    return {
+        **arg_shapes,
+        "offs": {
+            **offs,
+            "multiple_of": 128,
+            "sorted": True,
+            "low": 0,
+            "high": max(1, t_dim // 128 + 1),
+        },
+    }
+
+
+def _annotate_index(arg_shapes: dict) -> dict:
+    """Set each index's ``high`` to the corresponding self dim so random fill
+    stays in bounds — critical for size-1 dims where the default ``high=4`` is
+    always out of range."""
+    self_spec = arg_shapes.get("self")
+    self_shape = self_spec.get("shape") if isinstance(self_spec, dict) else self_spec
+    indices = arg_shapes.get("indices")
+    if not isinstance(self_shape, list | tuple) or not isinstance(indices, list | tuple):
+        return arg_shapes
+    new_indices = []
+    for i, idx in enumerate(indices):
+        if isinstance(idx, dict) and "high" not in idx and i < len(self_shape):
+            new_indices.append({**idx, "low": 0, "high": max(1, int(self_shape[i]))})
+        else:
+            new_indices.append(idx)
+    return {**arg_shapes, "indices": new_indices}
+
+
+def _annotate_repeat_interleave(arg_shapes: dict) -> dict:
+    """Drop the recorded ``output_size``: it was consistent with the model's
+    real repeats at trace time, but the test generates random repeats whose
+    sum won't match. Letting output_size be None makes the runtime derive it
+    from the actual sample."""
+    if arg_shapes.get("output_size") is None:
+        return arg_shapes
+    return {**arg_shapes, "output_size": None}
+
+
+_ANNOTATORS = {
+    "_grouped_mm": _annotate_grouped_mm,
+    "index": _annotate_index,
+    "repeat_interleave": _annotate_repeat_interleave,
+}
+
+
+def _annotate(op_name: str, arg_shapes: dict) -> dict:
+    """Apply per-op annotator, if any. Returns arg_shapes unchanged when no
+    annotator is registered for the base op name."""
+    base = op_name.replace("aten::", "").split(".", 1)[0]
+    fn = _ANNOTATORS.get(base)
+    return fn(arg_shapes) if fn else arg_shapes
+
+
 def build_registry(entries: list[ParsedCacheKey], existing: list | None = None) -> list[dict]:
     """Build flat registry with named arg_shapes, deduplicating."""
     seen: set[tuple[str, str]] = set()
@@ -518,7 +599,7 @@ def build_registry(entries: list[ParsedCacheKey], existing: list | None = None) 
             registry.append(e)
 
     for entry in entries:
-        arg_shapes = _build_arg_shapes(entry.op_name, entry)
+        arg_shapes = _annotate(entry.op_name, _build_arg_shapes(entry.op_name, entry))
         key = (entry.op_name, json.dumps(arg_shapes, sort_keys=True, default=str))
         if key in seen:
             continue
