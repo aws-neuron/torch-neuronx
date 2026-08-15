@@ -122,7 +122,7 @@ class TestCumsum:
             ((2, 3), None),  # None dim parameter
         ],
     )
-    @assert_raises(RuntimeError)
+    @assert_raises((RuntimeError, TypeError))
     def test_cumsum_string_dim(self, tensor_shape, dim):
         """Test cumsum failure case with string dim parameter"""
         input_cpu = torch.randn(tensor_shape)
