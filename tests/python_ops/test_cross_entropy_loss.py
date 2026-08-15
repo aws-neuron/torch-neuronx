@@ -1,5 +1,6 @@
 """Test that cross_entropy operation is properly registered with PyTorch dispatcher."""
 
+import os
 import re
 
 import pytest
@@ -7,7 +8,13 @@ import torch
 import torch.nn.functional as functional
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+from tests.utils.neuron_test_utils import (
+    assert_op_runs_on_neuron,
+    count_cpu_bounce_calls,
+    track_neuron_ops,
+)
+
+_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
 
 
 def _run_cross_entropy(logits_cpu, targets_cpu, backward=False, rtol=1e-4, atol=1e-4, **kwargs):
@@ -432,3 +439,73 @@ class TestCrossEntropy:
                 logits_neuron.grad.dtype == dtype
             ), f"Grad dtype {logits_neuron.grad.dtype} != {dtype}"
             assert torch.allclose(logits_neuron.grad.cpu(), logits_cpu.grad, rtol=1e-2, atol=1e-2)
+
+    # ── Input-validation shape stability (regression) ────────────────────
+    # `_validate_ce_inputs` used to bounds-check targets via boolean-mask
+    # indexing (`target[target != ignore_index]`).  That is nonzero-backed:
+    # the output shape depends on tensor *values*, so the number of ignored
+    # targets in a batch changed the traced shape and forced a fresh compile
+    # on every step.  Real SFT batches vary their padding token count
+    # constantly, so this recompiled forever and device utilization sat near
+    # zero.  The validation itself must stay -- the .tolist() sync forces the
+    # Dynamo graph break that keeps aten::cross_entropy_loss off the compiled
+    # path (it has no Meta kernel) -- so these tests pin the shape-stability
+    # and sync-count properties rather than the validation's absence.
+
+    def test_cross_entropy_no_recompile_on_varying_ignore_count(self):
+        """Varying the *count* of ignored targets at a fixed shape must not
+        add compilations."""
+        n_classes = 128
+        targets_cpu = torch.randint(0, n_classes, (64,))
+        logits = torch.randn(64, n_classes).to("neuron")
+
+        def compile_count():
+            torch.neuron.synchronize()
+            return torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
+
+        # Warm up: the first call compiles for this shape.
+        functional.cross_entropy(logits, targets_cpu.to("neuron"), ignore_index=-100)
+        baseline = compile_count()
+
+        for n_ignored in (0, 7, 31, 63):
+            targets = targets_cpu.clone()
+            targets[:n_ignored] = -100
+            functional.cross_entropy(logits, targets.to("neuron"), ignore_index=-100)
+
+        assert compile_count() == baseline, (
+            "cross_entropy recompiled when the number of ignored targets changed; "
+            "input validation must not use value-dependent (nonzero-backed) shapes"
+        )
+
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="C++ dispatch calls NRT directly from C++, bypassing the Python-level "
+        "monkeypatch in count_cpu_bounce_calls",
+    )
+    def test_cross_entropy_validation_single_host_sync(self):
+        """Validation must transfer the target bounds in one read.
+
+        The bounds check needs two scalars (min and max).  Stacking them before
+        transferring keeps this at a single blocking device->host sync;
+        reverting to two separate ``.item()`` calls doubles the syncs on a path
+        that runs on every step.  Calls the validator directly so the count
+        isolates validation from the loss computation itself.
+        """
+        from torch_neuronx.python_ops.torch_mlir.ops.loss import _validate_ce_inputs
+
+        n_classes = 128
+        logits = torch.randn(64, n_classes).to("neuron")
+        targets = torch.randint(0, n_classes, (64,))
+        targets[:5] = -100
+        targets = targets.to("neuron")
+
+        # Warm up: first call may compile the min/max reduction.
+        _validate_ce_inputs(logits, targets, None, -100, 0.0)
+
+        counts = count_cpu_bounce_calls(
+            lambda: _validate_ce_inputs(logits, targets, None, -100, 0.0)
+        )
+        assert counts["reads"] == 1, (
+            f"target bounds check performed {counts['reads']} device->host reads, "
+            "expected 1: min and max should transfer in a single stacked read"
+        )

@@ -118,15 +118,22 @@ def _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing):
             f"tensor of shape: {list(weight.shape)}"
         )
 
-    if not is_prob_target:
-        valid = target[target != ignore_index]
-        if valid.numel() > 0:
-            max_t = valid.max().item()
-            if max_t >= n_classes:
-                raise IndexError(f"Target {max_t} is out of bounds.")
-            min_t = valid.min().item()
-            if min_t < 0:
-                raise IndexError(f"Target {min_t} is out of bounds.")
+    if not is_prob_target and target.numel() > 0:
+        # Neutralize ignore_index entries by mapping them to 0 rather than
+        # masking them out. Boolean-mask indexing is nonzero-backed, so its
+        # output shape depends on tensor *values* — that forces a recompile
+        # whenever the number of ignored targets changes between steps. This
+        # form keeps the shape static, so it compiles once and hits the NEFF
+        # cache thereafter. The numel() guard preserves the old code's
+        # `valid.numel() > 0` check: max()/min() raise on 0 elements.
+        safe = torch.where(target == ignore_index, torch.zeros_like(target), target)
+        # Stack before transferring: one host sync instead of two, and both
+        # reductions schedule into a single graph rather than serializing.
+        max_t, min_t = torch.stack([safe.max(), safe.min()]).tolist()
+        if max_t >= n_classes:
+            raise IndexError(f"Target {max_t} is out of bounds.")
+        if min_t < 0:
+            raise IndexError(f"Target {min_t} is out of bounds.")
 
 
 def _flatten_spatial(input, target, n_classes, is_prob_target):
