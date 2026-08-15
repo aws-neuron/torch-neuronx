@@ -110,28 +110,68 @@ _OPS_SKIP_COMPILE_DYNAMIC: tuple[str, ...] = (
 )
 
 
-def _requires_named_tensor(op_name: str) -> bool:
-    """True for dimname / names_out overloads (a ``dim``/``names`` arg typed as
-    ``str`` / ``List[str]`` / ``Optional[List[str]]``).
-
-    Named tensors can't be traced through ``torch.compile(backend='neuron')`` —
-    the ``torch.ops.aten.*`` dispatch this suite uses rejects them ("NYI: Named
-    tensors are currently unsupported in TorchScript"). The shape registry omits
-    these overloads (see the "Dimname / names_out variants" note in
-    neuron_shape_defaults_generated.py), but PyTorch's op_db still vends a
-    functional-variant fallback sample, which then surfaces as a misleading
-    ``invalid_sample`` (op_db path) or ``failed_lowering`` (factory ``.names_out``)
-    row. Detecting them here lets the compile test report ``no_input_sample``
-    instead.
-
-    Compile-only on purpose: the eager coverage test may still exercise these
-    via op_db, so this filtering is not applied in the shared NeuronOpInfo layer.
-    """
-    op = _resolve_op(op_name)
-    schema = getattr(op, "_schema", None)
-    if schema is None:
-        return False
-    return any(a.name in ("dim", "names") and "str" in str(a.type) for a in schema.arguments)
+# Curated status overrides from manual triage of the coverage CSV (see
+# failed_lowerings.md). Keyed by exact aten op name (incl. overload) → (status,
+# detail). Ops listed here are NOT executed on device: the test emits the given
+# status with the detail written into the ``error`` column, then skips. This is
+# an xfail-style registry — a curated op will not auto-detect if Neuron later
+# gains support, so prune an entry once the underlying gap is closed.
+_OPS_STATUS_OVERRIDE: dict[str, tuple[str, str]] = {
+    # Data-dependent output shape — cannot trace through a static graph.
+    "aten::_unique2": ("graph_break", "data dependent shape"),
+    "aten::bincount": ("graph_break", "data dependent shape"),
+    "aten::masked_select": ("graph_break", "data dependent shape"),
+    "aten::masked_select.out": ("graph_break", "data dependent shape"),
+    "aten::nonzero": ("graph_break", "data dependent shape"),
+    "aten::nonzero.out": ("graph_break", "data dependent shape"),
+    "aten::unique_consecutive": ("graph_break", "data dependent shape"),
+    "aten::linalg_lstsq.out": ("graph_break", "data dependent shape"),
+    # Upstream torch bug (functionalization assert on in-place fused optimizer).
+    "aten::_fused_adam_": ("graph_break", "torch functionalization bug"),
+    "aten::_fused_adamw_": ("graph_break", "torch functionalization bug"),
+    # Unsupported tracing constructs.
+    "aten::random_.from": ("graph_break", "unsupported"),
+    "aten::sym_storage_offset": ("graph_break", "unsupported"),
+    # No named tensor support
+    "aten::all.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::any.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::cat.names_out": ("graph_break", "no named tensor support"),
+    "aten::cumprod.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::cumsum.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::full.names_out": ("graph_break", "no named tensor support"),
+    "aten::gather.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::index_add.dimname": ("graph_break", "no named tensor support"),
+    "aten::index_copy.dimname": ("graph_break", "no named tensor support"),
+    "aten::index_copy_.dimname": ("graph_break", "no named tensor support"),
+    "aten::index_fill.Dimname_Scalar": ("graph_break", "no named tensor support"),
+    "aten::index_fill.Dimname_Tensor": ("graph_break", "no named tensor support"),
+    "aten::index_fill_.Dimname_Scalar": ("graph_break", "no named tensor support"),
+    "aten::index_fill_.Dimname_Tensor": ("graph_break", "no named tensor support"),
+    "aten::index_select.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::kthvalue.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::logcumsumexp.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::logsumexp.names_out": ("graph_break", "no named tensor support"),
+    "aten::max.names_dim_max": ("graph_break", "no named tensor support"),
+    "aten::mean.names_out": ("graph_break", "no named tensor support"),
+    "aten::median.names_dim_values": ("graph_break", "no named tensor support"),
+    "aten::min.names_dim_min": ("graph_break", "no named tensor support"),
+    "aten::mode.dimname_out": ("graph_break", "no named tensor support"),
+    "aten::nanmedian.names_dim_values": ("graph_break", "no named tensor support"),
+    "aten::norm.names_dtype_out": ("graph_break", "no named tensor support"),
+    "aten::norm.names_out": ("graph_break", "no named tensor support"),
+    "aten::ones.names_out": ("graph_break", "no named tensor support"),
+    "aten::prod.Dimname_out": ("graph_break", "no named tensor support"),
+    "aten::rand.generator_with_names_out": ("graph_break", "no named tensor support"),
+    "aten::rand.names_out": ("graph_break", "no named tensor support"),
+    "aten::randn.generator_with_names_out": ("graph_break", "no named tensor support"),
+    "aten::randn.names_out": ("graph_break", "no named tensor support"),
+    "aten::std.correction_names_out": ("graph_break", "no named tensor support"),
+    "aten::std.names_out": ("graph_break", "no named tensor support"),
+    "aten::sum.DimnameList_out": ("graph_break", "no named tensor support"),
+    "aten::var.correction_names_out": ("graph_break", "no named tensor support"),
+    "aten::var.names_out": ("graph_break", "no named tensor support"),
+    "aten::zeros.names_out": ("graph_break", "no named tensor support"),
+}
 
 
 # Above this many input elements, the float32 CPU oracle's own reduction loses
@@ -558,18 +598,13 @@ class TestTargetOpsCompileCoverage:
             _save_compile_result(result)
             pytest.skip(f"{op_name}: op not found")
 
-        # Named-tensor / dimname overloads aren't traceable through
-        # torch.compile(backend='neuron'); report them as no_input_sample rather
-        # than letting an op_db fallback sample produce a misleading
-        # invalid_sample / failed_lowering row. See _requires_named_tensor.
-        if _requires_named_tensor(op_name):
-            result["error"] = (
-                "no shapes registered (named-tensor overload, not traceable via torch.compile)"
-            )
-            result["status"] = "no_input_sample"
-            result["input_source"] = "pending_registry"
+        override = _OPS_STATUS_OVERRIDE.get(op_name)
+        if override is not None:
+            status, detail = override
+            result["status"] = status
+            result["error"] = detail
             _save_compile_result(result)
-            pytest.skip(f"{op_name}: pending_registry (named-tensor overload)")
+            pytest.skip(f"{op_name}: {status} ({detail})")
 
         try:
             samples = list(op_info.sample_inputs("cpu", torch.float32, requires_grad=False))
