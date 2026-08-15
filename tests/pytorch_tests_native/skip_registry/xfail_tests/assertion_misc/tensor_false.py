@@ -1,8 +1,8 @@
 ASSERTION_MISC_TENSOR_FALSE = [
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_fmod_remainder_by_zero_float_neuron_float32",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_fmod_remainder_by_zero_float_neuron_float64",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_remainder_fmod_large_dividend_neuron_float32",
-    "test_binary_ufuncs.py::TestBinaryUfuncsNEURON::test_remainder_fmod_large_dividend_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_fmod_remainder_by_zero_float_neuron_float32",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_fmod_remainder_by_zero_float_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_remainder_fmod_large_dividend_neuron_float32",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_remainder_fmod_large_dividend_neuron_float64",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs__conversions_polar_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_addcdiv_neuron_float16",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_addcdiv_neuron_float32",

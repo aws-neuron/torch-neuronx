@@ -64,8 +64,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "(autocast cpu graph break)"
         ),
         tests=[
-            "CtxManagerTests::test_autocast_cpu_graph_break",
-            "CtxManagerTests::test_autocast_cpu_graph_break_inner_fn",
+            "*CtxManagerTests::test_autocast_cpu_graph_break*",
+            "*CtxManagerTests::test_autocast_cpu_graph_break_inner_fn*",
             "DynamicShapesCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_dynamic_shapes",
         ],
     ),
@@ -97,7 +97,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Hardcoded CUDA device reference: test uses .to('cuda') directly",
         tests=[
             "DynamicShapesFunctionTests::test_get_device_properties_tensor_device_dynamic_shapes",
-            "FunctionTests::test_get_device_properties_tensor_device",
+            "*FunctionTests::test_get_device_properties_tensor_device*",
         ],
     ),
     SkipGroup(
@@ -123,7 +123,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Torch-MLIR reduction region element-type mismatch in select_scatter"),
         tests=[
             "DynamicShapesReproTests::test_select_scatter_mixed_dtype_dynamic_shapes",
-            "ReproTests::test_select_scatter_mixed_dtype",
+            "*ReproTests::test_select_scatter_mixed_dtype*",
         ],
     ),
     SkipGroup(
@@ -135,7 +135,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=("Torch-MLIR stablehlo.concatenate inferred type incompatibility"),
         tests=[
-            "MiscTests::test_scalar_tensor_is_equivalent_to_symint_list_argument",
+            "*MiscTests::test_scalar_tensor_is_equivalent_to_symint_list_argument*",
         ],
     ),
     SkipGroup(
@@ -196,9 +196,9 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Torch-MLIR lowering failure at aten.uniform"),
         tests=[
             "DynamicShapesReproTests::test_tensor_uniform_dynamic_shapes",
-            "ReproTests::test_randint_out_dynamic",
-            "UnspecTests::test_exponential",
-            "UnspecTests::test_shape_graph_break",
+            "*ReproTests::test_randint_out_dynamic*",
+            "*UnspecTests::test_exponential*",
+            "*UnspecTests::test_shape_graph_break*",
         ],
     ),
     SkipGroup(
@@ -206,7 +206,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesReproTests::test_list_reverse_dynamic_shapes",
             "DynamicShapesReproTests::test_ones_out_dynamic_dynamic_shapes",
-            "ReproTests::test_ones_out_dynamic",
+            "*ReproTests::test_ones_out_dynamic*",
         ],
     ),
     SkipGroup(
@@ -216,8 +216,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=("Torch-MLIR lowering failure at aten.Float"),
         tests=[
-            "DefaultsTests::test_cast_tensor_single_elem",
-            "UnspecTests::test_symfloat_to_tensor",
+            "*DefaultsTests::test_cast_tensor_single_elem*",
+            "*UnspecTests::test_symfloat_to_tensor*",
         ],
     ),
     SkipGroup(
@@ -259,8 +259,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("HOP 'auto_functionalized_v2' not implemented in the FxImporter"),
         tests=[
             "DynamicShapesMiscTests::test_out_variant_custom_op_dynamic_shapes",
-            "MiscTests::test_generate_trivial_abstract_impl",
-            "MiscTests::test_out_variant_custom_op",
+            "*MiscTests::test_generate_trivial_abstract_impl*",
+            "*MiscTests::test_out_variant_custom_op*",
             "NestedGraphBreakLoggingTests::test_nested_generic_ctx_mgr",
         ],
     ),
@@ -271,7 +271,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "AOTAutogradCacheTests::test_invoke_subgraph",
             "GraphDededuplicationTests::test_param_transfer_to_submodule",
             "GraphDededuplicationTests::test_tuple_return",
-            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_distinct_per_invoke_subgraph_raises_neuron",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_distinct_per_invoke_subgraph_raises_neuron*",
             "RegionalInductorInvokeSubgraphTests::test_invoke_subgraph_functionalize_schema_cache",
         ],
     ),
@@ -364,10 +364,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Neuron backend error: name 'sparsity' is not defined",
         tests=[
             "GetItemTests::test_opaque_object_getitem",
-            "HooksTests::test_functools_arg_vary",
-            "HooksTests::test_intermediary_hooks_same_on_aot_eager",
-            "HooksTests::test_intermediary_hooks_same_on_inductor",
-            "HooksTests::test_intermediate_hook_with_closure_aot",
+            "*HooksTests::test_functools_arg_vary*",
+            "*HooksTests::test_intermediary_hooks_same_on_aot_eager*",
+            "*HooksTests::test_intermediary_hooks_same_on_inductor*",
+            "*HooksTests::test_intermediate_hook_with_closure_aot*",
         ],
     ),
     SkipGroup(
@@ -378,7 +378,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Neuron NEFF param_num / output_idx out of bounds",
         tests=[
             "AOTAutogradCacheBundledTests::test_dtensor_cache_hit",
-            "MiscTests::test_builtin_abs",
+            "*MiscTests::test_builtin_abs*",
             "TestNestedTensor::test_basic_autograd",
         ],
     ),
@@ -392,7 +392,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="RecursionError: maximum recursion depth exceeded on Neuron",
         tests=[
             "DynamicShapesReproTests::test_tokenization_dynamic_shapes",
-            "MiscTests::test_sourceless_namedtuple",
+            "*MiscTests::test_sourceless_namedtuple*",
         ],
     ),
     SkipGroup(
@@ -401,14 +401,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "ContextlibContextManagerTests::test_functorch_low_level_gb_False",
             "DynamicShapesNNModuleTests::test_conv_transpose_call_forward_directly_dynamic_shapes",
             "DynamicShapesNNModuleTests::test_conv_transpose_call_super_forward_directly_dynamic_shapes",
-            "NNModuleTests::test_conv_transpose_call_forward_directly",
+            "*NNModuleTests::test_conv_transpose_call_forward_directly*",
         ],
     ),
     SkipGroup(
         reason=("Neuron backend returns unexpected number of outputs " "or wrong error type"),
         tests=[
             "AotAutogradFallbackTests::test_mutation",
-            "DefaultsTests::test_is_vmapped_mutated_tensor_tensor",
+            "*DefaultsTests::test_is_vmapped_mutated_tensor_tensor*",
             "DynamicShapesAotAutogradFallbackTests::test_call_fn_with_non_const_inputs_aot_unsafe_dynamic_shapes",
         ],
     ),
@@ -416,8 +416,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Neuron ShardIndexInjection pass error for " "arange with float32 dtype"),
         tests=[
             "DynamicShapesMiscTests::test_arange_length_with_float32_dtype_dynamic_shapes",
-            "MiscTests::test_arange_length_with_float32_dtype",
-            "UnspecTests::test_mark_unbacked_hint_consistency",
+            "*MiscTests::test_arange_length_with_float32_dtype*",
+            "*UnspecTests::test_mark_unbacked_hint_consistency*",
         ],
     ),
     SkipGroup(
@@ -438,14 +438,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "DynamicShapesFunctionTests::test_compare_constant_and_tensor_dynamic_shapes",
-            "FunctionTests::test_operator_concat",
+            "*FunctionTests::test_operator_concat*",
         ],
     ),
     SkipGroup(
         reason=("FakeTensor / meta tensor device propagation failure " "on Neuron"),
         tests=[
             "DynamicShapesReproTests::test_inplace_add_from_meta_tensor_factory_dynamic_shapes",
-            "ReproTests::test_inplace_add_from_meta_tensor_factory",
+            "*ReproTests::test_inplace_add_from_meta_tensor_factory*",
         ],
     ),
     SkipGroup(
@@ -469,8 +469,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Unsupported: Attempt to trace generator",
         tests=[
-            "HooksTests::test_post_acc_grad_hook",
-            "ActivationCheckpointingViaTagsTestsNEURON::test_tags_must_save_tensor_that_has_backward_hook_neuron",
+            "*HooksTests::test_post_acc_grad_hook*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_tags_must_save_tensor_that_has_backward_hook_neuron*",
         ],
     ),
     SkipGroup(
@@ -492,7 +492,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Assertion failure on Neuron: multithread compile dynamic",
         tests=[
-            "MiscTests::test_multithread_compile_dynamic",
+            "*MiscTests::test_multithread_compile_dynamic*",
         ],
     ),
     SkipGroup(
@@ -504,21 +504,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Expected RuntimeError not raised on Neuron",
         tests=[
-            "ReproTests::test_one_hot_bounds_check_compiled",
-            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_conflict_raises_neuron",
-            "ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_partial_annotation_raises_neuron",
+            "*ReproTests::test_one_hot_bounds_check_compiled*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_conflict_raises_neuron*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_partial_annotation_raises_neuron*",
         ],
     ),
     SkipGroup(
         reason="FunctionalTensor usage without FunctionalTensorMode",
         tests=[
-            "ReproTests::test_trace_functional_tensor_with",
+            "*ReproTests::test_trace_functional_tensor_with*",
         ],
     ),
     SkipGroup(
         reason="Invalid device argument on Neuron",
         tests=[
-            "ReproTests::test_mem_leak_guards",
+            "*ReproTests::test_mem_leak_guards*",
         ],
     ),
     SkipGroup(
@@ -544,13 +544,13 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Neuron compilation failure",
         tests=[
             "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_error_dynamic_shapes",
-            "FunctionTests::test_quantize_per_tensor",
+            "*FunctionTests::test_quantize_per_tensor*",
             "NbFloatTests::test_tensor_dunder_float",
             "NbFloatTests::test_tensor_int_dtype",
             "NbIntTests::test_tensor_float_dtype",
-            "ReproTests::test_fp8_qdq_repeated_modules_no_recompile",
+            "*ReproTests::test_fp8_qdq_repeated_modules_no_recompile*",
             "NestedGraphBreaksReproTests::test_fp8_qdq_repeated_modules_no_recompile_nested_graph_breaks",
-            "MiscTests::test_mutable_mapping_dict_access_pattern",
+            "*MiscTests::test_mutable_mapping_dict_access_pattern*",
             "NestedGraphBreaksMiscTests::test_nan_nested_graph_breaks",
         ],
     ),
@@ -563,13 +563,13 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Unsupported: Failed to convert args/kwargs to proxy",
         tests=[
-            "ReproTests::test_issue164247_backend_eager",
+            "*ReproTests::test_issue164247_backend_eager*",
         ],
     ),
     SkipGroup(
         reason="Numerical precision mismatch on Neuron for float rounding",
         tests=[
-            "UnspecTests::test_unspec_roundtrip_float_input",
+            "*UnspecTests::test_unspec_roundtrip_float_input*",
         ],
     ),
     SkipGroup(
@@ -636,8 +636,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " contains `s64[...] power(...)` which fails compilation."
         ),
         tests=[
-            "MiscTests::test_itertools_accumulate_tensors_builtins",
-            "MiscTests::test_torch_dynamo_codegen_pow",
+            "*MiscTests::test_itertools_accumulate_tensors_builtins*",
+            "*MiscTests::test_torch_dynamo_codegen_pow*",
         ],
     ),
     SkipGroup(
@@ -649,7 +649,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "SubclassTests::test_subclass_dont_invoke_torch_function_on_overridden_method",
             "TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
-            "ActivationCheckpointingViaTagsTestsNEURON::test_frozen_dataclass_pytree_output_neuron",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_frozen_dataclass_pytree_output_neuron*",
         ],
     ),
     SkipGroup(
@@ -660,6 +660,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
+            "TestTwoTensorSubclass::test_subclass_TwoTensor_nested_diff_sizes",
         ],
     ),
     SkipGroup(
@@ -677,7 +678,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_complex.py::ComplexTests::test_rope",
             "test_complex.py::ComplexTests::test_conj_alias",
             "test_complex.py::ComplexTests::test_neg_alias",
-            "test_repros.py::ReproTests::test_issue183886_istft_length_pads_in_fake_tensor",
+            "test_repros.py::*ReproTests::test_issue183886_istft_length_pads_in_fake_tensor*",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_issue183886_istft_length_pads_in_fake_tensor_nested_graph_breaks",
         ],
     ),
@@ -688,14 +689,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " unhandled type for getConstantWithGivenDtypeAndValue'."
         ),
         tests=[
-            "test_repros.py::ReproTests::test_pad_sequence_mixed_dtype_padding_value",
+            "test_repros.py::*ReproTests::test_pad_sequence_mixed_dtype_padding_value*",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_sequence_mixed_dtype_padding_value_nested_graph_breaks",
         ],
     ),
     SkipGroup(
         reason=("[PT2.13] HOP 'with_effects' not implemented in the FxImporter"),
         tests=[
-            "test_repros.py::ReproTests::test_linalg_inv_singular_aot_eager_raises",
+            "test_repros.py::*ReproTests::test_linalg_inv_singular_aot_eager_raises*",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_linalg_inv_singular_aot_eager_raises_nested_graph_breaks",
         ],
     ),
@@ -705,7 +706,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " backend (pad_packed_sequence graph break after packed GRU)."
         ),
         tests=[
-            "test_repros.py::ReproTests::test_pad_packed_sequence_graph_break_after_packed_gru",
+            "test_repros.py::*ReproTests::test_pad_packed_sequence_graph_break_after_packed_gru*",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_packed_sequence_graph_break_after_packed_gru_nested_graph_breaks",
         ],
     ),
@@ -714,7 +715,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "[PT2.13] torch._dynamo.exc.Unsupported: Unsupported functorch tracing" " attempt."
         ),
         tests=[
-            "test_ctx_manager.py::CtxManagerTests::test_functorch_get_dynamic_layer_stack_depth",
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_get_dynamic_layer_stack_depth*",
             "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_compile_vmap_compiled_fn_jacrev_has_aux",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_get_dynamic_layer_stack_depth_nested_graph_breaks",
         ],
@@ -725,8 +726,8 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " not observed on Neuron ('False is not true')."
         ),
         tests=[
-            "test_ctx_manager.py::CtxManagerTests::test_functorch_low_level_gb_True",
-            "test_ctx_manager.py::CtxManagerTests::test_functorch_low_level_gb_False",
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_low_level_gb_True*",
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_low_level_gb_False*",
             "test_ctx_manager.py::CtxManagerTestsDeviceNEURON::test_autocast_decorator_neuron",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_True_nested_graph_breaks",
             "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_False_nested_graph_breaks",
