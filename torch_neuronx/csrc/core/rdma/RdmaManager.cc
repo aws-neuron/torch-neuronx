@@ -556,8 +556,25 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
   }
 
   // Resolve VAs first; the first one drives lazy fabric init.
-  for (auto& e : entries) e.nrt_va = ResolveHbmVA(e.user_va);
-  EnsureInitialized(entries.front().nrt_va);
+  //
+  // Zero-size entries have a null user_va (empty tensor's storage is unallocated).
+  // Keep in batch so NextSeq counter and store multiSet/multiGet handshake stay in lockstep across
+  // ranks.
+  void* first_real_va = nullptr;
+  for (auto& e : entries) {
+    if (e.size == 0) {
+      e.nrt_va = nullptr;
+      continue;
+    }
+    e.nrt_va = ResolveHbmVA(e.user_va);
+    if (first_real_va == nullptr) first_real_va = e.nrt_va;
+  }
+  // Lazy fabric init needs a real HBM VA. Only call when this batch has a non-zero-size entry.
+  // An all-zero-size batch has no fabric work to do and no resolvable VA, so calling ResolveHbmVA
+  // on its null user_va would fault.
+  if (first_real_va != nullptr) {
+    EnsureInitialized(first_real_va);
+  }
 
   // Phase 1: build recv descriptors. Receiver also AV-inserts the sender's
   // endpoint — EFA RDM requires bilateral AV registration. Without this,
@@ -567,6 +584,24 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
   std::vector<std::vector<uint8_t>> recv_vals;
   for (auto& e : entries) {
     if (e.kind == P2PEntry::Kind::kRecv) {
+      // Zero-size recv: publish a descriptor with no regions and mark the recv
+      // already complete. No FI_REMOTE_CQ_DATA will ever arrive for a zero-byte
+      // remote write.
+      if (e.size == 0) {
+        neuron::rdma::TransferDescriptor desc;
+        desc.set_receiver_endpoint(local_endpoint_addr_);
+        desc.set_transfer_id(0);
+        if (rank >= 0) desc.set_rank(rank);
+        std::string serialized;
+        TORCH_CHECK(desc.SerializeToString(&serialized),
+                    "RdmaManager: failed to serialize zero-size recv descriptor");
+        int seq = NextSeq(e.peer, rank, e.tag);
+        recv_keys.push_back(MakeStoreKey(e.peer, rank, e.tag, seq));
+        recv_vals.push_back(std::vector<uint8_t>(serialized.begin(), serialized.end()));
+        e.recv_consumed = true;  // nothing to wait for in DrainAndPending
+        continue;
+      }
+
       // Bilateral AV: receiver inserts sender's endpoint.
       GetOrInsertPeer(e.peer);
 
@@ -636,6 +671,13 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
     std::string descriptor(send_vals[k].begin(), send_vals[k].end());
     neuron::rdma::TransferDescriptor desc;
     TORCH_CHECK(desc.ParseFromString(descriptor), "RdmaManager: failed to parse send descriptor");
+    // Zero-size send: the paired receiver published a regionless descriptor
+    // Nothing to write, so skip fi_writedata.
+    if (e.size == 0) {
+      TORCH_CHECK(desc.regions_size() == 0,
+                  "RdmaManager: zero-size send expected a regionless descriptor from peer");
+      continue;
+    }
     TORCH_CHECK(desc.regions_size() > 0, "RdmaManager: empty send descriptor");
     TORCH_CHECK(desc.rank() != rank,
                 "RdmaManager: same-rank P2P should be handled before reaching the engine "

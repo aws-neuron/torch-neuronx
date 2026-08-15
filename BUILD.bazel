@@ -456,6 +456,7 @@ proto_library(
 
 cc_proto_library(
     name = "transfer_descriptor_cc_proto",
+    visibility = ["//visibility:public"],
     deps = [":transfer_descriptor_proto"],
 )
 
