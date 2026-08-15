@@ -1836,6 +1836,32 @@ public:
   }
 };
 
+static bool hasIndexTensorOperand(Operation *op) {
+  return llvm::any_of(op->getOperands(), [](Value v) {
+    auto t = mlir::dyn_cast<RankedTensorType>(v.getType());
+    return t && t.getElementType().isIndex();
+  });
+}
+
+template <typename OpTy>
+class ConvertStablehloDynamicShapeConsumerOp
+    : public OpConversionPattern<OpTy> {
+public:
+  using OpConversionPattern<OpTy>::OpConversionPattern;
+  using OpAdaptor = typename OpTy::Adaptor;
+  LogicalResult
+  matchAndRewrite(OpTy op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
+                                                       resultTypes)))
+      return failure();
+    rewriter.replaceOpWithNewOp<OpTy>(op, resultTypes, adaptor.getOperands(),
+                                      op->getAttrs());
+    return success();
+  }
+};
+
 namespace {
 class ConvertTorchToStablehloCustomLowering
     : public impl::ConvertTorchToStablehloCustomLoweringBase<
@@ -2073,6 +2099,21 @@ public:
 
       target.addIllegalOp<math::IPowIOp>();
       patterns.add<ConvertMathIPowIOp>(typeConverter, context);
+
+      // Convert operand types from index->i64 for StableHLO dynamic-shape ops
+      // which accept shape tensor<...xindex> operands from shape/tensor ops
+      target.addDynamicallyLegalOp<
+          stablehlo::DynamicBroadcastInDimOp, stablehlo::DynamicReshapeOp,
+          stablehlo::DynamicIotaOp, stablehlo::RealDynamicSliceOp,
+          stablehlo::DynamicPadOp>(
+          [](Operation *op) { return !hasIndexTensorOperand(op); });
+      patterns.add<
+          ConvertStablehloDynamicShapeConsumerOp<stablehlo::DynamicBroadcastInDimOp>,
+          ConvertStablehloDynamicShapeConsumerOp<stablehlo::DynamicReshapeOp>,
+          ConvertStablehloDynamicShapeConsumerOp<stablehlo::DynamicIotaOp>,
+          ConvertStablehloDynamicShapeConsumerOp<stablehlo::RealDynamicSliceOp>,
+          ConvertStablehloDynamicShapeConsumerOp<stablehlo::DynamicPadOp>>(
+          typeConverter, context);
 
       // Convert function signatures so scalar i64/f64 args become tensor<i64>/tensor<f64>.
       populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(

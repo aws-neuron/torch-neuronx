@@ -856,3 +856,206 @@ func.func @math_ipowi(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
   %0 = math.ipowi %arg0, %arg1 : tensor<i64>
   return %0 : tensor<i64>
 }
+
+// -----
+
+// The following tests exercise the index->i64 conversion of *dynamic-shape
+// StableHLO consumers*. Index shape producers (shape.shape_of / tensor.dim /
+// tensor.from_elements) are rewritten to i64 (stablehlo.get_dimension_size),
+// and the dynamic_* consumers - created with `index`-typed shape operands by
+// the upstream chlo->stablehlo / torch->stablehlo lowerings - are rebuilt to
+// take the converted i64 operands so no
+// `builtin.unrealized_conversion_cast : tensor<Nxi64> -> tensor<Nxindex>`
+// survives. Only dynamic_broadcast_in_dim / dynamic_reshape / dynamic_iota /
+// real_dynamic_slice / dynamic_pad carry a shape operand whose type constraint
+// permits `index`; dynamic_gather / dynamic_conv / dynamic_slice /
+// dynamic_update_slice require integer operands and cannot present this seam.
+
+// dynamic_broadcast_in_dim - the exact aten::acos seam: a scalar broadcast to a
+// dynamic shape produced by shape.shape_of.
+// CHECK-LABEL:   func.func @dyn_broadcast_in_dim_shape_of(
+// CHECK-SAME:                                             %[[ARG0:.*]]: tensor<f32>,
+// CHECK-SAME:                                             %[[ARG1:.*]]: tensor<?x?xf32>) -> tensor<?x?xf32> {
+// CHECK:           %[[D0:.*]] = stablehlo.get_dimension_size %[[ARG1]], dim = 0 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:           %[[D0_I64:.*]] = stablehlo.convert %[[D0]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D0_R:.*]] = stablehlo.reshape %[[D0_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[D1:.*]] = stablehlo.get_dimension_size %[[ARG1]], dim = 1 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:           %[[D1_I64:.*]] = stablehlo.convert %[[D1]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D1_R:.*]] = stablehlo.reshape %[[D1_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[SHAPE:.*]] = stablehlo.concatenate %[[D0_R]], %[[D1_R]], dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+// CHECK:           %[[BCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %[[ARG0]], %[[SHAPE]], dims = [] : (tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           return %[[BCAST]] : tensor<?x?xf32>
+func.func @dyn_broadcast_in_dim_shape_of(%arg0: tensor<f32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %shape = shape.shape_of %arg1 : tensor<?x?xf32> -> tensor<2xindex>
+  %0 = stablehlo.dynamic_broadcast_in_dim %arg0, %shape, dims = [] : (tensor<f32>, tensor<2xindex>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// dynamic_broadcast_in_dim - index shape delivered via the function signature
+// (signature conversion turns tensor<2xindex> into tensor<2xi64>).
+// CHECK-LABEL:   func.func @dyn_broadcast_in_dim_arg(
+// CHECK-SAME:                                        %[[ARG0:.*]]: tensor<f32>,
+// CHECK-SAME:                                        %[[ARG1:.*]]: tensor<2xi64>) -> tensor<?x?xf32> {
+// CHECK:           %[[BCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %[[ARG0]], %[[ARG1]], dims = [] : (tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           return %[[BCAST]] : tensor<?x?xf32>
+func.func @dyn_broadcast_in_dim_arg(%arg0: tensor<f32>, %shape: tensor<2xindex>) -> tensor<?x?xf32> {
+  %0 = stablehlo.dynamic_broadcast_in_dim %arg0, %shape, dims = [] : (tensor<f32>, tensor<2xindex>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// dynamic_reshape - index shape from shape.shape_of.
+// CHECK-LABEL:   func.func @dyn_reshape_shape_of(
+// CHECK-SAME:                                    %[[ARG0:.*]]: tensor<?x?xf32>,
+// CHECK-SAME:                                    %[[ARG1:.*]]: tensor<?xf32>) -> tensor<?xf32> {
+// CHECK:           %[[D0:.*]] = stablehlo.get_dimension_size %[[ARG1]], dim = 0 : (tensor<?xf32>) -> tensor<i32>
+// CHECK:           %[[D0_I64:.*]] = stablehlo.convert %[[D0]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D0_R:.*]] = stablehlo.reshape %[[D0_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[SHAPE:.*]] = stablehlo.concatenate %[[D0_R]], dim = 0 : (tensor<1xi64>) -> tensor<1xi64>
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_reshape %[[ARG0]], %[[SHAPE]] : (tensor<?x?xf32>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           return %[[RES]] : tensor<?xf32>
+func.func @dyn_reshape_shape_of(%arg0: tensor<?x?xf32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {
+  %shape = shape.shape_of %arg1 : tensor<?xf32> -> tensor<1xindex>
+  %0 = stablehlo.dynamic_reshape %arg0, %shape : (tensor<?x?xf32>, tensor<1xindex>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// dynamic_reshape - index shape via function signature.
+// CHECK-LABEL:   func.func @dyn_reshape_arg(
+// CHECK-SAME:                               %[[ARG0:.*]]: tensor<?x?xf32>,
+// CHECK-SAME:                               %[[ARG1:.*]]: tensor<2xi64>) -> tensor<?x?xf32> {
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_reshape %[[ARG0]], %[[ARG1]] : (tensor<?x?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           return %[[RES]] : tensor<?x?xf32>
+func.func @dyn_reshape_arg(%arg0: tensor<?x?xf32>, %shape: tensor<2xindex>) -> tensor<?x?xf32> {
+  %0 = stablehlo.dynamic_reshape %arg0, %shape : (tensor<?x?xf32>, tensor<2xindex>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// Negative test: dynamic_reshape already fed an i64 shape passes through
+// unchanged (its operand is not index, so it stays legal).
+// CHECK-LABEL:   func.func @dyn_reshape_i64_passthrough(
+// CHECK-SAME:                                           %[[ARG0:.*]]: tensor<?x?xf32>,
+// CHECK-SAME:                                           %[[ARG1:.*]]: tensor<2xi64>) -> tensor<?x?xf32> {
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_reshape %[[ARG0]], %[[ARG1]] : (tensor<?x?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           return %[[RES]] : tensor<?x?xf32>
+func.func @dyn_reshape_i64_passthrough(%arg0: tensor<?x?xf32>, %shape: tensor<2xi64>) -> tensor<?x?xf32> {
+  %0 = stablehlo.dynamic_reshape %arg0, %shape : (tensor<?x?xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+  return %0 : tensor<?x?xf32>
+}
+
+// -----
+
+// dynamic_iota - index shape from shape.shape_of.
+// CHECK-LABEL:   func.func @dyn_iota_shape_of(
+// CHECK-SAME:                                 %[[ARG0:.*]]: tensor<?xf32>) -> tensor<?xi64> {
+// CHECK:           %[[D0:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 0 : (tensor<?xf32>) -> tensor<i32>
+// CHECK:           %[[D0_I64:.*]] = stablehlo.convert %[[D0]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D0_R:.*]] = stablehlo.reshape %[[D0_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[SHAPE:.*]] = stablehlo.concatenate %[[D0_R]], dim = 0 : (tensor<1xi64>) -> tensor<1xi64>
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_iota %[[SHAPE]], dim = 0 : (tensor<1xi64>) -> tensor<?xi64>
+// CHECK:           return %[[RES]] : tensor<?xi64>
+func.func @dyn_iota_shape_of(%arg0: tensor<?xf32>) -> tensor<?xi64> {
+  %shape = shape.shape_of %arg0 : tensor<?xf32> -> tensor<1xindex>
+  %0 = stablehlo.dynamic_iota %shape, dim = 0 : (tensor<1xindex>) -> tensor<?xi64>
+  return %0 : tensor<?xi64>
+}
+
+// -----
+
+// dynamic_iota - index shape via function signature.
+// CHECK-LABEL:   func.func @dyn_iota_arg(
+// CHECK-SAME:                            %[[ARG0:.*]]: tensor<1xi64>) -> tensor<?xi64> {
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_iota %[[ARG0]], dim = 0 : (tensor<1xi64>) -> tensor<?xi64>
+// CHECK:           return %[[RES]] : tensor<?xi64>
+func.func @dyn_iota_arg(%shape: tensor<1xindex>) -> tensor<?xi64> {
+  %0 = stablehlo.dynamic_iota %shape, dim = 0 : (tensor<1xindex>) -> tensor<?xi64>
+  return %0 : tensor<?xi64>
+}
+
+// -----
+
+// real_dynamic_slice - start / limit / stride are all index shape operands
+// (delivered via the signature).
+// CHECK-LABEL:   func.func @real_dynamic_slice_arg(
+// CHECK-SAME:                                      %[[ARG0:.*]]: tensor<?xf32>, %[[ARG1:.*]]: tensor<1xi64>, %[[ARG2:.*]]: tensor<1xi64>, %[[ARG3:.*]]: tensor<1xi64>) -> tensor<?xf32> {
+// CHECK:           %[[RES:.*]] = stablehlo.real_dynamic_slice %[[ARG0]], %[[ARG1]], %[[ARG2]], %[[ARG3]] : (tensor<?xf32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           return %[[RES]] : tensor<?xf32>
+func.func @real_dynamic_slice_arg(%arg0: tensor<?xf32>, %start: tensor<1xindex>, %limit: tensor<1xindex>, %stride: tensor<1xindex>) -> tensor<?xf32> {
+  %0 = stablehlo.real_dynamic_slice %arg0, %start, %limit, %stride : (tensor<?xf32>, tensor<1xindex>, tensor<1xindex>, tensor<1xindex>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// real_dynamic_slice fed from tensor.from_elements of index constants.
+// CHECK-LABEL:   func.func @real_dynamic_slice_from_elements(
+// CHECK-SAME:                                                %[[ARG0:.*]]: tensor<?xf32>) -> tensor<?xf32> {
+// CHECK:           %[[C0:.*]] = stablehlo.constant dense<0> : tensor<i64>
+// CHECK:           %[[C1:.*]] = stablehlo.constant dense<1> : tensor<i64>
+// CHECK:           %[[START:.*]] = stablehlo.constant dense<0> : tensor<1xi64>
+// CHECK:           %[[LIMIT:.*]] = stablehlo.constant dense<1> : tensor<1xi64>
+// CHECK:           %[[STRIDE:.*]] = stablehlo.constant dense<1> : tensor<1xi64>
+// CHECK:           %[[RES:.*]] = stablehlo.real_dynamic_slice %[[ARG0]], %[[START]], %[[LIMIT]], %[[STRIDE]] : (tensor<?xf32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           return %[[RES]] : tensor<?xf32>
+func.func @real_dynamic_slice_from_elements(%arg0: tensor<?xf32>) -> tensor<?xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %start = tensor.from_elements %c0 : tensor<1xindex>
+  %limit = tensor.from_elements %c1 : tensor<1xindex>
+  %stride = tensor.from_elements %c1 : tensor<1xindex>
+  %0 = stablehlo.real_dynamic_slice %arg0, %start, %limit, %stride : (tensor<?xf32>, tensor<1xindex>, tensor<1xindex>, tensor<1xindex>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// dynamic_pad - edge_low / edge_high / interior are index shape operands.
+// CHECK-LABEL:   func.func @dyn_pad_arg(
+// CHECK-SAME:                           %[[ARG0:.*]]: tensor<?xf32>, %[[ARG1:.*]]: tensor<f32>, %[[ARG2:.*]]: tensor<1xi64>, %[[ARG3:.*]]: tensor<1xi64>, %[[ARG4:.*]]: tensor<1xi64>) -> tensor<?xf32> {
+// CHECK:           %[[RES:.*]] = stablehlo.dynamic_pad %[[ARG0]], %[[ARG1]], %[[ARG2]], %[[ARG3]], %[[ARG4]] : (tensor<?xf32>, tensor<f32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<?xf32>
+// CHECK:           return %[[RES]] : tensor<?xf32>
+func.func @dyn_pad_arg(%arg0: tensor<?xf32>, %pv: tensor<f32>, %lo: tensor<1xindex>, %hi: tensor<1xindex>, %in: tensor<1xindex>) -> tensor<?xf32> {
+  %0 = stablehlo.dynamic_pad %arg0, %pv, %lo, %hi, %in : (tensor<?xf32>, tensor<f32>, tensor<1xindex>, tensor<1xindex>, tensor<1xindex>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
+// -----
+
+// End-to-end: the full aten::acos-style unary decomposition. Broadcasting the
+// `1.0` constant to the dynamic input shape used to leave an unresolved
+// i64->index materialization; the whole function must now lower with no cast.
+// CHECK-LABEL:   func.func @acos_style_broadcast_chain(
+// CHECK-SAME:                                          %[[ARG0:.*]]: tensor<?x?xf32>) -> tensor<?x?xf32> {
+// CHECK:           %[[CST:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+// CHECK:           %[[D0:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 0 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:           %[[D0_I64:.*]] = stablehlo.convert %[[D0]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D0_R:.*]] = stablehlo.reshape %[[D0_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[D1:.*]] = stablehlo.get_dimension_size %[[ARG0]], dim = 1 : (tensor<?x?xf32>) -> tensor<i32>
+// CHECK:           %[[D1_I64:.*]] = stablehlo.convert %[[D1]] : (tensor<i32>) -> tensor<i64>
+// CHECK:           %[[D1_R:.*]] = stablehlo.reshape %[[D1_I64]] : (tensor<i64>) -> tensor<1xi64>
+// CHECK:           %[[SHAPE:.*]] = stablehlo.concatenate %[[D0_R]], %[[D1_R]], dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+// CHECK:           %[[BCAST:.*]] = stablehlo.dynamic_broadcast_in_dim %[[CST]], %[[SHAPE]], dims = [] : (tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+// CHECK:           %[[SUB:.*]] = stablehlo.subtract %[[BCAST]], %[[ARG0]] : tensor<?x?xf32>
+// CHECK:           %[[ADD:.*]] = stablehlo.add %[[BCAST]], %[[ARG0]] : tensor<?x?xf32>
+// CHECK:           %[[MUL:.*]] = stablehlo.multiply %[[SUB]], %[[ADD]] : tensor<?x?xf32>
+// CHECK:           %[[SQRT:.*]] = stablehlo.sqrt %[[MUL]] : tensor<?x?xf32>
+// CHECK:           %[[ATAN2:.*]] = stablehlo.atan2 %[[SQRT]], %[[ARG0]] : tensor<?x?xf32>
+// CHECK:           return %[[ATAN2]] : tensor<?x?xf32>
+func.func @acos_style_broadcast_chain(%arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+  %shape = shape.shape_of %arg2 : tensor<?x?xf32> -> tensor<2xindex>
+  %1 = stablehlo.dynamic_broadcast_in_dim %cst, %shape, dims = [] : (tensor<f32>, tensor<2xindex>) -> tensor<?x?xf32>
+  %2 = stablehlo.subtract %1, %arg2 : tensor<?x?xf32>
+  %3 = stablehlo.add %1, %arg2 : tensor<?x?xf32>
+  %4 = stablehlo.multiply %2, %3 : tensor<?x?xf32>
+  %5 = stablehlo.sqrt %4 : tensor<?x?xf32>
+  %6 = stablehlo.atan2 %5, %arg2 : tensor<?x?xf32>
+  return %6 : tensor<?x?xf32>
+}
