@@ -426,6 +426,25 @@ static const std::unordered_set<std::string> VIEW_OPS_WHITELIST = {
     "aten::swapdims",
 };
 
+static c10::optional<c10::Device> FindPrivateUse1ReadInputDevice(
+    const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema) {
+  const auto& schema_args = schema.arguments();
+  TORCH_INTERNAL_ASSERT(args.size() == schema_args.size(),
+                        "Expected one IValue per op schema argument");
+
+  c10::optional<c10::Device> device;
+  for (size_t i = 0; i < args.size() && !device.has_value(); ++i) {
+    const auto& alias_info = schema_args[i].alias_info();
+    if (alias_info && alias_info->isWrite()) continue;
+    torch_neuronx::dispatch::ForEachTensor({args[i]}, [&](const at::Tensor& tensor) {
+      if (!device.has_value() && tensor.device().type() == c10::DeviceType::PrivateUse1) {
+        device = tensor.device();
+      }
+    });
+  }
+  return device;
+}
+
 // Custom CPU fallback with warning system.
 //
 // Registered as the global PrivateUse1 fallback: routes ops with no
@@ -479,19 +498,8 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
     const auto n_args = schema.arguments().size();
     if (stack->size() >= n_args) {
       const auto args_begin = stack->size() - n_args;
-      // Device of the Neuron inputs (first non-write PrivateUse1 tensor).
-      c10::optional<c10::Device> in_dev;
-      for (size_t i = 0; i < n_args && !in_dev.has_value(); ++i) {
-        const auto& info = schema.arguments()[i].alias_info();
-        const bool is_write = info != nullptr && info->isWrite();
-        const auto& v = (*stack)[args_begin + i];
-        if (!is_write && v.isTensor()) {
-          const auto& t = v.toTensor();
-          if (t.defined() && t.device().type() == c10::DeviceType::PrivateUse1) {
-            in_dev = t.device();
-          }
-        }
-      }
+      const std::vector<c10::IValue> args(stack->end() - n_args, stack->end());
+      const auto in_dev = FindPrivateUse1ReadInputDevice(args, schema);
       if (in_dev.has_value()) {
         for (size_t i = 0; i < n_args; ++i) {
           const auto& info = schema.arguments()[i].alias_info();
@@ -508,6 +516,33 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
             }
           }
         }
+      }
+    }
+  }
+
+  static const std::unordered_set<std::string> kSameDeviceReadInputOps = {
+      "aten::linalg_householder_product",
+      "aten::linalg_householder_product.out",
+  };
+  if (kSameDeviceReadInputOps.count(op_name) != 0) {
+    const auto& schema_args = op.schema().arguments();
+    const auto n_args = schema_args.size();
+    TORCH_INTERNAL_ASSERT(stack->size() >= n_args,
+                          "neuron_cpu_fallback: stack has fewer IValues than op schema args");
+    const std::vector<c10::IValue> args(stack->end() - n_args, stack->end());
+    const auto reference_device = FindPrivateUse1ReadInputDevice(args, op.schema());
+
+    if (reference_device) {
+      for (size_t i = 0; i < n_args; ++i) {
+        const auto& alias_info = schema_args[i].alias_info();
+        if (alias_info && alias_info->isWrite()) continue;
+        torch_neuronx::dispatch::ForEachTensor({args[i]}, [&](const at::Tensor& tensor) {
+          const bool is_cpu_scalar = tensor.device().is_cpu() && tensor.dim() == 0;
+          TORCH_CHECK(is_cpu_scalar || tensor.device() == *reference_device,
+                      "Expected all tensors to be on the same device, but argument '",
+                      schema_args[i].name(), "' is on ", tensor.device().str(), " and expected ",
+                      reference_device->str());
+        });
       }
     }
   }
