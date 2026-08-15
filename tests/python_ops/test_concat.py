@@ -224,6 +224,17 @@ class TestConcat:
         assert result.dtype == torch.float16
         assert result is out
 
+    def test_concat_single_tensor_with_out_functional(self):
+        """Single-input cat.out must populate and return the requested output tensor."""
+        input_cpu = torch.arange(100, dtype=torch.float32)
+        input_neuron = input_cpu.to("neuron")
+        out = torch.empty_like(input_neuron)
+
+        result = torch.concat((input_neuron,), dim=0, out=out)
+
+        assert result is out
+        torch.testing.assert_close(result.cpu(), input_cpu)
+
     @pytest.mark.xfail(
         condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",

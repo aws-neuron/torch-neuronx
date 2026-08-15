@@ -73,7 +73,7 @@ def torch_cat(tensors, dim=0, out=None):
     if not non_empty:
         return torch.cat(tensors, dim)
     if len(non_empty) == 1:
-        return non_empty[0]
+        return non_empty[0].clone()
     return torch.cat(non_empty, dim)
 
 
