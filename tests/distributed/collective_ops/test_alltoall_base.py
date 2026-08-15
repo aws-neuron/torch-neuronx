@@ -1,3 +1,5 @@
+import contextlib
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -245,12 +247,17 @@ def run_uneven_split_sizes_alltoall_base_test(rank, world_size, kwargs):
     input_tensor = torch.full((N,), float(rank + 1), dtype=torch.float32).to("neuron")
     output_tensor = torch.zeros(N, dtype=torch.float32).to("neuron")
 
-    dist.all_to_all_single(
-        output_tensor,
-        input_tensor,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-    )
+    use_nki = kwargs.get("use_nki")
+    flag_context = pytest.MonkeyPatch.context() if use_nki is not None else contextlib.nullcontext()
+    with flag_context as monkeypatch:
+        if use_nki is not None:
+            monkeypatch.setenv("NEURON_USE_NKI_ALLTOALLV", use_nki)
+        dist.all_to_all_single(
+            output_tensor,
+            input_tensor,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     # rank 0 should receive from rank 3 (value = 4.0), etc.
     expected_value = float(src + 1)
@@ -365,5 +372,8 @@ class TestAllToAllBaseWorldSize2(BaseCollectiveOpTest):
         self.distributed_tester.run_test(run_split_sizes_alltoall_base_test)
 
     def test_uneven_split_sizes_alltoall_base(self):
-        """Test alltoall_base with uneven split sizes (permute_tensor pattern) with world size 2."""
-        self.distributed_tester.run_test(run_uneven_split_sizes_alltoall_base_test)
+        """The compatibility fallback supports the world-size-2 permute pattern."""
+        self.distributed_tester.run_test(
+            run_uneven_split_sizes_alltoall_base_test,
+            use_nki="0",
+        )

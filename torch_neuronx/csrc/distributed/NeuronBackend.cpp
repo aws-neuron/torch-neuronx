@@ -192,9 +192,13 @@ at::Tensor GetOrCreateRuntimeScalar(int64_t value, const at::Device& device) {
   return scalar;
 }
 
-std::vector<std::vector<int>> CreateGlobalReplicaGroups(
-    int world_size, const std::vector<int>& current_group_ranks) {
-  return torch_neuronx::distributed::CreateGlobalReplicaGroups(world_size, current_group_ranks);
+// Route uneven all-to-all through native NKI all_to_all_v by default. Setting
+// NEURON_USE_NKI_ALLTOALLV=0 selects the compatibility padding fallback.
+// Read per-call (not cached) — tests toggle the flag via a context manager wrapping
+// individual all_to_all_single calls at dispatch time.
+bool UseNkiAllToAllV() {
+  const char* env = std::getenv("NEURON_USE_NKI_ALLTOALLV");
+  return env == nullptr || std::string(env) == "1";
 }
 
 }  // namespace
@@ -1132,21 +1136,88 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::barrier(const c10d::BarrierOptions
   return work;
 }
 
+std::vector<std::vector<int>> NeuronBackend::ValidateNkiAllToAllV() {
+  auto current_ranks = GetReplicaGroups()[0];
+  int64_t rg_size = static_cast<int64_t>(current_ranks.size());
+  auto replica_groups = CreateGlobalReplicaGroups(global_world_size_, current_ranks);
+
+  TORCH_CHECK(rg_size == 4 || rg_size == 8 || rg_size == 16 || rg_size % 32 == 0,
+              "all_to_all_v: unsupported world size ", rg_size,
+              ", supported sizes: 4, 8, 16, or multiples of 32");
+  for (size_t i = 0; i < replica_groups.size(); ++i) {
+    const auto& g = replica_groups[i];
+    TORCH_CHECK(!g.empty() && g[0] % rg_size == 0,
+                "all_to_all_v: replica group start ranks must be multiples of world size (",
+                rg_size, "), found: group[", i, "] starts at rank ", g.empty() ? -1 : g[0]);
+  }
+  // TRN3 NeuronSwitch fabric requires LNC=2 (host-side guard; see api doc restrictions).
+  const std::string lnc = at::neuron::utils::GetLogicalNeuronCores();
+  const std::string instance_type = at::neuron::utils::GetInstanceType();
+  const bool is_switch_fabric = (instance_type == "trn3" || instance_type == "trn3u");
+  TORCH_CHECK(!is_switch_fabric || lnc == "2",
+              "all_to_all_v requires LNC=2 on NeuronSwitch (Trn3) instances, got LNC=", lnc);
+  return replica_groups;
+}
+
+void NeuronBackend::SubmitNkiAllToAllV(at::Tensor& output_tensor, at::Tensor& input_tensor,
+                                       const std::vector<int64_t>& output_split_sizes,
+                                       const std::vector<int64_t>& input_split_sizes) {
+  auto replica_groups = ValidateNkiAllToAllV();
+  // Reentrant-safe: this method is entered from Python with the GIL held, so nested
+  // acquisition here does not deadlock. One driver serves both backends.
+  py::gil_scoped_acquire gil;
+  py::object fn = py::module_::import("torch_neuronx.distributed.ops.all_to_all_v")
+                      .attr("nki_all_to_all_v_single");
+  fn(output_tensor, input_tensor, py::cast(output_split_sizes), py::cast(input_split_sizes),
+     py::cast(replica_groups));
+}
+
+void NeuronBackend::SubmitNkiAllToAllV(std::vector<at::Tensor>& output_tensors,
+                                       at::Tensor& input_tensor,
+                                       const std::vector<int64_t>& output_split_sizes,
+                                       const std::vector<int64_t>& input_split_sizes) {
+  auto replica_groups = ValidateNkiAllToAllV();
+  py::gil_scoped_acquire gil;
+  py::object fn = py::module_::import("torch_neuronx.distributed.ops.all_to_all_v")
+                      .attr("nki_all_to_all_v_single");
+  fn(py::cast(output_tensors), input_tensor, py::cast(output_split_sizes),
+     py::cast(input_split_sizes), py::cast(replica_groups));
+}
+
 c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall(std::vector<at::Tensor>& output_tensors,
                                                        std::vector<at::Tensor>& input_tensors,
                                                        const c10d::AllToAllOptions& opts) {
   ValidateNeuronDevice(input_tensors, "alltoall");
   TORCH_CHECK(static_cast<int>(input_tensors.size()) == size_, "number of input tensors (",
               input_tensors.size(), ") must equal world size (", size_, ")");
-  if (input_tensors.size() > 1) {
-    auto ref_shape = input_tensors[0].sizes();
-    for (size_t i = 1; i < input_tensors.size(); ++i) {
-      TORCH_CHECK(input_tensors[i].sizes() == ref_shape,
-                  "all input tensors must have same shape, but found ", ref_shape, " and ",
-                  input_tensors[i].sizes());
+  bool async_op = opts.asyncOp;
+
+  // Detect unequal per-rank chunk shapes. Historically the list form required every
+  // input chunk to share one shape (even all-to-all). MoE token dispatch instead sends
+  // a variable number of rows per destination rank, so dim 0 legitimately varies across
+  // chunks. Dims >= 1 (the per-row feature size) MUST still match across every input AND
+  // output chunk — only dim 0 may differ. When any dim 0 differs we route to the native
+  // NKI all_to_all_v path (below), mirroring alltoall_base's uneven-split handling.
+  bool unequal_chunks = false;
+  if (!input_tensors.empty()) {
+    auto ref_trailing = input_tensors[0].sizes().slice(1);
+    int64_t ref_dim0 = input_tensors[0].size(0);
+    auto check_trailing = [&](const at::Tensor& t, const char* which, size_t idx) {
+      TORCH_CHECK(t.sizes().slice(1) == ref_trailing, "alltoall: all ", which,
+                  " tensors must have identical shape in dims >= 1 (only dim 0 may vary for "
+                  "variable-split all-to-all), but ",
+                  which, "[", idx, "] has shape ", t.sizes(), " vs expected trailing dims ",
+                  ref_trailing);
+    };
+    for (size_t i = 0; i < input_tensors.size(); ++i) {
+      check_trailing(input_tensors[i], "input", i);
+      if (input_tensors[i].size(0) != ref_dim0) unequal_chunks = true;
+    }
+    for (size_t i = 0; i < output_tensors.size(); ++i) {
+      check_trailing(output_tensors[i], "output", i);
+      if (output_tensors[i].size(0) != ref_dim0) unequal_chunks = true;
     }
   }
-  bool async_op = opts.asyncOp;
 
   // Early return for all-empty inputs
   bool all_empty = true;
@@ -1156,8 +1227,48 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall(std::vector<at::Tensor>& 
       break;
     }
   }
-  if (all_empty) {
+  if (all_empty && !UseNkiAllToAllV()) {
     auto work = CreateWork(output_tensors, {}, c10d::OpType::ALLTOALL, async_op);
+    FinishWork(work, async_op);
+    return work;
+  }
+  // An empty local rank may still have peers exchanging data with each other. It must
+  // enter the same variable-count collective rather than returning locally.
+  if (all_empty) unequal_chunks = true;
+
+  // Unequal per-rank chunk shapes: convert the list form to the split-size representation
+  // and delegate to the same variable-split NKI all_to_all_v machinery alltoall_base uses.
+  // The even list-form path below is untouched (bit-identical for the common equal-chunk
+  // case). This enables torchtitan's standard MoE token dispatcher (dist.all_to_all with
+  // per-rank-variable input/output chunks) on Neuron.
+  if (unequal_chunks) {
+    TORCH_CHECK(UseNkiAllToAllV(),
+                "alltoall: input/output chunks have unequal shapes (variable-split all-to-all), "
+                "which requires the native NKI all_to_all_v path. Remove "
+                "NEURON_USE_NKI_ALLTOALLV=0 or set it to 1; this requires NRT runtime-lib >= "
+                "2.x.62579 and "
+                "its matched collectives >= 2.x.63596. The equal-shape list form does not support "
+                "per-rank variable counts.");
+
+    std::vector<int64_t> in_sizes(input_tensors.size());
+    std::vector<int64_t> out_sizes(output_tensors.size());
+    for (size_t i = 0; i < input_tensors.size(); ++i) in_sizes[i] = input_tensors[i].size(0);
+    for (size_t i = 0; i < output_tensors.size(); ++i) out_sizes[i] = output_tensors[i].size(0);
+
+    // Concat inputs into one contiguous, destination-packed buffer along dim 0. The Python
+    // driver gathers each received rank slot directly into the caller's output tensor.
+    at::Tensor concat_in =
+        (input_tensors.size() == 1) ? input_tensors[0] : torch::cat(input_tensors, /*dim=*/0);
+
+    auto work = CreateWork(output_tensors, input_tensors, c10d::OpType::ALLTOALL, async_op);
+    try {
+      SubmitNkiAllToAllV(output_tensors, concat_in, out_sizes, in_sizes);
+      work->stash({concat_in});
+    } catch (...) {
+      work->setException(std::current_exception());
+      FinishWork(work, async_op);
+      throw;
+    }
     FinishWork(work, async_op);
     return work;
   }
@@ -1209,14 +1320,8 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall_base(
     std::vector<int64_t>& input_split_sizes, const c10d::AllToAllOptions& opts) {
   int64_t group_size = static_cast<int64_t>(size_);
 
-  // Empty tensors: nothing to exchange
-  if (input_tensor.numel() == 0 && output_tensor.numel() == 0) {
-    auto work = CreateWork({output_tensor}, {input_tensor}, c10d::OpType::ALLTOALL_BASE, false);
-    FinishWork(work, false);
-    return work;
-  }
-
   // Normalize split sizes: if empty/None, compute equal splits; else validate length.
+  const bool has_explicit_splits = !input_split_sizes.empty() || !output_split_sizes.empty();
   auto normalize = [&](const std::vector<int64_t>& sizes, int64_t total_size,
                        const char* name) -> std::vector<int64_t> {
     if (sizes.empty()) {
@@ -1231,18 +1336,47 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall_base(
   };
   auto in_sizes = normalize(input_split_sizes, input_tensor.size(0), "input");
   auto out_sizes = normalize(output_split_sizes, output_tensor.size(0), "output");
+  const bool locally_empty = input_tensor.numel() == 0 && output_tensor.numel() == 0;
+
+  // With implicit equal splits, a locally empty rank implies that every peer also has
+  // empty equal splits. Explicit zero splits can instead describe a rank that sends and
+  // receives nothing while other peers exchange data, so that rank must participate.
+  if (locally_empty && !has_explicit_splits) {
+    auto work = CreateWork({output_tensor}, {input_tensor}, c10d::OpType::ALLTOALL_BASE, false);
+    FinishWork(work, false);
+    return work;
+  }
 
   // Fast path: even splits (all sizes equal on both sides) — delegate to alltoall.
   bool even_in = std::all_of(in_sizes.begin() + 1, in_sizes.end(),
                              [&](int64_t s) { return s == in_sizes[0]; });
   bool even_out = std::all_of(out_sizes.begin() + 1, out_sizes.end(),
                               [&](int64_t s) { return s == out_sizes[0]; });
-  if (even_in && even_out) {
+  if (even_in && even_out && !locally_empty) {
     auto input_list = input_tensor.split(in_sizes[0], 0);
     auto output_list = output_tensor.split(out_sizes[0], 0);
     std::vector<at::Tensor> in_vec(input_list.begin(), input_list.end());
     std::vector<at::Tensor> out_vec(output_list.begin(), output_list.end());
     return alltoall(out_vec, in_vec, opts);
+  }
+
+  // Uneven splits with the NKI all_to_all_v kernel. Sends exactly the requested
+  // per-rank counts with no send-side padding. The NKI branch bypasses alltoall(),
+  // so we re-check the
+  // world-size / replica-group constraints enforced by alltoall(), plus an LNC=2
+  // guard for the NeuronSwitch (Trn3) fabric.
+  if (UseNkiAllToAllV()) {
+    auto work =
+        CreateWork({output_tensor}, {input_tensor}, c10d::OpType::ALLTOALL_BASE, opts.asyncOp);
+    try {
+      SubmitNkiAllToAllV(output_tensor, input_tensor, out_sizes, in_sizes);
+    } catch (...) {
+      work->setException(std::current_exception());
+      FinishWork(work, opts.asyncOp);
+      throw;
+    }
+    FinishWork(work, opts.asyncOp);
+    return work;
   }
 
   // Uneven splits: pad each sender's chunks to max_in_size, do an even alltoall via the

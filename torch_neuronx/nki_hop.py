@@ -156,6 +156,7 @@ class NKIKernelWrapper(HigherOrderOperator):
         arg_names: Sequence[str],
         constant_args_key: int,
         has_side_effect: bool = False,
+        has_collectives: bool = False,
     ) -> Any:
         return super().__call__(
             kernel_idx=kernel_idx,
@@ -166,6 +167,7 @@ class NKIKernelWrapper(HigherOrderOperator):
             arg_names=arg_names,
             constant_args_key=constant_args_key,
             has_side_effect=has_side_effect,
+            has_collectives=has_collectives,
         )
 
 
@@ -211,6 +213,7 @@ def nki_kernel_wrapper_meta(
     arg_names: Sequence[str],
     constant_args_key: int,
     has_side_effect: bool = False,
+    has_collectives: bool = False,
 ):
     dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return_types = return_types_of(dconfig)
@@ -257,6 +260,7 @@ def nki_kernel_wrapper_dense(
     arg_names: Sequence[str],
     constant_args_key: int,
     has_side_effect: bool = False,
+    has_collectives: bool = False,
 ):
     (
         dconfig,
@@ -300,6 +304,7 @@ def nki_kernel_wrapper_fake_tensor_mode(
     arg_names: Sequence[str],
     constant_args_key: int,
     has_side_effect: bool = False,
+    has_collectives: bool = False,
 ) -> Any:
     dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return_types = return_types_of(dconfig)
@@ -334,6 +339,7 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     arg_names: Sequence[str],
     constant_args_key: int,
     has_side_effect: bool = False,
+    has_collectives: bool = False,
 ):
     (
         dconfig,
@@ -350,6 +356,9 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
         "arg_names": tensor_arg_names,
         "constant_args_key": constant_args_key,
         "has_side_effect": has_side_effect,
+        # NKI FE determines this from the specialized kernel. Carry it on the
+        # HOP so the enclosing compiled graph can be loaded with collective context.
+        "has_collectives": dconfig.has_collectives,
     }
 
     node_args["backend_config"] = backend_config_str(dconfig)
@@ -383,6 +392,7 @@ def nki_kernel_wrapper_functionalize(
     arg_names: Sequence[str],
     constant_args_key: int,
     has_side_effect: bool = False,
+    has_collectives: bool = False,
 ) -> None:
     unwrapped_args = [
         ctx.unwrap_tensors(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
@@ -399,6 +409,7 @@ def nki_kernel_wrapper_functionalize(
             arg_names=arg_names,
             constant_args_key=constant_args_key,
             has_side_effect=has_side_effect,
+            has_collectives=dconfig.has_collectives,
         )
     if not isinstance(unwrapped_outputs, list | tuple):
         tuple_outputs = (unwrapped_outputs,)
@@ -556,6 +567,7 @@ def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     kernels whose effect is the call itself (e.g. a bounds check that faults via
     ``oob_mode.error``); otherwise the optimizer drops the call and the effect
     never runs.
+
     """
     sig = inspect.signature(nki_kernel.func)
     arg_names = list(sig.parameters.keys())

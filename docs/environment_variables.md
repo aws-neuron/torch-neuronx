@@ -93,6 +93,7 @@ These variables affect eager execution (non-compiled operations).
 |----------|------|---------|-------------|
 | `NEURON_USE_SPLIT_ALLGATHER` | bool | `True` | Enables split-based allgather for better memory efficiency. |
 | `NEURON_USE_SPLIT_REDUCE_SCATTER` | bool | `True` | Enables split-based reduce_scatter implementation. |
+| `NEURON_USE_NKI_ALLTOALLV` | bool | `True` | Enables native NKI `all_to_all_v`. Set to `0` to use the compatibility padding fallback. Native mode requires `aws-neuronx-runtime-lib >= 2.x.62579` and `aws-neuronx-collectives >= 2.x.63596`. |
 | `COLLECTIVE_BUCKETSIZE_IN_MB` | int | `512` | Maximum bucket size (MB) for collective operations. |
 | `COLLECTIVE_MIN_BUCKETS` | int | `0` | Minimum buckets for collectives. When > 1, forces splitting small tensors. |
 | `NEURON_DYN_NKI_COLLECTIVES` | bool | `False` | When `1`, routes eligible collective calls through the dynamic NKI kernel implementation. |

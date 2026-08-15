@@ -108,7 +108,8 @@ def _compile_fx_to_stablehlo(
 def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     """Detect if an FX graph contains collective operations.
 
-    Scans the FX graph for torch._c10d_functional collective operations.
+    Detects torch._c10d_functional collectives and NKI HOPs whose specialized
+    frontend config reports embedded collective communication.
 
     Args:
         gm (torch.fx.GraphModule): FX GraphModule to analyze.
@@ -116,10 +117,16 @@ def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     Returns:
         bool: True if graph contains any collective operations.
     """
+    from torch_neuronx.nki_hop import nki_kernel_wrapper
+
     collective_ops = {"all_reduce", "all_gather", "reduce_scatter", "all_to_all"}
 
     for node in gm.graph.nodes:
         if node.op == "call_function":
+            if node.target is nki_kernel_wrapper and node.kwargs.get("has_collectives", False):
+                logger.info("Detected collective NKI kernel")
+                return True
+
             func_name = (
                 node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
             )

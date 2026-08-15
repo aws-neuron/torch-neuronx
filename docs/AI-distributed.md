@@ -85,6 +85,8 @@ The collective-tuning vars (`NEURON_USE_SPLIT_ALLGATHER`,
 
 ## See also
 
+- `AI-all-to-all.md` — the all-to-all family (`all_to_all`, `all_to_all_single`
+  / NKI a2a-v) dispatch paths, layout-F driver, and NRT requirement.
 - `AI-csrc.md` — `NeuronWork`/`NeuronWatchdog` internals + `NeuronBindings.cpp`.
 - `AI-dynamo-backend.md` — `collective_legalization` +
   `dtensor_redistribute_optimization` FX passes.

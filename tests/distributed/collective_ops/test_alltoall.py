@@ -215,20 +215,41 @@ def run_wrong_list_size_test(rank, world_size, kwargs):
     dist.all_to_all(output_tensor_list, input_tensor_list)
 
 
-def run_shape_mismatch_test(rank, world_size, kwargs):
-    """Test alltoall with mismatched tensor shapes."""
+def run_trailing_dim_mismatch_test(rank, world_size, kwargs):
+    """alltoall where chunks disagree on a dim >= 1 (the per-row feature size).
+
+    Only dim 0 may vary across chunks (variable-split all-to-all); a mismatch in a
+    trailing dim is unrepresentable and must raise. Uses 2D chunks so dim 0 is equal
+    (rows=2) but dim 1 differs (4 vs 3)."""
     input_tensor_list = []
     for dst_rank in range(world_size):
         if dst_rank == 0:
-            # Different shape for first tensor
+            input_tensor_list.append(torch.ones(2, 4).to("neuron"))
+        else:
+            input_tensor_list.append(torch.ones(2, 3).to("neuron"))
+
+    output_tensor_list = [torch.zeros(2, 3).to("neuron") for _ in range(world_size)]
+
+    dist.all_to_all(output_tensor_list, input_tensor_list)
+
+
+def run_dim0_mismatch_flag_off_test(rank, world_size, kwargs):
+    """alltoall with unequal dim-0 chunk shapes and the NKI a2a-v flag OFF.
+
+    Variable-split all-to-all (unequal dim 0) requires the native NKI all_to_all_v
+    path. With the flag off it must raise an actionable error telling the user to
+    enable NEURON_USE_NKI_ALLTOALLV, NOT the old cryptic 'same shape' assert."""
+    input_tensor_list = []
+    for dst_rank in range(world_size):
+        if dst_rank == 0:
             input_tensor_list.append(torch.ones(5).to("neuron"))
         else:
-            # Different shape for other tensors
             input_tensor_list.append(torch.ones(3).to("neuron"))
 
     output_tensor_list = [torch.zeros(3).to("neuron") for _ in range(world_size)]
 
-    dist.all_to_all(output_tensor_list, input_tensor_list)
+    with patch.dict(os.environ, {"NEURON_USE_NKI_ALLTOALLV": "0"}):
+        dist.all_to_all(output_tensor_list, input_tensor_list)
 
 
 def run_dtype_mismatch_test(rank, world_size, kwargs):
@@ -383,10 +404,23 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with wrong list sizes."""
         self.distributed_tester.run_test(run_wrong_list_size_test)
 
-    @assert_raises(RuntimeError, match=r".*all input tensors must have same shape.*but found.*")
-    def test_shape_mismatch_error(self):
-        """Test alltoall error handling with shape mismatch."""
-        self.distributed_tester.run_test(run_shape_mismatch_test)
+    @assert_raises(
+        RuntimeError,
+        match=r".*must have identical shape in dims >= 1.*only dim 0 may vary.*",
+    )
+    def test_trailing_dim_mismatch_error(self):
+        """Chunks disagreeing on a dim >= 1 (per-row feature size) must raise; only
+        dim 0 may vary for variable-split all-to-all."""
+        self.distributed_tester.run_test(run_trailing_dim_mismatch_test)
+
+    @assert_raises(
+        RuntimeError,
+        match=r".*unequal shapes.*NEURON_USE_NKI_ALLTOALLV.*",
+    )
+    def test_dim0_mismatch_flag_off_error(self):
+        """Unequal dim-0 chunks with the NKI a2a-v flag OFF raise an actionable
+        error (enable NEURON_USE_NKI_ALLTOALLV), not the old 'same shape' assert."""
+        self.distributed_tester.run_test(run_dim0_mismatch_flag_off_test)
 
     @assert_raises(
         RuntimeError,
