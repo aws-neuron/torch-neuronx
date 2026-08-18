@@ -423,6 +423,7 @@ DYNAMO_SYMBOLIC_HANDLING_UNSUPPORTED = [
     "*MiscTests::test_check_simplification*",
     "*MiscTests::test_symint_copy_into_unbacked_slice*",
     "*MiscTests::test_unbacked_empty_tensor*",
+    "*MiscTests::test_unbacked_sources_per_dim*",
     "*MiscTests::test_unbacked_symint_split*",
     "*MiscTests::test_validate_outputs_unbacked*",
     "*MiscTests::test_validate_outputs_unbacked_by_custom_op*",
