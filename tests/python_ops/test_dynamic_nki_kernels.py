@@ -25,8 +25,18 @@ import torch
 import torch_neuronx
 
 _DTYPES = [torch.bfloat16, torch.float32, torch.float16]
-_DTYPE_ID = {torch.bfloat16: "bf16", torch.float32: "fp32", torch.float16: "fp16"}
-_TOL = {torch.float32: (1e-4, 1e-4), torch.bfloat16: (1e-2, 1e-2), torch.float16: (5e-3, 5e-3)}
+_DTYPE_ID = {
+    torch.bfloat16: "bf16",
+    torch.float32: "fp32",
+    torch.float16: "fp16",
+    torch.bool: "bool",
+}
+_TOL = {
+    torch.float32: (1e-4, 1e-4),
+    torch.bfloat16: (1e-2, 1e-2),
+    torch.float16: (5e-3, 5e-3),
+    torch.bool: (0, 0),
+}
 
 _FLAG_ON = os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") == "1"
 
@@ -99,6 +109,11 @@ def _recompiling_ops(step_fn, warm_seed, probe_seeds):
 # the dynamic dim (M / gather-scatter n), `h` the free dim; sweeps vary both.
 
 
+def _tol(spec, dtype):
+    """The spec's own tolerance if it declares one, else the per-dtype default."""
+    return spec.tol if spec.tol is not None else _TOL[dtype]
+
+
 @dataclass
 class OpSpec:
     name: str  # registry entry name, e.g. "exp", "mm", "scatter_add_"
@@ -107,6 +122,10 @@ class OpSpec:
     dtypes: tuple = tuple(_DTYPES)
     arbitrary_h: bool = False  # in the free-dim remainder sweep
     compile_once: bool = False  # in the compile-once-per-shape sweep
+    # (rtol, atol) override; None -> the per-dtype _TOL. Ops that are bit-exact by
+    # construction must set (0, 0) — a tolerance there can only hide a mis-tiled or
+    # partially written result, never a real numeric difference.
+    tol: tuple | None = None
 
 
 def _unary_spec(name, fn, **flags):
@@ -205,6 +224,31 @@ def _scatter_add_spec(**flags):
     return OpSpec("scatter_add_", build, run, **flags)
 
 
+def _where_spec(**flags):
+    """where.self: bool condition selects between two float operands of one shape.
+    tol=(0, 0): every output element is a verbatim copy of an input element."""
+
+    def build(dtype, *, rows=512, h=2048):
+        cond = torch.rand(1, rows, h) > 0.5
+        a = torch.randn(1, rows, h, dtype=dtype) / 8
+        b = torch.randn(1, rows, h, dtype=dtype) / 8
+        return (cond.to("neuron"), a.to("neuron"), b.to("neuron")), torch.where(cond, a, b)
+
+    return OpSpec("where", build, torch.where, tol=(0, 0), **flags)
+
+
+def _bitwise_or_spec(**flags):
+    """bitwise_or.Tensor: two bool masks (bitwise OR == logical OR on 0/1).
+    tol=(0, 0): a bitwise op on bool has no numeric error term."""
+
+    def build(dtype, *, rows=512, h=2048):
+        a = torch.rand(1, rows, h) > 0.5
+        b = torch.rand(1, rows, h) > 0.5
+        return (a.to("neuron"), b.to("neuron")), torch.bitwise_or(a, b)
+
+    return OpSpec("bitwise_or", build, torch.bitwise_or, dtypes=(torch.bool,), tol=(0, 0), **flags)
+
+
 _OP_SPECS = [
     _unary_spec("silu", torch.nn.functional.silu, arbitrary_h=True, compile_once=True),
     _unary_spec("exp", torch.exp, arbitrary_h=True, compile_once=True),
@@ -213,6 +257,10 @@ _OP_SPECS = [
     _unary_spec("sigmoid", torch.sigmoid, arbitrary_h=True, compile_once=True),
     _log_spec(arbitrary_h=True, compile_once=True),
     _unary_spec("neg", torch.neg, arbitrary_h=True, compile_once=True),
+    # tol=(0, 0): every element is exactly 1.0, representable in every dtype.
+    _unary_spec("ones_like", torch.ones_like, arbitrary_h=True, compile_once=True, tol=(0, 0)),
+    _where_spec(arbitrary_h=True, compile_once=True),
+    _bitwise_or_spec(arbitrary_h=True, compile_once=True),
     _binary_spec("add", torch.add, compile_once=True),
     _binary_spec("sub", torch.sub, compile_once=True),
     _binary_spec("mul", torch.mul),
@@ -251,7 +299,7 @@ class TestDynamicNkiKernels:
     # ── per-op correctness: routes to dynamic kernel AND matches CPU ──
     @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
     def test_dynamic_nki_op(self, spec, dtype):
-        rtol, atol = _TOL[dtype]
+        rtol, atol = _tol(spec, dtype)
         run_args, ref = spec.build(dtype)
         with _assert_dynamic_ran(spec.name):
             got = spec.run(*run_args).cpu()
@@ -264,10 +312,24 @@ class TestDynamicNkiKernels:
     @pytest.mark.parametrize("H", [640, 576, 384, 1000])
     @pytest.mark.parametrize("spec", _ARBITRARY_H_SPECS, ids=lambda s: s.name)
     def test_dynamic_nki_arbitrary_h(self, spec, H):  # noqa: N803
+        rtol, atol = _tol(spec, torch.bfloat16)
         run_args, ref = spec.build(torch.bfloat16, h=H)
         with _assert_dynamic_ran(spec.name):
             got = spec.run(*run_args).cpu()
-        torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
+
+    # ── single-tile sweep: rows=128 -> num_m_tiles == 1 -> the runtime loop
+    # (nl.fori_loop) runs exactly once. Guards the count==1 boundary: body must
+    # execute once and cross-iteration state (m_tile_start / k_off) must be
+    # initialized correctly. rows=128 keeps mm (M % 128 == 0) and gather/scatter
+    # (n % 128 == 0) valid, so one case covers every dynamic kernel. ──
+    @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
+    def test_dynamic_nki_single_tile(self, spec, dtype):
+        rtol, atol = _tol(spec, dtype)
+        run_args, ref = spec.build(dtype, rows=128)
+        with _assert_dynamic_ran(spec.name):
+            got = spec.run(*run_args).cpu()
+        torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
 
     # ── non-128 count sweep: the dynamic dim (M / gather-scatter n) is padded up
     # to the next 128-multiple inside prepare_io; the op still routes dynamically
@@ -276,7 +338,7 @@ class TestDynamicNkiKernels:
     @pytest.mark.parametrize("rows", [200, 129, 383])
     @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
     def test_dynamic_nki_non_128_count(self, spec, dtype, rows):
-        rtol, atol = _TOL[dtype]
+        rtol, atol = _tol(spec, dtype)
         run_args, ref = spec.build(dtype, rows=rows)
         with _assert_dynamic_ran(spec.name):
             got = spec.run(*run_args).cpu()
@@ -447,6 +509,103 @@ class TestDynamicNkiKernels:
         b = (torch.randn(128, 1024, dtype=torch.bfloat16) / 8).to("neuron")
         with _assert_dynamic_skipped("cat"):
             torch.cat([a, b], dim=0)
+
+    # ── where / bitwise_or / ones_like: the decline guards (the generic sweeps only
+    # build routable cases, and the arbitrary-H sweep only uses even H) plus the out=
+    # destinations. All three are bit-exact, so every comparison here is rtol=atol=0. ──
+    def test_dynamic_nki_where_odd_h_declines(self):
+        # The condition is DMA'd as an int16 view, which needs an even H.
+        cond = (torch.rand(256, 1025) > 0.5).to("neuron")
+        a = (torch.randn(256, 1025, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(256, 1025, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("where"):
+            got = torch.where(cond, a, b).cpu()
+        torch.testing.assert_close(got, torch.where(cond.cpu(), a.cpu(), b.cpu()), rtol=0, atol=0)
+
+    def test_dynamic_nki_bitwise_or_odd_h_declines(self):
+        # Same int16-view constraint, on both operands and the output.
+        a = (torch.rand(256, 1025) > 0.5).to("neuron")
+        b = (torch.rand(256, 1025) > 0.5).to("neuron")
+        with _assert_dynamic_skipped("bitwise_or"):
+            got = torch.bitwise_or(a, b).cpu()
+        torch.testing.assert_close(got, a.cpu() | b.cpu(), rtol=0, atol=0)
+
+    def test_dynamic_nki_where_scalar_other_declines(self):
+        # where.ScalarOther lands here too; a scalar operand can't ride the kernel.
+        cond = (torch.rand(256, 2048) > 0.5).to("neuron")
+        a = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("where"):
+            got = torch.where(cond, a, 0.0).cpu()
+        torch.testing.assert_close(got, torch.where(cond.cpu(), a.cpu(), 0.0), rtol=0, atol=0)
+
+    def test_dynamic_nki_where_broadcast_declines(self):
+        # All three shapes must match; a broadcast condition must fall back.
+        cond = (torch.rand(256, 1) > 0.5).to("neuron")
+        a = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("where"):
+            got = torch.where(cond, a, b).cpu()
+        torch.testing.assert_close(got, torch.where(cond.cpu(), a.cpu(), b.cpu()), rtol=0, atol=0)
+
+    def test_dynamic_nki_bitwise_or_int_dtype_declines(self):
+        # Only bool is enabled (_BITWISE_DTYPES); integer operands fall back.
+        a = torch.randint(0, 255, (256, 2048), dtype=torch.int32).to("neuron")
+        b = torch.randint(0, 255, (256, 2048), dtype=torch.int32).to("neuron")
+        with _assert_dynamic_skipped("bitwise_or"):
+            got = torch.bitwise_or(a, b).cpu()
+        torch.testing.assert_close(got, a.cpu() | b.cpu(), rtol=0, atol=0)
+
+    def test_dynamic_nki_ones_like_dtype_override_declines(self):
+        # The NEFF bakes x's dtype, so a dtype override must fall back.
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("ones_like"):
+            got = torch.ones_like(x, dtype=torch.float32).cpu()
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got, torch.ones(256, 2048), rtol=0, atol=0)
+
+    def test_dynamic_nki_ones_like_same_dtype_routes(self):
+        # ... but the guard must not over-decline an explicit dtype equal to x's.
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_ran("ones_like"):
+            got = torch.ones_like(x, dtype=torch.bfloat16).cpu()
+        torch.testing.assert_close(got, torch.ones(256, 2048, dtype=torch.bfloat16), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("rows", [256, 200])
+    def test_dynamic_nki_ones_like_strided_input_untouched(self, rows):
+        # reads_input=False: prepare_io hands the output buffer to arg0 instead of
+        # padding/contiguifying the caller's tensor, so a strided input at an aligned
+        # and an unaligned M must still route and leave the source untouched.
+        base = (torch.randn(rows, 4096, dtype=torch.bfloat16) / 8).to("neuron")
+        x = base.chunk(2, dim=-1)[1]  # strided view, H=2048
+        before = x.cpu().clone()
+        with _assert_dynamic_ran("ones_like"):
+            got = torch.ones_like(x).cpu()
+        torch.testing.assert_close(
+            got, torch.ones(rows, 2048, dtype=torch.bfloat16), rtol=0, atol=0
+        )
+        torch.testing.assert_close(x.cpu(), before, rtol=0, atol=0)
+
+    def test_dynamic_nki_where_out_writes_in_place(self):
+        # out= is the destination buffer; dynamic path writes into it.
+        cond = (torch.rand(256, 2048) > 0.5).to("neuron")
+        a = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        buf = torch.empty_like(a)
+        with _assert_dynamic_ran("where"):
+            torch.where(cond, a, b, out=buf)
+        torch.testing.assert_close(
+            buf.cpu(), torch.where(cond.cpu(), a.cpu(), b.cpu()), rtol=0, atol=0
+        )
+
+    def test_dynamic_nki_bitwise_or_out_writes_in_place(self):
+        # The bool out= buffer is handed to the NEFF as an int16 view — the one dest
+        # reuse in the registry that crosses a dtype view.
+        a = (torch.rand(256, 2048) > 0.5).to("neuron")
+        b = (torch.rand(256, 2048) > 0.5).to("neuron")
+        buf = torch.empty_like(a)
+        with _assert_dynamic_ran("bitwise_or"):
+            torch.bitwise_or(a, b, out=buf)
+        torch.testing.assert_close(buf.cpu(), a.cpu() | b.cpu(), rtol=0, atol=0)
 
     # ── E2E MoE forward: no recompiles as routing (token counts) change ──
     # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.
