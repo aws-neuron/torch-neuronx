@@ -56,6 +56,15 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_ops.py::TestCommonNEURON::test_out_addr_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_amax_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_amin_neuron_float32",
+    # NOTE: test_out_baddbmm_neuron_float32 is deliberately absent. baddbmm
+    # carries its own out= dtype guard (_check_out_dtype in
+    # python_ops/torch_mlir/ops/linear_algebra.py), so it raises CPU's
+    # "Expected out tensor to have dtype float, but got long int instead" and
+    # the test passes. Its addmm/bmm/mm siblings below still lack the guard.
+    # Note the matmul family needs an EXACT dtype match, not the at::canCast
+    # rule the TensorIterator ops use, so a single central canCast guard would
+    # not fix these entries: CPU accepts torch.add(fp32, fp32, out=fp64) but
+    # rejects out=fp64 for mm/bmm/addmm/baddbmm.
     "test_ops.py::TestCommonNEURON::test_out_bmm_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_ceil_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_clamp_max_neuron_float32",

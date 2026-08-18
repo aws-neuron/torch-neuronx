@@ -33,7 +33,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     # frac, nan_to_num, fmod), log/exp variants (exp2, expm1, log10/1p/2,
     # logaddexp, logaddexp2), bitwise/integer-only (gcd, lcm,
     # hash_tensor), and misc (copysign, fmax, fmin, heaviside, hypot,
-    # ldexp, nextafter, angle, isposinf, isin, sinc, addbmm, baddbmm,
+    # ldexp, nextafter, angle, isposinf, isin, sinc, addbmm,
     # logit, col2im, im2col, max_unpool2d/3d, kl_div, pairwise_distance,
     # ormqr, smooth_l1_loss_backward, huber_loss_backward,
     # multilabel_margin_loss_forward).
@@ -49,7 +49,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_addbmm_neuron*",
             "*_addbmm__neuron*",
             "*_atan2_neuron*",
-            "*_baddbmm_neuron*",
             "*_celu_neuron*",
             "*_col2im_neuron*",
             "*_copysign_neuron*",

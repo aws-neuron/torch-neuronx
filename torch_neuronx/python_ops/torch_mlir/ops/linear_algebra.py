@@ -25,6 +25,168 @@ def torch_bmm(batch1, batch2, out=None):
     return torch.bmm(batch1, batch2)
 
 
+# ``caffe2::TypeMeta`` names, spelled exactly as PyTorch's structured-kernel
+# out= check prints them ("Expected out tensor to have dtype float, but got
+# long int instead"). These are demangled C++ type names, not
+# ``c10::toString(ScalarType)`` names ("Float"/"Long"), so they cannot be
+# derived from ``str(dtype)``.
+_TYPE_META_NAMES = {
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.float16: "c10::Half",
+    torch.bfloat16: "c10::BFloat16",
+    torch.int64: "long int",
+    torch.int32: "int",
+    torch.int16: "short int",
+    torch.int8: "signed char",
+    torch.uint8: "unsigned char",
+    torch.bool: "bool",
+}
+
+
+def _reject_bool_operands(input, batch1, batch2):
+    """Reject bool operands, which CPU refuses but the device path accepts.
+
+    CPU raises ``NotImplementedError: "baddbmm" not implemented for 'Bool'``.
+    On Neuron the matmul lowers happily for bool, so without this guard
+    ``baddbmm`` reports bool as a *working* dtype and OpInfo's
+    ``test_dtypes_baddbmm`` fails with "dtypes worked in forward but are not
+    listed by the OpInfo: {torch.bool}".
+
+    The message is CPU's byte-for-byte: OpInfo error tests regex-match it, and
+    the offending argument is visible in the traceback anyway.
+
+    Scoped to baddbmm rather than the whole matmul family: bmm/mm/addmm/matmul
+    diverge from CPU on bool identically, but their ``test_dtypes_*`` OpInfo
+    tests are all skipped under ``ATEN_SEGFAULT``
+    (tests/pytorch_tests_native/skip_registry/skipped_tests/aten_skips.py), so
+    widening the guard would change four shared ops' behavior with no upstream
+    test able to confirm the resulting dtype set. That cleanup has to start by
+    fixing the segfault skip, which is out of scope here.
+    """
+    for tensor in (input, batch1, batch2):
+        if isinstance(tensor, torch.Tensor) and tensor.dtype is torch.bool:
+            raise NotImplementedError("\"baddbmm\" not implemented for 'Bool'")
+
+
+def _check_out_dtype(expected, out):
+    """Reject an ``out=`` tensor whose dtype is not exactly the result dtype.
+
+    The Neuron dispatch path copies the result into ``out=`` unconditionally, so
+    without this guard an fp32 result silently casts into an int64 ``out=``
+    instead of raising — the divergence OpInfo's ``test_out`` case 4 checks.
+
+    The matmul family requires an **exact** dtype match rather than the
+    ``at::canCast`` rule that ``TensorIterator`` ops (add/mul/cosh) use: CPU
+    accepts ``torch.add(fp32, fp32, out=fp64)`` but rejects
+    ``torch.baddbmm(fp32, fp32, fp32, out=fp64)``, because the structured
+    kernel's ``resize_out`` compares dtypes for equality. A shared canCast
+    guard would therefore be wrong here.
+    """
+    if isinstance(out, torch.Tensor) and out.dtype is not expected:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_TYPE_META_NAMES.get(expected, expected)}, "
+            f"but got {_TYPE_META_NAMES.get(out.dtype, out.dtype)} instead"
+        )
+
+
+def _validate_baddbmm(input, batch1, batch2, *_args, out=None, **_kwargs):
+    """Guard bool operands and the ``out=`` dtype for ``baddbmm``/``.out``.
+
+    ``beta``/``alpha`` are keyword-only in the schema, so they arrive in
+    ``_kwargs``; ``_args`` is kept for robustness if that ever changes.
+    """
+    _reject_bool_operands(input, batch1, batch2)
+    operands = [t for t in (input, batch1, batch2) if isinstance(t, torch.Tensor)]
+    if len({t.dtype for t in operands}) != 1:
+        # CPU rejects mismatched operand dtypes ("Input dtypes must be the
+        # same, got: ...") *before* it looks at out=, so leave the message to
+        # torch.baddbmm rather than reporting a misleading out= mismatch.
+        return
+    # All operands share one dtype, so that dtype is also the result dtype
+    # (torch.result_type over equal dtypes is the identity).
+    _check_out_dtype(operands[0].dtype, out)
+
+
+def _validate_baddbmm_dtype(input, batch1, batch2, out_dtype=None, *_args, out=None, **_kwargs):
+    """Same guards for ``.dtype``/``.dtype_out``, whose result dtype is ``out_dtype``.
+
+    ``out_dtype`` is positional arg 3 in these schemas (``beta``/``alpha`` stay
+    keyword-only), and the operands are cast to it before the matmul, so the
+    result dtype is ``out_dtype`` regardless of the operand dtypes.
+    """
+    _reject_bool_operands(input, batch1, batch2)
+    if isinstance(out_dtype, torch.dtype):
+        _check_out_dtype(out_dtype, out)
+
+
+@register_aten(
+    ["aten::baddbmm", "aten::baddbmm.out"],
+    output_params=("out",),
+    static_argnames=("beta", "alpha"),
+    validate_static_inputs=_validate_baddbmm,
+)
+def torch_baddbmm(input, batch1, batch2, beta=1, alpha=1, out=None):
+    """Batch matrix-matrix product with broadcasted input add.
+
+    Schema: aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2,
+                          *, Scalar beta=1, Scalar alpha=1) -> Tensor
+
+    Computes: out = beta * input + alpha * (batch1 @ batch2)
+
+    Shape/dim validation is delegated to ``torch.baddbmm`` rather than
+    reimplemented here: it already raises for non-3-D operands, batch-size
+    and inner-dim mismatches, and a non-broadcastable ``input``, with the
+    exact messages CPU produces. Hand-written checks diverged from those
+    messages (e.g. a 2-D ``batch1`` raises an expand error on CPU, not a
+    "expected 3D tensor" error), which breaks OpInfo error-regex tests.
+
+    ``beta``/``alpha`` must be static: ``torch.baddbmm`` reads them as
+    Python scalars while the graph is traced, so passing them as runtime
+    inputs fails with ``aten._local_scalar_dense`` during make_fx. Each
+    distinct pair compiles its own NEFF (same as addmm/addmv), which the
+    persistent NEFF cache absorbs after the first call.
+    """
+    return torch.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
+
+
+@register_aten(
+    ["aten::baddbmm.dtype", "aten::baddbmm.dtype_out"],
+    output_params=("out",),
+    static_argnums=(3,),
+    static_argnames=("out_dtype", "beta", "alpha"),
+    validate_static_inputs=_validate_baddbmm_dtype,
+)
+def torch_baddbmm_dtype(input, batch1, batch2, out_dtype, beta=1, alpha=1, out=None):
+    """``baddbmm`` with an explicit accumulate/output dtype.
+
+    Schema: aten::baddbmm.dtype(Tensor self, Tensor batch1, Tensor batch2,
+                                ScalarType out_dtype, *, Scalar beta=1,
+                                Scalar alpha=1) -> Tensor
+
+    ``out_dtype`` is a *positional* ScalarType (arg 3), not a keyword — so
+    these are separate overloads from ``aten::baddbmm``/``.out`` and are
+    dispatched independently. Registering them matters even though they are
+    rare: an unregistered overload cannot fall back, because upstream
+    PyTorch 2.12 ships no CPU kernel for ``baddbmm.dtype``/``.dtype_out``
+    at all, so the CPU fallback path raises NotImplementedError instead of
+    producing a result.
+
+    Casting the operands up front makes the matmul accumulate in
+    ``out_dtype`` (the point of the overload for bf16/fp16 inputs with an
+    fp32 output). Each operand is tested against ``out_dtype`` individually
+    — gating all three casts on ``batch1`` alone would leave a lower-precision
+    ``input`` uncast, and ``torch.baddbmm`` then raises a scalar-type mismatch
+    instead of honoring ``out_dtype``.
+    """
+    # Cast the operands, not the result: the matmul accumulates in out_dtype.
+    if out_dtype is not None:
+        input = input.to(out_dtype) if input.dtype != out_dtype else input
+        batch1 = batch1.to(out_dtype) if batch1.dtype != out_dtype else batch1
+        batch2 = batch2.to(out_dtype) if batch2.dtype != out_dtype else batch2
+    return torch.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
+
+
 @register_aten(["aten::addmm", "aten::addmm.out"], static_argnames=("beta", "alpha"))
 def torch_addmm(input, mat1, mat2, beta=1, alpha=1, out=None):
     # Validate that mat1 and mat2 are 2D tensors

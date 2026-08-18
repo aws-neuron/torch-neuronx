@@ -75,6 +75,16 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addmm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addmv_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addr_neuron_float64",
+    # baddbmm's float64 decomp comparison, alongside addmm/addmv/addr above.
+    # Neuron has no float64: the op runs in float32 and is compared against a
+    # float64 CPU reference at float64 tolerance (1e-07), so the matmul
+    # accumulation shows up as noise just above the bar. Measured: 13/250
+    # elements mismatched, greatest absolute difference 7.63e-06 (= 2^-17,
+    # i.e. one float32 ULP at these magnitudes), greatest RELATIVE difference
+    # 1.167e-07 against a 1e-07 limit — 1.17x over, not a wrong result.
+    # Forward numerics are covered positively at float32 tolerance by the 73
+    # tests in tests/python_ops/test_baddbmm.py.
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_baddbmm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_constant_pad_nd_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_constant_pad_nd_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_corrcoef_neuron_uint8",
@@ -147,6 +157,12 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_quick_addmm_decomposed_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_addmm_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_quick_addmm_neuron_float64",
+    # Same float64 tolerance as the comprehensive entry above, same op — the
+    # quick variant walks a subset of the same OpInfo samples. Measured:
+    # 11/250 mismatched, greatest absolute difference 7.63e-06, greatest
+    # relative difference 1.166e-07 against 1e-07. test_quick_addmm_neuron
+    # _float64 immediately above is the sibling precedent.
+    "test_decomp.py::TestDecompNEURON::test_quick_baddbmm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_constant_pad_nd_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_quick_constant_pad_nd_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_core_backward_mv_neuron_float64",

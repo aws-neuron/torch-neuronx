@@ -538,6 +538,38 @@ const ReductionConfig* GetReductionConfig(const std::string& op_name) {
   return (it != kConfigs.end()) ? &it->second : nullptr;
 }
 
+const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_name) {
+  // beta * self + alpha * (matmul) — see MatmulAccumulateConfig in the header.
+  // Keyed on the base name, so all overloads (.out/.dtype/.dtype_out) match.
+  //
+  // Only natively-lowered ops belong here. `addbmm` has the same semantics but
+  // is NOT registered (it CPU-falls-back, which already gives the right answer
+  // for a zero contraction dim), so an entry for it would be dead code — add
+  // one if/when addbmm gains a native lowering.
+  static const std::unordered_map<std::string, MatmulAccumulateConfig> kConfigs = {
+      {"baddbmm", {0}},
+      {"addmm", {0}},
+  };
+  auto base = ExtractBaseOpName(op_name);
+  auto it = kConfigs.find(base);
+  return (it != kConfigs.end()) ? &it->second : nullptr;
+}
+
+bool HasZeroDim(const std::vector<int64_t>& shape) {
+  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == 0; });
+}
+
+c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
+                             const c10::FunctionSchema& schema, const std::string& name,
+                             const c10::Scalar& default_value) {
+  const auto& schema_args = schema.arguments();
+  for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
+    if (schema_args[i].name() != name) continue;
+    return args[i].isScalar() ? args[i].toScalar() : default_value;
+  }
+  return default_value;
+}
+
 const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
   // Mirrors Python config.py: IndexOps.INDEX_OPS
   // index_argnum = position of the index tensor, input_argnum = position of self/input
