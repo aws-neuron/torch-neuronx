@@ -14,7 +14,15 @@ void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size
 void nrt_copy_cpu_to_neuron(void* src_data_ptr, nrt_tensor_t* dst_data_ptr, size_t dst_offset,
                             size_t size);
 void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
+
+/// Strided neuron->neuron copy using only NRT/stream primitives.
+/// Submits one stream-ordered device copy op per contiguous span.
 void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
+
+/// Strided neuron->neuron copy preferring the on-device NKI kernel.
+/// Default entry point for a strided copy.
+void nki_copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
+
 nrt_tensor_t* get_nrt_tensor(const at::Tensor& tensor, bool non_blocking = false);
 void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src);
 

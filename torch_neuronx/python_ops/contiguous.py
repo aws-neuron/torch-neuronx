@@ -137,7 +137,7 @@ class ContiguousNKIImpl(OperationImplementation):
             dtype=self_tensor.dtype,
             device=self_tensor.device,
         )
-        _C._nrt_copy_strided_neuron_to_neuron(src, output)
+        _C._nki_copy_strided_neuron_to_neuron(src, output)
         return ExecutionResult(success=True, output=output)
 
     def _channels_last_strides(self, shape, memory_format):

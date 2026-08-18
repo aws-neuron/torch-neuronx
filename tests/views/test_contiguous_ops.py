@@ -399,20 +399,19 @@ class TestStridedCopyStrideS:
 
     A contiguous <-> stride-S lane view (any supported dtype — e.g. an
     object-collective uint8 buffer, or a ``[:, k]`` column of an ``(N, S)``
-    tensor) is routed by ``copy_strided_neuron_to_neuron`` to the NKI
-    gather/scatter kernel instead of a per-element / host round-trip (PR #1458 /
+    tensor) is routed by ``nki_copy_strided_neuron_to_neuron`` to the NKI
+    gather/scatter kernel instead of a per-element span copy (PR #1458 /
     MFU-415). These pin correctness (copied values + untouched lanes preserved)
-    and that no CPU-bounce fallback fires. ``_C._nrt_copy_strided_neuron_to_neuron``
-    is the direct binding for ``copy_strided_neuron_to_neuron``; it's called
-    directly because a plain ``dst.copy_(src)`` of a supported dtype is served by
-    the MLIR epilogue and never reaches this path.
+    and that no CPU-bounce fallback fires. ``_C._nki_copy_strided_neuron_to_neuron``
+    is the direct binding for that entry point; it's called directly because a
+    plain ``dst.copy_(src)`` of a supported dtype is served by the MLIR epilogue
+    and never reaches this path.
 
     ``rows`` covers both tiling paths: < P_MAX (tail) and >= P_MAX (main tile).
     """
 
     _CPU_BOUNCE_FALLBACKS: typing.ClassVar = {
         "aten::copy_[noncontiguous_scatter_cpu_bounce]",
-        "aten::copy_[strided_span_bound_cpu_bounce]",
     }
 
     # dtypes the kernel moves bit-exactly. Excludes bool (NKI rejects it) and
@@ -458,7 +457,7 @@ class TestStridedCopyStrideS:
         assert not dst.is_contiguous()
 
         with track_neuron_ops():
-            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+            _C._nki_copy_strided_neuron_to_neuron(src, dst)
             fallbacks = torch_neuronx.get_fallback_ops()
 
         torch.testing.assert_close(dst.cpu(), src.cpu())
@@ -475,7 +474,7 @@ class TestStridedCopyStrideS:
         assert not src.is_contiguous()
 
         with track_neuron_ops():
-            _C._nrt_copy_strided_neuron_to_neuron(src, dst)
+            _C._nki_copy_strided_neuron_to_neuron(src, dst)
             fallbacks = torch_neuronx.get_fallback_ops()
 
         torch.testing.assert_close(dst.cpu(), base[:, lane].cpu())
@@ -495,6 +494,68 @@ class TestStridedCopyStrideS:
         self._check_gather(torch.float32, stride, rows, lane)
 
 
+class TestStridedCopySpanDecomposition:
+    """Strided copies the NKI kernel does not handle, decomposed into spans.
+
+    ``nki_copy_strided_neuron_to_neuron`` — the default strided-copy entry point —
+    routes uniform stride-S gather/scatter to the NKI kernel
+    (``TestStridedCopyStrideS``) and delegates everything it declines — both sides
+    strided, non-uniform strides, unsupported dtypes — to
+    ``copy_strided_neuron_to_neuron``, which submits one stream-ordered device copy
+    op per contiguous span.
+
+    Every shape below is deliberately *not* kernel-eligible, so it exercises that
+    span decomposition. Each asserts the bytes outside the destination view are
+    left alone, which comparing only the view cannot detect.
+    """
+
+    def test_element_spans_preserve_dst_gaps(self):
+        """No unit stride on either side: 12 single-element spans."""
+        base_src = torch.arange(24, dtype=torch.float32).reshape(4, 6).to("neuron")
+        src = base_src[:, ::2]  # (4, 3), strides (6, 2)
+
+        base_dst = torch.zeros((4, 6), device="neuron")
+        sentinel = torch.full((4, 3), -7.0, device="neuron")
+        base_dst[:, 1::2] = sentinel  # lanes the copy must leave alone
+        dst = base_dst[:, ::2]  # (4, 3), strides (6, 2)
+
+        # Strided on both sides, so the kernel declines it (it needs one
+        # contiguous side).
+        assert not src.is_contiguous() and not dst.is_contiguous()
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        torch.testing.assert_close(base_dst[:, 1::2].cpu(), sentinel.cpu())
+
+    def test_row_spans_preserve_dst_gaps(self):
+        """Unit innermost stride on both sides: 4 spans of 3 elements."""
+        rows = 4
+        base_dst = torch.zeros((2 * rows, 3), device="neuron")
+        sentinel = torch.full((rows, 3), -7.0, device="neuron")
+        base_dst[1::2] = sentinel  # rows the copy must leave alone
+
+        src = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3).to("neuron")
+        # A row slice: strides (6, 1) are not a uniform stride-S layout, so the
+        # kernel declines it and the copy decomposes per row.
+        dst = base_dst[::2]
+        assert not dst.is_contiguous()
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        torch.testing.assert_close(base_dst[1::2].cpu(), sentinel.cpu())
+
+    def test_contiguous_is_single_span(self):
+        """A fully contiguous copy is one bulk span."""
+        src = torch.arange(20, dtype=torch.float32).reshape(4, 5).to("neuron")
+        dst = torch.empty_like(src)
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+
 class TestChannelsLastCopyCount:
     """Tests to verify copy optimization reduces number of operations"""
 
@@ -507,13 +568,13 @@ class TestChannelsLastCopyCount:
         import torch_neuronx._C as _C
 
         copy_calls = {"count": 0}
-        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+        orig_copy = _C._nki_copy_strided_neuron_to_neuron
 
         def counting_copy(src, dst):
             copy_calls["count"] += 1
             return orig_copy(src, dst)
 
-        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+        monkeypatch.setattr(_C, "_nki_copy_strided_neuron_to_neuron", counting_copy)
 
         x = make_test_tensor((2, 3, 4, 5), device="neuron")
         assert x.is_contiguous()
@@ -544,7 +605,7 @@ class TestChannelsLastCopyCount:
 
         copy_calls = {"count": 0}
         clone_calls = {"count": 0}
-        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+        orig_copy = _C._nki_copy_strided_neuron_to_neuron
 
         def counting_copy(src, dst):
             copy_calls["count"] += 1
@@ -552,7 +613,7 @@ class TestChannelsLastCopyCount:
             assert all(s != 0 for s in src.stride()), "Source should be materialized (no stride=0)"
             return orig_copy(src, dst)
 
-        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+        monkeypatch.setattr(_C, "_nki_copy_strided_neuron_to_neuron", counting_copy)
 
         # Patch clone to count materializations
         orig_clone = torch.Tensor.clone

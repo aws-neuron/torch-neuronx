@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <vector>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
@@ -293,7 +295,59 @@ void RunNkiStridedCopy(const at::Tensor& src, at::Tensor& dst) {
 
 }  // namespace
 
-void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
+namespace {
+
+// One contiguous (src_offset, dst_offset, nbytes) piece of a strided copy.
+struct CopySpan {
+  size_t src_offset_bytes;
+  size_t dst_offset_bytes;
+  size_t size_bytes;
+};
+
+// Enumerate the contiguous spans into which this strided copy decomposes.
+void EnumerateCopySpans(const at::Tensor& src, const at::Tensor& dst,
+                        std::vector<CopySpan>& spans) {
+  const auto element_size = static_cast<size_t>(src.element_size());
+  const auto ndim = static_cast<int64_t>(src.dim());
+  const size_t src_base_offset = src.storage_offset() * element_size;
+  const size_t dst_base_offset = dst.storage_offset() * element_size;
+
+  if (src.is_contiguous() && dst.is_contiguous()) {
+    spans.push_back(
+        {src_base_offset, dst_base_offset, static_cast<size_t>(src.numel()) * element_size});
+    return;
+  }
+
+  auto sizes = src.sizes();
+  auto src_strides = src.strides();
+  auto dst_strides = dst.strides();
+
+  std::function<void(int64_t, size_t, size_t)> recurse = [&](int64_t dim, size_t src_off,
+                                                             size_t dst_off) {
+    if (dim == ndim) {
+      spans.push_back({src_off, dst_off, element_size});  // scalar element
+      return;
+    }
+    const int64_t n = sizes[dim];
+    if (n == 0) return;
+    const int64_t src_step = src_strides[dim];
+    const int64_t dst_step = dst_strides[dim];
+    // Innermost dim with unit strides on both sides = one contiguous span.
+    if (dim == ndim - 1 && src_step == 1 && dst_step == 1) {
+      spans.push_back({src_off, dst_off, static_cast<size_t>(n) * element_size});
+      return;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      recurse(dim + 1, src_off + static_cast<size_t>(i * src_step) * element_size,
+              dst_off + static_cast<size_t>(i * dst_step) * element_size);
+    }
+  };
+  recurse(0, src_base_offset, dst_base_offset);
+}
+
+// Preconditions shared by every strided-copy entry point. Runs before the kernel
+// gate too, so an invalid copy is rejected here rather than inside NKI.
+void ValidateStridedCopy(const at::Tensor& src, const at::Tensor& dst) {
   TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1,
               "copy_strided: expected src to be a neuron tensor");
   TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1,
@@ -303,79 +357,60 @@ void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
   TORCH_CHECK(src.dtype() == dst.dtype(), "copy_strided: src and dst must have the same dtype");
   TORCH_CHECK(src.device().index() == dst.device().index(),
               "copy_strided: src and dst must be on the same Neuron core");
+}
+
+}  // namespace
+
+void copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
+  ValidateStridedCopy(src, dst);
 
   if (src.numel() == 0) {
     return;
   }
 
-  // Fast path: a uniform stride-S gather/scatter (one side contiguous, the other
-  // a uniform stride-S lane view) runs on-device via the NKI kernel in a single
-  // coalesced, stream-ordered launch — instead of the per-element, host-blocking
-  // nrt_tensor_copy loop below. Only kernel-eligible patterns are routed, so
-  // the op never falls back into this function (no recursion).
+  std::vector<CopySpan> spans;
+  EnumerateCopySpans(src, dst, spans);
+  if (spans.empty()) {
+    return;
+  }
+
+  // Submit each span as its own stream-ordered copy op. Spans from one stream
+  // land in one hardware queue in submission order, so overlapping spans
+  // overwrite in index order, as a synchronous per-span loop would.
+  const int device = src.device().index();
+  auto stream = at::neuron::getCurrentNeuronStream(device);
+  void* src_ptr = src.storage().mutable_data();
+  void* dst_ptr = dst.storage().mutable_data();
+  auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
+  auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
+
+  for (const auto& span : spans) {
+    auto copy_kernel = std::make_unique<at::neuron::CopyDirectKernelExecution>(
+        "neuron::copy::strided_neuron_to_neuron",
+        at::neuron::TensorDataRef{src_tensor_ptr, src_ptr},
+        at::neuron::TensorDataRef{dst_tensor_ptr, dst_ptr}, span.src_offset_bytes,
+        span.dst_offset_bytes, span.size_bytes, device);
+    auto context = std::make_unique<at::neuron::OperationContext>(std::move(copy_kernel));
+    at::neuron::SubmitOperationContext(stream, std::move(context));
+  }
+}
+
+void nki_copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
+  ValidateStridedCopy(src, dst);
+
+  if (src.numel() == 0) {
+    return;
+  }
+
+  // A uniform stride-S gather/scatter (one side contiguous, the other a uniform
+  // stride-S lane view) runs on-device via the NKI kernel in a single coalesced,
+  // stream-ordered launch. Falls back to direct NRT copy for dtypes/stride patterns
+  // the NKI kernel cannot handle.
   if (IsNkiStridedCopyEligible(src, dst)) {
     RunNkiStridedCopy(src, dst);
     return;
   }
-
-  // Drain the stream so all pending operations complete before we issue
-  // direct nrt_tensor_copy calls outside the stream.
-  auto stream = at::neuron::getCurrentNeuronStream(src.device().index());
-  stream.synchronize();
-
-  const auto element_size = static_cast<size_t>(src.element_size());
-  const auto ndim = static_cast<int64_t>(src.dim());
-
-  // Resolve NRT handles
-  nrt_tensor_t* src_nrt = get_nrt_tensor(src);
-  nrt_tensor_t* dst_nrt = get_nrt_tensor(dst);
-  size_t src_base_offset = src.storage_offset() * element_size;
-  size_t dst_base_offset = dst.storage_offset() * element_size;
-
-  // Fast path: both contiguous — single bulk copy
-  if (src.is_contiguous() && dst.is_contiguous()) {
-    size_t nbytes = static_cast<size_t>(src.numel()) * element_size;
-    NRT_STATUS status = nrt_tensor_copy(src_nrt, src_base_offset, dst_nrt, dst_base_offset, nbytes);
-    TORCH_CHECK(status == NRT_SUCCESS,
-                "copy_strided: nrt_tensor_copy failed (status=", static_cast<int>(status), ")");
-    return;
-  }
-
-  // Recursive strided copy — walks dimensions and copies contiguous spans
-  auto sizes = src.sizes();
-  auto src_strides = src.strides();
-  auto dst_strides = dst.strides();
-
-  std::function<void(int64_t, size_t, size_t)> recurse = [&](int64_t dim, size_t src_off,
-                                                             size_t dst_off) {
-    if (dim == ndim) {
-      // Scalar element — copy single element
-      NRT_STATUS status = nrt_tensor_copy(src_nrt, src_off, dst_nrt, dst_off, element_size);
-      TORCH_CHECK(status == NRT_SUCCESS, "copy_strided: nrt_tensor_copy failed");
-      return;
-    }
-
-    const int64_t n = sizes[dim];
-    if (n == 0) return;
-
-    const int64_t src_step = src_strides[dim];
-    const int64_t dst_step = dst_strides[dim];
-
-    // If innermost dim and both strides are 1, copy the whole span at once
-    if (dim == ndim - 1 && src_step == 1 && dst_step == 1) {
-      size_t nbytes = static_cast<size_t>(n) * element_size;
-      NRT_STATUS status = nrt_tensor_copy(src_nrt, src_off, dst_nrt, dst_off, nbytes);
-      TORCH_CHECK(status == NRT_SUCCESS, "copy_strided: nrt_tensor_copy failed");
-      return;
-    }
-
-    for (int64_t i = 0; i < n; ++i) {
-      recurse(dim + 1, src_off + static_cast<size_t>(i * src_step) * element_size,
-              dst_off + static_cast<size_t>(i * dst_step) * element_size);
-    }
-  };
-
-  recurse(0, src_base_offset, dst_base_offset);
+  copy_strided_neuron_to_neuron(src, dst);
 }
 
 void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src) {
