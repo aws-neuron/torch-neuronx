@@ -386,13 +386,9 @@ BLOCKLIST: list[SkipGroup] = [
             "custom_operator",
             "distributions",
             "higher_order_ops",
-            # pipeline parallelism not supported
-            "distributed/pipelining",
             "distributed/algorithms/quantization",
             # an experimental next-gen distributed API (the dist2 namespace)
             "distributed/test_dist2.py",
-            # pipeline parallelism
-            "distributed/_composable/test_composability/test_pp_composability.py",
             # Masked / named / nested tensors
             "test_masked.py",
             "test_maskedtensor.py",
