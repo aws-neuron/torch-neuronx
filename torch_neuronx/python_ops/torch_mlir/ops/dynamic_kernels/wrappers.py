@@ -10,6 +10,7 @@ from torch_neuronx.nki_hop import nki_op, wrap_nki
 from torch_neuronx.utils import get_logical_neuron_cores
 
 from .add_kernel import add_kernel
+from .bitwise_or_kernel import bitwise_or_kernel
 from .cat_kernel import cat_kernel
 from .cos_kernel import cos_kernel
 from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
@@ -17,6 +18,8 @@ from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
 from .exp_kernel import exp_kernel
 from .gather_kernel import gather_kernel
 from .mul_kernel import mul_kernel
+from .neg_kernel import neg_kernel
+from .ones_like_kernel import ones_like_kernel
 from .scatter_add_kernel import scatter_add_kernel
 from .sigmoid_backward_kernel import sigmoid_backward_kernel
 from .sigmoid_kernel import sigmoid_kernel
@@ -25,6 +28,7 @@ from .silu_kernel import silu_kernel
 from .sin_kernel import sin_kernel
 from .sub_kernel import sub_kernel
 from .sum_kernel import sum_kernel
+from .where_kernel import where_kernel
 
 # Grid must match logical_neuron_cores so the compiler emits identical code on
 # every core (NCC_IXGM002 fires on basic-block-count mismatch otherwise). The
@@ -47,6 +51,9 @@ _wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
 _wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
 _wrapped_gather = wrap_nki(gather_kernel)
 _wrapped_scatter_add = wrap_nki(scatter_add_kernel)
+_wrapped_ones_like = wrap_nki(ones_like_kernel)
+_wrapped_where = wrap_nki(where_kernel)
+_wrapped_bitwise_or = wrap_nki(bitwise_or_kernel)
 
 
 @nki_op("dynamic_nki::add", mutates_args={})
@@ -147,3 +154,25 @@ def dynamic_scatter_add_nki(
     num_m_tiles: torch.Tensor,
 ) -> torch.Tensor:
     return _wrapped_scatter_add[_GRID](data, indices, output_buffer, num_m_tiles)
+
+
+@nki_op("dynamic_nki::ones_like", mutates_args={})
+def dynamic_ones_like_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_ones_like[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::where", mutates_args={})
+def dynamic_where_nki(
+    condition: torch.Tensor,
+    input_a: torch.Tensor,
+    input_b: torch.Tensor,
+    num_m_tiles: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_where[_GRID](condition, input_a, input_b, num_m_tiles)
+
+
+@nki_op("dynamic_nki::bitwise_or", mutates_args={})
+def dynamic_bitwise_or_nki(
+    input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
+) -> torch.Tensor:
+    return _wrapped_bitwise_or[_GRID](input_a, input_b, num_m_tiles)
