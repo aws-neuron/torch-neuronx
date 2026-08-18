@@ -301,6 +301,54 @@ struct IndexOpConfig {
  */
 const IndexOpConfig* GetIndexOpConfig(const std::string& op_name);
 
+/**
+ * Matmul-accumulate op configuration for empty tensor handling.
+ *
+ * These ops compute ``beta * self + alpha * (matmul)``. When only the
+ * *contraction* dimension is zero (e.g. baddbmm with batch1=[b,n,0],
+ * batch2=[b,0,p]) the matmul term is an empty sum — zero — but the output
+ * is NOT empty: the correct result is ``beta * self``, broadcast to the
+ * matmul's output shape.
+ *
+ * The generic empty-tensor path fills such outputs with zeros, which
+ * silently drops the ``beta * self`` term. Ops listed here are handled by a
+ * dedicated branch in HandleEmptyTensors that fabricates ``beta * self``
+ * directly (see the matmul-accumulate branch). Only ``self_argnum`` is stored;
+ * the two matmul operands sit immediately after ``self`` (``self_argnum + 1``
+ * and ``+ 2``) in both baddbmm and addmm, and the branch reads them there to
+ * infer the output shape without a Meta kernel (baddbmm.dtype has none).
+ *
+ * Only ops whose result depends on a non-empty operand belong here. Plain
+ * matmuls (mm/bmm) are correctly served by the zeros path — with a zero
+ * contraction dim their result genuinely is all zeros.
+ */
+struct MatmulAccumulateConfig {
+  int self_argnum;  // Position of the accumulated (`self`) tensor
+};
+
+/**
+ * Check if an op is a matmul-accumulate op and get its config.
+ * Returns nullptr if the op is not one.
+ */
+const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_name);
+
+/** True if any dimension of `shape` is zero (i.e. the tensor is empty). */
+bool HasZeroDim(const std::vector<int64_t>& shape);
+
+/**
+ * Read a positional/keyword Scalar argument by schema name, returning
+ * `default_value` when it is absent or None. Used to recover `beta` for the
+ * matmul-accumulate empty-tensor branch.
+ *
+ * Returns the `c10::Scalar` verbatim rather than flattening to `double`: the
+ * scalar's type category (integral vs floating) must survive so that
+ * `beta * self` keeps an integer output integer instead of promoting it to
+ * float. Flattening to double silently broke that (int32 `self` → float32).
+ */
+c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
+                             const c10::FunctionSchema& schema, const std::string& name,
+                             const c10::Scalar& default_value);
+
 // ═══════════════════════════════════════════════════════════════
 //  Meta dispatch utilities — used by HandleEmptyTensors.
 //

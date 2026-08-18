@@ -21,6 +21,22 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addmv_neuron_bfloat16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addmv_neuron_float16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_addmv_neuron_float32",
+    # baddbmm joins its matmul-accumulate siblings addmm/addmv/addcmul above,
+    # for the identical root cause. test_decomp's DecompCrossRefMode runs the
+    # decomposition against a float64 reference and asserts every intermediate
+    # keeps its dtype; the `beta * self` multiply comes back float32 because
+    # Neuron down-casts 64-bit types on entry (docs/packed_int64_design.md,
+    # "Neuron computes on 32-bit types"). Messages measured:
+    #   bfloat16/float16: "0 Operation: aten.mul.Tensor dtype mismatch:
+    #                      torch.float64 != torch.float32"
+    #   float32:          "Object comparison failed: torch.float64 !=
+    #                      torch.float32"
+    # test_comprehensive_addmm_neuron_float32 above fails with that same
+    # "Object comparison failed" message and is filed here, so the grouping is
+    # by root cause, not by message wording.
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_baddbmm_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_baddbmm_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_baddbmm_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linspace_neuron_int16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linspace_neuron_int32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linspace_neuron_int64",

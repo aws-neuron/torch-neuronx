@@ -117,6 +117,25 @@ TIMEOUT = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_linalg_vector_norm_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_linalg_vector_norm_neuron_float32",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_pow_slowpath_inplace_neuron_float64",
+    # test_baddbmm shares test_bmm's structure and its timeout cause: the
+    # generator yields 296 operand layouts (6*6*6 transpose permutations, 64
+    # broadcast combinations, 16 zero-sized) and the helper runs ~10 baddbmm
+    # calls per layout. Each distinct layout is its own NEFF compile at ~1.6s,
+    # so the test needs ~15+ min and exceeds the 900s timeout. Measured: the
+    # scalar beta/alpha values do NOT drive this — repeat calls hit the cache
+    # at 0.000s; it is the layout count alone.
+    #
+    # Listed alongside test_bmm_neuron_{bfloat16,float16,float32} below, which
+    # are already here for the identical reason on the identical test shape
+    # (test_bmm_neuron_float64 is in the "extreme duration" group in
+    # aten_skips_registry.py). This is a test-duration limit, not a baddbmm
+    # correctness gap — the same layouts are covered in seconds by
+    # tests/python_ops/test_baddbmm.py (transposed/expanded/broadcast/zero-sized
+    # cases) and by test_ops.py's OpInfo suite, both of which pass.
+    "test_linalg.py::TestLinalgNEURON::test_baddbmm_neuron_bfloat16",
+    "test_linalg.py::TestLinalgNEURON::test_baddbmm_neuron_float16",
+    "test_linalg.py::TestLinalgNEURON::test_baddbmm_neuron_float32",
+    "test_linalg.py::TestLinalgNEURON::test_baddbmm_neuron_float64",
     "test_linalg.py::TestLinalgNEURON::test_bmm_neuron_bfloat16",
     "test_linalg.py::TestLinalgNEURON::test_bmm_neuron_float16",
     "test_linalg.py::TestLinalgNEURON::test_bmm_neuron_float32",

@@ -2646,8 +2646,32 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
   try {
     auto device = ExtractDevice(args);
 
-    // ── 1a. Infer output shapes/dtypes via Meta dispatch ──
-    auto meta_specs = InferOutputsViaMeta(op, args);
+    // ── 1a. Infer output shapes/dtypes ──
+    // Matmul-accumulate ops (baddbmm/addmm) include overloads such as
+    // baddbmm.dtype that have no usable Meta kernel — its meta decomposition
+    // mishandles the positional ScalarType arg and throws. Infer their single
+    // output spec from the matmul operands directly (shape = mat1's non-
+    // contraction dims + mat2's last dim; dtype = explicit out_dtype if given,
+    // else self's) so the branch below never depends on Meta dispatch. All
+    // other ops use Meta.
+    auto* matmul_cfg = GetMatmulAccumulateConfig(op_name);
+    std::vector<MetaOutputSpec> meta_specs;
+    if (matmul_cfg) {
+      const int self_argnum = matmul_cfg->self_argnum;
+      const auto& self_t = args[self_argnum].toTensor();
+      const auto& mat1 = args[self_argnum + 1].toTensor();
+      const auto& mat2 = args[self_argnum + 2].toTensor();
+      std::vector<int64_t> shape(mat1.sizes().begin(), mat1.sizes().end() - 1);
+      shape.push_back(mat2.sizes().back());
+      c10::ScalarType dtype = self_t.scalar_type();
+      const auto& schema_args = schema.arguments();
+      for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
+        if (schema_args[i].name() == "out_dtype") dtype = args[i].toScalarType();
+      }
+      meta_specs.push_back({std::move(shape), dtype, /*is_undefined=*/false});
+    } else {
+      meta_specs = InferOutputsViaMeta(op, args);
+    }
 
     TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] Meta inferred", " op=", op_name,
                                  " num_outputs=", meta_specs.size());
@@ -2742,10 +2766,35 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
           if (spec.is_undefined) {
             outputs.push_back(torch::Tensor());
           } else {
-            bool has_zero_dim =
-                std::any_of(spec.shape.begin(), spec.shape.end(), [](int64_t d) { return d == 0; });
-            outputs.push_back(has_zero_dim ? make_empty(spec) : make_zeros(spec));
+            outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec) : make_zeros(spec));
           }
+        }
+      }
+
+    } else if (matmul_cfg) {
+      // ── Matmul-accumulate (baddbmm/addmm) with a zero contraction dim ──
+      // `beta * self + alpha * (matmul)`: when only the contraction dim is
+      // empty the matmul term is an empty sum (zero) but the output is NOT
+      // empty — the result is `beta * self` broadcast to the output shape.
+      // Fabricate that directly here; a genuinely empty output (some
+      // batch/row/col dim is zero) still gets an empty tensor.
+      TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] matmul-accumulate op", " op=", op_name);
+      const auto& self_t = args[matmul_cfg->self_argnum].toTensor();
+      const c10::Scalar beta = ExtractScalarArg(args, schema, "beta", 1);
+      for (const auto& spec : meta_specs) {
+        if (spec.is_undefined) {
+          outputs.push_back(torch::Tensor());
+        } else if (HasZeroDim(spec.shape)) {
+          outputs.push_back(make_empty(spec));  // genuinely empty output
+        } else if (beta.equal(0)) {
+          outputs.push_back(make_zeros(spec));  // beta=0 drops self (incl. NaN)
+        } else {
+          // beta * self, in the output dtype. `beta` stays a c10::Scalar so the
+          // multiply keeps an integer output integer: a scalar bumps only the
+          // type *category*, never the dtype within it (int32.mul(scalar) stays
+          // int32, not float32/int64). A float beta on an integer baddbmm/addmm
+          // is rejected by aten before this path, matching CPU.
+          outputs.push_back(self_t.to(spec.dtype).mul(beta).expand(spec.shape).contiguous());
         }
       }
 
@@ -2755,9 +2804,7 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
         if (spec.is_undefined) {
           outputs.push_back(torch::Tensor());
         } else {
-          bool has_zero_dim =
-              std::any_of(spec.shape.begin(), spec.shape.end(), [](int64_t d) { return d == 0; });
-          outputs.push_back(has_zero_dim ? make_empty(spec) : make_zeros(spec));
+          outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec) : make_zeros(spec));
         }
       }
     }

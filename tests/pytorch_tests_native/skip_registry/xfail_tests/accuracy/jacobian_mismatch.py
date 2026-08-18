@@ -269,6 +269,16 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addcmul_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addmm_decomposed_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addmm_neuron_float64",
+    # float64-only batched-grad tolerance, matching the addmm entries above and
+    # test_fn_gradgrad/test_inplace_grad/test_inplace_gradgrad below. Triage:
+    # gradcheck PASSES on device for BOTH float32 and float64 with realistic
+    # tolerances (eps=1e-3, atol/rtol=1e-2), with check_batched_grad both on
+    # and off — so this is the OpInfo's tight float64 default tolerance against
+    # matmul accumulation, not a lowering defect. The float32 gradient path is
+    # covered positively by test_baddbmm_backward_matches_cpu in
+    # tests/python_ops/test_baddbmm.py and test_baddbmm_backward in
+    # tests/neuron_dynamo_backend/e2e/test_baddbmm_ops.py, both passing.
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_baddbmm_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_cdist_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_corrcoef_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_diff_neuron_float64",
@@ -336,6 +346,9 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad___rmod___neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad___rmul___neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_addcdiv_neuron_float64",
+    # See the test_fn_grad_baddbmm note above — same float64 batched-grad
+    # tolerance, same triage.
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_baddbmm_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_addcmul_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_cholesky_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_corrcoef_neuron_float64",
@@ -406,6 +419,16 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_var_mean_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_addmm_decomposed_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_addmm_neuron_float64",
+    # See the test_fn_grad_baddbmm note above — same float64 batched-grad
+    # tolerance, same triage. In-place (baddbmm_) variants.
+    #
+    # test_inplace_grad_baddbmm XPASSES intermittently under high xdist
+    # parallelism (observed once as XPASS under -n 64; fails 5/5 when run
+    # alone). It sits right at the tolerance boundary, so do NOT delete this
+    # entry on the strength of a single XPASS — the group is strict=False
+    # precisely so a boundary flake does not turn into a red build either way.
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_baddbmm_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_baddbmm_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_div_no_rounding_mode_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_exp_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_float_power_neuron_float64",

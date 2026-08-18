@@ -374,7 +374,7 @@
 |367|torch.addmm|Y|Native MLIR impl|
 |368|torch.addmv|Y|Native MLIR impl|
 |369|torch.addr|CPU_FALLBACK|aten::addr not registered|
-|370|torch.baddbmm|CPU_FALLBACK|aten::baddbmm not registered|
+|370|torch.baddbmm|Y|Native MLIR impl; supports beta, alpha, out_dtype|
 |371|torch.bmm|Y|Native MLIR impl|
 |372|torch.chain_matmul|Y|Deprecated; decomposes to chain of mm|
 |373|torch.cholesky|CPU_FALLBACK|aten::cholesky not registered|
@@ -960,7 +960,7 @@
 |37|Tensor.addmm_|Y|Native MLIR impl; supports beta, alpha|
 |38|Tensor.sspaddmm|CPU_FALLBACK|Sparse; no native Neuron impl|
 |39|Tensor.addmv|CPU_FALLBACK|No native Neuron impl|
-|40|Tensor.addmv_|CPU_FALLBACK|No native Neuron impl|
+|40|Tensor.addmv_|Y|Native MLIR impl; supports beta, alpha|
 |41|Tensor.addr|CPU_FALLBACK|No native Neuron impl|
 |42|Tensor.addr_|CPU_FALLBACK|No native Neuron impl|
 |43|Tensor.adjoint|Y|View operation|
@@ -990,8 +990,8 @@
 |67|Tensor.all|Y|Native MLIR impl|
 |68|Tensor.any|Y|Native MLIR impl; uint8 input returns uint8|
 |69|Tensor.backward|CPU_FALLBACK|Falls back to CPU (aten::normal_)|
-|70|Tensor.baddbmm|CPU_FALLBACK|No native Neuron impl|
-|71|Tensor.baddbmm_|CPU_FALLBACK|No native Neuron impl|
+|70|Tensor.baddbmm|Y|Native MLIR impl; supports beta, alpha|
+|71|Tensor.baddbmm_|Y|Native MLIR impl; supports beta, alpha|
 |72|Tensor.bernoulli|CPU_FALLBACK|No native Neuron impl|
 |73|Tensor.bernoulli_|CPU_FALLBACK|No native Neuron impl|
 |74|Tensor.bfloat16|Y|Uses to(bfloat16)|
