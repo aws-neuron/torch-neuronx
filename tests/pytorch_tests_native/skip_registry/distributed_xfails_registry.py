@@ -3,7 +3,7 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
-            "Neuron SDPA doesn't support float64. " "TODO: Once resolved, xfails will be removed."
+            "Neuron SDPA doesn't support float64. TODO: Once resolved, xfails will be removed."
         ),
         tests=[
             "DistTensorParallelExampleTest::test_transformer_req_grad_float64_thaw_all",
@@ -19,11 +19,12 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "Distributed cross_entropy with all-reduce "
             "accumulates float32 values in a different "
             "order than local cross_entropy, causing a "
-            "~1.7e-05 difference that exceeds the "
+            "~2.4e-05 difference that exceeds the "
             "test's 1e-05 tolerance."
         ),
         tests=[
             "DistTensorParallelExampleTest::test_loss_parallel",
+            "DistTensorParallelExampleTest::test_loss_parallel_replicate_non_tp_dim",
             "DistTensorParallelExampleTestWithLocalTensor::test_loss_parallel",
         ],
     ),
@@ -197,6 +198,26 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "TestFullyShardMixedPrecisionCasts::test_norm_modules_bf16",
             "TestReplicateMixedPrecisionCasts::test_norm_modules_fp16",
             "TestReplicateMixedPrecisionCasts::test_norm_modules_bf16",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "torch-neuronx lacks generator-aware PrivateUse1 support for aten::normal_. "
+            "randn with an explicit Neuron generator reaches CPU fallback, which rejects "
+            "the generator device before the test reaches torch.func.jvp."
+        ),
+        tests=[
+            "test_fully_shard_mixed_precision.py::TestFullyShardMixedPrecisionJVP::test_no_warmup_jvp_reshard_after_forward_false",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Each Neuron process can access only its rank-local assigned device. "
+            "The test hardcodes device 0 on every rank, causing rank 1 to access "
+            "a device outside its visible range."
+        ),
+        tests=[
+            "test_fully_shard_training.py::TestFullyShardForwardInputs::test_root_no_forward_inputs",
         ],
     ),
     SkipGroup(

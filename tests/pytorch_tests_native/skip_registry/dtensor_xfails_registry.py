@@ -228,4 +228,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_pointwise_ops.py::DistElementwiseOpsTest::test_dropout_backward",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "CollectiveLegalization leaves an opaque ProcessGroup placeholder/get-attribute in the"
+            " FX graph and thus will need handling. "
+        ),
+        tests=[
+            "TestCompileOnOneRank::test_all_reduce_with_implicit_world_group",
+            "TestCompileOnOneRank::test_all_reduce_with_explicit_pg_input",
+        ],
+    ),
 ]
