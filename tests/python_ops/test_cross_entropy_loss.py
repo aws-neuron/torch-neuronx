@@ -160,6 +160,13 @@ class TestCrossEntropy:
         targets = torch.randint(0, shape[1], (shape[0], *shape[2:]), dtype=torch.long)
         _run_cross_entropy(logits, targets, backward=backward)
 
+    def test_cross_entropy_multidimensional_none_backward(self):
+        """Test unreduced backward with a spatial dimension."""
+        shape = (2, 3, 4)
+        logits = torch.randn(shape)
+        targets = torch.randint(0, shape[1], (shape[0], *shape[2:]), dtype=torch.long)
+        _run_cross_entropy(logits, targets, backward=True, reduction="none")
+
     # ── Batch size edge cases ────────────────────────────────────────────
 
     @pytest.mark.parametrize(

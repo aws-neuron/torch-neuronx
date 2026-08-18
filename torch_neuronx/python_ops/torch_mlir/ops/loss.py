@@ -521,7 +521,8 @@ def _ce_bwd(
     if no_batch:
         grad_input = grad_input.squeeze(0)
     if grad_output.dim() > 0 and grad_input.dim() > grad_output.dim():
-        grad_output = grad_output.unsqueeze(-1)
+        # Unreduced cross entropy omits the class dimension from grad_output.
+        grad_output = grad_output.unsqueeze(1)
     return grad_input * grad_output
 
 
