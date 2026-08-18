@@ -278,6 +278,8 @@ public:
       return transformFusedQuantizeMxScaledMm(op, adaptor, rewriter);
     } else if (opName == "torch.neuron._scaled_mm") {
       return transformScaledMm(op, adaptor, rewriter);
+    } else if (opName == "torch.aten._fused_rms_norm") {
+      return transformFusedRmsNorm(op, adaptor, rewriter);
     }
 
     return failure();
@@ -380,6 +382,122 @@ public:
     }
 
     return failure();
+  }
+
+  // torch.aten._fused_rms_norm(input, normalized_shape, weight, eps)
+  //   -> (output, rstd)
+  // Map the forward to stablehlo.custom_call @AwsNeuronRmsNorm(input, weight,
+  // eps_f32) {backend_config="<reduce_dim>"}. The op has a 2nd result (rstd)
+  // consumed only by the (decomposed) backward: it is dead in inference (DCE'd),
+  // and recomputed as rsqrt(mean(x^2)+eps) when used so the decomposed backward
+  // gets a correct value in training.
+  LogicalResult transformFusedRmsNorm(Torch::OperatorOp op, OpAdaptor adaptor,
+                                      ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ValueRange operands = adaptor.getOperands();
+
+    Value input = operands[0];
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType)
+      return rewriter.notifyMatchFailure(op, "input must be a ranked tensor");
+    int64_t reduceDim = inputType.getRank() - 1; // RMSNorm normalizes last dim
+
+    SmallVector<Value> normShape;
+    if (!getListConstructElements(op.getOperand(1), normShape))
+      return rewriter.notifyMatchFailure(
+          op, "normalized_shape must come from a PrimListConstructOp");
+    if (normShape.size() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "only single-trailing-dim RMSNorm (normalized_shape of length 1) "
+              "is supported");
+    // When the last dim is static, defensively confirm normalized_shape matches
+    // it; PyTorch guarantees this for a well-formed graph.
+    int64_t normDim0;
+    if (!inputType.isDynamicDim(reduceDim) &&
+        matchPattern(normShape[0], Torch::m_TorchConstantInt(&normDim0)) &&
+        normDim0 != inputType.getDimSize(reduceDim))
+      return rewriter.notifyMatchFailure(
+          op, "normalized_shape does not match the last input dim");
+
+    if (isa<Torch::NoneType>(operands[2].getType()))
+      return rewriter.notifyMatchFailure(op, "weight must be present");
+    Value weight = operands[2];
+
+    auto epsC = op.getOperand(3).getDefiningOp<Torch::ConstantFloatOp>();
+    if (!epsC)
+      return rewriter.notifyMatchFailure(op, "eps must be a constant float");
+    double epsVal = epsC.getValue().convertToDouble();
+
+    Type outType = getTypeConverter()->convertType(op.getResult(0).getType());
+    if (!outType)
+      return rewriter.notifyMatchFailure(op, "failed to convert output type");
+
+    auto f32 = rewriter.getF32Type();
+    auto scalarF32 = RankedTensorType::get({}, f32);
+
+    // eps as an f32 scalar constant operand (AwsNeuronRmsNorm's 3rd operand).
+    Value epsConst = stablehlo::ConstantOp::create(
+        rewriter, loc,
+        DenseElementsAttr::get(scalarF32,
+                               rewriter.getF32FloatAttr(static_cast<float>(epsVal))));
+
+    auto callTargetName = rewriter.getStringAttr("AwsNeuronRmsNorm");
+    auto backendConfig = rewriter.getStringAttr(std::to_string(reduceDim));
+    auto customCall = stablehlo::CustomCallOp::create(
+        rewriter, loc, outType, ValueRange{input, weight, epsConst}, callTargetName,
+        /*has_side_effect=*/false, backendConfig,
+        stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+        /*called_computations=*/nullptr, /*operand_layouts=*/nullptr,
+        /*result_layouts=*/nullptr, /*output_operand_aliases=*/nullptr);
+    Value output = customCall.getResult(0);
+
+    // rstd (result 1) = rsqrt(mean(x^2)+eps), consumed by the decomposed backward.
+    // Always compute it so training gradients are always correct; when unused
+    // (inference) the whole chain is dead-code-eliminated, so there is no cost.
+    Type rstdType = getTypeConverter()->convertType(op.getResult(1).getType());
+    Value rstd;
+    {
+      int64_t reduceSize = inputType.getDimSize(reduceDim);
+      // rstd = rsqrt(mean(x^2) + eps), reduced over the last dim (keepdim).
+      Value xf =
+          stablehlo::ConvertOp::create(rewriter, loc, inputType.clone(f32), input);
+      Value sq = stablehlo::MulOp::create(rewriter, loc, xf, xf);
+      Value zero = stablehlo::ConstantOp::create(rewriter, loc,
+                                                 rewriter.getZeroAttr(scalarF32));
+      SmallVector<int64_t> reducedShape(inputType.getShape().begin(),
+                                        inputType.getShape().end());
+      reducedShape.pop_back();
+      auto reducedType = RankedTensorType::get(reducedShape, f32);
+      auto reduceOp = stablehlo::ReduceOp::create(
+          rewriter, loc, reducedType, sq, zero,
+          rewriter.getDenseI64ArrayAttr({reduceDim}));
+      Block &block = reduceOp.getBody().emplaceBlock();
+      block.addArguments({scalarF32, scalarF32}, {loc, loc});
+      {
+        OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPointToStart(&block);
+        Value s = stablehlo::AddOp::create(rewriter, loc, block.getArgument(0),
+                                           block.getArgument(1));
+        stablehlo::ReturnOp::create(rewriter, loc, s);
+      }
+      Value sumSq =
+          stablehlo::ReshapeOp::create(rewriter, loc, rstdType, reduceOp.getResult(0));
+      auto rstdShaped = cast<ShapedType>(rstdType);
+      Value nConst = stablehlo::ConstantOp::create(
+          rewriter, loc,
+          DenseElementsAttr::get(
+              rstdShaped, rewriter.getF32FloatAttr(static_cast<float>(reduceSize))));
+      Value mean = stablehlo::DivOp::create(rewriter, loc, sumSq, nConst);
+      Value epsB = stablehlo::ConstantOp::create(
+          rewriter, loc,
+          DenseElementsAttr::get(
+              rstdShaped, rewriter.getF32FloatAttr(static_cast<float>(epsVal))));
+      Value denom = stablehlo::AddOp::create(rewriter, loc, mean, epsB);
+      rstd = stablehlo::RsqrtOp::create(rewriter, loc, denom);
+    }
+
+    rewriter.replaceOp(op, {output, rstd});
+    return success();
   }
 
   LogicalResult transformAllReduce(Torch::OperatorOp op, OpAdaptor adaptor,

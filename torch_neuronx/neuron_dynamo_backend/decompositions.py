@@ -108,7 +108,6 @@ neuron_decompositions = get_decompositions(
         aten.clamp_min,
         aten.clamp_max,
         aten.linear_backward,
-        aten._fused_rms_norm,
         aten._fused_rms_norm_backward,
         aten.fill.Scalar,
         aten.fill.Tensor,
@@ -328,6 +327,27 @@ def dot_empty_shortcut(a, b):
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((), a, b)
+
+
+_NATIVE_FUSED_RMS_NORM = get_decompositions([aten._fused_rms_norm])[aten._fused_rms_norm.default]
+
+
+@register_decomposition([aten._fused_rms_norm])
+def _fused_rms_norm_fallback(input, normalized_shape, weight=None, eps=None):
+    """Route RMSNorm to the AwsNeuronRmsNorm custom-call when the kernel can
+    express it, otherwise decompose.
+
+    TorchToNeuron only lowers `aten._fused_rms_norm` to the AwsNeuronRmsNorm
+    custom-call when it normalizes exactly the last dim, has a real weight, and a
+    constant eps. Any other shape -- multi-trailing-dim ``normalized_shape``,
+    ``weight=None`` (nn.RMSNorm(elementwise_affine=False)), or ``eps=None``
+    (nn.RMSNorm's default) -- is decomposed here by delegating to PyTorch's native
+    _fused_rms_norm decomposition; AOTAutograd then differentiates the resulting
+    primitives directly.
+    """
+    if len(normalized_shape) > 1 or weight is None or eps is None:
+        return _NATIVE_FUSED_RMS_NORM(input, normalized_shape, weight, eps)
+    return NotImplemented
 
 
 @register_decomposition([aten.ormqr.default])
