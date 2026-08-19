@@ -243,20 +243,14 @@ if is_building:
                     """Rewrite RPATH for the installed wheel layout.
 
                     patchelf --set-rpath REPLACES the RPATH, so every runtime
-                    dependency dir must be listed. EFA lib is included because _C.so
-                    has a hard DT_NEEDED on libfabric; matches LIBFABRIC_LOCAL_PATH in
-                    bazel/libfabric_extension.bzl.
+                    dependency dir must be listed. EFA/libfabric is loaded via
+                    dlopen at runtime (not linked), so its path is not needed here.
                     """
-                    efa_lib = os.path.join(
-                        os.environ.get("LIBFABRIC_LOCAL_PATH", "/opt/amazon/efa"),
-                        "lib",
-                    )
                     new_rpath = (
                         "$ORIGIN"
                         ":$ORIGIN/../../../../../torch_neuronx"
                         ":$ORIGIN/../../torch_neuronx"
                         ":$ORIGIN/../torch/lib:/opt/aws/neuron/lib"
-                        f":{efa_lib}"
                     )
 
                     # Check if patchelf is available

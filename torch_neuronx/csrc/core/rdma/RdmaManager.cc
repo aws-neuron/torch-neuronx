@@ -54,6 +54,41 @@ struct NrtRdmaSymbols {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Libfabric dlsym wrappers - loaded lazily so import torch_neuronx succeeds
+// without EFA installed. Only bootstrap functions are true exports; all other
+// fi_* calls are static inline vtable dispatches defined in the headers.
+// ---------------------------------------------------------------------------
+struct LibfabricSymbols {
+  decltype(&::fi_getinfo) fi_getinfo = nullptr;
+  decltype(&::fi_freeinfo) fi_freeinfo = nullptr;
+  decltype(&::fi_dupinfo) fi_dupinfo = nullptr;
+  decltype(&::fi_fabric) fi_fabric = nullptr;
+  decltype(&::fi_strerror) fi_strerror = nullptr;
+
+  bool loaded = false;
+
+  static const LibfabricSymbols& Instance() {
+    static LibfabricSymbols syms;
+    return syms;
+  }
+
+ private:
+  LibfabricSymbols() {
+    void* handle = dlopen("libfabric.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) return;
+
+    auto load = [handle](auto& dest, const char* name) { *(void**)(&dest) = dlsym(handle, name); };
+    load(fi_getinfo, "fi_getinfo");
+    load(fi_freeinfo, "fi_freeinfo");
+    load(fi_dupinfo, "fi_dupinfo");
+    load(fi_fabric, "fi_fabric");
+    load(fi_strerror, "fi_strerror");
+
+    loaded = (fi_getinfo && fi_freeinfo && fi_dupinfo && fi_fabric && fi_strerror);
+  }
+};
+
 bool TensorRdmaSupport() {
   const auto& syms = NrtRdmaSymbols::Instance();
   if (!syms.nrt_get_hbm_mmap_va || !syms.nrt_get_attached_efa_bdf) return false;
@@ -112,8 +147,8 @@ RdmaManager::~RdmaManager() {
   registered_memory_.clear();
   domain_.reset();
   fabric_.reset();
-  if (info_) fi_freeinfo(info_);
-  if (hints_) fi_freeinfo(hints_);
+  if (info_) LibfabricSymbols::Instance().fi_freeinfo(info_);
+  if (hints_) LibfabricSymbols::Instance().fi_freeinfo(hints_);
   info_ = nullptr;
   hints_ = nullptr;
   // Safe to clear: at process teardown the engine has already joined the host
@@ -185,18 +220,21 @@ void RdmaManager::DiscoverHBMRegions() {
 }
 
 RdmaStatus RdmaManager::DiscoverEFAInfo() {
-  fi_info* hints = fi_allocinfo();
+  fi_info* hints = LibfabricSymbols::Instance().fi_dupinfo(nullptr);
   if (!hints) return RdmaStatus::Error("fi_allocinfo failed");
   hints->fabric_attr->prov_name = strdup("efa");
 
   fi_info* info = nullptr;
-  int ret = fi_getinfo(FI_VERSION(1, 9), nullptr, nullptr, 0, hints, &info);
-  fi_freeinfo(hints);
-  if (ret) return RdmaStatus::Error(std::string("fi_getinfo failed: ") + fi_strerror(-ret));
+  int ret =
+      LibfabricSymbols::Instance().fi_getinfo(FI_VERSION(1, 9), nullptr, nullptr, 0, hints, &info);
+  LibfabricSymbols::Instance().fi_freeinfo(hints);
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_getinfo failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   unsigned int domain, bus, device, function;
   if (sscanf(efa_bdf_.c_str(), "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4) {
-    fi_freeinfo(info);
+    LibfabricSymbols::Instance().fi_freeinfo(info);
     return RdmaStatus::Error(std::string("Invalid BDF format: ") + efa_bdf_);
   }
 
@@ -213,7 +251,7 @@ RdmaStatus RdmaManager::DiscoverEFAInfo() {
       }
     }
   }
-  fi_freeinfo(info);
+  LibfabricSymbols::Instance().fi_freeinfo(info);
 
   if (!found) return RdmaStatus::Error(std::string("No EFA device found for BDF: ") + efa_bdf_);
   TORCH_NEURONX_RDMA_INFO("Discovered EFA domain: ", efa_interface_, " for BDF: ", efa_bdf_);
@@ -221,7 +259,7 @@ RdmaStatus RdmaManager::DiscoverEFAInfo() {
 }
 
 RdmaStatus RdmaManager::InitFabric() {
-  hints_ = fi_allocinfo();
+  hints_ = LibfabricSymbols::Instance().fi_dupinfo(nullptr);
   if (!hints_) return RdmaStatus::Error("fi_allocinfo failed");
 
   hints_->caps = FI_MSG | FI_RMA | FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_HMEM;
@@ -234,20 +272,27 @@ RdmaStatus RdmaManager::InitFabric() {
   hints_->fabric_attr->prov_name = strdup("efa");
   hints_->fabric_attr->name = strdup("efa-direct");
 
-  int ret = fi_getinfo(FI_VERSION(1, 9), nullptr, nullptr, 0, hints_, &info_);
-  if (ret) return RdmaStatus::Error(std::string("fi_getinfo failed: ") + fi_strerror(-ret));
+  int ret = LibfabricSymbols::Instance().fi_getinfo(FI_VERSION(1, 9), nullptr, nullptr, 0, hints_,
+                                                    &info_);
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_getinfo failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   if (info_->domain_attr->cq_data_size < 4)
     return RdmaStatus::Error("EFA provider does not support 4-byte immediate data");
 
   fid_fabric* fabric_raw = nullptr;
-  ret = fi_fabric(info_->fabric_attr, &fabric_raw, nullptr);
-  if (ret) return RdmaStatus::Error(std::string("fi_fabric failed: ") + fi_strerror(-ret));
+  ret = LibfabricSymbols::Instance().fi_fabric(info_->fabric_attr, &fabric_raw, nullptr);
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_fabric failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   fabric_.reset(fabric_raw);
 
   fid_domain* domain_raw = nullptr;
   ret = fi_domain(fabric_.get(), info_, &domain_raw, nullptr);
-  if (ret) return RdmaStatus::Error(std::string("fi_domain failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_domain failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   domain_.reset(domain_raw);
 
   return CreateEndpoint();
@@ -262,25 +307,35 @@ RdmaStatus RdmaManager::CreateEndpoint() {
 
   fid_cq* cq_raw = nullptr;
   int ret = fi_cq_open(domain_.get(), &cq_attr, &cq_raw, nullptr);
-  if (ret) return RdmaStatus::Error(std::string("fi_cq_open failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_cq_open failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   cq_.reset(cq_raw);
 
   fi_av_attr av_attr = {};
   av_attr.type = FI_AV_MAP;
   fid_av* av_raw = nullptr;
   ret = fi_av_open(domain_.get(), &av_attr, &av_raw, nullptr);
-  if (ret) return RdmaStatus::Error(std::string("fi_av_open failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_av_open failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   av_.reset(av_raw);
 
   fid_ep* ep_raw = nullptr;
   ret = fi_endpoint(domain_.get(), info_, &ep_raw, nullptr);
-  if (ret) return RdmaStatus::Error(std::string("fi_endpoint failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_endpoint failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   endpoint_.reset(ep_raw);
 
   ret = fi_ep_bind(endpoint_.get(), &cq_->fid, FI_TRANSMIT | FI_RECV);
-  if (ret) return RdmaStatus::Error(std::string("fi_ep_bind(cq) failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_ep_bind(cq) failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   ret = fi_ep_bind(endpoint_.get(), &av_->fid, 0);
-  if (ret) return RdmaStatus::Error(std::string("fi_ep_bind(av) failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_ep_bind(av) failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   // Disable EFA's intra-node SHM transfer. The default SHM path does not
   // support FI_HMEM_NEURON writes between processes sharing the same NIC, so
@@ -294,19 +349,24 @@ RdmaStatus RdmaManager::CreateEndpoint() {
                          &shm_permitted, sizeof(shm_permitted));
     if (sret && sret != -FI_ENOSYS && sret != -FI_ENOPROTOOPT) {
       TORCH_NEURONX_RDMA_WARN("fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED failed: ",
-                              fi_strerror(-sret), " (continuing — SHM may be active)");
+                              LibfabricSymbols::Instance().fi_strerror(-sret),
+                              " (continuing — SHM may be active)");
     } else {
       TORCH_NEURONX_RDMA_INFO("Disabled FI_OPT_SHARED_MEMORY_PERMITTED on endpoint");
     }
   }
 
   ret = fi_enable(endpoint_.get());
-  if (ret) return RdmaStatus::Error(std::string("fi_enable failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_enable failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   char ep_addr[256];
   size_t ep_addr_len = sizeof(ep_addr);
   ret = fi_getname(&endpoint_->fid, ep_addr, &ep_addr_len);
-  if (ret) return RdmaStatus::Error(std::string("fi_getname failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_getname failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
   local_endpoint_addr_ = std::string(ep_addr, ep_addr_len);
 
   TORCH_NEURONX_RDMA_INFO("Local endpoint created on EFA ", efa_bdf_);
@@ -333,7 +393,9 @@ RdmaStatus RdmaManager::EnsureRegistered(const HBMInfo& info) {
 
   fid_mr* mr_raw = nullptr;
   int ret = fi_mr_regattr(domain_.get(), &mr_attr, 0, &mr_raw);
-  if (ret) return RdmaStatus::Error(std::string("fi_mr_regattr failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_mr_regattr failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   registered_memory_.push_back({info.device_id, info.base, info.size, FidPtr<fid_mr>(mr_raw)});
   TORCH_NEURONX_RDMA_INFO("Registered MR: base=", info.base, ", size=", info.size / (1024 * 1024),
@@ -360,7 +422,9 @@ RdmaStatus RdmaManager::EnsureBufferRegistered(void* addr, size_t size, int devi
 
   fid_mr* mr_raw = nullptr;
   int ret = fi_mr_regattr(domain_.get(), &mr_attr, 0, &mr_raw);
-  if (ret) return RdmaStatus::Error(std::string("fi_mr_regattr failed: ") + fi_strerror(-ret));
+  if (ret)
+    return RdmaStatus::Error(std::string("fi_mr_regattr failed: ") +
+                             LibfabricSymbols::Instance().fi_strerror(-ret));
 
   registered_memory_.push_back({device_id, addr, size, FidPtr<fid_mr>(mr_raw)});
   return RdmaStatus::Ok();
@@ -392,6 +456,9 @@ void RdmaManager::SetStore(c10::intrusive_ptr<c10d::Store> store) {
 // kAlloc binds.
 void RdmaManager::EnsureInitialized(void* nrt_va) {
   if (initialized_) return;
+  TORCH_CHECK(LibfabricSymbols::Instance().loaded,
+              "RdmaManager: libfabric.so.1 not available. "
+              "Install aws-efa-installer for RDMA/P2P support.");
   TORCH_NEURONX_RDMA_INFO("EnsureInitialized: starting (nrt_va=", nrt_va, ")");
   {
     std::lock_guard<std::mutex> lock(setup_mutex_);
@@ -711,10 +778,11 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
     int ret = fi_writedata(endpoint_.get(), e.nrt_va, e.size, fi_mr_desc(mr), desc.transfer_id(),
                            remote_addr, region.remote_addr(), region.rkey(), ctx_raw);
     if (ret != 0) {
-      TORCH_NEURONX_RDMA_ERROR("PrepareBatch: fi_writedata failed: ", fi_strerror(-ret),
-                               " (nrt_va=", e.nrt_va, " peer=", e.peer, ")");
+      TORCH_NEURONX_RDMA_ERROR(
+          "PrepareBatch: fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret),
+          " (nrt_va=", e.nrt_va, " peer=", e.peer, ")");
     }
-    TORCH_CHECK(ret == 0, "fi_writedata failed: ", fi_strerror(-ret));
+    TORCH_CHECK(ret == 0, "fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret));
     send_contexts_.insert(std::move(ctx));
     e.send_ctx = ctx_raw;
   }
@@ -761,14 +829,16 @@ bool RdmaManager::DrainAndPending(std::vector<P2PEntry>& entries) {
       } else if (ret == -FI_EAGAIN) {
         break;
       } else {
-        TORCH_NEURONX_RDMA_ERROR("fi_cq_read returned ", ret, " (", fi_strerror(-ret),
+        TORCH_NEURONX_RDMA_ERROR("fi_cq_read returned ", ret, " (",
+                                 LibfabricSymbols::Instance().fi_strerror(-ret),
                                  ") — calling fi_cq_readerr for details");
         fi_cq_err_entry err = {};
         int err_ret = fi_cq_readerr(cq_.get(), &err, 0);
         if (err_ret > 0) {
           char prov_buf[256] = {};
           fi_cq_strerror(cq_.get(), err.prov_errno, err.err_data, prov_buf, sizeof(prov_buf));
-          TORCH_NEURONX_RDMA_ERROR("CQ err_entry: err=", err.err, " (", fi_strerror(err.err),
+          TORCH_NEURONX_RDMA_ERROR("CQ err_entry: err=", err.err, " (",
+                                   LibfabricSymbols::Instance().fi_strerror(err.err),
                                    ") prov_errno=", err.prov_errno, " prov_err=\"", prov_buf,
                                    "\" flags=0x", std::hex, err.flags, std::dec, " len=", err.len,
                                    " data=", err.data, " op_context=", err.op_context);

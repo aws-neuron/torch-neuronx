@@ -1,27 +1,33 @@
-"""Module extension for libfabric from system EFA installation.
+"""Module extension for libfabric (vendored headers, runtime dlopen).
 
-Looks up libfabric headers and runtime under `LIBFABRIC_LOCAL_PATH` (default
-`/opt/amazon/efa`). The rpath of the built extension is set to the same path
-so the override applies end-to-end (build + runtime).
+The libfabric v1.22.0 public headers are vendored at third_party/libfabric/include/
+because EFA is not available in non-Trainium environments (compile-only mode).
+The RDMA code still needs the header type definitions (structs, enums, function
+signatures) to compile. The actual libfabric.so.1 is loaded via dlopen() at runtime
+only when RDMA is needed on EFA-equipped machines.
+
+To update: replace third_party/libfabric/include/rdma/ from a new release tarball.
 """
 
 def _libfabric_repo_impl(rctx):
-    local_path = rctx.os.environ.get("LIBFABRIC_LOCAL_PATH", "/opt/amazon/efa")
-    rctx.symlink(local_path, "efa")
+    # Symlink the vendored headers from the main repo into the external repo workspace.
+    rctx.symlink(rctx.attr.headers_path, "include")
     rctx.file("BUILD", """package(default_visibility = ["//visibility:public"])
 
+# Headers-only target for compile-time struct/enum definitions.
+# libfabric.so is NOT linked - it is loaded via dlopen at runtime.
 cc_library(
-    name = "libfabric",
-    hdrs = glob(["efa/include/**/*.h"]),
-    srcs = glob(["efa/lib/libfabric.so*"]),
-    linkopts = ["-Wl,-rpath,{rpath}"],
-    strip_include_prefix = "efa/include",
+    name = "libfabric_hdrs",
+    hdrs = glob(["include/rdma/**/*.h"]),
+    strip_include_prefix = "include",
 )
-""".format(rpath = local_path + "/lib"))
+""")
 
 _libfabric_repo = repository_rule(
     implementation = _libfabric_repo_impl,
-    environ = ["LIBFABRIC_LOCAL_PATH"],
+    attrs = {
+        "headers_path": attr.label(default = Label("//:third_party/libfabric/include")),
+    },
     local = True,
 )
 
