@@ -1,174 +1,241 @@
-"""
-Generic Dynamic Matmul Kernel: [dynamic, K] @ [K, N] -> [dynamic, N]
+"""Dynamic-M matmul lhs[M,K] @ rhs[K,N] -> [M,N]. M runtime-dynamic (num_m_tiles),
+K any positive size, N a multiple of num_programs (LNC shard). Weight-resident + LNC-sharded.
 
-Simplified dynamic matmul with single block size = 128 (one m-tile per dynamic iteration).
-Takes lhs [m_static, k] (not transposed), does internal transpose.
-num_m_tiles is a scalar [1,1] tensor indicating how many 128-row tiles to process.
-Works for any K and N that are multiples of 128 (k) and 512 (n).
+- weight-resident: n-block loop outer; each n-block's rhs loaded once, reused across M-tiles.
+- LNC shard: grid=(num_programs,); core prog_id owns N columns [prog_id*shard_n, ...),
+  loads only its rhs columns, writes disjoint output.
+- ragged tiling: K in 128-tiles (final k-tile may be < 128); shard_n in 512-segments
+  (short final n-tile, widths need not be 128-mult), grouped 2/n-block.
+- adaptive n-block width: block_size_n (1024/512/256/128) shrinks with K so the resident
+  rhs fits SBUF; a function of K alone, so compile_key=(K,N) still keys it.
 """
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 
+from .adapter_utils import mm_block_size_n
+
+
+def div_ceil(n, d):
+    return (n + d - 1) // d
+
 
 def static_matmul_block(
     lhsT_stripes_in_block,  # noqa: N803
     rhs_stripes_in_block,
     result_accum,
+    psum_tiles,
     tile_size_m,
-    tile_size_k,
-    tile_size_n,
-    tiles_in_block_k,
-    tiles_in_block_n,
+    k_widths_in_block,
+    block_local_tiles,
+    tiles_this_k,
 ):
-    """
-    Static matmul for one m-tile (128 rows) across all k-blocks and n-tiles within one n-block.
-    tiles_in_block_m is always 1 here (single block size = 128).
-    """
-    # Single m-tile (tiles_in_block_m = 1)
-    for tn in nl.affine_range(tiles_in_block_n):
-        n_start_local = tn * tile_size_n
+    """One m-tile across the k-tiles + n-tiles of one n-block. block_local_tiles =
+    [(local_n_offset, n_width)] per n-tile; k_widths_in_block[tk] = contraction width
+    of k-tile tk (128, or < 128 for the final ragged k-tile); tiles_this_k = valid
+    k-tiles in this (maybe partial) k-block; psum_tiles allocated by the caller in-body."""
+    for tn in range(len(block_local_tiles)):
+        n_local = block_local_tiles[tn][0]
+        n_width = block_local_tiles[tn][1]
 
-        psum_tile = nl.ndarray((tile_size_m, tile_size_n), nl.float32, nl.psum)
+        psum_tile = psum_tiles[tn]
         nisa.memset(psum_tile, 0.0)
 
-        for tk_local in nl.affine_range(tiles_in_block_k):
+        for tk_local in nl.affine_range(tiles_this_k):
+            k_this = k_widths_in_block[tk_local]
             lhsT_stripe = lhsT_stripes_in_block[tk_local]  # noqa: N806
             rhs_stripe = rhs_stripes_in_block[tk_local]
 
-            if lhsT_stripe is not None and rhs_stripe is not None:
-                nisa.nc_matmul(
-                    dst=psum_tile[0:tile_size_m, 0:tile_size_n],
-                    stationary=lhsT_stripe[0:tile_size_k, 0:tile_size_m],
-                    moving=rhs_stripe[0:tile_size_k, n_start_local : n_start_local + tile_size_n],
-                )
+            nisa.nc_matmul(
+                dst=psum_tile[0:tile_size_m, 0:n_width],
+                stationary=lhsT_stripe[0:k_this, 0:tile_size_m],
+                moving=rhs_stripe[0:k_this, n_local : n_local + n_width],
+            )
 
         nisa.tensor_tensor(
-            dst=result_accum[0:tile_size_m, n_start_local : n_start_local + tile_size_n],
-            data1=result_accum[0:tile_size_m, n_start_local : n_start_local + tile_size_n],
-            data2=psum_tile[0:tile_size_m, 0:tile_size_n],
+            dst=result_accum[0:tile_size_m, n_local : n_local + n_width],
+            data1=result_accum[0:tile_size_m, n_local : n_local + n_width],
+            data2=psum_tile[0:tile_size_m, 0:n_width],
             op=nl.add,
         )
 
 
 @nki.jit()
 def dynamic_m_matmul_kernel(lhs, rhs, num_m_tiles):
-    """
-    Dynamic matmul: lhs[m_static, K] @ rhs[K, N] -> res[m_static, N]
-
-    Args:
-        lhs: [m_static, k=2048] on HBM
-        rhs: [k=2048, n=4096] on HBM
-        num_m_tiles: [1, 1] int32 tensor — number of 128-row tiles to process
-    """
+    """lhs[m_static,K] @ rhs[K,N] -> res[m_static,N]. num_m_tiles [1,1] int32 = number of
+    128-row m-tiles. K,N any positive size (ragged final k-tile / n-tile); N divisible
+    by num_programs (LNC shard)."""
     m_static, k_max = lhs.shape
     k_max_, n_max = rhs.shape
     assert k_max == k_max_
 
-    # Hyperparams
+    # SPMD LNC shard over N columns (num_progs trace-time const; prog_id only in offsets).
+    num_progs = nl.num_programs(0)
+    prog_id = nl.program_id(0)
+    assert n_max % num_progs == 0, "N must be divisible by num_programs for the LNC shard"
+    shard_n = n_max // num_progs
+    n_shard_offset = prog_id * shard_n
+
     tile_size_m = 128
     tile_size_k = 128
-    tile_size_n = 512
-    tiles_in_block_k = 8  # k_block = 1024
-    tiles_in_block_n = 2  # n_block = 1024
-    block_size_n = tiles_in_block_n * tile_size_n  # 1024
+    tiles_in_block_k = 4  # transpose(<=4) + accumulation(<=tiles_in_block_n) PSUM banks <= 8
 
-    num_tile_k = k_max // tile_size_k  # 16
-    num_block_k = num_tile_k // tiles_in_block_k  # 2
-    num_tile_n = n_max // tile_size_n  # 8
-    num_block_n = num_tile_n // tiles_in_block_n  # 4
+    num_tile_k = div_ceil(k_max, tile_size_k)  # any count; final k-tile may be < 128
+    num_block_k = div_ceil(num_tile_k, tiles_in_block_k)  # final k-block may be partial
 
-    # Output buffer
+    # Per-k-tile contraction width: 128, except a ragged final tile (k_max % 128).
+    k_tile_widths = []
+    for t in range(num_tile_k):
+        k_tile_widths.append(min(tile_size_k, k_max - t * tile_size_k))
+
+    # fn of K -> compile_key=(K,N) keys it (recompile-free).
+    block_size_n = mm_block_size_n(num_tile_k)
+    tile_size_n = min(512, block_size_n)  # PSUM free dim <= 512
+    tiles_in_block_n = block_size_n // tile_size_n
+
+    # n-tiles over the per-core shard: tile_size_n-wide segments with a short final tile.
+    n_tile_list = []  # (local_n_start, n_width)
+    n_off = 0
+    while n_off < shard_n:
+        n_w = min(tile_size_n, shard_n - n_off)
+        n_tile_list.append((n_off, n_w))
+        n_off += n_w
+
+    # n-blocks: group tiles_in_block_n consecutive n-tiles; final block may be partial.
+    n_block_list = []  # (block_start_local, block_width, [(local_offset, width), ...])
+    i = 0
+    while i < len(n_tile_list):
+        group = n_tile_list[i : i + tiles_in_block_n]
+        block_start = group[0][0]
+        block_width = 0
+        block_local_tiles = []
+        for gi in range(len(group)):
+            w = group[gi][1]
+            block_local_tiles.append((block_width, w))
+            block_width += w
+        n_block_list.append((block_start, block_width, block_local_tiles))
+        i += tiles_in_block_n
+    num_block_n = len(n_block_list)
+    max_block_width = 0  # size rhs_resident to actual, not block_size_n
+    for nb in n_block_list:
+        if nb[1] > max_block_width:
+            max_block_width = nb[1]
+
     res = nl.ndarray((m_static, n_max), lhs.dtype, nl.shared_hbm)
 
-    # Load num_m_tiles into register
     num_m_tiles_sbuf = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=num_m_tiles_sbuf, src=num_m_tiles[0])
-    num_m_tiles_reg = nisa.register_alloc()
-    nisa.register_load(num_m_tiles_reg, num_m_tiles_sbuf)
 
-    # Track dynamic offset (in units of elements, i.e. m_tile_idx * tile_size_m * stride)
-    m_tile_start = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
-    nisa.memset(m_tile_start, 0.0)
-
-    # Pre-allocate SBUF tensors outside dynamic loop
-    result_accum = nl.ndarray((tile_size_m, block_size_n), nl.float32, nl.sbuf)
-    nisa.memset(result_accum, 0.0)
-
+    # Top-level SBUF scratch (only PSUM must be in-body); distinct buffer per k-tile.
     lhsT_stripes = []  # noqa: N806
-    rhs_stripes = []
+    lhs_tiles = []
     for _ in range(tiles_in_block_k):
-        lhsT_s = nl.ndarray((tile_size_k, tile_size_m), nl.bfloat16, nl.sbuf)  # noqa: N806
-        nisa.memset(lhsT_s, 0.0)
-        lhsT_stripes.append(lhsT_s)
-        rhs_s = nl.ndarray((tile_size_k, block_size_n), nl.bfloat16, nl.sbuf)
-        nisa.memset(rhs_s, 0.0)
-        rhs_stripes.append(rhs_s)
+        s = nl.ndarray((tile_size_k, tile_size_m), nl.bfloat16, nl.sbuf)
+        nisa.memset(s, 0.0)
+        lhsT_stripes.append(s)
+        t = nl.ndarray((tile_size_m, tile_size_k), nl.bfloat16, nl.sbuf)
+        nisa.memset(t, 0.0)
+        lhs_tiles.append(t)
 
-    # Dynamic loop: each iteration processes one 128-row m-tile
-    for _ in nl.dynamic_range(0, num_m_tiles_reg, 1):
-        # Static loop over n-blocks
-        for n_block in nl.affine_range(num_block_n):
+    # Resident rhs stripes for one n-block across all K, sized to actual max width.
+    rhs_resident = []
+    for _ in range(num_tile_k):
+        rhs_s = nl.ndarray((tile_size_k, max_block_width), nl.bfloat16, nl.sbuf)
+        nisa.memset(rhs_s, 0.0)
+        rhs_resident.append(rhs_s)
+
+    # Per-n-block m offset + loop count, top-level so each fori_loop body dominates them.
+    m_tile_starts = []
+    m_tile_regs = []
+    for _ in range(num_block_n):
+        m_start = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
+        nisa.memset(m_start, 0.0)
+        m_tile_starts.append(m_start)
+        reg = nisa.register_alloc()
+        nisa.register_load(reg, num_m_tiles_sbuf)
+        m_tile_regs.append(reg)
+
+    # n-block OUTER (unrolled): load its rhs stripes once, then the M-loop reuses them.
+    # body is defined inline + passed straight to fori_loop (the tracer forbids calling
+    # inner functions), so it closes over the per-n-block loop vars — safe because
+    # fori_loop traces body immediately, so B023 is per-file-ignored for this kernel.
+    for n_block in range(num_block_n):
+        block_start = n_block_list[n_block][0]
+        block_width = n_block_list[n_block][1]
+        block_local_tiles = n_block_list[n_block][2]
+        col_offset = n_shard_offset + block_start
+        for tk_global in range(num_tile_k):
+            k_this = k_tile_widths[tk_global]
+            nisa.dma_copy(
+                dst=rhs_resident[tk_global][0:k_this, 0:block_width],
+                src=rhs.ap(
+                    pattern=[[n_max, k_this], [1, block_width]],
+                    offset=tk_global * tile_size_k * n_max + col_offset,
+                ),
+            )
+        m_tile_start = m_tile_starts[n_block]
+
+        def body(_i):
+            # PSUM + result_accum in-body, fresh per iteration (NCC_IBIR092 / live-range).
+            temp_transposes = []
+            for _ in range(tiles_in_block_k):
+                temp_transposes.append(nl.ndarray((tile_size_k, tile_size_m), nl.bfloat16, nl.psum))
+            psum_tiles = []
+            for _ in range(len(block_local_tiles)):
+                psum_tiles.append(nl.ndarray((tile_size_m, tile_size_n), nl.float32, nl.psum))
+            result_accum = nl.ndarray((tile_size_m, block_width), nl.float32, nl.sbuf)
             nisa.memset(result_accum, 0.0)
 
-            # Static loop over k-blocks
-            for k_block in nl.sequential_range(num_block_k):
-                for tk_local in range(tiles_in_block_k):
+            for k_block in range(num_block_k):
+                tiles_this_k = min(tiles_in_block_k, num_tile_k - k_block * tiles_in_block_k)
+                for tk_local in range(tiles_this_k):
                     tk_global = k_block * tiles_in_block_k + tk_local
-
-                    # Load lhs tile [128, 128] and transpose to [128, 128]
-                    lhs_tile = nl.ndarray((tile_size_m, tile_size_k), nl.bfloat16, nl.sbuf)
+                    k_this = k_tile_widths[tk_global]
                     nisa.dma_copy(
-                        dst=lhs_tile[0:tile_size_m, 0:tile_size_k],
+                        dst=lhs_tiles[tk_local][0:tile_size_m, 0:k_this],
                         src=lhs.ap(
-                            pattern=[[k_max, tile_size_m], [1, tile_size_k]],
+                            pattern=[[k_max, tile_size_m], [1, k_this]],
                             offset=tk_global * tile_size_k,
                             scalar_offset=m_tile_start,
                             indirect_dim=0,
                         ),
                     )
-                    temp_transpose = nl.ndarray((tile_size_k, tile_size_m), nl.bfloat16, nl.psum)
-                    nisa.nc_transpose(dst=temp_transpose, data=lhs_tile)
+                    nisa.nc_transpose(
+                        dst=temp_transposes[tk_local][0:k_this, 0:tile_size_m],
+                        data=lhs_tiles[tk_local][0:tile_size_m, 0:k_this],
+                    )
                     nisa.tensor_copy(
-                        dst=lhsT_stripes[tk_local][0:tile_size_k, 0:tile_size_m],
-                        src=temp_transpose,
+                        dst=lhsT_stripes[tk_local][0:k_this, 0:tile_size_m],
+                        src=temp_transposes[tk_local][0:k_this, 0:tile_size_m],
                     )
 
-                    # Load rhs stripe [128, 1024]
-                    nisa.dma_copy(
-                        dst=rhs_stripes[tk_local][0:tile_size_k, 0:block_size_n],
-                        src=rhs[
-                            tk_global * tile_size_k : (tk_global + 1) * tile_size_k,
-                            n_block * block_size_n : (n_block + 1) * block_size_n,
-                        ],
-                    )
-
-                # Compute matmul for this k-block
-                static_matmul_block(
+                static_matmul_block(  # reads resident rhs for this k-block (no reload)
                     lhsT_stripes,
-                    rhs_stripes,
+                    rhs_resident[
+                        k_block * tiles_in_block_k : k_block * tiles_in_block_k + tiles_this_k
+                    ],
                     result_accum,
+                    psum_tiles,
                     tile_size_m,
-                    tile_size_k,
-                    tile_size_n,
-                    tiles_in_block_k,
-                    tiles_in_block_n,
+                    k_tile_widths[
+                        k_block * tiles_in_block_k : k_block * tiles_in_block_k + tiles_this_k
+                    ],
+                    block_local_tiles,
+                    tiles_this_k,
                 )
 
-            # Write result to HBM
             nisa.dma_copy(
                 dst=res.ap(
-                    pattern=[[n_max, tile_size_m], [1, block_size_n]],
-                    offset=n_block * block_size_n,
+                    pattern=[[n_max, tile_size_m], [1, block_width]],
+                    offset=col_offset,
                     scalar_offset=m_tile_start,
                     indirect_dim=0,
                 ),
-                src=result_accum[0:tile_size_m, 0:block_size_n],
+                src=result_accum[0:tile_size_m, 0:block_width],
             )
+            nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
 
-        # Advance m offset by 128 rows
-        # (in row-major: 128 * k_max elements for lhs, 128 * n_max for res)
-        nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
+        nl.fori_loop(0, m_tile_regs[n_block], body)
 
     return res
