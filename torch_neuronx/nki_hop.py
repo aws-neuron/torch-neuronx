@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 import torch.utils._pytree as pytree
+from nki.collectives import ReplicaGroup
 from nki.framework.torch_native import TorchNativeKernel
 from torch._C import DispatchKey
 from torch._dynamo import allow_in_graph
@@ -118,6 +119,21 @@ class NKIRegistry:
 
 
 kernel_registry = NKIRegistry()
+
+
+@torch._dynamo.assume_constant_result
+def register_nki_constant_args(
+    arg_names: tuple[str, ...], replica_group_arg_names: tuple[str, ...], *args: Any
+) -> str:
+    """Register compile-time NKI arguments before they cross the HOP boundary."""
+    constant_args = dict(zip(arg_names, args, strict=True))
+    for name in replica_group_arg_names:
+        value = constant_args[name]
+        if not isinstance(value, ReplicaGroup):
+            constant_args[name] = ReplicaGroup(value)
+    constant_args_key = str(tuple((k, v) for k, v in sorted(constant_args.items())))
+    kernel_registry.add_constant_args(constant_args, constant_args_key)
+    return constant_args_key
 
 
 def merge_tensor_constant_args(
@@ -531,6 +547,46 @@ class NKIHOPCaller:
                 list(self.grid),
                 str({}),
                 False,
+            )
+
+        # ReplicaGroup is an NKI compile-time configuration object, not an FX
+        # runtime value. Register all static arguments before the HOP so Dynamo
+        # never attempts to proxy the ReplicaGroup object.
+        if any(isinstance(arg, ReplicaGroup) for arg in combined_args):
+            tensor_args = []
+            tensor_arg_names = []
+            constant_arg_names = []
+            constant_args = []
+            replica_group_arg_names = []
+            for name, arg in zip(self.kernel_arg_names, combined_args, strict=True):
+                if isinstance(arg, torch.Tensor):
+                    tensor_args.append(arg)
+                    tensor_arg_names.append(name)
+                else:
+                    constant_arg_names.append(name)
+                    if isinstance(arg, ReplicaGroup):
+                        replica_group_arg_names.append(name)
+                        # Dynamo tracks fields assigned by an in-graph dataclass
+                        # constructor even though the backing Python object is
+                        # not fully initialized yet.
+                        constant_args.append(arg._value)
+                    else:
+                        constant_args.append(arg)
+
+            constant_args_key = register_nki_constant_args(
+                tuple(constant_arg_names),
+                tuple(replica_group_arg_names),
+                *constant_args,
+            )
+            return nki_kernel_wrapper(
+                kernel_idx=self.kernel_idx,
+                grid=self.grid,
+                backend_config="",
+                operand_output_aliases={},
+                args=tuple(tensor_args),
+                arg_names=tuple(tensor_arg_names),
+                constant_args_key=constant_args_key,
+                has_side_effect=self.has_side_effect,
             )
 
         # torch.compile path: use HOP dispatch (unchanged)
