@@ -30,6 +30,7 @@ def register_aten(
     translate_args_fn: Callable | None = None,
     python_dispatch: bool = False,
     error_handler: Callable | None = None,
+    relower_every_call: bool = False,
     **kwargs,
 ):
     """
@@ -51,6 +52,17 @@ def register_aten(
                        or whose preprocessing branches on runtime tensor state
                        (``_foreach_copy_``). This property cannot be inferred
                        from the op definition and must be declared explicitly.
+        relower_every_call: Re-run the preprocessing factory and re-lower in
+                       Python on every call, rather than caching the C++
+                       ``DispatchCacheEntry`` and replaying it. Needed when the
+                       graph depends on a tensor value (``one_hot`` resolves
+                       num_classes from max(x)), which that entry's key — built
+                       from the raw args — cannot distinguish. Execution still
+                       happens in C++, and the HLO/NEFF cache inside
+                       ``kernel.lower`` still applies, keyed on the
+                       *preprocessed* args, so a repeated resolved value hits it
+                       and does not recompile. Requires preprocessing=; mutually
+                       exclusive with python_dispatch.
 
     Usage:
         @register_aten("aten::add")
@@ -68,6 +80,19 @@ def register_aten(
         raise ValueError(
             f"preprocessing must be a Preprocessing enum value (SHAPE_ONLY or VALUE_DEPENDENT), "
             f"got {preprocessing!r}"
+        )
+
+    if relower_every_call and preprocessing is None:
+        raise ValueError(
+            "relower_every_call=True requires preprocessing= to be set: the uncached C++ "
+            "path re-runs the preprocessing factory to lower on every call."
+        )
+
+    if relower_every_call and python_dispatch:
+        raise ValueError(
+            "relower_every_call and python_dispatch are mutually exclusive: the former "
+            "keeps execution in C++ (only lowering in Python), whereas python_dispatch "
+            "runs both preprocessing and execution in Python."
         )
 
     def decorator(func: Callable):
@@ -89,6 +114,7 @@ def register_aten(
                 "validate_static_inputs": validate_static_inputs,
                 "translate_args_fn": translate_args_fn,
                 "python_dispatch": python_dispatch,
+                "relower_every_call": relower_every_call,
             }
 
             # Phase 1: Add to torch-mlir registry immediately
@@ -320,7 +346,13 @@ def _static_argnums_for_lowering(new_args, original_args, base_static_argnums):
 
 
 def _make_preprocessing_lower(
-    torch_fn, aten_name, output_params, static_argnums, static_argnames, validate_fn=None
+    torch_fn,
+    aten_name,
+    output_params,
+    static_argnums,
+    static_argnames,
+    validate_fn=None,
+    relower_every_call=False,
 ):
     """Create the lowering function for a preprocessing op.
 
@@ -423,6 +455,10 @@ def _make_preprocessing_lower(
             original_kwargs=orig_new_kwargs,
             alias_out_tensors=alias_out_tensors,
             alias_flat_inputs=alias_flat_inputs,
+            # relower_every_call ops resolve a tensor value during preprocessing (histc raw
+            # min==max==0, one_hot raw num_classes==-1), so the raw-args dispatch key
+            # cannot tell two such calls apart. Key on the preprocessed args instead.
+            reuse_dispatch_key=not relower_every_call,
             **new_kwargs,
         )
 
@@ -570,7 +606,13 @@ def _resolve_lower_func(
     """
     if reg_info.get("preprocessing") is not None:
         return _make_preprocessing_lower(
-            torch_fn, aten_name, output_params, static_argnums, static_argnames, validate_fn
+            torch_fn,
+            aten_name,
+            output_params,
+            static_argnums,
+            static_argnames,
+            validate_fn,
+            relower_every_call=bool(reg_info.get("relower_every_call")),
         )
 
     for impl in operation._implementations:
@@ -722,7 +764,9 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
             # Register with C++ NeuronDispatcher. Dtype inference is unified into
             # lower_func: on cache miss, C++ passes both downcasted and original
             # args, and lower_func infers output dtypes at original precision
-            # inside the single Python call.
+            # inside the single Python call. relower_every_call re-lowers every call
+            # instead of caching (value-dependent ops).
+            relower_every_call = bool(reg_info.get("relower_every_call"))
             try:
                 _C._register_neuron_op(
                     op_name,
@@ -730,6 +774,7 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
                     lower_func,
                     list(static_argnums) if static_argnums else [],
                     list(static_argnames) if static_argnames else [],
+                    relower_every_call,
                 )
                 registered_count += 1
 

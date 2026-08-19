@@ -223,6 +223,30 @@ class TestRepeatInterleave:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
 
+    def test_repeat_interleave_tensor_stale_neff_regression(self, device):
+        """Two repeat_interleave.Tensor calls with the same repeats shape but
+        different sum(repeats) must not share a cached NEFF.
+
+        The output length is sum(repeats), baked in as a static arg. The raw
+        dispatch args are identical for both calls (same-shape int64 repeats), so
+        the lowering must key on the preprocessed output_size; otherwise the
+        second call returns the first call's length.
+        """
+        with track_neuron_ops():
+            # First call: sum(repeats) = 6 -> output length 6.
+            repeats_a = torch.tensor([1, 2, 3], device=device)
+            result_a = torch.repeat_interleave(repeats_a)
+            assert result_a.shape == torch.Size([6])
+            torch.testing.assert_close(result_a.cpu(), torch.repeat_interleave(repeats_a.cpu()))
+
+            # Second call: same repeats shape, sum = 12 -> output length 12. A
+            # stale output_size would return length 6.
+            repeats_b = torch.tensor([3, 4, 5], device=device)
+            result_b = torch.repeat_interleave(repeats_b)
+            assert result_b.shape == torch.Size([12])
+            torch.testing.assert_close(result_b.cpu(), torch.repeat_interleave(repeats_b.cpu()))
+            assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
+
     def test_repeat_interleave_tensor_variant_with_output_size(self, device):
         """Test repeat_interleave.Tensor variant with output_size."""
         with track_neuron_ops():

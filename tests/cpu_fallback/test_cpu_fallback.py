@@ -67,13 +67,14 @@ class TestCpuFallback:
         else:
             torch.linalg.householder_product(reflectors, tau)
 
+    # Either layer can raise this check: ATen's TORCH_CHECK spells dtypes
+    # "float"/"int", histc's own validator spells them "torch.float32"/"torch.int32".
+    # Which one wins depends on the fallback mode and on --forked (this suite uses
+    # both), so accept either. \b keeps it exact, "int64" still fails.
     @assert_raises(
         RuntimeError,
-        match="torch.histogram: input tensor and hist tensor should have the same dtype, "
-        "but got input torch.float32 and hist torch.int32"
-        if use_mlir_aten_ops()
-        else "torch.histogram: input tensor and hist tensor should have the same dtype, "
-        "but got input float and hist int",
+        match=r"torch\.histogram: input tensor and hist tensor should have the same dtype, "
+        r"but got input (torch\.float32|float)\b and hist (torch\.int32|int)\b",
     )
     def test_histc_out_inconsistent_dtype_neuron(self):
         """Test histc with inconsistent dtype on Neuron device."""

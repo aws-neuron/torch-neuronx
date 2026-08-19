@@ -163,6 +163,39 @@ Add `preprocessing=` to your `@register_aten` decorator:
 **When in doubt, use `Preprocessing.VALUE_DEPENDENT`** — it's the safe default. A wrong
 `Preprocessing.SHAPE_ONLY` classification can cause silent correctness bugs (stale cache).
 
+#### `relower_every_call=True`
+
+The C++ dispatcher normally caches a `DispatchCacheEntry` and replays it, so a hit skips
+Python entirely. That key covers op name, shapes, dtypes, strides, and static args. It never
+covers tensor values.
+
+That is a problem for any op whose graph depends on a value:
+
+```
+one_hot(tensor([0,1,2]), -1)  ->  num_classes 3   ->  output [3, 3]
+one_hot(tensor([0,1,9]), -1)  ->  num_classes 10  ->  output [3, 10]
+```
+
+Both calls build the same key, so the second replays the first's NEFF and returns `[3, 3]`.
+No error, just the wrong shape.
+
+`relower_every_call=True` gives up that entry. Every call re-enters Python, re-runs the
+preprocessing factory, and re-lowers. Execution stays in C++.
+
+**It does not disable caching.** The HLO/NEFF cache inside `kernel.lower` still applies, keyed
+on the *preprocessed* args, where the resolved value is a static arg. In a training loop where
+`num_classes` is always the vocab size, that cache hits and nothing recompiles. Only a changed
+resolved value costs a compile. The per-call cost is the Python round-trip, not a compile.
+
+When to use which:
+
+- Preprocessing only resolves values into the graph → `relower_every_call=True`.
+- Preprocessing replaces the op's runtime input tensors (`_index_put_impl_` turns a bool mask
+  into `nonzero` indices) → `python_dispatch=True`, because C++ derives execution inputs from
+  the raw args.
+
+Mutually exclusive; both require `preprocessing=`.
+
 #### How to Choose
 
 Ask: **would my preprocessing produce the same `(compute_fn, args, kwargs)` for
@@ -243,6 +276,9 @@ C++ `DispatchImpl` calls it on cache miss. Cache hits are pure C++, zero Python.
 **Value-dependent** → `_make_preprocessing_dispatch` creates an optimized Python
 function registered via `aten_lib.impl`. Runs preprocessing + cached kernel
 execution directly, skipping `Operation.__call__` overhead.
+
+**Value-dependent + `relower_every_call=True`** → `_make_preprocessing_lower` as above, but the
+dispatch entry is never cached: every call re-lowers in Python and executes in C++.
 
 ### Step 5: Testing Checklist
 

@@ -42,6 +42,30 @@ class TestMaskedSelect:
             # Op will be short-circuited with all false mask
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
 
+    def test_masked_select_stale_neff_regression(self, device):
+        """Two masked_select calls with the same mask shape but different
+        true-counts must not share a cached NEFF.
+
+        The output length is mask.sum(), baked in as a static arg. The raw
+        dispatch args are identical for both calls (same-shape float32 input and
+        bool mask), so the lowering must key on the preprocessed size; otherwise
+        the second call returns the first call's length.
+        """
+        with track_neuron_ops():
+            x = torch.arange(8, dtype=torch.float32, device=device)
+
+            # First call: 3 True -> output length 3.
+            mask_a = torch.tensor([1, 1, 1, 0, 0, 0, 0, 0], device=device).bool()
+            result_a = torch.masked_select(x, mask_a)
+            assert result_a.shape == torch.Size([3])
+
+            # Second call: same mask shape, 5 True -> output length 5. A stale
+            # size would return length 3.
+            mask_b = torch.tensor([1, 1, 1, 1, 1, 0, 0, 0], device=device).bool()
+            result_b = torch.masked_select(x, mask_b)
+            assert result_b.shape == torch.Size([5])
+            torch.testing.assert_close(result_b.cpu(), torch.masked_select(x.cpu(), mask_b.cpu()))
+
     def test_masked_select_all_true_mask(self, device):
         """Test masked_select with all True mask."""
         with track_neuron_ops():
