@@ -44,6 +44,35 @@ class TestOneHot:
             assert result.size() == torch.Size([4, 4])
             assert_op_runs_on_neuron("aten::one_hot")
 
+    @pytest.mark.xfail(
+        reason="Can't support meta tensor evaluation requiring accessing meta tensor content",
+        condition=not use_mlir_aten_ops(),
+    )
+    def test_one_hot_inferred_classes_stale_neff_regression(self):
+        """Two auto-inferred one_hot(-1) calls with the same input shape but
+        different max must not share a cached NEFF.
+
+        Their raw dispatch args are identical (same-shape int64, num_classes=-1),
+        so the relower_every_call lowering must key on the preprocessed num_classes
+        (max(x)+1); otherwise the second call replays the first's shape.
+        """
+        with track_neuron_ops():
+            # First call: max index 2 -> inferred num_classes 3 -> shape (3, 3)
+            indices_a = torch.tensor([0, 1, 2], dtype=torch.int64).to("neuron")
+            result_a = functional.one_hot(indices_a)
+            assert result_a.size() == torch.Size([3, 3])
+
+            # Second call: same shape (3,) but max index 9 -> inferred
+            # num_classes 10 -> shape (3, 10). A stale key would replay (3, 3).
+            indices_b = torch.tensor([0, 1, 9], dtype=torch.int64).to("neuron")
+            result_b = functional.one_hot(indices_b)
+            assert result_b.size() == torch.Size([3, 10])
+
+            # Verify values are correct for the second (distinct) lowering.
+            expected_b = functional.one_hot(torch.tensor([0, 1, 9], dtype=torch.int64), 10)
+            assert torch.all(result_b.cpu() == expected_b)
+            assert_op_runs_on_neuron("aten::one_hot")
+
     @pytest.mark.parametrize(
         "indices_shape, num_classes, expected_shape",
         [

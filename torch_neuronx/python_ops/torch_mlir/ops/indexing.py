@@ -285,9 +285,10 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     ["aten::masked_select", "aten::masked_select.out", "aten::masked_select.Tensor_out"],
     static_argnums=(2,),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
-    # Output size is mask.sum().item(), a function of tensor values rather than
-    # the cache key, so the lowering cannot be cached and replayed in C++.
-    python_dispatch=True,
+    # Output size is mask.sum().item(), which the raw cache key cannot capture, so
+    # re-lower every call and key on the resolved size. That size usually differs
+    # per call, so the NEFF recompiles whenever the count changes.
+    relower_every_call=True,
 )
 def torch_masked_select(x, mask, out=None):
     if mask.dtype != torch.bool:
@@ -411,8 +412,9 @@ def _index_put_error_handler(ctx):
     static_argnames=("accumulate", "unsafe", "use_masked_fill"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     translate_args_fn=_translate_index_put_args,
-    # Preprocessing branches on the boolean index contents (via nonzero), so the
-    # lowering depends on tensor values and cannot be cached and replayed in C++.
+    # Bool masks resolve to int indices via torch.nonzero, so preprocessing replaces
+    # the op's runtime inputs with synthesized ones. relower_every_call cannot express that:
+    # C++ dispatch and op-concatenation both derive execution inputs from raw args.
     python_dispatch=True,
     error_handler=_index_put_error_handler,
 )

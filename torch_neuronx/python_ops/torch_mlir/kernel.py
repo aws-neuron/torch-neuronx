@@ -1484,6 +1484,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         original_kwargs=None,
         alias_out_tensors=None,
         alias_flat_inputs=None,
+        reuse_dispatch_key=True,
         **kwargs,
     ):
         """Lower the operation to StableHLO without executing.
@@ -1498,6 +1499,12 @@ class TorchMlirKernel(BaseNeuronKernel):
             original_kwargs: Original (pre-downcast) keyword args as a dict.
             alias_out_tensors, alias_flat_inputs: Buffer-donation hints for in-place
                 factory ops; see ``_build_input_output_aliases``. None otherwise.
+            reuse_dispatch_key: Key the HLO/NEFF cache on the C++ dispatch key
+                (built from raw args), which is the same base as the dispatch cache
+                entry. Pass False when the raw args do not determine the graph — a
+                value-dependent op resolves its value during preprocessing, so the
+                key must come from the preprocessed args instead or two calls with
+                identical raw args would share one NEFF.
             **kwargs: Downcasted/preprocessed keyword args.
         """
         from torch_neuronx.python_ops.lowering_result import LoweringResult
@@ -1509,7 +1516,9 @@ class TorchMlirKernel(BaseNeuronKernel):
         try:
             import torch_neuronx as _tnx
 
-            dispatch_cache_key = getattr(_tnx._dispatch_context, "cache_key", None)
+            dispatch_cache_key = (
+                getattr(_tnx._dispatch_context, "cache_key", None) if reuse_dispatch_key else None
+            )
 
             # Infer output dtypes at original (pre-downcast) precision.
             # Runs validate_static_inputs (if registered) then meta dispatch.

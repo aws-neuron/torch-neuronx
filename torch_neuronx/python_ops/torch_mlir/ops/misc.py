@@ -117,12 +117,19 @@ def _validate_histc(
         "aten::histc",
         "aten::histc.out",
     ],
+    # Both lists are needed because they index different signatures: argnums the
+    # ATen schema histc(self, bins, min, max), argnames the compute fn's kwargs
+    # (range_min/range_max are the adjusted values, hence the different spelling).
+    # Without argnums, C++ PreprocessArgs tensorizes the positional min/max into
+    # runtime inputs the traced graph never declared, and the launch is rejected
+    # ("Unable to find input tensor input1 in input set").
+    static_argnums=(1, 2, 3),
     static_argnames=("bins", "range_min", "range_max"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_histc,
-    # When the range is unset the bin edges are derived from min()/max() of the
-    # data, so the lowering depends on tensor values and cannot be cached.
-    python_dispatch=True,
+    # Auto-range (min == max == 0) derives bin edges from min()/max(), so re-lower
+    # every call.
+    relower_every_call=True,
 )
 def torch_histc(
     input: torch.Tensor, bins: int = 100, min: float = 0.0, max: float = 0.0, out=None
