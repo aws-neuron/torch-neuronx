@@ -37,6 +37,15 @@ int64_t _fused_sdp_choice_neuron(const at::Tensor& query, const at::Tensor& key,
     return SDPBackend_math;
   }
 
+  // Symbolic sizes/strides (e.g. FakeTensors during tracing) cannot call
+  // numel() concretely. Route to the math backend which decomposes without
+  // requiring concrete element counts.
+  if (query.unsafeGetTensorImpl()->has_symbolic_sizes_strides() ||
+      key.unsafeGetTensorImpl()->has_symbolic_sizes_strides() ||
+      value.unsafeGetTensorImpl()->has_symbolic_sizes_strides()) {
+    return SDPBackend_math;
+  }
+
   // Zero-size inputs (e.g. a zero-length query/key head dim, as in
   // scaled_dot_product_attention with an empty embedding dim) cannot be handled
   // by the fused NKI/MLIR kernels behind the overrideable backend. The math
