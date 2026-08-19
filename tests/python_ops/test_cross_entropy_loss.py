@@ -43,12 +43,14 @@ def _run_cross_entropy(logits_cpu, targets_cpu, backward=False, rtol=1e-4, atol=
         assert_op_runs_on_neuron("aten::cross_entropy_loss")
 
     if backward:
+        logits_before_backward = logits_neuron.detach().cpu()
         (loss_neuron.sum() if loss_neuron.dim() > 0 else loss_neuron).backward()
 
     assert loss_cpu.shape == loss_neuron.shape
     assert torch.allclose(loss_cpu, loss_neuron.cpu(), rtol=rtol, atol=atol)
 
     if backward:
+        assert torch.equal(logits_neuron.cpu(), logits_before_backward)
         assert logits_cpu.grad.shape == logits_neuron.grad.shape
         assert torch.allclose(logits_cpu.grad, logits_neuron.grad.cpu(), rtol=rtol, atol=atol)
 

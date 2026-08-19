@@ -2,7 +2,7 @@
 
 Implements:
   * aten::nll_loss_forward / aten::nll_loss_backward
-  * aten::cross_entropy_loss / aten::cross_entropy_loss_backward_
+  * aten::cross_entropy_loss / aten::cross_entropy_loss_backward
 
 Cross-entropy uses a chunked online-logsumexp algorithm that avoids
 materializing the full (N, V) softmax/log-softmax matrix, keeping peak
@@ -425,7 +425,7 @@ def _ce_chunked_fwd_inner(
 
 
 @register_aten(
-    ["aten::cross_entropy_loss_backward_"],
+    ["aten::cross_entropy_loss_backward"],
     static_argnames=(
         "n_classes",
         "reduction",
@@ -447,10 +447,9 @@ def cross_entropy_loss_backward(
 ):
     """Preprocessing (eager): detect shapes, return ``_ce_bwd``.
 
-    ``input`` is the first positional arg so that the trailing-underscore
-    in-place convention causes kernel.py to reuse it as the output buffer,
-    avoiding a separate allocation for the gradient.  All reshaping is
-    deferred to the traced function so the output shape matches input.
+    ``input`` is the first positional arg to match the autograd formula's
+    calling convention. All reshaping is deferred to the traced function so
+    the output shape matches input without aliasing its storage.
     """
     no_batch = input.dim() == 1
     n_classes = (
@@ -488,8 +487,8 @@ def _ce_bwd(
     """Unified backward entry point.
 
     All reshaping (unsqueeze, flatten, unflatten) happens here inside the
-    traced function so the HLO output shape matches the input shape,
-    enabling in-place output buffer reuse by kernel.py.
+    traced function so the HLO output shape matches the input shape while
+    preserving the input tensor.
     """
     if no_batch:
         input = input.unsqueeze(0)
@@ -897,7 +896,7 @@ class CrossEntropyLossOp(OperationImplementation):
 
         bwd_fn = cross_entropy_loss_backward
         self._bwd = TorchMlirOpImpl(
-            "aten::cross_entropy_loss_backward_",
+            "aten::cross_entropy_loss_backward",
             bwd_fn,
             static_argnames=(
                 "n_classes",
