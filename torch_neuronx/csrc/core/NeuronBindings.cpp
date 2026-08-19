@@ -14,11 +14,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -283,13 +281,6 @@ OutputTransformationResult ProcessOutputTransformations(const std::string& op_na
 
   return result;
 }
-
-// Track slice tensors per tensor set for cleanup. TensorPtr keeps the
-// underlying root segment alive until the slice is released.
-static std::unordered_map<nrt_tensor_set_t*,
-                          std::vector<c10_neuron::NeuronCachingAllocator::TensorPtr>>
-    slice_tensors_map;
-static std::mutex slice_tensors_mutex;
 
 // PrepareKernelTensors — implementation of the function declared in NeuronOpsApi.h
 std::pair<std::vector<at::neuron::TensorDataRef>, std::vector<at::neuron::TensorContext>>
@@ -1184,167 +1175,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return py::none();
       },
       "Find the nrt_tensor_t* for a given data pointer", py::arg("data_ptr"));
-
-  // NRT functions for NKI kernel execution
-  m.def(
-      "_nrt_load",
-      [](py::bytes neff_bytes, py::int_ current_device_id) -> py::object {
-        torch_neuronx::maybe_lazy_init();
-        std::string neff_data = neff_bytes;
-        nrt_model_t* model = nullptr;
-
-        int vnc_id = c10_neuron::get_vnc_id(current_device_id);
-
-        // Load model on the current device
-        NRT_STATUS status = nrt_load(neff_data.data(), neff_data.size(), vnc_id, 1, &model);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to load NEFF. Status: " + std::to_string(status));
-        }
-        return py::int_(reinterpret_cast<uintptr_t>(model));
-      },
-      "Load a NEFF and return model handle", py::arg("neff_bytes"), py::arg("current_device_id"));
-
-  m.def(
-      "_nrt_load_collectives",
-      [](py::bytes neff_bytes, py::int_ global_device_id, py::int_ global_device_count,
-         py::int_ current_device_id) -> py::object {
-        torch_neuronx::maybe_lazy_init();
-        std::string neff_data = neff_bytes;
-        nrt_model_t* model = nullptr;
-
-        int vnc_id = c10_neuron::get_vnc_id(current_device_id);
-
-        // Load model on the current device
-        NRT_STATUS status = nrt_load_collectives(neff_data.data(), neff_data.size(), vnc_id, 1,
-                                                 global_device_id, global_device_count, &model);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to load NEFF. Status: " + std::to_string(status));
-        }
-        return py::int_(reinterpret_cast<uintptr_t>(model));
-      },
-      "Load a NEFF and return model handle", py::arg("neff_bytes"), py::arg("global_device_id"),
-      py::arg("global_device_count"), py::arg("current_device_id"));
-
-  m.def(
-      "_nrt_unload",
-      [](py::int_ model_handle) {
-        nrt_model_t* model = reinterpret_cast<nrt_model_t*>(model_handle.cast<uintptr_t>());
-        NRT_STATUS status = nrt_unload(model);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to unload model. Status: " + std::to_string(status));
-        }
-      },
-      "Unload a model", py::arg("model_handle"));
-
-  m.def(
-      "_nrt_allocate_tensor_set",
-      []() -> py::object {
-        nrt_tensor_set_t* tensor_set = nullptr;
-        NRT_STATUS status = nrt_allocate_tensor_set(&tensor_set);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to allocate tensor set. Status: " +
-                                   std::to_string(status));
-        }
-        return py::int_(reinterpret_cast<uintptr_t>(tensor_set));
-      },
-      "Allocate a new tensor set");
-
-  m.def(
-      "_nrt_destroy_tensor_set",
-      [](py::int_ tensor_set_handle) {
-        nrt_tensor_set_t* tensor_set =
-            reinterpret_cast<nrt_tensor_set_t*>(tensor_set_handle.cast<uintptr_t>());
-
-        // Clean up slice tensors before destroying tensor set. The TensorPtr
-        // deleters will invoke nrt_tensor_free as the vector clears.
-        {
-          std::lock_guard<std::mutex> lock(torch_neuronx::slice_tensors_mutex);
-          torch_neuronx::slice_tensors_map.erase(tensor_set);
-        }
-
-        nrt_destroy_tensor_set(&tensor_set);
-      },
-      "Destroy a tensor set", py::arg("tensor_set_handle"));
-
-  m.def(
-      "_nrt_add_tensor_to_tensor_set",
-      [](py::int_ tensor_set_handle, py::object tensor_obj, const std::string& tensor_name) {
-        nrt_tensor_set_t* tensor_set =
-            reinterpret_cast<nrt_tensor_set_t*>(tensor_set_handle.cast<uintptr_t>());
-
-        // Get PyTorch tensor using THPVariable_Unpack
-        torch::Tensor torch_tensor = THPVariable_Unpack(tensor_obj.ptr());
-
-        // Verify tensor is on neuron device
-        if (torch_tensor.device().type() != c10::DeviceType::PrivateUse1) {
-          throw std::runtime_error("Tensor must be on neuron device, but got: " +
-                                   torch_tensor.device().str());
-        }
-
-        if (!torch_tensor.is_contiguous()) {
-          throw std::runtime_error("Cannot add non-contiguous tensor to NRT tensor set");
-        }
-
-        // Get data pointer - adjust for storage offset to get base storage pointer
-        void* data_ptr = torch_tensor.data_ptr();
-        size_t storage_offset_bytes = torch_tensor.storage_offset() * torch_tensor.element_size();
-        void* base_ptr = static_cast<char*>(data_ptr) - storage_offset_bytes;
-        size_t view_size_bytes = torch_tensor.numel() * torch_tensor.element_size();
-
-        // Produce a short-lived NRT slice for this view.
-        c10_neuron::NeuronCachingAllocator::TensorPtr slice;
-        if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-          slice = c10_neuron::NeuronCachingAllocator::createSliceForView(
-              base_ptr, storage_offset_bytes, view_size_bytes, tensor_name.c_str());
-        } else {
-          nrt_tensor_t* base_tensor = c10_neuron::NeuronCachingAllocator::findTensor(base_ptr);
-          if (!base_tensor) {
-            throw std::runtime_error(
-                "Could not find NRT tensor for PyTorch tensor. Ensure tensor is on neuron device.");
-          }
-          nrt_tensor_t* raw_slice = nullptr;
-          NRT_STATUS offset_status = nrt_tensor_allocate_slice(
-              base_tensor, storage_offset_bytes, view_size_bytes, tensor_name.c_str(), &raw_slice);
-          if (offset_status != NRT_SUCCESS) {
-            throw std::runtime_error("Failed to create tensor slice with offset. Status: " +
-                                     std::to_string(offset_status));
-          }
-          slice = c10_neuron::NeuronCachingAllocator::TensorPtr(
-              raw_slice, [](nrt_tensor_t* t) { nrt_tensor_free(&t); });
-        }
-
-        // Add to tensor set
-        NRT_STATUS status =
-            nrt_add_tensor_to_tensor_set(tensor_set, tensor_name.c_str(), slice.get());
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to add tensor to tensor set. Status: " +
-                                   std::to_string(status));
-        }
-
-        {
-          std::lock_guard<std::mutex> lock(torch_neuronx::slice_tensors_mutex);
-          torch_neuronx::slice_tensors_map[tensor_set].push_back(std::move(slice));
-        }
-      },
-      "Add a PyTorch tensor to tensor set", py::arg("tensor_set_handle"), py::arg("tensor"),
-      py::arg("tensor_name"));
-
-  m.def(
-      "_nrt_execute",
-      [](py::int_ model_handle, py::int_ input_set_handle, py::int_ output_set_handle) {
-        nrt_model_t* model = reinterpret_cast<nrt_model_t*>(model_handle.cast<uintptr_t>());
-        nrt_tensor_set_t* input_set =
-            reinterpret_cast<nrt_tensor_set_t*>(input_set_handle.cast<uintptr_t>());
-        nrt_tensor_set_t* output_set =
-            reinterpret_cast<nrt_tensor_set_t*>(output_set_handle.cast<uintptr_t>());
-
-        NRT_STATUS status = nrt_execute(model, input_set, output_set);
-        if (status != NRT_SUCCESS) {
-          throw std::runtime_error("Failed to execute model. Status: " + std::to_string(status));
-        }
-      },
-      "Execute a model", py::arg("model_handle"), py::arg("input_set_handle"),
-      py::arg("output_set_handle"));
 
   m.def(
       "_nrt_barrier",
