@@ -437,4 +437,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_python_dispatch.py::TestPythonDispatch::test_capture_logs_with_torch_dispatch_mode",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Neuron profiler records bfloat16 norm type promotion as aten::to,"
+            " while the test expects promotion to occur internally within the"
+            " norm operation, as it does on CUDA."
+        ),
+        tests=[
+            "test_linalg.py::TestLinalgNEURON::test_norm_fused_type_promotion_neuron_bfloat16",
+        ],
+    ),
 ]
