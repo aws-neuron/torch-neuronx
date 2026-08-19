@@ -18,14 +18,27 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=(
             "Distributed cross_entropy with all-reduce "
             "accumulates float32 values in a different "
-            "order than local cross_entropy, causing a "
-            "~2.4e-05 difference that exceeds the "
+            "order than local cross_entropy, causing up "
+            "to a ~2.7e-05 difference that exceeds the "
             "test's 1e-05 tolerance."
         ),
         tests=[
             "DistTensorParallelExampleTest::test_loss_parallel",
+            "DistTensorParallelExampleTest::test_loss_parallel_3d_input_non_batch_shard",
+            "DistTensorParallelExampleTest::test_loss_parallel_multi_dim_mesh",
             "DistTensorParallelExampleTest::test_loss_parallel_replicate_non_tp_dim",
             "DistTensorParallelExampleTestWithLocalTensor::test_loss_parallel",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Support for validating plain cross_entropy targets on multi-dimensional "
+            "DTensor meshes needs to be added. Neuron currently converts the target "
+            "to a fully replicated DTensor even when another mesh dimension shards "
+            "the input batch."
+        ),
+        tests=[
+            "DistTensorParallelExampleTest::test_loss_parallel_plain_tensor_target_rejected_on_multi_dim",
         ],
     ),
     SkipGroup(

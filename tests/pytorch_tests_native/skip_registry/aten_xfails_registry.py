@@ -447,4 +447,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_linalg.py::TestLinalgNEURON::test_norm_fused_type_promotion_neuron_bfloat16",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Neuron eager functionalization does not write BatchNorm running_mean "
+            "and running_var mutations back to module buffers. SWA update_bn "
+            "therefore leaves stale running statistics and fails CPU parity. "
+            "Tracked as an xfail pending mutation-aliasing write-back support."
+        ),
+        tests=[
+            "test_optim.py::TestSWAUtilsNEURON::test_update_bn_cnn_neuron",
+            "test_optim.py::TestSWAUtilsNEURON::test_update_bn_dnn_neuron",
+        ],
+    ),
 ]
