@@ -17,6 +17,20 @@ _TILE_M = 128
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32, torch.float16)
 
+# Weight-resident mm: rhs is num_tile_k*block_width*2 B/partition; SBUF 192 KiB/partition.
+# Single source of truth shared by the kernel (width selection) and the adapter (fit gate).
+_MM_RESIDENT_BUDGET = 192 * 1024 - 16 * 1024  # headroom for lhs/result scratch
+_MM_BLOCK_N_CANDIDATES = (1024, 512, 256, 128)
+
+
+def mm_block_size_n(num_tile_k: int) -> int:
+    """Widest candidate n-block width whose resident rhs fits SBUF (narrowest if none)."""
+    for cand in _MM_BLOCK_N_CANDIDATES:
+        if num_tile_k * cand * 2 <= _MM_RESIDENT_BUDGET:
+            return cand
+    return _MM_BLOCK_N_CANDIDATES[-1]
+
+
 # Memoized [[num_tiles]] int32 device tensors: torch.tensor(..., device="neuron")
 # does a host->device copy every call, but the value only depends on num_tiles.
 # Keyed by (num_tiles, device.type, device.index); kernels read it read-only.

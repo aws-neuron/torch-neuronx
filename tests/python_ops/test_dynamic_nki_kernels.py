@@ -784,6 +784,68 @@ class TestDynamicNkiKernels:
         for gi, (gn, gc) in enumerate(zip(neuron_grads, _fwd_bwd("cpu"), strict=True)):
             torch.testing.assert_close(gn, gc, rtol=3e-2, atol=3e-2, msg=f"grad[{gi}] mismatch")
 
+    # generalized mm: any positive K, N a multiple of num_programs (ragged k-tile /
+    # n-tile), sharded.
+    @pytest.mark.parametrize(
+        "K, N",
+        [
+            (2048, 4096),  # both %1024 (regression)
+            (2048, 1408),  # N = 512+512+384 (non-%512 remainder)
+            (1408, 2048),  # K = 11 tiles (partial final k-block)
+            (256, 256),  # tiny K, N < 512
+            (128, 128),  # smallest single tile
+            (2048, 352),  # dsv3 16B TP4 w1/w3: N=352 not %128 (ragged n-tile)
+            (352, 2048),  # dsv3 16B TP4 w2: K=352 not %128 (partial final k-tile, width 96)
+            (352, 352),  # both K and N ragged (non-128)
+            (129, 256),  # K=129: final k-tile width 1 (smallest remainder)
+            (255, 256),  # K=255: final k-tile width 127 (largest remainder)
+            (256, 130),  # N=130: ragged n-tile, even so LNC-shardable
+            (16384, 4096),  # adaptive block_size_n -> 512
+            (32768, 512),  # adaptive block_size_n -> 256
+            (65536, 256),  # adaptive block_size_n -> 128
+        ],
+    )
+    def test_dynamic_nki_mm_generalized_shapes(self, K, N):  # noqa: N803
+        mm = _entry("mm")
+        execs = mm._exec_count
+        a = torch.randn(384, K, dtype=torch.bfloat16) / 8
+        w = torch.randn(K, N, dtype=torch.bfloat16) / 8
+        ref = a.float() @ w.float()
+        with _assert_dynamic_ran("mm"):
+            got = torch.mm(a.to("neuron"), w.to("neuron")).cpu().float()
+        assert mm._exec_count > execs
+        torch.testing.assert_close(got, ref, rtol=3e-2, atol=3e-2)
+
+    def test_dynamic_nki_mm_over_capacity_declines(self):
+        # Weight-resident rhs is (K/128)*block_width*2 bytes/partition; SBUF is 192 KiB.
+        # The kernel picks an adaptive block_width (1024/512/256/128 by K), so it declines
+        # only when even width-128 over-subscribes: (K/128)*min(128,shard_n)*2 > budget.
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapters.matmul import (
+            _can_handle_mm,
+        )
+
+        # K=16384,N=4096: width-1024 = 256 KiB (over), but width-512 = 128 KiB fits ->
+        # ACCEPTED (runs dynamically at the shrunk block width).
+        big_a = torch.empty(128, 16384, dtype=torch.bfloat16, device="neuron")
+        big_w = torch.empty(16384, 4096, dtype=torch.bfloat16, device="neuron")
+        assert _can_handle_mm(big_a, big_w) is True
+        # K=131072,N=256: even width-128 = 256 KiB/partition over budget -> DECLINES.
+        # (N=256 keeps the rhs alloc ~67 MB — can_handle only reads shape metadata.)
+        huge_a = torch.empty(128, 131072, dtype=torch.bfloat16, device="neuron")
+        huge_w = torch.empty(131072, 256, dtype=torch.bfloat16, device="neuron")
+        assert _can_handle_mm(huge_a, huge_w) is False
+        ok_a = torch.empty(128, 2048, dtype=torch.bfloat16, device="neuron")
+        ok_w = torch.empty(2048, 4096, dtype=torch.bfloat16, device="neuron")
+        assert _can_handle_mm(ok_a, ok_w) is True
+        # N not divisible by num_programs (e.g. odd N under LNC>=2) declines -> native.
+        from torch_neuronx.utils import get_logical_neuron_cores
+
+        lnc = int(get_logical_neuron_cores())
+        if lnc >= 2:
+            odd_a = torch.empty(128, 256, dtype=torch.bfloat16, device="neuron")
+            odd_w = torch.empty(256, lnc * 4 + 1, dtype=torch.bfloat16, device="neuron")
+            assert _can_handle_mm(odd_a, odd_w) is False
+
     # backward ops asserted on (mm/mm_k = grad_input/grad_weight).
     MOE_BWD_OPS: ClassVar = ["mm", "mm_k", "silu_backward", "index", "mul"]
 

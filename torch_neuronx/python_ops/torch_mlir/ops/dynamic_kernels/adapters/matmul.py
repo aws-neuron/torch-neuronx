@@ -5,7 +5,11 @@ bf16-only (the dynamic-M matmul kernel is bf16-specialized). compile_key=(K,N).
 
 import torch
 
+from torch_neuronx.utils import get_logical_neuron_cores
+
 from ..adapter_utils import (
+    _MM_BLOCK_N_CANDIDATES,
+    _MM_RESIDENT_BUDGET,
     _TILE_M,
     _ceil_to_tile,
     _compile_or_load_neff,
@@ -14,9 +18,7 @@ from ..adapter_utils import (
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
-# dynamic_m_matmul_kernel block sizes: k_block=8*128=1024, n_block=2*512=1024.
-_MM_KBLOCK = 1024
-_MM_NBLOCK = 1024
+_MM_KTILE = 128
 
 
 def _can_handle_mm(mat1, mat2, out=None) -> bool:
@@ -32,7 +34,18 @@ def _can_handle_mm(mat1, mat2, out=None) -> bool:
     K2, N = mat2.shape  # noqa: N806
     if K != K2 or M == 0:  # any M > 0 — prepare_io pads rows up to a 128-multiple
         return False
-    if K % _MM_KBLOCK != 0 or N % _MM_NBLOCK != 0:  # noqa: SIM103
+    if K <= 0 or N <= 0:  # K any positive size (ragged final k-tile handled in-kernel)
+        return False
+    # N is LNC-sharded into num_programs equal column blocks, so it must divide evenly.
+    # N not divisible (e.g. odd N under LNC=2) is declined here -> correct native fallback.
+    lnc = int(get_logical_neuron_cores())
+    if N % lnc != 0:
+        return False
+    # decline only if even the narrowest block over-subscribes SBUF (else silent corruption)
+    shard_n = N // lnc
+    backstop_width = min(_MM_BLOCK_N_CANDIDATES[-1], shard_n)
+    num_tile_k = -(-K // _MM_KTILE)  # ceil-div: ragged final k-tile counts as a full tile
+    if num_tile_k * backstop_width * 2 > _MM_RESIDENT_BUDGET:  # noqa: SIM103
         return False
     return True
 
