@@ -968,8 +968,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       [](const at::Tensor& src_neuron, at::Tensor& dst_neuron) {
         torch_neuronx::utils::copy_strided_neuron_to_neuron(src_neuron, dst_neuron);
       },
-      "Strided copy between Neuron tensors — handles arbitrary src/dst strides", py::arg("src"),
-      py::arg("dst"));
+      "Strided copy between Neuron tensors using only NRT — handles arbitrary src/dst strides. "
+      "Never routes to the NKI kernel, so nki_strided_copy_ can fall back here without recursing.",
+      py::arg("src"), py::arg("dst"));
+  m.def(
+      "_nki_copy_strided_neuron_to_neuron",
+      [](const at::Tensor& src_neuron, at::Tensor& dst_neuron) {
+        torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(src_neuron, dst_neuron);
+      },
+      "Strided copy between Neuron tensors preferring the on-device NKI stride-S kernel, "
+      "delegating to _nrt_copy_strided_neuron_to_neuron for patterns it does not handle. "
+      "The default entry point for a strided copy.",
+      py::arg("src"), py::arg("dst"));
 
   // ── Packed int64 utilities ──
   m.def(

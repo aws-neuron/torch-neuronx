@@ -116,7 +116,7 @@ def copy_cpu_to_neuron(
                 cpu_src.shape, src_strides, dtype=torch.int64, device=target_device
             )
             strided_phys = packed_physical_view(strided)
-            _C._nrt_copy_strided_neuron_to_neuron(dst_physical, strided_phys)
+            _C._nki_copy_strided_neuron_to_neuron(dst_physical, strided_phys)
             dst = strided
         return dst
 
@@ -134,7 +134,7 @@ def copy_cpu_to_neuron(
         strided = torch.empty_strided(
             cpu_src.shape, src_strides, dtype=tmp.dtype, device=target_device
         )
-        _C._nrt_copy_strided_neuron_to_neuron(dst, strided)
+        _C._nki_copy_strided_neuron_to_neuron(dst, strided)
         dst = strided
     return dst
 

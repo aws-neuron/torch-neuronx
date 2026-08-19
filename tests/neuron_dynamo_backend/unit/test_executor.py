@@ -1247,18 +1247,18 @@ class TestExecutor:
             # output[2] = pass-through -> reuses input[2] buffer
             assert neuron_outputs[2] is neuron_2
 
-    @patch("torch_neuronx._C._nrt_copy_strided_neuron_to_neuron")
+    @patch("torch_neuronx._C._nki_copy_strided_neuron_to_neuron")
     @patch("torch_neuronx._C.execute_compiled_graph")
     @patch("torch.neuron.current_device")
-    def test_noncontiguous_neuron_input_uses_nrt_strided_copy(
-        self, mock_current_device, mock_execute, mock_nrt_copy
+    def test_noncontiguous_neuron_input_uses_strided_copy(
+        self, mock_current_device, mock_execute, mock_strided_copy
     ):
-        """Test that non-contiguous neuron inputs are made contiguous via NRT strided copy.
+        """Test that non-contiguous neuron inputs are made contiguous via a device strided copy.
 
         When torch.compile graph segments produce non-contiguous views (e.g. from
         scatter/gather in torch_geometric MessagePassing), calling .contiguous()
         would re-enter the dispatch pipeline and fail inside the compilation context.
-        Instead, _prepare_inputs uses torch.empty + NRT strided copy directly.
+        Instead, _prepare_inputs uses torch.empty + the strided copy binding directly.
         """
         mock_current_device.return_value = 0
 
@@ -1281,17 +1281,17 @@ class TestExecutor:
 
             executor(neuron_tensor)
 
-            # Verify NRT strided copy was used (not .contiguous())
-            mock_nrt_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
+            # Verify the strided copy was used (not .contiguous())
+            mock_strided_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
             neuron_tensor.contiguous.assert_not_called()
 
-    @patch("torch_neuronx._C._nrt_copy_strided_neuron_to_neuron")
+    @patch("torch_neuronx._C._nki_copy_strided_neuron_to_neuron")
     @patch("torch_neuronx._C.execute_compiled_graph")
     @patch("torch.neuron.current_device")
-    def test_contiguous_neuron_input_skips_nrt_copy(
-        self, mock_current_device, mock_execute, mock_nrt_copy
+    def test_contiguous_neuron_input_skips_strided_copy(
+        self, mock_current_device, mock_execute, mock_strided_copy
     ):
-        """Test that already-contiguous neuron inputs skip the NRT strided copy."""
+        """Test that already-contiguous neuron inputs skip the strided copy."""
         mock_current_device.return_value = 0
 
         io_specs, cast_spec = _make_io_specs(num_inputs=1, num_outputs=1)
@@ -1306,13 +1306,13 @@ class TestExecutor:
         with _mock_empty_output():
             executor(neuron_tensor)
 
-            mock_nrt_copy.assert_not_called()
+            mock_strided_copy.assert_not_called()
 
-    @patch("torch_neuronx._C._nrt_copy_strided_neuron_to_neuron")
+    @patch("torch_neuronx._C._nki_copy_strided_neuron_to_neuron")
     @patch("torch_neuronx._C.execute_compiled_graph")
     @patch("torch.neuron.current_device")
     def test_noncontiguous_int64_input_made_contiguous_before_view(
-        self, mock_current_device, mock_execute, mock_nrt_copy
+        self, mock_current_device, mock_execute, mock_strided_copy
     ):
         """Test that non-contiguous int64 inputs are made contiguous before view(int32).
 
@@ -1347,7 +1347,7 @@ class TestExecutor:
             executor(neuron_tensor)
 
             # Verify: NRT copy first, then view(int32) on the contiguous result
-            mock_nrt_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
+            mock_strided_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
             contiguous_buf.view.assert_called_once_with(torch.int32)
 
 

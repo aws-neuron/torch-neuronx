@@ -119,7 +119,7 @@ class Executor:
                 contiguous_tensor = torch.empty(
                     tensor.shape, dtype=tensor.dtype, device=tensor.device
                 )
-                torch_neuronx._C._nrt_copy_strided_neuron_to_neuron(tensor, contiguous_tensor)
+                torch_neuronx._C._nki_copy_strided_neuron_to_neuron(tensor, contiguous_tensor)
                 tensor = contiguous_tensor
             if tensor.dtype in self.INT_64_TO_32:
                 if tensor.dim() == 0:
