@@ -471,14 +471,6 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
     }
   }
 
-  // Not whitelisted - warn once per operation
-  if (!is_whitelisted_view) {
-    if (torch_neuronx::shouldLogFallback(op_name)) {
-      TORCH_NEURONX_FALLBACK_WARN(op_name);
-      torch_neuronx::markFallbackLogged(op_name);
-    }
-  }
-
   // Cross-device out= guard. A write-aliased (out=/inplace) tensor on a device
   // different from the Neuron inputs is the same-device violation PyTorch
   // reports up front. Without this, at::native::cpu_fallback proceeds and later
@@ -539,6 +531,10 @@ void neuron_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack
   }
 
   at::native::cpu_fallback(op, stack);
+
+  if (!is_whitelisted_view) {
+    torch_neuronx::markFallbackLogged(op_name);
+  }
 }
 
 // Device properties structure

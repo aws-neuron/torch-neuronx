@@ -439,7 +439,6 @@ void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src) {
   // host. It is reported under a distinct name so it does not shadow the bare
   // "aten::copy_" that legitimately appears in the executed-ops list (which
   // tests such as test_pad_decomposition_to_correct_ops key on).
-  torch_neuronx::markFallbackLogged("aten::copy_[noncontiguous_scatter_cpu_bounce]");
 
   size_t storage_bytes = dst.storage().nbytes();
   int64_t storage_elems = static_cast<int64_t>(storage_bytes / dst.element_size());
@@ -464,6 +463,8 @@ void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src) {
 
   // 4. Write storage back to Neuron
   copy_cpu_to_neuron(cpu_buffer, dst_flat, /*non_blocking=*/false);
+
+  torch_neuronx::markFallbackLogged("aten::copy_[noncontiguous_scatter_cpu_bounce]");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

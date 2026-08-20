@@ -101,7 +101,6 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     TORCH_NEURONX_DISPATCH_DEBUG("[NeuronSafeCast] CPU round-trip via NRT",
                                  " from=", t.scalar_type(), " to=", target_dtype,
                                  " device=", orig_device.str());
-    torch_neuronx::markFallbackLogged("aten::_to_copy");
 
     // Use NRT helpers directly instead of .to() to avoid re-dispatching
     // through aten::_to_copy.  Matches Python convert_for_neuron() which
@@ -144,6 +143,7 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     auto result = torch::empty(
         cpu_tmp.sizes(), torch::TensorOptions().dtype(cpu_tmp.scalar_type()).device(orig_device));
     utils::copy_cpu_to_neuron(cpu_tmp, result, /*non_blocking=*/false);
+    torch_neuronx::markFallbackLogged("aten::_to_copy");
     return result;
   }
 
