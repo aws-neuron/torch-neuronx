@@ -38,6 +38,15 @@ _TOL = {
     torch.bool: (0, 0),
 }
 
+
+def _cast_tol(src_dtype, dst_dtype):
+    """Exact when the cast is lossless (same dtype, or widening to fp32); the
+    destination's tolerance when it rounds."""
+    if src_dtype is dst_dtype or dst_dtype is torch.float32:
+        return (0, 0)
+    return _TOL[dst_dtype]
+
+
 _FLAG_ON = os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") == "1"
 
 
@@ -122,10 +131,17 @@ class OpSpec:
     dtypes: tuple = tuple(_DTYPES)
     arbitrary_h: bool = False  # in the free-dim remainder sweep
     compile_once: bool = False  # in the compile-once-per-shape sweep
+    non_128: bool = True  # in the non-128-count sweeps (False: op requires whole tiles)
+    min_rows: int = 1  # smallest M the op accepts (in-place copy_ needs a whole tile)
+    label: str | None = None  # test-id stem; defaults to name (set when name repeats)
     # (rtol, atol) override; None -> the per-dtype _TOL. Ops that are bit-exact by
     # construction must set (0, 0) — a tolerance there can only hide a mis-tiled or
     # partially written result, never a real numeric difference.
     tol: tuple | None = None
+
+    @property
+    def id(self) -> str:
+        return self.label or self.name
 
 
 def _unary_spec(name, fn, **flags):
@@ -178,6 +194,50 @@ def _sum_spec(**flags):
         return (x.to("neuron"),), ref
 
     return OpSpec("sum", build, lambda x: x.sum(dim=1, keepdim=True), **flags)
+
+
+def _to_copy_spec(dst_dtype, **flags):
+    """``x.to(dst_dtype)`` (aten::_to_copy): dtype cast, fresh output.
+
+    The sweep's ``dtype`` is the SOURCE dtype — one spec per target, sources being
+    the other two (same-dtype declines). Tolerance is the destination dtype's,
+    since the cast rounds to that precision."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(rows, h, dtype=dtype) / 8
+        return (x.to("neuron"),), x.to(dst_dtype)
+
+    return OpSpec(
+        "_to_copy",
+        build,
+        lambda x: x.to(dst_dtype),
+        dtypes=tuple(d for d in _DTYPES if d != dst_dtype),
+        label=f"_to_copy_{_DTYPE_ID[dst_dtype]}",
+        # Widening to fp32 is lossless (bf16 and fp16 are both exactly
+        # representable) -> exact; narrowing rounds to the destination's precision.
+        tol=(0, 0) if dst_dtype is torch.float32 else _TOL[dst_dtype],
+        **flags,
+    )
+
+
+def _copy_spec(**flags):
+    """``dst.copy_(src)`` (aten::copy_): in-place, same dtype — a pure data move, so
+    the reference is `src` itself and the comparison is exact. min_rows keeps the
+    sub-tile counts, which decline, out of the shared sweeps."""
+
+    def build(dtype, *, rows=512, h=2048):
+        src = torch.randn(rows, h, dtype=dtype) / 8
+        dst = torch.zeros(rows, h, dtype=dtype)
+        return (dst.to("neuron"), src.to("neuron")), src
+
+    return OpSpec(
+        "copy_",
+        build,
+        lambda dst, src: dst.copy_(src),
+        min_rows=128,
+        tol=(0, 0),
+        **flags,
+    )
 
 
 def _mm_spec():
@@ -266,6 +326,11 @@ _OP_SPECS = [
     _binary_spec("mul", torch.mul),
     _sigmoid_backward_spec(compile_once=True),
     _sum_spec(arbitrary_h=True, compile_once=True),
+    _to_copy_spec(torch.float32, arbitrary_h=True, compile_once=True),
+    # No arbitrary_h / compile_once for the bf16 target: those sweeps hardcode a
+    # bf16 source, which would be a same-dtype (declined) _to_copy.
+    _to_copy_spec(torch.bfloat16),
+    _copy_spec(arbitrary_h=True, compile_once=True),
     _mm_spec(),
     _index_spec(arbitrary_h=True),
     _scatter_add_spec(arbitrary_h=True),
@@ -273,9 +338,14 @@ _OP_SPECS = [
 
 # one correctness case per op per supported dtype
 _OP_DTYPE_CASES = [(s, dt) for s in _OP_SPECS for dt in s.dtypes]
-_OP_DTYPE_IDS = [f"{s.name}-{_DTYPE_ID[dt]}" for s, dt in _OP_DTYPE_CASES]
+_OP_DTYPE_IDS = [f"{s.id}-{_DTYPE_ID[dt]}" for s, dt in _OP_DTYPE_CASES]
 _ARBITRARY_H_SPECS = [s for s in _OP_SPECS if s.arbitrary_h]
 _COMPILE_ONCE_SPECS = [s for s in _OP_SPECS if s.compile_once]
+# Non-128 sweeps skip the ops that require whole 128-row tiles; spec.min_rows drops
+# the sub-tile counts per op.
+_NON_128_CASES = [(s, dt) for s, dt in _OP_DTYPE_CASES if s.non_128]
+_NON_128_IDS = [f"{s.id}-{_DTYPE_ID[dt]}" for s, dt in _NON_128_CASES]
+_NON_128_ONCE_SPECS = [s for s in _COMPILE_ONCE_SPECS if s.non_128]
 
 
 @pytest.mark.skipif(
@@ -310,7 +380,7 @@ class TestDynamicNkiKernels:
     # short tile), 1000=512+488 (non-128 remainder). H is baked, so the kernel
     # tiles the free dim at trace time (512-wide + final short tile), no padding.
     @pytest.mark.parametrize("H", [640, 576, 384, 1000])
-    @pytest.mark.parametrize("spec", _ARBITRARY_H_SPECS, ids=lambda s: s.name)
+    @pytest.mark.parametrize("spec", _ARBITRARY_H_SPECS, ids=lambda s: s.id)
     def test_dynamic_nki_arbitrary_h(self, spec, H):  # noqa: N803
         rtol, atol = _tol(spec, torch.bfloat16)
         run_args, ref = spec.build(torch.bfloat16, h=H)
@@ -336,7 +406,7 @@ class TestDynamicNkiKernels:
     # and stays correct after the padded rows are sliced off. 200->256, 129->256,
     # 383->384 exercise the pad path (and 383 is just below a tile boundary). ──
     @pytest.mark.parametrize("rows", [200, 129, 383])
-    @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
+    @pytest.mark.parametrize("spec,dtype", _NON_128_CASES, ids=_NON_128_IDS)
     def test_dynamic_nki_non_128_count(self, spec, dtype, rows):
         rtol, atol = _tol(spec, dtype)
         run_args, ref = spec.build(dtype, rows=rows)
@@ -345,7 +415,7 @@ class TestDynamicNkiKernels:
         torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
 
     # ── compile-once-per-shape sweep ──
-    @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.name)
+    @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.id)
     def test_dynamic_nki_compile_once(self, spec):
         """Compile for one M, run on other Ms without recompiling — the
         warm-restart / MoE-routing scenario. Runs at every M while one (H, dtype)
@@ -373,14 +443,15 @@ class TestDynamicNkiKernels:
     # ── non-128 counts don't recompile: the padded dim is not in the compile_key,
     # so distinct non-128 counts (padding to distinct tiles) reuse one NEFF. This
     # is the recompile-avoidance guarantee for realistic (unfloored) routing. ──
-    @pytest.mark.parametrize("spec", _COMPILE_ONCE_SPECS, ids=lambda s: s.name)
+    @pytest.mark.parametrize("spec", _NON_128_ONCE_SPECS, ids=lambda s: s.id)
     def test_dynamic_nki_non_128_no_recompile(self, spec):
         entry = _entry(spec.name)
         compiled_before = len(entry._compiled)
         exec_before = entry._exec_count
         entry._exec_ms.clear()
 
-        rows = (100, 200, 300)  # pad to 128/256/384 — three distinct tile counts
+        # 100/200/300 -> three distinct tile counts; min_rows drops the sub-tile one.
+        rows = tuple(m for m in (100, 200, 300) if m >= spec.min_rows)
         for m in rows:
             run_args, _ = spec.build(torch.bfloat16, rows=m, h=2048)
             spec.run(*run_args).cpu()
@@ -606,6 +677,208 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_ran("bitwise_or"):
             torch.bitwise_or(a, b, out=buf)
         torch.testing.assert_close(buf.cpu(), a.cpu() | b.cpu(), rtol=0, atol=0)
+
+    # ── _to_copy-specific: every dtype pair, the plan's warm-restart shapes, the
+    # dim1-dynamic ([1, seq]) collapse, and the declines (same dtype / unsupported
+    # dtype / non-contiguous source) ──
+    @pytest.mark.parametrize("src_dtype", _DTYPES, ids=lambda d: _DTYPE_ID[d])
+    @pytest.mark.parametrize("dst_dtype", _DTYPES, ids=lambda d: _DTYPE_ID[d])
+    def test_dynamic_nki_to_copy_dtype_pairs(self, src_dtype, dst_dtype):
+        """All 9 (src, dst) pairs: the 6 casts run dynamically and match CPU; the 3
+        same-dtype ones are short-circuited before the dynamic path."""
+        x = torch.randn(512, 256, dtype=src_dtype) / 8
+        x_n = x.to("neuron")
+        ref = x.to(dst_dtype)
+        expect_dynamic = src_dtype != dst_dtype
+        ctx = _assert_dynamic_ran if expect_dynamic else _assert_dynamic_skipped
+        with ctx("_to_copy"):
+            got = x_n.to(dst_dtype).cpu()
+        assert got.dtype == dst_dtype
+        rtol, atol = _cast_tol(src_dtype, dst_dtype)
+        torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
+
+    def test_dynamic_nki_to_copy_plan_shapes_no_recompile(self):
+        """Plan's _to_copy row: [512, 256] (warm) and [4096, 256] (cold) bf16 -> fp32
+        on ONE NEFF."""
+        entry = _entry("_to_copy")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        for rows in (512, 4096):
+            x = (torch.randn(rows, 256, dtype=torch.bfloat16) / 8).to("neuron")
+            got = x.to(torch.float32).cpu()
+            torch.testing.assert_close(got, x.cpu().to(torch.float32), rtol=1e-4, atol=1e-4)
+
+        assert entry._exec_count - exec_before == 2, "_to_copy did not run at both shapes"
+        assert entry._exec_ms.issuperset({512, 4096}), f"saw Ms {entry._exec_ms}"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "_to_copy recompiled between [512,256] and [4096,256]"
+
+    def test_dynamic_nki_to_copy_1d_no_recompile(self):
+        """1-D [seq] flattens to [numel, 1] — H = 1 baked, length dynamic -> one NEFF
+        across a seq change."""
+        entry = _entry("_to_copy")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+
+        for seq in (512, 4096):
+            x = (torch.randn(seq, dtype=torch.bfloat16) / 8).to("neuron")
+            with _assert_dynamic_ran("_to_copy"):
+                got = x.to(torch.float32).cpu()
+            assert got.shape == (seq,)
+            torch.testing.assert_close(got, x.cpu().to(torch.float32), rtol=1e-4, atol=1e-4)
+
+        assert entry._exec_count - exec_before == 2
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "_to_copy recompiled across the 1-D length change"
+
+    def test_dynamic_nki_to_copy_unsupported_dtype_declines(self):
+        # fp64 is not a kernel dtype -> fallback (NRT/CPU-bounce path), still correct.
+        x = torch.randn(512, 256, dtype=torch.float64, device="neuron")
+        with _assert_dynamic_skipped("_to_copy"):
+            got = x.to(torch.float32).cpu()
+        torch.testing.assert_close(got, x.cpu().to(torch.float32))
+
+    def test_dynamic_nki_to_copy_non_contiguous_declines(self):
+        # A transposed source must keep its dense strides -> decline to the
+        # framework's strided path.
+        x = (torch.randn(256, 512, dtype=torch.float32) / 8).to("neuron").t()
+        assert not x.is_contiguous()
+        with _assert_dynamic_skipped("_to_copy"):
+            got = x.to(torch.bfloat16).cpu()
+        torch.testing.assert_close(got, x.cpu().to(torch.bfloat16), rtol=1e-2, atol=1e-2)
+
+    # ── copy_-specific: in-place (the destination buffer IS `self`) — casts, the
+    # plan's [512, 1] shapes, broadcast, row slices, ragged counts, declines ──
+    @pytest.mark.parametrize("src_dtype", _DTYPES, ids=lambda d: _DTYPE_ID[d])
+    @pytest.mark.parametrize("dst_dtype", _DTYPES, ids=lambda d: _DTYPE_ID[d])
+    def test_dynamic_nki_copy_dtype_pairs(self, src_dtype, dst_dtype):
+        """dst.copy_(src), all 9 dtype pairs: casts src into dst's dtype in place
+        (same-dtype included — copy_ is a real data move)."""
+        src = torch.randn(512, 256, dtype=src_dtype) / 8
+        dst_n = torch.zeros(512, 256, dtype=dst_dtype).to("neuron")
+        with _assert_dynamic_ran("copy_"):
+            out = dst_n.copy_(src.to("neuron"))
+        assert out.data_ptr() == dst_n.data_ptr(), "copy_ must return the mutated self"
+        rtol, atol = _cast_tol(src_dtype, dst_dtype)
+        torch.testing.assert_close(dst_n.cpu(), src.to(dst_dtype), rtol=rtol, atol=atol)
+
+    def test_dynamic_nki_copy_plan_shapes_no_recompile(self):
+        """Plan's copy_ row: [512, 1] (warm) and [4096, 1] (cold) on ONE NEFF."""
+        entry = _entry("copy_")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        for rows in (512, 4096):
+            src = torch.randn(rows, 1, dtype=torch.bfloat16) / 8
+            dst = torch.zeros(rows, 1, dtype=torch.bfloat16).to("neuron")
+            dst.copy_(src.to("neuron"))
+            torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+        assert entry._exec_count - exec_before == 2, "copy_ did not run at both shapes"
+        assert entry._exec_ms.issuperset({512, 4096}), f"saw Ms {entry._exec_ms}"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "copy_ recompiled between [512,1] and [4096,1]"
+
+    def test_dynamic_nki_copy_broadcast_src(self):
+        """A broadcast source is expanded to self's shape before this path, so the
+        dynamic kernel handles it."""
+        src = torch.randn(1, 2048, dtype=torch.bfloat16) / 8
+        dst = torch.zeros(512, 2048, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("copy_"):
+            dst.copy_(src.to("neuron"))
+        torch.testing.assert_close(dst.cpu(), src.expand(512, 2048), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("rows", [129, 200, 255, 383, 1001])
+    def test_dynamic_nki_copy_non_128_runs(self, rows):
+        """A ragged row count runs in place: the tail tile is backward-aligned at row
+        M-128, so `self` is written exactly on [0, M)."""
+        src = torch.randn(rows, 2048, dtype=torch.bfloat16) / 8
+        dst = torch.zeros(rows, 2048, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("copy_"):
+            dst.copy_(src.to("neuron"))
+        torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("op", ["copy_", "_to_copy"])
+    def test_dynamic_nki_cast_ragged_no_recompile(self, op):
+        """The point of dropping the padding: ragged counts stay on ONE NEFF — M is not
+        in the compile_key and there is no pad buffer whose shape could recompile."""
+        entry = _entry(op)
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        rows = (129, 200, 255, 383, 1001)
+        for m in rows:
+            src = torch.randn(m, 2048, dtype=torch.bfloat16) / 8
+            if op == "copy_":
+                dst = torch.zeros(m, 2048, dtype=torch.bfloat16).to("neuron")
+                dst.copy_(src.to("neuron"))
+                torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+            else:
+                got = src.to("neuron").to(torch.float32).cpu()
+                torch.testing.assert_close(got, src.to(torch.float32), rtol=0, atol=0)
+
+        assert entry._exec_count - exec_before == len(rows), f"{op} did not run at every count"
+        assert entry._exec_ms.issuperset(
+            set(rows)
+        ), f"expected exec at {set(rows)}, saw {entry._exec_ms}"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), f"{op} recompiled across ragged counts {rows}"
+
+    @pytest.mark.parametrize("rows", [1, 64, 127])
+    def test_dynamic_nki_copy_sub_tile_declines(self, rows):
+        """Below one tile the tail offset would go negative and an in-place destination
+        cannot be padded -> decline, still correct."""
+        src = torch.randn(rows, 2048, dtype=torch.bfloat16) / 8
+        dst = torch.zeros(rows, 2048, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_skipped("copy_"):
+            dst.copy_(src.to("neuron"))
+        torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("rows", [129, 200, 383])
+    def test_dynamic_nki_copy_ragged_row_slice_no_clobber(self, rows):
+        """Tightest guard on the tail: a ragged in-place destination that is a row slice
+        in the MIDDLE of a bigger tensor — padding would corrupt the rows after it."""
+        big = torch.zeros(1024, 2048, dtype=torch.bfloat16).to("neuron")
+        dst = big[128 : 128 + rows]
+        assert dst.is_contiguous() and dst.storage_offset() != 0
+        src = torch.randn(rows, 2048, dtype=torch.bfloat16) / 8
+        with _assert_dynamic_ran("copy_"):
+            dst.copy_(src.to("neuron"))
+        out = big.cpu()
+        torch.testing.assert_close(out[128 : 128 + rows], src, rtol=0, atol=0)
+        assert out[:128].eq(0).all(), "wrote before the slice"
+        assert out[128 + rows :].eq(0).all(), "wrote past the ragged slice end"
+
+    def test_dynamic_nki_copy_into_row_slice(self):
+        """A row-slice destination is contiguous but starts at a non-zero storage
+        offset — the NEFF must write at that offset and leave the rest untouched."""
+        big = torch.zeros(512, 2048, dtype=torch.bfloat16).to("neuron")
+        dst = big[128:384]  # contiguous view, storage_offset = 128 * 2048
+        assert dst.is_contiguous() and dst.storage_offset() != 0
+        src = torch.randn(256, 2048, dtype=torch.bfloat16) / 8
+        with _assert_dynamic_ran("copy_"):
+            dst.copy_(src.to("neuron"))
+        out = big.cpu()
+        torch.testing.assert_close(out[128:384], src, rtol=0, atol=0)
+        # rows outside the slice must be untouched (a base-pointer write would clobber them)
+        assert out[:128].eq(0).all() and out[384:].eq(0).all(), "wrote outside the slice"
+
+    def test_dynamic_nki_copy_non_contiguous_dst_declines(self):
+        # A strided destination can't be written by the contiguous-tile kernel.
+        base = torch.zeros(2048, 512, dtype=torch.bfloat16).to("neuron")
+        dst = base.t()  # [512, 2048], non-contiguous
+        src = torch.randn(512, 2048, dtype=torch.bfloat16) / 8
+        with _assert_dynamic_skipped("copy_"):
+            dst.copy_(src.to("neuron"))
+        torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
 
     # ── E2E MoE forward: no recompiles as routing (token counts) change ──
     # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.

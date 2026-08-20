@@ -11,6 +11,7 @@ from torch_neuronx.utils import get_logical_neuron_cores
 
 from .add_kernel import add_kernel
 from .bitwise_or_kernel import bitwise_or_kernel
+from .cast_kernel import cast_kernel_bf16, cast_kernel_fp16, cast_kernel_fp32
 from .cat_kernel import cat_kernel
 from .cos_kernel import cos_kernel
 from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
@@ -46,6 +47,10 @@ _wrapped_sin = wrap_nki(sin_kernel)
 _wrapped_mul = wrap_nki(mul_kernel)
 _wrapped_sum = wrap_nki(sum_kernel)
 _wrapped_cat = wrap_nki(cat_kernel)
+# One per cast TARGET dtype; the source dtype comes from the input tensor's metadata.
+_wrapped_cast_bf16 = wrap_nki(cast_kernel_bf16)
+_wrapped_cast_fp16 = wrap_nki(cast_kernel_fp16)
+_wrapped_cast_fp32 = wrap_nki(cast_kernel_fp32)
 _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
 _wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
 _wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
@@ -114,6 +119,24 @@ def dynamic_cat_nki(
     input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_cat[_GRID](input_a, input_b, num_m_tiles)
+
+
+# Dtype cast (_to_copy / copy_); the adapter picks the wrapper by target dtype.
+# These take the real ROW count, not a tile count: the kernel needs the exact M to
+# place its ragged tail tile, and pads nothing.
+@nki_op("dynamic_nki::cast_bf16", mutates_args={})
+def dynamic_cast_bf16_nki(input_tensor: torch.Tensor, num_rows: torch.Tensor) -> torch.Tensor:
+    return _wrapped_cast_bf16[_GRID](input_tensor, num_rows)
+
+
+@nki_op("dynamic_nki::cast_fp16", mutates_args={})
+def dynamic_cast_fp16_nki(input_tensor: torch.Tensor, num_rows: torch.Tensor) -> torch.Tensor:
+    return _wrapped_cast_fp16[_GRID](input_tensor, num_rows)
+
+
+@nki_op("dynamic_nki::cast_fp32", mutates_args={})
+def dynamic_cast_fp32_nki(input_tensor: torch.Tensor, num_rows: torch.Tensor) -> torch.Tensor:
+    return _wrapped_cast_fp32[_GRID](input_tensor, num_rows)
 
 
 @nki_op("dynamic_nki::matmul", mutates_args={})
