@@ -1,15 +1,23 @@
-// RdmaManager unit tests: store-based control plane and P2P handling.
+// RdmaManager unit tests: descriptor wire format, the pure seq/channel-key
+// logic, and the local (fabric-free) zero-size P2P path.
 //
-// Only the control plane is testable here, and only for batches whose entries are
-// all zero-size. Anything touching a real transfer — MR registration, rkey
-// exchange, the same-rank TORCH_CHECK, transfer_id uniqueness, CQ completion
-// and error attribution — needs hardware plus a peer process and belongs in the
-// multi-rank Python P2P tests.
+// Testable without Neuron hardware or a peer process:
+//   1. the TransferDescriptor protobuf wire format (pure serialization);
+//   2. NextSeq (per-(src,dst,tag) seq lockstep) and TagChannelKey (the channel-map
+//      key), reached via a friend seam; and
+//   3. the zero-size (empty-tensor) send/recv path, which by design touches
+//      neither the store nor the fabric — it only advances the per-(src,dst,tag)
+//      NextSeq counter to stay in lockstep with the peer.
+// The per-(peer,tag) channel setup + RMA round-trip — MR registration, the
+// store coordinate/imm-token exchange, fi_writedata, CQ completion and error
+// attribution — needs hardware and a peer, and belongs in the multi-rank Python
+// P2P tests.
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <map>
+#include <set>
 #include <string>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <vector>
@@ -17,32 +25,35 @@
 #include "torch_neuronx/csrc/core/rdma/RdmaManager.h"
 #include "torch_neuronx/csrc/core/rdma/TransferDescriptor.pb.h"
 
+namespace neuron {
 namespace {
 
-// Non-zero so rank is actually serialized
 constexpr int kSelfRank = 3;
 constexpr int kPeerRank = 1;
 
-// In-memory Store recording the calls PrepareBatch makes. multiGet does not
-// block on a missing key, so test that reaches a blocking multiGet has already
-// failed, and returning empty keeps the suite from hanging.
+// In-memory Store standing in for the TCPStore. The zero-size path must NOT touch
+// it (only the one-time endpoint/mailbox bootstrap does, and that needs hardware),
+// so the tests assert these recording vectors stay empty. multiGet does not block
+// on a missing key — a test that reached a blocking multiGet has already failed,
+// and returning empty keeps the suite from hanging.
 class FakeStore : public c10d::Store {
  public:
   void set(const std::string& key, const std::vector<uint8_t>& value) override {
+    set_keys_.push_back(key);
     data_[key] = value;
   }
 
   std::vector<uint8_t> get(const std::string& key) override {
+    requested_keys_.push_back(key);
     auto it = data_.find(key);
     return it == data_.end() ? std::vector<uint8_t>{} : it->second;
   }
 
   void multiSet(const std::vector<std::string>& keys,
                 const std::vector<std::vector<uint8_t>>& values) override {
-    multi_set_calls_++;
     for (size_t i = 0; i < keys.size(); ++i) {
-      data_[keys[i]] = values[i];
       set_keys_.push_back(keys[i]);
+      data_[keys[i]] = values[i];
     }
   }
 
@@ -51,7 +62,8 @@ class FakeStore : public c10d::Store {
     out.reserve(keys.size());
     for (const auto& k : keys) {
       requested_keys_.push_back(k);
-      out.push_back(get(k));
+      auto it = data_.find(k);
+      out.push_back(it == data_.end() ? std::vector<uint8_t>{} : it->second);
     }
     return out;
   }
@@ -77,9 +89,8 @@ class FakeStore : public c10d::Store {
   void wait(const std::vector<std::string>&) override {}
   void wait(const std::vector<std::string>&, const std::chrono::milliseconds&) override {}
 
-  bool Has(const std::string& key) const { return data_.find(key) != data_.end(); }
-  int multi_set_calls() const { return multi_set_calls_; }
-  // Keys this rank published (phase 1) and looked up (phase 2), in order.
+  // Keys this rank published and looked up, in order. Both stay empty for the
+  // zero-size path.
   const std::vector<std::string>& set_keys() const { return set_keys_; }
   const std::vector<std::string>& requested_keys() const { return requested_keys_; }
 
@@ -87,16 +98,7 @@ class FakeStore : public c10d::Store {
   std::map<std::string, std::vector<uint8_t>> data_;
   std::vector<std::string> set_keys_;
   std::vector<std::string> requested_keys_;
-  int multi_set_calls_ = 0;
 };
-
-// Mirrors RdmaManager::MakeStoreKey (private). This key
-// format is the cross-rank wire contract, so changing it should fail a test here
-// rather than desync peers at runtime.
-std::string StoreKey(int src, int dst, int tag, int seq) {
-  return "rdma_" + std::to_string(src) + "_" + std::to_string(dst) + "_" + std::to_string(tag) +
-         "_" + std::to_string(seq);
-}
 
 neuron::P2PEntry ZeroSizeRecv(int tag, int peer = kPeerRank) {
   return neuron::P2PEntry{neuron::P2PEntry::Kind::kRecv, /*user_va=*/nullptr, /*size=*/0, peer,
@@ -108,47 +110,10 @@ neuron::P2PEntry ZeroSizeSend(int tag, int peer = kPeerRank) {
                           tag};
 }
 
-// Serialized descriptor as a peer's zero-size recv publishes it: no regions.
-std::vector<uint8_t> RegionlessDescriptor() {
-  neuron::rdma::TransferDescriptor desc;
-  desc.set_transfer_id(0);
-  desc.set_rank(kPeerRank);
-  std::string s;
-  EXPECT_TRUE(desc.SerializeToString(&s));
-  return std::vector<uint8_t>(s.begin(), s.end());
-}
-
-// Descriptor for a real (non-zero-size) recv: carries one memory region.
-std::vector<uint8_t> DescriptorWithRegion() {
-  neuron::rdma::TransferDescriptor desc;
-  desc.set_transfer_id(7);
-  desc.set_rank(kPeerRank);
-  auto* region = desc.add_regions();
-  region->set_remote_addr(0xdeadbeef);
-  region->set_size(64);
-  region->set_rkey(1234);
-  std::string s;
-  EXPECT_TRUE(desc.SerializeToString(&s));
-  return std::vector<uint8_t>(s.begin(), s.end());
-}
-
-class RdmaManagerTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    store_ = c10::make_intrusive<FakeStore>();
-    auto& mgr = neuron::RdmaManager::Instance();
-    mgr.SetStore(store_);
-    mgr.SetRank(kSelfRank);
-  }
-
-  FakeStore& store() { return *store_; }
-  neuron::RdmaManager& mgr() { return neuron::RdmaManager::Instance(); }
-
-  c10::intrusive_ptr<FakeStore> store_;
-};
+}  // namespace
 
 // ===========================================================================
-// Descriptor wire format
+// Descriptor wire format — the only bytes that cross between ranks.
 // ===========================================================================
 
 TEST(TransferDescriptor, RoundTripsRegionFields) {
@@ -178,278 +143,213 @@ TEST(TransferDescriptor, RoundTripsRegionFields) {
 }
 
 TEST(TransferDescriptor, EmptyBytesParseAsRegionlessMessage) {
-  // proto3 accepts empty input as a valid empty message, so "absent key" and
-  // "regionless descriptor" are indistinguishable after parsing. The seq handshake
-  // (not parse failure) is what guarantees the key was actually published by the peer.
+  // proto3 accepts empty input as a valid empty message. The mailbox seq
+  // handshake (not parse success) is what proves a slot was actually written.
   neuron::rdma::TransferDescriptor parsed;
   EXPECT_TRUE(parsed.ParseFromString(""));
   EXPECT_EQ(parsed.regions_size(), 0);
 }
 
+class RdmaManagerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    store_ = c10::make_intrusive<FakeStore>();
+    auto& mgr = RdmaManager::Instance();
+    mgr.SetStore(store_);
+    mgr.SetRank(kSelfRank);
+  }
+
+  FakeStore& store() { return *store_; }
+  RdmaManager& mgr() { return RdmaManager::Instance(); }
+
+  // --- private-member seams (friendship-gated) ---
+  uint32_t nextSeq(int src, int dst, int tag) { return mgr().NextSeq(src, dst, tag); }
+  static uint64_t tagChannelKey(int peer, int tag) { return RdmaManager::TagChannelKey(peer, tag); }
+  static uint32_t ringDepth(uint32_t s, uint32_t r) { return RdmaManager::RingDepth(s, r); }
+  static constexpr uint32_t kMailboxSlots = RdmaManager::kMailboxSlots;
+
+  c10::intrusive_ptr<FakeStore> store_;
+};
+
 // ===========================================================================
-// Control plane: store keys and sequence numbering
+// NextSeq: per-(src,dst,tag) counters kept in lockstep across ranks.
+// The manager is a singleton with persistent counters, so each test uses a
+// tuple range no other test touches (src/dst >= 40, tags >= 500).
 // ===========================================================================
 
-TEST_F(RdmaManagerTest, RecvPublishesUnderSenderKeyedTuple) {
-  constexpr int kTag = 4101;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
-
-  mgr().PrepareBatch(entries);
-
-  // A recv publishes under (peer=src, self=dst): the key the paired sender
-  // computes as (self=src, peer=dst).
-  ASSERT_EQ(store().set_keys().size(), 1u);
-  EXPECT_EQ(store().set_keys()[0], StoreKey(kPeerRank, kSelfRank, kTag, 0));
+TEST_F(RdmaManagerTest, NextSeqAdvancesPerTuple) {
+  // Consecutive transfers on one tuple must occupy consecutive seq slots, or the
+  // sender's expected_seq guard would reject the receiver's descriptor.
+  EXPECT_EQ(nextSeq(40, 41, 500), 0u);
+  EXPECT_EQ(nextSeq(40, 41, 500), 1u);
+  EXPECT_EQ(nextSeq(40, 41, 500), 2u);
 }
 
-TEST_F(RdmaManagerTest, SendLooksUpSelfKeyedTuple) {
-  constexpr int kTag = 4102;
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), RegionlessDescriptor());
+TEST_F(RdmaManagerTest, NextSeqIsIndependentPerTag) {
+  // Distinct tags are distinct streams: both start at 0. A shared counter would
+  // strand the peer waiting on the seq the other tag consumed.
+  EXPECT_EQ(nextSeq(42, 43, 501), 0u);
+  EXPECT_EQ(nextSeq(42, 43, 502), 0u);
+}
 
+TEST_F(RdmaManagerTest, NextSeqIsIndependentPerEndpoint) {
+  // Same tag, different src or dst — each (src,dst) pair is its own stream.
+  EXPECT_EQ(nextSeq(44, 45, 503), 0u);
+  EXPECT_EQ(nextSeq(46, 45, 503), 0u);  // different src
+  EXPECT_EQ(nextSeq(44, 47, 503), 0u);  // different dst
+}
+
+TEST_F(RdmaManagerTest, NextSeqSeparatesSendAndRecvDirections) {
+  // (src,dst) ordering distinguishes the two directions, so a bidirectional
+  // exchange on one tag does not collide — both sit at seq 0.
+  EXPECT_EQ(nextSeq(48, 49, 504), 0u);
+  EXPECT_EQ(nextSeq(49, 48, 504), 0u);  // reversed direction is a separate stream
+}
+
+TEST_F(RdmaManagerTest, NextSeqRejectsFieldOverflow) {
+  // (src,dst,tag) each pack into 20 bits; an out-of-range value would bleed into
+  // the adjacent field and alias another tuple's counter.
+  constexpr int kOverflow = 1 << 20;
+  EXPECT_THROW(nextSeq(kOverflow, 1, 1), c10::Error);
+  EXPECT_THROW(nextSeq(1, kOverflow, 1), c10::Error);
+  EXPECT_THROW(nextSeq(1, 1, kOverflow), c10::Error);
+}
+
+// ===========================================================================
+// TagChannelKey: packs (peer, tag) into the lazily-created channel-map key.
+// Distinct channels must map to distinct keys, or two channels would alias one
+// buffer + imm-token set.
+// ===========================================================================
+
+TEST_F(RdmaManagerTest, TagChannelKeyIsInjective) {
+  std::set<uint64_t> seen;
+  for (int peer = 0; peer < 40; ++peer) {
+    for (int tag = 0; tag < 40; ++tag) {
+      EXPECT_TRUE(seen.insert(tagChannelKey(peer, tag)).second)
+          << "channel-key collision at peer=" << peer << " tag=" << tag;
+    }
+  }
+}
+
+TEST_F(RdmaManagerTest, TagChannelKeySeparatesPeerAndTag) {
+  // peer and tag occupy disjoint halves of the 64-bit key.
+  EXPECT_NE(tagChannelKey(1, 0), tagChannelKey(0, 1));
+  EXPECT_EQ(tagChannelKey(0, 5), tagChannelKey(0, 5));
+}
+
+// ===========================================================================
+// RingDepth: per-batch (peer, tag) ring depth = max(kMailboxSlots, sends, recvs).
+// The depth must be identical on both ranks with no negotiation, which holds
+// because my {send,recv} counts on a channel are the peer's {recv,send} counts and
+// max is order-independent — so an asymmetric (e.g. ZBV) batch still agrees.
+// ===========================================================================
+
+TEST_F(RdmaManagerTest, RingDepthFloorsAtMailboxSlots) {
+  // A single transfer each way still gets the double-buffering floor.
+  EXPECT_EQ(ringDepth(0, 0), kMailboxSlots);
+  EXPECT_EQ(ringDepth(1, 1), kMailboxSlots);
+  EXPECT_EQ(ringDepth(1, 0), kMailboxSlots);
+}
+
+TEST_F(RdmaManagerTest, RingDepthGrowsToBatchCount) {
+  // N same-(peer,tag) transfers one way need N distinct slots (above the floor).
+  EXPECT_EQ(ringDepth(5, 1), 5u);
+  EXPECT_EQ(ringDepth(1, 8), 8u);
+  EXPECT_EQ(ringDepth(3, 7), 7u);
+}
+
+TEST_F(RdmaManagerTest, RingDepthIsSymmetricUnderAsymmetricCounts) {
+  // The crux: a ZBV batch may have send_count != recv_count on a channel, but the
+  // two ranks see mirrored counts. max() must return the same depth either way, or
+  // the ranks would disagree on the ring size and read/write mismatched slots.
+  for (uint32_t s = 0; s < 12; ++s) {
+    for (uint32_t r = 0; r < 12; ++r) {
+      EXPECT_EQ(ringDepth(s, r), ringDepth(r, s)) << "asymmetry at s=" << s << " r=" << r;
+    }
+  }
+}
+
+// ===========================================================================
+// Zero-size (empty-tensor) path: local, fabric-free, store-free.
+// ===========================================================================
+
+TEST_F(RdmaManagerTest, ZeroSizeRecvCompletesLocallyWithoutStoreOrFabric) {
+  constexpr int kTag = 1;
+  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
+  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
+
+  EXPECT_TRUE(entries[0].prepared);
+  EXPECT_TRUE(entries[0].recv_consumed);
+  EXPECT_EQ(entries[0].transfer_id, 0u);
+  // The descriptor exchange is skipped entirely: nothing crossed the store.
+  EXPECT_TRUE(store().set_keys().empty());
+  EXPECT_TRUE(store().requested_keys().empty());
+  // No data completion will ever arrive, yet the recv is already satisfied.
+  EXPECT_FALSE(mgr().DrainAndPending(entries));
+}
+
+TEST_F(RdmaManagerTest, ZeroSizeSendCompletesLocallyWithoutStoreOrFabric) {
+  constexpr int kTag = 2;
   std::vector<neuron::P2PEntry> entries{ZeroSizeSend(kTag)};
   ASSERT_NO_THROW(mgr().PrepareBatch(entries));
 
-  ASSERT_EQ(store().requested_keys().size(), 1u);
-  EXPECT_EQ(store().requested_keys()[0], StoreKey(kSelfRank, kPeerRank, kTag, 0));
+  EXPECT_TRUE(entries[0].prepared);
+  EXPECT_EQ(entries[0].send_ctx, nullptr);  // no fi_writedata was posted
+  EXPECT_TRUE(store().set_keys().empty());
+  EXPECT_TRUE(store().requested_keys().empty());
+  EXPECT_FALSE(mgr().DrainAndPending(entries));
 }
 
-TEST_F(RdmaManagerTest, SeqCountersAreIndependentPerTag) {
-  constexpr int kTagA = 4103;
-  constexpr int kTagB = 4104;
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTagA), ZeroSizeRecv(kTagB)};
-  mgr().PrepareBatch(entries);
-
-  // Distinct tags are distinct streams: both start at seq 0. A shared counter
-  // would put one of them at seq 1 and strand the peer waiting on seq 0.
-  EXPECT_TRUE(store().Has(StoreKey(kPeerRank, kSelfRank, kTagA, 0)));
-  EXPECT_TRUE(store().Has(StoreKey(kPeerRank, kSelfRank, kTagB, 0)));
+TEST_F(RdmaManagerTest, AllZeroSizeBatchNeverTouchesUninitializedFabric) {
+  // Regression: an all-zero-size batch has no HBM VA to lazily initialize the
+  // fabric with, so it must complete without ever calling into libfabric. Routed
+  // through the mailbox this segfaulted on a null endpoint/AV; the local path
+  // never reaches the fabric.
+  constexpr int kTag = 3;
+  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag), ZeroSizeSend(kTag, /*peer=*/2)};
+  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
+  EXPECT_TRUE(entries[0].prepared);
+  EXPECT_TRUE(entries[1].prepared);
+  EXPECT_FALSE(mgr().DrainAndPending(entries));
+  EXPECT_TRUE(store().set_keys().empty());
+  EXPECT_TRUE(store().requested_keys().empty());
 }
 
-TEST_F(RdmaManagerTest, SeqCountersAreIndependentPerPeer) {
-  constexpr int kTag = 4105;
-  constexpr int kOtherPeer = 2;
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag, kPeerRank),
-                                        ZeroSizeRecv(kTag, kOtherPeer)};
-  mgr().PrepareBatch(entries);
-
-  // Same tag, different peers.
-  EXPECT_TRUE(store().Has(StoreKey(kPeerRank, kSelfRank, kTag, 0)));
-  EXPECT_TRUE(store().Has(StoreKey(kOtherPeer, kSelfRank, kTag, 0)));
-}
-
-TEST_F(RdmaManagerTest, SeqCounterAdvancesAcrossBatches) {
-  constexpr int kTag = 4106;
-
-  std::vector<neuron::P2PEntry> first{ZeroSizeRecv(kTag)};
-  mgr().PrepareBatch(first);
-  std::vector<neuron::P2PEntry> second{ZeroSizeRecv(kTag)};
-  mgr().PrepareBatch(second);
-
-  // Consecutive transfers on one tuple must occupy consecutive seq slots.
-  EXPECT_EQ(store().set_keys().size(), 2u);
-  EXPECT_EQ(store().set_keys()[0], StoreKey(kPeerRank, kSelfRank, kTag, 0));
-  EXPECT_EQ(store().set_keys()[1], StoreKey(kPeerRank, kSelfRank, kTag, 1));
-}
-
-TEST_F(RdmaManagerTest, SendSeqCounterAdvancesAcrossBatches) {
-  constexpr int kTag = 4107;
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), RegionlessDescriptor());
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 1), RegionlessDescriptor());
-
-  std::vector<neuron::P2PEntry> first{ZeroSizeSend(kTag)};
-  ASSERT_NO_THROW(mgr().PrepareBatch(first));
-  std::vector<neuron::P2PEntry> second{ZeroSizeSend(kTag)};
-  ASSERT_NO_THROW(mgr().PrepareBatch(second));
-
-  // Asserted on the requested keys, not on a throw: a missing key would parse
-  // as a regionless descriptor and be silently accepted by the zero-size path
-  // so key identity is the only real evidence the seq advanced.
-  ASSERT_EQ(store().requested_keys().size(), 2u);
-  EXPECT_EQ(store().requested_keys()[0], StoreKey(kSelfRank, kPeerRank, kTag, 0));
-  EXPECT_EQ(store().requested_keys()[1], StoreKey(kSelfRank, kPeerRank, kTag, 1));
-}
-
-TEST_F(RdmaManagerTest, SendAndRecvOnSameTagUseSeparateStreams) {
-  constexpr int kTag = 4108;
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), RegionlessDescriptor());
-
-  // (src,dst) ordering distinguishes the two directions, so a bidirectional
-  // exchange on one tag does not collide - both sit at seq 0.
+TEST_F(RdmaManagerTest, MixedZeroSizeSendAndRecvInOneBatchBothComplete) {
+  constexpr int kTag = 4;
   std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag), ZeroSizeSend(kTag)};
   ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-
-  ASSERT_EQ(store().set_keys().size(), 1u);
-  EXPECT_EQ(store().set_keys()[0], StoreKey(kPeerRank, kSelfRank, kTag, 0));
-  ASSERT_EQ(store().requested_keys().size(), 1u);
-  EXPECT_EQ(store().requested_keys()[0], StoreKey(kSelfRank, kPeerRank, kTag, 0));
-}
-
-TEST_F(RdmaManagerTest, TagExceedingFieldWidthIsRejected) {
-  // NextSeq packs (src, dst, tag) into 20 bits each. dist.send/recv tags are
-  // user-controlled, so an oversized tag must fail loudly rather than bleed
-  // into the adjacent field and alias another tuple's counter.
-  constexpr int kOversizedTag = 1 << 20;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kOversizedTag)};
-  EXPECT_THROW(mgr().PrepareBatch(entries), c10::Error);
-}
-
-TEST_F(RdmaManagerTest, LargestValidTagAccepted) {
-  constexpr int kMaxTag = (1 << 20) - 1;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kMaxTag)};
-  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-  EXPECT_TRUE(store().Has(StoreKey(kPeerRank, kSelfRank, kMaxTag, 0)));
-}
-
-// ===========================================================================
-// Zero-size recv
-// ===========================================================================
-
-TEST_F(RdmaManagerTest, ZeroSizeRecvPublishesRegionlessDescriptor) {
-  constexpr int kTag = 4201;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
-
-  mgr().PrepareBatch(entries);
-
-  auto raw = store().get(StoreKey(kPeerRank, kSelfRank, kTag, 0));
-  neuron::rdma::TransferDescriptor desc;
-  ASSERT_TRUE(desc.ParseFromArray(raw.data(), static_cast<int>(raw.size())));
-
-  // No regions is the signal the sender keys off to skip fi_writedata.
-  EXPECT_EQ(desc.regions_size(), 0);
-  EXPECT_EQ(desc.rank(), kSelfRank);
-  // transfer_id stays 0: a zero-size recv must not consume an id from
-  // next_transfer_id_, or it could collide with a real recv's CQ immediate.
-  EXPECT_EQ(desc.transfer_id(), 0u);
-}
-
-TEST_F(RdmaManagerTest, ZeroSizeRecvSkipsVaResolutionAndCompletesImmediately) {
-  constexpr int kTag = 4202;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
-
-  // Would throw if the entry went through ResolveHbmVA (null user_va is not
-  // NRT-resolvable) or EnsureInitialized (no EFA device in this binary).
-  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-
-  EXPECT_EQ(entries[0].nrt_va, nullptr);
-  EXPECT_TRUE(entries[0].prepared);
-  // No FI_REMOTE_CQ_DATA will ever arrive for a zero-byte remote write, so the
-  // recv is marked consumed up front; otherwise DrainAndPending reports it
-  // pending forever and the op spins until the P2P timeout.
-  EXPECT_TRUE(entries[0].recv_consumed);
   EXPECT_FALSE(mgr().DrainAndPending(entries));
+  for (const auto& e : entries) EXPECT_TRUE(e.prepared);
+}
+
+TEST_F(RdmaManagerTest, ZeroSizeAcceptsLargeTag) {
+  // Tags are unbounded (channels are created lazily per (peer, tag)); zero-size
+  // in particular is bounded only by NextSeq's 20-bit field. A large tag that a
+  // fixed per-peer slot table would have rejected must be accepted.
+  constexpr int kLargeTag = (1 << 20) - 7;
+  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kLargeTag)};
+  EXPECT_NO_THROW(mgr().PrepareBatch(entries));
 }
 
 // ===========================================================================
-// Zero-size send
+// Batch bookkeeping.
 // ===========================================================================
-
-TEST_F(RdmaManagerTest, ZeroSizeSendConsumesRegionlessDescriptorWithoutPosting) {
-  constexpr int kTag = 4301;
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), RegionlessDescriptor());
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(kTag)};
-  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-
-  EXPECT_TRUE(entries[0].prepared);
-  // No fi_writedata was posted, so there is no completion context. A null
-  // send_ctx is what DrainAndPending treats as already-complete.
-  EXPECT_EQ(entries[0].send_ctx, nullptr);
-  EXPECT_FALSE(mgr().DrainAndPending(entries));
-}
-
-TEST_F(RdmaManagerTest, ZeroSizeSendRejectsDescriptorCarryingRegions) {
-  constexpr int kTag = 4302;
-  // Peer published a real (regionful) descriptor while this rank thinks the
-  // transfer is zero-size: the ranks disagree on the tensor's size, so the seq
-  // streams are already skewed. Fail loudly instead of silently dropping a
-  // transfer the peer is waiting on.
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), DescriptorWithRegion());
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(kTag)};
-  EXPECT_THROW(mgr().PrepareBatch(entries), c10::Error);
-}
-
-TEST_F(RdmaManagerTest, ZeroSizeSendRejectsUnparseableDescriptor) {
-  constexpr int kTag = 4303;
-  // Field 1 (regions), wire type 2, declared length 127, no payload: truncated
-  // and unparseable. Parsing happens before the size check, so corruption must
-  // surface as an error rather than degrade into a plausible "regionless, nothing to write".
-  store().set(StoreKey(kSelfRank, kPeerRank, kTag, 0), std::vector<uint8_t>{0x0A, 0x7F});
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(kTag)};
-  EXPECT_THROW(mgr().PrepareBatch(entries), c10::Error);
-}
-
-// ===========================================================================
-// Batch-level behavior
-// ===========================================================================
-
-TEST_F(RdmaManagerTest, MultipleZeroSizeRecvsShareOneMultiSet) {
-  constexpr int kTagA = 4401;
-  constexpr int kTagB = 4402;
-
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTagA), ZeroSizeRecv(kTagB)};
-  mgr().PrepareBatch(entries);
-
-  // Both descriptors go out in the single phase-1 multiSet, matching the
-  // batching a coalesced batch_isend_irecv group relies on.
-  EXPECT_EQ(store().multi_set_calls(), 1);
-  for (const auto& e : entries) EXPECT_TRUE(e.recv_consumed);
-  EXPECT_FALSE(mgr().DrainAndPending(entries));
-}
-
-TEST_F(RdmaManagerTest, ZeroSizeSendAndRecvInOneBatch) {
-  constexpr int kSendTag = 4403;
-  constexpr int kRecvTag = 4404;
-  store().set(StoreKey(kSelfRank, kPeerRank, kSendTag, 0), RegionlessDescriptor());
-
-  // Mirrors a coalesced group exchanging empty tensors both ways, as a pipeline
-  // stage does when a microbatch carries no data for this rank.
-  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(kSendTag), ZeroSizeRecv(kRecvTag)};
-  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-
-  EXPECT_EQ(entries[0].send_ctx, nullptr);
-  EXPECT_TRUE(entries[1].recv_consumed);
-  EXPECT_FALSE(mgr().DrainAndPending(entries));
-}
 
 TEST_F(RdmaManagerTest, PrepareBatchIsIdempotent) {
-  constexpr int kTag = 4405;
+  constexpr int kTag = 5;
   std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
-
-  mgr().PrepareBatch(entries);
-  const int after_first = store().multi_set_calls();
-
-  // The kHost closure re-enters PrepareBatch while polling; the prepared
-  // early-return must keep it from publishing again under a fresh seq, which
-  // would strand the peer's send on the original key.
-  mgr().PrepareBatch(entries);
-
-  EXPECT_EQ(store().multi_set_calls(), after_first);
-  EXPECT_FALSE(store().Has(StoreKey(kPeerRank, kSelfRank, kTag, 1)));
-}
-
-TEST_F(RdmaManagerTest, DrainAndPendingIsStableAcrossRepeatedCalls) {
-  constexpr int kTag = 4406;
-  std::vector<neuron::P2PEntry> entries{ZeroSizeRecv(kTag)};
-  mgr().PrepareBatch(entries);
-
-  // The poll loop calls DrainAndPending repeatedly. recv_consumed must keep an
-  // already-satisfied recv from flipping back to pending once the completed-id
-  // set is empty.
-  for (int i = 0; i < 3; ++i) {
-    EXPECT_FALSE(mgr().DrainAndPending(entries)) << "call " << i;
-  }
+  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
+  // Second call is a no-op early-return on entries.front().prepared.
+  ASSERT_NO_THROW(mgr().PrepareBatch(entries));
+  EXPECT_TRUE(store().set_keys().empty());
+  EXPECT_TRUE(store().requested_keys().empty());
 }
 
 TEST_F(RdmaManagerTest, EmptyBatchIsANoOp) {
   std::vector<neuron::P2PEntry> entries;
-
   ASSERT_NO_THROW(mgr().PrepareBatch(entries));
-  EXPECT_EQ(store().multi_set_calls(), 0);
   EXPECT_FALSE(mgr().DrainAndPending(entries));
 }
 
-}  // namespace
+}  // namespace neuron

@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
+#include <thread>
 
 extern "C" {
 #include <nrt/nrt.h>
@@ -145,6 +147,8 @@ RdmaManager::~RdmaManager() {
   cq_.reset();
   av_.reset();
   registered_memory_.clear();
+  tag_channels_.clear();
+  retired_channels_.clear();
   domain_.reset();
   fabric_.reset();
   if (info_) LibfabricSymbols::Instance().fi_freeinfo(info_);
@@ -156,6 +160,7 @@ RdmaManager::~RdmaManager() {
   // DrainAndPending can be touching these containers.
   send_contexts_.clear();
   completed_recv_ids_.clear();
+  mailbox_arrived_.clear();
   av_cache_.clear();
 }
 
@@ -439,6 +444,109 @@ fid_mr* RdmaManager::FindMR(void* addr, size_t size) {
   return nullptr;
 }
 
+uint32_t RdmaManager::RingDepth(uint32_t send_count, uint32_t recv_count) {
+  return std::max(kMailboxSlots, std::max(send_count, recv_count));
+}
+
+RdmaManager::TagChannel* RdmaManager::TryEnsureLocalChannel(int peer, int tag,
+                                                            uint32_t needed_depth) {
+  const uint64_t key = TagChannelKey(peer, tag);
+  auto it = tag_channels_.find(key);
+  if (it != tag_channels_.end() && it->second.ring_depth >= needed_depth) {
+    return &it->second;  // existing channel already deep enough
+  }
+
+  // Bilateral AV: EFA RDM requires the peer inserted before we publish/write.
+  // Non-blocking — if the peer hasn't published its endpoint yet, defer (return
+  // nullptr) and let the progress loop retry, rather than block the whole batch.
+  fi_addr_t peer_fi;
+  if (!TryGetOrInsertPeer(peer, &peer_fi)) return nullptr;
+
+  const int rank = rank_.load();
+  const uint32_t depth = std::max(needed_depth, kMailboxSlots);
+
+  // Grow path: an earlier, shallower channel exists. Retire its buffer+MR (a
+  // prior mailbox write may still reference it) rather than free under a possibly
+  // in-flight write, then build a fresh, deeper one. Safe because each coalesced
+  // batch fully drains before the next PrepareBatch runs (SubmitP2POp drains to
+  // completion), so no live transfer targets this channel when we resize.
+  if (it != tag_channels_.end()) {
+    TORCH_NEURONX_RDMA_INFO("TryEnsureLocalChannel: GROW peer=", peer, " tag=", tag, " depth ",
+                            it->second.ring_depth, " -> ", depth);
+    retired_channels_.push_back(std::move(it->second));
+    tag_channels_.erase(it);
+  }
+
+  TagChannel ch;
+  ch.ring_depth = depth;
+  const size_t inbox_bytes = static_cast<size_t>(depth) * kMailboxSlotBytes;
+  ch.buf.assign(2 * inbox_bytes, 0);  // zeroed: a reader never sees a stale seq
+
+  fi_mr_attr mr_attr = {};
+  mr_attr.access = FI_REMOTE_WRITE | FI_WRITE | FI_READ | FI_REMOTE_READ;
+  mr_attr.iface = FI_HMEM_SYSTEM;
+  struct iovec iov = {ch.buf.data(), ch.buf.size()};
+  mr_attr.mr_iov = &iov;
+  mr_attr.iov_count = 1;
+  fid_mr* mr_raw = nullptr;
+  int ret = fi_mr_regattr(domain_.get(), &mr_attr, 0, &mr_raw);
+  TORCH_CHECK(ret == 0, "RdmaManager: tag-channel fi_mr_regattr failed (peer=", peer, " tag=", tag,
+              "): ", LibfabricSymbols::Instance().fi_strerror(-ret));
+  ch.mr.reset(mr_raw);
+  ch.inbox_rkey = fi_mr_key(mr_raw);
+  ch.inbox_base_token = next_imm_token_.fetch_add(depth);
+  TORCH_CHECK(ch.inbox_base_token + depth <= kMailboxImmFlag,
+              "RdmaManager: imm token space exhausted at ", ch.inbox_base_token);
+
+  // Publish OUR inbox coords under (owner=rank, writer=peer, tag): value =
+  // 8B addr || 8B rkey || 4B base token || 4B ring depth, little-endian.
+  const std::string pub_key =
+      "rdma_slot_" + std::to_string(rank) + "_" + std::to_string(peer) + "_" + std::to_string(tag);
+  const uint64_t inbox_addr = reinterpret_cast<uint64_t>(ch.buf.data());
+  std::vector<uint8_t> val(24);
+  std::memcpy(val.data(), &inbox_addr, 8);
+  std::memcpy(val.data() + 8, &ch.inbox_rkey, 8);
+  std::memcpy(val.data() + 16, &ch.inbox_base_token, 4);
+  std::memcpy(val.data() + 20, &depth, 4);
+  store_->set(pub_key, val);
+  TORCH_NEURONX_RDMA_INFO("TryEnsureLocalChannel: peer=", peer, " tag=", tag, " depth=", depth,
+                          " inbox=0x", std::hex, inbox_addr, " rkey=0x", ch.inbox_rkey, std::dec,
+                          " token=", ch.inbox_base_token, " (published ", pub_key, ")");
+  auto res = tag_channels_.emplace(key, std::move(ch));
+  return &res.first->second;
+}
+
+bool RdmaManager::TryResolveRemoteChannel(TagChannel& ch, int peer, int tag,
+                                          uint32_t needed_depth) {
+  if (ch.remote_ready && ch.remote_ring_depth >= needed_depth) return true;
+  const int rank = rank_.load();
+  // Peer's inbox under (owner=peer, writer=rank, tag).
+  const std::string fetch_key =
+      "rdma_slot_" + std::to_string(peer) + "_" + std::to_string(rank) + "_" + std::to_string(tag);
+  // Non-blocking: check() never blocks server-side. defer and re-check next iteration.
+  if (!store_->check({fetch_key})) return false;
+  auto bytes = store_->get(fetch_key);
+  TORCH_CHECK(bytes.size() == 24, "RdmaManager: bad tag-channel value (peer=", peer, " tag=", tag,
+              "): ", bytes.size(), " bytes, expected 24");
+  std::memcpy(&ch.remote_inbox_addr, bytes.data(), 8);
+  std::memcpy(&ch.remote_rkey, bytes.data() + 8, 8);
+  std::memcpy(&ch.remote_base_token, bytes.data() + 16, 4);
+  std::memcpy(&ch.remote_ring_depth, bytes.data() + 20, 4);
+  // The peer may not have grown to needed_depth yet (its matching batch grows its
+  // inbox and republishes; symmetric depth guarantees it will reach needed_depth).
+  // Treat a still-shallow publication as not-ready and re-check next iteration.
+  if (ch.remote_ring_depth < needed_depth) {
+    ch.remote_ready = false;
+    return false;
+  }
+  ch.remote_ready = true;
+  TORCH_NEURONX_RDMA_INFO("TryResolveRemoteChannel: peer=", peer, " tag=", tag,
+                          " rdepth=", ch.remote_ring_depth, " remote=0x", std::hex,
+                          ch.remote_inbox_addr, " rrkey=0x", ch.remote_rkey, std::dec,
+                          " rtoken=", ch.remote_base_token, " (fetched ", fetch_key, ")");
+  return true;
+}
+
 void RdmaManager::SetRank(int rank) { rank_.store(rank); }
 
 void RdmaManager::SetStore(c10::intrusive_ptr<c10d::Store> store) {
@@ -502,7 +610,7 @@ void RdmaManager::EnsureInitialized(void* nrt_va) {
                           efa_bdf_);
 
   // Publish our endpoint so peers can find us, plus a sibling rdma_ep_bdf_<rank>
-  // key carrying the EFA BDF so GetOrInsertPeer can log same- vs cross-NIC peers.
+  // key carrying the EFA BDF so TryGetOrInsertPeer can log same- vs cross-NIC peers.
   const std::string ep_key = "rdma_ep_" + std::to_string(rank);
   store_->set(ep_key,
               std::vector<uint8_t>(local_endpoint_addr_.begin(), local_endpoint_addr_.end()));
@@ -511,20 +619,29 @@ void RdmaManager::EnsureInitialized(void* nrt_va) {
   TORCH_NEURONX_RDMA_INFO("EnsureInitialized: published ", ep_key, " (",
                           local_endpoint_addr_.size(), " bytes), ", bdf_key, "=", efa_bdf_);
 
+  // TryGetOrInsertPeer runs on the first transfer that touches a peer and fetches
+  // that peer's one-time rdma_ep_ key (non-blocking via check()); each (peer, tag)
+  // channel is likewise set up on first use via the rdma_slot_ rendezvous.
   initialized_.store(true);
   TORCH_NEURONX_RDMA_INFO("EnsureInitialized: done; rank=", rank, " efa_bdf=", efa_bdf_);
 }
 
-fi_addr_t RdmaManager::GetOrInsertPeer(int peer) {
+bool RdmaManager::TryGetOrInsertPeer(int peer, fi_addr_t* out) {
   auto it = av_cache_.find(peer);
   if (it != av_cache_.end()) {
-    TORCH_NEURONX_RDMA_DEBUG("GetOrInsertPeer: cache hit peer=", peer, " fi_addr=", it->second);
-    return it->second;
+    TORCH_NEURONX_RDMA_DEBUG("TryGetOrInsertPeer: cache hit peer=", peer, " fi_addr=", it->second);
+    *out = it->second;
+    return true;
   }
-  TORCH_NEURONX_RDMA_INFO("GetOrInsertPeer: cache miss peer=", peer, ", fetching rdma_ep_", peer,
-                          " from store");
-  auto bytes = store_->get("rdma_ep_" + std::to_string(peer));
-  TORCH_NEURONX_RDMA_DEBUG("GetOrInsertPeer: got ", bytes.size(), " bytes for peer=", peer);
+  const std::string ep_key = "rdma_ep_" + std::to_string(peer);
+  const std::string bdf_key = "rdma_ep_bdf_" + std::to_string(peer);
+  // Non-blocking: only proceed once the peer has published BOTH keys
+  if (!store_->check({ep_key, bdf_key})) {
+    TORCH_NEURONX_RDMA_DEBUG("TryGetOrInsertPeer: peer=", peer, " endpoint not yet published");
+    return false;
+  }
+  TORCH_NEURONX_RDMA_INFO("TryGetOrInsertPeer: cache miss peer=", peer, ", fetching ", ep_key);
+  auto bytes = store_->get(ep_key);
   fi_addr_t addr;
   // Synchronous AV (FI_AV_MAP, no FI_EVENT): fi_av_insert returns the count of
   // addresses inserted, not a negative errno. On failure it is < 1 and addr is
@@ -533,17 +650,16 @@ fi_addr_t RdmaManager::GetOrInsertPeer(int peer) {
   TORCH_CHECK(ret == 1, "fi_av_insert failed for peer ", peer, ": inserted ", ret,
               " of 1 addresses (", bytes.size(), "-byte endpoint)");
   av_cache_[peer] = addr;
-  // Log whether the peer shares our NIC. The bdf key is published alongside
-  // rdma_ep_<peer> in EnsureInitialized, so it is already present here.
-  auto bdf_bytes = store_->get("rdma_ep_bdf_" + std::to_string(peer));
+  auto bdf_bytes = store_->get(bdf_key);
   std::string peer_bdf(bdf_bytes.begin(), bdf_bytes.end());
-  TORCH_NEURONX_RDMA_INFO("GetOrInsertPeer: inserted peer=", peer, " fi_addr=", addr,
+  TORCH_NEURONX_RDMA_INFO("TryGetOrInsertPeer: inserted peer=", peer, " fi_addr=", addr,
                           " peer_bdf=", peer_bdf, " self_bdf=", efa_bdf_,
                           peer_bdf != efa_bdf_ ? " (REMOTE NIC)" : " (same NIC)");
-  return addr;
+  *out = addr;
+  return true;
 }
 
-int RdmaManager::NextSeq(int src, int dst, int tag) {
+uint32_t RdmaManager::NextSeq(int src, int dst, int tag) {
   // Pack (src, dst, tag) into 20 bits each. A tag (or rank) >= 2^20 would
   // bleed into the adjacent field and silently alias seq counters across
   // distinct tuples, matching the wrong descriptor. PP schedules use small
@@ -555,11 +671,6 @@ int RdmaManager::NextSeq(int src, int dst, int tag) {
       ") exceeds the 20-bit field width; tags and ranks must be < ", kMaxField);
   uint64_t key = (uint64_t(src) << 40) | (uint64_t(dst) << 20) | uint64_t(tag);
   return seq_counters_[key]++;
-}
-
-std::string RdmaManager::MakeStoreKey(int src, int dst, int tag, int seq) {
-  return "rdma_" + std::to_string(src) + "_" + std::to_string(dst) + "_" + std::to_string(tag) +
-         "_" + std::to_string(seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,22 +704,32 @@ void* ResolveHbmVA(void* user_va) {
 // PrepareBatch
 // ---------------------------------------------------------------------------
 //
-// Three phases per batch:
-//   1. resolve VAs and build local recv descriptors;
-//   2. publish all recv descriptors (multiSet) and fetch send descriptors (multiGet);
-//   3. post fi_writedata for each send entry.
+// The descriptor handshake has three conceptual phases:
+//   1. every recv RMA-writes its descriptor into the SENDER's mailbox inbox;
+//   2. every send reads the descriptor the receiver wrote into OUR inbox;
+//   3. every send posts fi_writedata for the data, using that descriptor.
+// They run in one loop with no barrier between them: each iteration advances the
+// ops that are ready (peer endpoint published, channel coords resolved, descriptor
+// arrived on the CQ) and skips the rest. No op blocks another — every store touch
+// is a non-blocking check() and every descriptor read is gated on a CQ arrival
+//
+// seq stamps for all recvs then all sends are assigned up front, keeping NextSeq in
+// lockstep with the peer regardless of the arrival order the loop observes.
+//
+// Zero-size (empty-tensor) entries are handled locally: they move no data, so they
+// touch neither the fabric nor a mailbox slot — they only bump NextSeq to stay in
+// lockstep with the peer's local-only pair. An all-zero-size batch thus never
+// reaches an uninitialized endpoint (it has no HBM VA to init the fabric with).
 //
 // Same-rank pairs (peer == self) are filtered before reaching the engine —
 // NeuronBackend::endCoalescing pairs them and resolves via at::Tensor::copy_.
 // Non-coalesced same-rank send/recv is rejected at the user-thread entry.
 //
-// Deadlock-freedom is structural, not barrier-based: within a single batch
-// every recv descriptor is multiSet (phase 1) before any send descriptor is
-// multiGet (phase 2). Since multiGet blocks on a missing key, a peer's needed
-// recv descriptor is always published before that peer can block waiting on
-// it. There is no inter-rank barrier between phases — a fast rank may reach
-// phase 2 while its peer is still in phase 1, and that is safe.
-void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
+// The per-(peer,tag) ring depth is max(kMailboxSlots, #sends, #recvs) on the
+// channel, so a batch with N same-(peer,tag) transfers gets N distinct slots. The
+// depth is identical on both ends (max is symmetric over the mirrored send/recv
+// counts), so it needs no negotiation; a deeper batch grows the channel in place.
+void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries, int64_t timeout_ms) {
   if (entries.empty()) return;
   if (entries.front().prepared) return;  // already prepared
 
@@ -623,10 +744,6 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
   }
 
   // Resolve VAs first; the first one drives lazy fabric init.
-  //
-  // Zero-size entries have a null user_va (empty tensor's storage is unallocated).
-  // Keep in batch so NextSeq counter and store multiSet/multiGet handshake stay in lockstep across
-  // ranks.
   void* first_real_va = nullptr;
   for (auto& e : entries) {
     if (e.size == 0) {
@@ -643,153 +760,259 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries) {
     EnsureInitialized(first_real_va);
   }
 
-  // Phase 1: build recv descriptors. Receiver also AV-inserts the sender's
-  // endpoint — EFA RDM requires bilateral AV registration. Without this,
-  // the sender's fi_writedata fails with prov_errno=14 REMOTE_ERROR_UNKNOWN_PEER
-  // because the receiver's NIC has no address handle for the incoming write.
-  std::vector<std::string> recv_keys;
-  std::vector<std::vector<uint8_t>> recv_vals;
-  for (auto& e : entries) {
-    if (e.kind == P2PEntry::Kind::kRecv) {
-      // Zero-size recv: publish a descriptor with no regions and mark the recv
-      // already complete. No FI_REMOTE_CQ_DATA will ever arrive for a zero-byte
-      // remote write.
-      if (e.size == 0) {
-        neuron::rdma::TransferDescriptor desc;
-        desc.set_receiver_endpoint(local_endpoint_addr_);
-        desc.set_transfer_id(0);
-        if (rank >= 0) desc.set_rank(rank);
-        std::string serialized;
-        TORCH_CHECK(desc.SerializeToString(&serialized),
-                    "RdmaManager: failed to serialize zero-size recv descriptor");
-        int seq = NextSeq(e.peer, rank, e.tag);
-        recv_keys.push_back(MakeStoreKey(e.peer, rank, e.tag, seq));
-        recv_vals.push_back(std::vector<uint8_t>(serialized.begin(), serialized.end()));
-        e.recv_consumed = true;  // nothing to wait for in DrainAndPending
-        continue;
-      }
+  // Ring depth per (peer, tag) this batch = max(kMailboxSlots, #sends, #recvs) on
+  // the channel. Both ranks compute the IDENTICAL depth from their own local batch:
+  // my {send,recv} counts on (peer,tag) are the peer's {recv,send} counts on
+  // (self,tag), and max is order-independent
+  std::unordered_map<uint64_t, uint32_t> send_ct, recv_ct;
+  for (const auto& e : entries) {
+    if (e.size == 0) continue;
+    const uint64_t k = TagChannelKey(e.peer, e.tag);
+    if (e.kind == P2PEntry::Kind::kSend)
+      ++send_ct[k];
+    else
+      ++recv_ct[k];
+  }
+  auto channel_depth = [&](int peer, int tag) -> uint32_t {
+    const uint64_t k = TagChannelKey(peer, tag);
+    const auto si = send_ct.find(k);
+    const auto ri = recv_ct.find(k);
+    return RingDepth(si == send_ct.end() ? 0 : si->second, ri == recv_ct.end() ? 0 : ri->second);
+  };
 
-      // Bilateral AV: receiver inserts sender's endpoint.
-      GetOrInsertPeer(e.peer);
+  // Assign seq to every recv (entry order) then every send (entry order) up front,
+  // so NextSeq advances in lockstep with the peer regardless of the arrival timing
+  // the progress loop observes. Zero-size entries bump the counter and complete
+  // locally to stay in lockstep with the peer's local-only pair.
+  struct RecvWork {
+    size_t idx = 0;
+    uint32_t seq = 0;
+    bool posted = false;
+  };
+  struct SendWork {
+    size_t idx = 0;
+    uint32_t seq = 0;
+    bool have_desc = false;  // descriptor read from our inbox yet?
+    bool posted = false;     // data write posted yet?
+    uint32_t transfer_id = 0;
+    uint64_t remote_addr = 0;
+    uint64_t rkey = 0;
+    int32_t peer_rank = 0;
+  };
+  std::vector<RecvWork> recvs;
+  std::vector<SendWork> sends;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    auto& e = entries[i];
+    if (e.kind != P2PEntry::Kind::kRecv) continue;
+    const uint32_t seq = NextSeq(e.peer, rank, e.tag);  // also validates 20-bit tag packing
+    if (e.size == 0) {
+      e.transfer_id = 0;
+      e.recv_consumed = true;
+      continue;
+    }
+    RecvWork rw;
+    rw.idx = i;
+    rw.seq = seq;
+    recvs.push_back(rw);
+  }
+  for (size_t i = 0; i < entries.size(); ++i) {
+    auto& e = entries[i];
+    if (e.kind != P2PEntry::Kind::kSend) continue;
+    const uint32_t seq = NextSeq(rank, e.peer, e.tag);
+    if (e.size == 0) continue;
+    SendWork sw;
+    sw.idx = i;
+    sw.seq = seq;
+    sends.push_back(sw);
+  }
 
+  size_t posted_recvs = 0, posted_sends = 0;
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  while (posted_recvs < recvs.size() || posted_sends < sends.size()) {
+    DrainAndPending(entries);  // drains CQ -> mailbox_arrived_ + completions
+    bool progress = false;
+
+    // Phase 1: RMA-write each recv's descriptor into the SENDER's inbox slot, once
+    // our channel is published and the peer's inbox coords are resolved.
+    for (auto& rw : recvs) {
+      if (rw.posted) continue;
+      auto& e = entries[rw.idx];
+      const uint32_t depth = channel_depth(e.peer, e.tag);
+      TagChannel* ch = TryEnsureLocalChannel(e.peer, e.tag, depth);
+      if (!ch) continue;  // peer endpoint not published yet (bilateral AV) — defer
+      if (!TryResolveRemoteChannel(*ch, e.peer, e.tag, depth)) continue;  // peer coords not ready
+      fi_addr_t peer_fi;
+      if (!TryGetOrInsertPeer(e.peer, &peer_fi)) continue;  // cache hit after the above
+      const uint32_t ring = rw.seq % ch->ring_depth;
+
+      // Build the recv descriptor: register the buffer and advertise its (addr,
+      // size, rkey) so the sender can RMA-write straight into it.
       auto reg = EnsureBufferRegistered(e.nrt_va, e.size);
       TORCH_CHECK(reg.ok(), "RdmaManager: register recv buffer failed: ", reg.error);
       fid_mr* mr = FindMR(e.nrt_va, e.size);
       TORCH_CHECK(mr, "RdmaManager: recv VA not in registered memory: ", e.nrt_va);
-
       uint32_t tid = next_transfer_id_.fetch_add(1);
       if (tid == 0) tid = next_transfer_id_.fetch_add(1);
       e.transfer_id = tid;
-
       neuron::rdma::TransferDescriptor desc;
-      desc.set_receiver_endpoint(local_endpoint_addr_);
+      desc.set_rank(rank);
       desc.set_transfer_id(tid);
-      if (rank >= 0) desc.set_rank(rank);
       auto* region = desc.add_regions();
       region->set_remote_addr(reinterpret_cast<uint64_t>(e.nrt_va));
       region->set_size(e.size);
       region->set_rkey(fi_mr_key(mr));
 
-      std::string serialized;
-      TORCH_CHECK(desc.SerializeToString(&serialized),
-                  "RdmaManager: failed to serialize recv descriptor");
-      int seq = NextSeq(e.peer, rank, e.tag);
-      recv_keys.push_back(MakeStoreKey(e.peer, rank, e.tag, seq));
-      recv_vals.push_back(std::vector<uint8_t>(serialized.begin(), serialized.end()));
+      const size_t desc_len = desc.ByteSizeLong();
+      TORCH_CHECK(desc_len <= kMailboxPayloadBytes, "RdmaManager: serialized descriptor (",
+                  desc_len, "B) exceeds mailbox payload capacity ", kMailboxPayloadBytes);
+
+      // Stage the {seq, len, proto-bytes} frame in our OUTBOX half at this ring slot.
+      const size_t inbox_bytes = static_cast<size_t>(ch->ring_depth) * kMailboxSlotBytes;
+      auto* out =
+          reinterpret_cast<MailboxSlot*>(ch->buf.data() + inbox_bytes + ring * kMailboxSlotBytes);
+      // The whole slot ships in one fi_writedata. The sender does NOT read it until
+      // it consumes the write's remote CQ completion (see the send path + DrainAndPending).
+      out->payload_len = static_cast<uint32_t>(desc_len);
+      TORCH_CHECK(desc.SerializeToArray(out->payload, kMailboxPayloadBytes),
+                  "RdmaManager: descriptor SerializeToArray failed");
+      out->seq = rw.seq + 1;
+
+      // Write into the peer's inbox slot for this ring. imm = the token the peer
+      // assigned to that physical slot, so the sender matches this exact arrival.
+      uint64_t dst = ch->remote_inbox_addr + ring * kMailboxSlotBytes;
+      uint32_t imm = kMailboxImmFlag | (ch->remote_base_token + ring);
+
+      auto ctx = std::make_unique<SendContext>();
+      ctx->addr = out;
+      ctx->is_mailbox = true;
+      SendContext* ctx_raw = ctx.get();
+      TORCH_NEURONX_RDMA_DEBUG("PrepareBatch: recv mailbox write -> sender=", e.peer,
+                               " tag=", e.tag, " seq=", rw.seq, " ring=", ring, " dst=0x", std::hex,
+                               dst, " rkey=0x", ch->remote_rkey, std::dec, " imm=", imm,
+                               " tid=", tid);
+      int ret = fi_writedata(endpoint_.get(), out, kMailboxSlotBytes, fi_mr_desc(ch->mr.get()), imm,
+                             peer_fi, dst, ch->remote_rkey, ctx_raw);
+      TORCH_CHECK(ret == 0,
+                  "mailbox fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret));
+      send_contexts_.insert(std::move(ctx));
+      rw.posted = true;
+      ++posted_recvs;
+      progress = true;
     }
-  }
-  if (!recv_keys.empty()) {
-    TORCH_NEURONX_RDMA_INFO("PrepareBatch: phase1 multiSet ", recv_keys.size(),
-                            " recv descriptor keys");
-    for (size_t i = 0; i < recv_keys.size(); ++i) {
-      TORCH_NEURONX_RDMA_DEBUG("PrepareBatch:   set[", i, "] key=", recv_keys[i],
-                               " val_bytes=", recv_vals[i].size());
+
+    // Phase 2: read each send's descriptor from OUR inbox once its CQ arrival is
+    // confirmed. Phase 3: post the data write using that descriptor. Both happen
+    // here so a send flows straight from descriptor to data in one pass.
+    for (auto& sw : sends) {
+      if (sw.posted) continue;
+      auto& e = entries[sw.idx];
+      const uint32_t depth = channel_depth(e.peer, e.tag);
+      TagChannel* ch = TryEnsureLocalChannel(e.peer, e.tag, depth);
+      if (!ch) continue;  // cannot publish our inbox until the peer is AV-insertable
+      const uint32_t ring = sw.seq % ch->ring_depth;
+
+      // Phase 2. The receiver stamps the token WE assigned this inbox slot, so the
+      // CQ arrival carrying that imm is our signal the descriptor has fully landed.
+      if (!sw.have_desc) {
+        const uint32_t expected_imm = kMailboxImmFlag | (ch->inbox_base_token + ring);
+        auto ait = mailbox_arrived_.find(expected_imm);
+        if (ait == mailbox_arrived_.end()) continue;  // descriptor not yet arrived — defer
+        mailbox_arrived_.erase(ait);
+        const MailboxSlot* s =
+            reinterpret_cast<const MailboxSlot*>(ch->buf.data() + ring * kMailboxSlotBytes);
+        TORCH_CHECK(s->seq == sw.seq + 1,  // generation guard: receiver stamped seq+1
+                    "RdmaManager: mailbox generation mismatch (slot seq=", s->seq, ", expected ",
+                    sw.seq + 1, ") for peer=", e.peer, " tag=", e.tag);
+        neuron::rdma::TransferDescriptor desc;
+        TORCH_CHECK(s->payload_len <= kMailboxPayloadBytes &&
+                        desc.ParseFromArray(s->payload, static_cast<int>(s->payload_len)),
+                    "RdmaManager: descriptor ParseFromArray failed (len=", s->payload_len,
+                    ") — mailbox corruption or version mismatch");
+        // A written descriptor always carries exactly one region (zero-size
+        // transfers never touch the mailbox).
+        TORCH_CHECK(desc.regions_size() == 1, "RdmaManager: expected exactly 1 memory region, got ",
+                    desc.regions_size());
+        sw.peer_rank = desc.rank();
+        sw.transfer_id = desc.transfer_id();
+        sw.remote_addr = desc.regions(0).remote_addr();
+        sw.rkey = desc.regions(0).rkey();
+        sw.have_desc = true;
+        progress = true;
+      }
+
+      // Phase 3. endCoalescing handles same-rank pairs on the user thread, so every
+      // peer here is remote.
+      fi_addr_t peer_fi;
+      if (!TryGetOrInsertPeer(e.peer, &peer_fi)) continue;  // cache hit in practice
+      TORCH_CHECK(sw.peer_rank != rank,
+                  "RdmaManager: same-rank P2P should be handled before reaching the engine "
+                  "(NeuronBackend::endCoalescing). Got peer rank == self (",
+                  rank, ") for entry user_va=", e.user_va);
+      auto reg = EnsureBufferRegistered(e.nrt_va, e.size);
+      TORCH_CHECK(reg.ok(), "RdmaManager: register send buffer failed: ", reg.error);
+      fid_mr* mr = FindMR(e.nrt_va, e.size);
+      TORCH_CHECK(mr, "RdmaManager: send VA not in registered memory: ", e.nrt_va);
+      // Completion context keyed by the ctx pointer (not nrt_va): looped / interleaved
+      // schedules can have multiple in-flight sends from one buffer.
+      auto ctx = std::make_unique<SendContext>();
+      ctx->addr = e.nrt_va;
+      ctx->complete = false;
+      ctx->error = false;
+      SendContext* ctx_raw = ctx.get();
+      TORCH_NEURONX_RDMA_DEBUG("PrepareBatch: send fi_writedata local nrt_va=", e.nrt_va,
+                               " size=", e.size, " peer=", e.peer, " peer_fi_addr=", peer_fi,
+                               " remote_addr=0x", std::hex, sw.remote_addr, std::dec, " rkey=0x",
+                               std::hex, sw.rkey, std::dec, " imm(transfer_id)=", sw.transfer_id);
+      int ret = fi_writedata(endpoint_.get(), e.nrt_va, e.size, fi_mr_desc(mr), sw.transfer_id,
+                             peer_fi, sw.remote_addr, sw.rkey, ctx_raw);
+      if (ret != 0) {
+        TORCH_NEURONX_RDMA_ERROR(
+            "PrepareBatch: fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret),
+            " (nrt_va=", e.nrt_va, " peer=", e.peer, ")");
+      }
+      TORCH_CHECK(ret == 0,
+                  "fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret));
+      send_contexts_.insert(std::move(ctx));
+      e.send_ctx = ctx_raw;
+      sw.posted = true;
+      ++posted_sends;
+      progress = true;
     }
-    store_->multiSet(recv_keys, recv_vals);
-  }
 
-  // Phase 2: fetch send descriptors.
-  std::vector<std::string> send_keys;
-  std::vector<size_t> send_indices;  // entries[] index for each send_keys[] entry
-  for (size_t i = 0; i < entries.size(); ++i) {
-    if (entries[i].kind != P2PEntry::Kind::kSend) continue;
-    int seq = NextSeq(rank, entries[i].peer, entries[i].tag);
-    send_keys.push_back(MakeStoreKey(rank, entries[i].peer, entries[i].tag, seq));
-    send_indices.push_back(i);
-  }
-  std::vector<std::vector<uint8_t>> send_vals;
-  if (!send_keys.empty()) {
-    TORCH_NEURONX_RDMA_INFO("PrepareBatch: phase2 multiGet ", send_keys.size(),
-                            " send descriptor keys (may block until peers publish)");
-    for (size_t i = 0; i < send_keys.size(); ++i) {
-      TORCH_NEURONX_RDMA_DEBUG("PrepareBatch:   get[", i, "] key=", send_keys[i]);
+    if (posted_recvs == recvs.size() && posted_sends == sends.size()) break;
+
+    // Timeout is a dead-peer backstop only (default 0 = wait forever). Covers both
+    // un-posted recvs (peer endpoint/channel never appeared) and un-posted sends
+    // (descriptor never arrived).
+    if (timeout_ms > 0) {
+      if (!deadline) {
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+      } else if (std::chrono::steady_clock::now() > *deadline) {
+        std::string stuck;
+        for (const auto& rw : recvs) {
+          if (rw.posted) continue;
+          const auto& e = entries[rw.idx];
+          if (!stuck.empty()) stuck += ", ";
+          stuck += "recv<-" + std::to_string(e.peer) + " tag=" + std::to_string(e.tag);
+        }
+        for (const auto& sw : sends) {
+          if (sw.posted) continue;
+          const auto& e = entries[sw.idx];
+          if (!stuck.empty()) stuck += ", ";
+          stuck += "send->" + std::to_string(e.peer) + " tag=" + std::to_string(e.tag);
+        }
+        throw std::runtime_error("RDMA P2P prepare timeout after " + std::to_string(timeout_ms) +
+                                 "ms; unfinished [" + stuck + "] (peer may have failed)");
+      }
     }
-    send_vals = store_->multiGet(send_keys);
-    TORCH_CHECK(send_vals.size() == send_keys.size(), "RdmaManager: multiGet returned wrong size");
-    TORCH_NEURONX_RDMA_INFO("PrepareBatch: phase2 multiGet complete (", send_vals.size(),
-                            " values returned)");
-  }
-
-  // Phase 3: post sends. NeuronBackend::endCoalescing handles same-rank
-  // (peer == self) pairs on the user thread via at::Tensor::copy_, so by the
-  // time we reach the engine, every entry's peer is a remote rank.
-  for (size_t k = 0; k < send_indices.size(); ++k) {
-    auto& e = entries[send_indices[k]];
-    std::string descriptor(send_vals[k].begin(), send_vals[k].end());
-    neuron::rdma::TransferDescriptor desc;
-    TORCH_CHECK(desc.ParseFromString(descriptor), "RdmaManager: failed to parse send descriptor");
-    // Zero-size send: the paired receiver published a regionless descriptor
-    // Nothing to write, so skip fi_writedata.
-    if (e.size == 0) {
-      TORCH_CHECK(desc.regions_size() == 0,
-                  "RdmaManager: zero-size send expected a regionless descriptor from peer");
-      continue;
-    }
-    TORCH_CHECK(desc.regions_size() > 0, "RdmaManager: empty send descriptor");
-    TORCH_CHECK(desc.rank() != rank,
-                "RdmaManager: same-rank P2P should be handled before reaching the engine "
-                "(NeuronBackend::endCoalescing). Got peer rank == self (",
-                rank, ") for entry user_va=", e.user_va);
-
-    fi_addr_t remote_addr = GetOrInsertPeer(e.peer);
-
-    auto reg = EnsureBufferRegistered(e.nrt_va, e.size);
-    TORCH_CHECK(reg.ok(), "RdmaManager: register send buffer failed: ", reg.error);
-    fid_mr* mr = FindMR(e.nrt_va, e.size);
-    TORCH_CHECK(mr, "RdmaManager: send VA not in registered memory: ", e.nrt_va);
-
-    // Per-send completion context. Multiple in-flight sends may share the
-    // same nrt_va (looped/interleaved schedules); we use the ctx pointer (the
-    // op_context returned in CQ events) rather than nrt_va as the
-    // identification key, so concurrent sends from the same buffer don't
-    // collide.
-    auto ctx = std::make_unique<SendContext>();
-    ctx->addr = e.nrt_va;
-    ctx->complete = false;
-    ctx->error = false;
-    SendContext* ctx_raw = ctx.get();
-
-    const auto& region = desc.regions(0);
-    TORCH_NEURONX_RDMA_DEBUG("PrepareBatch: phase3 fi_writedata local nrt_va=", e.nrt_va,
-                             " size=", e.size, " peer=", e.peer, " peer_fi_addr=", remote_addr,
-                             " remote_addr=0x", std::hex, region.remote_addr(), std::dec,
-                             " rkey=0x", std::hex, region.rkey(), std::dec,
-                             " imm(transfer_id)=", desc.transfer_id());
-    int ret = fi_writedata(endpoint_.get(), e.nrt_va, e.size, fi_mr_desc(mr), desc.transfer_id(),
-                           remote_addr, region.remote_addr(), region.rkey(), ctx_raw);
-    if (ret != 0) {
-      TORCH_NEURONX_RDMA_ERROR(
-          "PrepareBatch: fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret),
-          " (nrt_va=", e.nrt_va, " peer=", e.peer, ")");
-    }
-    TORCH_CHECK(ret == 0, "fi_writedata failed: ", LibfabricSymbols::Instance().fi_strerror(-ret));
-    send_contexts_.insert(std::move(ctx));
-    e.send_ctx = ctx_raw;
+    // Only yield when nothing advanced this pass — avoids a hot spin while still
+    // polling the CQ every iteration (efa-direct has no wait-fd to block on).
+    if (!progress) std::this_thread::yield();
   }
 
   for (auto& e : entries) e.prepared = true;
-  TORCH_NEURONX_RDMA_INFO("PrepareBatch: prepared ", entries.size(),
-                          " entries (sends posted, recvs awaiting CQ)");
+  TORCH_NEURONX_RDMA_INFO("PrepareBatch: prepared ", entries.size(), " entries (", posted_recvs,
+                          " recvs posted, ", posted_sends, " sends posted)");
 }
 
 // ---------------------------------------------------------------------------
@@ -813,11 +1036,28 @@ bool RdmaManager::DrainAndPending(std::vector<P2PEntry>& entries) {
             auto* ctx = static_cast<SendContext*>(cq_entries[i].op_context);
             TORCH_NEURONX_RDMA_DEBUG("CQ: FI_WRITE complete ctx=", ctx,
                                      " addr=", (ctx ? ctx->addr : nullptr));
-            if (ctx) ctx->complete = true;
+            if (ctx && ctx->is_mailbox) {
+              auto cit = std::find_if(
+                  send_contexts_.begin(), send_contexts_.end(),
+                  [ctx](const std::unique_ptr<SendContext>& p) { return p.get() == ctx; });
+              if (cit != send_contexts_.end()) send_contexts_.erase(cit);
+            } else if (ctx) {
+              ctx->complete = true;
+            }
           } else if (cq_entries[i].flags & (FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA)) {
-            uint32_t tid = static_cast<uint32_t>(cq_entries[i].data);
-            TORCH_NEURONX_RDMA_DEBUG("CQ: FI_REMOTE_CQ_DATA arrived transfer_id=", tid);
-            completed_recv_ids_.insert(tid);
+            uint32_t imm = static_cast<uint32_t>(cq_entries[i].data);
+            if (imm & kMailboxImmFlag) {
+              // A peer's descriptor write landed. Consuming this completion is the
+              // delivery barrier: the slot bytes are now fully visible. Record the
+              // arrival so PrepareBatch phase 2 knows it is safe to read that slot.
+              mailbox_arrived_.insert(imm);
+              TORCH_NEURONX_RDMA_DEBUG("CQ: mailbox descriptor arrived imm=0x", std::hex, imm,
+                                       std::dec);
+            } else {
+              uint32_t tid = imm;
+              TORCH_NEURONX_RDMA_DEBUG("CQ: FI_REMOTE_CQ_DATA arrived transfer_id=", tid);
+              completed_recv_ids_.insert(tid);
+            }
           } else {
             // Defensive: a CQ entry with neither FI_WRITE nor FI_REMOTE_WRITE
             // should not happen with the FI_CQ_FORMAT_DATA / efa-direct setup
