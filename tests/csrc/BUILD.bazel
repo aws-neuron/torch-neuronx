@@ -632,8 +632,8 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
-    name = "DynamicAllGatherTilingTest",
-    srcs = ["core/distributed/DynamicAllGatherTilingTest.cpp"],
+    name = "DynamicCollectiveTilingTest",
+    srcs = ["core/distributed/DynamicCollectiveTilingTest.cpp"],
     deps = ["//:distributed"],
 )
 

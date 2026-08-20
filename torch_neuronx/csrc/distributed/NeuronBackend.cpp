@@ -30,7 +30,7 @@
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/distributed/DistributedUtils.h"
-#include "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h"
+#include "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h"
 
 namespace py = pybind11;
 
@@ -778,7 +778,14 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::allreduce(std::vector<at::Tensor>&
 
   auto work = CreateWork(tensors, allreduce_inputs, c10d::OpType::ALLREDUCE, async_op);
   try {
-    SubmitCollective(c10d::OpType::ALLREDUCE, allreduce_inputs, tensors, replica_groups, red_op);
+    int64_t world_size = static_cast<int64_t>(replica_groups[0].size());
+    // Dynamic NKI all-reduce: single-tensor only.
+    const bool dynamic_handled =
+        UseDynamicNkiCollectives() && tensors.size() == 1 &&
+        TryDynamicAllreduce(tensors[0], replica_groups, world_size, red_op, work);
+    if (!dynamic_handled) {
+      SubmitCollective(c10d::OpType::ALLREDUCE, allreduce_inputs, tensors, replica_groups, red_op);
+    }
   } catch (...) {
     work->setException(std::current_exception());
     FinishWork(work, async_op);
@@ -797,8 +804,8 @@ bool NeuronBackend::TryDynamicAllgather(at::Tensor& input_tensor, at::Tensor& ou
   int64_t dsize = input_tensor.element_size();
   int lnc = std::atoi(at::neuron::utils::GetLogicalNeuronCores().c_str());  // = nprg (kernel grid)
   int64_t nprg = lnc >= 1 ? lnc : 1;
-  auto plan = ag_tiling::ComputePlan(numel, world_size, nprg, dsize,
-                                     at::neuron::utils::GetPlatformTarget());
+  auto plan = collective_tiling::ComputePlan(numel, world_size, nprg, dsize,
+                                             at::neuron::utils::GetPlatformTarget());
   bool contig = input_tensor.is_contiguous() && output_tensor.is_contiguous();
   // Eligibility: (1) every rank-major element offset must fit a signed int32 which
   // requires world_size * numel < 2^31; (2) dtype is bf16/fp16/fp32.
@@ -819,6 +826,49 @@ bool NeuronBackend::TryDynamicAllgather(at::Tensor& input_tensor, at::Tensor& ou
       input_bound.scalar_type(), plan.unroll);
   SubmitInNeffCollective(c10d::OpType::ALLGATHER, {input_bound, scalar}, {output_bound},
                          replica_groups, /*reduce_op=*/0, /*slice_output=*/false,
+                         /*cache_key_override=*/cache_key);
+  return true;
+}
+
+// Attempt dynamic multi-tier NKI all-reduce
+bool NeuronBackend::TryDynamicAllreduce(at::Tensor& io_tensor,
+                                        const std::vector<std::vector<int>>& replica_groups,
+                                        int world_size, int reduce_op,
+                                        c10::intrusive_ptr<NeuronWork>& work) {
+  if (!UseDynamicNkiCollectives()) return false;
+  // The NKI all_reduce supports SUM/MIN/MAX (c10d RedOpType 0/3/4). PREMUL_SUM is already
+  // resolved to SUM (inputs pre-scaled) upstream in ResolveReduceOp; AVG/PRODUCT/bitwise ops
+  // are unsupported -> fall back to the native collective.
+  if (!(reduce_op == 0 || reduce_op == 3 || reduce_op == 4)) return false;
+  int64_t numel = io_tensor.numel();
+  int64_t dsize = io_tensor.element_size();
+  int lnc = std::atoi(at::neuron::utils::GetLogicalNeuronCores().c_str());  // = nprg (kernel grid)
+  int64_t nprg = lnc >= 1 ? lnc : 1;
+  auto plan = collective_tiling::ComputePlan(numel, world_size, nprg, dsize,
+                                             at::neuron::utils::GetPlatformTarget(),
+                                             collective_tiling::Collective::kAllReduce);
+  bool contig = io_tensor.is_contiguous();
+  auto st = io_tensor.scalar_type();
+  bool native_dtype = (st == at::kBFloat16 || st == at::kHalf || st == at::kFloat);
+  // Eligibility: (1) all-reduce output is the same size as its input, so every element offset is
+  // in [0, numel) and must fit a signed int32 (numel < 2^31); (2) dtype is bf16/fp16/fp32.
+  constexpr int64_t kInt32Extent = int64_t{1} << 31;
+  bool offsets_fit = numel > 0 && numel < kInt32Extent;
+  if (!(plan.eligible && contig && native_dtype && offsets_fit)) return false;
+  // The NKI kernel is functional (reads the input, writes a fresh output, no alias metadata).
+  // Binding the same tensor as both the input and the output port makes the reduced result land
+  // in place. Its forward OOB-skipped tail never reads an element written by an earlier tier, so
+  // no pristine-input snapshot is needed.
+  at::Tensor output_bound = io_tensor.reshape({numel, 1});
+  auto scalar = GetOrCreateRuntimeScalar(numel, io_tensor.device());
+  work->stash({scalar});  // keep alive until the collective completes
+  // Bucketed key: keyed on trace_numel (rung) + tiles (regime) + unroll + reduce_op, so the whole
+  // bucket reuses one NEFF and add/min/max get distinct NEFFs.
+  auto cache_key = at::neuron::CacheKeyGenerator::GenerateDynamicCollectiveKey(
+      "allreduce", plan.trace_numel, plan.large, plan.medium, plan.small, replica_groups,
+      output_bound.scalar_type(), plan.unroll, reduce_op);
+  SubmitInNeffCollective(c10d::OpType::ALLREDUCE, {output_bound, scalar}, {output_bound},
+                         replica_groups, reduce_op, /*slice_output=*/false,
                          /*cache_key_override=*/cache_key);
   return true;
 }
@@ -884,7 +934,11 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::_allgather_base(at::Tensor& output
 
   auto work = CreateWork({output_tensor}, {input_tensor}, c10d::OpType::_ALLGATHER_BASE, async_op);
   try {
-    if (!TryDynamicAllgather(input_tensor, output_tensor, replica_groups, world_size, work)) {
+    // Dynamic NKI all-gather.
+    const bool dynamic_handled =
+        UseDynamicNkiCollectives() &&
+        TryDynamicAllgather(input_tensor, output_tensor, replica_groups, world_size, work);
+    if (!dynamic_handled) {
       SubmitCollective(c10d::OpType::ALLGATHER, {input_tensor}, {output_tensor}, replica_groups, 0);
     }
   } catch (...) {
@@ -1469,7 +1523,14 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::allreduce_coalesced(
         }
       }
     } else {
-      SubmitCollective(c10d::OpType::ALLREDUCE, non_empty, non_empty, replica_groups, red_op);
+      // Dynamic NKI all-reduce is single-tensor only.
+      int64_t world_size = static_cast<int64_t>(replica_groups[0].size());
+      const bool dynamic_handled =
+          UseDynamicNkiCollectives() && non_empty.size() == 1 &&
+          TryDynamicAllreduce(non_empty[0], replica_groups, world_size, red_op, work);
+      if (!dynamic_handled) {
+        SubmitCollective(c10d::OpType::ALLREDUCE, non_empty, non_empty, replica_groups, red_op);
+      }
     }
   } catch (...) {
     work->setException(std::current_exception());

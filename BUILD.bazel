@@ -432,7 +432,7 @@ cc_library(
         "torch_neuronx/csrc/distributed/NeuronWatchdog.cpp",
     ],
     hdrs = [
-        "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h",
+        "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h",
         "torch_neuronx/csrc/distributed/DistributedUtils.h",
         "torch_neuronx/csrc/distributed/NeuronWork.h",
         "torch_neuronx/csrc/distributed/NeuronWatchdog.h",
@@ -592,7 +592,7 @@ cc_library(
         "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h",
         "torch_neuronx/csrc/utils/TypeConversion.h",
         "torch_neuronx/csrc/distributed/NeuronBackend.h",
-        "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h",
+        "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h",
     ],
     copts = [
         "-DTORCH_API_INCLUDE_EXTENSION_H",

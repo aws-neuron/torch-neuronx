@@ -162,6 +162,13 @@ class NeuronBackend : public c10d::Backend {
                            const std::vector<std::vector<int>>& replica_groups, int world_size,
                            c10::intrusive_ptr<NeuronWork>& work);
 
+  // Attempt the dynamic multi-tier NKI all-reduce for a single in/out tensor. reduce_op is the
+  // resolved c10d RedOpType int (SUM/MIN/MAX supported). Returns false (caller falls back to the
+  // native collective) when disabled, ineligible, or the op/dtype is unsupported.
+  bool TryDynamicAllreduce(at::Tensor& io_tensor,
+                           const std::vector<std::vector<int>>& replica_groups, int world_size,
+                           int reduce_op, c10::intrusive_ptr<NeuronWork>& work);
+
   // Submit a variable-split (uneven) all-to-all via the native NKI all_to_all_v kernel.
   // Enforces the world-size / replica-group start-rank / LNC=2 guards, then invokes the
   // Python driver, which sends exactly the per-rank row counts in `input_split_sizes` and
