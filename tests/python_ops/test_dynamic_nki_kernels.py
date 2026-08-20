@@ -196,6 +196,17 @@ def _sum_spec(**flags):
     return OpSpec("sum", build, lambda x: x.sum(dim=1, keepdim=True), **flags)
 
 
+def _compare_spec(name, fn, other=0.0, **flags):
+    """Compare-with-scalar: bool output, other=0.0 so the mask is a mix. The reference is
+    fp32 because both neuron paths compare in fp32 -- a bf16 one disagrees at boundaries."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(1, rows, h, dtype=dtype) / 8
+        return (x.to("neuron"),), fn(x.float(), other)
+
+    return OpSpec(name, build, lambda x: fn(x, other), tol=(0, 0), non_128=False, **flags)
+
+
 def _to_copy_spec(dst_dtype, **flags):
     """``x.to(dst_dtype)`` (aten::_to_copy): dtype cast, fresh output.
 
@@ -321,6 +332,10 @@ _OP_SPECS = [
     _unary_spec("ones_like", torch.ones_like, arbitrary_h=True, compile_once=True, tol=(0, 0)),
     _where_spec(arbitrary_h=True, compile_once=True),
     _bitwise_or_spec(arbitrary_h=True, compile_once=True),
+    _compare_spec("ge", torch.ge, arbitrary_h=True, compile_once=True),
+    _compare_spec("lt", torch.lt, arbitrary_h=True, compile_once=True),
+    _compare_spec("ne", torch.ne, arbitrary_h=True, compile_once=True),
+    _compare_spec("le", torch.le, arbitrary_h=True, compile_once=True),
     _binary_spec("add", torch.add, compile_once=True),
     _binary_spec("sub", torch.sub, compile_once=True),
     _binary_spec("mul", torch.mul),
@@ -466,6 +481,134 @@ class TestDynamicNkiKernels:
         assert (
             len(entry._compiled) - compiled_before <= 1
         ), "recompiled across non-128 counts (padded dim leaked into compile_key?)"
+
+    # ── comparison-specific: plan shapes, arbitrary M, NEFF reuse, overloads ──
+    _CMP_FNS: ClassVar = {"ge": torch.ge, "lt": torch.lt, "ne": torch.ne, "le": torch.le}
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_plan_shapes(self, name):
+        """The plan's shapes: [1, seq] and 1-D collapse to [numel, 1], [rows, H]
+        keeps the last dim as H."""
+        fn = self._CMP_FNS[name]
+        for shape in ((1, 512), (512,), (6144, 720)):
+            x = (torch.randn(*shape, dtype=torch.bfloat16) / 8).to("neuron")
+            with _assert_dynamic_ran(name):
+                got = fn(x, 0.0).cpu()
+            torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_arbitrary_m_no_pad(self, name):
+        """Any M >= 128, no padding: the tail tile covers the remainder. rem=1 and
+        rem=127 included; the whole sweep must stay on one NEFF."""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        compiled_before = len(entry._compiled)
+        for m in (128, 129, 200, 255, 383, 1001):
+            x = (torch.randn(m, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+            with _assert_dynamic_ran(name):
+                got = fn(x, 0.0).cpu()
+            torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0, msg=f"M={m}")
+        assert len(entry._compiled) - compiled_before <= 1, "recompiled across M values"
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_m_below_one_tile_declines(self, name):
+        """M < 128 leaves no room for the tail tile -> declined."""
+        fn = self._CMP_FNS[name]
+        x = (torch.randn(4, 8, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped(name):
+            got = fn(x, 0.0).cpu()
+        torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_no_recompile_on_seqlen(self, name):
+        """Warm-restart scenario: same op, different seq length (plan #8/#10 go
+        512 -> 4096). One NEFF, including seq lengths that are not 128-multiples."""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        seqs = (512, 4096, 777, 4097, 256)
+        for seq in seqs:
+            x = (torch.randn(1, seq, dtype=torch.bfloat16) / 8).to("neuron")
+            got = fn(x, 0.0).cpu()
+            torch.testing.assert_close(
+                got, fn(x.cpu().float(), 0.0), rtol=0, atol=0, msg=f"seq={seq}"
+            )
+        assert entry._exec_count - exec_before == len(seqs), f"{name} skipped a seq"
+        assert len(entry._compiled) - compiled_before <= 1, f"{name}: recompiled across seq lengths"
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_scalar_no_recompile(self, name):
+        """The threshold is a runtime operand, not baked: distinct scalars must NOT
+        add NEFFs. (H is unique to this test so sibling tests can't mask a miss.)"""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        h = 1234  # no sibling spec uses this H
+        x = (torch.randn(256, h, dtype=torch.bfloat16) / 8).to("neuron")
+        fn(x, 0.0).cpu()  # compile the (h, bf16) NEFF
+        compiled_before = len(entry._compiled)
+        for other in (0.3, -1.5, 7.25, 0.0):
+            got = fn(x, other).cpu()
+            torch.testing.assert_close(
+                got, fn(x.cpu().float(), other), rtol=0, atol=0, msg=f"other={other}"
+            )
+        assert len(entry._compiled) == compiled_before, (
+            f"{name}: a distinct threshold compiled a new NEFF -- the scalar leaked "
+            f"into the compile_key"
+        )
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_tensor_operand_declines(self, name):
+        """The .Tensor overload (tensor `other`) isn't a scalar compare -> declined."""
+        fn = self._CMP_FNS[name]
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        y = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped(name):
+            got = fn(x, y).cpu()
+        torch.testing.assert_close(got, fn(x.cpu().float(), y.cpu().float()), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_nonfinite_declines(self, name):
+        """NaN/inf compare semantics on the ALU are unverified -> declined."""
+        fn = self._CMP_FNS[name]
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        for other in (float("nan"), float("inf")):
+            with _assert_dynamic_skipped(name):
+                fn(x, other).cpu()
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_out_writes_in_place(self, name):
+        """Unpadded, so the kernel writes into out= directly -- result aliases it."""
+        fn = self._CMP_FNS[name]
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+        buf = torch.empty(256, 2048, dtype=torch.bool).to("neuron")
+        with _assert_dynamic_ran(name):
+            res = fn(x, 0.0, out=buf)
+        assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
+        torch.testing.assert_close(buf.cpu(), fn(x.cpu().float(), 0.0), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    def test_dynamic_nki_compare_noncontiguous_out_is_honored(self, name):
+        """out= must hold the result and be the returned tensor (the `Tensor(a!) out`
+        contract), non-contiguous included. can_handle declines a dest it can't alias --
+        serving it means a stride-keyed copy_ back -- so the static lowering honours it."""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
+
+        # transposed view, pre-zeroed so a missed write is deterministically detectable
+        buf = torch.zeros(2048, 256, dtype=torch.bool).to("neuron").t()
+        assert buf.shape == (256, 2048) and not buf.is_contiguous()
+
+        assert not entry.can_handle(x, 0.0, out=buf), "can_handle took a dest it can't alias"
+        assert entry.can_handle(x, 0.0, out=buf.contiguous())
+
+        with _assert_dynamic_skipped(name):
+            res = fn(x, 0.0, out=buf)
+        expected = fn(x.cpu().float(), 0.0)
+        torch.testing.assert_close(res.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(buf.cpu(), expected, rtol=0, atol=0)
+        assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
 
     # ── add-specific declining / routing (not in the op table) ──
     def test_dynamic_nki_add_alpha_declines(self):

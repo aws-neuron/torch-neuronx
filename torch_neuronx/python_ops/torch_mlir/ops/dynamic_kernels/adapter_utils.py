@@ -93,6 +93,19 @@ def _pad_or_contig(t_2d: torch.Tensor, M_ceil: int) -> torch.Tensor:  # noqa: N8
     return _pad_rows_to(t_2d, M_ceil)
 
 
+def _dest_reusable(dest, M, H, dtype, device) -> bool:  # noqa: N803
+    """True if a caller ``out=`` / ``grad_input=`` can back the NEFF's [M, H] output, i.e.
+    ``_dest_buffer`` aliases it. One that fails this needs dispatch_entry's copy-back,
+    which is stride-keyed — an adapter can decline it in ``can_handle``."""
+    return (
+        dest is not None
+        and dest.dtype == dtype
+        and dest.device.type == device.type
+        and dest.numel() == M * H
+        and dest.is_contiguous()
+    )
+
+
 def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
     """Return the [M, H] output buffer for the NEFF to write into.
 
@@ -102,13 +115,7 @@ def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
     avoid the copy-back the framework would otherwise do for out/in-place
     variants. Otherwise we allocate a fresh output.
     """
-    if (
-        dest is not None
-        and dest.dtype == dtype
-        and dest.device.type == device.type
-        and dest.numel() == M * H
-        and dest.is_contiguous()
-    ):
+    if _dest_reusable(dest, M, H, dtype, device):
         return dest.reshape(M, H)
     return torch.empty(M, H, dtype=dtype, device=device)
 

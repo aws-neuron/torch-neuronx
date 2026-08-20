@@ -90,7 +90,11 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
         if k not in _DEST_KWARGS and k not in CompilationConfig.PYTORCH_SPECIFIC_PARAMS
     }
 
-    if not entry.can_handle(*args, **op_kwargs):
+    # The gate also sees the dest, as `out` whichever kwarg carried it, so an adapter can
+    # decline one it can't write in place (that would fall to the copy-back below, a
+    # stride-keyed op). compile_key_fn takes no dest — it must not enter the compile_key.
+    gate_kwargs = op_kwargs if dest is None else {**op_kwargs, "out": dest}
+    if not entry.can_handle(*args, **gate_kwargs):
         return None
 
     compile_key_fn = getattr(entry, "compile_key_fn", None)
