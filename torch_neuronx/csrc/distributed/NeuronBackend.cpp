@@ -430,7 +430,11 @@ void SubmitP2POp(std::vector<::neuron::P2PEntry> entries, int device_idx, int64_
       [entries_owned, timeout](const std::vector<at::neuron::TensorDataRef>&,
                                const std::vector<at::neuron::TensorDataRef>&) {
         auto& mgr = ::neuron::RdmaManager::Instance();
-        mgr.PrepareBatch(*entries_owned);  // idempotent; early-returns once prepared
+        // Pass the batch timeout: the mailbox descriptor exchange inside
+        // PrepareBatch polls for peer writes and must be bounded too (a dead peer
+        // never writes its descriptor), not just the data-drain loop below.
+        mgr.PrepareBatch(*entries_owned,
+                         timeout.count());  // idempotent; early-returns once prepared
         std::optional<std::chrono::steady_clock::time_point> deadline;
         while (true) {
           if (!mgr.DrainAndPending(*entries_owned)) return;  // all entries done
