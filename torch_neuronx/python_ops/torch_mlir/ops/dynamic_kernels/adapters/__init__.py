@@ -12,6 +12,7 @@ def register_all():
     from . import (
         bitwise,
         cast,
+        comparison,
         concat,
         elementwise,
         gather,
@@ -34,3 +35,4 @@ def register_all():
     concat.register()
     where.register()
     bitwise.register()
+    comparison.register()

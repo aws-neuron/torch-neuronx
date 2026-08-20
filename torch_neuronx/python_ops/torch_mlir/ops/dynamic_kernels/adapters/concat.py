@@ -16,6 +16,7 @@ from ..adapter_utils import (
     _ceil_to_tile,
     _compile_or_load_neff,
     _dest_buffer,
+    _dest_reusable,
     _num_tiles_tensor,
     _pad_or_contig,
 )
@@ -37,8 +38,6 @@ def _is_last_dim(dim, ndim) -> bool:
 
 
 def _can_handle_cat(tensors, dim=0, out=None) -> bool:
-    if out is not None:
-        return False
     pair = _cat_tensor_pair(tensors)
     if pair is None:
         return False
@@ -57,9 +56,13 @@ def _can_handle_cat(tensors, dim=0, out=None) -> bool:
         return False
     H1, H2 = a.shape[-1], b.shape[-1]  # noqa: N806
     M = a.numel() // H1  # noqa: N806
-    if M == 0 or H1 == 0 or H2 == 0:  # noqa: SIM103
+    if M == 0 or H1 == 0 or H2 == 0:
         return False
-    return True
+    # prepare_io aliases an out= only when no row padding is needed; one it can't alias
+    # would cost a stride-keyed copy_ back, so decline that to the static lowering.
+    return out is None or (
+        _ceil_to_tile(M) == M and _dest_reusable(out, M, H1 + H2, a.dtype, a.device)
+    )
 
 
 def _cat_compile_key(tensors, dim=0, out=None, **_):

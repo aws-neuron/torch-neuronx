@@ -7,8 +7,8 @@ kernel is needed. Covers:
   - register / get round-trip, gated by the env flag
   - get_compiled memoizes ONE NEFF per compile_key; distinct keys -> distinct NEFFs
   - compile_key_fn None -> single NEFF under key None
-  - kwarg handling: out=/grad_input= as dest, framework params dropped, op kwargs
-    forwarded to can_handle/compile_key_fn/prepare_io, can_handle as the gate
+  - kwarg handling: out=/grad_input= as dest (offered to the gate as `out`, never in the
+    compile_key), framework params dropped, op kwargs forwarded, can_handle as the gate
 """
 
 import pytest
@@ -151,9 +151,9 @@ class TestDynamicNkiDispatchKwargs:
 
         assert alpha_seen == {"can_handle": 2, "compile_key_fn": 2, "prepare_io": 2}
 
-    def test_out_kwarg_becomes_dest_not_op_kwarg(self):
-        # out= is the destination buffer: it reaches prepare_io as `dest`, and is
-        # NOT forwarded as an op kwarg to can_handle.
+    def test_out_kwarg_becomes_dest_and_is_offered_to_the_gate(self):
+        # out= reaches prepare_io as `dest` and can_handle as `out` (the gate must be able
+        # to reject a dest the kernel can't write in place), never as an op kwarg.
         forwarded = {}
 
         def can_handle(x, **op_kwargs):
@@ -168,7 +168,56 @@ class TestDynamicNkiDispatchKwargs:
         _register_stub_op("out_stub", can_handle, prepare_io)
         de.try_dynamic_nki_dispatch("out_stub", (FakeTensor(),), {"out": "BUFFER"})
 
-        assert forwarded == {"can_handle": {}, "dest": "BUFFER", "prepare_io": {}}
+        assert forwarded == {"can_handle": {"out": "BUFFER"}, "dest": "BUFFER", "prepare_io": {}}
+
+    def test_grad_input_kwarg_is_offered_to_the_gate_as_out(self):
+        # grad_input= is the same role under another aten name; the gate sees one name.
+        seen = {}
+
+        def can_handle(x, out=None):
+            seen["out"] = out
+            return True
+
+        _register_stub_op("grad_input_stub", can_handle, lambda x, dest=None: _STUB_IO)
+        de.try_dynamic_nki_dispatch("grad_input_stub", (FakeTensor(),), {"grad_input": "BUFFER"})
+
+        assert seen == {"out": "BUFFER"}
+
+    def test_no_dest_leaves_out_unset(self):
+        # No dest -> no `out` kwarg, so a can_handle that doesn't declare one still works.
+        _register_stub_op("no_dest_stub", lambda x: True, lambda x, dest=None: _STUB_IO)
+        assert de.try_dynamic_nki_dispatch("no_dest_stub", (FakeTensor(),), {}) is not None
+
+    def test_can_handle_declining_on_out_falls_back(self):
+        # An adapter that can't serve this dest (e.g. non-contiguous out=) declines ->
+        # dispatch returns None -> default lowering honours out=. prepare_io must not run.
+        ran = []
+
+        def prepare_io(x, dest=None):
+            ran.append(dest)
+            return _STUB_IO
+
+        _register_stub_op("picky_dest_stub", lambda x, out=None: out is None, prepare_io)
+        assert (
+            de.try_dynamic_nki_dispatch("picky_dest_stub", (FakeTensor(),), {"out": "BAD"}) is None
+        )
+        assert ran == [], "prepare_io ran even though the gate declined"
+        assert de.try_dynamic_nki_dispatch("picky_dest_stub", (FakeTensor(),), {}) is not None
+
+    def test_dest_is_not_in_the_compile_key(self):
+        # The dest is a runtime buffer: compile_key_fn never sees it, so out= vs no out=
+        # share one NEFF.
+        compiled_keys = []
+        _register_stub_op(
+            "dest_key_stub",
+            can_handle=lambda x, out=None: True,
+            prepare_io=lambda x, dest=None: _STUB_IO,
+            compile_key_fn=lambda x: ("H",),
+            compile_fn=lambda key: compiled_keys.append(key) or (b"hlo", f"cache::{key}"),
+        )
+        de.try_dynamic_nki_dispatch("dest_key_stub", (FakeTensor(),), {})
+        de.try_dynamic_nki_dispatch("dest_key_stub", (FakeTensor(),), {"out": "BUFFER"})
+        assert compiled_keys == [("H",)]
 
     def test_framework_params_are_dropped(self):
         # device / memory_format etc. aren't op args -> filtered out before dispatch.
