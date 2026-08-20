@@ -695,10 +695,35 @@ public:
       stride = kernelSize;
     }
 
+    // PyTorch accepts a single int (parsed as a length-1 list) for
+    // kernel_size/stride/padding, meaning "same value for every spatial dim".
+    // Broadcast to length Dim so the per-dim indexing below is in bounds.
+    // (Previously untested: the OpInfo samples that use length-1 padding only
+    // run now that avg_pool2d is un-skipped.)
+    auto broadcastToDim = [](SmallVector<int64_t, Dim> &v) {
+      if (v.size() == 1) {
+        v.assign(Dim, v[0]);
+      }
+    };
+    broadcastToDim(kernelSize);
+    broadcastToDim(stride);
+    broadcastToDim(padding);
+
+    // divisor_override (avg_pool2d only): when set, every window is divided by
+    // this fixed constant instead of the window element count. CPU allows any
+    // nonzero value (including negative); zero is rejected before dispatch.
+    // Applied after the window-sum reduce_window below.
+    bool hasDivisorOverride = false;
+    int64_t divisorOverride = 0;
     if constexpr (std::is_same<AtenOpT, AtenAvgPool2dOp>()) {
-      if (succeeded(checkNotNone(rewriter, op, op.getDivisorOverride())))
-        return rewriter.notifyMatchFailure(
-            op, "only None divisor_override supported for now!");
+      if (succeeded(checkNotNone(rewriter, op, op.getDivisorOverride()))) {
+        if (!matchPattern(op.getDivisorOverride(),
+                          m_TorchConstantInt(&divisorOverride))) {
+          return rewriter.notifyMatchFailure(
+              op, "non-const int divisor_override unsupported!");
+        }
+        hasDivisorOverride = true;
+      }
     }
 
     // Prepend 1 to kernelSize, stride, dilation until they are of same rank
@@ -729,6 +754,41 @@ public:
       stablehloPadding[stablehloPadding.size() - 1] = padding[2];
     } else {
       assert(false && "Unsupported pooling dimension");
+    }
+
+    // ceil_mode makes PyTorch's output larger than the floor formula. outTy
+    // already carries the authoritative (ceil) output shape from the type
+    // converter, so instead of recomputing that shape here (error-prone across
+    // kernels), derive the extra trailing padding needed to make reduce_window
+    // produce exactly outShape: with window w and stride s, an output of size o
+    // needs a padded input of (o-1)*s + w. The excess over the explicitly
+    // padded input is the ceil-added padding, appended on the trailing side.
+    // Recorded per-dim so the divisor logic can exclude those cells (PyTorch
+    // never counts ceil-added cells, even under count_include_pad=True).
+    SmallVector<int64_t, Dim> ceilFrontExtra(Dim, 0);
+    SmallVector<int64_t, Dim> ceilBackExtra(Dim, 0);
+    bool ceilAddedPadding = false;
+    if (ceilMode) {
+      const size_t spatialIdxStart = inputRank - Dim;
+      for (int i = 0; i < Dim; i++) {
+        const size_t backPadIdx = (spatialIdxStart + i) * 2 + 1;
+        const int64_t inputSize = inputTy.getDimSize(spatialIdxStart + i);
+        const int64_t outputSize = outShape[spatialIdxStart + i];
+        // Dynamic spatial dims: the ceil-padding delta can't be computed
+        // statically, so leave padding as-is (dynamic ceil is not supported).
+        if (inputSize == ShapedType::kDynamic ||
+            outputSize == ShapedType::kDynamic)
+          continue;
+        const int64_t neededPadded = (outputSize - 1) * stride[i] + kernelSize[i];
+        const int64_t explicitPadded = inputSize + 2 * padding[i];
+        const int64_t extra = neededPadded - explicitPadded;
+        if (extra > 0) {
+          // All ceil-added padding is trailing (matches PyTorch's window layout).
+          stablehloPadding[backPadIdx] += extra;
+          ceilBackExtra[i] = extra;
+          ceilAddedPadding = true;
+        }
+      }
     }
 
     Value initVal =
@@ -766,8 +826,28 @@ public:
       stablehlo::ReturnOp::create(rewriter, op->getLoc(), sumResult);
     }
 
-    // Use kernel size as the divisor
-    if (countIncludePad) {
+    // divisor_override: divide the window sum by the fixed constant, bypassing
+    // the count-based divisor entirely (matches CPU, which ignores padding and
+    // count_include_pad when divisor_override is set).
+    if (hasDivisorOverride) {
+      Value divisor =
+          hlo::getConstTensor<int64_t>(rewriter, op, {divisorOverride}, {}).value();
+      divisor = hlo::promoteType(rewriter, op.getLoc(), divisor,
+                                 outTy.getElementType());
+      DenseI64ArrayAttr bcastDimensions;
+      rewriter.replaceOpWithNewOp<mlir::chlo::BroadcastDivOp>(
+          op, outTy, reduceWindowSum.getResult(0), divisor, bcastDimensions);
+      return success();
+    }
+
+    // Use kernel size as the divisor.
+    // Fast path: count_include_pad=True with no ceil-added padding -> every
+    // window contains exactly kernel_prod elements, so a constant divisor is
+    // exact. When ceil added padding, edge windows are clipped (PyTorch never
+    // counts ceil-added cells even under count_include_pad=True), so we fall
+    // through to the count-mask reduce_window path below with a ones-mask that
+    // includes the explicit-padding region but excludes the ceil-added cells.
+    if (countIncludePad && !ceilAddedPadding) {
       Value divisor;
       if (Dim == 1) {
         divisor =
@@ -793,25 +873,67 @@ public:
       return success();
     }
 
-    // Use another mhlo.ReduceWindowOp to get the divisor
-    Value windowSizeConst =
-        hlo::getConstTensor<float>(rewriter, op, {1.0}, {}).value();
-    windowSizeConst = hlo::promoteType(rewriter, op.getLoc(), windowSizeConst,
-                                       outTy.getElementType());
-    auto inputShapeVec = *hlo::getDimIndexOfTensor(rewriter, op, input);
-    auto inputShapeTensor = mlir::tensor::FromElementsOp::create(
-        rewriter, op->getLoc(), inputShapeVec);
-
-    windowSizeConst = stablehlo::DynamicBroadcastInDimOp::create(
-        rewriter, op->getLoc(),
-        RankedTensorType::get(inputTy.getShape(), outTy.getElementType()),
-        windowSizeConst, inputShapeTensor, rewriter.getDenseI64ArrayAttr({}));
+    // Divisor via a second reduce_window over a ones-mask, whose shape and pad
+    // are chosen to count exactly the cells CPU counts.
+    Value windowSizeConst;
+    DenseIntElementsAttr maskPad;
+    if (countIncludePad && ceilAddedPadding) {
+      // count_include_pad=True + ceilAddedPadding: the ones-mask covers the
+      // input + explicit-pad region (all ones) and reduce_window pads only the
+      // ceil-added extras. Explicit-pad cells are counted (1); ceil-added cells
+      // become 0 -> excluded, matching PyTorch's rule that ceil-added cells are
+      // never counted even under count_include_pad=True. ceilAddedPadding only
+      // becomes true for static spatial dims (guarded above), so maskShape is
+      // static and the mask is a splat constant.
+      SmallVector<int64_t> maskShape(inputTy.getShape().begin(),
+                                     inputTy.getShape().end());
+      SmallVector<int64_t> maskPadding(stablehloPadding);
+      const size_t spatialIdxStart = inputRank - Dim;
+      for (int i = 0; i < Dim; i++) {
+        maskShape[spatialIdxStart + i] += 2 * padding[i];
+        const size_t frontPadIdx = (spatialIdxStart + i) * 2;
+        const size_t backPadIdx = (spatialIdxStart + i) * 2 + 1;
+        maskPadding[frontPadIdx] = ceilFrontExtra[i];
+        maskPadding[backPadIdx] = ceilBackExtra[i];
+      }
+      auto maskTy = RankedTensorType::get(maskShape, outTy.getElementType());
+      windowSizeConst = stablehlo::ConstantOp::create(
+          rewriter, op->getLoc(), maskTy,
+          DenseElementsAttr::get(
+              maskTy, rewriter.getFloatAttr(outTy.getElementType(), 1.0)));
+      maskPad = DenseIntElementsAttr::get(
+          RankedTensorType::get(
+              {static_cast<int64_t>(inputRank), static_cast<int64_t>(2)},
+              rewriter.getI64Type()),
+          maskPadding);
+    } else {
+      // count_include_pad=False (any shape, incl. dynamic): ones over the input
+      // broadcast dynamically, reduce_window with the full padding (explicit +
+      // any ceil extras). Both explicit-padding and ceil-added cells become
+      // 0 -> excluded, so the divisor is the count of real elements. Uses a
+      // dynamic broadcast so dynamic input shapes are supported.
+      Value oneConst = hlo::getConstTensor<float>(rewriter, op, {1.0}, {}).value();
+      oneConst = hlo::promoteType(rewriter, op.getLoc(), oneConst,
+                                  outTy.getElementType());
+      auto inputShapeVec = *hlo::getDimIndexOfTensor(rewriter, op, input);
+      auto inputShapeTensor = mlir::tensor::FromElementsOp::create(
+          rewriter, op->getLoc(), inputShapeVec);
+      windowSizeConst = stablehlo::DynamicBroadcastInDimOp::create(
+          rewriter, op->getLoc(),
+          RankedTensorType::get(inputTy.getShape(), outTy.getElementType()),
+          oneConst, inputShapeTensor, rewriter.getDenseI64ArrayAttr({}));
+      maskPad = DenseIntElementsAttr::get(
+          RankedTensorType::get(
+              {static_cast<int64_t>(inputRank), static_cast<int64_t>(2)},
+              rewriter.getI64Type()),
+          stablehloPadding);
+    }
 
     Value zero = createInitialValueForAtenPoolingOp(op, inputElemTy, rewriter);
     auto reduceWindowSize = stablehlo::ReduceWindowOp::create(
         rewriter, op->getLoc(), RankedTensorType::get(outShape, inputElemTy),
         windowSizeConst, zero, windowDimensions, windowStrides, baseDilations,
-        windowDilations, pad);
+        windowDilations, maskPad);
 
     Block &sizeBlock = reduceWindowSize.getBody().emplaceBlock();
 
