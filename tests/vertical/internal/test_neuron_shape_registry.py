@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from .neuron_shape_registry import NeuronShapeRegistry, OpShapeEntry
+from .neuron_shape_defaults_generated import (
+    QWEN3_235B_A22B,
+    TRACED_MODEL_OPS,
+    register_all_defaults,
+)
+from .neuron_shape_registry import BUILTIN_SOURCE, NeuronShapeRegistry
 
 # ── NeuronShapeRegistry ─────────────────────────────────────────────────────
 
@@ -258,6 +263,122 @@ class TestNeuronShapeRegistry:
         s = reg.stats()
         assert s["total_ops"] == 2
         assert s["total_shapes"] == 3
+
+
+# ── Per-model selection ──────────────────────────────────────────────────────
+
+
+class TestModelFilter:
+    """``--traced-model``'s backing query."""
+
+    @staticmethod
+    def _two_models() -> NeuronShapeRegistry:
+        reg = NeuronShapeRegistry()
+        reg.register("aten::mm", {"self": (8, 8), "mat2": (8, 8)}, source=BUILTIN_SOURCE)
+        reg.register("aten::mm", {"self": (4096, 4096), "mat2": (4096, 4096)}, source="qwen3-235b")
+        reg.register("aten::mm", {"self": (512, 512), "mat2": (512, 512)}, source="llama-7b")
+        reg.register("aten::gelu", {"self": (128, 4096)}, source="llama-7b")
+        return reg
+
+    def test_get_narrows_to_one_model(self):
+        reg = self._two_models()
+        assert len(reg.get("aten::mm")) == 3  # unfiltered: builtin + both models
+        assert [e.arg_shapes["self"] for e in reg.get("aten::mm", model="qwen3-235b")] == [
+            (4096, 4096)
+        ]
+        assert [e.arg_shapes["self"] for e in reg.get("aten::mm", model="llama-7b")] == [(512, 512)]
+
+    def test_get_builtin_is_selectable_by_name(self):
+        """``builtin`` is just another source tag, not a special case in ``get``."""
+        reg = self._two_models()
+        assert [e.arg_shapes["self"] for e in reg.get("aten::mm", model=BUILTIN_SOURCE)] == [(8, 8)]
+
+    def test_unknown_model_selects_nothing_rather_than_everything(self):
+        """A typo'd ``--traced-model`` must not silently widen to the full registry."""
+        reg = self._two_models()
+        assert reg.get("aten::mm", model="typo-3b") == []
+        assert reg.all_ops(model="typo-3b") == []
+
+    def test_all_ops_narrows_to_the_model_that_has_the_op(self):
+        reg = self._two_models()
+        assert reg.all_ops() == ["aten::gelu", "aten::mm"]
+        assert reg.all_ops(model="llama-7b") == ["aten::gelu", "aten::mm"]
+        assert reg.all_ops(model="qwen3-235b") == ["aten::mm"]
+
+    def test_models_lists_traces_and_excludes_builtin(self):
+        assert self._two_models().models() == ["llama-7b", "qwen3-235b"]
+
+    def test_a_shape_shared_by_two_models_is_selected_by_either(self):
+        """Dedup merges sources onto one entry, so both tags must still find it."""
+        reg = NeuronShapeRegistry()
+        shapes = {"input": (1, 2048, 4096), "weight": (11008, 4096), "bias": None}
+        reg.register("aten::linear", shapes, source="llama-7b", count=47)
+        reg.register("aten::linear", shapes, source="qwen3-235b", count=12)
+        assert len(reg.get("aten::linear")) == 1
+        assert len(reg.get("aten::linear", model="llama-7b")) == 1
+        assert len(reg.get("aten::linear", model="qwen3-235b")) == 1
+
+    def test_propagated_overloads_keep_the_model_tag(self):
+        """Propagation copies sources, so a model filter still reaches ``.out`` variants."""
+        reg = NeuronShapeRegistry()
+        reg.register(
+            "aten::amax", {"self": (4, 4), "dim": [0], "keepdim": False}, source="qwen3-235b"
+        )
+        reg.propagate_to_compatible_overloads({"aten::amax", "aten::amax.out"})
+        assert len(reg.get("aten::amax.out", model="qwen3-235b")) == 1
+
+
+# ── Model shape sets: the --traced-model registration gate ───────────────────
+
+
+class TestModelShapeSets:
+    """``register_all_defaults(traced_models=...)``.
+
+    The gate is what keeps a model set out of the shared pool until a run asks for it.
+    Without it the new entries would compete in the top-N-by-size cap in
+    ``NeuronOpInfo._registry_entries`` and displace shapes the coverage suites measure
+    today, so "off by default" is the property under test.
+    """
+
+    @staticmethod
+    def _register(traced_models):
+        reg = NeuronShapeRegistry()
+        register_all_defaults(reg.register, traced_models=traced_models)
+        return reg
+
+    def test_no_model_registers_only_builtin(self):
+        assert self._register(()).models() == []
+
+    def test_naming_a_set_registers_it_on_top_of_builtin(self):
+        reg = self._register([QWEN3_235B_A22B])
+        assert reg.models() == [QWEN3_235B_A22B]
+        # builtin is still there -- the set adds, it does not replace
+        assert len(reg.get("aten::mm", model=BUILTIN_SOURCE)) > 0
+
+    def test_gate_is_off_by_default_so_the_pool_is_unchanged(self):
+        """The guarantee existing suites rely on: omitting the kwarg entirely and passing an
+        empty allowlist both yield exactly the builtin pool."""
+        explicit_empty = self._register(())
+        default_arg = NeuronShapeRegistry()
+        register_all_defaults(default_arg.register)  # no traced_models kwarg at all
+        assert len(default_arg) == len(explicit_empty)
+        assert default_arg.all_ops() == explicit_empty.all_ops()
+        assert len(explicit_empty) < len(self._register([QWEN3_235B_A22B]))
+
+    def test_unknown_model_raises_rather_than_registering_nothing(self):
+        """A typo must not read as a clean run over zero shapes."""
+        with pytest.raises(KeyError, match="unknown --traced-model"):
+            self._register(["qwen3-235b"])  # real name uses underscores
+
+    def test_declared_op_set_matches_what_was_registered(self):
+        """``TRACED_MODEL_OPS`` is what the accuracy suite sweeps, so it must not drift from
+        the entries ``TRACED_MODEL_SHAPES`` actually registers."""
+        reg = self._register([QWEN3_235B_A22B])
+        registered = {op for op in reg.all_ops() if reg.get(op, model=QWEN3_235B_A22B)}
+        # all_ops(model=) additionally reports propagated .out/.default overloads, so the
+        # declared set is a subset -- every declared op must be present, none missing.
+        assert TRACED_MODEL_OPS[QWEN3_235B_A22B] <= registered
+        assert len(TRACED_MODEL_OPS[QWEN3_235B_A22B]) == 54
 
 
 # ── Propagation to compatible overloads ─────────────────────────────────────

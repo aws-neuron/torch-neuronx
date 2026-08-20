@@ -27,7 +27,11 @@ from torch.testing._internal.opinfo.core import OpInfo, SampleInput, _dispatch_d
 # reference it without a circular import.
 TENSOR_LIST_DEFAULT_COUNT = 15
 
-from .neuron_shape_registry import SHAPE_REGISTRY, max_tensor_elems  # noqa: E402
+from .neuron_shape_registry import (  # noqa: E402
+    BUILTIN_SOURCE,
+    SHAPE_REGISTRY,
+    max_tensor_elems,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -491,10 +495,17 @@ class NeuronOpInfo(OpInfo):
         cold-compile sweep and can OOM HBM on the largest shapes. Keeping
         the top-N by size preserves the strongest roofline signal per
         compile. A non-positive value disables the cap.
+
+        ``NEURON_TRACED_MODEL`` (``--traced-model``) restricts the vended list to
+        one model's traced shapes. Without it, a run pointed at a model registry
+        still sees that op's ``builtin`` defaults.
         """
-        entries = SHAPE_REGISTRY.get(self.op_name)
+        # ``NEURON_TRACED_MODEL`` (``--traced-model``) narrows to one model's traced shapes.
+        entries = SHAPE_REGISTRY.get(
+            self.op_name, model=os.environ.get("NEURON_TRACED_MODEL") or None
+        )
         if entries and os.environ.get("NEURON_MODEL_SHAPES_ONLY"):
-            entries = [e for e in entries if any(s != "builtin" for s in e.sources)]
+            entries = [e for e in entries if any(s != BUILTIN_SOURCE for s in e.sources)]
 
         # Drop entries whose largest tensor exceeds a single NeuronCore's
         # usable HBM. Without this, shapes like [1,16,8192,8192] (4 GB per
