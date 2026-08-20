@@ -932,6 +932,91 @@ def adaptive_avg_pool2d_backward_decomp(grad_output, self):
     return grad_input
 
 
+def _pool_pair(v):
+    """Normalize an int or 1/2-length sequence to a 2-tuple."""
+    if isinstance(v, list | tuple):
+        return (int(v[0]), int(v[0])) if len(v) == 1 else (int(v[0]), int(v[1]))
+    return int(v), int(v)
+
+
+def _avg_pool2d_bwd_scatter_weight(o_size, i_size, k, s, p, device, dtype):
+    """Boolean scatter matrix W[i, o] = 1 iff input index i lies in output o's
+    window. avg_pool2d_backward distributes each output gradient equally across
+    the inputs its window covered, so grad_input = W @ (grad_output / divisor).
+    Handles overlapping windows (stride < kernel) naturally.
+    """
+    out_idx = torch.arange(o_size, device=device)
+    starts = out_idx * s - p  # window start in input coordinates
+    in_idx = torch.arange(i_size, device=device).unsqueeze(1)  # (i, 1)
+    return ((in_idx >= starts) & (in_idx < starts + k)).to(dtype)  # (i, o)
+
+
+def _avg_pool2d_bwd_divisor_1d(o_size, i_size, k, s, p, count_include_pad, device, dtype):
+    """Per-output-position element count along one spatial dim, in the pooling
+    window's padded coordinate frame. Output ``o``'s window spans padded coords
+    ``[o*s, o*s + k)``; it counts the cells that overlap the countable region:
+      count_include_pad=True  -> real + explicit-pad region [0, i + 2p)
+      count_include_pad=False -> real region only [p, p + i)
+    Ceil-mode-added cells lie beyond that region and are excluded (matching
+    PyTorch, which never counts them regardless of count_include_pad). The count
+    is the overlap length, computed with arange/clamp (all lowerable ops; avoids
+    unfold/as_strided which do not legalize).
+    """
+    lo = 0 if count_include_pad else p
+    hi = (i_size + 2 * p) if count_include_pad else (p + i_size)
+    win_start = torch.arange(o_size, device=device, dtype=dtype) * s
+    win_end = win_start + k
+    # overlap = max(0, min(win_end, hi) - max(win_start, lo))
+    return (win_end.clamp(max=hi) - win_start.clamp(min=lo)).clamp(min=0)
+
+
+@register_decomposition([aten.avg_pool2d_backward])
+def avg_pool2d_backward_decomp(
+    grad_output,
+    self,
+    kernel_size,
+    stride,
+    padding,
+    ceil_mode,
+    count_include_pad,
+    divisor_override=None,
+):
+    """Decompose avg_pool2d_backward into separable scatter matmuls.
+
+    torch-mlir's DecomposeAtenAvgPool2dBackwardOp lowers to a grouped
+    convolution_backward that fails on Neuron for overlapping windows
+    (stride < kernel: 'torch.constant.int' fails to legalize) and refuses
+    count_include_pad=False outright. Rather than depend on it, compute the
+    backward directly: the gradient of an average is each output gradient split
+    equally over its window's inputs, so with a per-dim scatter matrix W (input
+    index in output window) and per-output divisor d,
+    ``grad_input = Wh @ (grad_output / d) @ Ww^T`` (separable over H and W).
+    This is the same stable einsum pattern as _adaptive_avg_pool2d_backward and
+    avoids convolution entirely. Verified against CPU across the full
+    kernel/stride/padding/ceil/count_include_pad/divisor_override matrix.
+    """
+    kh, kw = _pool_pair(kernel_size)
+    sh, sw = _pool_pair(stride if stride not in (None, []) else kernel_size)
+    ph, pw = _pool_pair(padding)
+    i_h, i_w = self.shape[-2], self.shape[-1]
+    o_h, o_w = grad_output.shape[-2], grad_output.shape[-1]
+    device, dtype = grad_output.device, grad_output.dtype
+
+    if divisor_override is not None:
+        divisor = float(divisor_override)
+        scaled = grad_output / divisor
+    else:
+        count_h = _avg_pool2d_bwd_divisor_1d(o_h, i_h, kh, sh, ph, count_include_pad, device, dtype)
+        count_w = _avg_pool2d_bwd_divisor_1d(o_w, i_w, kw, sw, pw, count_include_pad, device, dtype)
+        scaled = grad_output / (count_h[:, None] * count_w[None, :])
+
+    weight_h = _avg_pool2d_bwd_scatter_weight(o_h, i_h, kh, sh, ph, device, dtype)  # (i_h, o_h)
+    weight_w = _avg_pool2d_bwd_scatter_weight(o_w, i_w, kw, sw, pw, device, dtype)  # (i_w, o_w)
+    grad_input = torch.einsum("hq,...qw->...hw", weight_h, scaled)
+    grad_input = torch.einsum("...hw,vw->...hv", grad_input, weight_w)
+    return grad_input
+
+
 def _adaptive_avg_pool3d_backward_impl(grad_output, self):
     """Shared math for _adaptive_avg_pool3d_backward (separable per-dim matmuls).
 
