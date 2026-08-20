@@ -107,6 +107,10 @@ struct OpRegistration {
   // dtype inference path.  Set automatically at registration time when
   // lower_func is not py::none().
   bool has_lower_func = false;
+
+  // Optional callback that adds operation-specific output metadata to a
+  // LoweringResult. Called after lowering and by the empty-tensor Meta path.
+  py::object lowering_result_transform = py::none();
 };
 
 /**
@@ -158,7 +162,8 @@ class NeuronDispatcher {
    */
   void RegisterOp(const std::string& op_name, py::object python_wrapper,
                   py::object lower_func = py::none(), std::vector<int64_t> static_argnums_vec = {},
-                  std::vector<std::string> static_argnames_vec = {}, bool skip_cache = false);
+                  std::vector<std::string> static_argnames_vec = {}, bool skip_cache = false,
+                  py::object lowering_result_transform = py::none());
 
   /**
    * Dedicated boxed handler for aten::scalar_tensor.
@@ -454,7 +459,8 @@ class NeuronDispatcher {
    */
   static bool TryHandleEmptyTensors(const c10::OperatorHandle& op, torch::jit::Stack* stack,
                                     const std::vector<c10::IValue>& args,
-                                    const c10::FunctionSchema& schema, const std::string& op_name);
+                                    const c10::FunctionSchema& schema, const std::string& op_name,
+                                    const OpRegistration& reg);
 };
 
 /**

@@ -62,6 +62,54 @@ class TestNativeBatchNorm:
         atol = 1e-3 if dtype == torch.bfloat16 else 1e-5
         torch.testing.assert_close(out_neuron.cpu(), out_cpu, rtol=rtol, atol=atol)
 
+    @pytest.mark.parametrize(
+        "memory_format,input_shape",
+        [
+            (torch.channels_last, (2, 4, 6, 7)),
+            (torch.channels_last_3d, (2, 4, 3, 6, 7)),
+        ],
+    )
+    def test_native_batch_norm_preserves_channels_last(self, memory_format, input_shape):
+        torch.manual_seed(42)
+        channels = input_shape[1]
+        input_cpu = torch.randn(input_shape).contiguous(memory_format=memory_format)
+        weight_cpu = torch.randn(channels)
+        bias_cpu = torch.randn(channels)
+        mean_cpu = torch.randn(channels)
+        var_cpu = torch.rand(channels) + 0.5
+        cpu_args = (input_cpu, weight_cpu, bias_cpu, mean_cpu, var_cpu)
+        neuron_args = tuple(value.to("neuron") for value in cpu_args)
+
+        expected = torch.ops.aten.native_batch_norm(*cpu_args, False, 0.1, 1e-5)[0]
+        with track_neuron_ops():
+            actual = torch.ops.aten.native_batch_norm(*neuron_args, False, 0.1, 1e-5)[0]
+        assert_op_runs_on_neuron("aten::native_batch_norm")
+
+        assert actual.is_contiguous(memory_format=memory_format)
+        torch.testing.assert_close(actual.cpu(), expected)
+
+    @pytest.mark.parametrize(
+        "memory_format,input_shape",
+        [
+            (torch.channels_last, (0, 4, 6, 7)),
+            (torch.channels_last_3d, (0, 4, 3, 6, 7)),
+        ],
+    )
+    def test_empty_native_batch_norm_preserves_channels_last(self, memory_format, input_shape):
+        channels = input_shape[1]
+        input = torch.empty(input_shape, device="neuron", memory_format=memory_format)
+        weight = torch.ones(channels, device="neuron")
+        bias = torch.zeros(channels, device="neuron")
+        running_mean = torch.zeros(channels, device="neuron")
+        running_var = torch.ones(channels, device="neuron")
+
+        actual = torch.ops.aten.native_batch_norm(
+            input, weight, bias, running_mean, running_var, False, 0.1, 1e-5
+        )[0]
+
+        assert actual.numel() == 0
+        assert actual.is_contiguous(memory_format=memory_format)
+
     def test_batch_norm_forward_1d(self):
         """Test BatchNorm1d forward with 1D spatial input (N, C, L)."""
         torch.manual_seed(42)
@@ -155,6 +203,10 @@ class TestNativeBatchNorm:
         out = torch.empty_like(expected[0], device="neuron")
         save_mean = torch.empty_like(expected[1], device="neuron")
         save_invstd = torch.empty_like(expected[2], device="neuron")
+        output_impls = tuple(tensor._cdata for tensor in (out, save_mean, save_invstd))
+        output_storage_impls = tuple(
+            tensor.untyped_storage()._cdata for tensor in (out, save_mean, save_invstd)
+        )
 
         with track_neuron_ops():
             result = torch.ops.aten.native_batch_norm.out(
@@ -172,6 +224,8 @@ class TestNativeBatchNorm:
             )
         assert_op_runs_on_neuron("aten::native_batch_norm")
 
+        assert tuple(tensor._cdata for tensor in result) == output_impls
+        assert tuple(tensor.untyped_storage()._cdata for tensor in result) == output_storage_impls
         rtol, atol = _TOLERANCES[dtype]
         torch.testing.assert_close(result[0].cpu(), expected[0], rtol=rtol, atol=atol)
         torch.testing.assert_close(out.cpu(), expected[0], rtol=rtol, atol=atol)

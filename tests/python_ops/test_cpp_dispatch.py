@@ -29,9 +29,9 @@ class TestCppDispatchRegistration:
 
     def test_register_neuron_op_binding_exists(self):
         """Verify _C._register_neuron_op is callable."""
-        assert hasattr(_C, "_register_neuron_op"), (
-            "_C._register_neuron_op binding not found — " "NeuronDispatcher not compiled into _C.so"
-        )
+        assert hasattr(
+            _C, "_register_neuron_op"
+        ), "_C._register_neuron_op binding not found — NeuronDispatcher not compiled into _C.so"
         assert callable(_C._register_neuron_op)
 
     def test_get_neuron_dispatcher_ops_binding_exists(self):

@@ -20,6 +20,7 @@
 #include "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/LoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
@@ -102,14 +103,15 @@ torch::Library& NeuronDispatcher::GetDispatchLib() {
 
 void NeuronDispatcher::RegisterOp(const std::string& op_name, py::object python_wrapper,
                                   py::object lower_func, std::vector<int64_t> static_argnums_vec,
-                                  std::vector<std::string> static_argnames_vec, bool skip_cache) {
+                                  std::vector<std::string> static_argnames_vec, bool skip_cache,
+                                  py::object lowering_result_transform) {
   std::unordered_set<size_t> sa_set(static_argnums_vec.begin(), static_argnums_vec.end());
   std::unordered_set<std::string> sn_set(static_argnames_vec.begin(), static_argnames_vec.end());
 
   bool has_lower = !lower_func.is_none();
-  auto reg = std::make_shared<OpRegistration>(
-      OpRegistration{std::move(python_wrapper), std::move(lower_func), std::move(sa_set),
-                     std::move(sn_set), skip_cache, has_lower});
+  auto reg = std::make_shared<OpRegistration>(OpRegistration{
+      std::move(python_wrapper), std::move(lower_func), std::move(sa_set), std::move(sn_set),
+      skip_cache, has_lower, std::move(lowering_result_transform)});
 
   op_registrations_[op_name] = reg;
 
@@ -1114,7 +1116,7 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
                                " num_args=", num_args, " has_lower=", !reg.lower_func.is_none());
 
   // Empty tensors (numel()==0) cannot be compiled by the Neuron compiler.
-  if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+  if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return;
   }
 
@@ -1221,7 +1223,7 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
   auto schema = op.schema();
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
-  if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+  if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return;
   }
 
@@ -1359,7 +1361,7 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
     }
   }
 
-  if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+  if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return;
   }
 
@@ -1494,7 +1496,7 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
   auto schema = op.schema();
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
-  if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+  if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return;
   }
 
@@ -1667,7 +1669,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
   // Early exit: empty tensors
-  if (TryHandleEmptyTensors(op, stack, args, schema, op_name)) {
+  if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return {{}, {}, torch::Device(torch::kCPU), true};
   }
 
@@ -2170,11 +2172,15 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
   }
 
   auto [py_args, py_kwargs] = IValuesToPyArgsKwargs(args, schema);
+  py::tuple logical_args = py_args;
+  py::dict logical_kwargs = py_kwargs;
 
   // Pass original (pre-downcast) args to lower_func for dtype inference.
   // lower_func uses these to infer output dtypes at original precision.
   if (!original_args.empty()) {
     auto [orig_py_args, orig_py_kwargs] = IValuesToPyArgsKwargs(original_args, schema);
+    logical_args = orig_py_args;
+    logical_kwargs = orig_py_kwargs;
     py_kwargs["original_args"] = orig_py_args;
     py_kwargs["original_kwargs"] = orig_py_kwargs;
   }
@@ -2198,6 +2204,10 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
       TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] lower_func returned None",
                                    " cache_key=", cache_key);
       return nullptr;
+    }
+
+    if (!reg.lowering_result_transform.is_none()) {
+      reg.lowering_result_transform(result, logical_args, logical_kwargs);
     }
 
     TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] parsing LoweringResult",
@@ -2521,11 +2531,57 @@ torch::Device NeuronDispatcher::ExtractDevice(const std::vector<c10::IValue>& ar
 //    Falls through to cpu_fallback for ops without Meta kernels.
 // ═══════════════════════════════════════════════════════════════
 
-bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
-                                             torch::jit::Stack* stack,
-                                             const std::vector<c10::IValue>& args,
-                                             const c10::FunctionSchema& schema,
-                                             const std::string& op_name) {
+static std::vector<std::optional<std::vector<int64_t>>> TransformEmptyOutputSpecs(
+    const std::vector<MetaOutputSpec>& meta_specs, const std::vector<c10::IValue>& args,
+    const c10::FunctionSchema& schema, const OpRegistration& reg) {
+  std::vector<std::optional<std::vector<int64_t>>> target_strides(meta_specs.size());
+  if (reg.lowering_result_transform.is_none()) {
+    return target_strides;
+  }
+
+  py::gil_scoped_acquire gil;
+  LoweringResult lowering_result;
+  for (const auto& spec : meta_specs) {
+    py::tuple shape(spec.shape.size());
+    for (size_t i = 0; i < spec.shape.size(); ++i) {
+      shape[i] = py::int_(spec.shape[i]);
+    }
+    py::object dtype = py::none();
+    if (!spec.is_undefined) {
+      dtype = py::int_(static_cast<int>(spec.dtype));
+    }
+    lowering_result.output_specs.append(py::make_tuple(std::move(shape), std::move(dtype)));
+  }
+
+  auto [logical_args, logical_kwargs] = IValuesToPyArgsKwargs(args, schema);
+  auto result = py::cast(&lowering_result, py::return_value_policy::reference);
+  reg.lowering_result_transform(result, logical_args, logical_kwargs);
+
+  TORCH_CHECK(lowering_result.output_specs.size() == meta_specs.size(),
+              "lowering_result_transform must preserve the number of output specs");
+  for (size_t i = 0; i < meta_specs.size(); ++i) {
+    auto transformed = lowering_result.output_specs[i].cast<py::tuple>();
+    TORCH_CHECK(transformed.size() >= 2,
+                "lowering_result_transform produced an invalid output spec");
+
+    auto shape = transformed[0].cast<std::vector<int64_t>>();
+    TORCH_CHECK(shape == meta_specs[i].shape,
+                "lowering_result_transform must not change output shapes");
+    if (transformed.size() < 3 || transformed[2].is_none()) {
+      continue;
+    }
+
+    auto strides = transformed[2].cast<std::vector<int64_t>>();
+    TORCH_CHECK(strides.size() == shape.size(),
+                "lowering_result_transform target strides must match output rank");
+    target_strides[i] = std::move(strides);
+  }
+  return target_strides;
+}
+
+bool NeuronDispatcher::TryHandleEmptyTensors(
+    const c10::OperatorHandle& op, torch::jit::Stack* stack, const std::vector<c10::IValue>& args,
+    const c10::FunctionSchema& schema, const std::string& op_name, const OpRegistration& reg) {
   // ════════════════════════════════════════════════════════════
   //  Detection: does this op have empty tensors that we should handle?
   //  Each op category checks a different subset of args.
@@ -2676,20 +2732,34 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
     TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] Meta inferred", " op=", op_name,
                                  " num_outputs=", meta_specs.size());
 
+    auto target_strides = TransformEmptyOutputSpecs(meta_specs, args, schema, reg);
+
     // Helpers: create tensors on CPU then move to Neuron to avoid reentrancy.
     // torch::zeros/full on Neuron would re-enter the dispatcher via fill_.
     // torch::empty on Neuron is safe — goes through allocator only.
-    auto make_zeros = [&](const MetaOutputSpec& spec) {
-      auto cpu_opts = torch::TensorOptions().dtype(spec.dtype).device(c10::kCPU);
-      return torch::zeros(spec.shape, cpu_opts).to(device);
+    auto apply_target_strides = [&](torch::Tensor output, size_t output_index) {
+      const auto& target = target_strides[output_index];
+      if (!target.has_value() || output.strides().vec() == *target) {
+        return output;
+      }
+      auto relayout = torch::empty_strided(output.sizes(), *target, output.options());
+      if (output.numel() != 0) {
+        relayout.copy_(output);
+      }
+      return relayout;
     };
-    auto make_empty = [&](const MetaOutputSpec& spec) {
+    auto make_zeros = [&](const MetaOutputSpec& spec, size_t output_index) {
+      auto cpu_opts = torch::TensorOptions().dtype(spec.dtype).device(c10::kCPU);
+      return apply_target_strides(torch::zeros(spec.shape, cpu_opts).to(device), output_index);
+    };
+    auto make_empty = [&](const MetaOutputSpec& spec, size_t output_index) {
       auto opts = torch::TensorOptions().dtype(spec.dtype).device(device);
-      return torch::empty(spec.shape, opts);
+      return apply_target_strides(torch::empty(spec.shape, opts), output_index);
     };
-    auto make_full = [&](const MetaOutputSpec& spec, double fill_value) {
+    auto make_full = [&](const MetaOutputSpec& spec, size_t output_index, double fill_value) {
       auto cpu_opts = torch::TensorOptions().dtype(spec.dtype).device(c10::kCPU);
-      return torch::full(spec.shape, fill_value, cpu_opts).to(device);
+      return apply_target_strides(torch::full(spec.shape, fill_value, cpu_opts).to(device),
+                                  output_index);
     };
 
     // ── 1b. Create output tensors with correct fill values ──
@@ -2719,10 +2789,10 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
           outputs.push_back(torch::Tensor());
         } else if (i == 0) {
           // First output gets the identity value
-          outputs.push_back(make_full(spec, fill_value));
+          outputs.push_back(make_full(spec, i, fill_value));
         } else {
           // Additional outputs (like indices) get zeros
-          outputs.push_back(make_zeros(spec));
+          outputs.push_back(make_zeros(spec, i));
         }
       }
 
@@ -2762,11 +2832,12 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
 
       if (!returned_input) {
         // Fallback: create zeros
-        for (const auto& spec : meta_specs) {
+        for (size_t i = 0; i < meta_specs.size(); ++i) {
+          const auto& spec = meta_specs[i];
           if (spec.is_undefined) {
             outputs.push_back(torch::Tensor());
           } else {
-            outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec) : make_zeros(spec));
+            outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec, i) : make_zeros(spec, i));
           }
         }
       }
@@ -2781,13 +2852,14 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
       TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] matmul-accumulate op", " op=", op_name);
       const auto& self_t = args[matmul_cfg->self_argnum].toTensor();
       const c10::Scalar beta = ExtractScalarArg(args, schema, "beta", 1);
-      for (const auto& spec : meta_specs) {
+      for (size_t i = 0; i < meta_specs.size(); ++i) {
+        const auto& spec = meta_specs[i];
         if (spec.is_undefined) {
           outputs.push_back(torch::Tensor());
         } else if (HasZeroDim(spec.shape)) {
-          outputs.push_back(make_empty(spec));  // genuinely empty output
+          outputs.push_back(make_empty(spec, i));  // genuinely empty output
         } else if (beta.equal(0)) {
-          outputs.push_back(make_zeros(spec));  // beta=0 drops self (incl. NaN)
+          outputs.push_back(make_zeros(spec, i));  // beta=0 drops self (incl. NaN)
         } else {
           // beta * self, in the output dtype. `beta` stays a c10::Scalar so the
           // multiply keeps an integer output integer: a scalar bumps only the
@@ -2800,11 +2872,12 @@ bool NeuronDispatcher::TryHandleEmptyTensors(const c10::OperatorHandle& op,
 
     } else {
       // ── General case: create zeros ──
-      for (const auto& spec : meta_specs) {
+      for (size_t i = 0; i < meta_specs.size(); ++i) {
+        const auto& spec = meta_specs[i];
         if (spec.is_undefined) {
           outputs.push_back(torch::Tensor());
         } else {
-          outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec) : make_zeros(spec));
+          outputs.push_back(HasZeroDim(spec.shape) ? make_empty(spec, i) : make_zeros(spec, i));
         }
       }
     }
