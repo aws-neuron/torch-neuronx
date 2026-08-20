@@ -267,7 +267,7 @@ def run_with_timeout(
     log_path: Path,
     wall_timeout: int,
     env: dict[str, str] | None = None,
-) -> int:
+) -> tuple[int, bool]:
     """Run ``cmd``, tee output to ``log_path``, kill after ``wall_timeout`` seconds.
 
     Mirrors the prior ``timeout --signal=SIGINT --kill-after=300`` behavior:
@@ -277,10 +277,17 @@ def run_with_timeout(
     Uses ``select`` for non-blocking reads so the deadline check fires
     even when pytest produces no output for a long time (a hung test
     can silence stdout indefinitely otherwise).
+
+    Returns (exit_code, timed_out): exit_code is from child, timed_out indicates killed here
+    due to timeout. pytest installs its own SIGINT
+    handler, so it absorbs our timeout signal and exits 2 (ExitCode.INTERRUPTED)
+    after writing its reports. Without this timed_out signal, a wall-clock kill would
+    misclassify a timeout as a usage failure.
     """
     import select
 
     grace_period = 300
+    timed_out = False
     poll_interval = 1.0  # seconds between deadline checks when no output
     print(f"$ {shlex.join(cmd)}", flush=True)
     with open(log_path, "w") as log_file:
@@ -324,13 +331,14 @@ def run_with_timeout(
                     f"WARNING: Hit timeout after {wall_timeout}s — sending SIGINT",
                     flush=True,
                 )
+                timed_out = True
                 _signal_group(proc.pid, signal.SIGINT)
                 kill_deadline = now + grace_period
             elif kill_deadline is not None and now >= kill_deadline:
                 print("WARNING: SIGINT grace expired — sending SIGKILL", flush=True)
                 _signal_group(proc.pid, signal.SIGKILL)
                 break
-        return proc.wait()
+        return proc.wait(), timed_out
 
 
 def _signal_group(pid: int, sig: int) -> None:
@@ -543,14 +551,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = derive_report_paths(args.output_dir, args.items, args.shard_id)
     print(f"=== Running: {' '.join(args.items)} ===")
     main_cmd = build_pytest_argv(args, paths, num_workers=args.num_workers)
-    exit_code = run_with_timeout(main_cmd, paths["log"], args.class_timeout, env=pytest_env)
+    exit_code, timed_out = run_with_timeout(
+        main_cmd, paths["log"], args.class_timeout, env=pytest_env
+    )
 
-    if exit_code in TIMEOUT_EXIT_CODES:
+    if timed_out or exit_code in TIMEOUT_EXIT_CODES:
         print(f"WARNING: Hit timeout after {args.class_timeout}s (exit code: {exit_code})")
 
     # Single retry pass for failed tests — mirrors the bash retry block.
     # See the bash comment block for the worker-crash flakiness rationale.
-    if should_retry(exit_code):
+    if not timed_out and should_retry(exit_code):
         rpaths = retry_paths(paths)
         print_retry_header(args, rpaths)
         retry_cmd = build_pytest_argv(
@@ -559,7 +569,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_workers=args.num_workers_retry,
             extra=["--last-failed", "--last-failed-no-failures=none"],
         )
-        retry_exit = run_with_timeout(retry_cmd, rpaths["log"], args.retry_timeout, env=pytest_env)
+        retry_exit, _ = run_with_timeout(
+            retry_cmd, rpaths["log"], args.retry_timeout, env=pytest_env
+        )
         if retry_fully_cleared(paths["report"], rpaths["report"], retry_exit):
             print(
                 "\n=== Retry SUCCESS: all previously-failing tests re-ran and passed on retry ==="
