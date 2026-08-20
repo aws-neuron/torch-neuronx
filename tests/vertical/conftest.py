@@ -102,7 +102,15 @@ def pytest_addoption(parser):
     parser.addoption(
         "--shape-registry",
         default=None,
-        help="Path to JSON shape registry file to load model-traced shapes",
+        help="JSON shape registry file to load model-traced shapes from",
+    )
+    parser.addoption(
+        "--traced-model",
+        default=None,
+        help=(
+            "Comma-separated model-traced shape set(s) to enable, e.g. qwen3_235b_a22b "
+            "An unknown name is an error rather than an empty selection."
+        ),
     )
     parser.addoption(
         "--max-shapes-per-op",
@@ -147,6 +155,9 @@ def pytest_configure(config):
     registry_path = config.getoption("--shape-registry", default=None)
     if registry_path:
         os.environ["NEURON_SHAPE_REGISTRY"] = str(registry_path)
+    traced_model = config.getoption("--traced-model", default=None)
+    if traced_model:
+        os.environ["NEURON_TRACED_MODEL"] = str(traced_model)
     os.environ["NEURON_MAX_SHAPES_PER_OP"] = str(
         config.getoption("--max-shapes-per-op", default=10)
     )

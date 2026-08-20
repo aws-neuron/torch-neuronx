@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from math import prod
 from pathlib import Path
 
+# Source tag every entry in ``neuron_shape_defaults_generated`` carries. Anything else is
+# a model name, so ``source != BUILTIN_SOURCE`` is the "came from a real trace" test and
+# ``--traced-model <name>`` selects one such model.
+BUILTIN_SOURCE = "builtin"
+
 
 @dataclass
 class OpShapeEntry:
@@ -81,15 +86,31 @@ class NeuronShapeRegistry:
             entry.sources[source] = count
             self._entries[op_name][key] = entry
 
-    def get(self, op_name: str) -> list[OpShapeEntry]:
-        """Get all shape entries for an op, sorted by total count (most common first)."""
-        return sorted(self._entries.get(op_name, {}).values(), key=lambda e: -e.total_count)
+    def get(self, op_name: str, model: str | None = None) -> list[OpShapeEntry]:
+        """Get all shape entries for an op, sorted by total count (most common first).
+
+        ``model`` restricts the result to entries that carry that source tag.
+        """
+        entries = self._entries.get(op_name, {}).values()
+        if model is not None:
+            entries = [e for e in entries if model in e.sources]
+        return sorted(entries, key=lambda e: -e.total_count)
 
     def has(self, op_name: str) -> bool:
         return bool(self._entries.get(op_name))
 
-    def all_ops(self) -> list[str]:
-        return sorted(self._entries.keys())
+    def all_ops(self, model: str | None = None) -> list[str]:
+        """Registered op names, optionally only those carrying ``model``'s shapes."""
+        if model is None:
+            return sorted(self._entries.keys())
+        return sorted(op for op in self._entries if self.get(op, model=model))
+
+    def models(self) -> list[str]:
+        """Source tags other than ``BUILTIN_SOURCE`` -- i.e. the model traces loaded."""
+        return sorted(
+            {s for by_key in self._entries.values() for e in by_key.values() for s in e.sources}
+            - {BUILTIN_SOURCE}
+        )
 
     def __len__(self) -> int:
         return sum(len(v) for v in self._entries.values())
@@ -366,11 +387,16 @@ def _entry_compatible_with_schema(arg_shapes: dict, tgt_schema) -> bool:
     return True
 
 
-# Load all shape defaults (hand-crafted + auto-generated)
+# Load all shape defaults (hand-crafted + auto-generated).
+#
+# Model-traced shape sets live in the same registry as the builtin defaults. Registering them
+# is opt-in: ``NEURON_TRACED_MODEL`` (set by ``--traced-model``) is an allowlist, empty by
+# default. Adding a model to the registry doesn't impact existing runs.
 def _load_defaults():
     from .neuron_shape_defaults_generated import register_all_defaults
 
-    register_all_defaults(SHAPE_REGISTRY.register)
+    traced = [m.strip() for m in os.environ.get("NEURON_TRACED_MODEL", "").split(",") if m.strip()]
+    register_all_defaults(SHAPE_REGISTRY.register, traced_models=traced)
 
 
 _load_defaults()
