@@ -207,6 +207,10 @@ def test_copy_neuron_to_neuron_fp64_empty():
     assert dst.dtype == torch.float64
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_copy_non_default_stream_uses_direct_primitive():
     """Test that copy on non-default stream with host_cc routes to direct
     primitive (CopyNeuronImpl)."""
@@ -259,6 +263,10 @@ def test_copy_non_default_stream_without_host_cc_uses_mlir():
         is_host_cc_enabled.cache_clear()
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_to_copy_non_default_stream_uses_direct_primitive():
     """Test that _to_copy on non-default stream with host_cc routes to direct primitive."""
     from tests.utils.neuron_test_utils import requires_nrt_streams
@@ -409,6 +417,11 @@ class TestConjNegEdgeCases:
         torch.testing.assert_close(dst.cpu(), expected)
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read, so it only takes effect in a "
+    "process that has not already read it."
+)
 class TestNonDefaultStreamGuards:
     def test_copy_same_dtype_contiguous_accepted(self):
         """Same-dtype contiguous: raw NRT on-device copy."""

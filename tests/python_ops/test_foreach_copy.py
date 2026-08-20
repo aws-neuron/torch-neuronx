@@ -235,6 +235,10 @@ def test_unsupported_dtype_bool():
         torch.testing.assert_close(dst.cpu(), src.cpu())
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_nondefault_stream_same_dtype_raw_nrt():
     """Non-default stream + hostCC: same-dtype contiguous range routes to raw NRT."""
     from tests.utils.neuron_test_utils import requires_nrt_streams
@@ -256,6 +260,10 @@ def test_nondefault_stream_same_dtype_raw_nrt():
     _run()
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_nondefault_stream_scattered_raw_nrt():
     """Non-default stream + hostCC: scattered same-dtype routes per-tensor to raw NRT."""
     from tests.utils.neuron_test_utils import requires_nrt_streams
@@ -276,6 +284,10 @@ def test_nondefault_stream_scattered_raw_nrt():
     _run()
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_nondefault_stream_neg_src_falls_back():
     """Non-default stream + hostCC: src with .is_neg() falls through to dst.copy_(src)."""
     from tests.utils.neuron_test_utils import requires_nrt_streams
@@ -297,6 +309,10 @@ def test_nondefault_stream_neg_src_falls_back():
     _run()
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams sets TORCH_NEURONX_ENABLE_HOST_CC, which the C++ "
+    "dispatcher freezes in a static on first read."
+)
 def test_nondefault_stream_cross_dtype_falls_back():
     """Non-default stream + hostCC: cross-dtype falls through to per-pair dst.copy_(src)."""
     from tests.utils.neuron_test_utils import requires_nrt_streams

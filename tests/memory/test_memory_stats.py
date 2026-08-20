@@ -477,6 +477,12 @@ class TestMemoryStats:
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 @pytest.mark.usefixtures("clean_device_state")
 @pytest.mark.xdist_group("oom_serial")
+@pytest.mark.needs_process_isolation(
+    reason="Five of these drive an oversize_mib() alloc past total HBM to force a hard "
+    "OOM, and the OOM-report path can hit a KaenaRuntime assertion (tdrv/db.c:235) that "
+    "SIGABRTs the process. xdist_group serializes them but does not contain an abort: it "
+    "kills the whole worker, and the session wedges after xdist replaces it."
+)
 class TestLazyAllocDeferRetry:
     """End-to-end tests for the lazy-alloc defer-retry path: parks an OOM'd
     kAlloc as Deferred, waits for the stream to drain so preceding kDeallocs

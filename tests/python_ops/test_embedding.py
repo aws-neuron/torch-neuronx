@@ -236,6 +236,10 @@ class TestEmbeddingDenseBackward:
             False,
         )
 
+    @pytest.mark.needs_process_isolation(
+        reason="Pre-allocates ~17GB to force the NKI path, which aborts the xdist worker "
+        "when tests share a process."
+    )
     @pytest.mark.parametrize("padding_idx", [None, 3])
     @pytest.mark.parametrize("scale_grad_by_freq", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
