@@ -76,7 +76,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Temporary parent xfail: unary min/max all-NaN backward produces incorrect " "gradients"
+            "Temporary parent xfail: unary min/max all-NaN backward produces incorrect gradients"
         ),
         tests=[
             "test_autograd.py::TestAutogradDeviceTypeNEURON::test_min_max_aminmax_median_backprops_to_all_values_neuron",
@@ -457,6 +457,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "test_optim.py::TestSWAUtilsNEURON::test_update_bn_cnn_neuron",
             "test_optim.py::TestSWAUtilsNEURON::test_update_bn_dnn_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[cpu-only] Reduction-order artifact of OMP_NUM_THREADS=1, which the"
+            " conftest sets before importing torch so that --forked children cannot"
+            " deadlock on an OpenMP barrier inherited across fork(). The CPU batchnorm"
+            " kernel accumulates its reductions according to at::get_num_threads(), so"
+            " single-threading changes the summation order and the two paths diverge past"
+            " the test's tolerance (2.7e-05 vs 1e-05 allowed on 1 of 8 elements). No Neuron"
+            " device is involved. xfail (not skip) so it still runs and xpasses if"
+            " the thread pinning is ever narrowed or the upstream tolerance relaxes."
+        ),
+        tests=[
+            "test_nn.py::TestNN::test_batchnorm_nhwc_cpu",
         ],
     ),
 ]

@@ -30,6 +30,7 @@ from run_upstream_tests import (
     preload_env,
     retry_fully_cleared,
     retry_paths,
+    run_with_timeout,
     should_retry,
 )
 
@@ -411,6 +412,34 @@ def test_parse_args_env_var_overrides(monkeypatch):
 def test_parse_args_requires_at_least_one_item():
     with pytest.raises(SystemExit):
         parse_args([])
+
+
+def test_run_with_timeout_reports_timeout_and_keeps_real_exit_code(tmp_path):
+    """A wall-clock kill must be reported even when the child exits 0/1/2.
+
+    pytest traps SIGINT and exits 2 (ExitCode.INTERRUPTED) after writing its
+    reports, so the exit code alone can't distinguish "ran out of time" from
+    "usage error". The child's own code is still returned unmodified.
+    """
+    child = (
+        "import signal, sys, time\n"
+        "signal.signal(signal.SIGINT, lambda *a: sys.exit(2))\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+    exit_code, timed_out = run_with_timeout(
+        [sys.executable, "-c", child], tmp_path / "run.log", wall_timeout=1
+    )
+    assert timed_out is True
+    assert exit_code == 2
+
+
+def test_run_with_timeout_no_timeout_on_prompt_exit(tmp_path):
+    exit_code, timed_out = run_with_timeout(
+        [sys.executable, "-c", "raise SystemExit(3)"], tmp_path / "run.log", wall_timeout=60
+    )
+    assert timed_out is False
+    assert exit_code == 3
 
 
 # ---------------------------------------------------------------------------
