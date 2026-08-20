@@ -55,7 +55,7 @@
 // Metrics
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 // Include Distributed Work and Watchdog (for async collective completion tracking)
-#include "torch_neuronx/csrc/distributed/DynamicAllGatherTiling.h"
+#include "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h"
 #include "torch_neuronx/csrc/distributed/NeuronBackend.h"
 #include "torch_neuronx/csrc/distributed/NeuronWatchdog.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
@@ -1906,6 +1906,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Compile MLIR to NEFF and store in cache, return final cache key", py::arg("base_cache_key"),
       py::arg("mlir_bytes"), py::arg("has_collectives"), py::arg("use_tensorizer") = false);
 
+  // Expose the eager dispatch's compiler configuration so precompile paths can use it.
+  // Returns (additional_args, optimization_level) matching XLACompilableKernelExecution.
+  m.def(
+      "_get_eager_compiler_config",
+      []() -> py::tuple {
+        return py::make_tuple(at::neuron::XLACompilableKernelExecution::GetXLAAdditionalArgs(),
+                              at::neuron::XLACompilableKernelExecution::GetXLAOptimizationLevel());
+      },
+      "Get the eager dispatch compiler configuration (additional_args, optimization_level)");
+
+  // Compile MLIR to NEFF using explicit compiler configuration. Use _get_eager_compiler_config()
+  // to match the eager dispatch path for precompiling NEFFs that will be looked up at runtime.
+  m.def(
+      "compile_graph_with_config",
+      [](const std::string& base_cache_key, py::bytes mlir_bytes, bool has_collectives,
+         const std::string& additional_args, const std::string& optimization_level) -> std::string {
+        std::string_view mlir_str = mlir_bytes.cast<std::string_view>();
+        std::vector<uint8_t> mlir_vec(mlir_str.begin(), mlir_str.end());
+
+        auto compile_kernel = std::make_unique<at::neuron::CompileOnlyKernelExecution>(
+            base_cache_key, mlir_vec, has_collectives, additional_args, optimization_level);
+        std::string cache_key = compile_kernel->GetCompileKey();
+
+        auto context =
+            std::make_unique<at::neuron::OperationContext>(std::move(compile_kernel), "");
+
+        auto stream = at::neuron::getCurrentNeuronStream();
+        at::neuron::SubmitOperationContext(stream, std::move(context));
+        return cache_key;
+      },
+      "Compile MLIR to NEFF with explicit compiler config, return final cache key",
+      py::arg("base_cache_key"), py::arg("mlir_bytes"), py::arg("has_collectives"),
+      py::arg("additional_args"), py::arg("optimization_level"));
+
   // torch.compile: execute compiled graph using cache key
   m.def(
       "execute_compiled_graph",
@@ -1952,17 +1986,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // Dynamic multi-tier AllGather tiling plan — test/parity utility exposing
   // the C++ ComputePlan so a Python test can assert it matches
-  // dynamic_allgather.plan_dynamic_allgather (the two implementations must stay in lock-step).
+  // dynamic_collectives.plan_dynamic_allgather (the two implementations must stay in lock-step).
   m.def(
       "_allgather_compute_plan",
       [](int64_t numel, int64_t ranks, int64_t nprg, int64_t dtype_size,
          const std::string& platform) {
         std::string plat = platform.empty() ? at::neuron::utils::GetPlatformTarget() : platform;
-        auto p = torch_neuronx::distributed::ag_tiling::ComputePlan(numel, ranks, nprg, dtype_size,
-                                                                    plat);
+        auto p = torch_neuronx::distributed::collective_tiling::ComputePlan(numel, ranks, nprg,
+                                                                            dtype_size, plat);
         return py::make_tuple(p.large, p.medium, p.small, p.trace_numel, p.eligible, p.unroll);
       },
       "Compute the AllGather tiling plan -> (large, medium, small, trace_numel, eligible, "
+      "unroll). platform defaults to the runtime platform target when empty.",
+      py::arg("numel"), py::arg("ranks"), py::arg("nprg"), py::arg("dtype_size"),
+      py::arg("platform") = "");
+
+  // Dynamic multi-tier AllReduce tiling plan — parity utility exposing the C++ ComputePlan
+  // (all-reduce variant, PER-RANK byte accounting) so a Python test can assert it matches
+  // dynamic_collectives.plan_dynamic_allreduce.
+  m.def(
+      "_allreduce_compute_plan",
+      [](int64_t numel, int64_t ranks, int64_t nprg, int64_t dtype_size,
+         const std::string& platform) {
+        std::string plat = platform.empty() ? at::neuron::utils::GetPlatformTarget() : platform;
+        auto p = torch_neuronx::distributed::collective_tiling::ComputePlan(
+            numel, ranks, nprg, dtype_size, plat,
+            torch_neuronx::distributed::collective_tiling::Collective::kAllReduce);
+        return py::make_tuple(p.large, p.medium, p.small, p.trace_numel, p.eligible, p.unroll);
+      },
+      "Compute the AllReduce tiling plan -> (large, medium, small, trace_numel, eligible, "
       "unroll). platform defaults to the runtime platform target when empty.",
       py::arg("numel"), py::arg("ranks"), py::arg("nprg"), py::arg("dtype_size"),
       py::arg("platform") = "");

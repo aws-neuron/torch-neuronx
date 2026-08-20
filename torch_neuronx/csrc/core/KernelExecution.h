@@ -473,20 +473,32 @@ class XLACompilableKernelExecution
  protected:
   bool ValidateImpl() const override;
 
- private:
-  // Get XLA compilation configuration from environment
+ public:
+  // Get XLA compilation configuration from environment.
+  // Public so precompile paths can match the eager dispatch's persistent cache key.
   static std::string GetXLAAdditionalArgs();
   static std::string GetXLAOptimizationLevel();
 
+ private:
   std::vector<uint8_t> hlo_bytes_;
 };
 
 // torch.compile compilation kernels.
 class CompileOnlyKernelExecution : public CompilableKernelExecution, public NeuronKernelExecution {
  public:
+  // Default constructor uses GetCompileAdditionalArgs() / GetCompileOptimizationLevel().
   CompileOnlyKernelExecution(const std::string& base_cache_key,
                              const std::vector<uint8_t>& mlir_bytes, bool has_collectives,
                              bool use_tensorizer = false);
+
+  // Constructor with explicit compiler config overrides. When additional_args/optimization_level
+  // are non-empty, they replace the defaults. Use
+  // XLACompilableKernelExecution::GetXLAAdditionalArgs() and GetXLAOptimizationLevel() to match the
+  // eager dispatch path.
+  CompileOnlyKernelExecution(const std::string& base_cache_key,
+                             const std::vector<uint8_t>& mlir_bytes, bool has_collectives,
+                             const std::string& additional_args,
+                             const std::string& optimization_level, bool use_tensorizer = false);
 
   std::vector<uint8_t> CompileToNeff() const override;
 

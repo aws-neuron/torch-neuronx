@@ -144,6 +144,19 @@ CompileOnlyKernelExecution::CompileOnlyKernelExecution(const std::string& base_c
       platform_target_(utils::GetPlatformTarget()),
       logical_neuron_cores_(utils::GetLogicalNeuronCores()) {}
 
+CompileOnlyKernelExecution::CompileOnlyKernelExecution(
+    const std::string& base_cache_key, const std::vector<uint8_t>& mlir_bytes, bool has_collectives,
+    const std::string& additional_args, const std::string& optimization_level, bool use_tensorizer)
+    : CompilableKernelExecution(
+          CompilationCacheKey(base_cache_key, additional_args, optimization_level, &mlir_bytes_,
+                              CacheKeySource::EAGER),
+          additional_args, optimization_level, has_collectives),
+      NeuronKernelExecution("precompile_eager", -1, false),
+      mlir_bytes_(mlir_bytes),
+      use_tensorizer_(use_tensorizer),
+      platform_target_(utils::GetPlatformTarget()),
+      logical_neuron_cores_(utils::GetLogicalNeuronCores()) {}
+
 bool CompileOnlyKernelExecution::ValidateImpl() const {
   return CompilableKernelExecution::ValidateImpl() && !mlir_bytes_.empty();
 }

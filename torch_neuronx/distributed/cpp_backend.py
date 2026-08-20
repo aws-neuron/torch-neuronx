@@ -39,7 +39,18 @@ def _format_replica_groups(replica_groups):
 
 
 def _lower_all_reduce_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
-    """ALLREDUCE → torch-mlir trace of `_c10d_functional.all_reduce[_coalesced]`."""
+    """ALLREDUCE → torch-mlir trace of `_c10d_functional.all_reduce[_coalesced]`.
+
+    Dynamic path: when the C++ NeuronBackend injects a runtime numel scalar, route to the
+    dynamic all-reduce kernel lowering (threading the c10d reduce_op).
+    """
+    if os.environ.get("NEURON_DYN_NKI_COLLECTIVES") == "1" and is_dynamic_collective_inputs(inputs):
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dynamic_collectives import (
+            lower_dynamic_allreduce,
+        )
+
+        return lower_dynamic_allreduce(inputs, replica_groups, reduce_op)
+
     del kwargs
     reduce_op_str = _REDUCE_INT_TO_STR.get(reduce_op, "SUM").lower()
 
@@ -80,9 +91,9 @@ def _lower_all_to_all_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
     return kernel.lower(list(inputs), group_size=group_size, group_name=group_name)
 
 
-def is_dynamic_allgather_inputs(inputs) -> bool:
-    """True when the C++ NeuronBackend injected the runtime numel scalar
-    for the dynamic allgather
+def is_dynamic_collective_inputs(inputs) -> bool:
+    """True when the C++ NeuronBackend injected the runtime numel scalar for a dynamic
+    collective (all-gather / all-reduce): inputs == [data_tensor, int32 [1,1] numel scalar].
     """
     return (
         len(inputs) == 2
@@ -101,7 +112,7 @@ def _lower_all_gather_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
     del reduce_op
 
     # C++ only injects the numel scalar when the dynamic allgather is enabled
-    if os.environ.get("NEURON_DYN_NKI_COLLECTIVES") == "1" and is_dynamic_allgather_inputs(inputs):
+    if os.environ.get("NEURON_DYN_NKI_COLLECTIVES") == "1" and is_dynamic_collective_inputs(inputs):
         from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dynamic_collectives import (
             lower_dynamic_allgather,
         )

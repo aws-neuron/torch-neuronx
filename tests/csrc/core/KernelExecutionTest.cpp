@@ -632,6 +632,26 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
 
+TEST_F(KernelExecutionTest, CompileOnlyKernelExplicitConfigOverridesEnv) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_CC_FLAGS", "--env-should-be-ignored", 1);
+  setenv("NEURON_COMPILER_OPT_LEVEL", "-O3", 1);
+
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, /*has_collectives=*/true,
+                                    /*additional_args=*/"--foo", /*optimization_level=*/"-O1");
+
+  // Explicit args win; the environment is not consulted.
+  EXPECT_NE(kernel.GetAdditionalArgs().find("--foo"), std::string::npos);
+  EXPECT_EQ(kernel.GetAdditionalArgs().find("--env-should-be-ignored"), std::string::npos);
+  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O1");
+  EXPECT_TRUE(kernel.IsValid());
+  EXPECT_TRUE(kernel.HasCollectives());
+
+  unsetenv("NEURON_CC_FLAGS");
+  unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
 TEST_F(KernelExecutionTest, CompileOnlyKernelDoesNotForceFmaFlag) {
   std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
   CompileOnlyKernelExecution compile_only_kernel("key", bytes, false);
