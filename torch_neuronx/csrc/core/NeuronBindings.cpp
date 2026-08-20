@@ -1330,20 +1330,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "_register_neuron_op",
       [](const std::string& op_name, py::object python_wrapper, py::object lower_func,
          std::vector<int64_t> static_argnums, std::vector<std::string> static_argnames,
-         bool skip_cache) {
+         bool skip_cache, py::object lowering_result_transform) {
         torch_neuronx::dispatch::NeuronDispatcher::Instance().RegisterOp(
             op_name, std::move(python_wrapper), std::move(lower_func), std::move(static_argnums),
-            std::move(static_argnames), skip_cache);
+            std::move(static_argnames), skip_cache, std::move(lowering_result_transform));
       },
       "Register an op with the C++ NeuronDispatcher.\n"
       "  python_wrapper: Full Python execution fallback (Phase 1)\n"
       "  lower_func: kernel.lower(*args) → LoweringResult (for cache path)\n"
+      "  lowering_result_transform: Optional output metadata callback\n"
       "  static_argnums: Positional arg indices that are compile-time constants\n"
       "  static_argnames: Kwarg names that are compile-time constants\n"
       "  skip_cache: If true, always call lower_func (never cache the lowering result)",
       py::arg("op_name"), py::arg("python_wrapper"), py::arg("lower_func") = py::none(),
       py::arg("static_argnums") = std::vector<int64_t>{},
-      py::arg("static_argnames") = std::vector<std::string>{}, py::arg("skip_cache") = false);
+      py::arg("static_argnames") = std::vector<std::string>{}, py::arg("skip_cache") = false,
+      py::arg("lowering_result_transform") = py::none());
 
   m.def(
       "_get_neuron_dispatcher_ops",

@@ -1,6 +1,7 @@
 #include "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h"
 
 #include <c10/core/ScalarType.h>
+#include <c10/util/strides.h>
 #include <torch/csrc/Device.h>
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/autograd/python_variable.h>
@@ -82,7 +83,13 @@ void CacheKeyGenerator::AppendTensor(std::ostringstream& key, const at::Tensor& 
   key << "]:";
   AppendScalarType(key, t.scalar_type());
   key << ":S(";
-  if (t.is_contiguous()) {
+  auto canonical_strides = c10::contiguous_strides(t.sizes());
+  bool has_canonical_strides =
+      std::equal(t.strides().begin(), t.strides().end(), canonical_strides.begin());
+  auto memory_format = t.suggest_memory_format(/*channels_last_strides_exact_match=*/true);
+  bool has_exact_channels_last_strides = memory_format == c10::MemoryFormat::ChannelsLast ||
+                                         memory_format == c10::MemoryFormat::ChannelsLast3d;
+  if (has_canonical_strides || (t.is_contiguous() && !has_exact_channels_last_strides)) {
     key << "C";
   } else {
     for (int64_t d = 0; d < t.dim(); ++d) {

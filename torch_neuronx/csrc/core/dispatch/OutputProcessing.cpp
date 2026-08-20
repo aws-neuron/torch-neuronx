@@ -158,7 +158,7 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
     if (!outputs[i].defined()) {
       const auto& spec = entry.output_specs[i];
       auto opts = torch::TensorOptions().dtype(spec.dtype).device(device);
-      if (spec.target_strides.has_value()) {
+      if (spec.target_strides.has_value() && torch_neuronx::IsEpilogueEnabled()) {
         // SDPA / functional op with ATen stride contract.
         // Allocate a contiguous buffer with PHYSICAL shape (the layout the NEFF writes),
         // then return an as_strided view with the logical shape + target strides.
@@ -183,9 +183,10 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
         auto phys_tensor = torch::empty(physical_shape, opts);
 
         // Bounds check: verify the as_strided view fits within the physical buffer.
-        int64_t required_storage = 1;
-        for (size_t j = 0; j < ndims; ++j) {
-          if (spec.shape[j] > 0) {
+        int64_t required_storage = 0;
+        if (phys_tensor.numel() != 0) {
+          required_storage = 1;
+          for (size_t j = 0; j < ndims; ++j) {
             required_storage += (spec.shape[j] - 1) * target[j];
           }
         }
@@ -231,6 +232,25 @@ static void CopyBackOutTensors(
   }
 }
 
+static std::vector<torch::Tensor> ApplyTargetStrides(
+    std::vector<torch::Tensor> outputs, const DispatchCacheEntry& entry,
+    const std::vector<std::pair<size_t, torch::Tensor>>& original_out_tensors) {
+  for (size_t i = 0; i < outputs.size() && i < entry.output_specs.size(); ++i) {
+    bool is_out_tensor = std::any_of(original_out_tensors.begin(), original_out_tensors.end(),
+                                     [i](const auto& out) { return out.first == i; });
+    const auto& target = entry.output_specs[i].target_strides;
+    if (is_out_tensor || !target.has_value() || !outputs[i].defined() ||
+        outputs[i].strides().vec() == *target) {
+      continue;
+    }
+
+    auto relayout = torch::empty_strided(outputs[i].sizes(), *target, outputs[i].options());
+    relayout.copy_(outputs[i]);
+    outputs[i] = std::move(relayout);
+  }
+  return outputs;
+}
+
 std::vector<torch::Tensor> UpcastExecutionOutputs(
     const std::vector<torch::Tensor>& exec_outputs, const DispatchCacheEntry& entry,
     const std::vector<std::pair<size_t, torch::Tensor>>& original_out_tensors) {
@@ -243,9 +263,9 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
     if (!original_out_tensors.empty()) {
       auto result = exec_outputs;
       CopyBackOutTensors(result, original_out_tensors);
-      return result;
+      return ApplyTargetStrides(std::move(result), entry, original_out_tensors);
     }
-    return exec_outputs;
+    return ApplyTargetStrides(exec_outputs, entry, original_out_tensors);
   }
 
   // ── Build out_tensor_map for quick lookup ──
@@ -265,13 +285,13 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
   }
 
   if (!needs_upcast && original_out_tensors.empty()) {
-    return exec_outputs;
+    return ApplyTargetStrides(exec_outputs, entry, original_out_tensors);
   }
 
   if (!needs_upcast) {
     auto result = exec_outputs;
     CopyBackOutTensors(result, original_out_tensors);
-    return result;
+    return ApplyTargetStrides(std::move(result), entry, original_out_tensors);
   }
 
   // ── Perform upcast using exact inferred dtypes ──
@@ -329,7 +349,7 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
 
     upcasted.push_back(exec_outputs[i]);
   }
-  return upcasted;
+  return ApplyTargetStrides(std::move(upcasted), entry, original_out_tensors);
 }
 
 bool IsPureInputPassthrough(const DispatchCacheEntry& entry) {

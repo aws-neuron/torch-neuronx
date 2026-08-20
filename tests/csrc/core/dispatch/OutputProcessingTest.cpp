@@ -171,6 +171,21 @@ TEST(AllocateExecutionOutputsTest, TargetStrides_2DTranspose) {
   EXPECT_FALSE(outputs[0].is_contiguous());
 }
 
+TEST(AllocateExecutionOutputsTest, TargetStrides_EmptyChannelsLast) {
+  DispatchCacheEntry entry;
+  entry.output_specs = {{{0, 4, 6, 7}, c10::ScalarType::Float, {{168, 1, 28, 4}}}};
+
+  std::vector<c10::IValue> args = {torch::zeros({0, 4, 6, 7}), torch::ones({0, 4, 6, 7}), 1};
+  std::vector<torch::Tensor> filtered = {torch::zeros({0, 4, 6, 7})};
+
+  auto outputs = AllocateExecutionOutputs(entry, args, filtered, kCPU, AddSchema());
+  ASSERT_EQ(outputs.size(), 1u);
+  EXPECT_EQ(outputs[0].sizes(), (std::vector<int64_t>{0, 4, 6, 7}));
+  EXPECT_EQ(outputs[0].strides(), (std::vector<int64_t>{168, 1, 28, 4}));
+  EXPECT_EQ(outputs[0].numel(), 0);
+  EXPECT_TRUE(outputs[0].is_contiguous(c10::MemoryFormat::ChannelsLast));
+}
+
 TEST(AllocateExecutionOutputsTest, TargetStrides_NulloptUsesContiguous) {
   // When target_strides is nullopt, should allocate contiguous as usual
   DispatchCacheEntry entry;
@@ -397,6 +412,41 @@ TEST(UpcastExecutionOutputsTest, Float32ToFloat64Upcast) {
   EXPECT_NEAR(result[0][0][0].item<double>(), 1.0, 1e-6);
 }
 
+TEST(UpcastExecutionOutputsTest, AppliesTargetStridesAfterUpcast) {
+  DispatchCacheEntry entry;
+  entry.output_specs = {
+      {{2, 3, 4, 5}, c10::ScalarType::Float, {{60, 1, 15, 3}}},
+  };
+  entry.original_output_specs = {{{2, 3, 4, 5}, c10::ScalarType::Double}};
+  entry.inferred_output_dtypes = {c10::ScalarType::Double};
+
+  auto exec = std::vector<torch::Tensor>{torch::rand({2, 3, 4, 5}, torch::kFloat32)};
+  auto result = UpcastExecutionOutputs(exec, entry);
+
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_EQ(result[0].scalar_type(), c10::ScalarType::Double);
+  EXPECT_EQ(result[0].strides(), (std::vector<int64_t>{60, 1, 15, 3}));
+  EXPECT_TRUE(result[0].is_contiguous(c10::MemoryFormat::ChannelsLast));
+  EXPECT_TRUE(torch::allclose(result[0], exec[0].to(torch::kFloat64)));
+}
+
+TEST(UpcastExecutionOutputsTest, AppliesTargetStridesWithoutUpcast) {
+  DispatchCacheEntry entry;
+  entry.output_specs = {
+      {{2, 3, 4, 5}, c10::ScalarType::Float, {{60, 1, 15, 3}}},
+  };
+  entry.original_output_specs = {{{2, 3, 4, 5}, c10::ScalarType::Float}};
+  entry.inferred_output_dtypes = {c10::ScalarType::Float};
+
+  auto exec = std::vector<torch::Tensor>{torch::rand({2, 3, 4, 5}, torch::kFloat32)};
+  auto result = UpcastExecutionOutputs(exec, entry);
+
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_EQ(result[0].strides(), (std::vector<int64_t>{60, 1, 15, 3}));
+  EXPECT_TRUE(result[0].is_contiguous(c10::MemoryFormat::ChannelsLast));
+  EXPECT_TRUE(torch::allclose(result[0], exec[0]));
+}
+
 TEST(UpcastExecutionOutputsTest, Int32ToInt64Upcast) {
   DispatchCacheEntry entry;
   entry.output_specs = {{{4}, c10::ScalarType::Int}};
@@ -446,6 +496,26 @@ TEST(UpcastExecutionOutputsTest, CopyBackToOutTensor) {
   ASSERT_EQ(result.size(), 1u);
   // Should have copied the upcast result back into orig
   EXPECT_EQ(result[0].scalar_type(), c10::ScalarType::Double);
+}
+
+TEST(UpcastExecutionOutputsTest, TargetStridesPreserveOutTensorLayoutAndIdentity) {
+  DispatchCacheEntry entry;
+  entry.output_specs = {
+      {{2, 3, 4, 5}, c10::ScalarType::Float, {{60, 1, 15, 3}}},
+  };
+  entry.original_output_specs = {{{2, 3, 4, 5}, c10::ScalarType::Float}};
+  entry.inferred_output_dtypes = {c10::ScalarType::Float};
+
+  auto orig = torch::zeros({2, 3, 4, 5}, torch::kFloat32);
+  auto exec = std::vector<torch::Tensor>{torch::ones({2, 3, 4, 5}, torch::kFloat32)};
+  std::vector<std::pair<size_t, torch::Tensor>> out_tensors = {{0, orig}};
+
+  auto result = UpcastExecutionOutputs(exec, entry, out_tensors);
+
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_EQ(result[0].data_ptr(), orig.data_ptr());
+  EXPECT_EQ(result[0].strides(), orig.strides());
+  EXPECT_TRUE(torch::allclose(result[0], exec[0]));
 }
 
 // ═══════════════════════════════════════════════════════════════

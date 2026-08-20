@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import register_aten
+from ..output_layout import channels_last_strides, suggest_output_memory_format
 
 
 @register_aten(
@@ -241,10 +242,36 @@ def torch_native_group_norm_backward(
     )
 
 
+def _set_batch_norm_output_strides(lowering_result, logical_args, logical_kwargs):
+    """Preserve a dense channels-last input layout on the normalized output."""
+    if not logical_args or not lowering_result.output_specs:
+        return
+    if any(
+        isinstance(value, torch.Tensor)
+        for name, value in logical_kwargs.items()
+        if name == "out" or name.startswith("out") or name in ("save_mean", "save_invstd")
+    ):
+        return
+    input = logical_args[0]
+    if not isinstance(input, torch.Tensor):
+        return
+
+    memory_format = suggest_output_memory_format(input)
+    spec = lowering_result.output_specs[0]
+    if not isinstance(spec, tuple) or len(spec) < 2:
+        return
+    shape = spec[0]
+    target_strides = channels_last_strides(shape, memory_format)
+    if target_strides is None:
+        return
+    lowering_result.output_specs[0] = (shape, spec[1], target_strides)
+
+
 @register_aten(
     ["aten::_native_batch_norm_legit_functional"],
     static_argnums=(5, 6, 7),
     output_params=("out0", "out1", "out2", "out3", "out4"),
+    lowering_result_transform=_set_batch_norm_output_strides,
 )
 def torch_native_batch_norm_legit_functional(
     input,
@@ -279,6 +306,7 @@ def _validate_batch_norm_out(input, *args, out=None, **kwargs):
     static_argnums=(5, 6, 7),
     output_params=("out", "save_mean", "save_invstd"),
     validate_static_inputs=_validate_batch_norm_out,
+    lowering_result_transform=_set_batch_norm_output_strides,
 )
 def torch_native_batch_norm_legit(
     input,
@@ -306,6 +334,7 @@ def torch_native_batch_norm_legit(
     static_argnums=(3, 4, 5),
     output_params=("out", "save_mean", "save_invstd"),
     validate_static_inputs=_validate_batch_norm_out,
+    lowering_result_transform=_set_batch_norm_output_strides,
 )
 def torch_native_batch_norm_legit_no_stats(
     input,
@@ -330,6 +359,7 @@ def torch_native_batch_norm_legit_no_stats(
     ],
     static_argnums=(5, 6),
     output_params=("out0", "out1", "out2"),
+    lowering_result_transform=_set_batch_norm_output_strides,
 )
 def torch_native_batch_norm_legit_no_training(
     input,
@@ -352,6 +382,7 @@ def torch_native_batch_norm_legit_no_training(
     ["aten::native_batch_norm", "aten::native_batch_norm.out"],
     static_argnums=(5, 6, 7),
     output_params=("out", "save_mean", "save_invstd"),
+    lowering_result_transform=_set_batch_norm_output_strides,
 )
 def torch_native_batch_norm(
     input,

@@ -79,6 +79,34 @@ TEST_F(CacheKeyGeneratorTest, DifferentStridesDifferentKeys) {
   EXPECT_NE(a, b);
 }
 
+TEST_F(CacheKeyGeneratorTest, AmbiguousChannelsLastStridesRemainInKey) {
+  auto contiguous = torch::zeros({4, 1, 8, 8});
+  auto channels_last = torch::empty_strided({4, 1, 8, 8}, {64, 1, 8, 1});
+  ASSERT_TRUE(contiguous.is_contiguous());
+  ASSERT_TRUE(channels_last.is_contiguous());
+  ASSERT_TRUE(channels_last.is_contiguous(c10::MemoryFormat::ChannelsLast));
+  ASSERT_NE(contiguous.strides(), channels_last.strides());
+
+  auto contiguous_key = gen({contiguous, torch::zeros({2}), 1});
+  auto channels_last_key = gen({channels_last, torch::zeros({2}), 1});
+
+  EXPECT_NE(contiguous_key, channels_last_key);
+  EXPECT_NE(channels_last_key.find("S(64,1,8,1)"), std::string::npos);
+}
+
+TEST_F(CacheKeyGeneratorTest, OtherContiguousSingletonStridesRemainCanonical) {
+  auto canonical = torch::zeros({2, 1, 3});
+  auto singleton_strided = torch::empty_strided({2, 1, 3}, {3, 17, 1});
+  ASSERT_TRUE(singleton_strided.is_contiguous());
+  ASSERT_NE(canonical.strides(), singleton_strided.strides());
+
+  auto canonical_key = gen({canonical, torch::zeros({2}), 1});
+  auto singleton_strided_key = gen({singleton_strided, torch::zeros({2}), 1});
+
+  EXPECT_EQ(canonical_key, singleton_strided_key);
+  EXPECT_NE(singleton_strided_key.find("S(C)"), std::string::npos);
+}
+
 TEST_F(CacheKeyGeneratorTest, ZeroDimTensor) {
   auto k = gen({torch::tensor(5.0), torch::zeros({2}), 1});
   EXPECT_NE(k.find("[]"), std::string::npos);

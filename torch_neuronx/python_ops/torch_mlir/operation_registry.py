@@ -30,6 +30,7 @@ def register_aten(
     translate_args_fn: Callable | None = None,
     python_dispatch: bool = False,
     error_handler: Callable | None = None,
+    lowering_result_transform: Callable | None = None,
     relower_every_call: bool = False,
     **kwargs,
 ):
@@ -44,6 +45,11 @@ def register_aten(
                        static for cache key
         static_argnames: Tuple of keyword argument names that should be treated as
                         static for cache key
+        lowering_result_transform: Optional callback invoked by the C++ dispatcher
+                       after lowering, or after Meta inference for empty inputs. It receives
+                       ``(lowering_result, logical_args, logical_kwargs)`` and may
+                       add operation-specific output metadata such as fused
+                       epilogue strides.
         python_dispatch: Register the op on the Python dispatch path rather
                        than C++ cached dispatch. Required for ops whose lowering
                        is not a pure function of the cache key (op name, shapes,
@@ -111,6 +117,7 @@ def register_aten(
                 "static_argnums": static_argnums,
                 "static_argnames": static_argnames,
                 "preprocessing": preprocessing,
+                "lowering_result_transform": lowering_result_transform,
                 "validate_static_inputs": validate_static_inputs,
                 "translate_args_fn": translate_args_fn,
                 "python_dispatch": python_dispatch,
@@ -775,6 +782,7 @@ def finalize_registrations_cpp(aten_lib=None, verbose: bool = False):
                     list(static_argnums) if static_argnums else [],
                     list(static_argnames) if static_argnames else [],
                     relower_every_call,
+                    lowering_result_transform=reg_info.get("lowering_result_transform"),
                 )
                 registered_count += 1
 
