@@ -123,6 +123,7 @@ neuron_decompositions = get_decompositions(
         aten.lerp,
         aten.elu,
         aten.elu_backward,
+        aten.silu,
         aten.log_sigmoid_forward,
         aten.log_sigmoid_backward,
         aten.addmv,
