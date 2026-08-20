@@ -1146,11 +1146,11 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
       TORCH_NEURONX_DISPATCH_DEBUG(
           "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
           " op=", op_name);
-      torch_neuronx::markFallbackLogged(op_name);
       for (auto& arg : args) {
         torch::jit::push(*stack, arg);
       }
       at::native::cpu_fallback(op, stack);
+      torch_neuronx::markFallbackLogged(op_name);
       return;
     }
   }
@@ -1367,11 +1367,11 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
 
   if (HasComplexInput(args)) {
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchNonzero] complex dtype → CPU fallback", " op=", op_name);
-    torch_neuronx::markFallbackLogged(op_name);
     for (auto& arg : args) {
       torch::jit::push(*stack, arg);
     }
     at::native::cpu_fallback(op, stack);
+    torch_neuronx::markFallbackLogged(op_name);
     return;
   }
 
@@ -1502,11 +1502,11 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
 
   if (HasComplexInput(args)) {
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] complex dtype → CPU fallback", " op=", op_name);
-    torch_neuronx::markFallbackLogged(op_name);
     for (auto& arg : args) {
       torch::jit::push(*stack, arg);
     }
     at::native::cpu_fallback(op, stack);
+    torch_neuronx::markFallbackLogged(op_name);
     return;
   }
 
@@ -1524,11 +1524,11 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
           auto dt = idx.scalar_type();
           if (dt != c10::ScalarType::Long && dt != c10::ScalarType::Int &&
               dt != c10::ScalarType::Byte && dt != c10::ScalarType::Bool) {
-            torch_neuronx::markFallbackLogged(op_name);
             for (auto& arg : args) {
               torch::jit::push(*stack, arg);
             }
             at::native::cpu_fallback(op, stack);
+            torch_neuronx::markFallbackLogged(op_name);
             return;
           }
         }
@@ -1620,11 +1620,11 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
           auto idx_min = idx_cpu.min().item<int64_t>();
           if (idx_max >= dim_size || idx_min < -dim_size) {
             // Fall back to CPU which raises IndexError (not RuntimeError)
-            torch_neuronx::markFallbackLogged(op_name);
             for (auto& arg : args) {
               torch::jit::push(*stack, arg);
             }
             at::native::cpu_fallback(op, stack);
+            torch_neuronx::markFallbackLogged(op_name);
             return;
           }
         }
@@ -1709,9 +1709,9 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
       TORCH_CHECK(false, "NeuronDispatcher: CPU fallback disabled. Operation '", op_name,
                   "' could not be lowered to Neuron.");
     }
-    torch_neuronx::markFallbackLogged(op_name);
     for (const auto& arg : original_args) torch::jit::push(*stack, arg);
     at::native::cpu_fallback(op, stack);
+    torch_neuronx::markFallbackLogged(op_name);
     logOperationExecuted(op_name);
     return {{}, {}, torch::Device(torch::kCPU), true};
   }
@@ -1940,7 +1940,6 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     }
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] lowering returned null → CPU fallback",
                                  " op=", op_name);
-    torch_neuronx::markFallbackLogged(op_name);
     // Use original (pre-downcast) args for CPU fallback when available,
     // so that dtypes (e.g. int64) are preserved instead of using the
     // downcasted args (e.g. int32) from DowncastArgs.
@@ -1949,6 +1948,7 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
       torch::jit::push(*stack, arg);
     }
     at::native::cpu_fallback(op, stack);
+    torch_neuronx::markFallbackLogged(op_name);
     return {};
   }
 
