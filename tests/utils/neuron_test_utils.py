@@ -272,6 +272,13 @@ def requires_nrt_streams(test_func):
     """Decorator to enable multi-stream mode for tests that require unique streams.
 
     Sets TORCH_NEURONX_ENABLE_HOST_CC=1 for the duration of the test.
+
+    Only takes effect in a process that has not read that variable yet, because the
+    C++ dispatcher latches it at the first copy it dispatches. So every test using
+    this decorator must also be marked needs_process_isolation, and clearing the
+    lru_cache on is_host_cc_enabled() is NOT a way around that: it desynchronizes
+    the Python and C++ views of the flag and aborts the worker. See "Trap 2" in
+    docs/AI-testing.md.
     """
 
     @wraps(test_func)

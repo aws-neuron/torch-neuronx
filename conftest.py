@@ -15,6 +15,12 @@ def pytest_configure(config):
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
     config.addinivalue_line("markers", "multi_device: marks tests as distributed tests")
+    config.addinivalue_line(
+        "markers",
+        "needs_process_isolation(reason): test cannot share a process with other tests. "
+        "run-test-parallel --no-forked deselects these from the shared run and re-runs "
+        "them in a second, --forked invocation. See docs/testing.md.",
+    )
 
     global SANITY_PT_DISTRIBUTED_TESTS
     # Read the option from the distributed configuration object

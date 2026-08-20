@@ -32,6 +32,22 @@ declare -g ENABLE_JSON_REPORT=false
 declare -g HAS_EXPLICIT_TEST_PATH=false
 declare -g SKIP_PT_TEST_DISTRIBUTED=false
 declare -g SANITY_PT_DISTRIBUTED_TESTS=""
+# Share one process per xdist worker instead of forking per test, so the Neuron
+# runtime init is paid once per worker. See "Process isolation" in
+# docs/AI-testing.md for the full contract.
+declare -g NO_FORKED=false
+# Per-test timeout, usable only because the shared run drops --forked
+# (pytest-timeout and pytest-forked can't be combined).
+declare -g NO_FORKED_TEST_TIMEOUT=1800
+# Wall-clock ceiling for the shared run, needed because the per-test timeout uses
+# the signal method and so cannot interrupt a hang inside a native call. -k
+# escalates to SIGKILL: SIGTERM alone leaves a wedged xdist controller waiting on
+# its workers, which burned 86 and then 120 min on a 30 min suite.
+declare -g NO_FORKED_GROUP_TIMEOUT=3600
+# Workers for the isolated pass. Low on purpose: the marked set is the
+# device-hostile tests (hard OOMs, a 17GB pre-alloc per parametrization), which
+# the full suite only survived because they were spread over an hour.
+declare -g NO_FORKED_ISOLATED_WORKERS=4
 
 
 # Initialize environment
@@ -117,6 +133,7 @@ parse_arguments() {
             "--coverage") ENABLE_COVERAGE=true ;;
             "--json-report") ENABLE_JSON_REPORT=true ;;
             "--skip_pt_test_distributed") SKIP_PT_TEST_DISTRIBUTED=true ;;
+            "--no-forked") NO_FORKED=true ;;
             "--sanity_pt_distributed_tests")
                 SANITY_PT_DISTRIBUTED_TESTS="--sanity_pt_distributed_tests"
                 ;;
@@ -195,7 +212,9 @@ build_pytest_options() {
     local xdist_args=""
     local json_report_ops=""
 
-    if [[ "$ENABLE_COVERAGE" == "true" && "$report_name" == "report" ]]; then
+    # "isolated-report" is the --forked tail of the same logical group as "report",
+    # so it contributes to the same (appended) coverage data.
+    if [[ "$ENABLE_COVERAGE" == "true" && ( "$report_name" == "report" || "$report_name" == "isolated-report" ) ]]; then
         local cov_target="torch_neuronx"
         cov_opts="--cov=$cov_target --cov-report=html:$REPORTS_DIR/coverage --cov-report=term-missing --cov-append"
         if [[ "$ENABLE_JSON_REPORT" == "true" ]]; then
@@ -217,13 +236,22 @@ build_pytest_options() {
     echo "$xdist_args $html_opts $cov_opts $json_report_ops $warn_opts"
 }
 
-# Run command and track exit code, retrying only failed tests on exit code 1
+# Run command and track exit code, retrying only failed tests on exit code 1.
+# allow_empty=true treats exit 5 (nothing collected) as success. Needed by the
+# isolated pass: `--no-forked tests/streams` has no marked tests to select, and
+# without this the whole run would report failure with every test passing.
 run_and_record() {
     local test_name="$1"
     local cmd="$2"
+    local allow_empty="${3:-false}"
     echo "Running $test_name: $cmd"
     local test_exit=0
     eval "$cmd" || test_exit=$?
+
+    if [[ $test_exit -eq 5 && "$allow_empty" == "true" ]]; then
+        echo "=== $test_name: no tests selected, skipping ==="
+        return
+    fi
 
     # Retry only on exit code 1 (test failures with complete cache).
     # Skip timeouts (124/130/137) and internal errors where retry won't help.
@@ -291,8 +319,28 @@ run_main_tests() {
 	fi
 	pytest_opts=$(build_pytest_options "report" "$workers")
 
-    local cmd="${RUNNER[*]} -m pytest --forked $pytest_opts $test_args $ignore_args"
+    if [[ "$NO_FORKED" != "true" ]]; then
+        local cmd="${RUNNER[*]} -m pytest --forked $pytest_opts $test_args $ignore_args"
+        run_and_record "main_tests" "$cmd"
+        return
+    fi
+
+    # --no-forked: share one process per xdist worker, so runtime init is paid once
+    # per worker instead of once per test. Tests that cannot share a process carry
+    # @pytest.mark.needs_process_isolation and run in the second pass below.
+    #
+    # Two passes, not a per-test @pytest.mark.forked: forking a worker that has
+    # already touched the device is fatal. Why, and when to mark a test:
+    # "Process isolation" in docs/AI-testing.md.
+    local cmd="timeout -k 120 $NO_FORKED_GROUP_TIMEOUT ${RUNNER[*]} -m pytest --timeout=$NO_FORKED_TEST_TIMEOUT $pytest_opts"
+    cmd="$cmd -m 'not needs_process_isolation' $test_args $ignore_args"
     run_and_record "main_tests" "$cmd"
+
+    local isolated_opts
+    isolated_opts=$(build_pytest_options "isolated-report" "$NO_FORKED_ISOLATED_WORKERS")
+    local isolated_cmd="${RUNNER[*]} -m pytest --forked $isolated_opts"
+    isolated_cmd="$isolated_cmd -m needs_process_isolation $test_args $ignore_args"
+    run_and_record "isolated_tests" "$isolated_cmd" "true"
 }
 
 # Run additional tests
@@ -409,6 +457,10 @@ display_results() {
     echo "Test Reports Generated:"
     echo "========================================="
     echo "Main Report: $REPORTS_DIR/report.html"
+
+    if [[ "$NO_FORKED" == "true" ]]; then
+        echo "Isolated Tests: $REPORTS_DIR/isolated-report.html"
+    fi
 
     if [[ "$ENABLE_COVERAGE" == "true" ]]; then
         echo "Coverage Report: $REPORTS_DIR/coverage/index.html"
