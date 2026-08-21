@@ -34,6 +34,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "PyTorch 2.13 changed avg_pool2d validation error messages from PyTorch "
+            "2.12. Neuron requires version-specific validation behavior; temporarily "
+            "xfail while PT2.13 semantics are added without regressing PT2.12."
+        ),
+        tests=[
+            "test_nn.py::TestNNDeviceTypeNEURON::test_avg_pool2d_invalid_parameters_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Neuron only supports contiguous/preserve memory format"
             " Conv2d with channels_last layout fails through forward/backward."
         ),
