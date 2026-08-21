@@ -1,4 +1,5 @@
 import logging
+from typing import NamedTuple
 
 import torch
 from torch.fx import GraphModule, Node
@@ -57,11 +58,26 @@ TRACEABLE_OPS = {
 TRACEABLE_MUTATION_OPS = MUTATION_OPS | TRACEABLE_OPS
 
 
+class _CopyInplaceMutation(NamedTuple):
+    """One ``copy_`` rewrite: the mutated input and where its result already lands.
+
+    ``returned_output_idx`` is a slot in the pre-rewrite output tuple this mutation
+    may take, or None when it needs a new one, which also covers a returned result
+    whose slot an earlier mutation already claimed.
+    """
+
+    input_idx: int
+    param_idx: list[int] | None
+    src: Node
+    returned_output_idx: int | None
+
+
 class FunctionalizeCopyInplacePass(NeuronFXPass):
     """
     Pass that detects and records input-output mutation relationships.
 
-    Handles copy_ pattern: Removes copy_ ops, prepends mutation value to outputs
+    Handles copy_ pattern: removes copy_ ops and adds an output for each
+    mutation result the graph does not already return.
 
     Records mutation info mapping outputs to their source inputs,
     enabling compiler buffer optimizations (e.g., buffer reuse).
@@ -74,10 +90,12 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
         super().__init__(state)
         self.mutation_info: AliasingInfo = AliasingInfo()
         self.passthrough_info: AliasingInfo = AliasingInfo()
+        self.added_mutation_output_indices: list[int] = []
 
     def call(self, gm: GraphModule) -> PassResult:
         self.mutation_info = AliasingInfo()
         self.passthrough_info = AliasingInfo()
+        self.added_mutation_output_indices = []
         graph = gm.graph
 
         placeholders = [n for n in graph.nodes if n.op == "placeholder"]
@@ -98,12 +116,11 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
 
         # Collect all mutations to emit atomically as one PassMutations entry
         out_muts = []
-        aliased_output_indices = [alias.output_index for alias in self.mutation_info.aliases]
-        if aliased_output_indices:
+        if self.added_mutation_output_indices:
             out_muts.append(
                 IOMutation(
                     kind=MutationKind.ADD,
-                    indices=aliased_output_indices,
+                    indices=self.added_mutation_output_indices,
                     pass_name="FunctionalizeCopyInplacePass",
                 )
             )
@@ -199,20 +216,58 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
             return True
         return hasattr(target, "_name") and "copy_" in str(target._name)
 
+    def _find_returned_mutation_output(
+        self,
+        outputs: list[Node],
+        node: Node,
+        src: Node,
+        claimed_output_indices: set[int],
+    ) -> int | None:
+        """Find the output slot that already carries a copy_ node's mutation result."""
+        src_value = src
+        if src.op == "call_function" and src.target is torch.ops.aten.copy.default:
+            copied_from = src.args[1] if len(src.args) > 1 else None
+            if isinstance(copied_from, Node):
+                dst_val = src.meta.get("val")
+                src_val = copied_from.meta.get("val")
+                if (
+                    dst_val is not None
+                    and src_val is not None
+                    and dst_val.dtype == src_val.dtype
+                    # Concrete dims only: comparing a symbolic one would plant a shape
+                    # guard or raise on an unbacked symint.
+                    and all(isinstance(dim, int) for dim in (*dst_val.shape, *src_val.shape))
+                    and dst_val.shape == src_val.shape
+                ):
+                    src_value = copied_from
+
+        return next(
+            (
+                i
+                for i, output in enumerate(outputs)
+                if (output is node or output is src or output is src_value)
+                and i not in claimed_output_indices
+            ),
+            None,
+        )
+
     def _handle_copy_inplace(
         self, graph: torch.fx.Graph, placeholders: list[Node], output_node: Node
     ) -> bool:
         """
         Handle explicit copy_ operations on inputs.
 
-        Transforms: input.copy_(value) → removes copy_, adds value to outputs
-        Records the mutation relationship for compiler optimization.
+        Transforms: input.copy_(value) → removes copy_, and adds value to the
+        outputs unless the graph already returns it. Records the mutation
+        relationship for compiler optimization.
 
         Returns:
             True if graph was modified, False otherwise.
         """
-        mutations: list[tuple[int, list[int] | None, Node]] = []
+        original_outputs = self._normalize_outputs(output_node)
+        mutations: list[_CopyInplaceMutation] = []
         nodes_to_remove: list[Node] = []
+        claimed_output_indices: set[int] = set()
 
         for node in list(graph.nodes):
             if self._is_copy_inplace(node):
@@ -221,7 +276,14 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
 
                 if dst in placeholders:
                     input_idx = placeholders.index(dst)
-                    mutations.append((input_idx, None, src))
+                    returned_output_idx = self._find_returned_mutation_output(
+                        original_outputs, node, src, claimed_output_indices
+                    )
+                    if returned_output_idx is not None:
+                        claimed_output_indices.add(returned_output_idx)
+                    mutations.append(
+                        _CopyInplaceMutation(input_idx, None, src, returned_output_idx)
+                    )
                     node.replace_all_uses_with(src)
                     nodes_to_remove.append(node)
 
@@ -232,23 +294,31 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
         for node in nodes_to_remove:
             graph.erase_node(node)
 
-        # Prepend mutation values to outputs
         outputs = self._normalize_outputs(output_node)
-
-        mutation_outputs = []
-        for idx, (input_idx, param_idx, src_node) in enumerate(mutations):
-            mutation_outputs.append(src_node)
+        hidden = [m for m in mutations if m.returned_output_idx is None]
+        mutation_outputs = [m.src for m in hidden]
+        self.added_mutation_output_indices = list(range(len(mutation_outputs)))
+        for output_idx, mutation in enumerate(hidden):
             self.mutation_info.add(
-                parameter_number=input_idx,
-                parameter_index=param_idx,
-                output_index=idx,
+                parameter_number=mutation.input_idx,
+                parameter_index=mutation.param_idx,
+                output_index=output_idx,
             )
+
+        # An already-returned result keeps its slot, shifted by the prepended ones.
+        for mutation in mutations:
+            if mutation.returned_output_idx is not None:
+                self.mutation_info.add(
+                    parameter_number=mutation.input_idx,
+                    parameter_index=mutation.param_idx,
+                    output_index=len(mutation_outputs) + mutation.returned_output_idx,
+                )
 
         final_outputs = mutation_outputs + outputs
         output_node.args = (tuple(final_outputs),)
         logger.debug(
-            f"Prepended {len(mutation_outputs)} to outputs, increased from "
-            f"{len(outputs)}->{len(final_outputs)}: {output_node.args}"
+            f"Prepended {len(mutation_outputs)} of {len(mutations)} mutations to outputs, "
+            f"increased from {len(outputs)}->{len(final_outputs)}: {output_node.args}"
         )
 
         return True
