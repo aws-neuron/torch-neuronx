@@ -431,4 +431,24 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "TODO: Nondeterministic pipeline-schedule failures, xfailed as a safety net"
+            " while under investigation. Two distinct signatures, both scheduling-rate"
+            " dependent rather than test-specific:"
+            " check_leaked_tensors reports 5 (single-rank) or 1 (multi-rank) tensors"
+            " in gc.garbage after schedule.step(), failing 'Expected 0 but got N'. The"
+            " same test passes early in an xdist worker's sequence and fails at position"
+            " ~#10+, and a different member of this set fails on each run, so the tensor"
+            " graph is not what varies. Reproduces locally at a lower rate (~1 failure"
+            " per run) than in CI (7)."
+        ),
+        tests=[
+            "test_schedule.py::TestScheduleLowering::test_grad_with_v_schedule",
+            "test_schedule.py::TestScheduleLowering::test_grad_with_split_b_w",
+            "test_schedule_multiproc.py::ScheduleTest::test_grad_with_manual_interleaved_ScheduleClass*",
+            "test_schedule_multiproc.py::CustomSchedulesTest::test_schedule_with_native_zero_bubble_ScheduleClass*",
+            "test_schedule_multiproc.py::CustomSchedulesTest::test_pipeline_schedule_runtime_custom_sched_ScheduleClass*",
+        ],
+    ),
 ]
