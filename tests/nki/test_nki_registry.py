@@ -6,6 +6,11 @@ import pytest
 import torch
 from nki.collectives import ReplicaGroup
 from nki.framework.torch_native import TorchNativeKernel
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
+)
 
 import torch_neuronx.nki_hop as nki_hop
 from torch_neuronx.nki_hop import NKIHOPCaller, NKIRegistry, register_nki_constant_args
@@ -109,6 +114,134 @@ class TestNKIRegistryConstantArgs:
         second_key = register_nki_constant_args(("replica_group",), ("replica_group",), second)
 
         assert first_key == second_key
+
+
+@pytest.mark.parametrize(
+    "mode_type",
+    [nki_hop._CachingTorchDispatchMode, nki_hop._CachedTorchDispatchMode],
+)
+def test_nki_hop_delegates_checkpoint_modes(mode_type):
+    handler = nki_hop.nki_kernel_wrapper.python_key_table[mode_type]
+    mode = MagicMock(spec=mode_type)
+    mode.__torch_dispatch__.return_value = "checkpoint-result"
+
+    result = handler(mode, marker="value")
+
+    assert result == "checkpoint-result"
+    mode.__torch_dispatch__.assert_called_once_with(
+        nki_hop.nki_kernel_wrapper,
+        [],
+        (),
+        {"marker": "value"},
+    )
+
+
+def _call_test_nki_hop(x, *, backend_config=""):
+    return nki_hop.nki_kernel_wrapper(
+        kernel_idx=0,
+        grid=(1,),
+        backend_config=backend_config,
+        operand_output_aliases={},
+        args=(x,),
+        arg_names=("x",),
+        constant_args_key=-1,
+    )
+
+
+@pytest.fixture
+def cpu_nki_hop():
+    wrapper = nki_hop.nki_kernel_wrapper
+    dispatch_key = torch._C.DispatchKey.CompositeExplicitAutograd
+    original_impl = wrapper.py_kernels[dispatch_key]
+    calls = []
+
+    def impl(*, args, backend_config, **_kwargs):
+        calls.append(args[0].detach().clone())
+        if backend_config == "tuple":
+            return args[0] * 2, args[0] + 1
+        return args[0] * 2
+
+    wrapper.py_kernels[dispatch_key] = impl
+    wrapper._dispatch_cache.clear()
+    try:
+        yield calls
+    finally:
+        wrapper.py_kernels[dispatch_key] = original_impl
+        wrapper._dispatch_cache.clear()
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_calls"),
+    [
+        (CheckpointPolicy.MUST_SAVE, 1),
+        (CheckpointPolicy.PREFER_RECOMPUTE, 2),
+    ],
+)
+def test_nki_hop_checkpoint_modes_cache_or_recompute(cpu_nki_hop, policy, expected_calls):
+    def policy_fn(_ctx, _op, *_args, **_kwargs):
+        return policy
+
+    caching_mode, cached_mode = create_selective_checkpoint_contexts(policy_fn)
+    forward_input = torch.ones(4)
+    replay_input = torch.full((4,), 3.0)
+    with caching_mode:
+        forward = _call_test_nki_hop(forward_input)
+
+    with cached_mode:
+        replay = _call_test_nki_hop(replay_input)
+
+    assert len(cpu_nki_hop) == expected_calls
+    expected = forward if policy == CheckpointPolicy.MUST_SAVE else torch.full((4,), 6.0)
+    torch.testing.assert_close(replay, expected)
+
+
+def test_selective_checkpoint_contexts_replay_nki_hop_outputs_in_order(cpu_nki_hop):
+    caching_mode, cached_mode = create_selective_checkpoint_contexts([nki_hop.nki_kernel_wrapper])
+    forward_inputs = (torch.ones(4), torch.full((4,), 2.0))
+    replay_inputs = (torch.full((4,), 10.0), torch.full((4,), 20.0))
+
+    with caching_mode:
+        forward_outputs = tuple(_call_test_nki_hop(x) for x in forward_inputs)
+    with cached_mode:
+        replay_outputs = tuple(_call_test_nki_hop(x) for x in replay_inputs)
+
+    assert len(cpu_nki_hop) == len(forward_inputs)
+    for actual, expected in zip(replay_outputs, forward_outputs, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_selective_checkpoint_contexts_replay_tuple_output(cpu_nki_hop):
+    caching_mode, cached_mode = create_selective_checkpoint_contexts([nki_hop.nki_kernel_wrapper])
+    with caching_mode:
+        forward = _call_test_nki_hop(torch.ones(4), backend_config="tuple")
+    with cached_mode:
+        replay = _call_test_nki_hop(torch.full((4,), 10.0), backend_config="tuple")
+
+    assert len(cpu_nki_hop) == 1
+    assert isinstance(replay, tuple)
+    for actual, expected in zip(replay, forward, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_nki_hop_runs_through_checkpoint_forward_and_backward(cpu_nki_hop):
+    def context_fn():
+        return create_selective_checkpoint_contexts([nki_hop.nki_kernel_wrapper])
+
+    def fn(x):
+        cached_activation = _call_test_nki_hop(x).detach()
+        return x * cached_activation
+
+    x = torch.tensor([0.25, -0.5, 1.0], requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_(True)
+
+    actual = checkpoint(fn, x, use_reentrant=False, context_fn=context_fn)
+    expected = reference_x * (reference_x * 2).detach()
+    actual.sum().backward()
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, reference_x.grad)
+    assert len(cpu_nki_hop) == 1
 
 
 class TestNKIHOPCallerReplicaGroup:

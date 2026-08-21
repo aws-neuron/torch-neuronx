@@ -13,6 +13,7 @@ from nki.collectives import ReplicaGroup
 from nki.framework.torch_native import TorchNativeKernel
 from torch._C import DispatchKey
 from torch._dynamo import allow_in_graph
+from torch._higher_order_ops.utils import redirect_to_mode
 from torch._library.custom_ops import custom_op
 from torch._library.infer_schema import infer_schema
 from torch._ops import HigherOrderOperator
@@ -22,6 +23,7 @@ from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
     track_tensor_tree,
 )
+from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
 from .nki_kernel import backend_config_str, get_config, return_types_of
 from .utils import get_platform_target, map_external_dtype_to_torch
@@ -189,6 +191,10 @@ class NKIKernelWrapper(HigherOrderOperator):
 
 nki_kernel_wrapper = NKIKernelWrapper()
 nki_kernel_wrapper = allow_in_graph(nki_kernel_wrapper)
+
+
+redirect_to_mode(nki_kernel_wrapper, _CachingTorchDispatchMode)
+redirect_to_mode(nki_kernel_wrapper, _CachedTorchDispatchMode)
 
 
 def get_kernel_config(
