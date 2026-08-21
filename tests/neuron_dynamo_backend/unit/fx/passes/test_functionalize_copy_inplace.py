@@ -1,12 +1,25 @@
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.fx as fx
 import torch.nn as nn
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import GraphModule, symbolic_trace
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+    apply_output_mutations,
+    get_alias_output_buffer_map,
+    get_mutation_copy_back_inputs,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
     FunctionalizeCopyInplacePass,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
 
 # ============================================================================
 # Fixtures
@@ -800,6 +813,153 @@ class TestMutationDetected:
         assert mutation_info.aliases[0].parameter_number == 0
 
 
+# ============================================================================
+# Graph shapes shared by the copy_ and IO-mutation tests
+#
+# Each returns ``(gm, *nodes)``: the module first, then the nodes a caller
+# asserts on.
+# ============================================================================
+
+
+def _aot_functional_copy_graph(dst_shape=(4, 4), dst_dtype=torch.float32):
+    """AOT Autograd's spelling of ``buf.copy_(v); return v``.
+
+    IR:
+    ```
+    def forward(self, arg0_1, arg1_1):
+        mul = torch.ops.aten.mul.Tensor(arg0_1, 2)
+        copy = torch.ops.aten.copy.default(arg1_1, mul)
+        copy_ = torch.ops.aten.copy_.default(arg1_1, copy)
+        return (mul,)
+    ```
+
+    Functionalizing an in-place ``copy_`` leaves a functional ``copy`` between the
+    value and the ``copy_`` epilogue, so the returned node is neither the ``copy_``
+    node nor its ``src``. ``dst_shape`` and ``dst_dtype`` set the destination's
+    ``meta['val']``, which is what decides whether the functional copy broadcasts
+    or casts. ``mul`` is always ``float32[4, 4]``.
+    """
+    graph = fx.Graph()
+    arg0 = graph.placeholder("arg0_1")
+    arg1 = graph.placeholder("arg1_1")
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, (arg0, 2))
+    mul.meta["val"] = torch.zeros(4, 4, dtype=torch.float32)
+    functional_copy = graph.call_function(torch.ops.aten.copy.default, (arg1, mul))
+    functional_copy.meta["val"] = torch.zeros(dst_shape, dtype=dst_dtype)
+    graph.call_function(torch.ops.aten.copy_.default, (arg1, functional_copy))
+    graph.output((mul,))
+    return fx.GraphModule(torch.nn.Module(), graph), mul, functional_copy
+
+
+def _graph_returned_copy():
+    """The mutation result is the returned value (NF-255 KV-cache shape)."""
+    graph = fx.Graph()
+    cache = graph.placeholder("cache")
+    idx = graph.placeholder("idx")
+    row = graph.placeholder("row")
+    index_put = graph.call_function(torch.ops.aten.index_put.default, (cache, [idx], row))
+    copy_inplace = graph.call_function(torch.ops.aten.copy_.default, (cache, index_put))
+    graph.output((copy_inplace,))
+    return (fx.GraphModule(torch.nn.Module(), graph),)
+
+
+def _graph_src_returned():
+    """The copy_ src is returned because AOT Autograd saved it for backward."""
+    graph = fx.Graph()
+    primals_1 = graph.placeholder("primals_1")
+    primals_2 = graph.placeholder("primals_2")
+    primals_3 = graph.placeholder("primals_3")
+    add = graph.call_function(torch.ops.aten.add.Tensor, (primals_1, 1))
+    mm = graph.call_function(torch.ops.aten.mm.default, (primals_2, primals_3))
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, (mm, add))
+    graph.call_function(torch.ops.aten.copy_.default, (primals_1, add))
+    graph.output((mul, primals_2, add))
+    return fx.GraphModule(torch.nn.Module(), graph), mul, primals_2, add
+
+
+def _graph_hidden_copy():
+    """The mutation result is not returned, so the pass has to add an output."""
+    graph = fx.Graph()
+    cache = graph.placeholder("cache")
+    row = graph.placeholder("row")
+    other = graph.placeholder("other")
+    graph.call_function(torch.ops.aten.copy_.default, (cache, row))
+    add = graph.call_function(torch.ops.aten.add.Tensor, (row, other))
+    graph.output((add,))
+    return (fx.GraphModule(torch.nn.Module(), graph),)
+
+
+def _graph_mixed_copies():
+    """One returned mutation and one hidden mutation in the same graph."""
+    graph = fx.Graph()
+    returned_dst = graph.placeholder("returned_dst")
+    returned_src = graph.placeholder("returned_src")
+    hidden_dst = graph.placeholder("hidden_dst")
+    hidden_src = graph.placeholder("hidden_src")
+    x = graph.placeholder("x")
+    returned_copy = graph.call_function(torch.ops.aten.copy_.default, (returned_dst, returned_src))
+    graph.call_function(torch.ops.aten.copy_.default, (hidden_dst, hidden_src))
+    add = graph.call_function(torch.ops.aten.add.Tensor, (x, 1))
+    graph.output((returned_copy, add))
+    return fx.GraphModule(torch.nn.Module(), graph), hidden_src, returned_src, add
+
+
+def _graph_shared_src():
+    """Two inputs mutated with the same returned value."""
+    graph = fx.Graph()
+    arg0 = graph.placeholder("arg0_1")
+    arg1 = graph.placeholder("arg1_1")
+    x = graph.placeholder("x")
+    add = graph.call_function(torch.ops.aten.add.Tensor, (x, 1))
+    graph.call_function(torch.ops.aten.copy_.default, (arg0, add))
+    graph.call_function(torch.ops.aten.copy_.default, (arg1, add))
+    graph.output((add,))
+    return fx.GraphModule(torch.nn.Module(), graph), add
+
+
+def _graph_returned_copy_with_none():
+    """A returned mutation alongside a None output that RemoveNoneOutputs drops later."""
+    graph = fx.Graph()
+    cache = graph.placeholder("cache")
+    idx = graph.placeholder("idx")
+    row = graph.placeholder("row")
+    index_put = graph.call_function(torch.ops.aten.index_put.default, (cache, [idx], row))
+    copy_inplace = graph.call_function(torch.ops.aten.copy_.default, (cache, index_put))
+    graph.output((None, copy_inplace))
+    return (fx.GraphModule(torch.nn.Module(), graph),)
+
+
+def _graph_copy_returned_twice():
+    """The copy_ result is returned twice, so the second slot is a pass-through."""
+    graph = fx.Graph()
+    arg0 = graph.placeholder("arg0_1")
+    arg1 = graph.placeholder("arg1_1")
+    copy_inplace = graph.call_function(torch.ops.aten.copy_.default, (arg0, arg1))
+    graph.output((copy_inplace, copy_inplace))
+    return fx.GraphModule(torch.nn.Module(), graph), arg1
+
+
+def _graph_no_mutation():
+    """No copy_ at all, so the pass must emit nothing."""
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.placeholder("y")
+    graph.output((graph.call_function(torch.ops.aten.add.Tensor, (x, y)),))
+    return (fx.GraphModule(torch.nn.Module(), graph),)
+
+
+def _data_dependent_shape_pair():
+    """``meta['val']`` for a functional copy whose shapes cannot be compared.
+
+    The destination's leading dim is an unbacked SymInt, so comparing it against the
+    source's concrete 1 raises ``GuardOnDataDependentSymNode``. This is the shape
+    ``t = row.new_zeros(n.item(), 4); t.copy_(row)`` traces to.
+    """
+    shape_env = ShapeEnv()
+    with FakeTensorMode(shape_env=shape_env):
+        return torch.empty(shape_env.create_unbacked_symint(), 4), torch.empty(1, 4)
+
+
 class TestCopyInplace:
     """Tests for copy_ in-place operation handling."""
 
@@ -815,10 +975,11 @@ class TestCopyInplace:
         IR After:
         ```
         def forward(self, arg0_1, arg1_1):
-            return (arg1_1, arg1_1)  # copy_ removed, src prepended
+            return (arg1_1,)  # copy_ removed, existing output slot reused
         ```
 
-        copy_ operation should be removed and mutation recorded.
+        The graph already returned the copy_ result, so no output is added and the
+        mutation aliases the slot that already carries it.
         Expected: Graph modified, MutationInfo(parameter_number=0, output_index=0)
         """
         graph = fx.Graph()
@@ -830,10 +991,14 @@ class TestCopyInplace:
 
         result = pass_instance(gm)
         mutation_info = pass_instance.get_mutation_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
 
         assert result.modified is True
+        assert output_node.args[0] == (arg1,)
+        assert pass_instance.added_mutation_output_indices == []
         assert len(mutation_info) == 1
         assert mutation_info.aliases[0].parameter_number == 0
+        assert mutation_info.aliases[0].output_index == 0
 
         # Verify copy_ was removed
         copy_nodes = [
@@ -842,6 +1007,219 @@ class TestCopyInplace:
             if n.op == "call_function" and n.target == torch.ops.aten.copy_.default
         ]
         assert len(copy_nodes) == 0
+
+    def test_copy_inplace_src_already_returned(self, pass_instance):
+        """
+        IR Before:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            add = torch.ops.aten.add.Tensor(arg0_1, 1)
+            copy_ = torch.ops.aten.copy_.default(arg0_1, add)
+            return (add,)
+        ```
+
+        IR After:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            add = torch.ops.aten.add.Tensor(arg0_1, 1)
+            return (add,)
+        ```
+
+        The copy_ node itself is not returned, but its src already is, and
+        replace_all_uses_with puts src in the copy_ node's place, so that slot
+        carries the mutation result and no output is added.
+        """
+        graph = fx.Graph()
+        arg0 = graph.placeholder("arg0_1")
+        graph.placeholder("arg1_1")
+        add = graph.call_function(torch.ops.aten.add.Tensor, (arg0, 1))
+        graph.call_function(torch.ops.aten.copy_.default, (arg0, add))
+        graph.output((add,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        result = pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (add,)
+        assert pass_instance.added_mutation_output_indices == []
+        assert len(mutation_info) == 1
+        assert mutation_info.aliases[0].parameter_number == 0
+        assert mutation_info.aliases[0].output_index == 0
+        assert not [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.copy_.default
+        ]
+
+    def test_returned_value_behind_a_functional_copy_reuses_slot(self, pass_instance):
+        """``buf.copy_(v); return v``, the plainest returned in-place write.
+
+        IR After:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            mul = torch.ops.aten.mul.Tensor(arg0_1, 2)
+            return (mul,)
+        ```
+
+        The functional copy neither broadcasts nor casts, so it reproduces ``mul``
+        exactly and the slot holding ``mul`` already carries the mutation result.
+        Only the ``copy_`` epilogue is removed; the functional copy is left in place,
+        userless, for the compiler to drop.
+        """
+        gm, mul, functional_copy = _aot_functional_copy_graph()
+
+        result = pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (mul,)
+        assert pass_instance.added_mutation_output_indices == []
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(0, 1)]
+        assert not [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.copy_.default
+        ]
+        assert functional_copy in gm.graph.nodes
+        assert not functional_copy.users
+
+    def test_functional_copy_itself_returned_reuses_slot(self, pass_instance):
+        """``return buf.copy_(v)``, where AOT returns the functional copy itself.
+
+        IR:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            mul = torch.ops.aten.mul.Tensor(arg0_1, 2)
+            copy = torch.ops.aten.copy.default(arg1_1, mul)
+            copy_ = torch.ops.aten.copy_.default(arg1_1, copy)
+            return (copy,)
+        ```
+
+        Eager's ``copy_`` returns the destination, so the returned value here is the
+        functional copy that ``src`` also holds, not the value behind it. That slot
+        already carries the mutation result, so matching only the copy_ node or the
+        unwrapped value would prepend a duplicate full-size output.
+        """
+        gm, _, functional_copy = _aot_functional_copy_graph()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        output_node.args = ((functional_copy,),)
+
+        result = pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+
+        assert result.modified is True
+        assert output_node.args[0] == (functional_copy,)
+        assert pass_instance.added_mutation_output_indices == []
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(0, 1)]
+
+    @pytest.mark.parametrize(
+        ("dst_shape", "dst_dtype"),
+        [
+            pytest.param((4, 4), torch.bfloat16, id="casts"),
+            pytest.param((8, 4), torch.float32, id="broadcasts"),
+        ],
+    )
+    def test_functional_copy_that_changes_the_value_is_not_unwrapped(
+        self, pass_instance, dst_shape, dst_dtype
+    ):
+        """A functional copy that casts or broadcasts does not reproduce its source.
+
+        ``copy.default`` takes the destination's shape and dtype, so the returned
+        value and the mutation result are then two different values needing two
+        buffers. The pass must add a slot rather than donate the destination's
+        buffer to the slot holding the source.
+        """
+        gm, mul, functional_copy = _aot_functional_copy_graph(dst_shape, dst_dtype)
+
+        result = pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (functional_copy, mul)
+        assert pass_instance.added_mutation_output_indices == [0]
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(0, 1)]
+
+    def test_functional_copy_without_metadata_is_not_unwrapped(self, pass_instance):
+        """Without ``meta['val']`` the copy cannot be shown to be a no-op.
+
+        Donating the destination's buffer to the slot holding the source would then
+        be a guess, so the pass adds a slot instead.
+        """
+        gm, mul, functional_copy = _aot_functional_copy_graph()
+        functional_copy.meta.pop("val")
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (functional_copy, mul)
+        assert pass_instance.added_mutation_output_indices == [0]
+
+    def test_data_dependent_shapes_are_not_unwrapped(self, pass_instance):
+        """A symbolic dim is never compared, so a data-dependent shape is left alone.
+
+        Comparing an unbacked dim raises ``GuardOnDataDependentSymNode``, which would
+        fail the whole compilation for a graph the pass would otherwise handle. A
+        shape that is not concrete is not provably a no-op, so the pass adds a slot.
+        """
+        gm, mul, functional_copy = _aot_functional_copy_graph()
+        functional_copy.meta["val"], mul.meta["val"] = _data_dependent_shape_pair()
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (functional_copy, mul)
+        assert pass_instance.added_mutation_output_indices == [0]
+
+    def test_aot_saved_for_backward_mutation_reuses_slot(self, pass_instance):
+        """
+        Real AOT Autograd forward graph shape under keep_inference_input_mutations:
+        the mutation src is returned because backward saved it.
+
+        IR Before:
+        ```
+        def forward(self, primals_1, primals_2, primals_3):
+            add = torch.ops.aten.add.Tensor(primals_1, 1)
+            mm = torch.ops.aten.mm.default(primals_2, primals_3)
+            mul = torch.ops.aten.mul.Tensor(mm, add)
+            copy_ = torch.ops.aten.copy_.default(primals_1, add)
+            return (mul, primals_2, add)
+        ```
+
+        IR After:
+        ```
+        def forward(self, primals_1, primals_2, primals_3):
+            add = torch.ops.aten.add.Tensor(primals_1, 1)
+            mm = torch.ops.aten.mm.default(primals_2, primals_3)
+            mul = torch.ops.aten.mul.Tensor(mm, add)
+            return (mul, primals_2, add)
+        ```
+
+        `add` is full-size, so prepending it would cost a second device buffer
+        for a value already in the tuple.
+        """
+        gm, mul, primals_2, add = _graph_src_returned()
+
+        result = pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+        passthrough_info = pass_instance.get_passthrough_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (mul, primals_2, add)
+        assert pass_instance.added_mutation_output_indices == []
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(2, 0)]
+        assert [(a.output_index, a.parameter_number) for a in passthrough_info.aliases] == [(1, 1)]
+        assert not [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.copy_.default
+        ]
 
     def test_copy_inplace_prepends_to_output(self, pass_instance):
         """
@@ -919,6 +1297,147 @@ class TestCopyInplace:
 
         assert result.modified is True
         assert len(mutation_info) == 2
+        assert pass_instance.added_mutation_output_indices == [0, 1]
+
+    def test_mixed_returned_and_hidden_copy_inplace(self, pass_instance):
+        """
+        IR Before:
+        ```
+        def forward(self, returned_dst, returned_src, hidden_dst, hidden_src, x):
+            returned_copy = torch.ops.aten.copy_.default(returned_dst, returned_src)
+            copy__1 = torch.ops.aten.copy_.default(hidden_dst, hidden_src)
+            add = torch.ops.aten.add.Tensor(x, 1)
+            return (returned_copy, add)
+        ```
+
+        IR After:
+        ```
+        def forward(self, returned_dst, returned_src, hidden_dst, hidden_src, x):
+            add = torch.ops.aten.add.Tensor(x, 1)
+            return (hidden_src, returned_src, add)
+        ```
+
+        Only the hidden mutation is prepended; the returned one keeps its slot,
+        shifted by the one prepended output.
+        """
+        gm, hidden_src, returned_src, add = _graph_mixed_copies()
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (hidden_src, returned_src, add)
+        assert pass_instance.added_mutation_output_indices == [0]
+        assert [
+            (a.output_index, a.parameter_number) for a in pass_instance.get_mutation_info().aliases
+        ] == [(0, 2), (1, 0)]
+        assert not [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.copy_.default
+        ]
+
+    def test_shared_src_second_mutation_gets_its_own_slot(self, pass_instance):
+        """
+        IR Before:
+        ```
+        def forward(self, arg0_1, arg1_1, x):
+            add = torch.ops.aten.add.Tensor(x, 1)
+            copy_ = torch.ops.aten.copy_.default(arg0_1, add)
+            copy__1 = torch.ops.aten.copy_.default(arg1_1, add)
+            return (add,)
+        ```
+
+        IR After:
+        ```
+        def forward(self, arg0_1, arg1_1, x):
+            add = torch.ops.aten.add.Tensor(x, 1)
+            return (add, add)
+        ```
+
+        Two inputs are mutated with the same value, so two buffers must be
+        donated. One output can only be donated to one input, so the second
+        mutation cannot reuse the slot the first claimed and gets its own.
+        """
+        gm, add = _graph_shared_src()
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (add, add)
+        assert pass_instance.added_mutation_output_indices == [0]
+        assert [
+            (a.output_index, a.parameter_number) for a in pass_instance.get_mutation_info().aliases
+        ] == [(0, 1), (1, 0)]
+
+    def test_copy_returned_twice_aliases_first_slot_only(self, pass_instance):
+        """
+        IR Before:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            copy_ = torch.ops.aten.copy_.default(arg0_1, arg1_1)
+            return (copy_, copy_)
+        ```
+
+        IR After:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            return (arg1_1, arg1_1)
+        ```
+
+        One mutation cannot donate arg0_1 to both slots, so only the first is a
+        mutation alias. The second is a plain pass-through of arg1_1.
+        """
+        gm, arg1 = _graph_copy_returned_twice()
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (arg1, arg1)
+        assert pass_instance.added_mutation_output_indices == []
+        assert [
+            (a.output_index, a.parameter_number) for a in pass_instance.get_mutation_info().aliases
+        ] == [(0, 0)]
+        assert [
+            (a.output_index, a.parameter_number)
+            for a in pass_instance.get_passthrough_info().aliases
+        ] == [(1, 1)]
+
+    def test_bare_returned_copy_is_not_duplicated(self, pass_instance):
+        """
+        IR Before:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            copy_ = torch.ops.aten.copy_.default(arg0_1, arg1_1)
+            return copy_
+        ```
+
+        IR After:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            return (arg1_1,)
+        ```
+
+        A non-tuple return holding the copy_ result is still recognized.
+        """
+        graph = fx.Graph()
+        arg0 = graph.placeholder("arg0_1")
+        arg1 = graph.placeholder("arg1_1")
+        copy_inplace = graph.call_function(torch.ops.aten.copy_.default, (arg0, arg1))
+        graph.output(copy_inplace)
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        result = pass_instance(gm)
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert result.modified is True
+        assert output_node.args[0] == (arg1,)
+        assert pass_instance.added_mutation_output_indices == []
+        assert [
+            (a.output_index, a.parameter_number) for a in pass_instance.get_mutation_info().aliases
+        ] == [(0, 0)]
 
     def test_copy_inplace_non_placeholder_destination(self, pass_instance):
         """
@@ -1684,14 +2203,16 @@ class TestPassthroughDetection:
             return (copy_, arg2_1)
         ```
 
-        IR After (copy_ removed, mutation prepended):
+        IR After (copy_ removed, its existing output slot reused):
         ```
         def forward(self, arg0_1, arg1_1, arg2_1):
-            return (arg1_1, arg1_1, arg2_1)
+            return (arg1_1, arg2_1)
         ```
 
-        copy_ creates mutation at output[0] in mutation_info.
-        arg1_1 at output[1] and arg2_1 at output[2] are pass-throughs in passthrough_info.
+        output[0] holds arg1_1 but is the mutation's reused slot, so it aliases
+        arg0_1, the destination, not arg1_1. A slot can only be donated to one
+        input, so arg1_1 gets no pass-through of its own. arg2_1 at output[1] is an
+        ordinary pass-through.
         """
         graph = fx.Graph()
         arg0 = graph.placeholder("arg0_1")
@@ -1710,11 +2231,10 @@ class TestPassthroughDetection:
         assert len(mutation_info) == 1
         assert mutation_info.aliases[0].output_index == 0
         assert mutation_info.aliases[0].parameter_number == 0
-        # pass-throughs: arg1_1 (input[1]) at output[1], arg2_1 (input[2]) at output[2]
-        assert len(passthrough_info) == 2
-        aliases = sorted(passthrough_info.aliases, key=lambda a: a.output_index)
-        assert aliases[0].output_index == 1 and aliases[0].parameter_number == 1
-        assert aliases[1].output_index == 2 and aliases[1].parameter_number == 2
+        # pass-through: arg2_1 (input[2]) at output[1]
+        assert len(passthrough_info) == 1
+        assert passthrough_info.aliases[0].output_index == 1
+        assert passthrough_info.aliases[0].parameter_number == 2
 
     def test_passthrough_skips_already_aliased(self, pass_instance):
         """
@@ -1728,12 +2248,12 @@ class TestPassthroughDetection:
         IR After:
         ```
         def forward(self, arg0_1, arg1_1):
-            return (arg1_1, arg1_1)
+            return (arg1_1,)
         ```
 
-        output[0] is already aliased by copy_ mutation.
-        output[1] is arg1_1 (the copy source), which is a placeholder.
-        Pass-through detection should skip output[0] and detect output[1].
+        output[0] holds arg1_1, a placeholder, but it is already a mutation alias
+        of arg0_1. Recording it as a pass-through of arg1_1 too would claim two
+        different donors for one slot, so pass-through detection skips it.
         """
         graph = fx.Graph()
         arg0 = graph.placeholder("arg0_1")
@@ -1747,12 +2267,39 @@ class TestPassthroughDetection:
         passthrough_info = pass_instance.get_passthrough_info()
 
         assert result.modified is True
-        # output[0] = mutation
-        assert len(mutation_info) == 1
-        assert mutation_info.aliases[0].output_index == 0
-        # output[1] = arg1_1 = placeholder → pass-through
-        assert len(passthrough_info) == 1
-        assert passthrough_info.aliases[0].output_index == 1
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(0, 0)]
+        assert len(passthrough_info) == 0
+
+    def test_reused_slot_may_hold_a_bare_placeholder(self, pass_instance):
+        """
+        IR:
+        ```
+        def forward(self, arg0_1, arg1_1):
+            copy_ = torch.ops.aten.copy_.default(arg0_1, arg1_1)
+            return (copy_,)
+        ```
+
+        The reused slot ends up holding arg1_1, a bare placeholder, while aliasing
+        arg0_1. An output carrying no computation has no store in the compiled NEFF
+        (see the note in ``torch_neuronx/python_ops/torch_mlir/kernel.py``), so both
+        the mutation and this slot's value depend on the compiler honouring
+        must_alias here. Pinned because it is the one alias shape in this pass where
+        the aliased input differs from the value in the slot.
+        """
+        graph = fx.Graph()
+        arg0 = graph.placeholder("arg0_1")
+        arg1 = graph.placeholder("arg1_1")
+        copy_inplace = graph.call_function(torch.ops.aten.copy_.default, (arg0, arg1))
+        graph.output((copy_inplace,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        pass_instance(gm)
+        mutation_info = pass_instance.get_mutation_info()
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+
+        assert output_node.args[0] == (arg1,)
+        assert output_node.args[0][0].op == "placeholder"
+        assert [(a.output_index, a.parameter_number) for a in mutation_info.aliases] == [(0, 0)]
 
     def test_activation_checkpoint_pattern(self, pass_instance):
         """
@@ -1842,6 +2389,166 @@ class TestPassthroughDetection:
 
         assert len(passthrough_info) == 0
         assert result.modified is False
+
+
+def _run_with_state(build_graph):
+    """Run the pass with a state attached so it emits PassMutations."""
+    state = NeuronFXPassState(job=MagicMock(), model_name="test", dumping_enabled=False)
+    pass_instance = FunctionalizeCopyInplacePass(state)
+    gm, *_ = build_graph()
+    pass_instance(gm)
+    return gm, state
+
+
+def _graph_outputs(gm):
+    output_node = next(n for n in gm.graph.nodes if n.op == "output")
+    outputs = output_node.args[0]
+    return list(outputs) if isinstance(outputs, list | tuple) else [outputs]
+
+
+def _add_indices(state):
+    """Indices of the single MutationKind.ADD entry, or None when none was emitted."""
+    added = [
+        m.indices
+        for pm in state.pass_mutations
+        for m in pm.output_mutations
+        if m.kind == MutationKind.ADD
+    ]
+    assert len(added) <= 1, f"expected at most one ADD entry, got {added}"
+    return added[0] if added else None
+
+
+def _caller_output_slots(gm, state, extra_pass_mutations=()):
+    """NEFF output slot labels as the caller receives them after output mutations."""
+    pass_mutations = [*state.pass_mutations, *extra_pass_mutations]
+    n_graph_outputs = len(_graph_outputs(gm))
+    n_neff_outputs = n_graph_outputs - sum(
+        len(m.indices)
+        for pm in extra_pass_mutations
+        for m in pm.output_mutations
+        if m.kind == MutationKind.REMOVE
+    )
+    return apply_output_mutations(
+        [f"neff{i}" for i in range(n_neff_outputs)], pass_mutations, "cpu"
+    )
+
+
+# ============================================================================
+# Emitted IO mutations, as the executor and the compiler consume them
+# ============================================================================
+
+
+class TestEmittedIOMutations:
+    """Pins the PassMutations the pass emits, not the private bookkeeping.
+
+    MutationKind.ADD makes the executor filter an output out, so it must name only
+    the slots this pass actually added, not every slot that carries a mutation.
+    """
+
+    def test_returned_copy_emits_no_add(self):
+        gm, state = _run_with_state(_graph_returned_copy)
+
+        assert len(_graph_outputs(gm)) == 1
+        assert _add_indices(state) is None
+        assert get_alias_output_buffer_map(state.pass_mutations) == {0: 0}
+        assert get_mutation_copy_back_inputs(state.pass_mutations) == {0: 0}
+        assert _caller_output_slots(gm, state) == ["neff0"]
+
+    def test_src_returned_emits_no_add(self):
+        gm, state = _run_with_state(_graph_src_returned)
+
+        assert len(_graph_outputs(gm)) == 3
+        assert _add_indices(state) is None
+        # output[2] is the mutation result, output[1] a plain weight pass-through.
+        assert get_alias_output_buffer_map(state.pass_mutations) == {1: 1, 2: 0}
+        assert get_mutation_copy_back_inputs(state.pass_mutations) == {2: 0}
+        assert _caller_output_slots(gm, state) == ["neff0", "neff1", "neff2"]
+
+    def test_hidden_copy_emits_add(self):
+        gm, state = _run_with_state(_graph_hidden_copy)
+
+        assert len(_graph_outputs(gm)) == 2
+        assert _add_indices(state) == [0]
+        assert get_alias_output_buffer_map(state.pass_mutations) == {0: 0}
+        assert get_mutation_copy_back_inputs(state.pass_mutations) == {0: 0}
+        # The added slot is filtered out, leaving only the model's own output.
+        assert _caller_output_slots(gm, state) == ["neff1"]
+
+    def test_mixed_copies_add_only_the_hidden_one(self):
+        gm, state = _run_with_state(_graph_mixed_copies)
+
+        assert len(_graph_outputs(gm)) == 3
+        assert _add_indices(state) == [0]
+        assert get_alias_output_buffer_map(state.pass_mutations) == {0: 2, 1: 0}
+        assert get_mutation_copy_back_inputs(state.pass_mutations) == {0: 2, 1: 0}
+        assert _caller_output_slots(gm, state) == ["neff1", "neff2"]
+
+    def test_shared_src_donates_a_buffer_per_input(self):
+        gm, state = _run_with_state(_graph_shared_src)
+
+        assert len(_graph_outputs(gm)) == 2
+        assert _add_indices(state) == [0]
+        assert get_alias_output_buffer_map(state.pass_mutations) == {0: 1, 1: 0}
+        assert get_mutation_copy_back_inputs(state.pass_mutations) == {0: 1, 1: 0}
+        assert _caller_output_slots(gm, state) == ["neff1"]
+
+    def test_reused_slot_survives_a_later_output_removal(self):
+        """A reused slot is not at index 0, so a successor REMOVE has to shift it."""
+        gm, state = _run_with_state(_graph_returned_copy_with_none)
+
+        assert _graph_outputs(gm)[0] is None
+        assert _add_indices(state) is None
+
+        remove_none = PassMutations(
+            pass_name="RemoveNoneOutputs",
+            output_mutations=[
+                IOMutation(
+                    kind=MutationKind.REMOVE,
+                    indices=[0],
+                    transform_key="none",
+                    pass_name="RemoveNoneOutputs",
+                )
+            ],
+        )
+        pass_mutations = [*state.pass_mutations, remove_none]
+
+        assert get_alias_output_buffer_map(pass_mutations) == {0: 0}
+        assert get_mutation_copy_back_inputs(pass_mutations) == {0: 0}
+        assert _caller_output_slots(gm, state, [remove_none]) == [None, "neff0"]
+
+    def test_reused_slot_copy_back_names_a_caller_visible_slot(self):
+        """A reused slot's copy-back index is one the caller receives.
+
+        ``Executor._cast_output_device`` yields ``original_input.copy_(...)`` for
+        every copy-back index, i.e. the caller's own input tensor object, so under
+        TORCH_NEURONX_RETAIN_DEVICE_MODE=1 the caller receives that object as this
+        output. The value is the mutation result either way, and object identity
+        matches eager, which returns the mutated tensor itself.
+        """
+        gm, state = _run_with_state(_graph_returned_copy)
+
+        copy_back = get_mutation_copy_back_inputs(state.pass_mutations)
+        caller_slots = _caller_output_slots(gm, state)
+
+        assert copy_back == {0: 0}
+        assert all(f"neff{i}" in caller_slots for i in copy_back)
+
+    def test_added_slot_copy_back_names_a_filtered_slot(self):
+        """A prepended slot's copy-back index never reaches the caller."""
+        gm, state = _run_with_state(_graph_hidden_copy)
+
+        copy_back = get_mutation_copy_back_inputs(state.pass_mutations)
+        caller_slots = _caller_output_slots(gm, state)
+
+        assert copy_back == {0: 0}
+        assert all(f"neff{i}" not in caller_slots for i in copy_back)
+
+    def test_no_mutations_emits_nothing(self):
+        gm, state = _run_with_state(_graph_no_mutation)
+
+        assert state.pass_mutations == []
+        assert get_alias_output_buffer_map(state.pass_mutations) == {}
+        assert _caller_output_slots(gm, state) == ["neff0"]
 
 
 # ============================================================================
