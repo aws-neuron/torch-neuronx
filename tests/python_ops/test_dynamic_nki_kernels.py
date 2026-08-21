@@ -381,6 +381,26 @@ class TestDynamicNkiKernels:
     def _bf16_neuron(self, *shapes):
         return [torch.randn(s, dtype=torch.bfloat16).to("neuron") for s in shapes]
 
+    def test_dynamic_packed_int64_gather_compile_once(self):
+        from torch_neuronx.packed_storage import packed_int64_execution_view
+
+        def run(numel):
+            values = torch.arange(numel, dtype=torch.int64)
+            low = packed_int64_execution_view(values.to("neuron"))
+            torch.testing.assert_close(low.cpu(), values.to(torch.int32))
+
+        run(63)
+        run(128)
+        before = {entry["cache_key"] for entry in torch_neuronx._C._get_compilation_cache_entries()}
+        assert any("dynamic_packed_int64_gather_small--" in key for key in before)
+        assert any("dynamic_packed_int64_gather--" in key for key in before)
+
+        for numel in (1, 127, 129, 190, 218, 289, 327, 654):
+            run(numel)
+
+        after = {entry["cache_key"] for entry in torch_neuronx._C._get_compilation_cache_entries()}
+        assert after == before, f"dynamic numel sweep compiled new NEFFs: {after - before}"
+
     # ── per-op correctness: routes to dynamic kernel AND matches CPU ──
     @pytest.mark.parametrize("spec,dtype", _OP_DTYPE_CASES, ids=_OP_DTYPE_IDS)
     def test_dynamic_nki_op(self, spec, dtype):
