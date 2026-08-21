@@ -253,6 +253,10 @@ class TestFusedAdamW:
         for pc, pn in zip(params_cpu, params_neuron, strict=False):
             torch.testing.assert_close(pn.detach().cpu(), pc.detach(), rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.needs_process_isolation(
+        reason="Optimizer state mismatches CPU under process sharing and survives the "
+        "retry. Forked until the root cause is fixed."
+    )
     def test_fused_adamw_amsgrad(self):
         """Test AdamW with AMSGrad enabled."""
         torch.manual_seed(42)
@@ -279,6 +283,10 @@ class TestFusedAdamW:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
+    @pytest.mark.needs_process_isolation(
+        reason="Optimizer state mismatches CPU under process sharing and survives the "
+        "retry. Forked until the root cause is fixed."
+    )
     def test_fused_adamw_maximize(self):
         """Test AdamW with maximize=True."""
         torch.manual_seed(42)
@@ -382,6 +390,10 @@ class TestFusedAdamW:
                 state["exp_avg_sq"].data_ptr() == exp_avg_sq_ptr
             ), "exp_avg_sq should be updated in-place"
 
+    @pytest.mark.needs_process_isolation(
+        reason="Optimizer state mismatches CPU under process sharing and survives the "
+        "retry. Forked until the root cause is fixed."
+    )
     def test_fused_adamw_amsgrad_buffer_donation(self):
         """Test buffer donation with AMSGrad enabled."""
         torch.manual_seed(42)
@@ -788,6 +800,10 @@ class TestFusedAdam:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
+    @pytest.mark.needs_process_isolation(
+        reason="Optimizer state mismatches CPU under process sharing and survives the "
+        "retry. Forked until the root cause is fixed."
+    )
     def test_fused_adam_amsgrad(self):
         """Test Adam with AMSGrad."""
         torch.manual_seed(42)
@@ -811,6 +827,10 @@ class TestFusedAdam:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
+    @pytest.mark.needs_process_isolation(
+        reason="Optimizer state mismatches CPU under process sharing and survives the "
+        "retry. Forked until the root cause is fixed."
+    )
     def test_fused_adam_maximize(self):
         """Test Adam with maximize=True."""
         torch.manual_seed(42)
