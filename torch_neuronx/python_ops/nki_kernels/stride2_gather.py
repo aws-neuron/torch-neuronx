@@ -62,7 +62,7 @@ import nki.language as nl
 import torch
 
 from torch_neuronx.nki_hop import nki_op, wrap_nki
-from torch_neuronx.utils import get_logical_neuron_cores
+from torch_neuronx.utils import get_logical_neuron_cores, use_dynamic_nki_kernels
 
 # Partition dimension: the hardware partition count.
 P_MAX = 128
@@ -260,6 +260,19 @@ def run_strided_gather(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
     span = src_tensor.untyped_storage().nbytes() // src_tensor.element_size() - base_off
     grouped = src_tensor.as_strided((span,), (1,), storage_offset=base_off)
     out_flat = dst_tensor.reshape(numel)
+    if (
+        use_dynamic_nki_kernels()
+        and stride == 2
+        and lane == 0
+        and grouped.dtype == torch.int32
+        and out_flat.dtype == torch.int32
+    ):
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.packed_int64_gather import (
+            try_run_dynamic_packed_int64_gather,
+        )
+
+        if try_run_dynamic_packed_int64_gather(grouped, out_flat, numel):
+            return
     strided_flat_gather_kernel_[LNC](grouped, out_flat, int(stride), int(lane))
 
 
