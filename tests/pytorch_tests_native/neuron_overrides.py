@@ -12,6 +12,9 @@ files.
   before comparison
 """
 
+import contextlib
+import gc
+
 import torch
 import torch.testing._internal.common_utils as _common_utils
 
@@ -194,9 +197,34 @@ def _filter_complex_scalars_in_opinfo_samples():
     cmi.reference_inputs_where = _patched_reference_inputs_where
 
 
+_original_check_leaked_tensors = _common_utils.check_leaked_tensors
+
+
+@contextlib.contextmanager
+def _synced_check_leaked_tensors(*args, **kwargs):
+    """Drain the device queue before the leak check measures the heap.
+
+    On an eager CUDA/CPU backend the block's tensors are dereferenced when the
+    block ends, so the gc.collect() in upstream's check_leaked_tensors
+    measures the block correctly. On Neuron, execution is asynchronous: when the block
+    ends, the runtime may still hold transient references to those tensors, so
+    whether the collector sees the cycle as unreachable at that instant depends
+    on whether the queue happens to have drained. The measurement races the
+    device - without a synchronize(), assertions are non-deterministic and can
+    fail tests in an xdist worker due to asynchronous tensor lifetime, not
+    actual leaked tensors.
+    """
+    with _original_check_leaked_tensors(*args, **kwargs) as garbage_objs:
+        yield garbage_objs
+        with contextlib.suppress(Exception):
+            torch.neuron.synchronize()
+        gc.collect()
+
+
 def apply_patches():
     """Apply all Neuron test patches."""
     torch.compile = _neuron_compile
+    _common_utils.check_leaked_tensors = _synced_check_leaked_tensors
     torch.allclose = _cross_device_allclose
     torch.equal = _cross_device_equal
     _common_utils.TestCase.assertEqual = _cross_device_assert_equal

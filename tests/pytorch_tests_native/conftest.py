@@ -159,12 +159,6 @@ from skip_registry.neuron_blocklist import BLOCKLIST  # noqa: E402
 
 os.environ["DISTRIBUTED_TESTS_DEFAULT_TIMEOUT"] = "600"  # 10 minutes
 os.environ.setdefault("PYTORCH_TESTING_DEVICE_ONLY_FOR", "neuron")
-# Some upstream files hardcode only_for=["cpu","cuda","hpu","xpu"] in their
-# instantiate_device_type_tests() call, which drops the PrivateUse1 (neuron)
-# base before PYTORCH_TESTING_DEVICE_ONLY_FOR=neuron is even applied. This re-adds the
-# PrivateUse1 base from the full list, bypassing the file's only_for, and runs
-# before the env only_for filter so "privateuse1" survives.
-os.environ.setdefault("PYTORCH_TESTING_DEVICE_FOR_CUSTOM", "privateuse1")
 # Prefer multi-process over multi-threaded tests (NRT is not thread-safe)
 os.environ.setdefault("PYTORCH_TESTING_PREFER_MULTIPROCESS", "1")
 # Prevent torch.manual_seed() from triggering CUDA lazy init (segfaults without GPU driver)

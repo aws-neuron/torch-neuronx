@@ -336,11 +336,28 @@ SKIP_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="NRT cannot init collectives for non-contiguous replica groups in TP+FSDP mesh",
+        reason=(
+            "NRT cannot init collectives for replica groups that are not chip-aligned on trn2."
+        ),
         tests=[
             "TestTPFSDPIntegration::test_fsdp_tp_extension_grad",
             "TestTPFSDPIntegration::test_fsdp_tp_integration",
             "TestTPFSDPIntegration::test_fsdp_tp_sync_module_state",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass0_bfloat16",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass0_float32",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass1_bfloat16",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass1_float32",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass2_bfloat16",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass2_float32",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass3_bfloat16",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass3_float32",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass4_bfloat16",
+            "ComposabilityTest::test_replicate_pp_ScheduleClass4_float32",
+            "ComposabilityTest::test_replicate_pp_grads_ScheduleClass0",
+            "ComposabilityTest::test_replicate_pp_grads_ScheduleClass1",
+            "ComposabilityTest::test_replicate_pp_grads_ScheduleClass2",
+            "ComposabilityTest::test_replicate_pp_grads_ScheduleClass3",
+            "ComposabilityTest::test_replicate_pp_grads_ScheduleClass4",
         ],
     ),
     SkipGroup(
