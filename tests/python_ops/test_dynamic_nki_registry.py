@@ -12,6 +12,7 @@ kernel is needed. Covers:
 """
 
 import pytest
+import torch
 
 import torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dispatch_entry as de
 from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import (
@@ -281,6 +282,41 @@ class TestDynamicNkiDispatchKwargs:
         )
         with pytest.raises(TypeError):
             de.try_dynamic_nki_dispatch("inconsistent_stub", (FakeTensor(),), {"alpha": 2})
+
+
+class TestToCopyGate:
+    """_can_handle_to_copy declines sub-128-M casts to the native path.
+
+    The dynamic _to_copy avoids a pad only for M >= 128 (ragged-tail overlap); a sub-tile M
+    would take a fresh [128, H] zeros pad + slice-assign, which is wasteful for a tiny cast
+    and has faulted on device (NRT 1004) on some contiguous collective tensors (FSDP
+    reduce-scatter chunk_cat). _is_castable is stubbed True here to isolate the M gate from
+    the neuron-device / contiguity checks (those need a real device).
+    """
+
+    def _can_handle(self, monkeypatch, shape):
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapters import cast
+
+        monkeypatch.setattr(cast, "_is_castable", lambda t: True)
+        t = torch.empty(*shape, dtype=torch.float32)
+        return cast._can_handle_to_copy(t, dtype=torch.bfloat16)
+
+    def test_accepts_m_ge_128(self, monkeypatch):
+        assert self._can_handle(monkeypatch, (256, 2048)) is True
+        assert self._can_handle(monkeypatch, (128, 512)) is True  # exactly one tile
+
+    def test_declines_sub_128_m(self, monkeypatch):
+        assert self._can_handle(monkeypatch, (64, 2048)) is False
+        assert self._can_handle(monkeypatch, (127, 2048)) is False  # one row short
+        assert self._can_handle(monkeypatch, (100,)) is False  # 1-D: M = numel = 100
+
+    def test_no_dtype_change_declines(self, monkeypatch):
+        # A layout-only copy (same dtype) is not this kernel's job, regardless of M.
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapters import cast
+
+        monkeypatch.setattr(cast, "_is_castable", lambda t: True)
+        t = torch.empty(256, 2048, dtype=torch.bfloat16)
+        assert cast._can_handle_to_copy(t, dtype=torch.bfloat16) is False
 
 
 if __name__ == "__main__":

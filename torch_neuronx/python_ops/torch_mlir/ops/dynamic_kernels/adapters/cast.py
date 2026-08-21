@@ -5,9 +5,9 @@ dtype — into a fresh tensor for ``_to_copy`` or into ``self`` for ``copy_``.
 
 **Neither path pads the rows**: the kernel covers a ragged M with an overlapping
 tail tile (see ``cast_kernel``), so it needs no pad buffer and no over-allocated
-output, which is what makes the in-place ``copy_`` legal at any M >= 128. The one
-exception is a sub-tile ``_to_copy`` (the tail's ``M - 128`` offset would go
-negative), which is safe to pad since it owns its output; ``copy_`` declines there.
+output, which is what makes the in-place ``copy_`` legal at any M >= 128. Both
+``_to_copy`` and ``copy_`` require M >= 128 (the tail's ``M - 128`` offset would go
+negative for a sub-tile M); sub-128 casts decline to the native path.
 
 compile_key = (H, src_dtype, dst_dtype), all baked; M is dynamic.
 """
@@ -20,7 +20,6 @@ from ..adapter_utils import (
     _compile_or_load_neff,
     _dest_buffer,
     _num_tiles_tensor,
-    _pad_or_contig,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
@@ -63,13 +62,16 @@ def _target_dtype(dtype, out_dtype):
 
 
 def _can_handle_to_copy(self, dtype=None, out_dtype=None, non_blocking=False, **_) -> bool:
-    """Neuron->neuron dtype cast of a contiguous tensor. ``device`` / ``memory_format``
-    are filtered out before can_handle: the caller applies memory_format itself. No
-    dtype change means a layout-only copy, which this kernel does not implement."""
+    """Neuron->neuron dtype cast of a contiguous, M >= 128 tensor. ``device`` /
+    ``memory_format`` are filtered out before can_handle: the caller applies memory_format
+    itself. No dtype change means a layout-only copy, which this kernel does not implement."""
     target = _target_dtype(dtype, out_dtype)
     if target is None or not isinstance(self, torch.Tensor) or target == self.dtype:
         return False
-    return target in _SUPPORTED_DTYPES and _is_castable(self)
+    if not (target in _SUPPORTED_DTYPES and _is_castable(self)):
+        return False
+    M, _ = _mh(self)  # noqa: N806
+    return M >= _TILE_M
 
 
 def _to_copy_compile_key(self, dtype=None, out_dtype=None, non_blocking=False, **_):
@@ -79,27 +81,24 @@ def _to_copy_compile_key(self, dtype=None, out_dtype=None, non_blocking=False, *
 
 
 def _prepare_to_copy_io(self, dtype=None, out_dtype=None, non_blocking=False, dest=None, **_):
-    """Flatten to [M, H] and hand the kernel the real row count. Only a sub-tile M
-    pads, up to the one tile the tail offset needs; reshape_output slices it back off."""
+    """Flatten to [M, H] and hand the kernel the real row count. M >= _TILE_M (can_handle),
+    so the [M, H] view goes to the kernel unpadded; reshape_output just restores the shape."""
     target = _target_dtype(dtype, out_dtype)
     M, H = _mh(self)  # noqa: N806
     device = self.device
 
-    x_2d = self.reshape(M, H)
-    if M >= _TILE_M:
-        M_buf, x = M, x_2d  # noqa: N806  (contiguous per can_handle: no copy)
-    else:
-        M_buf, x = _TILE_M, _pad_or_contig(x_2d, _TILE_M)  # noqa: N806
+    # can_handle guarantees M >= _TILE_M, so no pad: the kernel covers the ragged tail with an
+    # overlapping last tile and reads the contiguous [M, H] view directly.
+    x = self.reshape(M, H)  # contiguous per can_handle: no copy
     # Holds a ROW count here, not a tile count: the kernel needs the exact M for its tail.
-    nr = _num_tiles_tensor(M_buf, device)
-    # dest= holds M*H elements, so it can only back the buffer when M is unpadded.
-    dest_buf = dest if M_buf == M else None
-    outputs = (_dest_buffer(dest_buf, M_buf, H, target, device),)
+    nr = _num_tiles_tensor(M, device)
+    outputs = (_dest_buffer(dest, M, H, target, device),)
     return (x, nr), outputs, M
 
 
 def _reshape_to_copy_output(outputs, original_args):
-    """Restore the source shape in the new dtype; the slice is a no-op unless padded."""
+    """Restore the source shape in the new dtype. M >= _TILE_M so the output is unpadded;
+    the [:M] slice is a no-op kept for shape safety."""
     self = original_args[0]
     M, _ = _mh(self)  # noqa: N806
     return outputs[0][:M].reshape(self.shape)
