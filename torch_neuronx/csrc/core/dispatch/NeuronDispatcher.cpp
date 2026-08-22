@@ -1,7 +1,11 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/transformers/sdp_utils.h>
+#include <ATen/ops/_conj.h>
+#include <ATen/ops/_neg_view.h>
 #include <ATen/ops/nonzero_numpy.h>
+#include <ATen/ops/stack.h>
+#include <ATen/ops/view_as_real.h>
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
@@ -458,6 +462,83 @@ static bool RunKHostCastChain(const at::Tensor& src, at::Tensor& dst) {
   return SubmitKHostCastChain(src_prepared, dst);
 }
 
+/// The same complex tensor with its conj/neg bits toggled off, sharing storage.
+static at::Tensor WithoutConjNeg(const at::Tensor& t) {
+  at::Tensor physical = t;
+  if (physical.is_conj()) physical = at::_conj(physical);
+  if (physical.is_neg()) physical = at::_neg_view(physical);
+  return physical;
+}
+
+/// Interleaved real view with the conj/neg bits cleared: `at::view_as_real`
+/// rejects a conjugated tensor and carries a neg bit onto its result.
+static at::Tensor PhysicalRealView(const at::Tensor& t) {
+  return at::view_as_real(WithoutConjNeg(t));
+}
+
+/// Cases the on-device complex path declines, leaving them to the CPU bounce.
+static bool ComplexCopyMustBounce(const at::Tensor& src, const at::Tensor& dst) {
+  // A cast, which copying interleaved real lanes does not do.
+  if (src.scalar_type() != dst.scalar_type()) return true;
+
+  // A peer copy: `dst_real.copy_(src_real)` reaches GetTargetDeviceId, which
+  // rejects a mismatched input/output device index.
+  if (src.device() != dst.device()) return true;
+
+  // A device write could read a lane it has already overwritten.
+  if (src.storage().is_alias_of(dst.storage())) return true;
+
+  // complex128 lanes are float64, which DowncastArgs silently rewrites to float32
+  // for the nested neg/stack. complex32 lanes are float16, which is supported.
+  return !IsSupportedDtype(c10::toRealValueType(src.scalar_type()));
+}
+
+/// Neuron→Neuron `copy_` for complex dtypes, on device.
+///
+/// `aten::copy_` is a fallthrough at ATen's Conjugate and Negative keys, so
+/// materializing those bits belongs to this op, and complex has no MLIR copy
+/// lowering — which left the CPU bounce below as the only implementation. View
+/// both sides as interleaved real instead and flip the lanes the metadata asks
+/// for: conj flips the imaginary lane, neg both, the two together only the real.
+/// Returns false for ComplexCopyMustBounce's cases, after normalizing a flagged
+/// dst, which the bounce cannot express.
+static bool TryComplexNeuronToNeuronCopy(const at::Tensor& src, at::Tensor& dst) {
+  if (ComplexCopyMustBounce(src, dst)) {
+    // The bounce materializes only the source — `CopyNeuronToCPU` reads
+    // `src.is_conj()` and never looks at dst — so move dst's bits onto src and
+    // redispatch against the physical dst. `_conj`/`_neg_view` toggle, so each
+    // composes as a logical conjugate. No recursion: that dst carries no bits.
+    if (!dst.is_conj() && !dst.is_neg()) return false;
+
+    at::Tensor src_adjusted = src;
+    if (dst.is_conj()) src_adjusted = at::_conj(src_adjusted);
+    if (dst.is_neg()) src_adjusted = at::_neg_view(src_adjusted);
+    at::Tensor dst_physical = WithoutConjNeg(dst);
+    dst_physical.copy_(src_adjusted);
+    return true;
+  }
+
+  const bool flip_conj = src.is_conj() != dst.is_conj();
+  const bool flip_neg = src.is_neg() != dst.is_neg();
+
+  at::Tensor src_real = PhysicalRealView(src);
+  at::Tensor dst_real = PhysicalRealView(dst);
+
+  if (flip_conj && flip_neg) {
+    // conj ∘ neg — real lane only.
+    src_real = at::stack({src_real.select(-1, 0).neg(), src_real.select(-1, 1)}, -1);
+  } else if (flip_conj) {
+    src_real = at::stack({src_real.select(-1, 0), src_real.select(-1, 1).neg()}, -1);
+  } else if (flip_neg) {
+    src_real = src_real.neg();
+  }
+
+  // Real dtype from here: no recursion, and the real paths handle broadcast and
+  // a non-contiguous dst.
+  dst_real.copy_(src_real);
+  return true;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  aten::copy_ — CPU↔Neuron via NRT, Neuron→Neuron via MLIR or NRT
 // ═══════════════════════════════════════════════════════════════
@@ -554,11 +635,23 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
   }
 
   // ── Neuron → Neuron ──
+  //   0. Complex          — via the interleaved real view, conj/neg on device
   //   1. MLIR pipeline    — contiguous dst, supported dtypes, default stream
   //   2. NRT on-device    — non-contiguous dst, same dtype, same shape
   //   2.5. Raw NRT N→N    — same dtype, contiguous src, non-default stream + hostCC
   //   3. NRT CPU bounce   — everything else
   if (src_is_neuron && dst_is_neuron) {
+    // ── 0. Complex: reconcile conj/neg on device instead of on the host ──
+    if (src.is_complex() && self_tensor.is_complex() &&
+        TryComplexNeuronToNeuronCopy(src, self_tensor)) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron complex real-view path",
+                                   " dtype=", src.scalar_type(), " shape=", src.sizes(),
+                                   " src_conj=", src.is_conj(), " src_neg=", src.is_neg());
+      logOperationExecuted("aten::copy_");
+      torch::jit::push(*stack, self_tensor);
+      return;
+    }
+
     const bool is_non_default_hostcc = IsNonDefaultStreamWithHostCC(self_tensor.device().index());
     bool mlir_can_handle = self_tensor.dim() > 0 && self_tensor.is_contiguous() &&
                            IsCopyMlirDtypeSupported(src.scalar_type()) &&
@@ -1238,6 +1331,27 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] already contiguous — returning as-is",
                                  " op=", op_name);
     torch::jit::push(*stack, self_tensor);
+    return;
+  }
+
+  // Complex: `contiguous` is an allocate-and-copy, and TryComplexNeuronToNeuronCopy
+  // reconciles the conj/neg bits on device, so route through it instead of the host —
+  // this is the op ATen's Conjugate key materializes a non-contiguous conjugated view
+  // through, as in `index_select(x.t().conj(), ...)`. Gated on copy_'s own real-lane
+  // dtype check: this branch sits above kFallbackOnlyForUnimplemented, so a dtype
+  // copy_ declines would otherwise reach the host bounce with the policy skipped.
+  // channels_last stays on the fallback below, which the real copy cannot express.
+  if (self_tensor.is_complex() && memory_format == c10::MemoryFormat::Contiguous &&
+      IsSupportedDtype(c10::toRealValueType(self_tensor.scalar_type()))) {
+    auto dst = at::empty(
+        self_tensor.sizes(),
+        at::TensorOptions().dtype(self_tensor.scalar_type()).device(self_tensor.device()));
+    dst.copy_(self_tensor);
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] complex via copy_", " op=", op_name,
+                                 " dtype=", self_tensor.scalar_type(),
+                                 " is_conj=", self_tensor.is_conj());
+    logOperationExecuted(op_name);
+    torch::jit::push(*stack, dst);
     return;
   }
 

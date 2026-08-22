@@ -195,19 +195,38 @@ class TestComplexCPUFallbackOps:
         not FLAG_ENABLED, reason="Requires TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1"
     )
     @pytest.mark.parametrize(
-        "make_noncontig",
+        ("shape", "make_noncontig"),
         [
-            lambda: torch.randn(8, 8, dtype=torch.complex64, device="neuron").transpose(0, 1),
-            lambda: torch.randn(8, 8, dtype=torch.complex64, device="neuron")[::2, :],
-            lambda: torch.randn(2, 3, 4, dtype=torch.complex64, device="neuron").permute(2, 0, 1),
+            ((8, 8), lambda t: t.transpose(0, 1)),
+            ((8, 8), lambda t: t[::2, :]),
+            ((2, 3, 4), lambda t: t.permute(2, 0, 1)),
         ],
         ids=["transpose", "slice", "permute"],
     )
-    def test_complex_contiguous_raises_when_flag_set(self, make_noncontig):
-        """Non-contiguous complex tensors raise with FALLBACK_ONLY=1."""
-        x_view = make_noncontig()
-        with pytest.raises(RuntimeError, match="complex"):
-            x_view.contiguous()
+    def test_complex_contiguous_runs_on_device_when_flag_set(self, shape, make_noncontig):
+        """Complex contiguous() is an on-device copy_, so it does not need the fallback."""
+        x_cpu = torch.randn(*shape, dtype=torch.complex64)
+        result = make_noncontig(x_cpu.to("neuron")).contiguous()
+        assert result.is_contiguous()
+        torch.testing.assert_close(result.cpu(), make_noncontig(x_cpu).contiguous())
+
+    @pytest.mark.skipif(
+        not FLAG_ENABLED, reason="Requires TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1"
+    )
+    def test_complex128_contiguous_still_raises_when_flag_set(self):
+        """complex128 lanes are float64, so copy_ declines it — the policy must still raise."""
+        x = torch.randn(8, 8, dtype=torch.complex128).to("neuron").transpose(0, 1)
+        with pytest.raises(RuntimeError, match="aten::contiguous"):
+            x.contiguous()
+
+    @pytest.mark.skipif(
+        not FLAG_ENABLED, reason="Requires TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1"
+    )
+    def test_complex_channels_last_contiguous_still_raises_when_flag_set(self):
+        """Only MemoryFormat::Contiguous goes on device; channels_last stays on the fallback."""
+        x = torch.randn(2, 3, 4, 5, dtype=torch.complex64).to("neuron")
+        with pytest.raises(RuntimeError, match="aten::contiguous"):
+            x.contiguous(memory_format=torch.channels_last)
 
     def test_complex_contiguous_noop_when_already_contiguous(self):
         """Already-contiguous returns as-is — no fallback, no raise."""
@@ -304,8 +323,7 @@ class TestConjNegNonContiguousCopy:
     """Non-contiguous complex copy with conj/neg bits requires CPU fallback.
 
     These tests exercise copy_ paths where the source or destination is
-    non-contiguous AND has conj/neg metadata. The contiguous() call on a
-    complex Neuron tensor falls back to CPU, so these need fallback enabled.
+    non-contiguous AND has conj/neg metadata, and run with fallback enabled.
     """
 
     def test_copy_conj_non_contiguous_src_to_neuron(self):
