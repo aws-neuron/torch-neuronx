@@ -5,6 +5,17 @@ from tests.pytorch_tests_native.skip_registry import skipped_tests as s
 
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
+        reason=(
+            "[PT2.13] Hangs indefinitely under torch.compile(neuron): one xdist worker"
+            " stalls on this test forever, holding the dynamo suite at 99% until the"
+            " ~70-min job timeout (KeyboardInterrupt). Deterministic — the sole"
+            " started-but-never-finished test across full runs."
+        ),
+        tests=[
+            "test_exception_contract.py::*::test_compile_preserves_index_error",
+        ],
+    ),
+    SkipGroup(
         reason="Test subprocess timeout on Neuron (exceeds 600s limit)",
         tests=[
             "TestFxGraphRunnableMultiProcessGroup::test_multiple_process_groups",
