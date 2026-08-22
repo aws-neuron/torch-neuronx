@@ -212,7 +212,8 @@ def _to_copy_spec(dst_dtype, **flags):
 
     The sweep's ``dtype`` is the SOURCE dtype — one spec per target, sources being
     the other two (same-dtype declines). Tolerance is the destination dtype's,
-    since the cast rounds to that precision."""
+    since the cast rounds to that precision. min_rows matches ``copy_``: since #1687
+    the cast adapter declines sub-128 M instead of padding it."""
 
     def build(dtype, *, rows=512, h=2048):
         x = torch.randn(rows, h, dtype=dtype) / 8
@@ -224,6 +225,7 @@ def _to_copy_spec(dst_dtype, **flags):
         lambda x: x.to(dst_dtype),
         dtypes=tuple(d for d in _DTYPES if d != dst_dtype),
         label=f"_to_copy_{_DTYPE_ID[dst_dtype]}",
+        min_rows=128,
         # Widening to fp32 is lossless (bf16 and fp16 are both exactly
         # representable) -> exact; narrowing rounds to the destination's precision.
         tol=(0, 0) if dst_dtype is torch.float32 else _TOL[dst_dtype],
