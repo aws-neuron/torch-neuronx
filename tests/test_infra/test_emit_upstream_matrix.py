@@ -8,6 +8,7 @@ toggle for CI reruns hangs off this.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_native" / "runner"))
 
+from distribution_config import expand_distribution_config
 from emit_upstream_matrix import (
     CONFIG_DIR,
     DEFAULT_DIST_CONFIG,
@@ -90,8 +92,6 @@ def test_default_config_exists_and_has_full_coverage():
     # Sanity: the default config covers the full upstream suite. If
     # someone shrinks it accidentally (like we did during a previous
     # debugging pass), this fails fast.
-    import json
-
     path = CONFIG_DIR / DEFAULT_DIST_CONFIG
     assert path.is_file(), f"Default distribution config not found: {path}"
     with open(path) as f:
@@ -105,9 +105,18 @@ def test_default_config_exists_and_has_full_coverage():
     )
 
 
-def test_smoke_config_exists_and_is_minimal():
-    import json
+def test_default_config_soft_fails_only_dedicated_pp_node():
+    with open(CONFIG_DIR / DEFAULT_DIST_CONFIG) as f:
+        dist = json.load(f)
 
+    nodes_by_items = {tuple(node["items"]): node for node in expand_distribution_config(dist)}
+
+    assert nodes_by_items[("distributed/pipelining",)]["soft_fail"] is True
+    assert nodes_by_items[("distributed/fsdp",)]["soft_fail"] is False
+    assert nodes_by_items[("distributed/_composable",)]["soft_fail"] is False
+
+
+def test_smoke_config_exists_and_is_minimal():
     path = CONFIG_DIR / "upstream_pytorch_test_distribution_config.smoke.json"
     assert path.is_file(), f"Smoke config missing: {path}"
     with open(path) as f:
