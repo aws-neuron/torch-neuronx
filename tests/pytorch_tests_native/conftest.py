@@ -14,8 +14,8 @@ from pathlib import Path
 _CORES_PER_WORKER_ENV = "NEURON_CORES_PER_WORKER"
 
 
-def _setup_neuron_cores_for_xdist() -> None:
-    """Partition visible cores across xdist workers, BEFORE ``import torch``.
+def _setup_neuron_worker_for_xdist() -> None:
+    """Configure Neuron resources for xdist workers, BEFORE ``import torch``.
 
     ``torch.get_device_module(...).device_count()`` (and
     ``torch.accelerator.device_count()``) memoize the Neuron device count on
@@ -54,14 +54,22 @@ def _setup_neuron_cores_for_xdist() -> None:
     if cores_per_worker <= 0:
         return
 
+    from tests.utils.bootstrap_ports import configure_worker_bootstrap_port
     from tests.utils.neuron_test_utils import (
         get_core_start_index,
         get_pytest_worker_count,
+        get_pytest_worker_index,
         get_total_core_count,
     )
 
     if get_pytest_worker_count() <= 1:
         return
+
+    # Replacement workers can have an index beyond the physical core count.
+    # Pin their bootstrap port before returning for an empty core window so they
+    # never fall back to the process-wide free-port selection.
+    configure_worker_bootstrap_port(get_pytest_worker_index())
+
     _core_start = get_core_start_index()
     _core_end = min(_core_start + cores_per_worker - 1, get_total_core_count() - 1)
     if _core_start > _core_end:
@@ -126,7 +134,7 @@ _overlay_torch_internal()
 
 # Partition Neuron cores per xdist worker BEFORE importing torch, so the device
 # count is memoized against this worker's window (see the function docstring).
-_setup_neuron_cores_for_xdist()
+_setup_neuron_worker_for_xdist()
 
 # Sibling-import shims for upstream test directories
 _TEST_ROOT = Path(__file__).parent / "test"
