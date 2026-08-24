@@ -274,15 +274,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "SDPA backward NRT execution failure — invalid NEFF during"
-            " all_reduce in _scaled_dot_product_fused_attention_overrideable_backward"
-        ),
-        tests=[
-            "TestFSDPHybridShard::test_fsdp_hybrid_shard_parity",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "NRT all_gather fails with invalid DMA block size for the tensor "
             "shape used in FSDP fine tuning pretrain step"
         ),

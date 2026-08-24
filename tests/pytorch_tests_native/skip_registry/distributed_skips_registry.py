@@ -3,6 +3,21 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "Flaky HSDP hybrid-shard parity: it can pass, fail gracefully (SDPA"
+            " backward invalid NEFF during all_reduce), or hit a fatal mode where the"
+            " strided replica group ([0,2,4,6]/[1,3,5,7]) finds no Neuron collective"
+            " algorithm (ENC 'no_hier no_mesh') and the rank aborts. The abort kills the"
+            " continuous-test rank pool and wedges the whole suite on a blocking"
+            " completion-queue get, which xfail cannot catch. Skipped (not xfailed) to"
+            " keep the suite reliable; pending a Neuron runtime fix for strided replica"
+            " groups."
+        ),
+        tests=[
+            "test_fsdp_hybrid_shard.py::TestFSDPHybridShard::test_fsdp_hybrid_shard_parity",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "FSDP v1 tests that time out (>600s) on Neuron and fail with"
             " 'Expected exit code 0 but got 1' or 'Scalars are not equal'."
             " Likely collective deadlocks during optim state dict operations."
