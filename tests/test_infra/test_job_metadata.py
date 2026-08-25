@@ -13,10 +13,13 @@ Two sides are covered:
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pytorch_tests_n
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
+import job_metadata  # noqa: E402  (import-after-skip is intentional)
 from job_metadata import (  # noqa: E402  (import-after-skip is intentional)
     VERSION_FIELDS,
     VERSIONS_SIDECAR_NAME,
@@ -41,7 +45,9 @@ _BASE_VERSIONS = {
     "pytorch_version": "2.12.0",
     "torch_neuronx_version": "2.12.0.1.0",
     "neuronx_cc_version": "2.21.18209.0+043b1bf7",
+    "neuronx_cc_build_time": "2026-08-20T01:40:06Z",
     "aws_neuronx_runtime_lib_version": "2.28.23.0",
+    "aws_neuronx_runtime_lib_build_time": "2026-08-19T08:17:00Z",
     "aws_neuronx_collectives_version": "2.28.27.0",
     "aws_neuronx_dkms_version": "2.24.7.0",
     "aws_neuronx_tools_version": "2.28.55.0",
@@ -93,6 +99,51 @@ def _write(results_dir: Path, out: Path, versions_per_node: list[dict]) -> list[
 # ---------------------------------------------------------------------------
 # Node side — probing
 # ---------------------------------------------------------------------------
+
+
+def test_neuronx_cc_build_time_normalizes_utc(monkeypatch):
+    version_module = SimpleNamespace(__buildtime__="Aug 20 2026, 01:40:06 UTC")
+    monkeypatch.setattr(importlib, "import_module", lambda _: version_module)
+
+    assert job_metadata._neuronx_cc_build_time() == "2026-08-20T01:40:06Z"
+
+
+@pytest.mark.parametrize(
+    "version_module",
+    [SimpleNamespace(), SimpleNamespace(__buildtime__="not a timestamp")],
+)
+def test_neuronx_cc_build_time_returns_none_for_invalid_metadata(monkeypatch, version_module):
+    monkeypatch.setattr(importlib, "import_module", lambda _: version_module)
+
+    assert job_metadata._neuronx_cc_build_time() is None
+
+
+def test_neuronx_cc_build_time_returns_none_when_import_fails(monkeypatch):
+    def fail_import(_):
+        raise ModuleNotFoundError
+
+    monkeypatch.setattr(importlib, "import_module", fail_import)
+
+    assert job_metadata._neuronx_cc_build_time() is None
+
+
+def test_runtime_lib_build_time_uses_newest_real_binary(tmp_path):
+    older = tmp_path / "libnrt.so.2.x.1.0"
+    newer = tmp_path / "libnrt.so.2.x.2.0"
+    symlink_target = tmp_path / "not-a-runtime-library"
+    older.touch()
+    newer.touch()
+    symlink_target.touch()
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newer, (1_800_000_000, 1_800_000_000))
+    os.utime(symlink_target, (1_900_000_000, 1_900_000_000))
+    (tmp_path / "libnrt.so.2").symlink_to(symlink_target)
+
+    assert job_metadata._runtime_lib_build_time(tmp_path) == "2027-01-15T08:00:00Z"
+
+
+def test_runtime_lib_build_time_returns_none_without_binary(tmp_path):
+    assert job_metadata._runtime_lib_build_time(tmp_path) is None
 
 
 def test_collect_versions_returns_all_fields():

@@ -15,8 +15,9 @@ The split is mandatory: only the test node has torch / neuronx-cc / dkms /
 collectives / runtime-lib installed, so versions can only be *captured* there;
 the aggregator can only *collect* what the nodes wrote.
 
-Captured versions (all nullable → NULL in Athena when a package is absent):
-  pytorch, torch_neuronx, neuronx_cc (compiler), aws_neuronx_runtime_lib (NRT),
+Captured metadata (all nullable → NULL in Athena when a package is absent):
+  pytorch, torch_neuronx, neuronx_cc (compiler), neuronx_cc build time,
+  aws_neuronx_runtime_lib (NRT), runtime library build time,
   aws_neuronx_collectives, aws_neuronx_dkms (driver), aws_neuronx_tools.
 
 Table grain: one row per run (versions are a property of the run's image,
@@ -32,12 +33,13 @@ Version capture must never fail a test run. The parquet is written under the
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
 import subprocess
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -46,13 +48,19 @@ logger = logging.getLogger(__name__)
 # for it across all ``upstream-pytorch-*`` node artifacts.
 VERSIONS_SIDECAR_NAME = "env_versions.json"
 
+NEURON_RUNTIME_LIB_DIR = Path("/opt/aws/neuron/lib")
+ISO_8601_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+NEURONX_CC_BUILD_TIME_FORMAT = "%b %d %Y, %H:%M:%S UTC"
+
 # The version fields captured, in the column order used by the parquet schema
 # and the Athena DDL. Each maps to one probe in ``collect_versions()``.
 VERSION_FIELDS = (
     "pytorch_version",
     "torch_neuronx_version",
     "neuronx_cc_version",
+    "neuronx_cc_build_time",
     "aws_neuronx_runtime_lib_version",
+    "aws_neuronx_runtime_lib_build_time",
     "aws_neuronx_collectives_version",
     "aws_neuronx_dkms_version",
     "aws_neuronx_tools_version",
@@ -107,6 +115,33 @@ def _dpkg_version(package: str) -> str | None:
         return None
 
 
+def _neuronx_cc_build_time() -> str | None:
+    """Return the compiler build time as UTC ISO-8601, else None."""
+    try:
+        version_module = importlib.import_module("neuronxcc.version")
+        parsed = datetime.strptime(version_module.__buildtime__, NEURONX_CC_BUILD_TIME_FORMAT)
+        return parsed.replace(tzinfo=timezone.utc).strftime(ISO_8601_UTC_FORMAT)
+    except Exception as exc:
+        logger.debug("neuronx-cc build-time probe failed: %s", exc)
+        return None
+
+
+def _runtime_lib_build_time(library_dir: Path = NEURON_RUNTIME_LIB_DIR) -> str | None:
+    """Return the newest real libnrt binary mtime as UTC ISO-8601, else None."""
+    try:
+        mtimes = [
+            path.stat().st_mtime
+            for path in library_dir.glob("libnrt.so.*")
+            if path.is_file() and not path.is_symlink()
+        ]
+        if not mtimes:
+            return None
+        return datetime.fromtimestamp(max(mtimes), timezone.utc).strftime(ISO_8601_UTC_FORMAT)
+    except Exception as exc:
+        logger.debug("runtime build-time probe failed: %s", exc)
+        return None
+
+
 def collect_versions() -> dict[str, str | None]:
     """Probe every component version. Keys are ``VERSION_FIELDS``; values are a
     version string or None (missing/uninstalled). Safe to call anywhere — all
@@ -115,7 +150,9 @@ def collect_versions() -> dict[str, str | None]:
         "pytorch_version": _module_version("torch"),
         "torch_neuronx_version": _pip_version("torch-neuronx") or _module_version("torch_neuronx"),
         "neuronx_cc_version": _module_version("neuronxcc") or _pip_version("neuronx-cc"),
+        "neuronx_cc_build_time": _neuronx_cc_build_time(),
         "aws_neuronx_runtime_lib_version": _dpkg_version("aws-neuronx-runtime-lib"),
+        "aws_neuronx_runtime_lib_build_time": _runtime_lib_build_time(),
         "aws_neuronx_collectives_version": _dpkg_version("aws-neuronx-collectives"),
         "aws_neuronx_dkms_version": _dpkg_version("aws-neuronx-dkms"),
         "aws_neuronx_tools_version": _dpkg_version("aws-neuronx-tools"),
