@@ -53,6 +53,7 @@ class TestMetricsUnit:
         """_get_compilation_cache_entries returns per-graph compilation times."""
         import torch.nn as nn
 
+        torch_neuronx.synchronize()
         torch_neuronx._C._clear_compilation_cache()
 
         class Model(nn.Module):
