@@ -304,6 +304,15 @@ def torch_masked_select(x, mask, out=None):
     def masked_select_fn(x, mask, size, out=None):
         broadcast_shape = torch.broadcast_shapes(x.shape, mask.shape)
 
+        # A 0-d broadcast shape (both self and mask are scalars) has no
+        # coordinate axes, which nonzero_static cannot express: the size==0 path
+        # stacks an empty coordinate list ("stack expects a non-empty
+        # TensorList") and the size==1 path indexes shape[-1] (IndexError).
+        # Viewing both operands as 1-element vectors gives the same result --
+        # masked_select always returns a 1-d tensor.
+        if not broadcast_shape:
+            broadcast_shape = torch.Size([1])
+
         if x.shape != broadcast_shape:
             x = x.broadcast_to(broadcast_shape)
         if mask.shape != broadcast_shape:
@@ -315,8 +324,58 @@ def torch_masked_select(x, mask, out=None):
     return masked_select_fn, (x, mask, size), {"out": out}
 
 
-@register_aten(["aten::masked_fill"])
-@register_aten(["aten::masked_fill_.Scalar"], validate_static_inputs=validate_inplace_broadcast)
+def _validate_masked_fill(x, mask, value, out=None, **_kwargs):
+    """Enforce masked_fill's input contract before the lowering runs.
+
+    Raising here (rather than letting the traced ``torch.masked_fill`` fail and
+    the dispatcher retry on CPU) keeps the exact ATen message: with
+    ``TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1`` the fallback layer
+    replaces the op's own error with "CPU fallback disabled ...".
+    """
+    if isinstance(mask, torch.Tensor) and mask.dtype != torch.bool:
+        raise RuntimeError(
+            f"masked_fill_ only supports boolean masks, but got mask with dtype {mask.dtype}"
+        )
+    if isinstance(value, torch.Tensor) and value.dim() != 0:
+        raise RuntimeError(
+            "masked_fill_ only supports a 0-dimensional value tensor, but got tensor "
+            f"with {value.dim()} dimension(s)."
+        )
+
+
+def _validate_masked_fill_inplace(x, mask, value, out=None, **kwargs):
+    """masked_fill_: the input contract plus the no-expanding-destination rule."""
+    _validate_masked_fill(x, mask, value, out=out, **kwargs)
+    validate_inplace_broadcast(x, mask, **kwargs)
+
+
+# masked_fill has four overloads plus two in-place ones. Only the ``_`` variants
+# have a backend dispatch entry in native_functions.yaml; ``masked_fill.Scalar``,
+# ``.Tensor`` and the two ``_out`` forms are CompositeExplicitAutograd. They are
+# registered anyway so each lowers as a single Neuron kernel instead of
+# decomposing into clone/copy_ + masked_fill_, and so the executed-op log names
+# the overload that actually ran.
+#
+# The result always keeps ``self.dtype`` — masked_fill does not type-promote
+# against ``value`` — so the lowering must not run ``result_type``.
+#
+# The functional and ``_out`` overloads share one registration (the ``_out``
+# forms alias their ``out=`` buffer through the standard out-tensor path, so no
+# ``output_params`` is needed). Only the in-place ``_`` variants take a separate
+# decorator, for the no-expanding-destination validator.
+@register_aten(
+    [
+        "aten::masked_fill.Scalar",
+        "aten::masked_fill.Tensor",
+        "aten::masked_fill.Scalar_out",
+        "aten::masked_fill.Tensor_out",
+    ],
+    validate_static_inputs=_validate_masked_fill,
+)
+@register_aten(
+    ["aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor"],
+    validate_static_inputs=_validate_masked_fill_inplace,
+)
 def torch_masked_fill(x, mask, value, out=None):
     return torch.masked_fill(x, mask, value)
 

@@ -371,10 +371,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="Neuron tuple index out of range for masked_fill/scatter ops",
-        tests=x.DYNAMO_TUPLE_INDEX_OUT_OF_RANGE,
-    ),
-    SkipGroup(
         reason="Neuron NEFF param_num / output_idx out of bounds",
         tests=[
             "AOTAutogradCacheBundledTests::test_dtensor_cache_hit",

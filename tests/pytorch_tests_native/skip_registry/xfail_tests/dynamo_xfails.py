@@ -469,13 +469,6 @@ DYNAMO_STREAM_EVENT_TYPE_MISMATCH = [
     "DynamicShapesCtxManagerTests::test_cuda_stream_context_manager1_dynamic_shapes",
 ]
 
-DYNAMO_TUPLE_INDEX_OUT_OF_RANGE = [
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float64",
-]
-
 DYNAMO_GRADIENT_NEURON_TO_CPU = [
     "BackwardHigherOrderOpTests::test_invoke_in_pt2_compiled_autograd_side_effect",
     "*MiscTests::test_requires_grad_intermediate_chunked_loss_backward*",
@@ -486,8 +479,6 @@ DYNAMO_INPLACE_METADATA_PROPAGATION = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_bfloat16",

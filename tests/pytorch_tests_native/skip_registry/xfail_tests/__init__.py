@@ -94,9 +94,6 @@ from .dynamo_xfails import (
     DYNAMO_TO_COPY_DISPATCH_FAILURE as DYNAMO_TO_COPY_DISPATCH_FAILURE,
 )
 from .dynamo_xfails import (
-    DYNAMO_TUPLE_INDEX_OUT_OF_RANGE as DYNAMO_TUPLE_INDEX_OUT_OF_RANGE,
-)
-from .dynamo_xfails import (
     DYNAMO_UNRESOLVED_MATERIALIZATION_I64 as DYNAMO_UNRESOLVED_MATERIALIZATION_I64,
 )
 from .dynamo_xfails import (

@@ -3470,6 +3470,18 @@ def register_all_defaults(r, traced_models=()):
         },
         source="builtin",
     )
+    # Explicit entry: the out= fallback derives its args from masked_fill.Scalar,
+    # whose float `value` doesn't type-check against the Tensor_out schema.
+    r(
+        "aten::masked_fill.Tensor_out",
+        {
+            "self": (256, 256),
+            "mask": {"shape": (256, 256), "dtype": "bool"},
+            "value": {"shape": (), "dtype": "float"},
+            "out": (256, 256),
+        },
+        source="builtin",
+    )
     r(
         "aten::masked_select.out",
         {
