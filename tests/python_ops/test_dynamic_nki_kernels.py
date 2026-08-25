@@ -50,6 +50,13 @@ def _cast_tol(src_dtype, dst_dtype):
 _FLAG_ON = os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") == "1"
 
 
+def _exact_src(rows, cols, dtype):
+    """Bit-exact source values; int dtypes can't use randn."""
+    if dtype.is_floating_point:
+        return torch.randn(rows, cols, dtype=dtype) / 8
+    return torch.arange(rows * cols, dtype=dtype).reshape(rows, cols)
+
+
 def _entry(op_name):
     from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import (
         get_dynamic_nki_entry,
@@ -1006,6 +1013,55 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_skipped("copy_"):
             dst.copy_(src.to("neuron"))
         torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+    # ── sub-tile M: delegated to neuron::nki_strided_copy_ (the block-strided gather) ──
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.bfloat16, torch.float16, torch.float32, torch.int32],
+        ids=["bf16", "fp16", "fp32", "int32"],
+    )
+    # rows=1 is excluded: a [1, H] slice of [1, 2H] is contiguous (extent-1 leading dim),
+    # so it is not a strided case at all and declines like any sub-tile contiguous copy.
+    @pytest.mark.parametrize("rows", [2, 16, 64, 100, 119, 127])
+    def test_dynamic_nki_copy_sub_tile_strided_src_delegates(self, rows, dtype):
+        """Sub-tile M is delegated to nki_strided_copy_ instead of declining to the
+        shape-baking prologue. Byte-exact: a copy does no arithmetic, so any tolerance
+        would hide a wrong access-pattern offset."""
+        wide = _exact_src(rows, 2048, dtype)
+        src_n = wide.to("neuron")[:, :1024]
+        assert not src_n.is_contiguous()
+        dst_n = torch.zeros(rows, 1024, dtype=dtype).to("neuron")
+        with _assert_dynamic_ran("copy_"):
+            dst_n.copy_(src_n)
+        torch.testing.assert_close(dst_n.cpu(), wide[:, :1024].contiguous(), rtol=0, atol=0)
+
+    def test_dynamic_nki_copy_sub_tile_strided_src_no_recompile(self):
+        """One NEFF per (block_size, row_stride, dtype) covers every sub-tile row count."""
+        import torch_neuronx._C as _C
+
+        def move(rows):
+            wide = _exact_src(rows, 2048, torch.bfloat16)
+            dst = torch.zeros(rows, 1024, dtype=torch.bfloat16).to("neuron")
+            dst.copy_(wide.to("neuron")[:, :1024])
+            torch.neuron.synchronize()
+            torch.testing.assert_close(dst.cpu(), wide[:, :1024].contiguous(), rtol=0, atol=0)
+
+        move(64)  # warm
+        before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+        for rows in [2, 16, 100, 127]:
+            move(rows)
+        new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
+        assert not new, f"recompiled for a new sub-tile M: {sorted(new)}"
+
+    @pytest.mark.parametrize("rows", [2, 64, 127])
+    def test_dynamic_nki_copy_sub_tile_broadcast_src_declines(self, rows):
+        """Stride-0 is not a gather pattern: stays declined (element path would overlap)."""
+        col = torch.randn(rows, 1, dtype=torch.bfloat16) / 8
+        src_n = col.to("neuron").expand(rows, 1024)
+        dst_n = torch.zeros(rows, 1024, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_skipped("copy_"):
+            dst_n.copy_(src_n)
+        torch.testing.assert_close(dst_n.cpu(), col.expand(rows, 1024), rtol=0, atol=0)
 
     @pytest.mark.parametrize("rows", [129, 200, 383])
     def test_dynamic_nki_copy_ragged_row_slice_no_clobber(self, rows):

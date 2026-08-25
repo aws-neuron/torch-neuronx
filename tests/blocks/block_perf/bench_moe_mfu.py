@@ -144,6 +144,10 @@ def _run(mode, shape_mode, args):
     out_fd, out_json = tempfile.mkstemp(suffix=f"_{shape_mode}_{mode}.json")
     os.close(out_fd)
     env = dict(os.environ)
+    # Both default to ON, which lets the C++ prologue/epilogue absorb a non-contiguous
+    # operand and bake its shape into the cache key.
+    env["TORCH_NEURONX_ENABLE_PROLOGUE"] = "0"
+    env["TORCH_NEURONX_ENABLE_EPILOGUE"] = "0"
     env.pop("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS", None)
     cc = env.get("NEURON_CC_FLAGS", "").replace(_DYN_CC_FLAG, "")
     cc = " ".join(cc.split())

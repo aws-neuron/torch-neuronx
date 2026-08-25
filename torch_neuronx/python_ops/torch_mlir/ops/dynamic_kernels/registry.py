@@ -30,6 +30,10 @@ class DynamicNkiEntry:
     # Optional: derive compile_key from op args. When None, one NEFF (key=None).
     compile_key_fn: Callable[..., object] | None = None
 
+    # Optional: handle the op here, for work delegated to another dynamic kernel that owns
+    # its own compile+execute. Returns (result, actual_M), or None to fall through.
+    run: Callable[..., object] | None = None
+
     _compiled: dict = field(default_factory=dict, repr=False)
 
     # Instrumentation (for tests / debugging): every time this dynamic kernel

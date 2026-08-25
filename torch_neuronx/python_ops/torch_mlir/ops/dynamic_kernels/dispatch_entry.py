@@ -97,6 +97,17 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     if not entry.can_handle(*args, **gate_kwargs):
         return None
 
+    # A shape our own kernel can't cover may be delegated to another dynamic kernel, which
+    # owns its compile+execute and so bypasses the steps below.
+    run = getattr(entry, "run", None)
+    if run is not None:
+        delegated = run(*args, dest=dest, **op_kwargs)
+        if delegated is not None:
+            result, actual_m = delegated
+            entry.record_exec(actual_m)
+            logger.debug("dynamic NKI delegated op=%s M=%s", short_name, actual_m)
+            return result
+
     compile_key_fn = getattr(entry, "compile_key_fn", None)
     compile_key = compile_key_fn(*args, **op_kwargs) if compile_key_fn is not None else None
     _hlo_bytes, cache_key = entry.get_compiled(compile_key)

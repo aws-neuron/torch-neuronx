@@ -543,6 +543,33 @@ static bool TryComplexNeuronToNeuronCopy(const at::Tensor& src, at::Tensor& dst)
 //  aten::copy_ — CPU↔Neuron via NRT, Neuron→Neuron via MLIR or NRT
 // ═══════════════════════════════════════════════════════════════
 
+// Feature flag, read once. The env var is process-fixed, so when the feature is
+// off this is a single cached bool test on the hot path (no getenv, no GIL).
+static const bool kDynNkiEnabled = []() {
+  const char* env = std::getenv("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS");
+  return env != nullptr && std::string(env) == "1";
+}();
+
+// Dtypes the dynamic copy/cast kernels can move: adapter_utils._SUPPORTED_DTYPES plus
+// int32, which has no cast kernel but rides the strided kernel's passthrough variant.
+static inline bool DynNkiCopyDtype(c10::ScalarType t) {
+  return t == c10::ScalarType::BFloat16 || t == c10::ScalarType::Half ||
+         t == c10::ScalarType::Float || t == c10::ScalarType::Int;
+}
+
+// Keeps the GIL off the hot path: only a strided source of a kernel-supported dtype is
+// worth a Python can_handle walk. A contiguous copy_ still reaches the adapter via the
+// Python impl path, so filtering it here costs no NEFF (measured: block test unchanged).
+static inline bool DynNkiCopyCandidate(const at::Tensor& dst, const at::Tensor& src) {
+  return DynNkiCopyDtype(dst.scalar_type()) && DynNkiCopyDtype(src.scalar_type()) &&
+         !src.is_contiguous();
+}
+
+// Forward declaration — TryDynNkiDispatch is defined below, after the copy handlers.
+static bool TryDynNkiDispatch(const c10::OperatorHandle& op, torch::jit::Stack* stack,
+                              const std::string& lookup_name, const std::vector<c10::IValue>& args,
+                              const c10::FunctionSchema& schema, const std::string& op_name);
+
 void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
                                         c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack,
                                         const OpRegistration& reg) {
@@ -595,6 +622,18 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
 
   bool src_is_neuron = src.is_privateuseone();
   bool dst_is_neuron = self_tensor.is_privateuseone();
+
+  // ── Dynamic-NKI pre-check ── runs first so the kernel's access pattern reads the
+  // strided source directly; .contiguous() here would let the prologue bake the row count.
+  if (kDynNkiEnabled && src_is_neuron && dst_is_neuron && !needs_broadcast &&
+      self_tensor.is_contiguous() && self_tensor.numel() > 0 &&
+      DynNkiCopyCandidate(self_tensor, src)) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] dynamic-NKI pre-check", " src_shape=", src.sizes(),
+                                 " src_strides=", src.strides());
+    if (TryDynNkiDispatch(op, stack, "copy_", args, schema, "aten::copy_")) {
+      return;
+    }
+  }
 
   // ── CPU → Neuron ──
   if (src.device().is_cpu() && dst_is_neuron) {
@@ -995,6 +1034,17 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
+    // ── Dynamic-NKI pre-check ── same reason as DispatchCopyImpl.
+    if (kDynNkiEnabled && src_is_neuron && dst_is_neuron && same_index && preserve_fmt &&
+        self_tensor.numel() > 0 && DynNkiCopyDtype(target_dtype) && !self_tensor.is_contiguous()) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] dynamic-NKI pre-check",
+                                   " src_shape=", self_tensor.sizes(),
+                                   " src_strides=", self_tensor.strides());
+      if (TryDynNkiDispatch(op, stack, "_to_copy", args, schema, "aten::_to_copy")) {
+        return;
+      }
+    }
+
     // ── default stream: dtype (Phase 1) then layout (Phase 2) ──
     // _to_copy is two independent transforms — a dtype conversion and a
     // memory_format change. Doing dtype first, layout second.
@@ -1125,13 +1175,6 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
 // ═══════════════════════════════════════════════════════════════
 //  Dynamic-NKI pre-check
 // ═══════════════════════════════════════════════════════════════
-
-// Feature flag, read once. The env var is process-fixed, so when the feature is
-// off this is a single cached bool test on the hot path (no getenv, no GIL).
-static const bool kDynNkiEnabled = []() {
-  const char* env = std::getenv("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS");
-  return env != nullptr && std::string(env) == "1";
-}();
 
 // When the feature is enabled and a registered dynamic kernel can_handle this
 // op, Python compiles-once + executes the NEFF at the actual runtime shape and
@@ -1401,6 +1444,16 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
     logOperationExecuted(op_name);
     torch::jit::push(*stack, result);
     return;
+  }
+
+  // ── Dynamic-NKI pre-check ── same reason as DispatchCopyImpl.
+  if (kDynNkiEnabled && !self_tensor.is_contiguous() && self_tensor.numel() > 0) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] dynamic-NKI pre-check",
+                                 " shape=", self_tensor.sizes(),
+                                 " strides=", self_tensor.strides());
+    if (TryDynNkiDispatch(op, stack, lookup_name, args, schema, op_name)) {
+      return;
+    }
   }
 
   auto original_args = args;

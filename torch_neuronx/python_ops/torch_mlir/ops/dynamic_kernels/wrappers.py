@@ -27,6 +27,12 @@ from .sigmoid_kernel import sigmoid_kernel
 from .silu_bwd_kernel import silu_bwd_kernel
 from .silu_kernel import silu_kernel
 from .sin_kernel import sin_kernel
+from .strided_copy_kernel import (
+    strided_copy_kernel_bf16,
+    strided_copy_kernel_fp16,
+    strided_copy_kernel_fp32,
+    strided_copy_kernel_same,
+)
 from .sub_kernel import sub_kernel
 from .sum_kernel import sum_kernel
 from .where_kernel import where_kernel
@@ -51,6 +57,11 @@ _wrapped_cat = wrap_nki(cat_kernel)
 _wrapped_cast_bf16 = wrap_nki(cast_kernel_bf16)
 _wrapped_cast_fp16 = wrap_nki(cast_kernel_fp16)
 _wrapped_cast_fp32 = wrap_nki(cast_kernel_fp32)
+# Strided-view -> contiguous copy; `same` keeps the source dtype (the only int32 path).
+_wrapped_strided_same = wrap_nki(strided_copy_kernel_same)
+_wrapped_strided_bf16 = wrap_nki(strided_copy_kernel_bf16)
+_wrapped_strided_fp16 = wrap_nki(strided_copy_kernel_fp16)
+_wrapped_strided_fp32 = wrap_nki(strided_copy_kernel_fp32)
 _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
 _wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
 _wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
@@ -137,6 +148,50 @@ def dynamic_cast_fp16_nki(input_tensor: torch.Tensor, num_rows: torch.Tensor) ->
 @nki_op("dynamic_nki::cast_fp32", mutates_args={})
 def dynamic_cast_fp32_nki(input_tensor: torch.Tensor, num_rows: torch.Tensor) -> torch.Tensor:
     return _wrapped_cast_fp32[_GRID](input_tensor, num_rows)
+
+
+@nki_op("dynamic_nki::strided_copy_same", mutates_args={})
+def dynamic_strided_copy_same_nki(
+    base: torch.Tensor,
+    stride_proto: torch.Tensor,
+    width_proto: torch.Tensor,
+    fan_proto: torch.Tensor,
+    meta: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_strided_same[_GRID](base, stride_proto, width_proto, fan_proto, meta)
+
+
+@nki_op("dynamic_nki::strided_copy_bf16", mutates_args={})
+def dynamic_strided_copy_bf16_nki(
+    base: torch.Tensor,
+    stride_proto: torch.Tensor,
+    width_proto: torch.Tensor,
+    fan_proto: torch.Tensor,
+    meta: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_strided_bf16[_GRID](base, stride_proto, width_proto, fan_proto, meta)
+
+
+@nki_op("dynamic_nki::strided_copy_fp16", mutates_args={})
+def dynamic_strided_copy_fp16_nki(
+    base: torch.Tensor,
+    stride_proto: torch.Tensor,
+    width_proto: torch.Tensor,
+    fan_proto: torch.Tensor,
+    meta: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_strided_fp16[_GRID](base, stride_proto, width_proto, fan_proto, meta)
+
+
+@nki_op("dynamic_nki::strided_copy_fp32", mutates_args={})
+def dynamic_strided_copy_fp32_nki(
+    base: torch.Tensor,
+    stride_proto: torch.Tensor,
+    width_proto: torch.Tensor,
+    fan_proto: torch.Tensor,
+    meta: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_strided_fp32[_GRID](base, stride_proto, width_proto, fan_proto, meta)
 
 
 @nki_op("dynamic_nki::matmul", mutates_args={})
