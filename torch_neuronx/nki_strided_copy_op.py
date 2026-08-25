@@ -109,6 +109,16 @@ def _nki_strided_copy_impl(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor
             run_strided_gather(src, dst, stride=stride, lane=int(src.storage_offset()) % stride)
             return dst
 
+        # Block-strided gather: [M, H] with stride (row_stride, 1) where row_stride > H.
+        # Column-slice of a wider tensor — M contiguous blocks of H elements.
+        if src.dim() == 2 and src.stride(1) == 1 and src.stride(0) > src.size(1):
+            from torch_neuronx.python_ops.nki_kernels.stride2_gather import (
+                run_block_strided_gather,
+            )
+
+            if run_block_strided_gather(src, dst):
+                return dst
+
     # Scatter: contiguous src -> uniform stride-S dst (other lanes preserved).
     if src.is_contiguous() and not dst.is_contiguous():
         stride = _uniform_stride(dst)
