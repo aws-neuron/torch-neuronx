@@ -21,11 +21,11 @@ tests/vertical/
 │   ├── neuron_op_db.py             # build_neuron_op_db() merging all sources
 │   ├── generate_op_shape_registry.py       # Tool: cache keys → op_shape_registry.json
 │   ├── test_generate_op_shape_registry.py  # Unit tests for the parser
-├── accuracy/                       # Op-accuracy suite (measured ULP vs. derived budget)
-│   ├── conftest.py                 # ROW_FIELDS CSV aggregation, --accumulator/--dtypes
-│   ├── budgets.py                  # Per-op error budget models (the theory side)
+├── accuracy/                       # Op-accuracy suite (normwise relative error vs. a flat 1-ULP budget)
+│   ├── conftest.py                 # ROW_FIELDS CSV aggregation, --dtypes/--seed-base
+│   ├── budgets.py                  # The threshold and which groups it applies to
 │   ├── formats.py                  # NumericFormat: unit roundoff + reference upcast
-│   ├── metrics.py                  # norms/ULP conversion, cell id, seeding
+│   ├── metrics.py                  # norms, relative-error conversion, cell id, seeding
 │   ├── test_metrics.py             # Phase 1: the error model, CPU-only, no device
 │   └── test_accuracy.py            # Phase 2: on-device sweep, one row per cell
 ├── test_target_ops_coverage.py             # Eager coverage + perf + correctness
@@ -76,11 +76,20 @@ neuron-profile artifacts (ntff + NEFFs) are written under `aten_profiles/<cell>/
 
 ## Running Op Accuracy Tests
 
-Measures each op's actual error against a budget *derived from its arithmetic*, in units of
-the input format's unit roundoff (`u_in = 2**-precision`; bf16 → `2**-8`). The check is
-`max_err_ulp <= budget_ulp`, where `max_err_ulp = (max|T-R| / max|R|) / u_in`. This is
-supplementary to `torch.testing.assert_close`, not a replacement: upstream's bf16 `rtol` of
-`0.016` is `4.1 u_in`, so it allows ~4 roundings' worth of error regardless of the op.
+Measures each op's **normwise relative error**, expressed in units of the input format's unit
+roundoff (`unit = 2**-precision`; bf16 → `2**-8`). The check is
+`max_rel_err_units <= budget_units`, where
+
+```
+max_rel_err_units = (max|T-R| / max|R|) / unit
+```
+
+**The budget is one flat constant: `2.0` units = 1 full ULP = the output format's machine
+epsilon** (bf16 → `2**-7`).
+
+**Only formats coarser than fp32 are gated.** At fp32 the accumulator *is* the input format,
+so accumulation rather than rounding sets the scale and no constant bounds it — a correct
+fp32 reduction over 4096 values drifts ~64 units. Those cells report `no_gate`.
 
 ```sh
 # Phase 1 -- the error model only. No device, unit test for accuracy related classes.
@@ -94,12 +103,6 @@ python -m pytest tests/vertical/accuracy/test_accuracy.py \
 python -m pytest "tests/vertical/accuracy/test_accuracy.py::TestOpAccuracy::test_op[aten::bmm]" \
     --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -s --log-cli-level=INFO
 
-# No --traced-model: sweeps the builtin pool instead, kept to ops that have a budget model.
-python -m pytest tests/vertical/accuracy/test_accuracy.py -n 32 --tb=no -q
-
-# Ask what the budget would be if the accumulator were bf16 instead of fp32
-python -m pytest tests/vertical/accuracy/test_accuracy.py --accumulator bfloat16 ...
-
 # Include shapes above the shared 512Mi-element guard (NeuronOpInfo._MAX_TENSOR_ELEMS).
 # For qwen3_235b_a22b that guard drops 3 of 181 entries -- the 151936-vocab lm_head
 # projections in mm / linear / index.Tensor, at 622M elements each.
@@ -107,14 +110,11 @@ NEURON_MAX_TENSOR_ELEMS=700000000 python -m pytest tests/vertical/accuracy/test_
     --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -n 32 --tb=no -q
 ```
 
-**Pass `--traced-model` to sweep a model.** It does two things — registers that set's shapes,
-and restricts the run to them. Both are needed: registering alone would leave the op's
-`builtin` shapes in the pool as well, so the sweep would report more cells than the set has
-entries and would not be purely model-shaped. `--model-shapes-only` excludes `builtin` but
-cannot separate two model sets registered together; `--traced-model` selects exactly one.
-
-**Not passing it registers no model set at all**, so every other suite here measures exactly
-the builtin pool it always has. See [Model-traced shape sets](#model-traced-shape-sets).
+**`--traced-model` is required.** It does two things — registers that set's shapes, and
+restricts the run to them. Both are needed: registering alone would leave the op's `builtin`
+shapes in the pool as well, so the sweep would report more cells than the set has entries and
+would not be purely model-shaped. `--model-shapes-only` excludes `builtin` but cannot separate
+two model sets registered together; `--traced-model` selects exactly one.
 
 **Not a gate.** `test_op` passes as long as cells ran; the verdict lives in the CSV. An op
 that could not be measured stays visible as a `status` rather than being folded into a pass.
@@ -123,32 +123,27 @@ that could not be measured stays visible as a `status` rather than being folded 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--accumulator` | `float32` | Assumed accumulator dtype. The parameter the budget turns on: at n=4096 fp32 budgets ~1.0 ULP, bf16 ~65 |
-| `--reduction-order` | `sequential` | Growth model: `sequential` → `sqrt(n)`, `pairwise` → `sqrt(log2 n)`. Differ 25x at n=8192, but only when the accumulator is narrow |
-| `--dtypes` | `bfloat16` | Comma-separated input dtypes to sweep |
+| `--dtypes` | `bfloat16` | Comma-separated input dtypes to sweep. fp32 cells are measured but not gated (`no_gate`) |
 | `--seed-base` | `0` | Re-roll every cell's input draw while keeping cells independent |
 
 ## Op Accuracy CSV
 
-One row per `(op, shapes, dtype)` cell, aggregated into `op_accuracy_<timestamp>.csv`. The
-budget's *inputs* are carried alongside its output so a verdict can be re-derived from the
-row without re-running the op.
+One row per `(op, shapes, dtype)` cell, aggregated into `op_accuracy_<timestamp>.csv`. `unit`
+is carried alongside the measurement so a verdict can be re-read from the row without
+re-running the op, and `arg_shapes` so anything shape-derived (reduction width, element count)
+stays recomputable without re-running it either.
 
 | Column | Description |
 |--------|-------------|
 | `cell_id` | 16-hex-char id of `(op, arg_shapes, dtype)`. Excludes the seed — the seed is derived from it |
 | `op` / `op_group` | Full ATen op name; `TARGET_ATEN_OP_GROUP` category |
 | `dtype` | Input dtype the cell was measured at |
-| `arg_shapes` | JSON of the registry entry used |
-| `unit` | `u_in`, the input format's unit roundoff (bf16 → `0.00390625`) |
-| `n` | Reduction width the budget was derived from. `1` = elementwise, `0` = bit-exact group, empty = unmodelled |
-| `u_acc` | Assumed accumulator unit roundoff (from `--accumulator`) |
-| `order` | Growth model (from `--reduction-order`) |
-| `max_err_ulp` | **The measurement.** `(max\|T-R\| / max\|R\|) / u_in` |
-| `fro_err_ulp` | Same, Frobenius-normalized. Catches broad drift that L-inf dilutes |
-| `budget_ulp` | **The prediction.** `const + coeff * g(n) * (u_acc / u_in)` |
+| `arg_shapes` | JSON of the registry entry used. The source for any shape-derived figure — the suite no longer extracts a reduction width itself |
+| `unit` | The input format's unit roundoff `2**-precision` = 1/2 ULP (bf16 → `0.00390625`). Multiply `max_rel_err_units` by this to get the raw relative error |
+| `max_rel_err_units` | **The measurement.** Normwise relative error, L-inf: `(max\|T-R\| / max\|R\|) / unit` |
+| `budget_units` | **The threshold.** `2.0` for arithmetic, `0.0` for bit-exact groups, empty when not gated |
 | `verdict` | `within`, `over`, `invalid`, or empty when `status != ok` |
-| `max_abs_err` / `max_abs_ref` / `fro_abs_err` / `fro_abs_ref` | The four raw scalars the ULP figures are computed from |
+| `max_abs_err` / `max_abs_ref` | The two raw absolute scalars `max_rel_err_units` is computed from |
 | `seed` | RNG seed, derived from `cell_id` + `--seed-base` |
 | `gates` | JSON of the shape-selection knobs in effect (`max_shapes_per_op`, `shape_registry`, `traced_model`, ...) |
 | `status` | See below |
@@ -158,16 +153,16 @@ row without re-running the op.
 
 | Verdict | Meaning |
 |---------|---------|
-| `within` | `max_err_ulp <= budget_ulp` — the op is as accurate as its arithmetic predicts |
+| `within` | `max_rel_err_units <= budget_units` — the worst element is inside one ULP of the fp32 reference |
 | `over` | Exceeded the budget. Includes `inf`, which is deliberate: an error against an exact-zero reference, or a bit-exact op that did not reproduce exactly |
-| `invalid` | `max_err_ulp` is `nan` — the output held a `nan`, or both sides overflowed to `inf`. Not a comparison, so not counted either way |
+| `invalid` | `max_rel_err_units` is `nan` — the output held a `nan`, or both sides overflowed to `inf`. Not a comparison, so not counted either way |
 
 ### Statuses
 
 | Status | Meaning |
 |--------|---------|
 | `ok` | Cell measured; read `verdict` |
-| `no_budget` | Measured, but no budget model for this op. Stays countable rather than passing silently |
+| `no_gate` | Measured, but the dtype is fp32 or finer, where a flat rounding bound is not the right instrument. Stays countable rather than passing silently |
 | `excluded` | `random` group — two correct RNG implementations disagree elementwise |
 | `no_input_sample` | The op's schema could not be satisfied from the registry entry |
 | `no_reference` | The CPU fp32 reference could not run, or its output arity disagreed with the device's |

@@ -30,9 +30,7 @@ _ROWS_DIR = (
     / "neuron_accuracy_rows"
 )
 
-# Column order for the aggregated CSV. Identity first so the file sorts readably; the
-# budget's *inputs* (unit, n, u_acc, order) are carried alongside its output so a verdict
-# can be re-derived from the row without re-running the op.
+# accuracy output csv columns.
 ROW_FIELDS = [
     "cell_id",
     "op",
@@ -40,17 +38,11 @@ ROW_FIELDS = [
     "dtype",
     "arg_shapes",
     "unit",
-    "n",
-    "u_acc",
-    "order",
-    "max_err_ulp",
-    "fro_err_ulp",
-    "budget_ulp",
+    "max_rel_err_units",
+    "budget_units",
     "verdict",
     "max_abs_err",
     "max_abs_ref",
-    "fro_abs_err",
-    "fro_abs_ref",
     "seed",
     "gates",
     "status",
@@ -60,27 +52,6 @@ ROW_FIELDS = [
 
 def pytest_addoption(parser):
     group = parser.getgroup("accuracy")
-    group.addoption(
-        "--accumulator",
-        default="float32",
-        choices=["float32", "bfloat16"],
-        help=(
-            "Assumed accumulator dtype for budget derivation. This is the parameter the "
-            "whole budget turns on: fp32 budgets a width-4096 reduction at ~0.5 ULP, bf16 "
-            "at ~64. fp32 is the default because accumulating a reduction in fp32 is the "
-            "expected behaviour"
-        ),
-    )
-    group.addoption(
-        "--reduction-order",
-        default="sequential",
-        choices=["sequential", "pairwise"],
-        help=(
-            "Assumed summation order. sequential -> sqrt(n) growth, pairwise -> "
-            "sqrt(log2 n). A tiled reducer very likely does pairwise; at n=8192 the two "
-            "differ by 25x, but only when the accumulator is narrow."
-        ),
-    )
     group.addoption(
         "--seed-base",
         default=0,
@@ -104,8 +75,6 @@ def accuracy_config(request) -> dict:
     """Resolved knobs, plus the gate values that decided which shapes are eligible."""
     opt = request.config.getoption
     return {
-        "accumulator": opt("--accumulator"),
-        "order": opt("--reduction-order"),
         "seed_base": opt("--seed-base"),
         "dtypes": [s.strip() for s in opt("--dtypes").split(",") if s.strip()],
         "gates": {
@@ -161,7 +130,9 @@ def _aggregate(rows_dir: Path, prefix: str):
     if not rows:
         return
 
-    rows.sort(key=lambda r: (str(r.get("op", "")), str(r.get("n", "")), str(r.get("cell_id", ""))))
+    rows.sort(
+        key=lambda r: (str(r.get("op", "")), str(r.get("dtype", "")), str(r.get("cell_id", "")))
+    )
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output = Path(f"{prefix}_{ts}.csv")
     with open(output, "w", newline="") as f:
@@ -181,8 +152,8 @@ def _aggregate(rows_dir: Path, prefix: str):
 def _cell(value) -> str:
     """One CSV cell. ``None`` becomes empty, not the string ``"None"``.
 
-    Every nullable column depends on this: a ``no_budget`` row's ``budget_ulp``, or the ``n``
-    the README documents as "empty = unmodelled", would otherwise be written as a non-empty
+    Every nullable column depends on this: a ``no_gate`` row's ``budget_units``, or the
+    ``max_rel_err_units`` of a cell that never ran, would otherwise be written as a non-empty
     ``"None"`` that reads as a value and breaks a numeric parse downstream.
     """
     if value is None:

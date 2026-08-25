@@ -1,9 +1,10 @@
 """Per-dtype error models.
 
-A ``NumericFormat`` answers two questions about a dtype:
+A ``NumericFormat`` answers three questions about a dtype:
 
 1. ``unit``            — 1 "unit of error" value = 0.5 ULP = 0.5 adjacent representable spacing
-2. ``reference(...)``  — upcast tensor to fp32, which is used to rerun and generate reference value
+2. ``gated``           — whether this input format needs a normalized relative error gating
+3. ``reference(...)``  — upcast tensor to fp32, which is used to rerun and generate reference value
 
 This covers bf16 + fp32 format, mxfp8 to be added
 """
@@ -11,6 +12,9 @@ This covers bf16 + fp32 format, mxfp8 to be added
 from __future__ import annotations
 
 import torch
+
+# No downcast rounding error check for input w/ precision 2^-24 (fp32) and above
+_UNGATED_FROM_PRECISION = 24
 
 # ── the model ────────────────────────────────────────────────────────────────
 
@@ -26,6 +30,7 @@ class NumericFormat:
         self.name = name
         self.dtype = dtype
         self.unit = 2.0**-precision
+        self.gated = precision < _UNGATED_FROM_PRECISION
 
     def reference(self, op, sample) -> torch.Tensor:
         """
@@ -47,12 +52,7 @@ FORMATS: dict[str, NumericFormat] = {f.name: f for f in (FP32, BF16)}
 
 
 def get_format(dtype: torch.dtype | str) -> NumericFormat:
-    """Look up a format by ``torch.dtype`` or by its string name.
-
-    Also the lookup for the *accumulator* side of a budget. The accumulator is a separate
-    axis from the input dtype -- bf16 in / fp32 accumulate is the case the whole budget
-    turns on -- but it draws from the same two formats.
-    """
+    """Look up a format by ``torch.dtype`` or by its string name."""
     key = str(dtype).removeprefix("torch.") if isinstance(dtype, torch.dtype) else dtype
     if key not in FORMATS:
         raise KeyError(f"no NumericFormat for {dtype!r}; known: {sorted(FORMATS)}")

@@ -2,7 +2,8 @@
 
 Runs the reference and the device path **in one process**.
 
-Usage::
+``--traced-model`` is required -- the sweep is per-model, no model input fails loudly::
+
     pytest tests/vertical/accuracy/test_accuracy.py \\
         --traced-model qwen3_235b_a22b --max-shapes-per-op 0 \\
         -n 32 --tb=no -q 2>&1 | tee accuracy_$(date +%Y%m%d_%H%M%S).log
@@ -30,36 +31,38 @@ from internal.common import classify_error as _classify_error
 from internal.common import flatten_tensors as _flatten_tensors
 from internal.neuron_op_info import _resolve_op
 from internal.neuron_shape_defaults_generated import TRACED_MODEL_OPS
-from internal.neuron_shape_registry import SHAPE_REGISTRY
 from internal.target_ops import TARGET_ATEN_OP_GROUP
 
-from .budgets import error_budget, has_model, width
+from .budgets import EXCLUDED_GROUPS, error_budget
 from .formats import get_format
-from .metrics import build_sample, cell_id, norms, seed_for, ulps
+from .metrics import build_sample, cell_id, norms, rel_err_units, seed_for
 
 logger = logging.getLogger(__name__)
 
 
 # ── op selection ─────────────────────────────────────────────────────────────
+_NO_MODEL = None
 
 
 def _registry_ops() -> list[str]:
-    """Ops to sweep. With ``--traced-model``, the set's own declared op list in the declared
-    frozenset; otherwise the whole registry, kept to ops with a known error-budget formula."""
+    """Ops to sweep: the declared op list by ``--traced-model``.
+    Selecting nothing is a loud failure, in ``_op_params``.
+    """
     for name in (os.environ.get("NEURON_TRACED_MODEL") or "").split(","):
         declared = TRACED_MODEL_OPS.get(name.strip())
         if declared:
             return sorted(declared)
 
-    return [op for op in SHAPE_REGISTRY.all_ops() if has_model(op)]
+    return []
 
 
 def _op_params():
     """
-    Per-op rather than per-cell so one worker compiles one op's shapes back to back and hits
-    a warm NEFF cache.
+    ops params helper
     """
     ops = _registry_ops()
+    if not ops:
+        return [pytest.param(_NO_MODEL, id="no-traced-model")]
     return [pytest.param(op, id=op) for op in ops]
 
 
@@ -75,17 +78,11 @@ def _blank_row(op_name: str, op_group: str, arg_shapes: dict, dtype_name: str, c
         "dtype": dtype_name,
         "arg_shapes": arg_shapes,
         "unit": None,
-        "n": None,
-        "u_acc": None,
-        "order": cfg["order"],
-        "max_err_ulp": None,
-        "fro_err_ulp": None,
-        "budget_ulp": None,
+        "max_rel_err_units": None,
+        "budget_units": None,
         "verdict": "",
         "max_abs_err": None,
         "max_abs_ref": None,
-        "fro_abs_err": None,
-        "fro_abs_ref": None,
         "seed": seed_for(cell, cfg["seed_base"]),
         "gates": cfg["gates"],
         "status": "ok",
@@ -95,19 +92,19 @@ def _blank_row(op_name: str, op_group: str, arg_shapes: dict, dtype_name: str, c
 
 def _worst_pair(dev_outs: list[torch.Tensor], ref_outs: list[torch.Tensor], unit: float):
     """
-    when outputs are from multiple arithmic ops, take the largest ulp divergence as the worst
+    when outputs are from multiple arithmic ops, take the largest relative error as the worst
     """
     worst = None
     for dev, ref in zip(dev_outs, ref_outs, strict=True):
         n = norms(dev, ref)
-        u = ulps(n, unit)
-        if worst is None or u["max_err_ulp"] > worst[1]["max_err_ulp"]:
+        u = rel_err_units(n, unit)
+        if worst is None or u["max_rel_err_units"] > worst[1]["max_rel_err_units"]:
             worst = (n, u)
     return worst
 
 
-def _exact_match_ulps(dev_outs, ref_outs) -> tuple[dict, dict]:
-    """Integer/bool outputs (argmax, comparisons, index results) have no ULP.
+def _exact_match_units(dev_outs, ref_outs) -> tuple[dict, dict]:
+    """Integer/bool outputs (argmax, comparisons, index results) have no rounding error.
     A correct kernel reproduces them exactly
     """
     exact = all(
@@ -115,10 +112,7 @@ def _exact_match_ulps(dev_outs, ref_outs) -> tuple[dict, dict]:
         for d, r in zip(dev_outs, ref_outs, strict=True)
     )
     err = 0.0 if exact else float("inf")
-    return (
-        {"max_abs_err": err, "max_abs_ref": 0.0, "fro_abs_err": err, "fro_abs_ref": 0.0},
-        {"max_err_ulp": err, "fro_err_ulp": err},
-    )
+    return ({"max_abs_err": err, "max_abs_ref": 0.0}, {"max_rel_err_units": err})
 
 
 def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg: dict) -> dict:
@@ -127,7 +121,6 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
     row = _blank_row(op_name, op_info.op_group, arg_shapes, dtype_name, cfg)
 
     fmt = get_format(dtype_name)
-    row["u_acc"] = get_format(cfg["accumulator"]).unit
 
     # Build initial sample once on CPU **at the target dtype**.
     try:
@@ -189,7 +182,7 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
         if ref_outs[0].is_floating_point():
             n, u = _worst_pair(dev_outs, ref_outs, unit)
         else:
-            n, u = _exact_match_ulps(dev_outs, ref_outs)
+            n, u = _exact_match_units(dev_outs, ref_outs)
     except Exception as e:
         row["status"] = "no_reference"
         row["error_cause_raw"] = f"compare failed: {e}"[:200]
@@ -197,24 +190,20 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
     row.update(n)
     row.update(u)
 
-    # Budget and verdict. ``None`` from either layer is a reported disposition, not a pass:
-    # an op nobody has modelled has to stay countable
-    row["n"] = width(op_name, op_info.op_group, arg_shapes)
-    budget = error_budget(
-        op_name, op_info.op_group, arg_shapes, unit, row["u_acc"], order=cfg["order"]
-    )
-    row["budget_ulp"] = budget
+    # Budget and verdict. ``None`` is a reported disposition, not a pass: this keeps it countable.
+    budget = error_budget(op_info.op_group, gated=fmt.gated)
+    row["budget_units"] = budget
 
-    # ``nan`` is the one ULP value that is not a comparison: it means the output held a nan,
+    # ``nan`` is the one measured value that is not a comparison: it means the output held a nan,
     # or that both sides overflowed to inf and the ratio was inf/inf. ``inf`` is
-    # *not* included -- ``_exact_match_ulps`` and ``to_ulp``'s zero-reference branch both
+    # *not* included -- ``_exact_match_units`` and ``to_units``'s zero-reference branch both
     # return it deliberately to mean "wrong", and those must stay countable as "over".
-    if math.isnan(row["max_err_ulp"]):
+    if math.isnan(row["max_rel_err_units"]):
         row["verdict"] = "invalid"
     elif budget is None:
-        row["status"] = "excluded" if op_info.op_group == "random" else "no_budget"
+        row["status"] = "excluded" if op_info.op_group in EXCLUDED_GROUPS else "no_gate"
     else:
-        row["verdict"] = "within" if row["max_err_ulp"] <= budget else "over"
+        row["verdict"] = "within" if row["max_rel_err_units"] <= budget else "over"
     return row
 
 
@@ -222,10 +211,16 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
 
 
 class TestOpAccuracy:
-    """Per-op accuracy sweep: measured ULP vs. derived budget, one row per cell."""
+    """Per-op accuracy sweep: measured relative error vs. the flat budget, one row per cell."""
 
     @pytest.mark.parametrize("op_name", _op_params())
     def test_op(self, op_name: str, accuracy_config: dict, emit_row):
+        if op_name is _NO_MODEL:
+            pytest.fail(
+                "no op set selected: pass --traced-model with one of "
+                f"{sorted(TRACED_MODEL_OPS)}."
+            )
+
         op_group = TARGET_ATEN_OP_GROUP.get(op_name, "unknown")
         op_info = NeuronOpInfo.from_schema(op_name, op_group=op_group)
 
@@ -257,12 +252,11 @@ class TestOpAccuracy:
                 emit_row(row)
                 rows.append(row)
                 logger.info(
-                    "%s %s n=%s max_ulp=%s budget=%s -> %s",
+                    "%s %s max_rel_err=%s budget=%s -> %s",
                     op_name,
                     dtype_name,
-                    row["n"],
-                    row["max_err_ulp"],
-                    row["budget_ulp"],
+                    row["max_rel_err_units"],
+                    row["budget_units"],
                     row["verdict"] or row["status"],
                 )
 

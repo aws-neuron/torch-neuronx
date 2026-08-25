@@ -1,5 +1,5 @@
 """
-Compares two tensors down to four scalars, derives cell identity, and builds seeded inputs.
+Compares two tensors down to two scalars, derives cell identity, and builds seeded inputs.
 
 Everything here runs on CPU so the metric layer is testable without hardware.
 
@@ -67,13 +67,12 @@ def build_sample(op_info, arg_shapes: dict, dtype: torch.dtype, seed: int):
 
 # ── the scalars ──────────────────────────────────────────────────────────────
 def norms(actual: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
-    """The four absolute scalars a comparison reduces to.
+    """The two absolute scalars a comparison reduces to, both L-infinity.
 
     FP64 is used so no additional error introduced at comparison time.
 
-    Both L-inf and Frobenius are returned because their blind spots are complementary --
-    L-inf catches a spike and ignores element drift, Frobenius catches drift, but dilutes
-    a single catastrophical spike.
+    L-inf only: it catches the worst single element, the failure mode a rounding bound
+    predicts.
     """
     a = actual.detach().to("cpu", torch.float64)
     r = ref.detach().to("cpu", torch.float64)
@@ -83,13 +82,14 @@ def norms(actual: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
     return {
         "max_abs_err": float(diff.abs().max()) if diff.numel() else 0.0,
         "max_abs_ref": float(r.abs().max()) if r.numel() else 0.0,
-        "fro_abs_err": float(torch.linalg.vector_norm(diff)),
-        "fro_abs_ref": float(torch.linalg.vector_norm(r)),
     }
 
 
-def to_ulp(abs_err: float, abs_ref: float, unit: float) -> float:
-    """Convert an absolute error to a count of error units.
+def to_units(abs_err: float, abs_ref: float, unit: float) -> float:
+    """``(abs_err / abs_ref) / unit`` -- the normwise relative error.
+
+    ``unit`` is the format's unit roundoff ``2**-P`` (bf16: ``2**-8``), the largest relative
+    error in a rounding.
 
     ``abs_ref == 0`` means the reference is identically zero, so there is no scale to be
     relative to. Returns 0.0 when the error is also zero (a correct all-zero result) and
@@ -101,9 +101,10 @@ def to_ulp(abs_err: float, abs_ref: float, unit: float) -> float:
     return (abs_err / abs_ref) / unit
 
 
-def ulps(n: dict[str, float], unit: float) -> dict[str, float]:
-    """``norms()`` output plus ``unit`` -> the two reported ULP figures."""
-    return {
-        "max_err_ulp": to_ulp(n["max_abs_err"], n["max_abs_ref"], unit),
-        "fro_err_ulp": to_ulp(n["fro_abs_err"], n["fro_abs_ref"], unit),
-    }
+def rel_err_units(n: dict[str, float], unit: float) -> dict[str, float]:
+    """the normalized relative-error value.
+
+    e.g. bf16 (``unit = 2**-8``) with ``max_abs_ref = 1.0`` and ``max_abs_err = 0.0078125``
+    -> ``0.0078125 / 1.0 / 2**-8 = 2.0`` units: two roundings worth of value drift.
+    """
+    return {"max_rel_err_units": to_units(n["max_abs_err"], n["max_abs_ref"], unit)}
