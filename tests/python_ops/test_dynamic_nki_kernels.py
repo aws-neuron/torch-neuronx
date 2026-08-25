@@ -1400,3 +1400,91 @@ class TestDynamicNkiKernels:
             f"recompiling-op set changed: got {sorted(got)}, expected {sorted(exp)}. "
             f"New op -> cover it or add here; missing op -> a gap closed, remove it."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dynamic block-strided gather (column-slice copy without recompilation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.skipif(not _FLAG_ON, reason="TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS != 1")
+class TestDynamicBlockStridedGather:
+    """Tests for the dynamic block-strided gather kernel.
+
+    The kernel copies contiguous blocks at regular offsets — the "row-gap" pattern
+    from column-slice views (e.g., ``gate_up[:, :1024]`` where ``gate_up`` is
+    ``[M, 2048]``). Compiled once per (block_size, row_stride, dtype); M is dynamic.
+    """
+
+    @pytest.mark.parametrize("num_rows", [128, 200, 211, 256, 300, 512])
+    def test_correctness_varying_m(self, num_rows):
+        """Correct results for varying M with H=1024, row_stride=2048."""
+        wide = torch.randn(num_rows, 2048, dtype=torch.bfloat16, device="neuron")
+        src = wide[:, :1024]
+        dst = torch.empty(num_rows, 1024, dtype=torch.bfloat16, device="neuron")
+        torch.ops.neuron.nki_strided_copy_(src, dst)
+        torch.neuron.synchronize()
+        torch.testing.assert_close(dst.cpu(), wide.cpu()[:, :1024].contiguous(), rtol=0, atol=0)
+
+    def test_second_half_offset(self):
+        """Handles non-zero storage offset (second half of buffer)."""
+        for num_r in [211, 300]:
+            wide = torch.randn(num_r, 2048, dtype=torch.bfloat16, device="neuron")
+            src = wide[:, 1024:]
+            dst = torch.empty(num_r, 1024, dtype=torch.bfloat16, device="neuron")
+            torch.ops.neuron.nki_strided_copy_(src, dst)
+            torch.neuron.synchronize()
+            torch.testing.assert_close(dst.cpu(), wide.cpu()[:, 1024:].contiguous(), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_dtypes(self, dtype):
+        """Works for all supported float dtypes."""
+        wide = torch.randn(256, 2048, dtype=dtype, device="neuron")
+        dst = torch.empty(256, 1024, dtype=dtype, device="neuron")
+        torch.ops.neuron.nki_strided_copy_(wide[:, :1024], dst)
+        torch.neuron.synchronize()
+        torch.testing.assert_close(dst.cpu(), wide.cpu()[:, :1024].contiguous(), rtol=0, atol=0)
+
+    def test_compile_once_varying_m(self):
+        """Compiles once and handles multiple M values without recompiling."""
+        import torch_neuronx._C as _C
+
+        # Warmup: compiles the kernel for (H=1024, row_stride=2048, bf16)
+        wide0 = torch.randn(200, 2048, dtype=torch.bfloat16, device="neuron")
+        dst0 = torch.empty(200, 1024, dtype=torch.bfloat16, device="neuron")
+        torch.ops.neuron.nki_strided_copy_(wide0[:, :1024], dst0)
+        torch.neuron.synchronize()
+
+        before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+
+        # Multiple M values — all reuse the same NEFF
+        for num_r in [211, 256, 275, 300, 400]:
+            wide = torch.randn(num_r, 2048, dtype=torch.bfloat16, device="neuron")
+            dst = torch.empty(num_r, 1024, dtype=torch.bfloat16, device="neuron")
+            torch.ops.neuron.nki_strided_copy_(wide[:, :1024], dst)
+            torch.neuron.synchronize()
+            torch.testing.assert_close(dst.cpu(), wide.cpu()[:, :1024].contiguous(), rtol=0, atol=0)
+
+        after = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+        new_keys = after - before
+        assert len(new_keys) == 0, (
+            f"Dynamic kernel recompiled! {len(new_keys)} new entries: "
+            f"{sorted(k[:80] for k in new_keys)}"
+        )
+
+    @pytest.mark.parametrize(
+        "block_size,row_stride",
+        [(512, 1024), (1024, 2048), (256, 1024), (1024, 4096)],
+        ids=["H512_S1024", "H1024_S2048", "H256_S1024", "H1024_S4096"],
+    )
+    def test_different_geometries(self, block_size, row_stride):
+        """Different (block_size, row_stride) pairs each compile their own NEFF."""
+        num_r = 256
+        wide = torch.randn(num_r, row_stride, dtype=torch.bfloat16, device="neuron")
+        src = wide[:, :block_size]
+        dst = torch.empty(num_r, block_size, dtype=torch.bfloat16, device="neuron")
+        torch.ops.neuron.nki_strided_copy_(src, dst)
+        torch.neuron.synchronize()
+        torch.testing.assert_close(
+            dst.cpu(), wide.cpu()[:, :block_size].contiguous(), rtol=0, atol=0
+        )

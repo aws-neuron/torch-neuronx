@@ -345,3 +345,42 @@ def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 1) -> to
     flat = packed.reshape(-1)
     lane = _wrapped_flat_gather[(lnc,)](flat, parity)
     return lane.reshape(logical_shape)
+
+
+def run_block_strided_gather(src_tensor, dst_tensor) -> bool:
+    """Gather M contiguous blocks of H elements from a column-slice view.
+
+    Handles [M, H] tensors with stride (row_stride, 1) where row_stride > H.
+    Currently routes through the dynamic NKI kernel when dynamic mode is enabled;
+    returns False otherwise (caller falls through to NRT DMA).
+
+    Args:
+        src_tensor: non-contiguous source (column-slice view)
+        dst_tensor: contiguous destination
+
+    Returns:
+        True if handled, False if caller should use fallback.
+    """
+    if not use_dynamic_nki_kernels():
+        return False
+
+    num_rows = int(src_tensor.size(0))
+    block_size = int(src_tensor.size(1))
+    row_stride = int(src_tensor.stride(0))
+    src_offset = int(src_tensor.storage_offset())
+    src_storage_elems = src_tensor.untyped_storage().nbytes() // src_tensor.element_size()
+    src_span = src_storage_elems - src_offset
+    src_flat = src_tensor.as_strided((src_span,), (1,), storage_offset=src_offset)
+    dst_flat = dst_tensor.reshape(num_rows * block_size)
+
+    from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.block_strided_gather import (
+        try_run_dynamic_block_strided_gather,
+    )
+
+    return try_run_dynamic_block_strided_gather(
+        src_flat,
+        dst_flat,
+        num_rows=num_rows,
+        block_size=block_size,
+        row_stride=row_stride,
+    )
