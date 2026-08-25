@@ -214,8 +214,9 @@ def test_selective_checkpoint_contexts_replay_tuple_output(cpu_nki_hop):
     caching_mode, cached_mode = create_selective_checkpoint_contexts([nki_hop.nki_kernel_wrapper])
     with caching_mode:
         forward = _call_test_nki_hop(torch.ones(4), backend_config="tuple")
+    replay_input = torch.full((4,), 10.0)
     with cached_mode:
-        replay = _call_test_nki_hop(torch.full((4,), 10.0), backend_config="tuple")
+        replay = _call_test_nki_hop(replay_input, backend_config="tuple")
 
     assert len(cpu_nki_hop) == 1
     assert isinstance(replay, tuple)

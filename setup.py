@@ -69,8 +69,8 @@ def _get_version():
 
     Format: {TORCH_MAJOR}.{TORCH_MINOR}.{NEURON_MAJOR}.{NEURON_MINOR}.{BUILD}+{suffix}
 
-    Mainline: 2.12.3.0.4527+8e870898.dev
-    Release:  2.12.3.0.4527+8e870898
+    Mainline: 2.13.3.0.4527+8e870898.dev
+    Release:  2.13.3.0.4527+8e870898
     """
     version_info = {}
     with open(Path(__file__).parent / "torch_neuronx" / "_version.py") as f:

@@ -41,6 +41,7 @@ def clean_state():
     DynamoCache.clear()
     PrecompileContext.clear()
     yield
+    torch.neuron.synchronize()
     torch._dynamo.reset()
     counters.clear()
     DynamoCache.clear()
