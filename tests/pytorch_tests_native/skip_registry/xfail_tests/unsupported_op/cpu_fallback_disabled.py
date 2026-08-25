@@ -74,7 +74,6 @@ UNSUPPORTED_OP_CPU_FALLBACK_DISABLED = [
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_nonzero_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples___getitem___neuron_int64",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_argwhere_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_masked_fill_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nonzero_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_argwhere_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nonzero_neuron_float32",

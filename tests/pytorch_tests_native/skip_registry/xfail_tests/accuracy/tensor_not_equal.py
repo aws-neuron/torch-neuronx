@@ -111,7 +111,6 @@ ACCURACY_TENSOR_NOT_EQUAL = [
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values___getitem___neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_argwhere_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_gather_neuron_bool",
-    "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_masked_select_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_constant_pad_nd_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_constant_pad_nd_neuron_int16",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_constant_pad_nd_neuron_int32",

@@ -128,7 +128,6 @@ RUNTIME_NRT_ERROR = [
     "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_where_neuron_float16",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_addcmul_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_addmv_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_masked_fill_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_dropout_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_nll_loss_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_stft_neuron_float32",

@@ -143,6 +143,53 @@ class TestMaskedSelect:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::masked_select")
 
+    @pytest.mark.parametrize("mask_value", [True, False])
+    def test_masked_select_scalar_self_and_mask(self, device, mask_value):
+        """Test masked_select when both self and mask are 0-dimensional.
+
+        The broadcast shape is () -- with no coordinate axis, the nonzero_static
+        decomposition used by the lowering has nothing to stack (mask False) and
+        no last dim to size (mask True), so the lowering views both operands as
+        1-element vectors. Result is 1-d either way: shape (1,) or (0,).
+        """
+        with track_neuron_ops():
+            x = torch.randn((), device=device)
+            mask = torch.tensor(mask_value, device=device)
+            neuron_result = torch.masked_select(x, mask)
+            cpu_result = torch.masked_select(x.cpu(), mask.cpu())
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.shape == cpu_result.shape
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::masked_select")
+
+    def test_masked_select_scalar_self_scalar_mask_out(self, device):
+        """Test the out= variant with 0-dimensional self and mask."""
+        with track_neuron_ops():
+            x = torch.randn((), device=device)
+            mask = torch.tensor(True, device=device)
+            out = torch.empty(1, dtype=x.dtype, device=device)
+            result = torch.masked_select(x, mask, out=out)
+            cpu_result = torch.masked_select(x.cpu(), mask.cpu())
+
+            assert result is out
+            torch.testing.assert_close(out.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::masked_select")
+
+    def test_masked_select_scalar_backward(self, device):
+        """masked_select backward with 0-dimensional self and mask.
+
+        This is the path masked_fill's own backward takes for a 0-d tensor
+        ``value`` (grad_value = grad.masked_select(mask).sum()).
+        """
+        x = torch.randn((), device=device, requires_grad=True)
+        mask = torch.tensor(True, device=device)
+        torch.masked_select(x, mask).sum().backward()
+
+        x_cpu = x.detach().cpu().requires_grad_(True)
+        torch.masked_select(x_cpu, mask.cpu()).sum().backward()
+        torch.testing.assert_close(x.grad.cpu(), x_cpu.grad)
+
     def test_masked_select_large_3d_shape(self, device):
         """Test masked_select with large 3D tensor (1, 300, 2048)."""
         with track_neuron_ops():
