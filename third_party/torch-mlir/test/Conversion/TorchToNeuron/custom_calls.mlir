@@ -654,3 +654,158 @@ func.func @test_scaled_mm_e4m3fn_explicit(
         -> !torch.vtensor<[64,256],bf16>
     return %0 : !torch.vtensor<[64,256],bf16>
 }
+
+// -----
+
+// CHECK-LABEL:   func.func @test_neuron_argmax_dim(
+// CHECK-SAME:                    %[[VAL_0:.*]]: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4],si64> {
+// CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,5],f32> -> tensor<4x5xf32>
+// CHECK:           %[[VAL_2:.*]] = stablehlo.custom_call @AwsNeuronArgMax(%[[VAL_1]]) {backend_config = "1"} : (tensor<4x5xf32>) -> tensor<4xi64>
+// CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]] : tensor<4xi64> -> !torch.vtensor<[4],si64>
+// CHECK:           return %[[VAL_3]] : !torch.vtensor<[4],si64>
+// CHECK:         }
+func.func @test_neuron_argmax_dim(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4],si64> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int1, %false : !torch.vtensor<[4,5],f32>, !torch.int, !torch.bool -> !torch.vtensor<[4],si64>
+  return %0 : !torch.vtensor<[4],si64>
+}
+
+// -----
+
+// A negative dim is normalised before it reaches the backend config.
+// CHECK-LABEL:   func.func @test_neuron_argmax_negative_dim(
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "1"} : (tensor<4x5xf32>) -> tensor<4xi64>
+func.func @test_neuron_argmax_negative_dim(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4],si64> {
+  %int-1 = torch.constant.int -1
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int-1, %false : !torch.vtensor<[4,5],f32>, !torch.int, !torch.bool -> !torch.vtensor<[4],si64>
+  return %0 : !torch.vtensor<[4],si64>
+}
+
+// -----
+
+// dim=None reduces over the flattened tensor: reshape to rank 1, dim 0.
+// CHECK-LABEL:   func.func @test_neuron_argmax_no_dim(
+// CHECK:           %[[FLAT:.*]] = stablehlo.reshape %{{.*}} : (tensor<4x5xf32>) -> tensor<20xf32>
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%[[FLAT]]) {backend_config = "0"} : (tensor<20xf32>) -> tensor<i64>
+func.func @test_neuron_argmax_no_dim(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[],si64> {
+  %none = torch.constant.none
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %none, %false : !torch.vtensor<[4,5],f32>, !torch.none, !torch.bool -> !torch.vtensor<[],si64>
+  return %0 : !torch.vtensor<[],si64>
+}
+
+// -----
+
+// keepdim reshapes the result so the reduced dimension comes back as 1.
+// CHECK-LABEL:   func.func @test_neuron_argmax_keepdim(
+// CHECK:           %[[CC:.*]] = stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "1"} : (tensor<4x5xf32>) -> tensor<4xi64>
+// CHECK:           stablehlo.reshape %[[CC]] : (tensor<4xi64>) -> tensor<4x1xi64>
+func.func @test_neuron_argmax_keepdim(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4,1],si64> {
+  %int1 = torch.constant.int 1
+  %true = torch.constant.bool true
+  %0 = torch.aten.argmax %arg0, %int1, %true : !torch.vtensor<[4,5],f32>, !torch.int, !torch.bool -> !torch.vtensor<[4,1],si64>
+  return %0 : !torch.vtensor<[4,1],si64>
+}
+
+// -----
+
+// s32 is supported, and a rank-1 input with dim=None needs no reshape.
+// CHECK-LABEL:   func.func @test_neuron_argmax_int32(
+// CHECK-NOT:       stablehlo.reshape
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "0"} : (tensor<8xi32>) -> tensor<i64>
+func.func @test_neuron_argmax_int32(%arg0: !torch.vtensor<[8],si32>) -> !torch.vtensor<[],si64> {
+  %none = torch.constant.none
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %none, %false : !torch.vtensor<[8],si32>, !torch.none, !torch.bool -> !torch.vtensor<[],si64>
+  return %0 : !torch.vtensor<[],si64>
+}
+
+// -----
+
+// An unsupported element type falls back to the max.dim lowering.
+// CHECK-LABEL:   func.func @test_neuron_argmax_unsupported_dtype(
+// CHECK-NOT:       AwsNeuronArgMax
+func.func @test_neuron_argmax_unsupported_dtype(%arg0: !torch.vtensor<[8],si8>) -> !torch.vtensor<[],si64> {
+  %none = torch.constant.none
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %none, %false : !torch.vtensor<[8],si8>, !torch.none, !torch.bool -> !torch.vtensor<[],si64>
+  return %0 : !torch.vtensor<[],si64>
+}
+
+// -----
+
+// A dynamic shape falls back too.
+// CHECK-LABEL:   func.func @test_neuron_argmax_dynamic_shape(
+// CHECK-NOT:       AwsNeuronArgMax
+func.func @test_neuron_argmax_dynamic_shape(%arg0: !torch.vtensor<[?,5],f32>) -> !torch.vtensor<[?],si64> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int1, %false : !torch.vtensor<[?,5],f32>, !torch.int, !torch.bool -> !torch.vtensor<[?],si64>
+  return %0 : !torch.vtensor<[?],si64>
+}
+
+// -----
+
+// A non-trailing reduced dimension.
+// CHECK-LABEL:   func.func @test_neuron_argmax_dim0_rank2(
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "0"} : (tensor<4x5xf32>) -> tensor<5xi64>
+func.func @test_neuron_argmax_dim0_rank2(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[5],si64> {
+  %int0 = torch.constant.int 0
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int0, %false : !torch.vtensor<[4,5],f32>, !torch.int, !torch.bool -> !torch.vtensor<[5],si64>
+  return %0 : !torch.vtensor<[5],si64>
+}
+
+// -----
+
+// A middle dimension, reduced away from both ends.
+// CHECK-LABEL:   func.func @test_neuron_argmax_dim1_rank3(
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "1"} : (tensor<2x3x4xf32>) -> tensor<2x4xi64>
+func.func @test_neuron_argmax_dim1_rank3(%arg0: !torch.vtensor<[2,3,4],f32>) -> !torch.vtensor<[2,4],si64> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int1, %false : !torch.vtensor<[2,3,4],f32>, !torch.int, !torch.bool -> !torch.vtensor<[2,4],si64>
+  return %0 : !torch.vtensor<[2,4],si64>
+}
+
+// -----
+
+// dim=None with keepdim: torch declares the result as all-ones of the input rank.
+// CHECK-LABEL:   func.func @test_neuron_argmax_no_dim_keepdim(
+// CHECK:           %[[FLAT:.*]] = stablehlo.reshape %{{.*}} : (tensor<4x5xf32>) -> tensor<20xf32>
+// CHECK:           %[[CC:.*]] = stablehlo.custom_call @AwsNeuronArgMax(%[[FLAT]]) {backend_config = "0"} : (tensor<20xf32>) -> tensor<i64>
+// CHECK:           stablehlo.reshape %[[CC]] : (tensor<i64>) -> tensor<1x1xi64>
+func.func @test_neuron_argmax_no_dim_keepdim(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[1,1],si64> {
+  %none = torch.constant.none
+  %true = torch.constant.bool true
+  %0 = torch.aten.argmax %arg0, %none, %true : !torch.vtensor<[4,5],f32>, !torch.none, !torch.bool -> !torch.vtensor<[1,1],si64>
+  return %0 : !torch.vtensor<[1,1],si64>
+}
+
+// -----
+
+// A rank-0 input with an explicit dim. The max.dim decomposition also declines
+// rank 0, so nothing would lower it if this pattern did too.
+// CHECK-LABEL:   func.func @test_neuron_argmax_rank0(
+// CHECK:           %[[FLAT:.*]] = stablehlo.reshape %{{.*}} : (tensor<f32>) -> tensor<1xf32>
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%[[FLAT]]) {backend_config = "0"} : (tensor<1xf32>) -> tensor<i64>
+func.func @test_neuron_argmax_rank0(%arg0: !torch.vtensor<[],f32>) -> !torch.vtensor<[],si64> {
+  %int0 = torch.constant.int 0
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int0, %false : !torch.vtensor<[],f32>, !torch.int, !torch.bool -> !torch.vtensor<[],si64>
+  return %0 : !torch.vtensor<[],si64>
+}
+
+// -----
+
+// f16 is supported.
+// CHECK-LABEL:   func.func @test_neuron_argmax_f16(
+// CHECK:           stablehlo.custom_call @AwsNeuronArgMax(%{{.*}}) {backend_config = "1"} : (tensor<4x5xf16>) -> tensor<4xi64>
+func.func @test_neuron_argmax_f16(%arg0: !torch.vtensor<[4,5],f16>) -> !torch.vtensor<[4],si64> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.argmax %arg0, %int1, %false : !torch.vtensor<[4,5],f16>, !torch.int, !torch.bool -> !torch.vtensor<[4],si64>
+  return %0 : !torch.vtensor<[4],si64>
+}

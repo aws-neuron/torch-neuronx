@@ -3186,38 +3186,8 @@ class TestArgsortDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestArgmaxDecompositionE2E:
-    """Tests for argmax decomposition"""
-
-    def test_argmax_basic_accuracy(self):
-        """Test argmax decomposition accuracy"""
-        input_tensor = torch.tensor([3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0])
-        result = decompositions.argmax_decomposition(input_tensor)
-        expected = torch.argmax(input_tensor)
-        torch.testing.assert_close(result, expected)
-
-    @pytest.mark.parametrize("dim", [0, 1, -1])
-    @pytest.mark.parametrize("keepdim", [False, True])
-    def test_argmax_dim_keepdim(self, dim, keepdim):
-        """Test argmax with different dimensions and keepdim parameter"""
-        input_tensor = torch.randn(4, 5)
-        result = decompositions.argmax_decomposition(input_tensor, dim=dim, keepdim=keepdim)
-        expected = torch.argmax(input_tensor, dim=dim, keepdim=keepdim)
-        torch.testing.assert_close(result, expected)
-
-    @pytest.mark.parametrize(
-        "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
-    )
-    def test_argmax_dtypes(self, dtype):
-        """Test argmax with various dtypes"""
-        torch.manual_seed(42)
-        if dtype in [torch.int32, torch.int64]:
-            input_tensor = torch.randint(-100, 100, (10,), dtype=dtype)
-        else:
-            input_tensor = torch.randn(10, dtype=dtype)
-        result = decompositions.argmax_decomposition(input_tensor)
-        expected = torch.argmax(input_tensor)
-        torch.testing.assert_close(result, expected)
+class TestArgmaxE2E:
+    """Tests for argmax, which lowers to the AwsNeuronArgMax custom call."""
 
     @pytest.mark.parametrize(
         "shape",
@@ -3231,7 +3201,10 @@ class TestArgmaxDecompositionE2E:
             (32, 50257),
         ],
     )
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64],
+    )
     def test_argmax_e2e(self, shape, dtype):
         """Test argmax accuracy via torch.compile with neuron backend"""
         torch.manual_seed(42)
@@ -3269,6 +3242,25 @@ class TestArgmaxDecompositionE2E:
         result_cpu = argmax_fn(x_cpu)
         result_neuron = compiled_fn(x_neuron)
 
+        torch.testing.assert_close(result_neuron.cpu(), result_cpu)
+
+    @pytest.mark.parametrize("shape", [(8,), (4, 5), (2, 3, 4)])
+    def test_argmax_no_dim_e2e(self, shape):
+        """argmax with no dim reduces over the flattened tensor and returns a scalar."""
+        torch.manual_seed(42)
+
+        def argmax_fn(x):
+            return torch.argmax(x)
+
+        compiled_fn = torch.compile(argmax_fn, backend="neuron")
+
+        x_cpu = torch.randn(shape)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        result_cpu = argmax_fn(x_cpu)
+        result_neuron = compiled_fn(x_neuron)
+
+        assert result_cpu.shape == ()
         torch.testing.assert_close(result_neuron.cpu(), result_cpu)
 
     def test_argmax_llm_decode_pattern(self):
