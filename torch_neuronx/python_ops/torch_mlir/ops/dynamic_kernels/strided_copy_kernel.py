@@ -12,6 +12,8 @@ every storage offset -- the two ``.chunk(2)`` halves share it.
   storage_offset instead trips NRT's "input tensor is too small" check.
 * The tail tile is backward-aligned and overlapping, so no short DMA is needed (a runtime
   DMA count is unsupported, NKI-2418). A copy is idempotent, so re-doing rows is harmless.
+* ``tile_m`` rows per tile is baked too: 128 fills the partition dim, and ``rows < 128``
+  uses 1 so the tail's ``rows - tile_m`` offset stays non-negative. Same body either way.
 * No LNC sharding: splitting needs equal per-program trip counts, and the writes are
   idempotent, so every core redundantly running the whole copy is correct.
 """
@@ -46,20 +48,31 @@ def _h_segments(width, tile_size_h):
 
 
 def _emit_tile(
-    base, result, dyn_stride, width, fanout, h_starts, h_widths, in_cur, out_cur, dt, convert
+    base,
+    result,
+    dyn_stride,
+    width,
+    fanout,
+    tile_m,
+    h_starts,
+    h_widths,
+    in_cur,
+    out_cur,
+    dt,
+    convert,
 ):
-    """Copy one _TILE_M-row tile. ``in_cur`` is a runtime ELEMENT offset into ``base``,
+    """Copy one tile_m-row tile. ``in_cur`` is a runtime ELEMENT offset into ``base``,
     ``out_cur`` a runtime ROW offset into ``result``. Module-level because NKI allows a
     nested function only as a loop body, and the tail tile needs this too."""
     for seg in range(len(h_starts)):
         h_start = h_starts[seg]
         w = h_widths[seg]
 
-        in_tile = nl.ndarray((_TILE_M, w), base.dtype, nl.sbuf)
+        in_tile = nl.ndarray((tile_m, w), base.dtype, nl.sbuf)
         nisa.dma_copy(
-            dst=in_tile[0:_TILE_M, 0:w],
+            dst=in_tile[0:tile_m, 0:w],
             src=base.ap(
-                pattern=[[dyn_stride, _TILE_M], [1, w]],
+                pattern=[[dyn_stride, tile_m], [1, w]],
                 offset=h_start,
                 scalar_offset=in_cur,
                 indirect_dim=0,
@@ -68,22 +81,22 @@ def _emit_tile(
         )
 
         if convert:
-            out_tile = nl.ndarray((_TILE_M, w), dt, nl.sbuf)
-            nisa.tensor_copy(dst=out_tile[0:_TILE_M, 0:w], src=in_tile[0:_TILE_M, 0:w])
+            out_tile = nl.ndarray((tile_m, w), dt, nl.sbuf)
+            nisa.tensor_copy(dst=out_tile[0:tile_m, 0:w], src=in_tile[0:tile_m, 0:w])
         else:
             out_tile = in_tile
 
         # fanout > 1 implies width == 1, so there is exactly one segment and w is 1.
         if fanout > 1:
-            store_src = nl.broadcast_to(out_tile[0:_TILE_M, 0:1], (_TILE_M, fanout))
+            store_src = nl.broadcast_to(out_tile[0:tile_m, 0:1], (tile_m, fanout))
             store_w = fanout
         else:
-            store_src = out_tile[0:_TILE_M, 0:w]
+            store_src = out_tile[0:tile_m, 0:w]
             store_w = w
 
         nisa.dma_copy(
             dst=result.ap(
-                pattern=[[width * fanout, _TILE_M], [1, store_w]],
+                pattern=[[width * fanout, tile_m], [1, store_w]],
                 offset=h_start * fanout,
                 scalar_offset=out_cur,
                 indirect_dim=0,
@@ -93,13 +106,16 @@ def _emit_tile(
         )
 
 
-def make_strided_copy_kernel(out_dtype):
+def make_strided_copy_kernel(out_dtype, tile_m=_TILE_M):
     """Build a strided-copy kernel whose result dtype is ``out_dtype``; None keeps the
     source dtype (the passthrough variant, and the only one that can move int32).
-    Default-bound so the tracer reads it as a local constant -- a closure fails to trace."""
+    ``tile_m`` is the rows per tile. Both are default-bound so the tracer reads them as
+    local constants -- a closure fails to trace."""
 
     @nki.jit()
-    def strided_copy_kernel(base, stride_proto, width_proto, fan_proto, meta, out_dtype=out_dtype):
+    def strided_copy_kernel(
+        base, stride_proto, width_proto, fan_proto, meta, out_dtype=out_dtype, tile_m=tile_m
+    ):
         """
         Gather a strided view into a contiguous result.
 
@@ -108,9 +124,9 @@ def make_strided_copy_kernel(out_dtype):
             stride_proto: [1, dyn_stride]  shape-only: source row stride
             width_proto:  [1, width]       shape-only: contiguous run length
             fan_proto:    [1, fanout]      shape-only: stride-0 fan-out (1 = none)
-            meta:         [4, 1] int32     [rows // _TILE_M, in_start,
-                                            in_start + (rows - _TILE_M) * dyn_stride,
-                                            rows - _TILE_M]
+            meta:         [4, 1] int32     [rows // tile_m, in_start,
+                                            in_start + (rows - tile_m) * dyn_stride,
+                                            rows - tile_m]
         Returns:
             result: [rows_static, width * fanout] on HBM
         """
@@ -164,6 +180,7 @@ def make_strided_copy_kernel(out_dtype):
                 dyn_stride,
                 width,
                 fanout,
+                tile_m,
                 h_starts,
                 h_widths,
                 in_cur,
@@ -171,12 +188,12 @@ def make_strided_copy_kernel(out_dtype):
                 dt,
                 convert,
             )
-            nisa.tensor_scalar(in_cur, in_cur, nl.add, _TILE_M * dyn_stride)
-            nisa.tensor_scalar(out_cur, out_cur, nl.add, _TILE_M)
+            nisa.tensor_scalar(in_cur, in_cur, nl.add, tile_m * dyn_stride)
+            nisa.tensor_scalar(out_cur, out_cur, nl.add, tile_m)
 
         nl.fori_loop(0, trips_reg, body)
 
-        # Backward-aligned tail: covers the rows % _TILE_M ragged rows with no short DMA,
+        # Backward-aligned tail: covers the rows % tile_m ragged rows with no short DMA,
         # and re-does the last full tile when rows is a whole multiple.
         _emit_tile(
             base,
@@ -184,6 +201,7 @@ def make_strided_copy_kernel(out_dtype):
             dyn_stride,
             width,
             fanout,
+            tile_m,
             h_starts,
             h_widths,
             in_tail,
@@ -203,3 +221,6 @@ strided_copy_kernel_same = make_strided_copy_kernel(None)
 strided_copy_kernel_bf16 = make_strided_copy_kernel(nl.bfloat16)
 strided_copy_kernel_fp16 = make_strided_copy_kernel(nl.float16)
 strided_copy_kernel_fp32 = make_strided_copy_kernel(nl.float32)
+# Sub-tile rows. Only same-dtype reaches it: copy_ requires matching dtypes for a strided
+# source, and contiguous cannot change dtype.
+strided_copy_kernel_same_row = make_strided_copy_kernel(None, tile_m=1)

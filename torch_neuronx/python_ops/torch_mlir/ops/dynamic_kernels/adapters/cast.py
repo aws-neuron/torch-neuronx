@@ -5,11 +5,10 @@ dtype — into a fresh tensor for ``_to_copy`` or into ``self`` for ``copy_``.
 
 **Neither path pads the rows**: the kernel covers a ragged M with an overlapping
 tail tile (see ``cast_kernel``), so it needs no pad buffer and no over-allocated
-output, which is what makes the in-place ``copy_`` legal at any M >= 128. Both
-``_to_copy`` and ``copy_`` require M >= 128 (the tail's ``M - 128`` offset would go
-negative for a sub-tile M). For a same-dtype strided source a sub-tile M is delegated to
-``neuron::nki_strided_copy_`` (see ``_block_fallback_view``); a sub-128 cast still
-declines to the native path.
+output, which is what makes the in-place ``copy_`` legal at any M >= 128. A cast still
+requires M >= 128 (the tail's ``M - 128`` offset would go negative for a sub-tile M); a
+same-dtype strided source instead takes the strided kernel's ``tile_m == 1`` variant,
+which walks single rows and so covers any sub-tile M.
 
 compile_key = (H, src_dtype, dst_dtype), all baked; M is dynamic.
 """
@@ -120,27 +119,7 @@ def _copy_plan(self, src):
     if src.dtype not in _NO_CAST_KERNEL_DTYPES:
         return None
     M, H = _mh(self)  # noqa: N806
-    if M < _TILE_M:
-        return None
     return strided_plan(src.reshape(M, H), M)
-
-
-# _STRIDED_COPY_KERNEL_DTYPES, narrowed to what we can produce here.
-_BLOCK_FALLBACK_DTYPES = (torch.float32, torch.float16, torch.bfloat16, torch.int32)
-
-
-def _block_fallback_view(t) -> bool:
-    """A sub-tile strided view for ``neuron::nki_strided_copy_``: its block-strided gather
-    loops per row so any M >= 1 works, and its own fallback is a runtime element copy --
-    neither compiles per M. Stride-0 is excluded (not a gather; overlapping reads)."""
-    if not isinstance(t, torch.Tensor) or t.device.type != "neuron":
-        return False
-    if t.dtype not in _BLOCK_FALLBACK_DTYPES or t.dim() < 1 or t.numel() == 0:
-        return False
-    if t.is_contiguous() or any(s <= 0 for s in t.stride()):
-        return False
-    M, _ = _mh(t)  # noqa: N806
-    return M < _TILE_M
 
 
 def _strided_inputs(src, plan):
@@ -149,10 +128,10 @@ def _strided_inputs(src, plan):
     base = src.as_strided((plan.span, 1), (1, 1), 0)
     meta = torch.tensor(
         [
-            [plan.rows // _TILE_M],
+            [plan.rows // plan.tile_m],
             [plan.start],
-            [plan.start + (plan.rows - _TILE_M) * plan.dyn_stride],
-            [plan.rows - _TILE_M],
+            [plan.start + (plan.rows - plan.tile_m) * plan.dyn_stride],
+            [plan.rows - plan.tile_m],
         ],
         dtype=torch.int32,
     ).to(src.device)
@@ -250,10 +229,7 @@ def _can_handle_copy(self, src=None, non_blocking=False, **_) -> bool:
     # Strided source: without this the C++ prologue absorbs the view and bakes M.
     if self.dtype != src.dtype or self.dtype not in _STRIDED_DTYPES:
         return False
-    if _copy_plan(self, src) is not None:
-        return True
-    # Sub-tile M: delegated to nki_strided_copy_ by _run_copy.
-    return _block_fallback_view(src)
+    return _copy_plan(self, src) is not None
 
 
 def _copy_compile_key(self, src, non_blocking=False, **_):
@@ -261,7 +237,15 @@ def _copy_compile_key(self, src, non_blocking=False, **_):
     offset are never in it."""
     plan = _copy_plan(self, src)
     if plan is not None:
-        return ("strided", plan.width, plan.fanout, plan.dyn_stride, src.dtype, self.dtype)
+        return (
+            "strided",
+            plan.width,
+            plan.fanout,
+            plan.dyn_stride,
+            plan.tile_m,
+            src.dtype,
+            self.dtype,
+        )
     _, H = _mh(self)  # noqa: N806
     return ("contig", H, src.dtype, self.dtype)
 
@@ -278,14 +262,6 @@ def _prepare_copy_io(self, src, non_blocking=False, dest=None, **_):
     return (x, nr), outputs, M
 
 
-def _run_copy(self, src=None, non_blocking=False, dest=None, **_):
-    """Sub-tile M: nki_strided_copy_ writes ``self`` in place. None = our kernel takes it."""
-    if not _block_fallback_view(src):
-        return None
-    torch.ops.neuron.nki_strided_copy_(src, self)
-    return self, _mh(self)[0]
-
-
 def _reshape_copy_output(outputs, original_args):
     """copy_ returns ``self``, not a view of it."""
     return original_args[0]
@@ -299,15 +275,20 @@ def _can_handle_contiguous(self, memory_format=None, **_) -> bool:
         return False
     if self.dtype not in _STRIDED_DTYPES:
         return False
-    if _strided_src_plan(self, self) is not None:
-        return True
-    # Sub-tile M: delegated to nki_strided_copy_ by _run_contiguous.
-    return _block_fallback_view(self)
+    return _strided_src_plan(self, self) is not None
 
 
 def _contiguous_compile_key(self, memory_format=None, **_):
     plan = _strided_src_plan(self, self)
-    return ("strided", plan.width, plan.fanout, plan.dyn_stride, self.dtype, self.dtype)
+    return (
+        "strided",
+        plan.width,
+        plan.fanout,
+        plan.dyn_stride,
+        plan.tile_m,
+        self.dtype,
+        self.dtype,
+    )
 
 
 def _prepare_contiguous_io(self, memory_format=None, dest=None, **_):
@@ -315,15 +296,6 @@ def _prepare_contiguous_io(self, memory_format=None, dest=None, **_):
     plan = _strided_src_plan(self, self)
     outputs = (_dest_buffer(dest, M, H, self.dtype, self.device),)
     return _strided_inputs(self, plan), outputs, M
-
-
-def _run_contiguous(self, memory_format=None, dest=None, **_):
-    """Sub-tile M: materialize through nki_strided_copy_ into a fresh buffer."""
-    if not _block_fallback_view(self):
-        return None
-    out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
-    torch.ops.neuron.nki_strided_copy_(self, out)
-    return out, _mh(self)[0]
 
 
 def _reshape_contiguous_output(outputs, original_args):
@@ -347,18 +319,20 @@ def _make_compile_fn(graph_prefix):
         # Meta example inputs: only shapes/dtypes matter, and meta avoids a stray
         # empty/zeros dispatch to the neuron device on cold compile.
         if kind == "strided":
-            _, width, fanout, dyn_stride, src_dtype, dst_dtype = compile_key
+            _, width, fanout, dyn_stride, tile_m, src_dtype, dst_dtype = compile_key
             sfx = "same" if src_dtype == dst_dtype else _WRAPPER_SUFFIX[dst_dtype]
+            if tile_m == 1:
+                sfx += "_row"  # sub-tile variant, same-dtype only
             wrapper = getattr(wrappers, f"dynamic_strided_copy_{sfx}_nki")
             graph_name = f"{graph_prefix}_strided_{sfx}_s{dyn_stride}_w{width}_f{fanout}"
             ins = (
-                torch.empty(_TILE_M * dyn_stride, 1, dtype=src_dtype, device="meta"),
+                torch.empty(tile_m * dyn_stride, 1, dtype=src_dtype, device="meta"),
                 torch.empty(1, dyn_stride, dtype=torch.int32, device="meta"),
                 torch.empty(1, width, dtype=torch.int32, device="meta"),
                 torch.empty(1, fanout, dtype=torch.int32, device="meta"),
                 torch.zeros(4, 1, dtype=torch.int32, device="meta"),
             )
-            out = torch.empty(_TILE_M, width * fanout, dtype=dst_dtype, device="meta")
+            out = torch.empty(tile_m, width * fanout, dtype=dst_dtype, device="meta")
         else:
             _, H, src_dtype, dst_dtype = compile_key  # noqa: N806
             wrapper = getattr(wrappers, f"dynamic_cast_{_WRAPPER_SUFFIX[dst_dtype]}_nki")
@@ -394,7 +368,6 @@ def register():
             prepare_io=_prepare_contiguous_io,
             reshape_output=_reshape_contiguous_output,
             compile_key_fn=_contiguous_compile_key,
-            run=_run_contiguous,
         ),
     )
     register_dynamic_nki(
@@ -405,6 +378,5 @@ def register():
             prepare_io=_prepare_copy_io,
             reshape_output=_reshape_copy_output,
             compile_key_fn=_copy_compile_key,
-            run=_run_copy,
         ),
     )
