@@ -284,6 +284,23 @@ def _index_spec(**flags):
     return OpSpec("index", build, lambda src, idx: src[idx], **flags)
 
 
+def _gather_spec(**flags):
+    """gather(0, idx) with the index constant along the free dim — a row gather in
+    disguise, as produced by the backward of a row scatter_add_. Same [T, H] source as
+    _index_spec. The expand must come AFTER the device copy: ``.to()`` on an expanded
+    view materializes it contiguous, and a contiguous index is not a row gather."""
+
+    def build(dtype, *, rows=512, h=2048):
+        t = 2 * rows  # n < T exercises the index-padding path
+        src = torch.randn(t, h, dtype=dtype) / 8
+        idx = torch.randperm(t)[:rows]
+        idx_n = idx.to("neuron").unsqueeze(1).expand(rows, h)
+        return (src.to("neuron"), idx_n), src[idx]
+
+    # tol=(0, 0): every output element is a verbatim copy of a source row element.
+    return OpSpec("gather", build, lambda src, idx: src.gather(0, idx), tol=(0, 0), **flags)
+
+
 def _scatter_add_spec(**flags):
     """in-place scatter_add_ into [T, H] at n unique rows (MoE token->row unique)."""
 
@@ -357,6 +374,7 @@ _OP_SPECS = [
     _copy_spec(arbitrary_h=True, compile_once=True),
     _mm_spec(),
     _index_spec(arbitrary_h=True),
+    _gather_spec(arbitrary_h=True),
     _scatter_add_spec(arbitrary_h=True),
 ]
 
@@ -1102,6 +1120,43 @@ class TestDynamicNkiKernels:
             dst.copy_(src.to("neuron"))
         torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
 
+    # ── row-gather via aten::gather (scatter_add_'s backward) ──
+
+    def test_dynamic_nki_gather_no_recompile_across_n(self):
+        """One NEFF per (T, H, dtype) while the gathered row count n varies — the
+        MoE-backward guarantee, where n is a per-expert token count."""
+        T, H = 512, 2048  # noqa: N806
+        entry = _entry("gather")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        src = torch.randn(T, H, dtype=torch.bfloat16) / 8
+        src_n = src.to("neuron")
+        ns = (128, 200, 383, 512)
+        for n in ns:
+            idx = torch.randperm(T)[:n]
+            idx_n = idx.to("neuron").unsqueeze(1).expand(n, H)
+            torch.testing.assert_close(src_n.gather(0, idx_n).cpu(), src[idx], rtol=0, atol=0)
+
+        assert entry._exec_count - exec_before == len(ns), "gather did not run for every n"
+        assert entry._exec_ms.issuperset(
+            set(ns)
+        ), f"expected exec at n={set(ns)}, saw {entry._exec_ms}"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "recompiled across n (did n leak into the compile_key?)"
+
+    def test_dynamic_nki_gather_non_row_index_declines(self):
+        """Only a free-dim-constant index on dim 0 is a row gather. A per-element
+        index falls back to the default lowering and stays correct."""
+        T, H = 512, 256  # noqa: N806
+        src = torch.randn(T, H, dtype=torch.bfloat16) / 8
+        elem = torch.randint(0, T, (256, H))  # a genuine element gather, not an expand
+        with _assert_dynamic_skipped("gather"):
+            got = src.to("neuron").gather(0, elem.to("neuron")).cpu()
+        torch.testing.assert_close(got, src.gather(0, elem), rtol=0, atol=0)
+
     # ── E2E MoE forward: no recompiles as routing (token counts) change ──
     # per-expert SwiGLU FFN: index -> mm -> silu -> mul -> mm -> scatter_add.
     # Routing changes per-expert token counts (M) each step; each op must reuse
@@ -1342,11 +1397,21 @@ class TestDynamicNkiKernels:
             assert _can_handle_mm(odd_a, odd_w) is False
 
     # backward ops asserted on (mm/mm_k = grad_input/grad_weight).
-    MOE_BWD_OPS: ClassVar = ["mm", "mm_k", "silu_backward", "index", "mul"]
+    MOE_BWD_OPS: ClassVar = [
+        "mm",
+        "mm_k",
+        "silu_backward",
+        "index",
+        "mul",
+        "scatter_add_",
+        "gather",
+    ]
 
     @staticmethod
     def _moe_expert_loop_autograd(x, w1, w2, w3, expert_indices, T, H, num_experts):  # noqa: N803
-        """Functional MoE forward (index_add, autograd-friendly)."""
+        """MoE forward whose expert-combine is the real scatter_add_ over an expanded
+        row index, so the backward goes through aten::gather. index_add's backward is
+        index_select and never reaches the row-gather path the MoE actually hits."""
         output = torch.zeros(T, H, dtype=x.dtype, device=x.device)
         for e in range(num_experts):
             idx = expert_indices[e]
@@ -1355,7 +1420,8 @@ class TestDynamicNkiKernels:
             x_expert = x[idx]
             gated = torch.nn.functional.silu(x_expert @ w1[e]) * (x_expert @ w2[e])
             out = gated @ w3[e]
-            output = output.index_add(0, idx.to(torch.int64), out)
+            # scatter_add_ index must be int64 on CPU
+            output.scatter_add_(0, idx.to(torch.int64).unsqueeze(1).expand_as(out), out)
         return output
 
     def test_dynamic_nki_moe_backward_no_recompile(self):
