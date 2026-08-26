@@ -4,21 +4,27 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises
+from tests.utils.neuron_test_utils import (
+    assert_op_did_not_run_on_neuron,
+    assert_op_runs_on_neuron,
+    track_neuron_ops,
+)
 
 
 class TestHasCompatibleShallowCopyType:
     """Test the _has_compatible_shallow_copy_type operation"""
 
-    @assert_raises(AssertionError)
     def test_same_device_compatible(self):
         """Test that same device tensors are compatible"""
-        # CPU to CPU
-        x_cpu = torch.randn(3, 4)
-        y_cpu = torch.randn(3, 4)
-        assert torch._has_compatible_shallow_copy_type(x_cpu, y_cpu)
-        # op should run on CPU
-        assert_op_runs_on_neuron("aten::_has_compatible_shallow_copy_type")
+        # track_neuron_ops clears the process-wide op record: without it, any earlier
+        # test in the same worker that ran this op on Neuron flips the absence check
+        with track_neuron_ops():
+            # CPU to CPU
+            x_cpu = torch.randn(3, 4)
+            y_cpu = torch.randn(3, 4)
+            assert torch._has_compatible_shallow_copy_type(x_cpu, y_cpu)
+            # op should run on CPU
+            assert_op_did_not_run_on_neuron("aten::_has_compatible_shallow_copy_type")
 
         # Neuron to Neuron
         x_neuron = torch.randn(3, 4, device="neuron")
