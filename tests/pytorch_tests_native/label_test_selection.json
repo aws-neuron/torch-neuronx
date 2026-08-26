@@ -40,6 +40,17 @@
     },
     "module:dynamo": {
       "items": [
+        "test_ops.py",
+        "test_meta.py",
+        "test_decomp.py",
+        "test_ops_gradients.py",
+        "test_ops_fwd_gradients.py",
+        "test_modules.py",
+        "test_foreach.py",
+        "test_unary_ufuncs.py",
+        "test_binary_ufuncs.py",
+        "test_linalg.py",
+        "test_reductions.py",
         "dynamo"
       ],
       "kind": "items"
