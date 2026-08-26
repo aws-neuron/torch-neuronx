@@ -1906,6 +1906,106 @@ public:
   }
 };
 
+// Doubles as the conversion-legality predicate, so it must decline exactly what
+// matchAndRewrite below cannot build: an op it turns down stays legal and keeps
+// its max.dim lowering.
+static bool argmaxUsesCustomCall(Torch::AtenArgmaxOp op) {
+  auto selfTy = dyn_cast<Torch::BaseTensorType>(op.getSelf().getType());
+  if (!selfTy || !selfTy.areAllSizesKnown() || !selfTy.hasDtype())
+    return false;
+
+  Type elemTy = selfTy.getDtype();
+  if (!isa<Float32Type, Float16Type, BFloat16Type>(elemTy)) {
+    auto intTy = dyn_cast<IntegerType>(elemTy);
+    if (!intTy || (intTy.getWidth() != 32 && intTy.getWidth() != 64))
+      return false;
+  }
+
+  bool keepDim;
+  if (!matchPattern(op.getKeepdim(), Torch::m_TorchConstantBool(&keepDim)))
+    return false;
+
+  // dim=None reduces over the flattened tensor, and a rank-0 input has a single
+  // element so it reduces the same way.
+  int64_t rank = selfTy.getSizes().size();
+  if (rank == 0 || isa<Torch::NoneType>(op.getDim().getType()))
+    return true;
+
+  int64_t dim;
+  return matchPattern(op.getDim(), Torch::m_TorchConstantInt(&dim)) &&
+         dim >= -rank && dim < rank;
+}
+
+// aten::argmax(Tensor self, int? dim, bool keepdim) -> Tensor
+//   %f = stablehlo.reshape(self)                    // dim=None/rank 0: flatten
+//   %r = stablehlo.custom_call @AwsNeuronArgMax(%f) // config = reduced dim
+//   %r = stablehlo.reshape(%r)                      // keepdim: dim back as 1
+class ConvertNeuronArgmaxOp : public OpConversionPattern<Torch::AtenArgmaxOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::AtenArgmaxOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!argmaxUsesCustomCall(op)) {
+      return rewriter.notifyMatchFailure(op, "left to the max.dim lowering");
+    }
+    Location loc = op.getLoc();
+
+    Value input = adaptor.getOperands()[0];
+    auto inputType = cast<RankedTensorType>(input.getType());
+    bool keepDim;
+    matchPattern(op.getKeepdim(), Torch::m_TorchConstantBool(&keepDim));
+
+    // Flatten for the dim=None and rank-0 cases; a rank-1 input is already flat.
+    int64_t dim = 0;
+    if (inputType.getRank() == 0 ||
+        isa<Torch::NoneType>(op.getDim().getType())) {
+      if (inputType.getRank() != 1)
+        input = stablehlo::ReshapeOp::create(
+            rewriter, loc,
+            RankedTensorType::get({inputType.getNumElements()},
+                                  inputType.getElementType()),
+            input);
+    } else {
+      matchPattern(op.getDim(), Torch::m_TorchConstantInt(&dim));
+      if (dim < 0)
+        dim += inputType.getRank();
+    }
+
+    // The call returns the rank-reduced index tensor and takes the reduced
+    // dimension in its backend config, so unlike AwsNeuronTopK it needs no
+    // transpose to the last dimension.
+    auto workingType = cast<RankedTensorType>(input.getType());
+    SmallVector<int64_t> reducedShape(workingType.getShape());
+    reducedShape.erase(reducedShape.begin() + dim);
+
+    auto customArgmax = stablehlo::CustomCallOp::create(
+        rewriter, loc,
+        TypeRange{RankedTensorType::get(reducedShape, rewriter.getI64Type())},
+        ValueRange{input}, rewriter.getStringAttr("AwsNeuronArgMax"),
+        false,                                       // has_side_effect
+        rewriter.getStringAttr(std::to_string(dim)), // reduced dimension
+        stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+        nullptr, // called_computations
+        nullptr, // operand_layouts
+        nullptr, // result_layouts
+        nullptr  // output_operand_aliases
+    );
+
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+
+    Value result = customArgmax.getResult(0);
+    if (keepDim)
+      result = stablehlo::ReshapeOp::create(rewriter, loc, resultType, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 class ConvertNeuronQuantizeMxOp
     : public OpConversionPattern<Torch::AtenQuantizeMxOp> {
 public:
@@ -2364,6 +2464,11 @@ public:
 
       target.addIllegalOp<Torch::AtenSiluOp>();
       patterns.add<ConvertNeuronSiluOp>(typeConverter, context);
+
+      // Dynamically legal, unlike its neighbours: see argmaxUsesCustomCall.
+      target.addDynamicallyLegalOp<Torch::AtenArgmaxOp>(
+          [](Torch::AtenArgmaxOp op) { return !argmaxUsesCustomCall(op); });
+      patterns.add<ConvertNeuronArgmaxOp>(typeConverter, context);
 
       target.addIllegalOp<Torch::AtenQuantizeMxOp>();
       patterns.add<ConvertNeuronQuantizeMxOp>(typeConverter, context);

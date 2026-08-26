@@ -5007,10 +5007,12 @@ def erfinv_decomposition(y):
 
 @register_decomposition([aten.argmin.default])
 def argmin_decomposition(self, dim=None, keepdim=False):
-    """Decompose argmin via min.dim, mirroring ``argmax_decomposition``.
+    """Decompose argmin via min.dim.
 
     aten.argmin has no direct Neuron lowering, but min.dim does and carries the
-    winning index as its second result.
+    winning index as its second result. argmax is not decomposed here.
+    TorchToNeuron lowers it to the AwsNeuronArgMax custom call when it can, and
+    otherwise leaves it for this same min.dim/max.dim shape.
     """
     if dim is None:
         return self.reshape(-1).min(dim=0).indices
@@ -5669,11 +5671,6 @@ def _foreach_norm_decomp(self, ord=2):
             logger.debug("NKI foreach_norm kernel failed; falling back to torch op", exc_info=True)
             result.append(torch.linalg.vector_norm(t.flatten(), ord=ord))
     return result
-
-
-@register_decomposition([aten.argmax.default])
-def argmax_decomposition(self, dim=-1, keepdim=False):
-    return self.max(dim=dim, keepdim=keepdim).indices
 
 
 @register_decomposition([aten.hardshrink_backward.default])
