@@ -1014,7 +1014,7 @@ class TestDynamicNkiKernels:
             dst.copy_(src.to("neuron"))
         torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
 
-    # ── sub-tile M: delegated to neuron::nki_strided_copy_ (the block-strided gather) ──
+    # ── sub-tile M: the same strided kernel, built with tile_m == 1 ──
     @pytest.mark.parametrize(
         "dtype",
         [torch.bfloat16, torch.float16, torch.float32, torch.int32],
@@ -1023,10 +1023,10 @@ class TestDynamicNkiKernels:
     # rows=1 is excluded: a [1, H] slice of [1, 2H] is contiguous (extent-1 leading dim),
     # so it is not a strided case at all and declines like any sub-tile contiguous copy.
     @pytest.mark.parametrize("rows", [2, 16, 64, 100, 119, 127])
-    def test_dynamic_nki_copy_sub_tile_strided_src_delegates(self, rows, dtype):
-        """Sub-tile M is delegated to nki_strided_copy_ instead of declining to the
-        shape-baking prologue. Byte-exact: a copy does no arithmetic, so any tolerance
-        would hide a wrong access-pattern offset."""
+    def test_dynamic_nki_copy_sub_tile_strided_src(self, rows, dtype):
+        """A sub-tile M takes the strided kernel's tile_m == 1 variant, which walks single
+        rows, instead of declining to the shape-baking prologue. Byte-exact: a copy does no
+        arithmetic, so any tolerance would hide a wrong access-pattern offset."""
         wide = _exact_src(rows, 2048, dtype)
         src_n = wide.to("neuron")[:, :1024]
         assert not src_n.is_contiguous()
@@ -1036,7 +1036,7 @@ class TestDynamicNkiKernels:
         torch.testing.assert_close(dst_n.cpu(), wide[:, :1024].contiguous(), rtol=0, atol=0)
 
     def test_dynamic_nki_copy_sub_tile_strided_src_no_recompile(self):
-        """One NEFF per (block_size, row_stride, dtype) covers every sub-tile row count."""
+        """One NEFF per (width, dyn_stride, dtype) covers every sub-tile row count."""
         import torch_neuronx._C as _C
 
         def move(rows):
@@ -1054,12 +1054,13 @@ class TestDynamicNkiKernels:
         assert not new, f"recompiled for a new sub-tile M: {sorted(new)}"
 
     @pytest.mark.parametrize("rows", [2, 64, 127])
-    def test_dynamic_nki_copy_sub_tile_broadcast_src_declines(self, rows):
-        """Stride-0 is not a gather pattern: stays declined (element path would overlap)."""
+    def test_dynamic_nki_copy_sub_tile_broadcast_src(self, rows):
+        """Stride-0 fan-out works at tile_m == 1 as well: the kernel replicates in SBUF, so
+        the DMA never reads stride 0."""
         col = torch.randn(rows, 1, dtype=torch.bfloat16) / 8
         src_n = col.to("neuron").expand(rows, 1024)
         dst_n = torch.zeros(rows, 1024, dtype=torch.bfloat16).to("neuron")
-        with _assert_dynamic_skipped("copy_"):
+        with _assert_dynamic_ran("copy_"):
             dst_n.copy_(src_n)
         torch.testing.assert_close(dst_n.cpu(), col.expand(rows, 1024), rtol=0, atol=0)
 

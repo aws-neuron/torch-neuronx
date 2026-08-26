@@ -32,6 +32,7 @@ from .strided_copy_kernel import (
     strided_copy_kernel_fp16,
     strided_copy_kernel_fp32,
     strided_copy_kernel_same,
+    strided_copy_kernel_same_row,
 )
 from .sub_kernel import sub_kernel
 from .sum_kernel import sum_kernel
@@ -59,6 +60,7 @@ _wrapped_cast_fp16 = wrap_nki(cast_kernel_fp16)
 _wrapped_cast_fp32 = wrap_nki(cast_kernel_fp32)
 # Strided-view -> contiguous copy; `same` keeps the source dtype (the only int32 path).
 _wrapped_strided_same = wrap_nki(strided_copy_kernel_same)
+_wrapped_strided_same_row = wrap_nki(strided_copy_kernel_same_row)
 _wrapped_strided_bf16 = wrap_nki(strided_copy_kernel_bf16)
 _wrapped_strided_fp16 = wrap_nki(strided_copy_kernel_fp16)
 _wrapped_strided_fp32 = wrap_nki(strided_copy_kernel_fp32)
@@ -159,6 +161,17 @@ def dynamic_strided_copy_same_nki(
     meta: torch.Tensor,
 ) -> torch.Tensor:
     return _wrapped_strided_same[_GRID](base, stride_proto, width_proto, fan_proto, meta)
+
+
+@nki_op("dynamic_nki::strided_copy_same_row", mutates_args={})
+def dynamic_strided_copy_same_row_nki(
+    base: torch.Tensor,
+    stride_proto: torch.Tensor,
+    width_proto: torch.Tensor,
+    fan_proto: torch.Tensor,
+    meta: torch.Tensor,
+) -> torch.Tensor:
+    return _wrapped_strided_same_row[_GRID](base, stride_proto, width_proto, fan_proto, meta)
 
 
 @nki_op("dynamic_nki::strided_copy_bf16", mutates_args={})
