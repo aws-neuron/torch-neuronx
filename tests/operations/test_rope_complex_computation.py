@@ -45,7 +45,16 @@ class TestRoPEComplexComputation(unittest.TestCase):
     """Test RoPE-style complex number computation on Neuron device."""
 
     def _precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0, device="cpu"):
-        """Precompute the frequency tensor for complex exponentials (cis)."""
+        """Precompute the frequency tensor for complex exponentials (cis).
+
+        Note on tolerances: ``theta ** (...)`` is ``scalar ** tensor`` — an
+        on-device ``aten::pow.Scalar``. Running it on Neuron (vs the CPU
+        fallback this replaces) leaves ``freqs`` off by ~1 fp32 ULP (~6e-8),
+        which the ``torch.outer(t, freqs)`` product then scales by positions up
+        to ``end``, so the freqs_cis comparisons below use atol/rtol of
+        1e-5/1e-4 rather than 1e-6. Bit-exact agreement is not achievable for a
+        transcendental amplified across the sequence length.
+        """
         freqs = 1.0 / (
             theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
         )
@@ -73,8 +82,8 @@ class TestRoPEComplexComputation(unittest.TestCase):
             xq_neuron, xk_neuron, freqs_cis_neuron
         )
 
-        torch.testing.assert_close(xq_out_neuron.cpu(), xq_out_cpu, atol=1e-5, rtol=1e-4)
-        torch.testing.assert_close(xk_out_neuron.cpu(), xk_out_cpu, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(xq_out_neuron.cpu(), xq_out_cpu, atol=5e-5, rtol=1e-4)
+        torch.testing.assert_close(xk_out_neuron.cpu(), xk_out_cpu, atol=5e-5, rtol=1e-4)
 
     def test_rope_complex_multiplication_pattern(self):
         """Complex mul with broadcast freqs_cis matches CPU."""
@@ -104,7 +113,7 @@ class TestRoPEComplexComputation(unittest.TestCase):
 
         self.assertEqual(freqs_cis_neuron.dtype, torch.complex64)
         self.assertEqual(freqs_cis_neuron.shape, (end, dim // 2))
-        torch.testing.assert_close(freqs_cis_neuron.cpu(), freqs_cis_cpu, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(freqs_cis_neuron.cpu(), freqs_cis_cpu, atol=1e-5, rtol=1e-4)
 
     def test_rope_frequency_tensor_different_thetas(self):
         """freqs_cis with different theta values matches CPU."""
@@ -117,7 +126,7 @@ class TestRoPEComplexComputation(unittest.TestCase):
                     dim, end, theta=theta, device="neuron"
                 )
                 torch.testing.assert_close(
-                    freqs_cis_neuron.cpu(), freqs_cis_cpu, atol=1e-6, rtol=1e-6
+                    freqs_cis_neuron.cpu(), freqs_cis_cpu, atol=1e-5, rtol=1e-4
                 )
 
     def test_rope_pattern_end_to_end(self):
