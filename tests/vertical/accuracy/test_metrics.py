@@ -1,7 +1,8 @@
 """Phase 1 acceptance tests: the error model, verified on CPU with no device.
 
-TestAccumulatorDiscriminator validates ULP a bf16 accumulator differs from an fp32 one
-by orders of magnitude.
+TestAccumulatorDiscriminator validates that the measured relative error of a bf16 accumulator
+differs from an fp32 one by orders of magnitude -- which is why the flat budget can drop the
+``u_acc`` term without losing the failure mode it predicted.
 """
 
 from __future__ import annotations
@@ -11,55 +12,50 @@ import math
 import pytest
 import torch
 
-from .budgets import error_budget, width
+from . import budgets
+from .budgets import ARITHMETIC_BUDGET_UNITS, error_budget
 from .conftest import _cell
 from .formats import BF16, FP32, get_format
-from .metrics import cell_id, norms, seed_for, seeded, to_ulp, ulps
+from .metrics import cell_id, norms, rel_err_units, seed_for, seeded, to_units
 
 U_BF16 = 2.0**-8
 U_FP32 = 2.0**-24
 
 
-# ── 1. a known injected error produces the expected ULP count ────────────────
+# ── 1. a known injected error produces the expected unit count ───────────────
 
 
 class TestMetricArithmetic:
     def test_injected_error_reads_back_exactly(self):
         ref = torch.full((100,), 2.0, dtype=torch.float64)
         actual = ref.clone()
-        actual[7] += 3.0 * U_BF16 * 2.0  # 3 ULP at the reference's scale
+        actual[7] += 3.0 * U_BF16 * 2.0  # 3 units at the reference's scale (max|R| = 2.0)
 
         n = norms(actual, ref)
         assert n["max_abs_ref"] == pytest.approx(2.0)
-        assert to_ulp(n["max_abs_err"], n["max_abs_ref"], U_BF16) == pytest.approx(3.0)
+        assert to_units(n["max_abs_err"], n["max_abs_ref"], U_BF16) == pytest.approx(3.0)
 
-    def test_exact_match_is_zero_ulp(self):
+    def test_exact_match_is_zero_error(self):
         ref = torch.randn(64, dtype=torch.float64)
-        assert ulps(norms(ref.clone(), ref), U_BF16) == {"max_err_ulp": 0.0, "fro_err_ulp": 0.0}
+        assert rel_err_units(norms(ref.clone(), ref), U_BF16) == {"max_rel_err_units": 0.0}
 
     def test_zero_reference_does_not_silently_pass(self):
-        """An all-zero reference has no scale. Exact -> 0 ULP; anything else -> inf."""
+        """An all-zero reference has no scale. Exact -> 0 units; anything else -> inf."""
         zero = torch.zeros(8, dtype=torch.float64)
-        assert to_ulp(0.0, 0.0, U_BF16) == 0.0
-        assert to_ulp(1e-30, 0.0, U_BF16) == math.inf
+        assert to_units(0.0, 0.0, U_BF16) == 0.0
+        assert to_units(1e-30, 0.0, U_BF16) == math.inf
 
         wrong = zero.clone()
         wrong[0] = 1e-30
-        assert ulps(norms(wrong, zero), U_BF16)["max_err_ulp"] == math.inf
+        assert rel_err_units(norms(wrong, zero), U_BF16)["max_rel_err_units"] == math.inf
 
-    def test_frobenius_and_linf_disagree_as_designed(self):
-        """One bad element vs. broad drift -- each norm sees what the other misses."""
+    def test_one_bad_element_is_not_diluted_by_tensor_size(self):
+        """L-inf reports the worst element, whatever the tensor size around it."""
         ref = torch.full((4096,), 1.0, dtype=torch.float64)
 
         spike = ref.clone()
         spike[0] += 100.0 * U_BF16
-        spike_u = ulps(norms(spike, ref), U_BF16)
-
-        drift = ref + 2.0 * U_BF16
-        drift_u = ulps(norms(drift, ref), U_BF16)
-
-        assert spike_u["max_err_ulp"] > drift_u["max_err_ulp"]  # L-inf catches the spike
-        assert drift_u["fro_err_ulp"] > spike_u["fro_err_ulp"]  # Frobenius catches the drift
+        assert rel_err_units(norms(spike, ref), U_BF16)["max_rel_err_units"] == pytest.approx(100.0)
 
     def test_nan_and_inf_outputs_are_distinguishable_from_the_metric_alone(self):
         inf = math.inf
@@ -67,7 +63,7 @@ class TestMetricArithmetic:
         def measure(actual, ref):
             kw = {"dtype": torch.float64}
             n = norms(torch.tensor(actual, **kw), torch.tensor(ref, **kw))
-            return to_ulp(n["max_abs_err"], n["max_abs_ref"], U_BF16)
+            return to_units(n["max_abs_err"], n["max_abs_ref"], U_BF16)
 
         assert measure([inf, 1.0], [3.0, 1.0]) == inf  # output overflowed: wrong, countable
         assert math.isnan(measure([3.0, 1.0], [inf, 1.0]))  # reference overflowed: not comparable
@@ -85,8 +81,8 @@ class TestMetricArithmetic:
         adjacent representables
         """
         midpoint = torch.tensor([1.0 + 2.0**-8], dtype=torch.float64)  # between 1 and 1+2**-7
-        measured = ulps(norms(midpoint.to(torch.bfloat16), midpoint), U_BF16)["max_err_ulp"]
-        assert measured == pytest.approx(1.0, abs=0.01)
+        measured = rel_err_units(norms(midpoint.to(torch.bfloat16), midpoint), U_BF16)
+        assert measured["max_rel_err_units"] == pytest.approx(1.0, abs=0.01)
 
     def test_global_normalization_lets_cast_error_grow_toward_one(self):
         """this checks 2 claims
@@ -97,10 +93,10 @@ class TestMetricArithmetic:
             small = torch.randn(1024, dtype=torch.float64)
             large = torch.randn(1 << 20, dtype=torch.float64)
 
-        def cast_ulp(r):
-            return ulps(norms(r.to(torch.bfloat16), r), U_BF16)["max_err_ulp"]
+        def cast_units(r):
+            return rel_err_units(norms(r.to(torch.bfloat16), r), U_BF16)["max_rel_err_units"]
 
-        assert cast_ulp(small) < cast_ulp(large) <= 1.0
+        assert cast_units(small) < cast_units(large) <= 1.0
 
 
 # ── 2. identity and seeding are reproducible ─────────────────────────────────
@@ -143,154 +139,52 @@ class TestDeterminism:
         assert torch.equal(torch.randn(4), expected)
 
 
-# ── 3. width extraction, the three cases that break on an assumed dim ────────
-
-
-class TestWidth:
-    def test_reduction_with_explicit_dim(self):
-        assert (
-            width("aten::sum.dim_IntList", "reduction", {"self": (128, 4096), "dim": [1]}) == 4096
-        )
-        assert width("aten::sum.dim_IntList", "reduction", {"self": (128, 4096), "dim": [0]}) == 128
-
-    def test_reduction_without_dim_reduces_everything(self):
-        """Mirrors ``_schema_make_sample``: a missing optional ``dim`` is reduce-all, not axis 0."""
-        assert width("aten::sum", "reduction", {"self": (128, 4096)}) == 128 * 4096
-
-    def test_reduction_with_negative_dim(self):
-        assert width("aten::mean.dim", "reduction", {"self": (8, 16, 32), "dim": [-1]}) == 32
-
-    def test_matmul_takes_the_contracted_dim(self):
-        assert width("aten::mm", "linalg", {"self": (512, 2048), "mat2": (2048, 1024)}) == 2048
-        assert (
-            width("aten::bmm", "linalg", {"self": (4, 512, 2048), "mat2": (4, 2048, 1024)}) == 2048
-        )
-
-    def test_linear_contracts_the_weights_last_axis(self):
-        """``linear`` stores weight as (out, in) -- the opposite of mm's (K, N)."""
-        assert (
-            width("aten::linear", "linalg", {"input": (1, 2048, 4096), "weight": (11008, 4096)})
-            == 4096
-        )
-
-    def test_softmax_reads_the_axis_it_is_given(self):
-        assert width("aten::_softmax", "nn", {"self": (32, 128, 8192), "dim": 1}) == 128
-        assert width("aten::_softmax", "nn", {"self": (32, 128, 8192), "dim": -1}) == 8192
-
-    @pytest.mark.parametrize("dim", [None, "<absent>"], ids=["null", "absent"])
-    def test_softmax_without_a_usable_dim_is_unmodelled(self, dim):
-        """``aten::_softmax`` takes a *required* ``int dim``, both cases are malformed."""
-        shapes = {"self": (32, 128, 8192)}
-        if dim != "<absent>":
-            shapes["dim"] = dim
-        assert width("aten::_softmax", "nn", shapes) is None
-        assert error_budget("aten::_softmax", "nn", shapes, U_BF16, U_FP32) is None
-
-    def test_null_dim_on_a_reduction_stays_reduce_all(self):
-        """The deliberate divergence from ``_width_axis``: here null really means every axis."""
-        shapes = {"self": (32, 128, 8192), "dim": None}
-        assert width("aten::sum", "reduction", shapes) == 32 * 128 * 8192
-
-    def test_layernorm_uses_normalized_shape(self):
-        shapes = {"input": (2, 512, 4096), "normalized_shape": [4096]}
-        assert width("aten::native_layer_norm", "nn", shapes) == 4096
-
-    def test_elementwise_is_width_one(self):
-        assert width("aten::add.Tensor", "elementwise", {"self": (4096, 4096)}) == 1
-
-    def test_explicit_model_outranks_the_group_taxonomy(self):
-        """
-        Hardcodes ops group type to `elementwise`, assert n is resolved from ops count.
-        note "baddbmm" isn't elementwise in fact, hardcode makes it go this path.
-        """
-        linear_shapes = {"input": (1, 2048, 4096), "weight": (11008, 4096)}
-        assert width("aten::linear", "elementwise", linear_shapes) == 4096
-        assert (
-            width(
-                "aten::baddbmm.dtype_out",
-                "elementwise",
-                {"self": (8, 256, 64), "batch1": (8, 256, 128), "batch2": (8, 128, 64)},
-            )
-            == 128
-        )
-
-    def test_unmodelled_op_returns_none(self):
-        """``None`` is a reported non-verdict, not a crash."""
-        assert width("aten::some_new_op", "unknown", {"self": (128,)}) is None
-
-    def test_dict_form_shape_spec(self):
-        """Registry entries may use the ``_tensor_from_spec`` dict form."""
-        shapes = {"self": {"shape": (128, 4096), "dtype": "bfloat16"}, "dim": [1]}
-        assert width("aten::sum.dim_IntList", "reduction", shapes) == 4096
-
-
-# ── budget arithmetic ────────────────────────────────────────────────────────
+# ── 3. budget arithmetic ─────────────────────────────────────────────────────
 
 
 class TestBudget:
-    def test_accumulator_dominates_the_answer(self):
-        """The two hypotheses the suite exists to distinguish, at n=4096."""
-        shapes = {"self": (4096,)}
-        fp32_acc = error_budget("aten::sum", "reduction", shapes, U_BF16, U_FP32)
-        bf16_acc = error_budget("aten::sum", "reduction", shapes, U_BF16, U_BF16)
+    def test_the_flat_budget_is_one_full_ulp(self):
+        """``2.0`` units is the output format's machine epsilon, not an arbitrary constant."""
+        assert ARITHMETIC_BUDGET_UNITS == 2.0
+        assert ARITHMETIC_BUDGET_UNITS * U_BF16 == 2.0**-7
+        assert ARITHMETIC_BUDGET_UNITS * U_FP32 == 2.0**-23
 
-        assert fp32_acc == pytest.approx(1.0 + 64 / 65536, rel=1e-3)
-        assert bf16_acc == pytest.approx(1.0 + 64, rel=1e-3)
-        assert bf16_acc / fp32_acc > 60
+    @pytest.mark.parametrize("group", ["reduction", "linalg", "nn", "elementwise", "foreach"])
+    def test_every_arithmetic_group_gets_the_same_budget(self, group):
+        """No per-op or per-group arithmetic left: shape and reduction width cannot change it."""
+        assert error_budget(group) == ARITHMETIC_BUDGET_UNITS
 
-    def test_fp32_accumulator_flattens_the_shape_dependence(self):
-        small = error_budget("aten::sum", "reduction", {"self": (10,)}, U_BF16, U_FP32)
-        large = error_budget("aten::sum", "reduction", {"self": (8192,)}, U_BF16, U_FP32)
-        assert large / small < 1.01, "with fp32 accumulation, width should barely matter"
-
-    def test_pairwise_is_much_tighter_than_sequential(self):
-        shapes = {"self": (8192,)}
-        seq = error_budget("aten::sum", "reduction", shapes, U_BF16, U_BF16, order="sequential")
-        pair = error_budget("aten::sum", "reduction", shapes, U_BF16, U_BF16, order="pairwise")
-        assert seq == pytest.approx(1.0 + math.sqrt(8192), rel=1e-3)
-        assert pair == pytest.approx(1.0 + math.sqrt(13), rel=1e-2)
-
-    def test_rms_norm_is_one_pass_not_two(self):
-        """``x / sqrt(mean(x^2) + eps) * w`` is a single reduction.
-
-        layer_norm's mean-then-variance is the two-pass case; giving rms_norm the same
-        coefficient doubled its allowance for arithmetic it does not perform.
-        """
-        shapes = {"input": (2, 512, 4096), "normalized_shape": [4096]}
-        rms = error_budget("aten::rms_norm", "nn", shapes, U_BF16, U_BF16)
-        ln = error_budget("aten::layer_norm", "nn", shapes, U_BF16, U_BF16)
-        assert rms == pytest.approx(2.0 + math.sqrt(4096), rel=1e-3)
-        assert (ln - 2.0) == pytest.approx(2 * (rms - 2.0), rel=1e-3)
-
-    def test_norm_layers_budget_two_roundings_not_one(self):
-        """A norm layer rounds twice outside the reduction: scale-and-shift, then output cast.
-
-        Under fp32 accumulation the width term all but vanishes, so this constant is the whole
-        budget -- and at 1.0 it rejected every layer_norm cell measured on trn2 (1.29-1.80).
-        """
-        shapes = {"input": (8, 4096), "normalized_shape": [4096]}
-        assert error_budget("aten::layer_norm", "nn", shapes, U_BF16, U_FP32) == pytest.approx(
-            2.0, abs=0.01
-        )
+    def test_an_unknown_group_is_gated_rather_than_skipped(self):
+        """The coverage the flat budget buys: ~270 ops that used to report ``no_budget``."""
+        assert error_budget("unknown") == ARITHMETIC_BUDGET_UNITS
+        assert error_budget("fft") == ARITHMETIC_BUDGET_UNITS
 
     def test_bitexact_groups_budget_zero(self):
-        assert error_budget("aten::view", "shape", {"self": (4, 4)}, U_BF16, U_FP32) == 0.0
-        assert (
-            error_budget("aten::index_select", "indexing", {"self": (4, 4)}, U_BF16, U_FP32) == 0.0
-        )
+        assert error_budget("shape") == 0.0
+        assert error_budget("indexing") == 0.0
+
+    def test_bitexactness_survives_an_ungated_format(self):
+        """A ``view`` must reproduce its input at every dtype, so ``gated`` must not reach it."""
+        assert error_budget("shape", gated=False) == 0.0
+        assert error_budget("indexing", gated=False) == 0.0
 
     def test_random_group_is_excluded(self):
-        assert error_budget("aten::rand", "random", {"self": (4,)}, U_BF16, U_FP32) is None
+        assert error_budget("random") is None
+        assert error_budget("random", gated=False) is None
 
-    def test_unmodelled_op_has_no_budget(self):
-        assert error_budget("aten::some_new_op", "unknown", {"self": (4,)}, U_BF16, U_FP32) is None
+    def test_ungated_format_gets_no_verdict(self):
+        """fp32 and finer: ``u_acc == u_in``, so accumulation not rounding sets the scale."""
+        assert error_budget("reduction", gated=False) is None
+        assert error_budget("nn", gated=False) is None
 
-    def test_unknown_order_is_an_error_not_a_default(self):
-        with pytest.raises(ValueError, match="unknown order"):
-            error_budget("aten::sum", "reduction", {"self": (8,)}, U_BF16, U_FP32, order="magic")
+    def test_a_group_allowance_is_one_table_entry(self, monkeypatch):
+        """The extension seam: a family measured above one ULP needs an entry, not a formula."""
+        monkeypatch.setitem(budgets.GROUP_BUDGET_UNITS, "nn", 4.0)
+        assert error_budget("nn") == 4.0
+        assert error_budget("reduction") == ARITHMETIC_BUDGET_UNITS
 
 
-# ── 4. THE DISCRIMINATOR: measured ULP infers the accumulator ────────────────
+# ── 4. THE DISCRIMINATOR: the measured error infers the accumulator ──────────
 
 
 class TestAccumulatorDiscriminator:
@@ -311,7 +205,7 @@ class TestAccumulatorDiscriminator:
         return acc
 
     def _measure(self, actual: torch.Tensor, ref: torch.Tensor) -> float:
-        return ulps(norms(actual.double(), ref), BF16.unit)["max_err_ulp"]
+        return rel_err_units(norms(actual.double(), ref), BF16.unit)["max_rel_err_units"]
 
     @classmethod
     @pytest.fixture(scope="class")
@@ -320,30 +214,38 @@ class TestAccumulatorDiscriminator:
             x = torch.rand(cls.N, dtype=torch.bfloat16)
         return x, x.double().sum()
 
-    def test_fp32_accumulation_lands_within_one_ulp(self, data):
+    def test_fp32_accumulation_passes_the_flat_gate(self, data):
+        """Why the flat constant can afford to drop the ``u_acc`` term.
+
+        With an fp32 accumulator the whole width contribution at n=8192 is
+        ``sqrt(8192) * 2**-16 = 0.0014`` units, so a correct reduction is output-cast bound
+        and lands well inside one full ULP whatever ``n`` is.
+        """
         x, ref = data
         measured = self._measure(x.float().sum().to(torch.bfloat16), ref)
-        budget = error_budget("aten::sum", "reduction", {"self": (self.N,)}, U_BF16, U_FP32)
-        assert budget == pytest.approx(1.0, abs=0.01), "fp32 accumulation leaves only the cast"
-        assert measured <= budget, f"fp32 accumulation should be output-cast bound, got {measured}"
+        assert (
+            measured <= ARITHMETIC_BUDGET_UNITS
+        ), f"fp32 accumulation should be output-cast bound, got {measured}"
 
-    def test_bf16_accumulation_blows_past_the_fp32_budget(self, data):
-        """
-        sqrt(8192) = 90.5, 50 is a slacked threshold that this should comfortably pass
+    def test_bf16_accumulation_blows_past_the_flat_gate(self, data):
+        """And why dropping it is safe: a narrow accumulator is not a near-miss.
+
+        sqrt(8192) = 90.5 units against a 2.0 gate, so 25x is a slack threshold this should
+        comfortably pass. The failure mode the ``u_acc`` term existed to predict is caught by
+        the flat bound anyway -- it just is not attributed.
         """
         x, ref = data
         measured = self._measure(self._bf16_sequential_sum(x), ref)
-        fp32_budget = error_budget("aten::sum", "reduction", {"self": (self.N,)}, U_BF16, U_FP32)
         assert (
-            measured > 50 * fp32_budget
-        ), f"bf16 accumulation at n={self.N} should be unmistakable, got {measured} ULP"
+            measured > 25 * ARITHMETIC_BUDGET_UNITS
+        ), f"bf16 accumulation at n={self.N} should be unmistakable, got {measured} units"
 
     def test_the_two_accumulators_separate_by_orders_of_magnitude(self, data):
         """The property the suite's diagnostic value rests on."""
         x, ref = data
-        fp32_ulp = self._measure(x.float().sum().to(torch.bfloat16), ref)
-        bf16_ulp = self._measure(self._bf16_sequential_sum(x), ref)
-        assert bf16_ulp / max(fp32_ulp, U_BF16) > 10
+        fp32_units = self._measure(x.float().sum().to(torch.bfloat16), ref)
+        bf16_units = self._measure(self._bf16_sequential_sum(x), ref)
+        assert bf16_units / max(fp32_units, U_BF16) > 10
 
 
 # ── format plumbing ──────────────────────────────────────────────────────────
@@ -393,7 +295,7 @@ class TestCsvCell:
 
     The nullable columns are the point. A cell that reads as empty means "not measured"; a
     cell holding the string ``"None"`` reads as a value, so every downstream numeric parse
-    of ``budget_ulp`` / ``n`` / ``max_err_ulp`` has to special-case it.
+    of ``budget_units`` / ``n`` / ``max_rel_err_units`` has to special-case it.
     """
 
     def test_none_becomes_empty_not_the_string_none(self):
@@ -409,5 +311,5 @@ class TestCsvCell:
         assert _cell("boom\nat line 2\r\n") == "boom at line 2 "
 
     def test_floats_keep_full_precision(self):
-        """ULP figures are compared against budgets downstream; rounding here would lie."""
+        """Error figures are compared against budgets downstream; rounding here would lie."""
         assert _cell(0.5506040337445887) == "0.5506040337445887"
