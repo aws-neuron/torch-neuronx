@@ -53,7 +53,19 @@ def _adam_step_mlir(
     return param_new, exp_avg_new, exp_avg_sq_new, max_exp_avg_sq_new
 
 
-def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
+def _make_adam_compute_fn(decoupled_wd):
+    """Build the traced compute function.
+
+    amsgrad and maximize are parameters, not captured values: they select which
+    graph is emitted and they vary from call to call, and the kernel cache keys on
+    compute_fn's code object, which every closure from this def shares. Captured,
+    they would be invisible to it and all four combinations would collide.
+
+    decoupled_wd stays captured: it is not an ATen argument, it is bound per
+    registration (_fused_adam_ False, _fused_adamw_ True), and each op name has its
+    own kernel cache, so one cache never sees both values.
+    """
+
     def compute_fn(
         params,
         grads,
@@ -66,6 +78,8 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
         beta2,
         weight_decay,
         eps,
+        amsgrad,
+        maximize,
     ):
         from torch_neuronx.python_ops.nki_kernels.adamw import adam_nki, adamw_nki
 
@@ -159,6 +173,8 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
         beta2,
         weight_decay,
         eps,
+        amsgrad,
+        maximize,
     ):
         updated_params = []
         updated_exp_avgs = []
@@ -215,7 +231,11 @@ def _make_adam_compute_fn(amsgrad, maximize, decoupled_wd):
 
 
 def _register_fused_adam(op_names, decoupled_wd):
-    static_args = (7, 8, 9, 10) if _has_nki_adam_kernels else ()
+    # 11, 12 are amsgrad and maximize. Static so they reach the trace as Python
+    # bools: amsgrad sets the number of outputs (4N vs 3N) and indexes
+    # max_exp_avg_sqs, which is [] when it is False, so neither can be deferred to
+    # a tensor. bool subclasses int, so a non-static one would be tensorized.
+    static_args = ((7, 8, 9, 10) if _has_nki_adam_kernels else ()) + (11, 12)
 
     @register_aten(
         op_names,
@@ -245,7 +265,7 @@ def _register_fused_adam(op_names, decoupled_wd):
         found_inf=None,
         **kwargs,
     ):
-        compute_fn = _make_adam_compute_fn(amsgrad, maximize, decoupled_wd)
+        compute_fn = _make_adam_compute_fn(decoupled_wd)
 
         if not params:
             return compute_fn, (), {}, lambda results: None
@@ -272,6 +292,8 @@ def _register_fused_adam(op_names, decoupled_wd):
                 beta2,
                 weight_decay,
                 eps,
+                amsgrad,
+                maximize,
             ),
             {"out": out_tensors},
             lambda results: None,

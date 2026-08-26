@@ -253,10 +253,41 @@ class TestFusedAdamW:
         for pc, pn in zip(params_cpu, params_neuron, strict=False):
             torch.testing.assert_close(pn.detach().cpu(), pc.detach(), rtol=1e-4, atol=1e-4)
 
-    @pytest.mark.needs_process_isolation(
-        reason="Optimizer state mismatches CPU under process sharing and survives the "
-        "retry. Forked until the root cause is fixed."
-    )
+    def test_fused_adamw_flag_variants_in_one_process(self):
+        """Run both values of amsgrad, and of maximize, inside one test body.
+
+        The kernel cache is per process and keys on compute_fn's code object, which
+        every closure from one def shares. When the flags were captured rather than
+        passed, the first combination to run installed its kernel and later ones
+        lowered its graph: maximize=True kept the un-negated gradient, amsgrad=True
+        never updated max_exp_avg_sq. The per-flag tests below only catch that when
+        they happen to share a process in the right order; this asserts it directly.
+        False runs first because it is the value that installs the kernel.
+        """
+        for flag in ("amsgrad", "maximize"):
+            for value in (False, True):
+                torch.manual_seed(42)
+
+                param_cpu = torch.randn(16, requires_grad=True)
+                param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+                opt_cpu = torch.optim.AdamW([param_cpu], lr=0.01, fused=False, **{flag: value})
+                opt_neuron = torch.optim.AdamW([param_neuron], lr=0.01, fused=True, **{flag: value})
+
+                for _ in range(2):
+                    param_cpu.pow(2).sum().backward()
+                    opt_cpu.step()
+                    opt_cpu.zero_grad()
+
+                    param_neuron.pow(2).sum().backward()
+                    opt_neuron.step()
+                    opt_neuron.zero_grad()
+
+                self._compare_optimizer_states(opt_cpu, opt_neuron)
+                torch.testing.assert_close(
+                    param_neuron.detach().cpu(), param_cpu.detach(), rtol=1e-4, atol=1e-4
+                )
+
     def test_fused_adamw_amsgrad(self):
         """Test AdamW with AMSGrad enabled."""
         torch.manual_seed(42)
@@ -283,10 +314,6 @@ class TestFusedAdamW:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
-    @pytest.mark.needs_process_isolation(
-        reason="Optimizer state mismatches CPU under process sharing and survives the "
-        "retry. Forked until the root cause is fixed."
-    )
     def test_fused_adamw_maximize(self):
         """Test AdamW with maximize=True."""
         torch.manual_seed(42)
@@ -390,10 +417,6 @@ class TestFusedAdamW:
                 state["exp_avg_sq"].data_ptr() == exp_avg_sq_ptr
             ), "exp_avg_sq should be updated in-place"
 
-    @pytest.mark.needs_process_isolation(
-        reason="Optimizer state mismatches CPU under process sharing and survives the "
-        "retry. Forked until the root cause is fixed."
-    )
     def test_fused_adamw_amsgrad_buffer_donation(self):
         """Test buffer donation with AMSGrad enabled."""
         torch.manual_seed(42)
@@ -800,10 +823,6 @@ class TestFusedAdam:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
-    @pytest.mark.needs_process_isolation(
-        reason="Optimizer state mismatches CPU under process sharing and survives the "
-        "retry. Forked until the root cause is fixed."
-    )
     def test_fused_adam_amsgrad(self):
         """Test Adam with AMSGrad."""
         torch.manual_seed(42)
@@ -827,10 +846,6 @@ class TestFusedAdam:
 
         self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
 
-    @pytest.mark.needs_process_isolation(
-        reason="Optimizer state mismatches CPU under process sharing and survives the "
-        "retry. Forked until the root cause is fixed."
-    )
     def test_fused_adam_maximize(self):
         """Test Adam with maximize=True."""
         torch.manual_seed(42)
