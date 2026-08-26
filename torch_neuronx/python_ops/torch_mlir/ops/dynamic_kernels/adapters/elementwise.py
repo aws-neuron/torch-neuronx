@@ -79,7 +79,7 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
     graph_name = f"dynamic_nki_{name}"
     # Unsharded, every LNC program redundantly runs the whole kernel; ones_like is
     # pure store, so that duplicated traffic is the entire cost of the op.
-    lnc_sharded = name in {"add", "sub", "mul", "ones_like"}
+    lnc_sharded = name in {"add", "sub", "ones_like"}
     num_programs = int(get_logical_neuron_cores()) if lnc_sharded else 1
     row_group = _TILE_M * num_programs
     # Ops whose kernel never DMAs its operand — it only bakes [M, H] + dtype.
