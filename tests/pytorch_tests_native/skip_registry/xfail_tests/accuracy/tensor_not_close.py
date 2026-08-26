@@ -103,6 +103,16 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_log_softmax_with_dtype_neuron_int64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_log_softmax_with_dtype_neuron_int8",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_log_softmax_with_dtype_neuron_uint8",
+    # logspace(start, end, base) computes base**linspace(...) — a scalar-base
+    # aten::pow.Scalar. Once that op is lowered on-device (it previously fell
+    # back to CPU) the transcendental runs in float32 and is compared against a
+    # float64 CPU reference at float64 tolerance (1e-07). Measured: 1/4 elements
+    # mismatched, greatest absolute difference 9.16e-05, greatest RELATIVE
+    # difference 1.972e-07 against a 1e-07 limit — ~1.97x over, not a wrong
+    # result. Direct sibling of the linspace_*_float64 entries above, same cause.
+    # Forward numerics are covered positively at float32 tolerance by
+    # tests/python_ops/test_pow_scalar_out.py.
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_logspace_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_logspace_tensor_overload_neuron_int16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_logspace_tensor_overload_neuron_int32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_logspace_tensor_overload_neuron_int64",
@@ -171,6 +181,12 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_quick_linspace_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_linspace_tensor_overload_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_log_softmax_neuron_float64",
+    # Same float64-vs-float32 logspace precision as the comprehensive entries
+    # above (base**linspace via on-device aten::pow.Scalar); the quick variants
+    # walk a subset of the same OpInfo samples. Sibling of test_quick_linspace_
+    # *_float64 above.
+    "test_decomp.py::TestDecompNEURON::test_quick_logspace_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_quick_logspace_tensor_overload_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_gelu_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_logsigmoid_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_pad_constant_neuron_float32",

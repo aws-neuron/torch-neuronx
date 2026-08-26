@@ -159,6 +159,20 @@ def torch_pow(x, exponent, out=None):
     return torch.pow(x, exponent)
 
 
+@register_aten(["aten::pow.Scalar", "aten::pow.Scalar_out"])
+def torch_pow_scalar(self, exponent, out=None):
+    """Scalar base raised to a tensor exponent (``scalar ** tensor``).
+
+    Distinct from pow.Tensor_Scalar (tensor ** scalar): here the first arg is a
+    Python scalar base and the second is the exponent tensor.
+    """
+    # neuronx-cc has no 64-bit-integer `power` opcode, so an int64-promoted result
+    # (e.g. `int ** int`) is computed in int32 and widened back.
+    if torch.result_type(self, exponent) == torch.int64:
+        return torch.pow(self, exponent.to(torch.int32)).to(torch.int64)
+    return torch.pow(self, exponent)
+
+
 @register_aten(
     [
         "aten::remainder",
