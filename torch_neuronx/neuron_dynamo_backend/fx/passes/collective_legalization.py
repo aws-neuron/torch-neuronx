@@ -64,8 +64,12 @@ def _get_process_group_ranks(group_name: str) -> list[list[int]]:
         logger.debug(f"Process group '{group_name}' has replica groups: {groups}")
         return groups
     except Exception as e:
-        logger.warning(f"Failed to get replica groups for '{group_name}': {e}")
-        logger.warning("Falling back to default world group")
+        logger.error(
+            f"Failed to resolve replica groups for process group '{group_name}': {e}. "
+            f"Falling back to the full world group; if '{group_name}' does not span the "
+            f"whole world this rewrites a sharded collective into a global reduction "
+            f"(WRONG NUMERICS). Register the mesh/PG to avoid this."
+        )
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(world_size))]
 

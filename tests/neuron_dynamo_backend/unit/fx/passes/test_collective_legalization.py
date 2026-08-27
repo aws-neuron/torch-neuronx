@@ -145,7 +145,9 @@ class TestRawNewGroupCapture:
 
     @patch.object(mesh_registry, "_original_new_group")
     @patch.object(mesh_registry.dist, "get_world_size", return_value=4)
-    def test_incomplete_partition_warns_and_uses_local_ranks(self, mock_world_size, mock_new_group):
+    def test_incomplete_partition_errors_and_uses_local_ranks(
+        self, mock_world_size, mock_new_group
+    ):
         pg23 = _process_group("pg_23")
         mock_new_group.return_value = pg23
         mesh_registry._patched_new_group(ranks=[2, 3])
@@ -158,14 +160,16 @@ class TestRawNewGroupCapture:
             ),
             patch.object(mesh_registry.dist, "is_initialized", return_value=True),
             patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[2, 3]),
-            patch.object(mesh_registry.logger, "warning") as mock_warning,
+            patch.object(mesh_registry.logger, "error") as mock_error,
         ):
             result = mesh_registry.get_all_replica_groups("pg_23")
 
         assert result == [[2, 3]]
-        mock_warning.assert_called_once_with(
-            "No complete replica groups registered for process group 'pg_23' in SPMD mode; "
-            "falling back to local ranks [2, 3] in world size 4."
+        mock_error.assert_called_once_with(
+            "No registered replica groups for PG 'pg_23' in SPMD mode "
+            "(local ranks [2, 3], world 4); falling back to per-rank groups, "
+            "which violates the SPMD identical-replica-groups invariant and may give wrong "
+            "collectives. Register the mesh or set TORCH_NEURONX_SPMD_DISABLE=1 to opt in."
         )
 
     @patch.object(mesh_registry, "_original_new_group")
@@ -193,14 +197,16 @@ class TestRawNewGroupCapture:
             ),
             patch.object(mesh_registry.dist, "is_initialized", return_value=True),
             patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[1, 2]),
-            patch.object(mesh_registry.logger, "warning") as mock_warning,
+            patch.object(mesh_registry.logger, "error") as mock_error,
         ):
             result = mesh_registry.get_all_replica_groups("pg_invalid")
 
         assert result == [[1, 2]]
-        mock_warning.assert_called_once_with(
-            "No complete replica groups registered for process group 'pg_invalid' in SPMD mode; "
-            "falling back to local ranks [1, 2] in world size 4."
+        mock_error.assert_called_once_with(
+            "No registered replica groups for PG 'pg_invalid' in SPMD mode "
+            "(local ranks [1, 2], world 4); falling back to per-rank groups, "
+            "which violates the SPMD identical-replica-groups invariant and may give wrong "
+            "collectives. Register the mesh or set TORCH_NEURONX_SPMD_DISABLE=1 to opt in."
         )
 
     @pytest.mark.parametrize("member_cell", ["a", "b"])
@@ -262,12 +268,12 @@ class TestRawNewGroupCapture:
             ),
             patch.object(mesh_registry.dist, "is_initialized", return_value=True),
             patch.object(mesh_registry.dist, "get_process_group_ranks", return_value=[0, 1]),
-            patch.object(mesh_registry.logger, "warning") as mock_warning,
+            patch.object(mesh_registry.logger, "error") as mock_error,
         ):
             result = mesh_registry.get_all_replica_groups("pg_01")
 
         assert result == [[0, 1]]
-        mock_warning.assert_called_once()
+        mock_error.assert_called_once()
 
     def test_registry_lookup_returns_defensive_copy(self):
         mesh_registry._register_replica_groups("pg", [[0, 1], [2, 3]])
