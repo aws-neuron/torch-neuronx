@@ -2661,6 +2661,14 @@ def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
     return out if inverse is None else out.permute(inverse)
 
 
+def _true_rank(flat_mask):
+    # cumsum lowers to int64 matmul which the compiler errors on
+    # -> cast to fp32 for cumsum + cast back to int64
+    return torch.clamp(torch.cumsum(flat_mask.to(torch.float32), dim=0) - 1.0, min=0).to(
+        torch.int64
+    )
+
+
 @register_decomposition([aten.masked_scatter.default])
 def masked_scatter_decomposition(self, mask, source):
     """Decompose masked_scatter into flatten + prefix-sum gather + where.
@@ -2684,12 +2692,29 @@ def masked_scatter_decomposition(self, mask, source):
     self_b = self.broadcast_to(shape)
     mask_b = mask.broadcast_to(shape)
 
-    # prefix-sum over the flattened mask gives, at each True position, its
-    # 1-based rank among all True elements; subtract 1 (clamped) to index source.
-    prefix_sum = torch.cumsum(mask_b.flatten().to(torch.int64), dim=0)
-    gather_idx = torch.clamp(prefix_sum - 1, min=0)
+    gather_idx = _true_rank(mask_b.flatten())
     picked = torch.index_select(source.flatten(), 0, gather_idx).reshape(shape)
     return torch.where(mask_b, picked, self_b)
+
+
+@register_decomposition([aten.masked_scatter_backward.default])
+def masked_scatter_backward_decomposition(grad_output, mask, sizes):
+    """Gradient of masked_scatter w.r.t. source: scatter each True position's grad,
+    in row-major rank order, into a source-shaped buffer."""
+    numel = math.prod(sizes)
+    if numel == 0:
+        return grad_output.new_zeros(sizes)
+
+    mask_b = mask.to(torch.bool).broadcast_to(grad_output.shape)
+    flat_grad = grad_output.flatten()
+    flat_mask = mask_b.flatten()
+
+    rank = _true_rank(flat_mask)
+    contrib = flat_grad * flat_mask.to(flat_grad.dtype)
+
+    target = grad_output.new_zeros(numel)
+    target = target.scatter_add(0, rank, contrib)
+    return target.reshape(sizes)
 
 
 @register_decomposition([aten._grouped_mm.default])
