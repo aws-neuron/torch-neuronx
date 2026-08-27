@@ -30,12 +30,21 @@ from internal.common import allocate_to_device as _allocate_to_device
 from internal.common import classify_error as _classify_error
 from internal.common import flatten_tensors as _flatten_tensors
 from internal.neuron_op_info import _resolve_op
-from internal.neuron_shape_defaults_generated import TRACED_MODEL_OPS
+from internal.neuron_shape_defaults_generated import QWEN3_235B_A22B, TRACED_MODEL_OPS
 from internal.target_ops import TARGET_ATEN_OP_GROUP
 
 from .budgets import EXCLUDED_GROUPS, error_budget
 from .formats import get_format
-from .metrics import build_sample, cell_id, norms, rel_err_units, seed_for
+from .metrics import (
+    FRO_RATIO_THRESHOLD,
+    FroVerdict,
+    build_sample,
+    cell_id,
+    fro_ratio,
+    norms,
+    rel_err_units,
+    seed_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +85,7 @@ def _blank_row(op_name: str, op_group: str, arg_shapes: dict, dtype_name: str, c
         "op": op_name,
         "op_group": op_group,
         "dtype": dtype_name,
+        "path": None,
         "arg_shapes": arg_shapes,
         "unit": None,
         "max_rel_err_units": None,
@@ -83,6 +93,9 @@ def _blank_row(op_name: str, op_group: str, arg_shapes: dict, dtype_name: str, c
         "verdict": "",
         "max_abs_err": None,
         "max_abs_ref": None,
+        "fro_abs_err_base": None,
+        "fro_ratio": None,
+        "fro_ratio_verdict": "",
         "seed": seed_for(cell, cfg["seed_base"]),
         "gates": cfg["gates"],
         "status": "ok",
@@ -113,6 +126,36 @@ def _exact_match_units(dev_outs, ref_outs) -> tuple[dict, dict]:
     )
     err = 0.0 if exact else float("inf")
     return ({"max_abs_err": err, "max_abs_ref": 0.0}, {"max_rel_err_units": err})
+
+
+def _cell_paths(entry) -> list:
+    """Capture-path labels an entry belongs to, from its source tags. ``--traced-model
+    qwen3_235b_a22b`` tags each entry with the base model source plus its path source
+    ``qwen3_235b_a22b_<path>``; this returns e.g. ``["eager"]``, ``["compiled"]``, or both
+    for a shape traced in both paths. ``[None]`` for non-model runs (one unsplit CSV)."""
+    prefix = QWEN3_235B_A22B + "_"
+    labels = sorted(s[len(prefix) :] for s in entry.sources if s.startswith(prefix))
+    return labels or [None]
+
+
+def _worst_fro_ratio(dev_outs, base_outs, ref_outs):
+    """Frobenius ratio ||trn_low - ref_high||_F / ||cpu_low - ref_high||_F per output *tensor*
+    (a tensor-wise norm ratio, not element-wise), worst across an op's outputs (single-output
+    ops yield the one ratio). ``fro_trn`` = ||trn_low - ref_high|| (numerator), ``fro_cpu`` =
+    ||cpu_low - ref_high|| (denominator); the zero-denominator case (bit-exact CPU baseline)
+    is guarded inside ``fro_ratio`` -- it returns 0.0 if the device is also exact, else inf,
+    and never divides by zero. Returns (ratio, fro_trn, fro_cpu)."""
+    worst = None
+    for dev, base, ref in zip(dev_outs, base_outs, ref_outs, strict=True):
+        fro_trn = norms(dev, ref)["fro_abs_err"]
+        fro_cpu = norms(base, ref)["fro_abs_err"]
+        if fro_cpu == 0.0:
+            r = 0.0 if fro_trn == 0.0 else float("inf")
+        else:
+            r = fro_ratio(fro_trn, fro_cpu)
+        if worst is None or r > worst[0]:
+            worst = (r, fro_trn, fro_cpu)
+    return worst  # (ratio, fro_trn, fro_cpu)
 
 
 def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg: dict) -> dict:
@@ -175,6 +218,16 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
         row["error_cause_raw"] = f"output arity {len(dev_outs)} vs ref {len(ref_outs)}"
         return row
 
+    # Fro-ratio denominator baseline: the op on CPU at the *candidate* dtype (the "ideal"
+    # rounding a reference device would show) -- i.e. the reference, just without the upcast.
+    # This is the last read of ``sample``, so an in-place op mutating it here is harmless.
+    try:
+        with torch.no_grad():
+            base_out = fmt.reference(resolved, sample, dtype=fmt.dtype)
+        base_outs = [t.detach().cpu() for t in _flatten_tensors(base_out)]
+    except Exception:
+        base_outs = None
+
     unit = fmt.unit
     row["unit"] = unit
 
@@ -204,6 +257,20 @@ def _measure_cell(op_info: NeuronOpInfo, arg_shapes: dict, dtype_name: str, cfg:
         row["status"] = "excluded" if op_info.op_group in EXCLUDED_GROUPS else "no_gate"
     else:
         row["verdict"] = "within" if row["max_rel_err_units"] <= budget else "over"
+
+    # Frobenius ratio = ||trn_low - ref_high|| / ||cpu_low - ref_high||: device vs the CPU
+    # baseline at the candidate dtype, both against the higher-precision reference (fp32 for
+    # bf16, fp64 for fp32). Floating outputs only (int/bool outputs have no rounding scale).
+    if ref_outs[0].is_floating_point() and base_outs and len(base_outs) == len(ref_outs):
+        ratio, _fro_trn, fro_cpu = _worst_fro_ratio(dev_outs, base_outs, ref_outs)
+        row["fro_abs_err_base"] = fro_cpu
+        row["fro_ratio"] = ratio
+        if math.isnan(ratio):
+            row["fro_ratio_verdict"] = FroVerdict.INVALID.value
+        elif ratio <= FRO_RATIO_THRESHOLD:
+            row["fro_ratio_verdict"] = FroVerdict.WITHIN.value
+        else:
+            row["fro_ratio_verdict"] = FroVerdict.OVER.value
     return row
 
 
@@ -247,10 +314,14 @@ class TestOpAccuracy:
 
         rows = []
         for entry in entries:
+            paths = _cell_paths(entry)
             for dtype_name in accuracy_config["dtypes"]:
                 row = _measure_cell(op_info, entry.arg_shapes, dtype_name, accuracy_config)
-                emit_row(row)
-                rows.append(row)
+                # A shape traced in both paths is measured once and reported under each.
+                for path in paths:
+                    prow = row if path is None else {**row, "path": path}
+                    emit_row(prow)
+                    rows.append(prow)
                 logger.info(
                     "%s %s max_rel_err=%s budget=%s -> %s",
                     op_name,

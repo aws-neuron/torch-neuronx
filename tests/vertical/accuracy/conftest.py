@@ -36,6 +36,7 @@ ROW_FIELDS = [
     "op",
     "op_group",
     "dtype",
+    "path",
     "arg_shapes",
     "unit",
     "max_rel_err_units",
@@ -43,6 +44,9 @@ ROW_FIELDS = [
     "verdict",
     "max_abs_err",
     "max_abs_ref",
+    "fro_abs_err_base",
+    "fro_ratio",
+    "fro_ratio_verdict",
     "seed",
     "gates",
     "status",
@@ -95,7 +99,8 @@ def emit_row():
 
     def _emit(row: dict) -> None:
         _ROWS_DIR.mkdir(parents=True, exist_ok=True)
-        name = f"{row.get('cell_id', 'unknown')}_{_WORKER_ID}.json"
+        # Include path so a shape measured for both capture paths writes two files, not one.
+        name = f"{row.get('cell_id', 'unknown')}_{row.get('path') or 'all'}_{_WORKER_ID}.json"
         (_ROWS_DIR / name).write_text(json.dumps(row, default=str))
 
     return _emit
@@ -134,15 +139,22 @@ def _aggregate(rows_dir: Path, prefix: str):
         key=lambda r: (str(r.get("op", "")), str(r.get("dtype", "")), str(r.get("cell_id", "")))
     )
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output = Path(f"{prefix}_{ts}.csv")
-    with open(output, "w", newline="") as f:
-        w = csv.DictWriter(
-            f, fieldnames=ROW_FIELDS, quoting=csv.QUOTE_MINIMAL, extrasaction="ignore"
-        )
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: _cell(row.get(k)) for k in ROW_FIELDS})
-    logger.info(f"wrote {len(rows)} rows -> {output}")
+
+    # One CSV per capture path (``row["path"]``); an unsplit run (path=None) writes one CSV.
+    by_path: dict = {}
+    for row in rows:
+        by_path.setdefault(row.get("path"), []).append(row)
+    for path, prows in sorted(by_path.items(), key=lambda kv: str(kv[0])):
+        out_prefix = f"{prefix}_{path}" if path else prefix
+        output = Path(f"{out_prefix}_{ts}.csv")
+        with open(output, "w", newline="") as f:
+            w = csv.DictWriter(
+                f, fieldnames=ROW_FIELDS, quoting=csv.QUOTE_MINIMAL, extrasaction="ignore"
+            )
+            w.writeheader()
+            for row in prows:
+                w.writerow({k: _cell(row.get(k)) for k in ROW_FIELDS})
+        logger.info(f"wrote {len(prows)} rows -> {output}")
 
     _summarize(rows)
     for fp in rows_dir.glob("*.json"):

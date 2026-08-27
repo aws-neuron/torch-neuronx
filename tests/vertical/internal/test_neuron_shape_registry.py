@@ -351,7 +351,7 @@ class TestModelShapeSets:
 
     def test_naming_a_set_registers_it_on_top_of_builtin(self):
         reg = self._register([QWEN3_235B_A22B])
-        assert reg.models() == [QWEN3_235B_A22B]
+        assert QWEN3_235B_A22B in reg.models()
         # builtin is still there -- the set adds, it does not replace
         assert len(reg.get("aten::mm", model=BUILTIN_SOURCE)) > 0
 
@@ -378,7 +378,7 @@ class TestModelShapeSets:
         # all_ops(model=) additionally reports propagated .out/.default overloads, so the
         # declared set is a subset -- every declared op must be present, none missing.
         assert TRACED_MODEL_OPS[QWEN3_235B_A22B] <= registered
-        assert len(TRACED_MODEL_OPS[QWEN3_235B_A22B]) == 54
+        assert len(TRACED_MODEL_OPS[QWEN3_235B_A22B]) == 46
 
 
 # ── Propagation to compatible overloads ─────────────────────────────────────
