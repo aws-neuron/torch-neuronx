@@ -41,19 +41,20 @@ def run_raw_partition_test(rank, world_size, kwargs):
 
 
 def run_incomplete_partition_test(rank, world_size, kwargs):
-    """A raw partial group warns and falls back to its local rank cell."""
+    """A raw partial group errors (loud) and falls back to its local rank cell."""
     clear_mesh_registry()
     group = dist.new_group(ranks=[0, 1])
 
     if rank in [0, 1]:
-        with patch.object(mesh_registry.logger, "warning") as mock_warning:
+        with patch.object(mesh_registry.logger, "error") as mock_error:
             result = get_all_replica_groups(group.group_name)
 
         assert result == [[0, 1]]
-        mock_warning.assert_called_once_with(
-            "No complete replica groups registered for process group "
-            f"'{group.group_name}' in SPMD mode; falling back to local ranks "
-            "[0, 1] in world size 4."
+        mock_error.assert_called_once_with(
+            f"No registered replica groups for PG '{group.group_name}' in SPMD mode "
+            "(local ranks [0, 1], world 4); falling back to per-rank groups, "
+            "which violates the SPMD identical-replica-groups invariant and may give wrong "
+            "collectives. Register the mesh or set TORCH_NEURONX_SPMD_DISABLE=1 to opt in."
         )
 
 
@@ -69,5 +70,5 @@ class TestRawProcessGroupReplicaGroups(BaseCollectiveOpTest):
         self.distributed_tester.run_test(run_raw_partition_test)
 
     @pytest.mark.multi_device
-    def test_incomplete_partition_warns_and_falls_back(self):
+    def test_incomplete_partition_errors_and_falls_back(self):
         self.distributed_tester.run_test(run_incomplete_partition_test)

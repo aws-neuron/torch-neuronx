@@ -239,9 +239,11 @@ def get_all_replica_groups(pg_name: str) -> list[list[int]]:
     if sorted(local_ranks) == list(range(world_size)):
         return [local_ranks]
 
-    logger.warning(
-        f"No complete replica groups registered for process group '{pg_name}' in SPMD mode; "
-        f"falling back to local ranks {local_ranks} in world size {world_size}."
+    logger.error(
+        f"No registered replica groups for PG '{pg_name}' in SPMD mode "
+        f"(local ranks {local_ranks}, world {world_size}); falling back to per-rank groups, "
+        f"which violates the SPMD identical-replica-groups invariant and may give wrong "
+        f"collectives. Register the mesh or set TORCH_NEURONX_SPMD_DISABLE=1 to opt in."
     )
     return [local_ranks]
 
