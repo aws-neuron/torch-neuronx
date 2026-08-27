@@ -989,10 +989,67 @@ public:
 };
 } // namespace
 
+namespace {
+// Lowers torch.prim.If (a !torch.bool condition plus then/else regions
+// terminated by torch.prim.If.yield) to stablehlo.if (a 0-d tensor<i1>
+// predicate plus true/false branches terminated by stablehlo.return). 
+class ConvertPrimIfOp : public OpConversionPattern<PrimIfOp> {
+public:
+  using OpConversionPattern<PrimIfOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(PrimIfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(op.getResultTypes(),
+                                                resultTypes)))
+      return rewriter.notifyMatchFailure(op, "result type conversion failed");
+
+    // stablehlo.if takes a 0-d tensor<i1> predicate. The backend type
+    // converter lowers !torch.bool -> i1, so wrap that scalar into a tensor.
+    Value predScalar = adaptor.getCondition();
+    Value pred = tensor::FromElementsOp::create(
+        rewriter, op.getLoc(), RankedTensorType::get({}, rewriter.getI1Type()),
+        predScalar);
+
+    auto ifOp =
+        stablehlo::IfOp::create(rewriter, op.getLoc(), resultTypes, pred);
+    // Move the then/else region bodies into stablehlo.if. The terminators stay
+    // as torch.prim.If.yield transiently and are converted to stablehlo.return
+    // by ConvertPrimIfYieldOp (which sees the type-converted operands via its
+    // adaptor). The branch body ops are converted by the other patterns.
+    rewriter.inlineRegionBefore(op.getThenRegion(), ifOp.getTrueBranch(),
+                                ifOp.getTrueBranch().end());
+    rewriter.inlineRegionBefore(op.getElseRegion(), ifOp.getFalseBranch(),
+                                ifOp.getFalseBranch().end());
+
+    rewriter.replaceOp(op, ifOp.getResults());
+    return success();
+  }
+};
+
+// Converts the torch.prim.If.yield terminator (inside a moved region) to
+// stablehlo.return, using the type-converted operands from the adaptor.
+class ConvertPrimIfYieldOp : public OpConversionPattern<PrimIfYieldOp> {
+public:
+  using OpConversionPattern<PrimIfYieldOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(PrimIfYieldOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, adaptor.getOperands());
+    return success();
+  }
+};
+} // namespace
+
 void mlir::torch::torch_to_stablehlo::populateUncategorizedPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
     ConversionTarget &target, const TorchToStablehloOptions &options) {
   MLIRContext *context = patterns.getContext();
+
+  target.addIllegalOp<PrimIfOp>();
+  target.addIllegalOp<PrimIfYieldOp>();
+  patterns.add<ConvertPrimIfOp>(typeConverter, context);
+  patterns.add<ConvertPrimIfYieldOp>(typeConverter, context);
 
   target.addIllegalOp<AtenQuantizePerTensorOp>();
   target.addIllegalOp<AtenIntReprOp>();
