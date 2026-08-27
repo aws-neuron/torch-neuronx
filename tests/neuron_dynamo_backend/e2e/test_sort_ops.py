@@ -46,14 +46,8 @@ SORT_CONFIGS = [
     pytest.param((256, 256), -1, False, torch.float32, id="large-2d-f32"),
     pytest.param((16, 32), -1, False, torch.float16, id="2d-f16"),
     pytest.param((16, 32), -1, False, torch.bfloat16, id="2d-bf16"),
-    pytest.param(
-        (16, 32),
-        -1,
-        False,
-        torch.int64,
-        id="2d-i64",
-        marks=pytest.mark.xfail(reason="AwsNeuronTopK does not support integer types"),
-    ),
+    pytest.param((16, 32), -1, False, torch.int32, id="2d-i32"),
+    pytest.param((16, 32), -1, False, torch.int64, id="2d-i64"),
     pytest.param((8, 17), -1, False, torch.float32, id="2d-odd-lastdim-f32"),
     pytest.param((13, 32), 0, False, torch.float32, id="2d-odd-dim0-f32"),
     pytest.param((4, 7, 16), 1, True, torch.float32, id="3d-odd-dim1-desc-f32"),
@@ -199,8 +193,8 @@ class TestSortE2E:
 
         rtol, atol = (1e-2, 1e-3) if dtype in (torch.float16, torch.bfloat16) else (1e-4, 1e-5)
         torch.testing.assert_close(neuron_values.cpu(), cpu_values, rtol=rtol, atol=atol)
-        if dtype in (torch.float16, torch.bfloat16):
-            # bf16/fp16 have ties; verify gathered values match sorted values
+        # ties (low-precision floats, integers): topk indices may differ, so check gathered values.
+        if dtype in (torch.float16, torch.bfloat16) or not dtype.is_floating_point:
             neuron_gathered = torch.gather(x, dim, neuron_indices.cpu())
             torch.testing.assert_close(neuron_gathered, neuron_values.cpu(), rtol=0, atol=0)
         else:

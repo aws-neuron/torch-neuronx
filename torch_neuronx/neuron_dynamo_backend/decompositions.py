@@ -4090,15 +4090,11 @@ def argsort_decomposition(input, dim=-1, descending=False, stable=False):
     return torch.sort(input, dim=dim, descending=descending, stable=stable)[1]
 
 
-@register_decomposition([aten.sort.stable])
-def sort_stable_decomposition(self, *, stable, dim=-1, descending=False):
-    """Route sort.stable to sort.default, which is the only sort overload that
-    lowers on Neuron (there is no stable-sort primitive). Stability is
-    best-effort; this matches the existing argsort.default path, which already
-    reaches sort.default. Also covers argsort.stable / argsort.stable_out and
-    sort.values_stable, which all reduce to sort.stable during tracing.
-    """
-    return aten.sort.default(self, dim=dim, descending=descending)
+@register_decomposition([aten.sort.default, aten.sort.stable])
+def sort_decomposition(self, dim=-1, descending=False, *, stable=None):
+    """Lower sort (default and stable) to topk; stability is best-effort."""
+    k = self.size(dim) if self.dim() > 0 else 1
+    return torch.topk(self, k, dim=dim, largest=descending, sorted=True)
 
 
 @register_decomposition([aten.mode.default])
