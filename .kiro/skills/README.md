@@ -63,6 +63,27 @@ Cross-references `docs/AI-*.md` for subsystem
 context; evaluates BC per `bc-guidelines.md`; walks the diff against
 `review-checklist.md`.
 
+### `compiler-artifact-repro/` — compiler-bug isolation & hand-off
+
+Turns a "test fails on this neuronx-cc version" report into a package
+for the Neuron compiler team: reproduces the failure on a Neuron
+(trn2-class) host, dumps the offending **HLO** (`module.mlir`) and
+**NEFF** (`module.neff`) via `TORCH_NEURONX_DEBUG_DIR` +
+`…PRESERVE_COMPILATION_ARTIFACTS`, and — the key step — proves the
+dumped HLO reproduces **standalone** through
+`torch_neuronx._C.compile_graph` / `execute_compiled_graph` (no aten
+dispatch, no Python decomposition). Then localizes the bug
+(shard / tile / shape / race) and packages the artifacts for hand-off.
+`SKILL.md` is the flow; `reference.md` (§A–F) holds the env-var,
+runtime-API, localization, and hand-off detail; `scripts/` has `artifact_dump.py`, `validate_hlo.py`
+(compile-only or execute+diff), and `gen_ticket.py`.
+
+Hardware access and the team's upload/issue-tracker routing are
+delegated (not prescribed) — matching the repo convention that skills
+emit host commands but don't bake in the execution mechanism. Isolates
+and hands off a compiler bug; it does **not** edit `torch_neuronx/`
+source — that's `pytorch-upstream-test-debugger`.
+
 ### `accuracy/` — Neuron-vs-GPU accuracy skill suite
 
 A nested **suite** (a master `accuracy` index/router + 25 sub-skills) for
@@ -124,6 +145,13 @@ self-tests (torch only) ship under several sub-skills' `scripts/`.
 │   ├── SKILL.md                            PR / branch review workflow
 │   ├── review-checklist.md                 per-subsystem review items
 │   └── bc-guidelines.md                    backward-compat rules for torch_neuronx
+├── compiler-artifact-repro/
+│   ├── SKILL.md                            compiler-bug isolation & hand-off flow
+│   ├── reference.md                        env vars, runtime API, localization, hand-off (§A–F)
+│   └── scripts/
+│       ├── artifact_dump.py                dump HLO/NEFF (set debug dir + preserve, before torch_neuronx)
+│       ├── validate_hlo.py                 compile + run a dumped module.mlir standalone (no aten)
+│       └── gen_ticket.py                   render a ready-to-file ticket.md into the repro folder
 ├── agent-isolation/
 │   ├── SKILL.md                            kit + three-tier dispatch policy
 │   └── scripts/
@@ -160,6 +188,10 @@ self-tests (torch only) ship under several sub-skills' `scripts/`.
   `scripts/` for the kit (`agent-run`, `provision-worktree`,
   `with-hw-lock`). Used by the orchestrator at
   `.kiro/agents/upstream-debugger-orchestrator.md`.
+- **Isolating a compiler miscompile and handing it to the Neuron compiler
+  team** → `compiler-artifact-repro`. Start with its `SKILL.md`, use
+  `scripts/` to dump + standalone-validate the HLO/NEFF, and consult
+  `reference.md` §A–F for the details.
 - **Validating or debugging model numerical accuracy on Neuron** → `accuracy/`.
   Start with `accuracy/SKILL.md` (the master router) to pick the level/skill, or
   load a sub-skill directly (e.g. `moduscope-op-bisect` to localize a divergent
