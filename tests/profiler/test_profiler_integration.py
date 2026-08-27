@@ -13,9 +13,9 @@ Tests are split into three groups:
     verifying output structure, chrome trace export, events, flow arrows, and metadata.
 """
 
+import contextlib
 import json
 import os
-import shutil
 import time
 
 import pytest
@@ -824,7 +824,10 @@ class TestNeuronProfilerIntegration:
                 f"found copied files: {sorted(copied_names)}"
             )
         finally:
-            shutil.rmtree(os.path.join(cache_dir, fake_key[:2]), ignore_errors=True)
+            # Remove only this file. cache_dir is now shared across workers, so
+            # removing the shard directory would take real entries with it.
+            with contextlib.suppress(OSError):
+                os.remove(fake_neff_path)
 
     def test_neuron_profiler_on_trace_ready(self):
         """Test NeuronProfiler.export_trace used as on_trace_ready callback."""

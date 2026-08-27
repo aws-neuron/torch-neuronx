@@ -7,13 +7,40 @@ set -e
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/pytorch_tests_native" "tests/cpu_fallback" "tests/vertical")
+# tests/cache is here because its conftest repoints TORCH_NEURONX_NEFF_CACHE_DIR at
+# import, which the C++ backend reads once per process, so collecting it in the main
+# group would redirect every worker's cache. It runs in its own group below.
+readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/pytorch_tests_native" "tests/cpu_fallback" "tests/vertical" "tests/cache")
+# Tests that drive the cache directly rather than through a compile. They need a
+# private cache dir, because _clear_compilation_cache() deletes the on-disk NEFFs
+# and would wipe what the other workers are using, and HLO-derived keying off,
+# because put_neff_cache cannot derive a key without HLO bytes.
+readonly CACHE_OWNING_TESTS=(
+    "tests/neuron_dynamo_backend/component/caching/test_megacache.py"
+    "tests/neuron_dynamo_backend/unit/test_metrics.py"
+    "tests/neuron_dynamo_backend/e2e/test_execute_compiled_graph_e2e.py"
+)
+readonly CACHE_OWNING_NEFF_DIR="/tmp/neff_cache_owned_by_tests"
 readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py" "tests/operations/test_launch_blocking_invariant.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
 
 # Retry configuration
 DEFAULT_NUM_WORKERS_RETRY=4
 DEFAULT_RETRY_TIMEOUT=1800
+
+# Persistent NEFF cache (--persistent-cache). The internal-compute fleet injects
+# these two vars into the pod when the job carries a
+# neuron.internal_compute.persistent-storage:{read,write} label, naming this repo's
+# S3 cache. The bucket is fleet-assigned, so suites are separated by prefix:
+# ATEN_NEFF_CACHE_S3_SUBDIR keeps ATen's NEFFs away from the upstream suite's.
+readonly PERSISTENT_STORAGE_BUCKET_ENV="PERSISTENT_STORAGE_BUCKET"
+readonly PERSISTENT_STORAGE_PREFIX_ENV="PERSISTENT_STORAGE_PREFIX"
+readonly ATEN_NEFF_CACHE_S3_SUBDIR="aten-unit-tests"
+# torch-neuronx's own default cache dir, on local NVMe. Set explicitly so the
+# download target and the compile path cannot drift apart. Overridable from the
+# environment to point a local run at a scratch cache.
+readonly ATEN_NEFF_CACHE_DIR="${ATEN_NEFF_CACHE_DIR:-/tmp/neff_cache}"
+readonly NEFF_CACHE_TRANSFER_TIMEOUT=600
 
 # Global state
 declare -g RUNNER=()
@@ -48,6 +75,8 @@ declare -g NO_FORKED_GROUP_TIMEOUT=3600
 # device-hostile tests (hard OOMs, a 17GB pre-alloc per parametrization), which
 # the full suite only survived because they were spread over an hour.
 declare -g NO_FORKED_ISOLATED_WORKERS=4
+declare -g PERSISTENT_CACHE=false
+declare -g PERSISTENT_CACHE_REFRESH=false
 
 
 # Initialize environment
@@ -134,6 +163,8 @@ parse_arguments() {
             "--json-report") ENABLE_JSON_REPORT=true ;;
             "--skip_pt_test_distributed") SKIP_PT_TEST_DISTRIBUTED=true ;;
             "--no-forked") NO_FORKED=true ;;
+            "--persistent-cache") PERSISTENT_CACHE=true ;;
+            "--refresh-persistent-cache") PERSISTENT_CACHE_REFRESH=true ;;
             "--sanity_pt_distributed_tests")
                 SANITY_PT_DISTRIBUTED_TESTS="--sanity_pt_distributed_tests"
                 ;;
@@ -185,15 +216,116 @@ build_ignore_args() {
     # Always ignore multistream host-cc tests (requires worldsize>8, run separately)
     ignore_args+="--ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py "
 
-    # Add multi-device and distributed test ignores for full suite runs
+    # Add multi-device, distributed and cache-owning ignores for full suite runs
     if [[ "$HAS_EXPLICIT_TEST_PATH" == "false" ]]; then
-        for test in "${SKIP_TESTS[@]}"; do
+        for test in "${SKIP_TESTS[@]}" "${CACHE_OWNING_TESTS[@]}"; do
             ignore_args+="--ignore=$test "
         done
     fi
 
     echo "$ignore_args"
 }
+# S3 location of this suite's NEFF cache, or non-zero when no storage label is set.
+# Partitioned by compiler version so a bump starts from an empty prefix rather
+# than paying a lookup against entries that can never match.
+neff_cache_s3_uri() {
+    local bucket="${!PERSISTENT_STORAGE_BUCKET_ENV:-}"
+    [[ -n "$bucket" ]] || return 1
+
+    local prefix="${!PERSISTENT_STORAGE_PREFIX_ENV:-}"
+    prefix="${prefix#/}"
+    prefix="${prefix%/}"
+
+    local compiler_version
+    compiler_version=$("${RUNNER[@]}" -c \
+        "import neuronxcc; print(neuronxcc.__version__)" 2>/dev/null) || compiler_version=""
+    [[ -n "$compiler_version" ]] || compiler_version="unknown"
+
+    local base="s3://$bucket"
+    [[ -n "$prefix" ]] && base="$base/$prefix"
+    echo "$base/version=$compiler_version/$ATEN_NEFF_CACHE_S3_SUBDIR/neff_cache/"
+}
+
+neff_cache_file_count() {
+    find "$ATEN_NEFF_CACHE_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Download the shared NEFF cache before the tests, so a compile that any previous
+# run already did is a cache hit here. Everything is fail-open: no label, no aws
+# CLI, or an S3 error just means a cold compile, never a failed run.
+neff_cache_download() {
+    [[ "$PERSISTENT_CACHE" == "true" ]] || return 0
+
+    if ! mkdir -p "$ATEN_NEFF_CACHE_DIR"; then
+        echo "=== NEFF cache: cannot create $ATEN_NEFF_CACHE_DIR; cold compile ==="
+        return 0
+    fi
+    export TORCH_NEURONX_NEFF_CACHE_DIR="$ATEN_NEFF_CACHE_DIR"
+    # Key each NEFF by its HLO, so a source edit that does not change the HLO still
+    # hits. Off by default in torch-neuronx.
+    export TORCH_NEURONX_NEFF_KEY_FROM_HLO=1
+
+    local s3_uri
+    if ! s3_uri=$(neff_cache_s3_uri); then
+        echo "=== NEFF cache: $PERSISTENT_STORAGE_BUCKET_ENV unset (no persistent-storage label?); cold compile ==="
+        return 0
+    fi
+
+    # Print without the s3:// scheme so the path is not redacted in CI logs.
+    echo "=== NEFF cache: downloading from ${s3_uri#s3://} ==="
+    local start=$SECONDS
+    if ! timeout "$NEFF_CACHE_TRANSFER_TIMEOUT" \
+            aws s3 cp --recursive --only-show-errors "$s3_uri" "$ATEN_NEFF_CACHE_DIR"; then
+        # A cold prefix exits non-zero too, which is normal on the first run of a
+        # compiler version.
+        echo "=== NEFF cache: nothing downloaded (cold prefix or transfer error) ==="
+    fi
+    echo "=== NEFF cache: $(neff_cache_file_count) entries local after $((SECONDS - start))s ==="
+}
+
+# Seed the shared cache with whatever this run compiled. Three independent gates,
+# all of which must pass, so a PR, a merge-queue run, a dependency bump or a
+# nightly on a custom branch can never publish NEFFs built from unmerged code:
+#   1. --refresh-persistent-cache, which only the nightly passes
+#   2. the branch is main
+#   3. a storage bucket is present, i.e. the job carries persistent-storage:write
+neff_cache_upload() {
+    [[ "$PERSISTENT_CACHE" == "true" ]] || return 0
+    [[ "$PERSISTENT_CACHE_REFRESH" == "true" ]] || return 0
+
+    # Internal compute forwards only TEST_COMMAND into the workload, so a caller
+    # that wants to upload has to export GITHUB_REF_NAME itself. Empty means the
+    # export is missing, not that we are off main, so say so rather than implying
+    # the branch was checked.
+    if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
+        echo "=== NEFF cache: skip upload (GITHUB_REF_NAME not forwarded into the workload) ==="
+        return 0
+    fi
+    if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+        echo "=== NEFF cache: skip upload (branch '${GITHUB_REF_NAME}' is not main) ==="
+        return 0
+    fi
+
+    local s3_uri
+    if ! s3_uri=$(neff_cache_s3_uri); then
+        echo "=== NEFF cache: $PERSISTENT_STORAGE_BUCKET_ENV unset (no :write label?); skip upload ==="
+        return 0
+    fi
+
+    echo "=== NEFF cache: uploading $(neff_cache_file_count) local entries to ${s3_uri#s3://} ==="
+    local start=$SECONDS
+    # AtomicWrite creates .tmp.XXXXXX inside the target shard directory, so a
+    # process killed before the rename leaves one behind. Excluded so partial
+    # writes are never published to the shared prefix.
+    if ! timeout "$NEFF_CACHE_TRANSFER_TIMEOUT" \
+            aws s3 cp --recursive --only-show-errors --exclude '.tmp.*' \
+            "$ATEN_NEFF_CACHE_DIR" "$s3_uri"; then
+        echo "=== NEFF cache: upload failed (non-fatal) ==="
+        return 0
+    fi
+    echo "=== NEFF cache: upload finished in $((SECONDS - start))s ==="
+}
+
 # Setup test reports directory and options
 setup_reports() {
     if [[ -z "$REPORTS_DIR" ]]; then
@@ -381,6 +513,21 @@ run_additional_tests() {
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
     run_and_record "cpu_fallback_tests" "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=0 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/cpu_fallback/test_cpu_fallback.py"
 
+    # Cache-owning tests: private cache dir and HLO-derived keying off.
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "cache-owning-report" "$NUM_WORKERS")
+    run_and_record "cache_owning_tests" \
+        "env -u TORCH_NEURONX_NEFF_KEY_FROM_HLO TORCH_NEURONX_NEFF_CACHE_DIR=$CACHE_OWNING_NEFF_DIR ${RUNNER[*]} -m pytest --forked $pytest_opts ${CACHE_OWNING_TESTS[*]}"
+
+    # tests/cache: no cache environment at all, which is how these ran before this
+    # feature. Their own conftest picks a per-worker dir and the HLO cache uses its
+    # default. Fork mode follows the caller, as the main group does.
+    local pytest_opts fork_arg=""
+    [[ "$NO_FORKED" == "true" ]] || fork_arg="--forked"
+    pytest_opts=$(build_pytest_options "cache-report" "$NUM_WORKERS")
+    run_and_record "cache_tests" \
+        "env -u TORCH_NEURONX_NEFF_KEY_FROM_HLO -u TORCH_NEURONX_NEFF_CACHE_DIR -u TORCH_NEURONX_HLO_CACHE_DIR ${RUNNER[*]} -m pytest $fork_arg $pytest_opts tests/cache"
+
     local pytest_opts
     local saved_custom_n="$CUSTOM_N"
     CUSTOM_N=true
@@ -500,7 +647,16 @@ main() {
     # Clear previous coverage data
     coverage erase
 
+    neff_cache_download
+
     run_main_tests
+
+    # Seed straight after the main group, not at the end of the run. The main group
+    # compiles the NEFFs that matter, and the later groups are long enough that the
+    # internal-compute workload timeout can kill the job before the upload runs.
+    # Whether the suite passed has no bearing on whether its NEFFs are reusable.
+    neff_cache_upload
+
     run_additional_tests
 
     # Generate HUD benchmark NDJSON from JSON reports
