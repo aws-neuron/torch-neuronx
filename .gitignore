@@ -89,7 +89,7 @@ uv.lock
 .clangd
 build
 
-# Claude Code local config — the .claude/skills and .claude/agents
-# symlinks are intentionally tracked, but per-user settings are not.
-.claude/settings.json
+# Claude Code config — .claude/skills, .claude/agents, and the shared
+# .claude/settings.json (team permission policy) are tracked. Only per-user
+# overrides live in the gitignored settings.local.json.
 .claude/settings.local.json

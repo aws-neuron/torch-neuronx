@@ -90,6 +90,11 @@ COVERAGE_FIELDS = [
     "error",
     "last_updated",
     "correctness_test",
+    # Appended (not inserted) so existing column positions are unchanged for any
+    # positional CSV consumer. Set by _reliable_roofline_category in the eager
+    # coverage test; blank in the compile CSV (unused there). Drives the verifier's
+    # roofline gate: only "trustworthy" categories are gated.
+    "roofline_category",
 ]
 
 

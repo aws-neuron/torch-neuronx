@@ -190,6 +190,49 @@ Notes:
   reviewing their own PR or someone else's — the tag marks provenance
   (AI), not authorship (self / other).
 
+### Re-review: closing the loop on resolved findings
+
+On the **second and later** iterations (the orchestrator re-runs you after the
+Implementer committed fixes and the Verifier re-PASSed), the individual comment
+threads from your *previous* review are still open in the GitHub UI even though
+your new top-level body says "resolved". A human reviewer treats the unresolved-
+conversation count as their checklist, so leave the threads reconciled — but only
+in a factual, non-negotiated way:
+
+- **Reply factually, linked to the fix commit.** For each of *your own prior
+  `[AI review]` findings* that you have **independently re-confirmed** is fixed
+  (re-read the new code; don't take the Implementer's word), post a one-line reply
+  to that thread: `**[AI review]** Resolved in <sha> — <what changed>.` No
+  argument about whether the finding was valid; just the resolution.
+- **Then resolve the thread — self-review threads only.** After the factual reply,
+  mark the conversation resolved via GraphQL `resolveReviewThread`. Do this **only
+  for threads you (the AI reviewer) authored.** Never resolve or dismiss a thread
+  authored by a **human** or an **external bot** (e.g. Copilot / github-code-
+  quality) — that checkbox is the human's, and auto-dismissing hides a finding
+  they may want.
+- **A finding you now believe was wrong (not actually fixed, or never a real
+  issue) is NOT self-cleared.** Do not reply-to-dismiss it; surface it and let the
+  orchestrator route it to a human (see stop-and-ask). Reply-to-resolve is for
+  genuinely-fixed findings only.
+- **Gate on the Verifier.** Only post resolution replies once the orchestrator has
+  told you the Verifier still returns PASS for this iteration; a resolution note on
+  an unverified fix is exactly the false-consensus this guard exists to prevent.
+
+```bash
+# factual reply on a review-comment thread (COMMENT_ID from the pulls/.../comments list)
+gh api repos/<owner>/<repo>/pulls/<number>/comments/<COMMENT_ID>/replies -X POST \
+  -f body='**[AI review]** Resolved in <sha> — factored into weight_norm_interface_backward_grads().'
+
+# resolve the thread (own self-review threads only) — needs the thread node id
+gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' \
+  -f id='<THREAD_NODE_ID>'
+```
+
+This is the **Reviewer's** job, not the Implementer's — the Implementer still
+never touches PR comments. It is a natural extension of the re-review you already
+publish (better placement of the "resolved" claim you're making anyway), not a new
+channel for defending or negotiating the code.
+
 ### Branch mode
 
 Review commits on the current branch that are not yet in
