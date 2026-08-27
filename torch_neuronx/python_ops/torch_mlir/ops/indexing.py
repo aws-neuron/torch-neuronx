@@ -2,6 +2,7 @@
 
 import torch
 
+from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name
 from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bounds
 from torch_neuronx.utils import skip_op_preconditions
 
@@ -466,19 +467,139 @@ def _index_put_error_handler(ctx):
             )
 
 
+def _bool_mask_true_count(idx):
+    """True-count of a boolean index, or None if ``idx`` is not one.
+
+    This count is the only tensor *value* index_put's preprocessing reads. It is
+    the length of the integer indices the mask expands into, which the raw cache
+    key cannot see — hence VALUE_DEPENDENT + relower_every_call.
+    """
+    if isinstance(idx, torch.Tensor) and idx.dtype == torch.bool:
+        return int(idx.sum().item())
+    return None
+
+
+def _expanded_index_specs(indices, mask_counts):
+    """Per-slot shapes of the integer indices the graph will use, ``None`` kept.
+
+    A boolean mask of rank ``n`` with ``k`` True entries expands to ``n`` slots of
+    shape ``(k,)`` — the shapes ``torch.nonzero(mask, as_tuple=True)`` would
+    produce. A rank-0 mask expands to no slots at all. ``None`` slots are kept
+    because they say which dimension the later slots index.
+    """
+    specs = []
+    for idx, count in zip(indices, mask_counts, strict=True):
+        if idx is None:
+            specs.append(None)
+        elif count is None:
+            specs.append(tuple(idx.shape))
+        else:
+            specs.extend([(count,)] * idx.dim())
+    return specs
+
+
+def _indexing_result_shape(x, specs):
+    """Shape ``values`` has to be expandable to, i.e. ATen's ``info.src.sizes()``.
+
+    Derived by running ``aten::index`` on meta tensors so PyTorch owns the
+    advanced-indexing rule rather than this file restating it. With no indexing
+    slot the result is ``x`` itself, which is what ATen reports too (``a[True]`` on
+    a ``(2, 3)`` tensor reports ``[2, 3]``, and an empty index list on a 0-dim
+    ``x`` reports ``[]``).
+    """
+    if all(s is None for s in specs):
+        return tuple(x.shape)
+    # ATen raises IndexError here; aten::index's meta kernel raises RuntimeError with
+    # the same text, so the check is done before the meta call rather than after.
+    if len(specs) > x.dim():
+        raise IndexError(f"too many indices for tensor of dimension {x.dim()} (got {len(specs)})")
+    meta_x = torch.empty(x.shape, dtype=x.dtype, device="meta")
+    meta_indices = [
+        None if s is None else torch.empty(s, dtype=torch.int64, device="meta") for s in specs
+    ]
+    return tuple(torch.ops.aten.index(meta_x, meta_indices).shape)
+
+
+def _check_index_put_shape(x, values, index_shapes):
+    """``values`` must be expandable to the indexing result shape.
+
+    ATen enforces this per backend rather than in a shared layer, so replacing the
+    implementation means owning it: CPU in ``make_index_put_iterator``
+    (``TensorAdvancedIndexing.cpp``), CUDA again in ``cuda/Indexing.cu``. Both raise
+    ``RuntimeError`` synchronously with this message (measured on an H200), and
+    without the check an invalid call reaches the compiler instead and surfaces a
+    ``TorchMlirCompilerError``, which is not a ``RuntimeError``.
+    """
+    result_shape = _indexing_result_shape(x, index_shapes)
+    # ATen's is_expandable_to (ExpandUtils.h). Deliberately not
+    # torch.broadcast_shapes(...) == result_shape, which decides the same question but
+    # raises for two non-1 unequal dims instead of returning False, hiding the message
+    # below for the most common mismatch.
+    value_shape = tuple(values.shape)
+    expandable = len(value_shape) <= len(result_shape) and all(
+        v in (r, 1) for v, r in zip(reversed(value_shape), reversed(result_shape), strict=False)
+    )
+    if not expandable:
+        raise RuntimeError(
+            f"shape mismatch: value tensor of shape {list(values.shape)} "
+            f"cannot be broadcast to indexing result of shape {list(result_shape)}"
+        )
+
+
+def _dtype_category(dtype):
+    """bool / integral / floating / complex, the coarse half of a dtype."""
+    if dtype == torch.bool:
+        return "bool"
+    if dtype.is_complex:
+        return "complex"
+    if dtype.is_floating_point:
+        return "floating"
+    return "integral"
+
+
+def _check_index_put_dtype(x, values):
+    """``values`` and ``x`` must be in the same dtype category.
+
+    ATen requires exact equality here (same sites as the shape check). Categories are
+    deliberately looser, for the reason in the TODO below. They still catch an integral
+    source into a floating destination or the reverse, at any width.
+    """
+    # TODO: compare dtypes exactly, like ATen, once 0-dim promotion is fixed. A 0-dim int32
+    # times a Python int returns int64 here, int32 on CPU, because PreprocessArgs rebuilds the
+    # Python int as a real 0-dim int64 tensor. index_add's decomposition does that multiply and
+    # calls index_put, so an exact compare would raise on a valid call. Only errors differ.
+    if _dtype_category(values.dtype) != _dtype_category(x.dtype):
+        dst = torch_dtype_to_scalar_type_name(x.dtype) or str(x.dtype)
+        src = torch_dtype_to_scalar_type_name(values.dtype) or str(values.dtype)
+        raise RuntimeError(
+            "Index put requires the source and destination dtypes match, got "
+            f"{dst} for the destination and {src} for the source."
+        )
+
+
 @register_aten(
     ["aten::_index_put_impl_"],
-    static_argnames=("accumulate", "unsafe", "use_masked_fill"),
+    # Matched against the preprocessed kwargs by name, so the synthesized ones count.
+    static_argnames=("accumulate", "unsafe", "use_masked_fill", "mask_counts"),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     translate_args_fn=_translate_index_put_args,
-    # Bool masks resolve to int indices via torch.nonzero, so preprocessing replaces
-    # the op's runtime inputs with synthesized ones. relower_every_call cannot express that:
-    # C++ dispatch and op-concatenation both derive execution inputs from raw args.
-    python_dispatch=True,
+    # A boolean mask's True-count is not in the raw cache key, so the dispatch
+    # entry must not be replayed.
+    relower_every_call=True,
     error_handler=_index_put_error_handler,
 )
 def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out=None):
-    """Torch MLIR implementation of torch._index_put_impl_."""
+    """Torch MLIR implementation of torch._index_put_impl_.
+
+    Takes one of three routes, all of which pass ``indices`` through unchanged:
+
+    - a single boolean mask with a one-element ``values`` becomes a ``where``
+    - a mask that selects nothing returns ``x``
+    - otherwise the masks expand to integer indices in-graph and ``x`` is scattered into
+
+    ``mask_counts`` carries each mask's True-count, which the expansion needs as a
+    compile-time size.
+    """
 
     # Validate index dtypes eagerly (raises before dispatch). The bounds check is
     # fused into _index_put_fn below (in-graph), so an OOB index faults as
@@ -496,7 +617,7 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
     def can_dispatch_to_masked_fill(x, indices, values):
         """Check if index_put can be optimized to masked_fill."""
         if values.numel() != 1 or accumulate:
-            return False, None
+            return False
 
         num_defined_indices = 0
         mask = None
@@ -505,43 +626,76 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
             if index is not None:
                 if hasattr(index, "dtype") and index.dtype == torch.bool:
                     if mask is not None:  # Already found a mask
-                        return False, None
+                        return False
                     mask = index
                     # Check shape compatibility
                     for j in range(index.ndim):
                         if index.shape[j] != x.shape[num_defined_indices + j]:
-                            return False, None
+                            return False
                     num_defined_indices += index.ndim
                 else:
-                    return False, None  # Non-boolean index found
+                    return False  # Non-boolean index found
             else:
                 num_defined_indices += 1
 
-        if mask is None:
-            return False, None
-
-        # Broadcast mask to match x's shape if needed
-        if mask.ndim < x.ndim:
-            # Add trailing dimensions
-            for _ in range(x.ndim - mask.ndim):
-                mask = mask.unsqueeze(-1)
-
-        return True, mask
+        return mask is not None
 
     # Check if we can dispatch to masked_fill optimization
-    can_dispatch, mask = can_dispatch_to_masked_fill(x, indices, values)
+    can_dispatch = can_dispatch_to_masked_fill(x, indices, values)
+
+    # The where route rewrites values in-graph, so it would accept a rank ATen
+    # rejects. Its result has rank x.dim() - mask.dim() + 1, and every dim of a
+    # one-element values is 1, so the rank alone decides expandability here.
+    if can_dispatch:
+        mask = next(i for i in indices if i is not None)
+        if values.dim() > x.dim() - mask.dim() + 1:
+            can_dispatch = False  # fall through and be validated with the counts
+
+    # Reading the counts costs a host sync, so only do it on the scatter route —
+    # the masked_fill route consumes the mask directly and needs no count.
+    mask_counts = None if can_dispatch else tuple(_bool_mask_true_count(i) for i in indices)
 
     def _index_put_fn(
-        x, indices, values, accumulate=False, unsafe=False, use_masked_fill=False, out=None
+        x,
+        indices,
+        values,
+        accumulate=False,
+        unsafe=False,
+        use_masked_fill=False,
+        mask_counts=None,
+        out=None,
     ):
         if use_masked_fill:
+            dim = next(i for i, idx in enumerate(indices) if idx is not None)
+            mask = indices[dim]
+            # Line the mask up with the dims it indexes — [dim, dim + mask.dim()) —
+            # so the select broadcasts over the rest. In-graph, so the mask stays
+            # the runtime input the raw arguments declare.
+            aligned = (1,) * dim + tuple(mask.shape) + (1,) * (x.dim() - dim - mask.dim())
             # Cannot directly call torch.masked_fill since it only takes float object for value
-            values = values.to(x.dtype)
-            return torch.where(indices, values, x)
+            return torch.where(mask.reshape(aligned), values.to(x.dtype), x)
+
+        # A mask that selects nothing writes nothing, and index_put returns self.
+        # Expanding it would put a zero-size tensor in the graph, which the Neuron
+        # compiler cannot lower.
+        if any(count == 0 for count in mask_counts):
+            return x.clone()
+
+        # Expand boolean masks to integer indices. nonzero_static rather than
+        # nonzero because mask_counts makes the size a compile-time constant, so
+        # the expansion traces to a static shape. fill_value is unreachable (the
+        # size is exact) but 0 keeps any padding in bounds.
+        expanded = []
+        for idx, count in zip(indices, mask_counts, strict=True):
+            if count is None:
+                expanded.append(idx)
+                continue
+            coords = torch.nonzero_static(idx, size=count, fill_value=0)
+            expanded.extend(coords[:, c] for c in range(coords.shape[1]))
 
         # Normalize negative indices and ensure proper tensor format
         normalized_indices = []
-        for i, idx in enumerate(indices):
+        for i, idx in enumerate(expanded):
             if idx is not None and isinstance(idx, torch.Tensor):
                 dim_size = x.shape[i]
                 idx = torch.where(idx < 0, idx + dim_size, idx)
@@ -556,32 +710,39 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
                 if idx.dim() == 0:
                     idx = idx.unsqueeze(0)  # Convert scalar to [1] shape
             normalized_indices.append(idx)
-        indices = tuple(normalized_indices)
 
-        return torch.ops.aten.index_put(x, indices, values, accumulate=accumulate)
+        return torch.ops.aten.index_put(x, tuple(normalized_indices), values, accumulate=accumulate)
 
-    if can_dispatch:
-        processed_indices = mask if mask.device == x.device else mask.to(x.device)
-    else:
-        processed_indices = convert_indices(indices)
-
-        # Check if indexing tensors can be broadcast together
-        non_none_indices = [idx for idx in processed_indices if idx is not None]
-        if len(non_none_indices) > 1:
+    # Preconditions, in ATen's order: make_info broadcasts the indices together,
+    # then make_index_put_iterator checks values against the result.
+    if not can_dispatch:
+        # Check if the indexing tensors can be broadcast together, on the shapes
+        # the in-graph expansion will produce.
+        specs = _expanded_index_specs(indices, mask_counts)
+        expanded_shapes = [s for s in specs if s is not None]
+        if len(expanded_shapes) > 1:
             try:
-                torch.broadcast_shapes(*[idx.shape for idx in non_none_indices])
+                torch.broadcast_shapes(*expanded_shapes)
             except RuntimeError:
                 # Incompatible shape cause IndexError for index_put
-                shapes_str = ", ".join([str(list(idx.shape)) for idx in non_none_indices])
+                shapes_str = ", ".join(str(list(s)) for s in expanded_shapes)
                 raise IndexError(
                     "shape mismatch: indexing tensors could not be broadcast together "
                     f"with shapes {shapes_str}"
                 ) from None
+        _check_index_put_shape(x, values, specs)
+    _check_index_put_dtype(x, values)
 
     return (
         _index_put_fn,
-        (x, processed_indices, values),
-        {"accumulate": accumulate, "unsafe": unsafe, "use_masked_fill": can_dispatch, "out": out},
+        (x, indices, values),
+        {
+            "accumulate": accumulate,
+            "unsafe": unsafe,
+            "use_masked_fill": can_dispatch,
+            "mask_counts": mask_counts,
+            "out": out,
+        },
     )
 
 

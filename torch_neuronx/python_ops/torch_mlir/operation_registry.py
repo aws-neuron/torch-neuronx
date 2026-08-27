@@ -367,12 +367,14 @@ def _make_preprocessing_lower(
     preprocessing ``torch_fn`` to obtain ``(compute_fn, new_args, new_kwargs)``,
     builds a ``TorchMlirKernel`` for ``compute_fn``, and calls its ``lower``.
 
-    Preprocessing keeps tensor lists full-length: empty tensors are replaced with
-    fresh empty placeholders (see ``foreach_ops._replace_empty``), not filtered
-    out. The NKI wrappers pass those placeholders through unchanged, so
-    ``capture_backend`` drops them as FX passthroughs before the compiler runs.
-    Because nothing is filtered, the flattened preprocessed and raw argument index
-    spaces stay identical and ``kept_input_indices`` need no remap on a cache hit.
+    ``new_args`` must hold the same tensors the op was called with, because
+    ``kept_input_indices`` is computed from them but applied to the raw ATen args
+    (``FlattenAndFilterInputs``). See ``docs/cpp_dispatch_onboarding_guide.md``.
+
+    Hence tensor lists stay full-length: empty tensors are replaced with fresh empty
+    placeholders (see ``foreach_ops._replace_empty``), not filtered out. The NKI
+    wrappers pass those placeholders through unchanged, so ``capture_backend`` drops
+    them as FX passthroughs before the compiler runs.
 
     Returns:
         A ``LoweringResult``, as required by the C++ dispatcher.
@@ -600,9 +602,10 @@ def _resolve_lower_func(
 
     - Ops that declare ``preprocessing=`` follow the factory protocol, where
       ``torch_fn`` returns ``(compute_fn, new_args, new_kwargs[, postprocess])``.
-      ``_make_preprocessing_lower`` folds that factory into a lowering function
-      and remaps ``kept_input_indices`` when preprocessing filters the input
-      list, so ``FlattenAndFilterInputs`` selects the correct tensors on a hit.
+      ``_make_preprocessing_lower`` folds that factory into a lowering function.
+      There is no remapping step: ``kept_input_indices`` is applied to the raw
+      ATen args, so the factory has to hand back the tensors it was given. See
+      ``_make_preprocessing_lower`` for what that rules out.
     - Plain ops already own a ``TorchMlirKernel``; its ``lower`` method is used
       directly. ``validate_fn`` is attached to the kernel so input validation
       runs during dtype inference on cache miss.

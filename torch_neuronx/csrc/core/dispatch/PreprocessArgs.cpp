@@ -255,9 +255,24 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
         auto elem = list.get(j);
         if (elem.isTensor()) {
           at::Tensor t = elem.toTensor();
+          if (!t.defined()) continue;
           std::string elem_label = debug_label + "[" + std::to_string(j) + "]";
-          if (t.defined() && PreprocessSingleTensor(t, target_device, skip_contiguous,
-                                                    list_is_write, elem_label.c_str())) {
+
+          // A list element is bound straight to the NEFF, so a CPU element has to
+          // be moved. PreprocessSingleTensor only relocates 0-dim CPU tensors,
+          // because for a plain Tensor argument a device mismatch is an error to
+          // raise, not repair. An index list is the exception: callers do pass CPU
+          // indices, and aten::index.Tensor already moves them (DispatchIndexImpl).
+          bool changed = false;
+          if (t.device().is_cpu() && t.dim() > 0) {
+            t = t.to(target_device);
+            changed = true;
+          }
+          if (PreprocessSingleTensor(t, target_device, skip_contiguous, list_is_write,
+                                     elem_label.c_str())) {
+            changed = true;
+          }
+          if (changed) {
             list.set(j, c10::IValue(std::move(t)));
             list_changed = true;
           }

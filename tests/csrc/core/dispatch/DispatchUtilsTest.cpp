@@ -417,6 +417,7 @@ TEST(GetIndexOpConfigTest, ScatterConfig) {
   ASSERT_NE(cfg, nullptr);
   EXPECT_EQ(cfg->index_argnum, 2);
   EXPECT_EQ(cfg->input_argnum, 0);
+  EXPECT_EQ(cfg->source_argnum, 3);
 }
 
 TEST(GetIndexOpConfigTest, ScatterAddConfig) {
@@ -424,6 +425,7 @@ TEST(GetIndexOpConfigTest, ScatterAddConfig) {
   ASSERT_NE(cfg, nullptr);
   EXPECT_EQ(cfg->index_argnum, 2);
   EXPECT_EQ(cfg->input_argnum, 0);
+  EXPECT_EQ(cfg->source_argnum, 3);
 }
 
 TEST(GetIndexOpConfigTest, IndexPutImplConfig) {
@@ -431,6 +433,18 @@ TEST(GetIndexOpConfigTest, IndexPutImplConfig) {
   ASSERT_NE(cfg, nullptr);
   EXPECT_EQ(cfg->index_argnum, 1);
   EXPECT_EQ(cfg->input_argnum, 0);
+  EXPECT_EQ(cfg->source_argnum, 2);
+}
+
+// The overload is stripped before lookup, so `scatter.value_out` shares
+// `scatter`'s config. Its source argument is a Scalar rather than a tensor,
+// which is what keeps an empty `out=` from being read as an empty source.
+TEST(GetIndexOpConfigTest, ScatterOverloadsShareTheBaseConfig) {
+  for (const char* name : {"scatter.value_out", "scatter.src_out", "scatter.value_reduce_out"}) {
+    auto* cfg = GetIndexOpConfig(name);
+    ASSERT_NE(cfg, nullptr) << name;
+    EXPECT_EQ(cfg->source_argnum, 3) << name;
+  }
 }
 
 TEST(GetIndexOpConfigTest, UnknownOpReturnsNull) { EXPECT_EQ(GetIndexOpConfig("matmul"), nullptr); }
