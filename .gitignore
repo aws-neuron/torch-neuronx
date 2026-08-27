@@ -93,3 +93,6 @@ build
 # .claude/settings.json (team permission policy) are tracked. Only per-user
 # overrides live in the gitignored settings.local.json.
 .claude/settings.local.json
+
+# Agent scratch space (temporary scripts, experiments)
+agent_space/
