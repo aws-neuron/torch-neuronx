@@ -5623,6 +5623,16 @@ def _foreach_minimum_list_inplace_decomp(self, other):
         torch.minimum(s, o, out=s)
 
 
+@register_decomposition([aten._foreach_maximum.Scalar])
+def _foreach_maximum_scalar_decomp(self, scalar):
+    return [torch.maximum(a, torch.full_like(a, scalar)) for a in self]
+
+
+@register_decomposition([aten._foreach_minimum.Scalar])
+def _foreach_minimum_scalar_decomp(self, scalar):
+    return [torch.minimum(a, torch.full_like(a, scalar)) for a in self]
+
+
 # lerp
 @register_decomposition([aten._foreach_lerp.Scalar])
 def _foreach_lerp_scalar_decomp(self, other, weight):
@@ -5659,10 +5669,20 @@ def _foreach_zero_inplace_decomp(self):
         s.zero_()
 
 
+@register_decomposition([aten._foreach_zero.default])
+def _foreach_zero_decomp(self):
+    return [torch.zeros_like(s) for s in self]
+
+
 @register_decomposition([aten._foreach_copy_.default])
 def _foreach_copy_inplace_decomp(self, other):
     for s, o in zip(self, other, strict=False):
         s.copy_(o)
+
+
+@register_decomposition([aten._foreach_copy.default])
+def _foreach_copy_decomp(self, other):
+    return [o.to(s.dtype) for s, o in zip(self, other, strict=False)]
 
 
 # norm
