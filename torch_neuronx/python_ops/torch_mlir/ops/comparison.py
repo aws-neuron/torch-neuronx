@@ -69,7 +69,8 @@ def torch_clamp_max(x, max, out=None):
     if isinstance(max, torch.Tensor):
         # Use torch.minimum instead of torch.clamp_max: it handles broadcasting
         # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
-        return torch.minimum(x, max.to(x.dtype))
+        common_dtype = torch.result_type(x, max)
+        return torch.minimum(x.to(common_dtype), max.to(common_dtype))
     return torch.clamp_max(x, max)
 
 
@@ -86,7 +87,8 @@ def torch_clamp_min(x, min, out=None):
     if isinstance(min, torch.Tensor):
         # Use torch.maximum instead of torch.clamp_min: it handles broadcasting
         # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
-        return torch.maximum(x, min.to(x.dtype))
+        common_dtype = torch.result_type(x, min)
+        return torch.maximum(x.to(common_dtype), min.to(common_dtype))
     return torch.clamp_min(x, min)
 
 

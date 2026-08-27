@@ -426,3 +426,33 @@ class TestClamp:
             result.dtype == expected.dtype
         ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"
         torch.testing.assert_close(result.cpu(), expected)
+
+    # Regression: single-bound clamp with a *tensor* bound must promote the
+    # output dtype per torch.result_type (like two-bound clamp already does).
+    # Previously torch_clamp_min/torch_clamp_max forced the bound to the input
+    # dtype, so e.g. clamp_min(int32, float_tensor) wrongly returned int32.
+    @pytest.mark.parametrize("x_dtype", [torch.int32, torch.bool])
+    def test_clamp_min_tensor_bound_promotes(self, x_dtype):
+        with track_neuron_ops():
+            x_cpu = torch.tensor([1, 0, 1], dtype=x_dtype)
+            bound_cpu = torch.tensor(0.5)  # float32 tensor bound
+            expected = torch.clamp_min(x_cpu, bound_cpu)
+            out = torch.clamp_min(x_cpu.to("neuron"), bound_cpu.to("neuron"))
+            assert out.dtype == torch.result_type(
+                x_cpu, bound_cpu
+            ), f"clamp_min dtype {out.dtype} != {torch.result_type(x_cpu, bound_cpu)}"
+            assert torch.allclose(out.cpu(), expected)
+            assert_op_runs_on_neuron("aten::clamp_min")
+
+    @pytest.mark.parametrize("x_dtype", [torch.int32, torch.bool])
+    def test_clamp_max_tensor_bound_promotes(self, x_dtype):
+        with track_neuron_ops():
+            x_cpu = torch.tensor([1, 0, 1], dtype=x_dtype)
+            bound_cpu = torch.tensor(0.5)
+            expected = torch.clamp_max(x_cpu, bound_cpu)
+            out = torch.clamp_max(x_cpu.to("neuron"), bound_cpu.to("neuron"))
+            assert out.dtype == torch.result_type(
+                x_cpu, bound_cpu
+            ), f"clamp_max dtype {out.dtype} != {torch.result_type(x_cpu, bound_cpu)}"
+            assert torch.allclose(out.cpu(), expected)
+            assert_op_runs_on_neuron("aten::clamp_max")
