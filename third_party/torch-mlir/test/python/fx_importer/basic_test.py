@@ -275,3 +275,37 @@ def test_stack_trace():
     m = fx.export_and_import(Basic(), x, y, func_name="test_stack_trace")
     mlir_asm = m.operation.get_asm(enable_debug_info=True)
     print(mlir_asm)
+
+
+@run
+# CHECK-LABEL: test_cond
+# The cond HOP lowers to torch.prim.If with the branch bodies inlined into the
+# two regions (no func.call), terminated by torch.prim.If.yield. The tensor
+# predicate is converted to a !torch.bool via torch.aten.Bool.Tensor.
+# CHECK: func.func @test_cond(%arg0: !torch.vtensor<[],i1>, %arg1: !torch.vtensor<[4],f32>) -> !torch.vtensor<[4],f32>
+# CHECK: %[[BOOL:.*]] = torch.aten.Bool.Tensor %arg0 : !torch.vtensor<[],i1> -> !torch.bool
+# CHECK: %[[IF:.*]] = torch.prim.If %[[BOOL]] -> (!torch.vtensor<[4],f32>) {
+# CHECK: torch.aten.add.Scalar %arg1
+# CHECK: torch.prim.If.yield %{{.*}} : !torch.vtensor<[4],f32>
+# CHECK: } else {
+# CHECK: torch.aten.sub.Scalar %arg1
+# CHECK: torch.prim.If.yield %{{.*}} : !torch.vtensor<[4],f32>
+# CHECK: }
+# CHECK: return %[[IF]] : !torch.vtensor<[4],f32>
+def test_cond():
+    from functorch.experimental.control_flow import cond
+
+    class M(nn.Module):
+        def forward(self, pred, x):
+            def true_fn(x):
+                return x + 1.0
+
+            def false_fn(x):
+                return x - 1.0
+
+            return cond(pred, true_fn, false_fn, [x])
+
+    m = fx.export_and_import(
+        M(), torch.tensor(True), torch.randn(4), func_name="test_cond"
+    )
+    print(m)

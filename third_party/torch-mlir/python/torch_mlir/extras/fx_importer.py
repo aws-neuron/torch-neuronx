@@ -2019,6 +2019,144 @@ class GraphNodeImporter:
         else:
             self.bind_node_value(node, loop_op.results[0])
 
+    def _import_hop_cond(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+    ):
+        """Imports the torch._higher_order_ops.cond.cond HOP.
+
+        Args format: (pred, true_fn, false_fn, operands)
+        The true_fn and false_fn are get_attr nodes pointing to submodule
+        graphs that have already been imported by import_program(); operands is
+        the (shared) list of inputs passed to both branches.
+
+        Emits torch.prim.If with a then/else region, each of which calls its
+        branch function and yields the results via torch.prim.If.yield. Both
+        branches must return the same result types (guaranteed by torch.cond).
+        """
+        pred_node, true_fn_node, false_fn_node = node.args[0], node.args[1], node.args[2]
+        operands = node.args[3] if len(node.args) > 3 else []
+
+        assert (
+            true_fn_node.op == "get_attr"
+        ), f"Expected get_attr for true_fn, got {true_fn_node.op}"
+        assert (
+            false_fn_node.op == "get_attr"
+        ), f"Expected get_attr for false_fn, got {false_fn_node.op}"
+
+        root_module = node.graph.owning_module
+        true_fn_module = getattr(root_module, true_fn_node.target, None)
+        false_fn_module = getattr(root_module, false_fn_node.target, None)
+
+        # Import the branch operands (shared by both branches).
+        operand_values = []
+        for operand in operands:
+            if isinstance(operand, tuple):
+                operand_values.extend(self._import_tuple_argument(loc, operand, None))
+            else:
+                operand_values.append(self._import_argument(loc, operand))
+
+        # Determine result types from node metadata. torch.cond always returns a
+        # tuple (even a single output is a 1-tuple), so derive per-element types
+        # whenever val is a list/tuple and bind results by index.
+        node_val = node.meta.get("val")
+        if isinstance(node_val, (list, tuple)):
+            result_types = [self._cc.value_info_to_type(v) for v in node_val]
+            tuple_result = True
+        else:
+            # Defensive fallback: torch.cond reports its outputs as a (possibly
+            # 1-)tuple in node.meta["val"], so this branch is not expected to
+            # trigger. Kept to stay robust if a non-tuple val ever reaches here.
+            result_types = [self._cc.node_val_to_type(node)]
+            tuple_result = False
+
+        # The predicate is a scalar bool tensor (vtensor<[],i1>); torch.prim.If
+        # takes a !torch.bool, so convert unless it is already one.
+        pred_value = self._import_argument(loc, pred_node)
+        if pred_value.type == self._cc.torch_bool_type:
+            cond_bool = pred_value
+        else:
+            # torch.cond takes a single-element predicate. When it arrives as a
+            # ranked tensor (e.g. torch.cond(torch.zeros(1), ...)), the
+            # AtenBoolTensorOp scalarization emits a cf.assert per dimension to
+            # verify each equals 1 -- and cf.assert has no StableHLO lowering,
+            # so the whole conversion rolls back. Since cond guarantees the
+            # predicate holds exactly one element, reshape it to rank-0 first so
+            # the scalarization takes the assert-free (rank-0) path. Rank-0
+            # predicates (the common `x.sum() > 0` case) are left untouched.
+            pred_meta = pred_node.meta.get("val")
+            if isinstance(pred_meta, torch.Tensor) and pred_meta.dim() > 0:
+                zerod_type = self._cc.get_vtensor_type(
+                    torch.Size([]), pred_meta.dtype
+                )
+                empty_shape = Operation.create(
+                    "torch.prim.ListConstruct",
+                    results=[IrType.parse("!torch.list<int>", context=self._c)],
+                    operands=[],
+                    loc=loc,
+                ).result
+                pred_value = Operation.create(
+                    name="torch.aten.view",
+                    results=[zerod_type],
+                    operands=[pred_value, empty_shape],
+                    loc=loc,
+                ).result
+            cond_bool = Operation.create(
+                name="torch.aten.Bool.Tensor",
+                results=[self._cc.torch_bool_type],
+                operands=[pred_value],
+                loc=loc,
+            ).result
+
+        # torch.prim.If %cond -> (results) { call @true_fn; yield } else { call @false_fn; yield }
+        if_op = Operation.create(
+            name="torch.prim.If",
+            results=result_types,
+            operands=[cond_bool],
+            regions=2,
+            loc=loc,
+        )
+
+        # Inline each branch subgraph directly into its region (no func.call):
+        # bind the branch's placeholders to the shared operand values, import
+        # the branch body ops into the region block, then yield the branch
+        # outputs. This keeps the branch bodies self-contained so the
+        # prim.If -> stablehlo.if lowering needs no cross-function handling.
+        for region, branch_module in (
+            (if_op.regions[0], true_fn_module),
+            (if_op.regions[1], false_fn_module),
+        ):
+            with loc:
+                block = Block.create_at_start(region, [])
+            branch_graph = branch_module.graph
+            sub = GraphNodeImporter(self.fx_importer, self._c, self._cc, block)
+            placeholders = [n for n in branch_graph.nodes if n.op == "placeholder"]
+            assert len(placeholders) == len(operand_values), (
+                f"cond branch expects {len(placeholders)} placeholder(s) but got "
+                f"{len(operand_values)} operand(s); refusing to bind a mismatched "
+                "set (zip would silently truncate)"
+            )
+            for ph, val in zip(placeholders, operand_values):
+                sub.bind_node_value(ph, val)
+            sub.import_nodes(branch_graph.nodes, skip_placeholders_outputs=True)
+            output_node = next(n for n in branch_graph.nodes if n.op == "output")
+            out_arg = output_node.args[0]
+            out_nodes = out_arg if isinstance(out_arg, (list, tuple)) else [out_arg]
+            with InsertionPoint(block):
+                yield_vals = [sub._import_argument(loc, a) for a in out_nodes]
+                Operation.create(
+                    name="torch.prim.If.yield",
+                    results=[],
+                    operands=yield_vals,
+                    loc=loc,
+                )
+
+        if tuple_result:
+            self._multi_result_nodes.add(node)
+            for i, value in enumerate(if_op.results):
+                self.bind_node_value(node, value, i)
+        else:
+            self.bind_node_value(node, if_op.results[0])
+
     def _import_hop_auto_functionalized(
         self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
     ):
