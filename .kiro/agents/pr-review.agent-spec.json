@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/aws/amazon-q-developer-cli/refs/heads/main/schemas/agent-v1.json",
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob",
+    "execute_bash"
+  ],
+  "description": "Reviewer agent that judges a torch-neuronx draft PR (or local branch) by following the /pr-review runbook: design quality, test adequacy, backward compatibility of the public surface, security, and correct use of project infrastructure. Publishes a COMMENT review. Feedback-only: no file-editing tool by design; never pushes, marks a PR ready, or merges. Spawned per-PR by aten-lowering-orchestrator and upstream-debugger-orchestrator, and usable standalone.",
+  "model": "claude-opus-4.8",
+  "name": "pr-review",
+  "prompt": "file://./.kiro/agents/pr-review.md",
+  "resources": [
+    "skill://.kiro/skills/pr-review/SKILL.md",
+    "skill://.kiro/skills/torch-neuronx-docs/SKILL.md"
+  ],
+  "tools": [
+    "@builtin"
+  ]
+}

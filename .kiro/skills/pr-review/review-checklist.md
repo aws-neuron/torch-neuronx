@@ -158,6 +158,24 @@ See `docs/AI-python-ops.md`.
       functions go into the existing file for their op family
       (`binary.py`, `reduction.py`, …), not a brand-new file unless
       the family is genuinely new.
+- [ ] **`static_argnums`/`static_argnames` mark graph-changing args
+      only** — An arg is static only if it changes output shape or lets
+      the compiler specialize (e.g. `pow`'s constant exponent,
+      `alpha`/`rounding_mode`). A plain scalar *operand* that only feeds
+      arithmetic must NOT be static — it forces a separate NEFF per
+      distinct value (runtime recompilation); pass it as a 0-d runtime
+      tensor like `mul.Scalar`. Reject a static scalar with no
+      graph-change or specialization rationale (see #1670 `pow.Scalar`).
+- [ ] **No redundant `output_params` / `_out` function** — On the C++
+      `register_aten` path the dispatcher aliases `out=` and preserves
+      its dtype natively, so a single `out` needs no `output_params` and
+      no separate `_out` function; functional + `.out` fold into one
+      decorator (`addcmul`/`div`/`lerp`). `output_params` is only for
+      multi-output ops with non-`out` names (`out0`/`grad_input`) or
+      `@neuron_op`/`python_dispatch` ops. A separate function is
+      justified only when an overload needs a *different*
+      `static_argnums`/`output_params` (those are read from the group's
+      first registration and applied to every overload under it).
 
 ### Cast policy and contiguity (`torch_neuronx/python_ops/cast_policy.py`)
 
@@ -207,6 +225,16 @@ See `docs/AI-python-ops.md` ("NKI backend").
       a trainable forward should declare a backward. Missing backward
       makes the op silently non-differentiable under
       `torch.compile` + autograd.
+- [ ] **Differentiable op: backward runs on Neuron, not just forward** —
+      Eager backward dispatches a *separate* ATen op (e.g.
+      `aten::_weight_norm_interface_backward`) that CPU-falls-back
+      silently if unlowered; a forward-only `assert_op_runs_on_neuron`
+      does not catch it. For a differentiable op the PR must lower the
+      backward op(s) (same family), add each to `target_ops.py`
+      (`runs_on_neuron` row), and assert the *backward op's* device in
+      the autograd test. `docs/torch_api_compatibility.md` claiming `Y`
+      must mean backward runs on Neuron too. A backward that can't must
+      be an allowlisted xfail, never a silent fallback.
 
 ### C++ extension (`torch_neuronx/csrc/`)
 

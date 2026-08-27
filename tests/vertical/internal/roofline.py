@@ -200,7 +200,22 @@ def compute_roofline(
     category = _classify(op_name)
     eb = ELEM_BYTES.get(dtype, 2)
     ve = _ve_throughput(dtype)
+    res = _dispatch_roofline(category, op_name, input_tensors, output_tensors, eb, ve)
+    if res is not None:
+        res["category"] = category
+    return res
 
+
+def _dispatch_roofline(
+    category: str,
+    op_name: str,
+    input_tensors: list,
+    output_tensors: list | None,
+    eb: int,
+    ve: float,
+) -> dict | None:
+    """Route to the per-category roofline handler. Returns None when the
+    category has no handler (view / dynamic-output), leaving the roofline blank."""
     if category == "mm":
         return _roofline_mm(input_tensors, eb)
     if category == "addmm":

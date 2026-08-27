@@ -58,6 +58,35 @@ from internal.roofline import compute_roofline
 
 logger = logging.getLogger(__name__)
 
+
+def _reliable_roofline_category(category: str, op, op_name: str) -> str:
+    """Return the roofline category, downgraded to "unknown" when the number
+    can't be trusted to gate on.
+
+    Every op that matches no explicit handler falls through to the "elementwise"
+    bucket in roofline.py, but that formula (1 read + 1 write, O(1) ops/elem) is
+    only correct for genuinely pointwise ops. Anything else that lands there
+    (weight-norm, pooling, cdist, scatter/gather, loss, resample, ...) gets a
+    confidently-wrong roofline. We keep "elementwise" only when PyTorch tags the
+    op ``pointwise`` (authoritative, self-maintaining) or it is a ``_foreach_``
+    op (elementwise by construction); otherwise it becomes "unknown" so the
+    verifier records the ratio as advisory instead of gating on it.
+    """
+    if category != "elementwise":
+        return category or ""
+    try:
+        if torch.Tag.pointwise in op.tags:
+            return "elementwise"
+    except (AttributeError, TypeError):
+        # Some op objects don't expose a usable ``tags`` attribute; treat as
+        # untagged and fall through to the checks below (ends at non-gating
+        # "unknown").
+        pass
+    if op_name.startswith("aten::_foreach_"):
+        return "elementwise"
+    return "unknown"
+
+
 NUM_EXEC_ITERATIONS = 3
 METRICS_DIR = (
     Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
@@ -112,6 +141,7 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
         "t_roofline_ms": None,
         "t_compute_ms": None,
         "t_memory_ms": None,
+        "roofline_category": "",
         "input_elems": _count_input_elems(sample),
     }
 
@@ -139,6 +169,9 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
         out["t_roofline_ms"] = roofline["t_roofline_ms"]
         out["t_compute_ms"] = roofline["t_compute_ms"]
         out["t_memory_ms"] = roofline["t_memory_ms"]
+        out["roofline_category"] = _reliable_roofline_category(
+            roofline.get("category", ""), op, op_name
+        )
 
     try:
         neuron_args = tuple(_allocate_to_device(a, "neuron") for a in (sample.input, *sample.args))
@@ -319,6 +352,7 @@ def _aggregate_into(result: dict, per_shape: list[dict], classification: str) ->
         result["bound"] = (
             "compute" if slowest_shape["t_compute_ms"] > slowest_shape["t_memory_ms"] else "memory"
         )
+        result["roofline_category"] = slowest_shape.get("roofline_category", "")
         exec_max = float(result.get("exec_max_ms", 0))
         roofline = slowest_shape["t_roofline_ms"]
         if roofline > 0 and exec_max > 0:
@@ -376,6 +410,7 @@ class TestTargetOpsCoverage:
             "t_memory_ms": "",
             "bound": "",
             "roofline_ratio": "",
+            "roofline_category": "",
         }
 
         if not op_info.op_resolved:
