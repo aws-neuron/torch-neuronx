@@ -96,6 +96,8 @@ fp32 reduction over 4096 values drifts ~64 units. Those cells report `no_gate`.
 python -m pytest tests/vertical/accuracy/test_metrics.py -q
 
 # Phase 2 -- on-device sweep against a model's traced op+shape list.
+# qwen3_235b_a22b is traced BOTH ways (eager + compiled); one run writes one CSV per
+# path: op_accuracy_eager_<ts>.csv and op_accuracy_compiled_<ts>.csv.
 python -m pytest tests/vertical/accuracy/test_accuracy.py \
     --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -n 32 --tb=no -q
 
@@ -104,8 +106,8 @@ python -m pytest "tests/vertical/accuracy/test_accuracy.py::TestOpAccuracy::test
     --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -s --log-cli-level=INFO
 
 # Include shapes above the shared 512Mi-element guard (NeuronOpInfo._MAX_TENSOR_ELEMS).
-# For qwen3_235b_a22b that guard drops 3 of 181 entries -- the 151936-vocab lm_head
-# projections in mm / linear / index.Tensor, at 622M elements each.
+# For qwen3_235b_a22b that guard drops the 151936-vocab lm_head projections in
+# mm / linear / index.Tensor, at 622M elements each.
 NEURON_MAX_TENSOR_ELEMS=700000000 python -m pytest tests/vertical/accuracy/test_accuracy.py \
     --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -n 32 --tb=no -q
 ```
@@ -128,7 +130,7 @@ that could not be measured stays visible as a `status` rather than being folded 
 
 ## Op Accuracy CSV
 
-One row per `(op, shapes, dtype)` cell, aggregated into `op_accuracy_<timestamp>.csv`. `unit`
+One row per `(op, shapes, dtype, path)` cell, aggregated into one CSV per capture path (`op_accuracy_eager_<timestamp>.csv` / `op_accuracy_compiled_<timestamp>.csv`; a single unsplit run writes `op_accuracy_<timestamp>.csv`). `unit`
 is carried alongside the measurement so a verdict can be re-read from the row without
 re-running the op, and `arg_shapes` so anything shape-derived (reduction width, element count)
 stays recomputable without re-running it either.
@@ -138,12 +140,14 @@ stays recomputable without re-running it either.
 | `cell_id` | 16-hex-char id of `(op, arg_shapes, dtype)`. Excludes the seed — the seed is derived from it |
 | `op` / `op_group` | Full ATen op name; `TARGET_ATEN_OP_GROUP` category |
 | `dtype` | Input dtype the cell was measured at |
+| `path` | Capture path the cell came from (`eager` / `compiled`); the split key for the per-path CSVs |
 | `arg_shapes` | JSON of the registry entry used. The source for any shape-derived figure — the suite no longer extracts a reduction width itself |
 | `unit` | The input format's unit roundoff `2**-precision` = 1/2 ULP (bf16 → `0.00390625`). Multiply `max_rel_err_units` by this to get the raw relative error |
 | `max_rel_err_units` | **The measurement.** Normwise relative error, L-inf: `(max\|T-R\| / max\|R\|) / unit` |
 | `budget_units` | **The threshold.** `2.0` for arithmetic, `0.0` for bit-exact groups, empty when not gated |
 | `verdict` | `within`, `over`, `invalid`, or empty when `status != ok` |
 | `max_abs_err` / `max_abs_ref` | The two raw absolute scalars `max_rel_err_units` is computed from |
+| `fro_abs_err_base` / `fro_ratio` / `fro_ratio_verdict` | Frobenius-ratio metric: denominator `‖cpu_low − ref_high‖`, the ratio `‖trn_low − ref_high‖ / ‖cpu_low − ref_high‖`, and its verdict (`within`/`over`/`invalid`, gate 1.1) |
 | `seed` | RNG seed, derived from `cell_id` + `--seed-base` |
 | `gates` | JSON of the shape-selection knobs in effect (`max_shapes_per_op`, `shape_registry`, `traced_model`, ...) |
 | `status` | See below |
@@ -308,8 +312,11 @@ module-level names:
 | `TRACED_MODEL_OPS[<name>]` | The frozenset of ops the set actually traced |
 | `<NAME>` | The source tag its entries carry, so `SHAPE_REGISTRY.get(op, model=<NAME>)` works |
 
-Currently: `qwen3_235b_a22b` — 181 entries over 54 ops, deduplicated on
-`(op_name, arg_shapes)` across eager-dispatch and compiled-FX traces with counts summed.
+Currently: `qwen3_235b_a22b` — 315 unique entries over 46 ops (eager 34 / compiled 33
+capture paths), deduplicated on `(op_name, arg_shapes)` with counts summed. It's the
+upstream_jul08 trace intersected with the shared 54-op reference set; the 8 unshared ops
+aren't traced by upstream_jul08. Ops failing the Frobenius ratio are kept and tracked
+per-cell in the CSV (fro_ratio_verdict), not dropped.
 
 **Registering a set is opt-in and off by default.** `register_all_defaults(r, traced_models=())`
 takes an allowlist, and `--traced-model` is the only thing that fills it. That makes the gate
