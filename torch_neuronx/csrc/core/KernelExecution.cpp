@@ -13,6 +13,7 @@
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/compilation/NeuronCompiler.h"
 #include "torch_neuronx/csrc/core/compilation/experimental/TensorizerCompiler.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -29,9 +30,64 @@ bool CompilableKernelExecution::ValidateImpl() const { return !compile_key_.IsEm
 
 // XLACompilableKernelExecution implementation
 
-std::string XLACompilableKernelExecution::GetXLAAdditionalArgs() {
+bool XLACompilableKernelExecution::HasInt64IO(const std::vector<TensorContext>& input_contexts,
+                                              const std::vector<TensorContext>& output_contexts) {
+  // Returns true when any input or output tensor has dtype Long (i64).
+  // Used to gate int64-policy compile-flag emission so that ops whose
+  // compiled HLO has nothing to do with int64 (e.g. pow(float,
+  // int_scalar) where the scalar is converted to i32 before reaching
+  // the kernel) don't pick up int64-related compiler flags. See
+  // .internal_docs/native_inplace_add_investigation.md "Stage 2" for
+  // the broader follow-up that pushes this check earlier in the
+  // dispatch path.
+  for (const auto& ctx : input_contexts) {
+    if (ctx.options.dtype().toScalarType() == c10::ScalarType::Long) {
+      return true;
+    }
+  }
+  for (const auto& ctx : output_contexts) {
+    if (ctx.options.dtype().toScalarType() == c10::ScalarType::Long) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string XLACompilableKernelExecution::GetXLAAdditionalArgs(const std::string& op_name,
+                                                               bool has_int64_io) {
   // Base XLA compilation arguments
   std::string args = "--model-type transformer --auto-cast=none --internal-disable-fma-on-ios";
+
+  // Per-op int64 compiler flags based on Int64Policy.
+  // See torch_neuronx/int64_policy.py::get_compiler_flags for the source of
+  // truth — this block must mirror it.
+  //
+  // The block is gated on ``has_int64_io``: we only consult the int64
+  // policy and emit int64-related flags when the kernel's input/output
+  // dtypes actually contain Long. For everything else (e.g.
+  // ``pow(float, int_scalar)``) the policy is bypassed entirely so the
+  // compile command line matches the legacy non-int64 stack.
+  if (has_int64_io && torch_neuronx::dispatch::IsS64Passthrough()) {
+    static const bool full_cast = [] {
+      const char* env = std::getenv("TORCH_NEURONX_INT64_FULL_CAST");
+      return env != nullptr && std::string(env) == "1";
+    }();
+    auto decision = torch_neuronx::dispatch::DecideInt64(op_name);
+    if (decision == torch_neuronx::dispatch::Int64Decision::NATIVE) {
+      if (full_cast) {
+        args += " --native-int64=disabled --implicit-integer-downcast=all";
+      } else {
+        args += " --native-int64=enabled --implicit-integer-downcast=all";
+      }
+    } else if (decision == torch_neuronx::dispatch::Int64Decision::DOWNCAST) {
+      if (full_cast) {
+        args += " --native-int64=disabled";
+      }
+      args +=
+          " --implicit-integer-downcast=all"
+          " --disable-hlo-operand-type-check=evrf_035";
+    }
+  }
 
   // Append user-provided XLA flags from environment
   if (const char* cc_flags_env = std::getenv("NEURON_CC_FLAGS")) {
@@ -55,9 +111,12 @@ XLACompilableKernelExecution::XLACompilableKernelExecution(
     const std::vector<TensorContext>& output_contexts, const std::string& base_cache_key,
     const std::vector<uint8_t>& hlo_bytes, bool has_collectives, int device_id)
     : CompilableKernelExecution(
-          CompilationCacheKey(base_cache_key, GetXLAAdditionalArgs(), GetXLAOptimizationLevel(),
-                              &hlo_bytes_, CacheKeySource::EAGER),
-          GetXLAAdditionalArgs(), GetXLAOptimizationLevel(), has_collectives),
+          CompilationCacheKey(
+              base_cache_key,
+              GetXLAAdditionalArgs(op_name, HasInt64IO(input_contexts, output_contexts)),
+              GetXLAOptimizationLevel(), &hlo_bytes_, CacheKeySource::EAGER),
+          GetXLAAdditionalArgs(op_name, HasInt64IO(input_contexts, output_contexts)),
+          GetXLAOptimizationLevel(), has_collectives),
       NeuronKernelExecutionTyped<KernelTypeEnum::kHLO, c10::DeviceType::PrivateUse1,
                                  c10::DeviceType::PrivateUse1>(
           op_name, std::move(input_refs), std::move(output_refs), input_contexts, output_contexts,

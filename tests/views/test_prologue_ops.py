@@ -336,3 +336,81 @@ class TestDedupSliceDimension:
         assert torch.allclose(
             result.cpu(), expected, atol=1e-4
         ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
+
+
+@pytest.fixture
+def native_int64_mode(monkeypatch):
+    """Pin TORCH_NEURONX_INT64_MODE=native across the Python + C++ layers.
+
+    Mirrors the ``int64_mode`` marker fixture in tests/python_ops/conftest.py
+    (which isn't in scope here) so this regression is deterministic regardless
+    of the shell's default mode.
+    """
+    from torch_neuronx import _C
+    from torch_neuronx.int64_policy import init_cpp_policy, reset_int64_mode_cache
+    from torch_neuronx.utils import global_version_hash
+
+    monkeypatch.setenv("TORCH_NEURONX_INT64_MODE", "native")
+    reset_int64_mode_cache()
+    global_version_hash.cache_clear()
+    if hasattr(_C, "_set_int64_mode_for_testing"):
+        _C._set_int64_mode_for_testing("native")
+    init_cpp_policy()
+
+    yield
+
+    reset_int64_mode_cache()
+    global_version_hash.cache_clear()
+    if hasattr(_C, "_reset_int64_mode_from_env"):
+        _C._reset_int64_mode_from_env()
+    init_cpp_policy()
+
+
+class TestNonContiguousInt64ScalarPrologue:
+    """Regression for the native-cascade int64 scalar over-promotion.
+
+    A ``_foreach_add`` ScalarList over a *non-contiguous* int32 input must keep
+    the python-int scalar at int32 (``int32 + int_scalar -> int32``). Previously,
+    native mode promoted the wrapped scalar to int64 in the scalar-producing op
+    (emitting a packed ``int32[..., 2]`` == ``2xi32``) while the consuming ``add``
+    correctly kept it int32. Because the non-contiguous input splits the work into
+    a prologue module + a main module, ``validateDepCompatibility`` (OpConcatUtils)
+    then rejected the boundary with:
+
+        Type mismatch in dependency: module1 output N (tensor<2xi32>)
+        cannot connect to module2 input N (expected tensor<i32>)
+
+    Packed mode was unaffected (uniformly packed on both sides).
+
+    Fixed by making ``FlattenScalarListToTensors`` materialize ``Scalar[]``
+    integer elements with weak-scalar promotion (the accompanying tensor
+    operand's integer dtype) instead of blindly int64 in native mode.
+    """
+
+    def test_foreach_add_scalarlist_noncontiguous_int32(self, native_int64_mode):
+        # Non-contiguous int32 [20, 20] (stride-2 view) forces the prologue split.
+        x = torch.arange(20 * 40, dtype=torch.int32, device=device).reshape(20, 40)[:, ::2]
+        assert not x.is_contiguous()
+
+        result = torch._foreach_add([x], [3])[0]
+
+        expected = x.cpu() + 3
+        assert result.dtype == torch.int32, f"expected int32, got {result.dtype}"
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_foreach_add_scalarlist_noncontiguous_int32_multi(self, native_int64_mode):
+        # Same pattern with several differently-shaped non-contiguous tensors,
+        # closer to the upstream OpInfo sample that first surfaced this.
+        shapes = [(20, 20), (19, 19), (18, 18)]
+        xs = [
+            torch.arange(h * w * 2, dtype=torch.int32, device=device).reshape(h, w * 2)[:, ::2]
+            for h, w in shapes
+        ]
+        assert all(not t.is_contiguous() for t in xs)
+        scalars = [3, 9, 4]
+
+        results = torch._foreach_add(xs, scalars)
+
+        for r, x, s in zip(results, xs, scalars, strict=False):
+            assert r.dtype == torch.int32, f"expected int32, got {r.dtype}"
+            torch.testing.assert_close(r.cpu(), x.cpu() + s)

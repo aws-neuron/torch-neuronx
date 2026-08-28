@@ -42,6 +42,75 @@ def is_wrap_nki_enabled() -> bool:
     return getattr(wrap_nki_enabled, "value", wrap_nki_enabled_default)
 
 
+# ─── Int64 handling for NKI-backed aten ops ──────────────────────────────
+# NKI's kernel language does not yet support int64 (NKI-151); kernels
+# silently demote int64 → int32 during lowering. The gate below lets
+# nki_op-registered custom ops participate in the int64 mode policy that
+# governs regular aten dispatch, so users see consistent behavior across
+# NKI-backed and torch-mlir-backed implementations of the same aten op.
+
+_warned_nki_int64_ops: set[str] = set()
+
+
+def _warn_once_nki_int64_demotion(op_name: str) -> None:
+    """Emit a one-time warning that ``op_name``'s NKI implementation will
+    silently demote int64 inputs to int32. Called only in NATIVE mode; the
+    other modes either auto-cast (packed / cpu_bounce) or raise
+    (native_strict)."""
+    if op_name in _warned_nki_int64_ops:
+        return
+    _warned_nki_int64_ops.add(op_name)
+    import warnings as _warnings
+
+    _warnings.warn(
+        f"int64 precision loss: '{op_name}' is implemented by a NKI kernel "
+        f"that silently demotes int64 to int32 (NKI int64 support pending "
+        f"NKI-151). Set TORCH_NEURONX_INT64_MODE=packed or =cpu_bounce for "
+        f"automatic int64↔int32 cast at the kernel boundary, or "
+        f"=native_strict to opt out of NKI execution for "
+        f"this op entirely.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _has_int64_input(args: tuple, kwargs: dict) -> bool:
+    if any(isinstance(a, torch.Tensor) and a.dtype == torch.int64 for a in args):
+        return True
+    return any(isinstance(v, torch.Tensor) and v.dtype == torch.int64 for v in kwargs.values())
+
+
+def _cast_int64_args_to_int32(args: tuple, kwargs: dict):
+    """Cast int64 tensor args/kwargs to int32 and return a closure that
+    upcasts int32 outputs back to int64. Used by ``packed`` / ``cpu_bounce``
+    mode so a NKI-backed aten op preserves the int64 dtype contract at its
+    public boundary even though the kernel runs in int32 internally.
+
+    Returns: ``(casted_args, casted_kwargs, restore)`` where
+    ``restore(result)`` upcasts any int32 tensor in ``result`` to int64.
+    """
+    casted_args = tuple(
+        a.to(torch.int32) if isinstance(a, torch.Tensor) and a.dtype == torch.int64 else a
+        for a in args
+    )
+    casted_kwargs = {
+        k: v.to(torch.int32) if isinstance(v, torch.Tensor) and v.dtype == torch.int64 else v
+        for k, v in kwargs.items()
+    }
+
+    def restore(result):
+        if isinstance(result, torch.Tensor):
+            return result.to(torch.int64) if result.dtype == torch.int32 else result
+        if isinstance(result, tuple | list):
+            return type(result)(
+                r.to(torch.int64) if isinstance(r, torch.Tensor) and r.dtype == torch.int32 else r
+                for r in result
+            )
+        return result
+
+    return casted_args, casted_kwargs, restore
+
+
 @contextlib.contextmanager
 def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
     """If nki kernels annotated with @wrap_nki should dispatch via HOP
@@ -630,6 +699,12 @@ def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     ``oob_mode.error``); otherwise the optimizer drops the call and the effect
     never runs.
 
+    Note on int64: ``wrap_nki`` is the kernel-compile primitive and
+    deliberately has no policy gating. It just compiles and runs whatever
+    NKI emits. Pre-NKI-151, NKI silently demotes int64 to int32 inside
+    its lowering, so direct ``wrap_nki(kernel)(int64_x)`` calls return
+    int32 with int32-precision values. Use ``@nki_op(...)`` for the
+    int64 policy contract (cast/raise/warn per ``Int64Mode``).
     """
     sig = inspect.signature(nki_kernel.func)
     arg_names = list(sig.parameters.keys())
@@ -674,6 +749,85 @@ def nki_op(
     def dec(fn: Callable):
         # All inner wrap_nki/nki.jit calls go through NkiDispatchEager C++ dispatch.
         def backend_fn(*args, **kwargs):
+            # Int64 mode policy gate. NKI's kernel language doesn't yet
+            # support int64 (NKI-151); kernels lower int64 to int32
+            # internally. From the policy's perspective this categorises
+            # NKI-implemented ops as DOWNCAST today; when NKI-151 lands
+            # and ``_NKI_INT64_NATIVE`` flips to True, the same ops
+            # automatically migrate to NATIVE behavior.
+            #
+            # Per-mode contract for an int64-input call:
+            #
+            #   NKI is DOWNCAST (today)         NKI is NATIVE (post-151)
+            #   ───────────────────────         ────────────────────────
+            #   native:         cast+upcast     pass-through, no warn
+            #                   + warn once
+            #   packed:         cast+upcast     cast+upcast (low-word run)
+            #   cpu_bounce:     cast+upcast     cast+upcast (downcast)
+            #   native_strict:  raise           pass-through (op is NATIVE)
+            #
+            # The cast/upcast in non-NATIVE-NKI modes substitutes for the
+            # neuronx-cc LegalizeInt64 pass that the regular DOWNCAST
+            # contract relies on; NKI doesn't have that pass, so the
+            # framework provides the equivalent at the kernel boundary.
+            if _has_int64_input(args, kwargs):
+                from torch_neuronx.int64_policy import (
+                    _NKI_INT64_NATIVE,
+                    Int64Mode,
+                    Int64Policy,
+                )
+
+                mode = Int64Policy.get().mode
+                nki_is_native = _NKI_INT64_NATIVE
+
+                # ── Modes that raise for NKI custom ops ──
+                # native_strict rejects int64 when NKI still demotes it
+                # (no precision loss allowed, and there is no CPU reference
+                # for a custom NKI op to fall back to).
+                if mode == Int64Mode.NATIVE_STRICT and not nki_is_native:
+                    raise NotImplementedError(
+                        f"Custom op {name!r} is implemented by a NKI kernel. "
+                        f"Under TORCH_NEURONX_INT64_MODE={mode.value}"
+                        + (
+                            ", int64 inputs are rejected because NKI "
+                            "silently demotes int64 to int32 (NKI-151) "
+                            "and there is no CPU reference for this "
+                            "custom op."
+                            if not nki_is_native
+                            else ", int64 inputs are rejected because "
+                            "there is no CPU reference for this "
+                            "custom op."
+                        )
+                        + " Either:\n"
+                        "  - cast inputs to int32 before calling, or\n"
+                        "  - use TORCH_NEURONX_INT64_MODE=packed or "
+                        "=cpu_bounce for automatic cast/upcast at the "
+                        "kernel boundary, or\n"
+                        "  - use TORCH_NEURONX_INT64_MODE=native"
+                        + (
+                            " to accept the demotion with a one-time " "warning."
+                            if not nki_is_native
+                            else "."
+                        )
+                    )
+
+                # ── Modes that cast in framework ──
+                # packed / cpu_bounce: always cast int64→int32 at the kernel
+                # boundary (downcast semantics; NKI runs on the low word).
+                # native + DOWNCAST NKI: cast as substitute for the missing
+                # LegalizeInt64 pass; emit a one-time warning so users see it.
+                must_cast = mode in (Int64Mode.PACKED, Int64Mode.CPU_BOUNCE) or (
+                    mode == Int64Mode.NATIVE and not nki_is_native
+                )
+                if must_cast:
+                    if mode == Int64Mode.NATIVE:
+                        _warn_once_nki_int64_demotion(name)
+                    cast_args, cast_kwargs, restore = _cast_int64_args_to_int32(args, kwargs)
+                    return restore(fn(*cast_args, **cast_kwargs))
+
+                # native + NATIVE NKI, or native_strict + NATIVE NKI:
+                # pass-through. NKI runs int64 natively.
+
             return fn(*args, **kwargs)
 
         result = custom_op(

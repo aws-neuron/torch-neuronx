@@ -15,6 +15,7 @@
 #include <cstdlib>
 
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -175,14 +176,29 @@ TEST(IsSupportedDtypeTest, Supported) {
   EXPECT_TRUE(IsSupportedDtype(c10::ScalarType::Bool));
 }
 
-TEST(IsSupportedDtypeTest, Unsupported) {
-  EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Double));
-  // Long is unsupported by default, but conditionally supported via TORCH_NEURONX_NATIVE_INT64=1.
-  // Test default behavior (env var not set).
+TEST(IsSupportedDtypeTest, Unsupported) { EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Double)); }
+
+TEST(IsSupportedDtypeTest, LongDependsOnInt64Mode) {
+  // Long is "supported" (kept, not downcast in DowncastArgs) when it is handled
+  // on-device: S64 to the compiler (native / native_strict) OR the packed view
+  // (packed keeps logical int64 and binds its int32[..., 2] physical view at the
+  // graph boundary). cpu_bounce is a CPU-roundtrip cast, so Long is unsupported.
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+
+  SetInt64ModeForTesting(Int64Mode::kNative);
+  EXPECT_TRUE(IsSupportedDtype(c10::ScalarType::Long));
+
+  SetInt64ModeForTesting(Int64Mode::kNativeStrict);
+  EXPECT_TRUE(IsSupportedDtype(c10::ScalarType::Long));
+
+  SetInt64ModeForTesting(Int64Mode::kPacked);
+  EXPECT_TRUE(IsSupportedDtype(c10::ScalarType::Long));
+
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
   EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Long));
-  EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Byte));
-  EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Short));
-  EXPECT_FALSE(IsSupportedDtype(c10::ScalarType::Char));
+
+  SetInt64ModeForTesting(Int64Mode::kNative);  // restore default
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -199,13 +215,215 @@ TEST(DowncastArgsTest, Float64ToFloat32) {
 }
 
 TEST(DowncastArgsTest, Int64KeptUnderPackedMode) {
-  // Under packed int64 mode (default), int64 operands are kept Long (packed
-  // on-device), not downcast to int32.
+  // In packed mode, int64 operands are kept Long (packed on-device via the
+  // graph-boundary physical view), not downcast to int32. (Default is now
+  // native, so packed must be selected explicitly.)
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kPacked);
   auto t = torch::ones({2, 3}, torch::kInt64);
   std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
   DowncastArgs(args, AddSchema());
   EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long);
   EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+}
+
+TEST(DowncastArgsTest, Int64ToInt32_CpuBounce) {
+  // In cpu_bounce mode, int64 is downcast to int32 at the DowncastArgs layer
+  // (via a CPU roundtrip in NeuronSafeCast on device).
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+
+  auto t = torch::ones({2, 3}, torch::kInt64);
+  std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
+  DowncastArgs(args, AddSchema());
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Int);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Int);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+}
+
+TEST(DowncastArgsTest, Int64Preserved_NativeMode) {
+  // In native mode, int64 to a NATIVE-listed op reaches the compiler unchanged
+  // (S64 passthrough). DowncastArgs is op-aware, so add must be registered.
+  std::unordered_set<std::string> native = {"aten::add"};
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(native, empty);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+
+  auto t = torch::ones({2, 3}, torch::kInt64);
+  std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
+  DowncastArgs(args, AddSchema());
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(DowncastArgsTest, Int64KeptInNativeMode_EvenForNonNativeOp) {
+  // DowncastArgs is op-unaware: in native mode int64 is kept (IsSupportedDtype
+  // (Long) is true) whether or not the op is NATIVE. The per-op choice of S64
+  // vs the packed int32[..., 2] view is made downstream in FlattenAndFilterInputs
+  // (UsePackedInt64ViewForOp), not here.
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);  // add not registered → non-native
+  SetInt64ModeForTesting(Int64Mode::kNative);
+
+  auto t = torch::ones({2, 3}, torch::kInt64);
+  std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
+  DowncastArgs(args, AddSchema());
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(DowncastArgsTest, Int64Preserved_NativeStrictMode) {
+  // In native_strict mode, int64 also reaches the compiler unchanged for
+  // ops that are NATIVE; for non-native ops the dispatcher's CPU-fallback
+  // gate fires before DowncastArgs, so this layer never has to differ from
+  // native mode. DowncastArgs is op-aware, so add must be registered.
+  std::unordered_set<std::string> native = {"aten::add"};
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(native, empty);
+  SetInt64ModeForTesting(Int64Mode::kNativeStrict);
+
+  auto t = torch::ones({2, 3}, torch::kInt64);
+  std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kInt64), 1};
+  DowncastArgs(args, AddSchema());
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(DowncastArgsTest, Float64DowncastIndependentOfInt64Mode) {
+  // Float64 → Float32 must happen regardless of int64 mode (ensures the
+  // refactor didn't accidentally couple Float64 handling to int64 state).
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  for (auto m :
+       {Int64Mode::kNative, Int64Mode::kNativeStrict, Int64Mode::kPacked, Int64Mode::kCpuBounce}) {
+    SetInt64ModeForTesting(m);
+    auto t = torch::ones({2, 3}, torch::kFloat64);
+    std::vector<c10::IValue> args = {t, torch::ones({2, 3}, torch::kFloat64), 1};
+    DowncastArgs(args, AddSchema());
+    EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Float)
+        << "Float64 should always downcast; mode=" << static_cast<int>(m);
+    EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Float)
+        << "Float64 should always downcast; mode=" << static_cast<int>(m);
+  }
+  SetInt64ModeForTesting(Int64Mode::kNative);
+}
+
+TEST(DowncastArgsTest, Int64TensorListDowncast_CpuBounce) {
+  // _foreach_add(Tensor[] self, Tensor[] other, ...) — the TensorList path
+  // must also honor the mode for int64.
+  auto schema =
+      c10::Dispatcher::singleton().findSchemaOrThrow("aten::_foreach_add", "List").schema();
+
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+
+  c10::List<at::Tensor> self_list(
+      {torch::ones({2}, torch::kInt64), torch::ones({2}, torch::kInt64)});
+  c10::List<at::Tensor> other_list(
+      {torch::ones({2}, torch::kInt64), torch::ones({2}, torch::kInt64)});
+  std::vector<c10::IValue> args = {c10::IValue(self_list), c10::IValue(other_list)};
+  DowncastArgs(args, schema);
+
+  auto self_after = args[0].toTensorList();
+  for (size_t j = 0; j < self_after.size(); ++j) {
+    EXPECT_EQ(self_after.get(j).scalar_type(), c10::ScalarType::Int);
+  }
+  auto other_after = args[1].toTensorList();
+  for (size_t j = 0; j < other_after.size(); ++j) {
+    EXPECT_EQ(other_after.get(j).scalar_type(), c10::ScalarType::Int);
+  }
+}
+
+TEST(DowncastArgsTest, Int64TensorListPreserved_Native) {
+  auto schema =
+      c10::Dispatcher::singleton().findSchemaOrThrow("aten::_foreach_add", "List").schema();
+
+  std::unordered_set<std::string> native = {"aten::_foreach_add"};
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(native, empty);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+
+  c10::List<at::Tensor> self_list({torch::ones({2}, torch::kInt64)});
+  c10::List<at::Tensor> other_list({torch::ones({2}, torch::kInt64)});
+  std::vector<c10::IValue> args = {c10::IValue(self_list), c10::IValue(other_list)};
+  DowncastArgs(args, schema);
+
+  EXPECT_EQ(args[0].toTensorList().get(0).scalar_type(), c10::ScalarType::Long);
+  EXPECT_EQ(args[1].toTensorList().get(0).scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(DowncastArgsTest, Int64DtypeKwarg_CpuBounce) {
+  // aten::sum.dim_IntList has a `ScalarType? dtype` kwarg. In cpu_bounce
+  // mode, an int64 dtype request should be rewritten to int32 alongside the
+  // tensor inputs.
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+
+  auto t = torch::ones({2, 3}, torch::kFloat32);
+  // sum.dim_IntList: (Tensor self, int[1] dim, bool keepdim=False, *, ScalarType? dtype=None)
+  std::vector<c10::IValue> args = {
+      t,
+      c10::IValue(std::vector<int64_t>{0}),
+      false,
+      c10::IValue(static_cast<int64_t>(c10::ScalarType::Long)),
+  };
+  DowncastArgs(args, SumSchema());
+  EXPECT_EQ(static_cast<c10::ScalarType>(args[3].toInt()), c10::ScalarType::Int);
+}
+
+TEST(DowncastArgsTest, Int64DtypeKwargPreserved_Native) {
+  std::unordered_set<std::string> native = {"aten::sum"};
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(native, empty);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+
+  auto t = torch::ones({2, 3}, torch::kFloat32);
+  std::vector<c10::IValue> args = {
+      t,
+      c10::IValue(std::vector<int64_t>{0}),
+      false,
+      c10::IValue(static_cast<int64_t>(c10::ScalarType::Long)),
+  };
+  DowncastArgs(args, SumSchema());
+  EXPECT_EQ(static_cast<c10::ScalarType>(args[3].toInt()), c10::ScalarType::Long);
+}
+
+TEST(DowncastArgsTest, WriteAliasedInt64_CpuBounceDowncasts_PackedKeeps) {
+  // copy_(Tensor(a!) self, Tensor src, bool non_blocking) — `self` is
+  // write-aliased. DowncastArgs keys only off IsSupportedDtype:
+  //   - cpu_bounce: int64 is unsupported → demoted to int32 here (the alias
+  //     contract is preserved via the original_out_tensors snapshot +
+  //     UpcastExecutionOutputs/CopyBackToOriginal path).
+  //   - packed: int64 is "supported" (kept logical; its int32[..., 2] physical
+  //     view is bound at the graph boundary), so it is NOT downcast here.
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+  {
+    auto self = torch::ones({2, 3}, torch::kInt64);
+    auto src = torch::ones({2, 3}, torch::kInt32);
+    std::vector<c10::IValue> args = {self, src, false};
+    DowncastArgs(args, CopySchema());
+    EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Int)
+        << "cpu_bounce: write-aliased int64 is demoted to int32";
+  }
+
+  SetInt64ModeForTesting(Int64Mode::kPacked);
+  {
+    auto self = torch::ones({2, 3}, torch::kInt64);
+    auto src = torch::ones({2, 3}, torch::kInt32);
+    std::vector<c10::IValue> args = {self, src, false};
+    DowncastArgs(args, CopySchema());
+    EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Long)
+        << "packed: int64 is kept (physical view bound at the boundary)";
+  }
+  SetInt64ModeForTesting(Int64Mode::kNative);
 }
 
 TEST(DowncastArgsTest, SupportedDtypeUnchanged) {

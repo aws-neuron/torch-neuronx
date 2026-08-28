@@ -66,7 +66,9 @@
 #include "torch_neuronx/csrc/core/utils/PackedInt64Utils.h"
 
 // Dispatch helpers (shared out= resize/warning)
+#include "torch_neuronx/csrc/core/dispatch/CpuFallback.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 // Runtime utilities (including profiling)
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 // Operation execution
@@ -165,6 +167,30 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
   result.final_inputs.reserve(inputs.size());
   result.kernel_transforms.resize(inputs.size());
 
+  // Native-int64 prologue boundary guard: for an op that packs its int64 inputs
+  // (DOWNCAST / packed mode → the op module represents them as int32[...,2]),
+  // any int64 operand appears *unpacked* (tensor<...xi64>) in a fused prologue's
+  // pass-through signature. Merging that prologue with the op then hits an
+  // i64-vs-i32x2 boundary that cannot be linked (validateDepCompatibility skips
+  // it → empty merged MLIR → "Failed to merge prologue"). This bites ops with a
+  // non-contiguous *non-int64* input plus an int64 operand (e.g.
+  // cross_entropy_loss: non-contiguous float32 input + int64 target). Disable
+  // fusion for such ops so their non-contiguous inputs are materialized instead
+  // (correct, and matches the packed path). Native ops keep S64 in both the
+  // prologue and the op (no boundary), so they are unaffected.
+  if (fuse_transforms && torch_neuronx::dispatch::UsePackedInt64ViewForOp(op_name)) {
+    for (const auto& in : inputs) {
+      if (in.defined() && in.scalar_type() == c10::ScalarType::Long) {
+        TORCH_NEURONX_DEBUG(
+            "Packed-int64 op with int64 operand: disabling prologue fusion to avoid the "
+            "i64/i32x2 merge boundary; non-contiguous inputs are materialized instead",
+            "op=", op_name);
+        fuse_transforms = false;
+        break;
+      }
+    }
+  }
+
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
 
@@ -173,6 +199,31 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
       // TODO: Add timing counter here for prologue perf measurement
       TORCH_NEURONX_DEBUG("Detected non-contiguous input", "op=", op_name, "input_index=", i,
                           "input_shape=", input.sizes(), "fuse_transforms=", fuse_transforms);
+
+      // Non-contiguous int64: never build a strided prologue transform for it.
+      // In the native int64 cascade a strided transform emits *unpacked* int64
+      // (tensor<...xi64>), but a packed/DOWNCAST consumer expects the packed
+      // physical view (tensor<...x2xi32>) — an unmergeable op-concat boundary;
+      // and native S64 strided compute can also hang the device. Materialize to
+      // a clean contiguous int64 instead; the consumer's input binding then
+      // packs it consistently.
+      //
+      // Do this ON DEVICE via the int32 physical view (no CPU roundtrip):
+      // contiguify the int32[...,2] view (well-defined 4-byte strides) with
+      // contiguous_internal, then logical_view back to int64. Operating on the
+      // int32 view is recursion-safe — contiguous_internal redispatches, but on
+      // int32 it can't re-enter this int64 branch. The [low,high] pairs are
+      // value-preserving, so the result equals input.contiguous().
+      if (input.scalar_type() == c10::ScalarType::Long) {
+        TORCH_NEURONX_DEBUG(
+            "Non-contiguous int64: on-device contiguify via physical view (no prologue transform)",
+            "op=", op_name, "input_index=", i);
+        auto phys = torch_neuronx::packed_int64::physical_view(input);
+        auto phys_contig =
+            torch_neuronx::ops::contiguous_internal(phys, c10::MemoryFormat::Contiguous);
+        result.final_inputs.push_back(torch_neuronx::packed_int64::logical_view(phys_contig));
+        continue;
+      }
 
       if (!fuse_transforms) {
         // Kernel cannot absorb a prologue merge (e.g. direct-NRT host-CC
@@ -1142,6 +1193,61 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             });
       },
       "Register the Python invoker(op_name, ctx) for per-op error handlers.", py::arg("invoker"));
+
+  // Int64 policy initialization — populates C++ lookup tables from Python.
+  // The active mode is read from TORCH_NEURONX_INT64_MODE via GetInt64Mode();
+  // these tables only carry the per-op native/unsupported classification.
+  m.def(
+      "_init_int64_policy",
+      [](std::vector<std::string> native_ops, std::vector<std::string> unsupported_ops) {
+        std::unordered_set<std::string> n(native_ops.begin(), native_ops.end());
+        std::unordered_set<std::string> u(unsupported_ops.begin(), unsupported_ops.end());
+        torch_neuronx::dispatch::InitInt64Policy(n, u);
+      },
+      "Initialize per-op int64 policy tables for C++ dispatch (mode is read from "
+      "TORCH_NEURONX_INT64_MODE via GetInt64Mode)",
+      py::arg("native_ops"), py::arg("unsupported_ops"));
+
+  // Test-only: override the process int64 mode in-place so the pytest harness
+  // can exercise every mode in one process (conftest.py int64_mode marker).
+  // Pass one of: "cpu_bounce", "native", "packed", "native_strict". Production
+  // code never calls this; the mode otherwise comes from the env once at init.
+  // Mirror with Python reset_int64_mode_cache() so both layers agree.
+  m.def(
+      "_set_int64_mode_for_testing",
+      [](const std::string& mode) {
+        namespace d = torch_neuronx::dispatch;
+        if (mode == "cpu_bounce") {
+          d::SetInt64ModeForTesting(d::Int64Mode::kCpuBounce);
+        } else if (mode == "native") {
+          d::SetInt64ModeForTesting(d::Int64Mode::kNative);
+        } else if (mode == "packed") {
+          d::SetInt64ModeForTesting(d::Int64Mode::kPacked);
+        } else if (mode == "native_strict") {
+          d::SetInt64ModeForTesting(d::Int64Mode::kNativeStrict);
+        } else if (mode == "cpu_fallback") {
+          d::SetInt64ModeForTesting(d::Int64Mode::kCpuFallback);
+        } else {
+          throw std::invalid_argument(
+              "Invalid int64 mode '" + mode +
+              "'. Valid: cpu_bounce, native, packed, native_strict, cpu_fallback.");
+        }
+      },
+      "TEST ONLY: override the C++ int64 dispatch mode for the current process.", py::arg("mode"));
+
+  // Test-only: re-parse TORCH_NEURONX_INT64_MODE into the C++ mode storage.
+  m.def("_reset_int64_mode_from_env", &torch_neuronx::dispatch::ResetInt64ModeFromEnv,
+        "TEST ONLY: re-read TORCH_NEURONX_INT64_MODE into the C++ mode storage.");
+
+  // CPU fallback helper for the python-dispatch path.
+  // Mirrors what neuron_cpu_fallback / NeuronDispatcher do for the C++ path,
+  // by dispatching through PyTorch's at::native::cpu_fallback. Honors out=,
+  // inplace, multi-return, and schema-based kwarg filtering.
+  m.def("_cpu_fallback", &torch_neuronx::dispatch::RunCpuFallback,
+        "Run an aten op via at::native::cpu_fallback. "
+        "Used by python_ops/torch_mlir/op_impl.py when Int64Policy decides to "
+        "fall back to CPU. The first argument is the full op name with overload, "
+        "e.g. 'aten::mm.out'; remaining args/kwargs are forwarded to the op.");
 
   // Expose allocator submodule temporarily for testing
   // ToDo: Remove this later

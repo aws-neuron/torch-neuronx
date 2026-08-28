@@ -108,6 +108,73 @@ _SESSION_TIMESTAMP = os.environ["NEURON_COVERAGE_TIMESTAMP"]
 neuron_op_db = get_neuron_op_db()
 
 
+# ── Local hacks: int64 dtype override for selected ops when running with
+#                --shape-registry pointing at a model-trace JSON ─────────────
+#
+# The shape registry stores tensor shapes; dtype is determined per-shape
+# entry by the schema-driven sample builder, which defaults to
+# ``torch.float32`` unless the registry entry overrides it. For a small set
+# of ops we want to verify behavior with ``int64`` inputs instead — without
+# rewriting every JSON entry to add a ``dtype: long`` annotation. Listing the
+# op_name here forces all floating-point tensors in the sample (including
+# ``out=`` kwargs populated by ``_with_out_kwargs``) to be regenerated as
+# ``torch.int64`` randints in [0, 100) right before allocation to Neuron.
+#
+# Gate: only applies when ``--shape-registry`` is provided (i.e.
+# ``NEURON_SHAPE_REGISTRY`` env var is set by conftest); the no-shape-registry
+# code path is unchanged. Keeps this file self-contained — no need to touch
+# the registry data files for a one-off dtype probe.
+_INT64_DTYPE_OPS = frozenset(
+    {
+        "aten::abs",
+        "aten::add.Tensor",
+        "aten::add.out",
+        "aten::amax",
+        "aten::amax.out",
+        "aten::bitwise_and.Tensor_out",
+        "aten::fill_.Scalar",
+        "aten::floor_divide",
+        "aten::ge.Scalar_out",
+        "aten::gt.Scalar_out",
+        "aten::lt.Scalar_out",
+        "aten::ne.Scalar_out",
+        "aten::neg",
+        "aten::sub.Tensor",
+        "aten::sum",
+        "aten::sum.dim_IntList",
+        "aten::sum.out",
+        "aten::zeros",
+    }
+)
+_INT64_HACK_ENABLED = bool(os.environ.get("NEURON_SHAPE_REGISTRY"))
+
+
+def _cast_sample_to_int64(sample):
+    """Return a new SampleInput with floating-point tensors replaced by
+    int64 randints in [0, 100). Non-float tensors and non-tensor values
+    pass through unchanged. Mirrors the shape/device/list-nesting layout
+    of the original.
+    """
+    from torch.testing._internal.opinfo.core import SampleInput
+
+    def cast(v):
+        if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+            return torch.randint(0, 100, v.shape, device=v.device, dtype=torch.int64)
+        if isinstance(v, list):
+            return [cast(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(cast(x) for x in v)
+        if isinstance(v, dict):
+            return {k: cast(x) for k, x in v.items()}
+        return v
+
+    return SampleInput(
+        cast(sample.input),
+        args=tuple(cast(a) for a in sample.args),
+        kwargs={k: cast(v) for k, v in sample.kwargs.items()},
+    )
+
+
 def _save_result(result: dict):
     result["last_updated"] = _SESSION_TIMESTAMP
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,7 +187,12 @@ def _save_result(result: dict):
 
 
 def _build_params():
-    return _build_params_for(neuron_op_db)
+    db = neuron_op_db
+    ops_filter = os.environ.get("NEURON_OPS_FILTER", "").strip()
+    if ops_filter:
+        wanted = {op.strip() for op in ops_filter.split(",") if op.strip()}
+        db = [info for info in db if info.op_name in wanted]
+    return _build_params_for(db)
 
 
 def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
@@ -146,6 +218,11 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
     }
 
     sample.kwargs.pop("requires_grad", None)
+
+    # Local hack: force int64 inputs for a curated set of ops when running
+    # against a model-trace JSON (--shape-registry). See _INT64_DTYPE_OPS.
+    if _INT64_HACK_ENABLED and op_name in _INT64_DTYPE_OPS:
+        sample = _cast_sample_to_int64(sample)
 
     # Compute roofline from CPU-side inputs before device allocation
     # Handle List[Tensor] inputs (foreach ops) by unwrapping lists
@@ -200,7 +277,7 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
         err_class = None
     except Exception as e:
         exc_str = str(e)
-        out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:200]
+        out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:5000]
         err_class = _classify_error(exc_str)
 
     # Always capture executed/fallback — same source for both the success and

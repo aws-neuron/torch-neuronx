@@ -143,6 +143,11 @@ try:
     _C._register_device()
     _C._register_profiler()
 
+    # Initialize per-op int64 policy tables in C++ (lock-free after this).
+    from torch_neuronx.int64_policy import init_cpp_policy
+
+    init_cpp_policy()
+
     # Wrap neuron C extensions with torch._dynamo.disable since they can't be traced.
     import inspect
 

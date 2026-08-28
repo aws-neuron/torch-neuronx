@@ -20,7 +20,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._filelock import FileLock
 
 from torch_neuronx import _C
-from torch_neuronx.int64_policy import is_packed_int64_mode
+from torch_neuronx.int64_policy import use_packed_int64_view_for_op
 from torch_neuronx.kernels.base import BaseNeuronKernel
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_decomposition_table
 from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
@@ -488,8 +488,9 @@ class TorchMlirKernel(BaseNeuronKernel):
         # the int64 inputs are faked as their int32[..., 2] physical view so the
         # traced graph parameter is int32 (the compiler has no int64 HLO type);
         # the wrap gathers the low words and the physical view is bound at exec.
+        physical_int64 = use_packed_int64_view_for_op(self.op_name, inputs)
         fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(
-            inputs, compilation_kwargs, physical_int64=is_packed_int64_mode()
+            inputs, compilation_kwargs, physical_int64=physical_int64
         )
 
         # Generate original_outputs by running meta eval
@@ -508,7 +509,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         # + interleave and bound to the output's physical storage.
         packed_output_positions = []
         trace_fn = None
-        if is_packed_int64_mode():
+        if use_packed_int64_view_for_op(self.op_name, inputs):
             # The wrap keys off `inputs` (the post-preprocess args the fakes were
             # generated from) — NOT context.original_inputs. `inputs` is aligned
             # 1:1 with fake_inputs, so operands promoted after the original
@@ -1846,7 +1847,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         # int32[..., 2] physical view to the NEFF here (matches the int32 graph
         # parameter — the fake input was generated as int32[..., 2] — and the
         # in-graph gather extracts the low words). Zero-copy reinterpret.
-        if is_packed_int64_mode():
+        if use_packed_int64_view_for_op(self.op_name, flattened_processed_inputs):
             filtered_inputs = tuple(
                 packed_physical_view(t)
                 if (

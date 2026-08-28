@@ -20,47 +20,83 @@ namespace torch_neuronx {
 namespace dispatch {
 
 /// Int64 execution mode — controls how int64 tensors are handled during dispatch.
+///
+/// Unifies the packed-view storage strategy (cpu_bounce / packed) with the
+/// native S64 dispatch policy (native / native_strict). Integer values are
+/// stable; the Python Int64Mode enum and Int64Policy mirror them.
 enum class Int64Mode : uint8_t {
-  kCpuBounce = 0,  // Move to CPU, cast to int32, move back (default)
-  kNative = 1,     // Pass int64 through to compiler as S64 HLO
-  kPacked = 2,     // Store as two int32 lanes; execute on low word only
+  kCpuBounce = 0,  // Cast int64→int32 via CPU roundtrip; op runs on device.
+  kNative = 1,     // Per-op cascade (default): native ops S64; non-native packed; matmul/conv CPU.
+  kPacked = 2,     // Force every int64 op through the packed view (low word).
+  kNativeStrict = 3,  // S64 to compiler for natively-supported ops only; rest → CPU.
+  kCpuFallback = 4,   // Run every int64 op entirely on CPU (no Neuron execution).
 };
 
-/// Read TORCH_NEURONX_INT64_MODE (or legacy TORCH_NEURONX_NATIVE_INT64=1).
-/// Cached on first call.
-inline Int64Mode GetInt64Mode() {
-  static const Int64Mode mode = []() {
-    const char* mode_env = std::getenv("TORCH_NEURONX_INT64_MODE");
-    if (mode_env != nullptr) {
-      std::string val(mode_env);
-      if (val == "packed") return Int64Mode::kPacked;
-      if (val == "native") return Int64Mode::kNative;
-      if (val == "cpu_bounce") return Int64Mode::kCpuBounce;
-      TORCH_WARN("Invalid TORCH_NEURONX_INT64_MODE='", val,
-                 "'. Valid: packed, native, cpu_bounce. Defaulting to cpu_bounce.");
-      return Int64Mode::kCpuBounce;
-    }
-    // Legacy fallback
-    const char* legacy = std::getenv("TORCH_NEURONX_NATIVE_INT64");
-    if (legacy != nullptr && std::string(legacy) == "1") {
-      return Int64Mode::kNative;
-    }
-    return Int64Mode::kPacked;
-  }();
+namespace detail {
+
+/// Parse TORCH_NEURONX_INT64_MODE.
+inline Int64Mode ParseInt64ModeEnv() {
+  const char* mode_env = std::getenv("TORCH_NEURONX_INT64_MODE");
+  if (mode_env != nullptr) {
+    std::string val(mode_env);
+    if (val == "packed") return Int64Mode::kPacked;
+    if (val == "native") return Int64Mode::kNative;
+    if (val == "native_strict") return Int64Mode::kNativeStrict;
+    if (val == "cpu_bounce") return Int64Mode::kCpuBounce;
+    if (val == "cpu_fallback") return Int64Mode::kCpuFallback;
+    TORCH_WARN("Invalid TORCH_NEURONX_INT64_MODE='", val,
+               "'. Valid: packed, native, native_strict, cpu_bounce, cpu_fallback. "
+               "Defaulting to native.");
+    return Int64Mode::kNative;
+  }
+  return Int64Mode::kNative;
+}
+
+/// Process-wide int64 mode storage. Parsed from env on first access. Mutable
+/// only so the test harness can exercise each mode within one process via
+/// SetInt64ModeForTesting; production code never writes it, so the value equals
+/// the env parse (identical behavior to the previous cached static).
+inline Int64Mode& Int64ModeStorage() {
+  static Int64Mode mode = ParseInt64ModeEnv();
   return mode;
 }
 
-/// Check if native int64 (S64 HLO) is enabled.
-/// Cached on first call — delegates to GetInt64Mode().
-inline bool IsNativeInt64Enabled() {
-  static const bool enabled = (GetInt64Mode() == Int64Mode::kNative);
-  return enabled;
+}  // namespace detail
+
+/// Read the active int64 mode. Default: native (per-op cascade).
+inline Int64Mode GetInt64Mode() { return detail::Int64ModeStorage(); }
+
+/// Test-only: override the process int64 mode in-place. Lets the pytest harness
+/// (conftest.py int64_mode marker) run the same test under each mode in one
+/// process. NOT called by any production dispatch path — mirror it with the
+/// Python reset_int64_mode_cache() so both layers agree.
+inline void SetInt64ModeForTesting(Int64Mode mode) { detail::Int64ModeStorage() = mode; }
+
+/// Test-only: re-parse TORCH_NEURONX_INT64_MODE into the mode storage.
+inline void ResetInt64ModeFromEnv() { detail::Int64ModeStorage() = detail::ParseInt64ModeEnv(); }
+
+/// True when int64 flows to the compiler as S64 (native or native_strict).
+/// This is the gate the dispatch policy keys off.
+inline bool IsS64Passthrough() {
+  const Int64Mode m = GetInt64Mode();
+  return m == Int64Mode::kNative || m == Int64Mode::kNativeStrict;
 }
 
-/// Check if packed int64 mode is enabled.
-inline bool IsPackedInt64Enabled() {
-  static const bool enabled = (GetInt64Mode() == Int64Mode::kPacked);
-  return enabled;
+/// Check if native int64 (S64 HLO) is enabled. Now means "S64 reaches the
+/// compiler" and covers both native and native_strict, matching the original
+/// semantics ("int64 passes through as S64") for all existing call sites.
+inline bool IsNativeInt64Enabled() { return IsS64Passthrough(); }
+
+/// Check if explicit packed int64 mode is enabled.
+inline bool IsPackedInt64Enabled() { return GetInt64Mode() == Int64Mode::kPacked; }
+
+/// True when an int64 op that is being *downcast* (i.e. NOT kept as S64) should
+/// use the on-device packed view rather than a CPU roundtrip. That's the
+/// explicit packed mode, and the native cascade (whose non-native ops demote to
+/// int32 via the packed view). cpu_bounce uses the CPU roundtrip instead.
+inline bool UsePackedInt64() {
+  const Int64Mode m = GetInt64Mode();
+  return m == Int64Mode::kPacked || m == Int64Mode::kNative;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -195,11 +231,12 @@ void PromoteBinaryCompareOperands(std::vector<c10::IValue>& args,
 
 /**
  * Downcast a vector of tensors in-place to Neuron-supported dtypes.
- * Float64 → Float32; unsupported int types → Int32 (unless IsNativeInt64Enabled).
+ * Float64 → Float32; int64 → Int32 (always, in every mode).
  * Returns true iff any tensor was downcasted.
  *
  * Used by the C++ process-group collective path, which lacks a FunctionSchema
- * to drive DowncastArgs. Leaves already-supported tensors untouched (by identity).
+ * to drive DowncastArgs. Collectives are handled in int32, so int64 is demoted
+ * here regardless of mode. Leaves already-supported tensors untouched (by identity).
  */
 bool DowncastTensorList(std::vector<at::Tensor>& tensors);
 

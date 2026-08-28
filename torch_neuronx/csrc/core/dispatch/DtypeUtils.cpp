@@ -29,7 +29,7 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
   //
   // NOTE: the explicit _to_copy Int<-Long cast (DispatchToCopyImpl) still calls
   // execution_view directly — it produces the actual gathered int32 result.
-  static const bool packed_int64 = IsPackedInt64Enabled();
+  const bool packed_int64 = IsPackedInt64Enabled();
   if (packed_int64 && t.scalar_type() == c10::ScalarType::Long &&
       target_dtype == c10::ScalarType::Int && t.device().type() == c10::DeviceType::PrivateUse1) {
     if (t.is_contiguous()) {
@@ -87,14 +87,19 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
     return torch_neuronx::packed_int64::materialize_from_i32(t);
   }
 
-  // Float64 always needs CPU bounce. Int64 needs CPU bounce only when
-  // native int64 is disabled and packed int64 is disabled.
-  static const bool native_int64 = IsNativeInt64Enabled();
-  bool is_unsupported_src = t.scalar_type() == c10::ScalarType::Double ||
-                            (!native_int64 && t.scalar_type() == c10::ScalarType::Long);
-  bool is_unsupported_dst = target_dtype == c10::ScalarType::Double ||
-                            (!native_int64 && target_dtype == c10::ScalarType::Long);
-  bool needs_cpu_roundtrip = t.is_privateuseone() && (is_unsupported_src || is_unsupported_dst);
+  // CPU bounce for any 64-bit dtype *conversion* that reaches here (i.e. wasn't
+  // handled by the packed-view blocks above). int64↔int32 and float64↔float32
+  // have no on-device conversion kernel. Crucially this must NOT fall through to
+  // t.to(target) below for int64: t.to() redispatches _to_copy → contiguous →
+  // DowncastArgs → NeuronSafeCast, an infinite recursion for the special-dispatch
+  // ops (contiguous/_to_copy) that don't enter the packed-view scope. Bouncing
+  // through CPU (t.cpu().to(...)) terminates because the CPU cast doesn't
+  // redispatch to the Neuron dispatcher.
+  bool is_64bit_src =
+      t.scalar_type() == c10::ScalarType::Double || t.scalar_type() == c10::ScalarType::Long;
+  bool is_64bit_dst =
+      target_dtype == c10::ScalarType::Double || target_dtype == c10::ScalarType::Long;
+  bool needs_cpu_roundtrip = t.is_privateuseone() && (is_64bit_src || is_64bit_dst);
 
   if (needs_cpu_roundtrip) {
     auto orig_device = t.device();

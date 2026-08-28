@@ -152,6 +152,16 @@ def pytest_addoption(parser):
         default=False,
         help="Preserve the neuronx-cc working directory for hilo/XLAInferGoldens runs",
     )
+    parser.addoption(
+        "--ops",
+        default=None,
+        help=(
+            "Comma-separated list of EXACT op names to run, e.g. "
+            "'aten::abs,aten::add.Tensor'. When unset, runs all target ops. "
+            "Useful for re-running a subset (e.g. the int64 hack list) "
+            "without -k expression escaping issues."
+        ),
+    )
 
 
 def pytest_configure(config):
@@ -179,6 +189,10 @@ def pytest_configure(config):
         os.environ["TORCH_NEURONX_PRESERVE_HILO_WORKDIR"] = "1"
     if config.getoption("--dynamic", default=False):
         os.environ["NEURON_COMPILE_COVERAGE_DYNAMIC"] = "1"
+
+    ops_filter = config.getoption("--ops", default=None)
+    if ops_filter:
+        os.environ["NEURON_OPS_FILTER"] = ops_filter
 
 
 def pytest_sessionstart(session):

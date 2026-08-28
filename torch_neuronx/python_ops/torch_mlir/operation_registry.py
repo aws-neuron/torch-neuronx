@@ -379,7 +379,7 @@ def _make_preprocessing_lower(
     Returns:
         A ``LoweringResult``, as required by the C++ dispatcher.
     """
-    from torch_neuronx.utils import is_native_int64_enabled
+    from torch_neuronx.int64_policy import Int64Policy
 
     from .kernel import TorchMlirKernel
 
@@ -445,7 +445,7 @@ def _make_preprocessing_lower(
         processed_new_args = kernel.arg_processor.preprocess_inputs(
             new_args,
             scalar_to_tensor=True,
-            convert_int64=not is_native_int64_enabled(),
+            convert_int64=not Int64Policy.get().native_int64_enabled,
         )
 
         # In-place factory ops (foreach, fused optimizers) name their mutated buffers

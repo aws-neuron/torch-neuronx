@@ -134,7 +134,9 @@ bool ShouldUseComplexDecomposition(bool has_lower_func) {
 // Neuron-supported dtypes for MLIR lowering. Matches Python copy.py / to_copy.py.
 // Dtypes NOT in this set are handled via CPU bounce in DispatchCopy/DispatchToCopy.
 bool IsSupportedDtype(c10::ScalarType dt) {
-  if (dt == c10::ScalarType::Long) return IsNativeInt64Enabled();
+  if (dt == c10::ScalarType::Long)
+    return torch_neuronx::dispatch::IsS64Passthrough() ||
+           torch_neuronx::dispatch::IsPackedInt64Enabled();
   return dt == c10::ScalarType::Float || dt == c10::ScalarType::Half ||
          dt == c10::ScalarType::BFloat16 || dt == c10::ScalarType::Int ||
          dt == c10::ScalarType::Bool || dt == c10::ScalarType::ComplexFloat;
@@ -221,7 +223,12 @@ bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
     auto& t = tensors[i];
     if (!t.defined()) continue;
     auto dt = t.scalar_type();
-    if (IsSupportedDtype(dt)) continue;
+    // Always downcast int64 to int32 here, regardless of mode: collectives are
+    // handled in int32. Unlike the op-aware DowncastArgs path (which keeps S64
+    // for native compute ops), this list is schema-less. Other dtypes follow
+    // IsSupportedDtype as usual (e.g. float64 → float32).
+    const bool needs_downcast = !IsSupportedDtype(dt) || dt == c10::ScalarType::Long;
+    if (!needs_downcast) continue;
     auto target = CastTarget(dt);
     tensors[i] = NeuronSafeCast(t, target);
     any_changed = true;

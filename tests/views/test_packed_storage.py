@@ -169,18 +169,18 @@ class TestPackedInt64WordAliases:
 
 class TestInt64Policy:
     def setup_method(self):
-        """Clear cache before each test."""
+        """Start each test from the true default (no env set)."""
+        os.environ.pop("TORCH_NEURONX_INT64_MODE", None)
         reset_int64_mode_cache()
 
     def teardown_method(self):
         """Restore env and clear cache after each test."""
         os.environ.pop("TORCH_NEURONX_INT64_MODE", None)
-        os.environ.pop("TORCH_NEURONX_NATIVE_INT64", None)
         reset_int64_mode_cache()
 
-    def test_default_is_packed(self):
-        assert get_int64_mode() == Int64Mode.PACKED
-        assert is_packed_int64_mode() is True
+    def test_default_is_native(self):
+        assert get_int64_mode() == Int64Mode.NATIVE
+        assert is_native_int64_mode() is True
 
     def test_packed_mode(self):
         os.environ["TORCH_NEURONX_INT64_MODE"] = "packed"
@@ -191,15 +191,6 @@ class TestInt64Policy:
         os.environ["TORCH_NEURONX_INT64_MODE"] = "native"
         assert get_int64_mode() == Int64Mode.NATIVE
         assert is_native_int64_mode() is True
-
-    def test_legacy_native_int64(self):
-        os.environ["TORCH_NEURONX_NATIVE_INT64"] = "1"
-        assert get_int64_mode() == Int64Mode.NATIVE
-
-    def test_new_var_overrides_legacy(self):
-        os.environ["TORCH_NEURONX_NATIVE_INT64"] = "1"
-        os.environ["TORCH_NEURONX_INT64_MODE"] = "packed"
-        assert get_int64_mode() == Int64Mode.PACKED
 
     def test_invalid_mode_raises(self):
         os.environ["TORCH_NEURONX_INT64_MODE"] = "invalid"
