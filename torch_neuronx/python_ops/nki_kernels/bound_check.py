@@ -31,6 +31,23 @@ from torch_neuronx.nki_hop import nki_op, wrap_nki
 # Hardware partition count: indirect vector_offset gathers <=128 rows per DMA.
 P_MAX = 128
 
+# The bounds check is lowered as an NKI kernel — an ``nki_kernel_wrapper``
+# HigherOrderOperator. That HOP has no batching rule, so it cannot dispatch
+# under a vmap/functorch transform: e.g. gradcheck's batched-gradient path
+# (``torch._vmap_internals._vmap``) runs an op's backward under the legacy
+# ``VmapMode`` dispatch key, and the HOP raises "could not find kernel ... at
+# dispatch key". Detect an active transform and skip the in-graph check there.
+# gradcheck always feeds valid indices, so skipping is safe; real (non-vmap)
+# execution keeps the full in-graph bounds check (and its clean OOB error).
+_VMAP_MODE_KEY = torch._C._dispatch_key_parse("VmapMode")
+
+
+def _vmap_transform_active() -> bool:
+    """True when a vmap/functorch transform is on the dispatch stack."""
+    return torch._C._are_functorch_transforms_active() or (
+        torch._C._dispatch_tls_is_dispatch_key_included(_VMAP_MODE_KEY)
+    )
+
 
 # ---------------------------------------------------------------------------
 # Standalone bounds check (for ops that do NOT gather: scatter, index_put,
@@ -176,6 +193,13 @@ def assert_index_in_bounds(index: torch.Tensor, hi: int, lo: int = 0) -> torch.T
     hi = int(hi)
     lo = int(lo)
     if index.numel() == 0:
+        return index
+
+    # The in-graph NKI check can't dispatch under a vmap/functorch transform
+    # (the HOP has no batching rule). Skip it there and return the index
+    # unchanged — the consuming op still runs, just unchecked. See the module
+    # note on ``_vmap_transform_active``.
+    if _vmap_transform_active():
         return index
 
     idx32 = index.to(torch.int32)

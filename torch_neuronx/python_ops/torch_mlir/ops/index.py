@@ -4,12 +4,38 @@ import logging
 
 import torch
 
+from torch_neuronx.python_ops import op_error_handlers
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
 from torch_neuronx.python_ops.shared import ExecutionContext
 from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
-from torch_neuronx.python_ops.torch_mlir.ops.indexing import convert_indices, index_checking
+from torch_neuronx.python_ops.torch_mlir.ops.indexing import (
+    _device_bounds_check,
+    convert_indices,
+    index_checking,
+)
+from torch_neuronx.utils import skip_op_preconditions
 
 logger = logging.getLogger(__name__)
+
+
+def _index_error_handler(ctx):
+    """Raise aten::index's exact out-of-bounds exception on an OOB device fault
+    (see op_error_handlers.py). Args: (tensor, indices); only the index tensors
+    are copied to CPU, sizes come from metadata. Window [-size, size)."""
+    shape = ctx.shape(0)
+    indices = ctx.tensor_list(1)
+    for dim, idx in enumerate(indices):
+        if idx is None or not isinstance(idx, torch.Tensor) or idx.dtype == torch.bool:
+            continue
+        size = shape[dim]
+        if bool(torch.any(idx >= size)) or bool(torch.any(idx < -size)):
+            raise IndexError(
+                f"index {torch.max(idx).item()} is out of bounds "
+                f"for dimension {dim} with size {size}"
+            )
+
+
+op_error_handlers.register("aten::index", _index_error_handler)
 
 
 class IndexMLIRImpl(OperationImplementation):
@@ -27,6 +53,12 @@ class IndexMLIRImpl(OperationImplementation):
                     normalized_indices.append(idx)
                 else:
                     size = tensor.shape[i]
+                    # In-graph bounds check (no host sync); window [-size, size)
+                    # matches the previous host/C++ check. Consume the checked
+                    # idx (feeds aten.index) so it survives DCE; an OOB index
+                    # faults and _index_error_handler surfaces the exception.
+                    if not skip_op_preconditions():
+                        idx = _device_bounds_check(tensor, i, idx, wrap=True)
                     normalized_indices.append(torch.where(idx < 0, idx + size, idx))
 
             return torch.ops.aten.index(tensor, normalized_indices)

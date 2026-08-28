@@ -1764,42 +1764,6 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
     }
   }
 
-  // ── Validate index bounds (respects TORCH_NEURONX_SKIP_OP_PRECONDITIONS) ──
-  static bool skip_preconditions = [] {
-    const char* env = std::getenv("TORCH_NEURONX_SKIP_OP_PRECONDITIONS");
-    return env != nullptr && std::string(env) == "1";
-  }();
-  if (!skip_preconditions && args.size() > 1 && args[1].isList()) {
-    auto self = args[0].toTensor();
-    auto indices_list = args[1].toListRef();
-    int dim = 0;
-    for (const auto& elem : indices_list) {
-      if (!elem.isNone() && elem.isTensor()) {
-        auto idx = elem.toTensor();
-        if (idx.defined() && idx.numel() > 0 && idx.scalar_type() != c10::ScalarType::Bool &&
-            idx.is_privateuseone()) {
-          int64_t dim_size = self.size(dim);
-          // Synchronize to read index values for bounds check
-          auto stream = at::neuron::getCurrentNeuronStream(idx.device().index());
-          stream.synchronize();
-          auto idx_cpu = idx.cpu();
-          auto idx_max = idx_cpu.max().item<int64_t>();
-          auto idx_min = idx_cpu.min().item<int64_t>();
-          if (idx_max >= dim_size || idx_min < -dim_size) {
-            // Fall back to CPU which raises IndexError (not RuntimeError)
-            for (auto& arg : args) {
-              torch::jit::push(*stack, arg);
-            }
-            at::native::cpu_fallback(op, stack);
-            torch_neuronx::markFallbackLogged(op_name);
-            return;
-          }
-        }
-      }
-      dim++;
-    }
-  }
-
   // ── Dynamic-NKI pre-check ──
   // After bool→int + device normalization above, so the dynamic gather adapter
   // receives clean on-device integer indices. No-op when the feature is off.
