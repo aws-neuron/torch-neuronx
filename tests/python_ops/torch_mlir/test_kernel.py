@@ -380,3 +380,27 @@ class TestBuildInputOutputAliases:
     def test_zero_outputs_no_aliases(self):
         k = self._kernel("aten::_foreach_mul_.Scalar")
         assert k._build_input_output_aliases([0, 1], 0, out_tensors=[], flat_inputs=[]) == []
+
+
+class TestTracedGraphMetaOwnsNoStorage:
+    """_generate_fx_graph must not leave a real tensor in node.meta["val"].
+    A real tensor would be leaked after the graph is discarded and reclaimed
+    by the cyclic collector.
+    """
+
+    def test_factory_op_with_no_inputs(self):
+        from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+
+        kernel = TorchMlirKernel(lambda: torch.ones(32, 512), "aten::ones")
+        gm = kernel._generate_fx_graph(fake_inputs=(), compilation_kwargs={})
+
+        targets = [str(n.target) for n in gm.graph.nodes]
+        assert any("ones" in t for t in targets), targets
+
+        checked = 0
+        for node in gm.graph.nodes:
+            val = node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                checked += 1
+                assert val.is_meta, f"{node.op}:{node.target} kept a {val.device} tensor"
+        assert checked

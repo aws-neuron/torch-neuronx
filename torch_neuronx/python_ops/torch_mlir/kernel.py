@@ -451,6 +451,15 @@ class TorchMlirKernel(BaseNeuronKernel):
                     *flat_args
                 )
 
+            # make_fx traces in real mode, so factory ops with no tensor inputs
+            # do not inherit fake_inputs and materialize on the default device (CPU).
+            # Only layout is needed, so drop the storage so these do not
+            # become leaked tensors reclaimed by the cyclic collector.
+            for node in decomposed_gm.graph.nodes:
+                val = node.meta.get("val")
+                if isinstance(val, torch.Tensor) and not val.is_meta:
+                    node.meta["val"] = val.to("meta")
+
             # NKI functionalization inserts non-functional copy_
             decomposed_gm = FunctionalizeCopyInplacePass()(decomposed_gm).graph_module
 
