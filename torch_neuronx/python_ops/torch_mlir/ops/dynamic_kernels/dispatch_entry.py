@@ -60,6 +60,22 @@ def _resolve_entry(short_name, args):
     return get_dynamic_nki_entry(short_name)
 
 
+def _deliver(result, dest):
+    """out=/grad_input=: the result must land in the caller's buffer. The dest-reuse
+    fast path (adapter_utils._dest_buffer) already writes into dest -> result aliases
+    it (same data_ptr), so this copy is skipped. It only fires when the adapter
+    couldn't reuse dest — e.g. row-padding to a 128-multiple forces a fresh, larger
+    kernel buffer whose sliced result must be copied back."""
+    if (
+        isinstance(dest, torch.Tensor)
+        and isinstance(result, torch.Tensor)
+        and result.data_ptr() != dest.data_ptr()
+    ):
+        dest.copy_(result)
+        return dest
+    return result
+
+
 def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     """Execute ``op_name`` via a pre-compiled dynamic NKI NEFF, if registered.
 
@@ -97,6 +113,16 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     if not entry.can_handle(*args, **gate_kwargs):
         return None
 
+    # Composite adapters run the op as a few existing dynamic kernels; None = not their
+    # shape, fall through to the single-graph path.
+    run_fn = getattr(entry, "run_fn", None)
+    if run_fn is not None:
+        result = run_fn(*args, dest=dest, **op_kwargs)
+        if result is not None:
+            entry.record_exec(result.shape[0] if result.dim() else 1)
+            logger.debug("dynamic NKI composite op=%s out=%s", short_name, tuple(result.shape))
+            return _deliver(result, dest)
+
     compile_key_fn = getattr(entry, "compile_key_fn", None)
     compile_key = compile_key_fn(*args, **op_kwargs) if compile_key_fn is not None else None
     _hlo_bytes, cache_key = entry.get_compiled(compile_key)
@@ -126,16 +152,4 @@ def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
     else:
         result = outputs[0].reshape(args[0].shape)
 
-    # out=/grad_input=: the result must land in the caller's buffer. The dest-reuse
-    # fast path (adapter_utils._dest_buffer) already writes into dest -> result
-    # aliases it (same data_ptr), so this copy is skipped. It only fires when the
-    # adapter couldn't reuse dest — e.g. row-padding to a 128-multiple forces a
-    # fresh, larger kernel buffer whose sliced result must be copied back.
-    if (
-        isinstance(dest, torch.Tensor)
-        and isinstance(result, torch.Tensor)
-        and result.data_ptr() != dest.data_ptr()
-    ):
-        dest.copy_(result)
-        return dest
-    return result
+    return _deliver(result, dest)

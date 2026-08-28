@@ -1,11 +1,10 @@
-"""Free-dim concat (2-input) dynamic NKI adapter.
+"""``aten::cat`` dynamic NKI adapter — two shapes, one registry entry.
 
-Covers ``aten::cat`` of exactly two 2-D+ tensors along the last dim:
-[*lead, H1] , [*lead, H2] -> [*lead, H1+H2]. Leading dims flatten to one dynamic
-row count M (padded to a 128-multiple); H1 + H2 + dtype are baked into the NEFF.
-This is the MoE backward of the block's ``.chunk(2, dim=-1)`` (grad flows back as
-cat([grad_gate, grad_up], dim=-1)). More than two tensors, non-last-dim concat,
-and mismatched leading shapes/dtypes decline to the default lowering.
+Free dim (2 inputs): [*lead, H1] , [*lead, H2] -> [*lead, H1+H2] on one NEFF (H1 + H2 +
+dtype baked, M dynamic) — the MoE backward of ``.chunk(2, dim=-1)``.
+Row dim (K inputs): dim-0 concat as K dynamic ``copy_`` calls, no NEFF of its own
+(``_run_cat_rows``) — TorchTitan's MoE for-loop ``cat([chunk_e @ w_e ...], dim=0)``.
+Anything else (other dims, mixed dtypes, strided inputs) declines to the default lowering.
 """
 
 import torch
@@ -37,7 +36,88 @@ def _is_last_dim(dim, ndim) -> bool:
     return dim in (ndim - 1, -1)
 
 
+def _is_row_dim(dim, ndim) -> bool:
+    return dim in (0, -ndim)
+
+
+def _cat_rows_width(tensors, dim) -> int | None:
+    """Row width H (trailing dims flattened) if ``tensors`` is a dim-0 concat of
+    same-width contiguous neuron rows, else None. Contiguity is required: a strided input
+    would take the copy kernel's strided variant, whose NEFF bakes the view's stride."""
+    if not isinstance(tensors, list | tuple) or len(tensors) < 2:
+        return None
+    first = tensors[0]
+    if not isinstance(first, torch.Tensor) or first.dim() < 2:
+        return None
+    if not _is_row_dim(dim, first.dim()) or first.device.type != "neuron":
+        return None
+    if first.dtype not in _SUPPORTED_DTYPES:
+        return None
+    rest = tuple(first.shape[1:])
+    H = 1  # noqa: N806
+    for d in rest:
+        H *= int(d)  # noqa: N806
+    if H == 0:
+        return None
+    for t in tensors:
+        if not isinstance(t, torch.Tensor) or t.dtype != first.dtype:
+            return None
+        if t.device != first.device or t.dim() != first.dim():
+            return None
+        if tuple(t.shape[1:]) != rest or not t.is_contiguous():
+            return None
+    return H
+
+
+def _can_handle_cat_rows(tensors, dim=0, out=None) -> bool:
+    """Take the dim-0 concat only when EVERY row copy has a dynamic kernel: one that
+    declines would compile per row count, i.e. the recompile this path exists to remove."""
+    from .cast import _can_handle_copy
+
+    H = _cat_rows_width(tensors, dim)  # noqa: N806
+    if H is None:
+        return False
+    M = 0  # noqa: N806
+    for t in tensors:
+        n = int(t.shape[0])
+        if n == 0:
+            continue  # no rows, no copy
+        M += n  # noqa: N806
+        # n == 1 is the one count copy_ can't take (strided_plan drops extent-1 dims);
+        # allowed because its fallback is the single fixed shape [1, H].
+        if n != 1 and not _can_handle_copy(t, t):
+            return False
+    if M == 0:
+        return False
+    first = tensors[0]
+    return out is None or _dest_reusable(out, M, H, first.dtype, first.device)
+
+
+def _run_cat_rows(tensors, dim=0, out=None, dest=None, **_):
+    """dim-0 concat as K dynamic row copies into one buffer; None = not this shape.
+
+    Compile-free at any K and any counts: ``torch.empty`` of a fresh row count is a pure
+    allocation, and ``copy_``'s key is (H, dtype) — neither the rows nor the dst offset."""
+    H = _cat_rows_width(tensors, dim)  # noqa: N806
+    if H is None:
+        return None
+    first = tensors[0]
+    rest = tuple(first.shape[1:])
+    M = sum(int(t.shape[0]) for t in tensors)  # noqa: N806
+    buf = _dest_buffer(dest, M, H, first.dtype, first.device)
+    off = 0
+    for t in tensors:
+        n = int(t.shape[0])
+        if n == 0:
+            continue
+        buf[off : off + n].copy_(t.reshape(n, H))
+        off += n
+    return buf.reshape(M, *rest)
+
+
 def _can_handle_cat(tensors, dim=0, out=None) -> bool:
+    if _can_handle_cat_rows(tensors, dim, out):
+        return True
     pair = _cat_tensor_pair(tensors)
     if pair is None:
         return False
@@ -123,5 +203,8 @@ def register():
             prepare_io=_prepare_cat_io,
             reshape_output=_reshape_cat_output,
             compile_key_fn=_cat_compile_key,
+            # dim-0 concat first (no NEFF of its own); returns None for the free-dim
+            # shapes, which then take the compile/execute path above.
+            run_fn=_run_cat_rows,
         ),
     )

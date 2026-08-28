@@ -110,15 +110,21 @@ def _strided_src_plan(logical, src):
 
 
 def _copy_plan(self, src):
-    """The strided plan backing ``self.copy_(src)``, or None. A contiguous source of a
-    dtype with no cast kernel is the degenerate plan dyn_stride == width."""
+    """The strided plan backing ``self.copy_(src)``, or None. A contiguous source takes the
+    degenerate plan (dyn_stride == width) only where the cast kernel can't reach it: a dtype
+    with no cast wrapper, or M < one tile (its tail starts at row M - 128). strided_plan
+    answers a sub-tile M with tile_m == 1, so the kernel walks single rows."""
     if not isinstance(src, torch.Tensor) or src.device.type != "neuron":
         return None
     if not src.is_contiguous():
         return _strided_src_plan(self, src)
-    if src.dtype not in _NO_CAST_KERNEL_DTYPES:
-        return None
     M, H = _mh(self)  # noqa: N806
+    if src.dtype in _NO_CAST_KERNEL_DTYPES:
+        return strided_plan(src.reshape(M, H), M)
+    if M >= _TILE_M:
+        return None  # the cast kernel owns full-tile contiguous copies
+    if src.dtype != self.dtype:
+        return None  # the sub-tile (tile_m == 1) strided variant is same-dtype only
     return strided_plan(src.reshape(M, H), M)
 
 
@@ -215,9 +221,10 @@ def _reshape_to_copy_output(outputs, original_args):
 
 # ── aten::copy_ ──────────────────────────────────────────────────────────────
 def _can_handle_copy(self, src=None, non_blocking=False, **_) -> bool:
-    """In-place neuron->neuron copy of a contiguous, equally-shaped source (``src``
-    arrives already broadcast). Any ragged M >= 128 works; below one tile the tail
-    offset would go negative and an in-place output cannot be padded, so it declines.
+    """In-place neuron->neuron copy of a contiguous, equally-shaped source (``src`` arrives
+    already broadcast). Ragged M >= 128 goes to the cast kernel; a same-dtype sub-tile M
+    takes the strided kernel's row-walking variant (``_copy_plan``) — declining it would
+    compile per row count, e.g. for each per-expert block of an MoE concat.
     C++-dispatch only: the Python path passes the destination as ``out=``."""
     if not isinstance(self, torch.Tensor) or not isinstance(src, torch.Tensor):
         return False
@@ -225,7 +232,8 @@ def _can_handle_copy(self, src=None, non_blocking=False, **_) -> bool:
         return False
     if _is_castable(self) and _is_castable(src):
         M, _ = _mh(self)  # noqa: N806
-        return M >= _TILE_M
+        if M >= _TILE_M:
+            return True
     # Strided source: without this the C++ prologue absorbs the view and bakes M.
     if self.dtype != src.dtype or self.dtype not in _STRIDED_DTYPES:
         return False
