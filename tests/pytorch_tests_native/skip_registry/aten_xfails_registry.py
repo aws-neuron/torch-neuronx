@@ -24,6 +24,19 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "[platform.float64] clamp with a float64 bound promotes (via"
+            " torch.result_type) to float64, which Neuron does not support."
+            " The non-float64 clamp promotion cases are fixed in this PR; these"
+            " float64-bound residuals are a platform limitation. xfail (not skip)"
+            " so a future float64 story would xpass and flag it."
+        ),
+        tests=[
+            "test_type_promotion.py::TestTypePromotionDeviceNEURON::test_clamp_type_promotion_neuron_bool_float64_float32",
+            "test_type_promotion.py::TestTypePromotionDeviceNEURON::test_clamp_type_promotion_neuron_int32_float64_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "these are @unittest.expectedFailure"
             " upstream but run on Neuron. The expected failure no longer occurs and"
             " unittest reports an Unexpected success. xfailing so the test"
