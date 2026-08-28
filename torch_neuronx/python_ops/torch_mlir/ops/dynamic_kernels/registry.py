@@ -30,6 +30,12 @@ class DynamicNkiEntry:
     # Optional: derive compile_key from op args. When None, one NEFF (key=None).
     compile_key_fn: Callable[..., object] | None = None
 
+    # Optional composite path: run the op as a few EXISTING dynamic kernels instead of a
+    # NEFF of its own — for ops whose operand COUNT is data-dependent, which a NEFF cannot
+    # express (see adapters/concat.py's dim-0 concat). ``run_fn(*args, dest=..., **kwargs)``
+    # returning None means "not my shape": dispatch falls through to compile/execute below.
+    run_fn: Callable[..., object] | None = None
+
     _compiled: dict = field(default_factory=dict, repr=False)
 
     # Instrumentation (for tests / debugging): every time this dynamic kernel

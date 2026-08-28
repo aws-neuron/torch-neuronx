@@ -726,9 +726,11 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_skipped("sum"):
             x.sum()
 
-    # ── cat-specific: 2-input last-dim concat (backward of .chunk(2, -1)). Runs
-    # dynamically and matches torch; N-D flattens leading dims; unequal widths OK;
-    # >2 tensors / non-last-dim / dtype-or-lead mismatch decline. ──
+    # ── cat-specific, two shapes. FREE DIM: 2-input last-dim concat (backward of
+    # .chunk(2, -1)) on one NEFF; N-D flattens leading dims; unequal widths OK; >2
+    # tensors and dtype-or-lead mismatch decline. ROW DIM: K-input dim-0 concat
+    # (TorchTitan's MoE for-loop) as K composite copies, so no row count is baked;
+    # a strided input or any middle dim declines. ──
     @pytest.mark.parametrize(
         "shape_a,shape_b",
         [
@@ -764,12 +766,95 @@ class TestDynamicNkiKernels:
             got = torch.cat(ts, dim=-1).cpu()
         torch.testing.assert_close(got, torch.cat([t.cpu() for t in ts], dim=-1), rtol=0, atol=0)
 
-    def test_dynamic_nki_cat_non_last_dim_declines(self):
-        # concat over dim 0 isn't the free-dim concat -> fallback.
-        a = (torch.randn(256, 1024, dtype=torch.bfloat16) / 8).to("neuron")
-        b = (torch.randn(128, 1024, dtype=torch.bfloat16) / 8).to("neuron")
+    @pytest.mark.parametrize(
+        "counts,width",
+        [
+            ([400, 500, 383], 352),  # DSv3 per-expert rows, w1/w3 width (1408/TP4)
+            ([128, 129, 384, 1024], 2048),  # DSv3 w2 width
+            ([37, 400, 60, 511], 352),  # sub-tile blocks mixed with full ones
+            ([8, 17, 120], 352),  # every block below one tile
+            ([0, 400, 0, 250], 2048),  # an empty expert contributes no rows
+            ([1, 400, 129], 352),  # a 1-row block: the copy declines, the concat holds
+        ],
+    )
+    def test_dynamic_nki_cat_row_dim(self, counts, width):
+        """dim-0 concat of K same-width blocks — TorchTitan's MoE for-loop
+        ``cat([chunk_e @ w_e ...], dim=0)``. Bit-exact: a concat does no arithmetic."""
+        parts = [_exact_src(n, width, torch.bfloat16) for n in counts]
+        ref = torch.cat(parts, dim=0)
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat([p.to("neuron") for p in parts], dim=0).cpu()
+        assert got.shape == ref.shape, f"{got.shape} != {ref.shape}"
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_row_dim_3d(self):
+        """Dims after the first flatten into the row width."""
+        parts = [_exact_src(n, 8 * 256, torch.bfloat16).reshape(n, 8, 256) for n in (300, 411)]
+        ref = torch.cat(parts, dim=0)
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat([p.to("neuron") for p in parts], dim=0).cpu()
+        assert got.shape == ref.shape, f"{got.shape} != {ref.shape}"
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_row_dim_no_recompile(self):
+        """The point of the composite path: 64 blocks with fresh row counts compile
+        nothing. The static lowering keys on ALL K counts -> 2 NEFFs per new routing."""
+        import random
+
+        import torch_neuronx._C as _C
+
+        rng = random.Random(0)
+
+        def step():
+            for width in (352, 2048):
+                counts = [rng.randint(1, 480) for _ in range(64)]
+                parts = [
+                    (torch.randn(n, width, dtype=torch.bfloat16) / 8).to("neuron") for n in counts
+                ]
+                assert torch.cat(parts, dim=0).shape == (sum(counts), width)
+
+        step()  # warm: one copy NEFF per width
+        for width in (352, 2048):  # plus the 1-row block's fixed [1, H] fallback
+            blocks = [
+                (torch.randn(n, width, dtype=torch.bfloat16) / 8).to("neuron") for n in (1, 200)
+            ]
+            torch.cat(blocks, dim=0)
+        before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+        for _ in range(3):
+            step()
+        new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
+        assert not new, f"recompiled for new per-expert counts: {sorted(new)}"
+
+    def test_dynamic_nki_cat_row_dim_backward(self):
+        """The composite copies run below autograd, so cat's backward still works."""
+        counts = (400, 90, 511)
+        parts = [(torch.randn(n, 352, dtype=torch.bfloat16) / 8).float() for n in counts]
+        w = torch.randn(sum(counts), 352)
+        cpu_leaves = [p.clone().requires_grad_(True) for p in parts]
+        (torch.cat(cpu_leaves, dim=0) * w).sum().backward()
+
+        nrn_leaves = [p.to(torch.bfloat16).to("neuron").requires_grad_(True) for p in parts]
+        with _assert_dynamic_ran("cat"):
+            out = torch.cat(nrn_leaves, dim=0)
+        (out.float() * w.to("neuron")).sum().backward()
+        for got, ref in zip(nrn_leaves, cpu_leaves, strict=True):
+            torch.testing.assert_close(got.grad.float().cpu(), ref.grad, rtol=2e-2, atol=2e-2)
+
+    def test_dynamic_nki_cat_row_dim_non_contiguous_declines(self):
+        """A strided block would bake its stride into the copy NEFF -> fall back."""
+        wide = (torch.randn(400, 704, dtype=torch.bfloat16) / 8).to("neuron")
+        parts = [wide[:, :352], wide[:, 352:]]
+        assert not parts[0].is_contiguous()
         with _assert_dynamic_skipped("cat"):
-            torch.cat([a, b], dim=0)
+            got = torch.cat(parts, dim=0).cpu()
+        torch.testing.assert_close(got, torch.cat([p.cpu() for p in parts], dim=0), rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_middle_dim_declines(self):
+        """Neither the row dim nor the free dim -> fallback."""
+        a = (torch.randn(2, 256, 1024, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(2, 128, 1024, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_skipped("cat"):
+            torch.cat([a, b], dim=1)
 
     # ── where / bitwise_or / ones_like: the decline guards (the generic sweeps only
     # build routable cases, and the arbitrary-H sweep only uses even H) plus the out=
@@ -1022,10 +1107,10 @@ class TestDynamicNkiKernels:
             len(entry._compiled) - compiled_before <= 1
         ), f"{op} recompiled across ragged counts {rows}"
 
-    @pytest.mark.parametrize("rows", [1, 64, 127])
+    @pytest.mark.parametrize("rows", [1])
     def test_dynamic_nki_copy_sub_tile_declines(self, rows):
-        """Below one tile the tail offset would go negative and an in-place destination
-        cannot be padded -> decline, still correct."""
+        """A single row is the one sub-tile count with no dynamic path: strided_plan drops
+        extent-1 dims. 2..127 rows DO run; this declines to one fixed [1, H] NEFF."""
         src = torch.randn(rows, 2048, dtype=torch.bfloat16) / 8
         dst = torch.zeros(rows, 2048, dtype=torch.bfloat16).to("neuron")
         with _assert_dynamic_skipped("copy_"):
@@ -1052,6 +1137,37 @@ class TestDynamicNkiKernels:
         with _assert_dynamic_ran("copy_"):
             dst_n.copy_(src_n)
         torch.testing.assert_close(dst_n.cpu(), wide[:, :1024].contiguous(), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("rows", [2, 64, 127])  # 1 row has no plan: see _declines
+    def test_dynamic_nki_copy_sub_tile_contiguous_src(self, rows):
+        """A CONTIGUOUS sub-tile copy takes the row-walking variant too: the cast kernel's
+        tail would start at row M - 128. Declining would compile per row count."""
+        src = _exact_src(rows, 1024, torch.bfloat16)
+        dst = torch.zeros(rows, 1024, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("copy_"):
+            dst.copy_(src.to("neuron"))
+        torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+    def test_dynamic_nki_copy_into_row_slice_no_recompile(self):
+        """The dst is one row block of a bigger buffer (how the dim-0 concat fills its
+        output): neither its storage offset nor the row count may reach the NEFF key."""
+        import torch_neuronx._C as _C
+
+        def fill(counts):
+            buf = torch.empty(sum(counts), 352, dtype=torch.bfloat16).to("neuron")
+            off = 0
+            for n in counts:
+                src = _exact_src(n, 352, torch.bfloat16)
+                buf[off : off + n].copy_(src.to("neuron"))
+                torch.testing.assert_close(buf[off : off + n].cpu(), src, rtol=0, atol=0)
+                off += n
+
+        fill([200, 64])  # warm: full-tile copy NEFF + row-walk NEFF
+        before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+        for counts in ([383, 129], [1001, 7], [17, 500]):
+            fill(counts)
+        new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
+        assert not new, f"recompiled for a new block size / offset: {sorted(new)}"
 
     def test_dynamic_nki_copy_sub_tile_strided_src_no_recompile(self):
         """One NEFF per (width, dyn_stride, dtype) covers every sub-tile row count."""
