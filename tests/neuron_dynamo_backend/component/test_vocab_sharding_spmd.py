@@ -1025,6 +1025,83 @@ def _build_backward_slice_dim1(
     return GraphModule(torch.nn.Module(), g)
 
 
+def _build_backward_slice_behind_a_view(
+    rank: int, tp_size: int = 4, vocab_size: int = 16384, hidden_dim: int = 4096
+):
+    """The gradient reaches the slice through a view, as a real backward graph has it."""
+    shard_size = vocab_size // tp_size
+    start = rank * shard_size
+
+    g = Graph()
+    tangents = g.placeholder("tangents_1")
+    tangents.meta["val"] = _meta((vocab_size * hidden_dim,), torch.bfloat16)
+    grad = g.call_function(torch.ops.aten.view.default, (tangents, [vocab_size, hidden_dim]))
+    grad.meta["val"] = _meta((vocab_size, hidden_dim), torch.bfloat16)
+    sliced = g.call_function(torch.ops.aten.slice.Tensor, (grad, 0, start, start + shard_size))
+    sliced.meta["val"] = _meta((shard_size, hidden_dim), torch.bfloat16)
+    g.output(sliced)
+    g.lint()
+    return GraphModule(torch.nn.Module(), g)
+
+
+def _build_table_band_truncations():
+    """Bands carved out of a larger table, each truncated on dim 0 to the extent it uses.
+
+    A band has the same shape signature as [vocab_size, hidden_dim], and the truncation starts
+    at 0 on every rank.
+    """
+    rows, columns = 1024, 128
+    bands = ((0, 44), (44, 86), (86, 128))
+    extents = (2, 8, 8)
+
+    g = Graph()
+    table = g.placeholder("freqs")
+    table.meta["val"] = _meta((rows, columns), torch.bfloat16)
+
+    outs = []
+    for (lo, hi), extent in zip(bands, extents, strict=True):
+        band = g.call_function(torch.ops.aten.slice.Tensor, (table, 1, lo, hi))
+        band.meta["val"] = _meta((rows, hi - lo), torch.bfloat16)
+        used = g.call_function(torch.ops.aten.slice.Tensor, (band, 0, 0, extent))
+        used.meta["val"] = _meta((extent, hi - lo), torch.bfloat16)
+        outs.append(used)
+    g.output(tuple(outs))
+    g.lint()
+    return GraphModule(torch.nn.Module(), g)
+
+
+def _build_sequence_parallel_activation_shard(tp_rank: int = 1, tp_size: int = 4):
+    """This rank's tile of an all-reduced activation, not a vocab gradient.
+
+    Reduce-scatter written as all-reduce plus a local slice. The tile divides the dimension
+    evenly and the start is aligned, so it meets every shape criterion a vocab gradient does.
+    """
+    seq, hidden = 16, 5120
+    tile = seq // tp_size
+    start = tp_rank * tile
+
+    g = Graph()
+    x = g.placeholder("x")
+    x.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+    residual = g.placeholder("residual")
+    residual.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+
+    reduced = g.call_function(torch.ops._c10d_functional.all_reduce.default, (x, "sum", "0"))
+    reduced.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+    waited = g.call_function(torch.ops._c10d_functional.wait_tensor.default, (reduced,))
+    waited.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+    added = g.call_function(torch.ops.aten.add.Tensor, (residual, waited))
+    added.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+    copied = g.call_function(torch.ops.aten.copy.default, (added, waited))
+    copied.meta["val"] = _meta((seq, hidden), torch.bfloat16)
+
+    sliced = g.call_function(torch.ops.aten.slice.Tensor, (copied, 0, start, start + tile))
+    sliced.meta["val"] = _meta((tile, hidden), torch.bfloat16)
+    g.output(sliced)
+    g.lint()
+    return GraphModule(torch.nn.Module(), g)
+
+
 class TestFindBackwardSlices:
     """Tests for find_backward_slices() pattern detection."""
 
@@ -1082,6 +1159,36 @@ class TestFindBackwardSlices:
         """tp_size=1 means shard_size == vocab_size — no-op slice, must be rejected."""
         gm = _build_backward_slice(rank=0, tp_size=1)
         assert len(find_backward_slices(gm.graph)) == 0
+
+    def test_gradient_behind_a_view_still_detected(self):
+        """A layout hop between the gradient and the slice must not hide the pattern."""
+        for rank in range(4):
+            slices = find_backward_slices(_build_backward_slice_behind_a_view(rank).graph)
+            assert len(slices) == 1
+            assert slices[0].start // slices[0].shard_size == rank
+
+    def test_table_band_truncation_not_detected(self):
+        """A band truncated to the extent it uses is not a vocab gradient shard."""
+        assert find_backward_slices(_build_table_band_truncations().graph) == []
+
+    def test_sequence_parallel_activation_shard_not_detected(self):
+        """An activation tile meets every shape criterion, and must still be left alone."""
+        for tp_rank in range(4):
+            gm = _build_sequence_parallel_activation_shard(tp_rank=tp_rank)
+            assert find_backward_slices(gm.graph) == []
+
+    def test_no_match_is_rank_independent(self):
+        """A rejection must not depend on the rank that traced the graph.
+
+        The truncation starts at 0 on every rank while a tile starts at 4 * tp_rank, so a
+        matcher accepting both agreed on shard index 0 only on rank 0.
+        """
+        decisions = set()
+        for tp_rank in range(4):
+            g = _build_table_band_truncations().graph
+            gm = _build_sequence_parallel_activation_shard(tp_rank=tp_rank)
+            decisions.add((len(find_backward_slices(g)), len(find_backward_slices(gm.graph))))
+        assert decisions == {(0, 0)}
 
 
 class TestShardIndexInjectionBackwardSlice:

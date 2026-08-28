@@ -135,6 +135,26 @@ class BackwardSlice:
     shard_size: int  # end - start
 
 
+def _is_reshaped_graph_input(node: Node) -> bool:
+    """Whether `node` is a graph input, or a reshape of one.
+
+    The gradient this matcher slices arrives as a graph input, so a value computed in the graph
+    is not it. Requiring the element count to survive each hop excludes slicing, so a value
+    carved out of an input does not pass as the input itself.
+    """
+    while node.op == "call_function":
+        sources = [arg for arg in node.args if isinstance(arg, Node)]
+        if len(sources) != 1:
+            return False
+        here, there = node.meta.get("val"), sources[0].meta.get("val")
+        if not isinstance(here, torch.Tensor) or not isinstance(there, torch.Tensor):
+            return False
+        if here.numel() != there.numel():
+            return False
+        node = sources[0]
+    return node.op == "placeholder"
+
+
 def find_backward_slices(graph: Graph) -> list[BackwardSlice]:
     """Find slice.Tensor nodes matching the backward vocab gradient slice pattern.
 
@@ -144,6 +164,7 @@ def find_backward_slices(graph: Graph) -> list[BackwardSlice]:
     3. start % shard_size == 0 (start is aligned to shard boundary)
     4. Input is 2-D (vocab_size, hidden_dim) — vocab gradient is always 2-D
     5. Input shape[0] % shard_size == 0 and shape[0] > shard_size
+    6. The sliced value is a graph input, or a reshape of one
     """
     results = []
     for node in graph.nodes:
@@ -175,6 +196,9 @@ def find_backward_slices(graph: Graph) -> list[BackwardSlice]:
             continue
         vocab_size = val.shape[0]
         if vocab_size % shard_size != 0 or vocab_size <= shard_size:
+            continue
+
+        if not _is_reshaped_graph_input(input_node):
             continue
 
         results.append(BackwardSlice(node=node, start=start, shard_size=shard_size))
