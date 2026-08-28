@@ -98,6 +98,18 @@ void CacheKeyGenerator::AppendTensor(std::ostringstream& key, const at::Tensor& 
     }
   }
   key << ")";
+  // Device type is part of the identity: the lowering depends on the operand's
+  // device, not just shape/dtype/strides. E.g. a CPU int64 index against a
+  // neuron self is host-downcast and binds as a plain int32[N] NEFF parameter,
+  // while a neuron int64 index (packed mode) binds its int32[N, 2] physical
+  // view with an in-graph low-word gather. Sharing one entry across devices
+  // poisons the cache: the variant that lands first is resumed by the other
+  // and mis-binds its buffer (observed: index_select consuming a packed index
+  // through a CPU-index HLO reads the [lo0, hi0] words as the index -> wrong
+  // rows). Device *type* only — the device index doesn't change lowering.
+  if (!t.device().is_privateuseone()) {
+    key << ":" << t.device().type();
+  }
 }
 
 void CacheKeyGenerator::AppendTensorOrUndef(std::ostringstream& key, const at::Tensor& t) {

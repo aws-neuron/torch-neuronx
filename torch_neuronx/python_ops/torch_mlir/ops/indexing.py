@@ -24,29 +24,16 @@ def convert_indices(indices):
 
 
 def index_checking(tensor, indices):
-    """Validate indices for index operations."""
-    for dim, idx in enumerate(indices):
+    """Validate index dtypes for index operations. Bounds checking is fused
+    in-graph (see index.py index_fn) to avoid a host sync; an OOB index faults
+    on-device and aten::index's error_handler surfaces the exact exception."""
+    for _, idx in enumerate(indices):
         if idx is None or idx.dtype == torch.bool:
             continue
 
         # Index dtype check
         if idx.is_floating_point():
             raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
-
-        # Bounds checking on PyTorch tensors.
-        # Note: for neuron-device indices, bounds checking is handled by the
-        # C++ DispatchIndexImpl (NeuronDispatcher.cpp) which copies idx to CPU
-        # via idx.cpu() for validation. That copy logs "neuron::copy::neuron_to_cpu"
-        # as an executed op, causing index.Tensor_out to appear as cpu_fallback
-        # in coverage tests. This is a known limitation of the op tracking
-        # infrastructure — the op runs correctly on neuron.
-        if not skip_op_preconditions():
-            size = tensor.shape[dim]
-            if torch.any(idx >= size) or torch.any(idx < -size):
-                raise IndexError(
-                    f"index {torch.max(idx).item()} is out of bounds "
-                    f"for dimension {dim} with size {size}"
-                )
 
 
 def _device_bounds_check(data, dim, index, *, wrap) -> torch.Tensor:
@@ -96,11 +83,19 @@ def _validate_index_select(x, dim, index, out=None):
         raise TypeError("index_select(): Expected dtype int32 or int64 for index")
 
 
+def _index_select_error_handler(ctx):
+    """Raise index_select's exact out-of-bounds exception on an OOB device fault
+    (see op_error_handlers.py). index_select uses a fixed message with no index
+    value, so the context is not needed."""
+    raise IndexError("index out of range in self")
+
+
 @register_aten(
     ["aten::index_select", "aten::index_select.out"],
     static_argnums=(1,),
     preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_index_select,
+    error_handler=_index_select_error_handler,
 )
 def torch_index_select(x, dim, index, out=None):
     _assert_no_internal_overlap(out)
@@ -109,20 +104,45 @@ def torch_index_select(x, dim, index, out=None):
     elif index.dim() != 1:
         raise IndexError("index_select(): Index is supposed to be a vector")
 
-    # Bounds checking. For 0-d input, dim_size is effectively 1 (a scalar holds
-    # exactly one element, addressable only at index 0 or -1) and at most one
-    # index is allowed. Matches CPU torch.index_select behavior.
-    if not skip_op_preconditions():
-        dim_size = x.size(dim) if x.dim() > 0 else 1
-        if torch.any(index >= dim_size) or torch.any(index < -dim_size):
-            raise IndexError("index out of range in self")
-        if x.dim() == 0 and index.numel() > 1:
-            raise RuntimeError(
-                f"index_select(): Index to scalar can have only 1 value, "
-                f"got {index.numel()} value(s)"
-            )
+    # 0-d (scalar) input: at most one index is allowed. This check is
+    # shape-based, so it is safe at trace time (shape is part of the compile
+    # cache key -> a different numel re-traces and re-checks). The *value*
+    # bounds check must NOT be eager here: this function only runs on a cache
+    # miss, so a value-dependent host check is skipped when a same-shape call
+    # (e.g. index [0], then [1]) hits the cache. The bounds are enforced
+    # in-graph below for every rank: for 0-d self the effective bound is 1
+    # (window [-1, 1)), see _device_bounds_check.
+    if not skip_op_preconditions() and x.dim() == 0 and index.numel() > 1:
+        raise RuntimeError(
+            f"index_select(): Index to scalar can have only 1 value, "
+            f"got {index.numel()} value(s)"
+        )
 
-    return torch.index_select, (x, dim, index), {}
+    def index_select_fn(x, dim, index):
+        # In-graph bounds check (no host sync): the gather consumes the checked
+        # index, so the check survives DCE and faults on an OOB index;
+        # _index_select_error_handler then surfaces the exact exception.
+        # Window [-n, n) matches the host check (n == 1 for 0-d self).
+        # Skipped under skip_op_preconditions.
+        if not skip_op_preconditions():
+            index = _device_bounds_check(x, dim, index, wrap=True)
+            if x.dim() == 0:
+                # A gather from 0-d self folds to a reshape (any in-bounds
+                # index selects the single element), dropping the checked
+                # index — the backend then dead-stores the whole check (the
+                # HLO-level has_side_effect attr does not survive NKI inlining,
+                # see neuronx-cc DeadCodeElim/eliminateDeadStore). Consume the
+                # checked index through a gather the compiler CANNOT fold: pad
+                # self to 2 rows and gather with clamp(index, min=0) — a
+                # runtime index into a size-2 dim. Valid checked values
+                # {-1, 0} both clamp to row 0 (== x); an OOB value faults in
+                # the check before this gather's result is consumed.
+                x2 = torch.cat([x.reshape(1), torch.zeros_like(x.reshape(1))])
+                idx0 = torch.clamp(index, min=0)
+                return torch.index_select(x2, 0, idx0).reshape(x.shape)
+        return torch.index_select(x, dim, index)
+
+    return index_select_fn, (x, dim, index), {}
 
 
 def _validate_index_copy(x, dim, indexes, source, out=None):
@@ -747,7 +767,9 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
 
 
 def _validate_index_select_backward(grad, input_sizes, dim, index):
-    """Validate index_select_backward dtypes and bounds on raw args."""
+    """Validate index_select_backward dtypes on raw args. The 1-d+ bounds check
+    is fused in-graph (see index_select_backward_fn) to avoid a host sync; the
+    0-d scalar case is a cheap single-element check kept here."""
     if index.dtype not in [torch.int32, torch.int64]:
         raise TypeError(
             f"index_select_backward(): Expected dtype int32/int64 for index but got: {index.dtype}"
@@ -756,28 +778,30 @@ def _validate_index_select_backward(grad, input_sizes, dim, index):
     if skip_op_preconditions():
         return
 
-    # For 0-d (input_sizes empty), dim_size is effectively 1 — the scalar
-    # grad holds a single element addressable only at index 0. CPU rejects
-    # negatives here (unlike the forward path) and rejects multiple indices.
-    # Match those semantics. For 1-d+, keep the existing `0 <= index < dim_size`
-    # check; negative-index support for 1-d+ backward is a pre-existing gap
-    # tracked separately.
-    if len(input_sizes) == 0:
-        if index.numel() > 1:
-            raise IndexError(
-                f"index_select_backward(): Index to scalar can have only 1 value, "
-                f"got {index.numel()} value(s)"
-            )
-        if torch.any(index != 0):
-            oob_idx = index.flatten()[0].item()
-            raise IndexError(f"index {oob_idx} is out of bounds for dimension {dim} with size 1")
-    else:
-        dim_size = input_sizes[dim]
-        if torch.any(index < 0) or torch.any(index >= dim_size):
-            oob_idx = index.min().item() if torch.any(index < 0) else index.max().item()
-            raise IndexError(
-                f"index {oob_idx} is out of bounds for dimension {dim} with size {dim_size}"
-            )
+    # 0-d self (input_sizes empty): the scalar grad holds a single element
+    # addressable only at index 0. CPU rejects negatives and multiple indices.
+    # Only the shape-based numel check is safe here: this validator runs at
+    # lowering (compile-cache miss) only, and shape is part of the cache key.
+    # The *value* bounds check is enforced in-graph (index_select_backward_fn)
+    # so it runs on every call, including cache hits.
+    if len(input_sizes) == 0 and index.numel() > 1:
+        raise IndexError(
+            f"index_select_backward(): Index to scalar can have only 1 value, "
+            f"got {index.numel()} value(s)"
+        )
+
+
+def _index_select_backward_error_handler(ctx):
+    """Raise index_select_backward's exact out-of-bounds exception on an OOB
+    device fault (see op_error_handlers.py). Args: (grad, input_sizes, dim,
+    index); input_sizes/dim are static scalars, index is the copied tensor."""
+    input_sizes = ctx.scalar(1)
+    dim = ctx.scalar(2)
+    index = ctx.tensor(3)
+    # 0-d self: input_sizes is empty; the single element gives an effective size 1.
+    size = input_sizes[dim] if len(input_sizes) > 0 else 1
+    oob = int(torch.min(index)) if bool(torch.any(index < 0)) else int(torch.max(index))
+    raise IndexError(f"index {oob} is out of bounds for dimension {dim} with size {size}")
 
 
 @register_aten(
@@ -785,12 +809,28 @@ def _validate_index_select_backward(grad, input_sizes, dim, index):
     static_argnums=(1, 2),
     preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_index_select_backward,
+    error_handler=_index_select_backward_error_handler,
 )
 def torch_index_select_backward(grad, input_sizes, dim, index):
     def index_select_backward_fn(grad, input_sizes, dim, index):
-        # 0-d self (input_sizes empty): CPU identity-returns the scalar grad.
+        # 0-d self (input_sizes empty): CPU identity-returns the scalar grad,
+        # but only index 0 is valid (CPU rejects negatives). Enforce in-graph
+        # (window [0, 1)) and consume the checked index through a gather the
+        # compiler cannot fold (pad grad to 2 rows, runtime index) — a gather
+        # from the 0-d/size-1 grad folds to a reshape and the backend then
+        # dead-stores the check (see torch_index_select).
         if len(input_sizes) == 0:
-            return grad
+            if skip_op_preconditions():
+                return grad
+            index = assert_index_in_bounds(index, 1, lo=0)
+            g2 = torch.cat([grad.reshape(1), torch.zeros_like(grad.reshape(1))])
+            return torch.index_select(g2, 0, index.reshape(1)).reshape(grad.shape)
+        # In-graph bounds check (no host sync); window [0, dim_size) rejects
+        # negatives. Consumed by (index == arange) below, so it survives DCE and
+        # faults on an OOB index; _index_select_backward_error_handler then
+        # surfaces the exact exception.
+        if not skip_op_preconditions():
+            index = assert_index_in_bounds(index, input_sizes[dim], lo=0)
         arange = torch.arange(input_sizes[dim], dtype=index.dtype, device=index.device).unsqueeze(1)
         one_hot = (index == arange).to(grad.dtype)
         # 1-d grad (forward input was 1-d): movedim(dim, -2) has no second-to-last
