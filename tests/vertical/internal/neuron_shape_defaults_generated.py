@@ -328,6 +328,28 @@ def register_all_defaults(r, traced_models=()):
             },
             source="builtin",
         )
+        # _index_put_impl_ shares the dynamic scatter_add kernel, but only on its
+        # accumulate=True path (accumulate=False is a scatter/overwrite the dynamic kernel
+        # declines)
+        r(
+            "aten::_index_put_impl_",
+            {
+                "self": (t, h),
+                "indices": [
+                    {
+                        "shape": (n,),
+                        "dtype": "long",
+                        "low": 0,
+                        "high": t,
+                        "distinct": True,
+                    }
+                ],
+                "values": (n, h),
+                "accumulate": True,
+                "unsafe": False,
+            },
+            source="builtin",
+        )
     r(
         "aten::index.Tensor_out",
         {
@@ -775,14 +797,24 @@ def register_all_defaults(r, traced_models=()):
         source="builtin",
     )
 
-    # Index put impl (in-place)
+    # Index put impl (in-place) — accumulate=True + a 1-D distinct row index
+    # so it routes to the dynamic scatter_add kernel (the accumulate=False /
+    # materialized-index form declines to the default lowering).
     r(
         "aten::_index_put_impl_",
         {
             "self": (4096, 4096),
-            "indices": [{"shape": (256,), "dtype": "long", "low": 0, "high": 4096}],
+            "indices": [
+                {
+                    "shape": (256,),
+                    "dtype": "long",
+                    "low": 0,
+                    "high": 4096,
+                    "distinct": True,
+                }
+            ],
             "values": (256, 4096),
-            "accumulate": False,
+            "accumulate": True,
             "unsafe": False,
         },
         source="builtin",
