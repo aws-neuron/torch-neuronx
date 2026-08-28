@@ -321,6 +321,31 @@ def _scatter_add_spec(**flags):
     return OpSpec("scatter_add_", build, run, **flags)
 
 
+def _index_put_spec(**flags):
+    """in-place index_put_ (accumulate=True) into [T, H] at n unique rows.
+
+    Lowers to aten::_index_put_impl_ — the same row-accumulate as scatter_add_,
+    but reached via the index_put_ op. This is the op the MoE combine and the
+    loss's masked assignment emit; a single 1-D integer row index on dim 0 with
+    accumulate=True routes to the dynamic row-scatter kernel.
+    """
+
+    def build(dtype, *, rows=512, h=2048):
+        t, n = 2 * rows, rows  # n < T, unique target rows
+        src = torch.randn(n, h, dtype=dtype) / 8
+        idx = torch.randperm(t)[:n]
+        ref = torch.zeros(t, h, dtype=dtype)
+        ref.index_put_((idx.to(torch.int64),), src, accumulate=True)
+        out = torch.zeros(t, h, dtype=dtype).to("neuron")
+        return (out, idx.to("neuron"), src.to("neuron")), ref
+
+    def run(out, idx_n, src):
+        out.index_put_((idx_n,), src, accumulate=True)  # -> aten::_index_put_impl_
+        return out
+
+    return OpSpec("_index_put_impl_", build, run, label="index_put", **flags)
+
+
 def _where_spec(**flags):
     """where.self: bool condition selects between two float operands of one shape.
     tol=(0, 0): every output element is a verbatim copy of an input element."""
@@ -376,6 +401,7 @@ _OP_SPECS = [
     _index_spec(arbitrary_h=True),
     _gather_spec(arbitrary_h=True),
     _scatter_add_spec(arbitrary_h=True),
+    _index_put_spec(arbitrary_h=True),
 ]
 
 # one correctness case per op per supported dtype
@@ -1256,6 +1282,35 @@ class TestDynamicNkiKernels:
             torch.testing.assert_close(src_n.gather(0, idx_n).cpu(), src[idx], rtol=0, atol=0)
 
         assert entry._exec_count - exec_before == len(ns), "gather did not run for every n"
+        assert entry._exec_ms.issuperset(
+            set(ns)
+        ), f"expected exec at n={set(ns)}, saw {entry._exec_ms}"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "recompiled across n (did n leak into the compile_key?)"
+
+    def test_dynamic_nki_index_put_no_recompile_across_n(self):
+        """One NEFF per (T, H, dtype) while the scattered row count n varies — the
+        MoE-combine guarantee for aten::_index_put_impl_ (accumulate=True). n is the
+        per-expert token count; it is padded to the baked T in prepare_io, so it must
+        not enter the compile_key. Shares the scatter_add kernel."""
+        T, H = 512, 2048  # noqa: N806
+        entry = _entry("_index_put_impl_")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        entry._exec_ms.clear()
+
+        ns = (128, 200, 383, 512)  # non-128 and 128-multiple counts, all n <= T
+        for n in ns:
+            idx = torch.randperm(T)[:n]  # unique target rows
+            src = torch.randn(n, H, dtype=torch.bfloat16) / 8
+            ref = torch.zeros(T, H, dtype=torch.bfloat16)
+            ref.index_put_((idx.to(torch.int64),), src, accumulate=True)
+            out = torch.zeros(T, H, dtype=torch.bfloat16).to("neuron")
+            out.index_put_((idx.to("neuron"),), src.to("neuron"), accumulate=True)
+            torch.testing.assert_close(out.cpu(), ref, rtol=1e-2, atol=1e-2, msg=f"n={n}")
+
+        assert entry._exec_count - exec_before == len(ns), "index_put did not run for every n"
         assert entry._exec_ms.issuperset(
             set(ns)
         ), f"expected exec at n={set(ns)}, saw {entry._exec_ms}"

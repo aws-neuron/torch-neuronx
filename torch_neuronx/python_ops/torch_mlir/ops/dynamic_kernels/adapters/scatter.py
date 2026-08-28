@@ -18,6 +18,7 @@ from ..adapter_utils import (
     _compile_or_load_neff,
     _index_to_int32,
     _num_tiles_tensor,
+    _pad_or_contig,
     _pad_rows_to,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
@@ -119,7 +120,7 @@ def _index_put_index_1d(indices):
     return idx
 
 
-def _can_handle_index_put(self, indices, values, accumulate=False, **_) -> bool:
+def _can_handle_index_put(self, indices, values, accumulate=False, unsafe=False, **_) -> bool:
     if not accumulate:  # non-accumulate index_put is overwrite, not scatter-add
         return False
     if not isinstance(self, torch.Tensor) or not isinstance(values, torch.Tensor):
@@ -142,19 +143,19 @@ def _can_handle_index_put(self, indices, values, accumulate=False, **_) -> bool:
     return True
 
 
-def _index_put_compile_key(self, indices, values, accumulate=False, **_):
+def _index_put_compile_key(self, indices, values, accumulate=False, unsafe=False, **_):
     """compile_key = (T, H, dtype) — same NEFF as scatter_add."""
     return (int(self.shape[0]), int(self.shape[1]), self.dtype)
 
 
-def _prepare_index_put_io(self, indices, values, accumulate=False, dest=None, **_):
+def _prepare_index_put_io(self, indices, values, accumulate=False, unsafe=False, dest=None, **_):
     """Marshal index_put args to the scatter_add kernel I/O; self is the in-place target."""
     T, H = self.shape  # noqa: N806
     device = self.device
     n = values.shape[0]
 
     idx_1d = _index_to_int32(_index_put_index_1d(indices)).reshape(n, 1)
-    idx = _pad_rows_to(idx_1d, T)
+    idx = _pad_or_contig(idx_1d, T)  # contiguous even when n == T (strided int32 alias otherwise)
     data = _pad_rows_to(values.contiguous(), T)
     nm = _num_tiles_tensor(_ceil_to_tile(n) // _TILE_M, device)
 
