@@ -334,12 +334,11 @@ class TestIndexPut:
         assert x.grad.shape == x.shape
 
     def test_repeated_backward_same_cpu_indices(self, device):
-        """Same CPU indices across iterations — tests cache hit with CPU tensors.
+        """Same CPU indices across iterations, so a later call reuses earlier work.
 
-        Guards against regression if _index_put_impl_ moves from Python dispatch
-        to C++ dispatch. On the C++ fast path, translate_args_fn only fires on
-        cache miss. If device mismatch isn't handled at the C++ level, iteration 2+
-        will crash because raw CPU indices are passed directly to the cached NEFF.
+        VLMs hand the same CPU index tensor to every step. Relocating it is
+        ``PreprocessArgs``' job; without that the raw CPU index reaches the NEFF and
+        the second iteration fails on device mismatch.
         """
         x = torch.randn(4, 8, requires_grad=True, device=device)
         cpu_indices = torch.tensor([0, 2, 3])
@@ -354,6 +353,190 @@ class TestIndexPut:
             expected_grad = torch.zeros(4, 8)
             expected_grad[cpu_indices] = 1.0
             torch.testing.assert_close(x.grad.cpu(), expected_grad)
+
+    def test_index_put_bool_mask_stale_neff_regression(self, device):
+        """Two masks of the same shape with different True counts.
+
+        The key records the mask's shape and dtype, not its values, so both calls
+        build the same key while needing NEFFs that scatter 1 row and 3 rows. Low
+        count first, so a stale entry shows up as rows that were never written.
+        """
+        expected_rows = torch.tensor([[1.0, 2.0]])
+        for mask_values in ([True, False, False, False], [True, True, True, False]):
+            x = torch.zeros(4, 2, device=device)
+            mask = torch.tensor(mask_values, device=device)
+            # values.numel() != 1 keeps this on the scatter route, not masked_fill.
+            x.index_put_((mask,), expected_rows.to(device))
+
+            expected = torch.zeros(4, 2)
+            expected[torch.tensor(mask_values)] = expected_rows
+            torch.testing.assert_close(x.cpu(), expected)
+
+    def test_index_put_values_shape_precondition(self, device):
+        """values must be expandable to the indexing result shape.
+
+        ATen enforces this per backend rather than in a shared layer
+        (make_index_put_iterator on CPU, cuda/Indexing.cu on CUDA), so replacing the
+        implementation means owning it. Without the check the call reaches the
+        compiler and raises TorchMlirCompilerError, which is not a RuntimeError and
+        so does not match what PyTorch promises.
+        """
+        x = torch.rand([], dtype=torch.float32, device=device)
+        with pytest.raises(RuntimeError, match="cannot be broadcast to indexing result of shape"):
+            torch.ops.aten._index_put_impl_(x, [], torch.tensor([1.0], device=device), True, False)
+
+    def test_index_put_values_shape_precondition_unequal_dims(self, device):
+        """The mismatched-dim case has to report ATen's message, not broadcast's.
+
+        Upstream ``test_indexing.py::test_boolean_assignment_value_mismatch`` matches
+        on "shape mismatch", so the wording is part of the contract.
+        """
+        x = torch.zeros(5, device=device)
+        with pytest.raises(
+            RuntimeError,
+            match=r"shape mismatch: value tensor of shape \[4\] cannot be "
+            r"broadcast to indexing result of shape \[3\]",
+        ):
+            x[torch.tensor([0, 1, 2], device=device)] = torch.ones(4, device=device)
+
+    @pytest.mark.parametrize(
+        "shape,dim", [((4, 4), 1), ((3, 4), 1), ((2, 3, 4), 1), ((2, 3, 4), 2)]
+    )
+    def test_index_put_bool_mask_not_at_dim0(self, device, shape, dim):
+        """A mask on a dim other than 0 must be applied to that dim.
+
+        Every other mask test here puts the mask at dim 0, where the two ways of
+        aligning it agree. Off dim 0 they do not: a square destination silently masks
+        rows instead of columns.
+        """
+        mask = torch.zeros(shape[dim], dtype=torch.bool)
+        mask[0] = True
+        mask[-1] = True
+        values = torch.tensor([9.0])
+        key = (slice(None),) * dim
+
+        expected = torch.zeros(shape)
+        expected[(*key, mask)] = values
+
+        x = torch.zeros(shape, device=device)
+        with track_neuron_ops():
+            x[(*key, mask.to(device))] = values.to(device)
+            assert_op_runs_on_neuron("aten::index_put")
+        torch.testing.assert_close(x.cpu(), expected)
+
+    def test_index_put_rank2_mask_multi_column(self, device):
+        """A rank-2 mask expands to one index tensor per dimension.
+
+        The other rank-2 case in this file passes a single value and so takes the
+        masked_fill route, leaving the expansion uncovered.
+        """
+        mask = torch.zeros(3, 4, dtype=torch.bool)
+        mask[0, 0] = True
+        mask[1, 2] = True
+        values = torch.tensor([7.0, 8.0])
+
+        expected = torch.zeros(3, 4)
+        expected[mask] = values
+
+        x = torch.zeros(3, 4, device=device)
+        with track_neuron_ops():
+            x[mask.to(device)] = values.to(device)
+            assert_op_runs_on_neuron("aten::index_put")
+        torch.testing.assert_close(x.cpu(), expected)
+
+    def test_index_put_accumulate_with_bool_mask(self, device):
+        """accumulate=True forces the scatter route, so the expansion feeds an
+        accumulating scatter. accumulate is otherwise only covered with integer
+        indices."""
+        mask = torch.tensor([True, False, True, False])
+        values = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
+
+        expected = torch.ones(4, 2)
+        expected.index_put_((mask,), values, accumulate=True)
+
+        x = torch.ones(4, 2, device=device)
+        with track_neuron_ops():
+            x.index_put_((mask.to(device),), values.to(device), accumulate=True)
+            assert_op_runs_on_neuron("aten::index_put_")
+        torch.testing.assert_close(x.cpu(), expected)
+
+    def test_index_put_dtype_precondition(self, device):
+        """values must have self's dtype, as CPU and CUDA both require.
+
+        Checked on the dtypes the kernel executes with, i.e. after this build's
+        int64/float64 folding, so the names in the message are the folded ones.
+        """
+        x = torch.ones(5, 2, dtype=torch.double, device=device)
+        values = torch.zeros(5, dtype=torch.int, device=device).unsqueeze(-1)
+        with pytest.raises(RuntimeError, match="requires the source and destination dtypes match"):
+            torch.ops.aten._index_put_impl_(
+                x, [None, torch.tensor([1], device=device)], values, False, False
+            )
+
+    def test_index_put_int64_source_into_int32_dest(self, device):
+        """An int64 source into an int32 destination must not be rejected here.
+
+        PyTorch's index_add decomposition does `tensor * alpha`, and on Neuron a 0-dim
+        int32 times a Python int promotes to int64 (CPU and CUDA keep int32), so the
+        decomposition hands index_put exactly this pair. The dtype check compares
+        categories, not widths, so it must not fire here. Guards upstream
+        test_decomp.py::test_quick_index_add.
+        """
+        x = torch.ones(1, dtype=torch.int32, device=device)
+        source = torch.ones((), dtype=torch.int32, device=device) * -1
+        # Pin the premise. Once the wrapped-number promotion is faithful this becomes
+        # int32 and the test would otherwise pass without exercising anything.
+        assert source.dtype == torch.int64, "promotion fixed; tighten the dtype check to =="
+        result = torch.ops.aten.index_put(
+            x, (torch.zeros(1, dtype=torch.int64, device=device),), source, True
+        )
+        assert result.cpu().tolist() == [0]
+
+    def test_index_put_rank0_mask_keeps_self_rank(self, device):
+        """A rank-0 mask must not add a dimension to an inplace result.
+
+        The where route builds its output with ``torch.where``, which broadcasts, so a
+        rank-0 mask can produce a rank the op is not allowed to return. ATen reports
+        ``self``'s shape.
+        """
+        x = torch.zeros(2, 3, device=device)
+        result = torch.ops.aten._index_put_impl_(
+            x, [torch.tensor(True, device=device)], torch.ones(1, 1, 1, device=device), False, False
+        )
+        assert tuple(result.shape) == (2, 3), f"rank-0 mask changed the rank: {tuple(result.shape)}"
+
+    @pytest.mark.xfail(
+        reason="An empty out= takes the empty-tensor branch's zeros fallback, so the "
+        "scatter is not applied. Pre-existing: main returns zeros here too. This op "
+        "shares _index_put_impl_'s branch, so the case is pinned here; source_argnum "
+        "only stops an empty out= being read as an empty source, which returned self "
+        "and discarded the scatter entirely.",
+        strict=True,
+    )
+    def test_scatter_empty_out_is_written(self, device):
+        """An empty ``out=`` should be resized and written, as ATen does."""
+        x = torch.ones(3, 4, device=device)
+        index = torch.zeros(1, 1, dtype=torch.int64, device=device)
+        out = torch.empty(0, device=device)
+        torch.scatter(x, 0, index, 9.0, out=out)
+
+        expected = torch.ones(3, 4)
+        expected.scatter_(0, torch.zeros(1, 1, dtype=torch.int64), 9.0)
+        torch.testing.assert_close(out.cpu(), expected)
+
+    def test_index_put_too_many_indices(self, device):
+        """More indices than dimensions is an IndexError, as ATen reports it.
+
+        The shape precondition asks ``aten::index``'s meta kernel for the indexing
+        result shape, and that kernel raises ``RuntimeError`` with the same text, so
+        the arity is checked before the meta call.
+        """
+        x = torch.zeros(2, 3, device=device)
+        idx = torch.tensor([0], dtype=torch.int64, device=device)
+        with pytest.raises(IndexError, match=r"too many indices for tensor of dimension 2"):
+            torch.ops.aten._index_put_impl_(
+                x, [idx, idx, idx], torch.ones(1, device=device), False, False
+            )
 
     def test_index_put_invalid_index(self, device):
         """index_put with an out-of-bounds index raises IndexError via the

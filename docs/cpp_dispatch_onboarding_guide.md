@@ -190,11 +190,23 @@ resolved value costs a compile. The per-call cost is the Python round-trip, not 
 When to use which:
 
 - Preprocessing only resolves values into the graph → `relower_every_call=True`.
-- Preprocessing replaces the op's runtime input tensors (`_index_put_impl_` turns a bool mask
-  into `nonzero` indices) → `python_dispatch=True`, because C++ derives execution inputs from
-  the raw args.
+- Preprocessing cannot avoid replacing the op's tensor arguments → `python_dispatch=True`.
 
 Mutually exclusive; both require `preprocessing=`.
+
+**Return the same tensors you were given.** C++ builds the NEFF's inputs from the raw ATen
+args, so the factory must not add, drop, reorder, reshape or retype one. Resolve the value you
+need into a static arg and do the tensor work inside `compute_fn`, where it joins the graph:
+
+```python
+size = int(mask.sum())                                  # value  -> static arg
+def compute_fn(x, mask, size):
+    coords = torch.nonzero_static(mask, size=size)      # expansion -> in the graph
+```
+
+`masked_select` and `_index_put_impl_` both expand bool masks this way. Doing it in
+preprocessing instead turns one bool tensor into N int tensors, and C++ then binds the mask
+where the graph wanted the indices.
 
 #### How to Choose
 

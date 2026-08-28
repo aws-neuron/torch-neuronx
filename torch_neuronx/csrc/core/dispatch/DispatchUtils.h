@@ -291,8 +291,9 @@ const ReductionConfig* GetReductionConfig(const std::string& op_name);
  * Mirrors Python IndexOps in config.py.
  */
 struct IndexOpConfig {
-  int index_argnum;  // Position of the index tensor argument
-  int input_argnum;  // Position of the input tensor argument
+  int index_argnum;        // Position of the index tensor argument
+  int input_argnum;        // Position of the input tensor argument
+  int source_argnum = -1;  // Position of the source argument, -1 if the op has none
 };
 
 /**

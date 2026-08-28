@@ -574,10 +574,12 @@ const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
   // Mirrors Python config.py: IndexOps.INDEX_OPS
   // index_argnum = position of the index tensor, input_argnum = position of self/input
   // When input is non-empty and index is empty → return input unchanged
+  // source_argnum = position of the argument written from; scatter's `.value`
+  // overloads pass a Scalar there rather than a tensor
   static const std::unordered_map<std::string, IndexOpConfig> kConfigs = {
-      {"scatter", {2, 0}},
-      {"scatter_add", {2, 0}},
-      {"_index_put_impl_", {1, 0}},
+      {"scatter", {2, 0, 3}},
+      {"scatter_add", {2, 0, 3}},
+      {"_index_put_impl_", {1, 0, 2}},
   };
   auto base = ExtractBaseOpName(op_name);
   auto it = kConfigs.find(base);

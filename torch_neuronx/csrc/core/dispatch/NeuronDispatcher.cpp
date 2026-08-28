@@ -2990,7 +2990,32 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
             }
           }
 
-          if (index_is_empty) {
+          bool index_is_bool_mask = false;
+          if (args[idx_argnum].isTensor()) {
+            const auto& idx = args[idx_argnum].toTensor();
+            index_is_bool_mask = idx.defined() && idx.scalar_type() == at::kBool;
+          } else if (args[idx_argnum].isList()) {
+            for (const auto& elem : args[idx_argnum].toListRef()) {
+              if (elem.isTensor() && elem.toTensor().defined() &&
+                  elem.toTensor().scalar_type() == at::kBool) {
+                index_is_bool_mask = true;
+                break;
+              }
+            }
+          }
+
+          // An all-False mask writes nothing even though the mask is non-empty.
+          // Restricted to a mask: with an integer index, a non-empty index and an
+          // empty source is a call ATen rejects, not a no-op.
+          bool source_is_empty = false;
+          const int src_argnum = index_cfg->source_argnum;
+          if (index_is_bool_mask && src_argnum >= 0 && src_argnum < static_cast<int>(args.size()) &&
+              args[src_argnum].isTensor()) {
+            const auto& src = args[src_argnum].toTensor();
+            source_is_empty = src.defined() && src.numel() == 0;
+          }
+
+          if (index_is_empty || source_is_empty) {
             outputs.push_back(input_tensor);
             returned_input = true;
           }
