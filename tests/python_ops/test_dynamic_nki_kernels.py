@@ -1086,6 +1086,22 @@ class TestDynamicNkiKernels:
             len(entry._compiled) - compiled_before <= 1
         ), "copy_ recompiled between [512,1] and [4096,1]"
 
+    def test_dynamic_nki_strided_large_width_compiles(self):
+        # Wide contiguous runs within the unroll budget compile (was an unroll failure).
+        entry = _entry("copy_")
+        f32 = torch.float32
+        for width in (1024, 5_000_000, 8_388_608):
+            entry.compile_fn(("strided", width, 1, width, 1, f32, f32))
+
+    def test_dynamic_nki_strided_over_budget_declines(self):
+        # ceil(width / knee) beyond _MAX_H_SEGMENTS -> can_handle declines (falls back).
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.strided_copy_kernel import (
+            width_within_unroll_budget,
+        )
+
+        assert width_within_unroll_budget(8_388_608, 4)  # 8192 segs
+        assert not width_within_unroll_budget(8_388_609, 4)  # 8193 segs
+
     def test_dynamic_nki_copy_broadcast_src(self):
         """A broadcast source is expanded to self's shape before this path, so the
         dynamic kernel handles it."""

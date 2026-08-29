@@ -23,7 +23,15 @@ from ..adapter_utils import (
     _num_tiles_tensor,
 )
 from ..registry import DynamicNkiEntry, register_dynamic_nki
+from ..strided_copy_kernel import width_within_unroll_budget
 from ..view_plan import strided_plan
+
+
+def _plan_fits_unroll_budget(plan, *dtypes) -> bool:
+    """Decline a plan whose `width` would overflow the strided kernel's static free-dim
+    unroll cap (falls back to the default lowering)."""
+    return width_within_unroll_budget(int(plan.width), max(d.itemsize for d in dtypes))
+
 
 # Target dtype -> the @nki_op wrapper that bakes it (see wrappers.py).
 _WRAPPER_SUFFIX = {
@@ -237,7 +245,11 @@ def _can_handle_copy(self, src=None, non_blocking=False, **_) -> bool:
     # Strided source: without this the C++ prologue absorbs the view and bakes M.
     if self.dtype != src.dtype or self.dtype not in _STRIDED_DTYPES:
         return False
-    return _copy_plan(self, src) is not None
+    plan = _copy_plan(self, src)
+    if plan is None:
+        return False
+    # Decline widths that would overflow the free-dim static-unroll cap (fall back).
+    return _plan_fits_unroll_budget(plan, self.dtype, src.dtype)
 
 
 def _copy_compile_key(self, src, non_blocking=False, **_):
@@ -283,7 +295,10 @@ def _can_handle_contiguous(self, memory_format=None, **_) -> bool:
         return False
     if self.dtype not in _STRIDED_DTYPES:
         return False
-    return _strided_src_plan(self, self) is not None
+    plan = _strided_src_plan(self, self)
+    if plan is None:
+        return False
+    return _plan_fits_unroll_budget(plan, self.dtype)
 
 
 def _contiguous_compile_key(self, memory_format=None, **_):
