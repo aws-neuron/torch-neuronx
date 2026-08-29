@@ -221,6 +221,18 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "Int64PolicyTest",
+    srcs = ["core/dispatch/Int64PolicyTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "CpuFallbackTest",
+    srcs = ["core/dispatch/CpuFallbackTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
     name = "NrtBarrierLogicTest",
     srcs = ["core/NrtBarrierLogicTest.cpp"],
     deps = ["//:device", "//:runtime"],

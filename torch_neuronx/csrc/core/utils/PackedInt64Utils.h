@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/core/impl/LocalDispatchKeySet.h>
 #include <torch/torch.h>
 
 #include <cstdint>
@@ -7,6 +8,19 @@
 
 namespace torch_neuronx {
 namespace packed_int64 {
+
+/// Alias ``out`` onto ``storage`` (offset/sizes/strides) for an internal packed
+/// int64 <-> int32 reinterpret view. The ``set_`` is a private implementation
+/// detail, so we exclude the Python dispatch keys around it: otherwise a
+/// user-installed ``__torch_dispatch__`` mode (e.g. the meta cross-ref test
+/// harness) intercepts this internal ``aten::set_`` and tries to meta-convert a
+/// Neuron storage, which fails. The view is a zero-copy alias regardless.
+inline void alias_set_(torch::Tensor& out, const c10::Storage& storage, int64_t offset,
+                       c10::IntArrayRef sizes, c10::IntArrayRef strides) {
+  c10::impl::ExcludeDispatchKeyGuard guard(
+      c10::DispatchKeySet({c10::DispatchKey::Python, c10::DispatchKey::PythonTLSSnapshot}));
+  out.set_(storage, offset, sizes, strides);
+}
 
 /// Compute physical shape for packed int64: appends trailing dim of 2.
 /// Scalar (empty shape) becomes {2} (append the lane dim to the empty logical
@@ -53,7 +67,7 @@ inline torch::Tensor physical_view(const torch::Tensor& t) {
 
   // Create empty int32 tensor and set_ it to share the same storage
   auto out = torch::empty({0}, t.options().dtype(c10::ScalarType::Int));
-  out.set_(t.storage(), offset, sizes, strides);
+  alias_set_(out, t.storage(), offset, sizes, strides);
   return out;
 }
 
@@ -78,7 +92,7 @@ inline torch::Tensor low_word_alias(const torch::Tensor& t) {
 
   // Create int32 tensor sharing the same untyped storage
   auto out = at::empty({0}, t.options().dtype(c10::ScalarType::Int));
-  out.set_(t.storage(), offset, sizes, result_strides);
+  alias_set_(out, t.storage(), offset, sizes, result_strides);
   return out;
 }
 
@@ -112,7 +126,7 @@ inline torch::Tensor logical_view(const torch::Tensor& packed) {
   int64_t offset = static_cast<int64_t>(packed.storage_offset()) / 2;
 
   auto out = at::empty({0}, packed.options().dtype(c10::ScalarType::Long));
-  out.set_(packed.storage(), offset, logical_sizes, logical_strides);
+  alias_set_(out, packed.storage(), offset, logical_sizes, logical_strides);
   return out;
 }
 
@@ -138,7 +152,7 @@ inline torch::Tensor high_word_alias(const torch::Tensor& t) {
   // alone selects the single high word.
 
   auto out = at::empty({0}, t.options().dtype(c10::ScalarType::Int));
-  out.set_(t.storage(), offset, sizes, result_strides);
+  alias_set_(out, t.storage(), offset, sizes, result_strides);
   return out;
 }
 

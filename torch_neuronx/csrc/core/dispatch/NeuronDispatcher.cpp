@@ -24,6 +24,7 @@
 #include "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 #include "torch_neuronx/csrc/core/dispatch/LoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
@@ -389,17 +390,22 @@ static bool CanUseDirectNeuronToCPUCopy(const at::Tensor& logical_src,
 
 /// Dtype supported by the MLIR aten::copy_ lowering (excludes Bool).
 static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
+  // Int64 copies use the NRT direct path (memcpy), not MLIR lowering — the
+  // MLIR copy lowering doesn't support int64 (true regardless of Int64Mode).
+  if (dt == c10::ScalarType::Long) return false;
   return IsSupportedDtype(dt) && !c10::isComplexType(dt);
 }
 
 /// Dtype supported by the MLIR aten::_to_copy lowering.
+/// Long is conditionally supported when int64 reaches the compiler as S64
+/// (native / native_strict, via IsNativeInt64Enabled) or when packed int64 is
+/// enabled.
 static bool IsToCopyMlirDtypeSupported(c10::ScalarType dt) {
-  static const bool native_int64 = IsNativeInt64Enabled();
-  static const bool packed_int64 = IsPackedInt64Enabled();
+  const bool native_int64 = IsNativeInt64Enabled();
+  const bool packed_int64 = IsPackedInt64Enabled();
+  if (dt == c10::ScalarType::Long) return native_int64 || packed_int64;
   return dt == c10::ScalarType::Half || dt == c10::ScalarType::BFloat16 ||
-         dt == c10::ScalarType::Float || dt == c10::ScalarType::Int ||
-         dt == c10::ScalarType::Bool ||
-         ((native_int64 || packed_int64) && dt == c10::ScalarType::Long);
+         dt == c10::ScalarType::Float || dt == c10::ScalarType::Int || dt == c10::ScalarType::Bool;
 }
 
 /// Returns true when on a non-default stream with host-cc enabled.
@@ -1048,7 +1054,9 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
     // ── default stream: dtype (Phase 1) then layout (Phase 2) ──
     // _to_copy is two independent transforms — a dtype conversion and a
     // memory_format change. Doing dtype first, layout second.
-    static const bool packed_int64 = IsPackedInt64Enabled();
+    // UsePackedInt64(): packed mode and the native cascade both demote int64
+    // casts on device via the packed view (_to_copy is a non-native op).
+    const bool packed_int64 = UsePackedInt64();
     const bool is_channels_last =
         memory_format_opt.has_value() && (*memory_format_opt == c10::MemoryFormat::ChannelsLast ||
                                           *memory_format_opt == c10::MemoryFormat::ChannelsLast3d);
@@ -1301,6 +1309,29 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
   TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] cache_key", " op=", op_name,
                                " cache_key=", cache_key);
 
+  // ── 1.5. Int64 → CPU fallback ──
+  // ShouldCpuFallback returns true when:
+  //   - The op is UNSUPPORTED (e.g. matmul/conv on int64 would produce garbage), or
+  //   - The active Int64Mode steers this op away from Neuron — namely
+  //     native_strict, where any non-native op runs on CPU. (packed and
+  //     cpu_bounce never force a whole-op CPU fallback.)
+  // We still require at least one int64 input — when there's no int64 there's
+  // nothing to fall back from.
+  if (ShouldCpuFallback(op_name)) {
+    bool has_int64_input = false;
+    ForEachTensor(args, [&](const at::Tensor& t) {
+      if (t.scalar_type() == c10::ScalarType::Long) has_int64_input = true;
+    });
+    if (has_int64_input) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] int64 → CPU fallback",
+                                   " op=", op_name);
+      torch_neuronx::markFallbackLogged(op_name);
+      for (auto& arg : args) torch::jit::push(*stack, arg);
+      at::native::cpu_fallback(op, stack);
+      return;
+    }
+  }
+
   // ── 2. Dispatch with casting ──
   // Dtype inference is unified into the lowering step: on cache miss,
   // lower_func receives both downcasted and original args, and the
@@ -1432,13 +1463,32 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
                 "' registered without lower_func — this should not happen");
   }
 
-  // Unsupported dtypes (float64, int64 without native support): DowncastArgs
-  // in DispatchWithCasting calls NeuronSafeCast which does a CPU roundtrip that
-  // inadvertently makes the tensor contiguous, causing composite_lower to fail.
-  // Short-circuit with a direct CPU roundtrip to avoid unnecessary HLO tracing.
-  if (!IsSupportedDtype(self_tensor.scalar_type())) {
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] unsupported dtype → CPU roundtrip",
-                                 " op=", op_name, " dtype=", self_tensor.scalar_type());
+  // CPU-roundtrip contiguify for dtypes with no on-device contiguify:
+  const auto self_dt = self_tensor.scalar_type();
+  // int64 contiguify. The prologue can't contiguify a non-contiguous int64: it
+  // would emit an i64 strided-copy module that can't connect to the packed
+  // int32[..., 2] NEFF parameter (the i64↔i32x2 boundary mismatch). When int64
+  // runs on-device (packed / native cascade), contiguify the int32[..., 2]
+  // *physical view* here instead — the same on-device mechanism NeuronSafeCast
+  // uses. contiguous_internal on the int32 view can't recurse into this branch
+  // (int32 is a supported dtype), and the [low, high] pairs are value-preserving
+  // so logical_view of the result equals self.contiguous(). PreprocessArgs routes
+  // non-contiguous operands of general ops through here via t.contiguous().
+  if (self_dt == c10::ScalarType::Long && UsePackedInt64()) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] on-device packed-int64 contiguify",
+                                 " op=", op_name);
+    auto phys = torch_neuronx::packed_int64::physical_view(self_tensor);  // int32[..., 2], strided
+    auto phys_contig = torch_neuronx::ops::contiguous_internal(phys, c10::MemoryFormat::Contiguous);
+    auto result = torch_neuronx::packed_int64::logical_view(phys_contig);  // int64, contiguous
+    logOperationExecuted(op_name);
+    torch::jit::push(*stack, result);
+    return;
+  }
+  // Unsupported dtypes (float64) and int64 in modes that don't run it on-device
+  // (cpu_bounce) → CPU roundtrip. (Contiguous int64 already fast-exited above.)
+  if (!IsSupportedDtype(self_dt) || self_dt == c10::ScalarType::Long) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchContiguous] CPU-roundtrip contiguify", " op=", op_name,
+                                 " dtype=", self_dt);
     auto cpu_contiguous = NeuronToContiguousCPU(self_tensor, /*non_blocking=*/false);
     auto result = CopyCPUToNewNeuron(cpu_contiguous, self_tensor.device(), /*non_blocking=*/false);
     logOperationExecuted(op_name);
@@ -1557,6 +1607,7 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
       original_args[i] = c10::IValue(original_args[i].toList().copy());
     }
   }
+
   // ── Strip the out= arg before dispatch ──
   // nonzero's execution output spec is the *static max-count* index buffer
   // (shape [numel, ndim]) — not the logical result shape [count, ndim].
@@ -1586,7 +1637,7 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
       }
     }
   }
-  PreprocessArgs(args, schema, effective_static_argnums, /*skip_contiguous=*/false);
+  PreprocessArgs(args, schema, effective_static_argnums, /*skip_contiguous=*/false, op_name);
 
   // ── Run DispatchCore — returns 2 tensors: (indices, count) ──
   auto exec_outputs = DispatchCore(op_name, cache_key, op, dispatch_keys, stack, args, schema, reg,
@@ -1831,14 +1882,16 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
       }
     }
   }
-  PreprocessArgs(args, schema, effective_static_argnums, /*skip_contiguous=*/false);
+  PreprocessArgs(args, schema, effective_static_argnums, /*skip_contiguous=*/false, op_name);
 
   // GetOrLower
   auto entry = dispatcher.GetOrLowerOperation(cache_key, reg, args, original_args, schema);
   if (!entry) {
     if (kFallbackOnlyForUnimplemented) {
-      TORCH_CHECK(false, "NeuronDispatcher: CPU fallback disabled. Operation '", op_name,
-                  "' could not be lowered to Neuron.");
+      TORCH_CHECK(false,
+                  "NeuronDispatcher: CPU fallback disabled because "
+                  "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation '",
+                  op_name, "' could not be lowered to Neuron.");
     }
     for (const auto& arg : original_args) torch::jit::push(*stack, arg);
     at::native::cpu_fallback(op, stack);
@@ -1878,6 +1931,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
   auto device = ExtractDevice(args);
   auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
                                                 reg.static_argnums, reg.static_argnames);
+
   auto exec_outputs = AllocateExecutionOutputs(*entry, args, filtered_inputs, device, schema);
 
   int device_id = c10_neuron::GetTargetDeviceId(filtered_inputs, exec_outputs);
@@ -2226,7 +2280,7 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
         }
       }
     }
-    PreprocessArgs(args, schema, effective_static_argnums, skip_contiguous);
+    PreprocessArgs(args, schema, effective_static_argnums, skip_contiguous, op_name);
 
     // ── 4.5. Promote binary compare/logical op operands to a common dtype ──
     // No-op for non-compare ops and for already same-dtype operands.
@@ -2471,12 +2525,33 @@ static bool IsScalarListType(const c10::Argument& arg) {
 // each scalar element of a Scalar[] arg to a 0-dim tensor during lowering.
 // On cache hit, C++ must produce the same flat tensor layout.
 static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch::Tensor>& out,
-                                       const torch::Device& target_device) {
+                                       const torch::Device& target_device,
+                                       c10::ScalarType ref_int_dtype = c10::ScalarType::Undefined) {
   static const bool native_int64 = IsNativeInt64Enabled();
+
+  // Weak-scalar promotion: a Scalar[] element combined with a tensor takes the
+  // tensor operand's dtype (int32 tensor + int -> int32, int64 tensor + int ->
+  // int64). Materializing at the accompanying integer tensor's dtype keeps the
+  // scalar's representation consistent with what the compute op expects. Without
+  // this, native mode over-promotes *every* int scalar to int64; the prologue
+  // then binds it as the packed int32[..., 2] physical view while the op's main
+  // graph keeps it int32, and op-concat rejects the boundary (2xi32 vs i32).
+  // Fall back to the mode default when there is no integer tensor operand (e.g.
+  // a float tensor list — the int scalar promotes to float in-graph regardless).
+  // Weak-scalar promotion: a Scalar[] element combined with a tensor takes the
+  // tensor operand's dtype. An int64 scalar is only needed when the tensor
+  // operand is itself int64 (then the whole op is int64 and packs/executes
+  // consistently). For every other operand dtype — int32, smaller ints, float,
+  // bf16/fp16, bool — an int32 scalar is correct: it either matches (int32) or
+  // promotes in-graph (to float/etc.) without ever being materialized as a
+  // packed int64. Blindly using int64 in native mode made the prologue bind the
+  // scalar as the packed int32[..., 2] physical view while the op's main graph
+  // kept it int32/float, tripping the op-concat boundary check (2xi32 vs i32).
+  const bool ref_is_int64 = (ref_int_dtype == c10::ScalarType::Long);
+  const auto int_dtype = (native_int64 && ref_is_int64) ? torch::kInt64 : torch::kInt32;
 
   if (val.isIntList()) {
     const auto& il = val.toIntList();
-    auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
     for (size_t j = 0; j < il.size(); ++j) {
       auto t = torch::tensor(il[j], torch::TensorOptions().dtype(int_dtype)).to(target_device);
       out.push_back(std::move(t));
@@ -2504,7 +2579,6 @@ static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch
         break;
       }
     }
-    auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
     auto c_dtype = all_int ? int_dtype : torch::kFloat32;
 
     // Build one CPU tensor holding all scalars.
@@ -2536,6 +2610,46 @@ static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch
   }
 }
 
+// Mirror of Python ``native_int64_guard_allows`` (int64_policy.py). Native S64
+// is safe only when every int64 operand is contiguous and at most one needs
+// broadcasting to the common shape (a native S64 binary op with BOTH operands
+// broadcast — e.g. kron's outer-product mul — hangs the device). Kept in
+// lockstep with the Python guard so the traced graph (fake) and this binding
+// agree on which invocations are packed.
+static bool NativeInt64GuardAllows(const std::vector<torch::Tensor>& tensors) {
+  std::vector<const torch::Tensor*> i64;
+  for (const auto& t : tensors) {
+    if (t.defined() && t.scalar_type() == c10::ScalarType::Long && t.dim() > 0) {
+      i64.push_back(&t);
+    }
+  }
+  if (i64.empty()) return true;
+  for (const auto* t : i64) {
+    if (!t->is_contiguous()) return false;
+  }
+  // Right-aligned broadcast shape.
+  size_t maxdim = 0;
+  for (const auto* t : i64) maxdim = std::max(maxdim, static_cast<size_t>(t->dim()));
+  std::vector<int64_t> common(maxdim, 1);
+  for (const auto* t : i64) {
+    auto sizes = t->sizes();
+    for (size_t k = 0; k < sizes.size(); ++k) {
+      size_t idx = maxdim - sizes.size() + k;
+      if (sizes[k] != 1) common[idx] = sizes[k];
+    }
+  }
+  int broadcast_count = 0;
+  for (const auto* t : i64) {
+    auto sizes = t->sizes();
+    bool differs = (static_cast<size_t>(t->dim()) != maxdim);
+    for (size_t k = 0; !differs && k < sizes.size(); ++k) {
+      if (sizes[k] != common[k]) differs = true;
+    }
+    if (differs) ++broadcast_count;
+  }
+  return broadcast_count < 2;
+}
+
 std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
     const std::vector<int>& kept_input_indices, const std::string& op_name,
@@ -2544,13 +2658,17 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   const auto& schema_args = schema.arguments();
   std::vector<torch::Tensor> flattened;
 
-  // Determine target device for scalar→tensor conversion (same logic as PreprocessArgs)
+  // Determine target device for scalar→tensor conversion (same logic as PreprocessArgs).
+  // Also capture the first integer tensor operand's dtype so Scalar[] elements are
+  // materialized with weak-scalar promotion (see FlattenScalarListToTensors).
   torch::Device target_device(c10::DeviceType::PrivateUse1,
                               static_cast<c10::DeviceIndex>(at::neuron::current_device()));
   bool found_device = false;
+  c10::ScalarType ref_tensor_dtype = c10::ScalarType::Undefined;
   ForEachTensor(args, [&](const at::Tensor& t) {
     if (!found_device && t.is_privateuseone() && t.dim() > 0) {
       target_device = t.device();
+      ref_tensor_dtype = t.scalar_type();
       found_device = true;
     }
   });
@@ -2566,7 +2684,7 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     // constant baked into the NEFF, not an input, so leave it out of `flattened`.
     if (!is_static && IsScalarListType(schema_args[i]) &&
         (args[i].isIntList() || args[i].isDoubleList() || args[i].isList())) {
-      FlattenScalarListToTensors(args[i], flattened, target_device);
+      FlattenScalarListToTensors(args[i], flattened, target_device, ref_tensor_dtype);
     } else {
       // Extracts real tensors only; for a static number list this adds nothing.
       FlattenTensorsFromIValue(args[i], flattened);
@@ -2587,7 +2705,16 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   // physical view to the NEFF here. This matches the int32 graph parameter
   // (the fake input is generated as int32[..., 2]) — the in-graph NKI gather
   // then extracts the low words. Zero-copy reinterpret.
-  if (IsPackedInt64Enabled()) {
+  //
+  // A NATIVE op is additionally demoted to the packed view when its int64
+  // operands fail the native-int64 guard (non-contiguous / dual-broadcast) —
+  // native S64 hangs the compiler for those. This MUST match the Python fake
+  // generation (use_packed_int64_view_for_op + native_int64_guard_allows), so
+  // the graph parameters (int32[...,2]) and this binding agree.
+  const bool guard_demotes_to_packed = IsS64Passthrough() &&
+                                       DecideInt64(op_name) == Int64Decision::NATIVE &&
+                                       !NativeInt64GuardAllows(flattened);
+  if (UsePackedInt64ViewForOp(op_name) || guard_demotes_to_packed) {
     for (auto& t : flattened) {
       if (t.defined() && t.scalar_type() == c10::ScalarType::Long &&
           t.device().type() == c10::DeviceType::PrivateUse1 && t.is_contiguous() && t.numel() > 0) {

@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 
 namespace torch_neuronx {
@@ -40,12 +41,15 @@ TEST(NeuronSafeCastTest, Float64ToFloat32) {
 }
 
 TEST(NeuronSafeCastTest, Int64KeptUnderPackedMode) {
-  // Under packed int64 mode (default), int64 is kept as Long and materialized
-  // on-device as packed int64 (int32[..., 2]) — not downcast to int32.
+  // In packed mode, int64 is kept as Long and materialized on-device as packed
+  // int64 (int32[..., 2]) — not downcast to int32. (Default mode is now native,
+  // so packed must be selected explicitly.)
+  SetInt64ModeForTesting(Int64Mode::kPacked);
   auto t = torch::tensor({10L, 20L}, torch::kInt64);
   auto result = NeuronSafeCast(t, c10::ScalarType::Int);
   EXPECT_EQ(result.scalar_type(), c10::ScalarType::Long);
   EXPECT_EQ(result[0].item<int64_t>(), 10);
+  SetInt64ModeForTesting(Int64Mode::kNative);
 }
 
 TEST(NeuronSafeCastTest, Int32ToInt64) {

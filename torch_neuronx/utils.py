@@ -74,6 +74,8 @@ def global_version_hash() -> str:
     except Exception:
         pass
 
+    hasher.update(os.environ.get("TORCH_NEURONX_INT64_MODE", "native").encode())
+
     return hasher.hexdigest()
 
 
@@ -218,21 +220,20 @@ def skip_op_preconditions() -> bool:
 
 
 def is_native_int64_enabled() -> bool:
-    """Check if native int64 passthrough to compiler is enabled.
+    """Check if int64 tensors flow through to the compiler as S64.
 
-    .. deprecated::
-        Use ``torch_neuronx.int64_policy.get_int64_mode()`` instead.
-        This function now delegates to the new policy module which reads
-        TORCH_NEURONX_INT64_MODE (preferred) or TORCH_NEURONX_NATIVE_INT64
-        (legacy).
+    Back-compat shim for "int64 reaches the compiler as S64".
+
+    True when ``TORCH_NEURONX_INT64_MODE`` is ``native`` or ``native_strict``.
+    False for ``packed`` and ``cpu_bounce``. Equivalent to
+    ``torch_neuronx.int64_policy.is_s64_passthrough()``.
 
     Returns:
-        bool: True when mode is NATIVE (TORCH_NEURONX_INT64_MODE=native
-              or legacy TORCH_NEURONX_NATIVE_INT64=1).
+        bool: True when the compiler sees int64 directly.
     """
-    from torch_neuronx.int64_policy import is_native_int64_mode
+    from torch_neuronx.int64_policy import is_s64_passthrough
 
-    return is_native_int64_mode()
+    return is_s64_passthrough()
 
 
 def get_logical_neuron_cores():

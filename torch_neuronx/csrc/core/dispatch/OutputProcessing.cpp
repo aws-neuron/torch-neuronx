@@ -85,7 +85,7 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
           TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using out tensor from arg[",
                                        arg_idx, "] for output[", ret_idx, "]",
                                        " contiguous=", out_tensor.is_contiguous());
-        } else if (IsPackedInt64Enabled() && out_tensor.scalar_type() == c10::ScalarType::Long &&
+        } else if (UsePackedInt64() && out_tensor.scalar_type() == c10::ScalarType::Long &&
                    ospec.dtype == c10::ScalarType::Int && out_tensor.is_contiguous() &&
                    ret_idx < entry.original_output_specs.size() &&
                    entry.original_output_specs[ret_idx].dtype == c10::ScalarType::Long &&
@@ -302,7 +302,7 @@ std::vector<torch::Tensor> UpcastExecutionOutputs(
   // interleave were folded into the compute graph. Reinterpret them as int64
   // (zero-copy) instead of running NeuronSafeCast -> materialize_from_i32.
   auto upcast_one = [](const torch::Tensor& t, c10::ScalarType target) -> torch::Tensor {
-    if (IsPackedInt64Enabled() && target == c10::ScalarType::Long &&
+    if (UsePackedInt64() && target == c10::ScalarType::Long &&
         t.scalar_type() == c10::ScalarType::Int && t.dim() >= 1 && t.size(-1) == 2) {
       return torch_neuronx::packed_int64::logical_view(t);
     }

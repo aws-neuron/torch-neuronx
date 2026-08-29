@@ -182,7 +182,11 @@ void NeuronCompilationService::WorkerLoop() {
         // Build config from per-request values
         CompilationConfig request_config = compilation_config_;
         request_config.optimization_level = job->optimization_level;
-        request_config.additional_args = job->additional_args;
+        // Append per-request args to base config (preserves int64 flags from FromEnvironment)
+        if (!job->additional_args.empty()) {
+          if (!request_config.additional_args.empty()) request_config.additional_args += " ";
+          request_config.additional_args += job->additional_args;
+        }
 
         auto neff_bytes = NeuronCompiler::CompileHloToNeff(hlo_bytes, request_config, job->ir_type,
                                                            job->op_name, job->cache_key);

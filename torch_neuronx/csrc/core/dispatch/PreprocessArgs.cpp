@@ -4,6 +4,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 
 namespace torch_neuronx {
 namespace dispatch {
@@ -80,7 +81,15 @@ static bool PreprocessSingleTensor(at::Tensor& t, const torch::Device& target_de
   // ════════════════════════════════════════════════════════════
 
   // ── Make contiguous unless skipped ──
-  if (!skip_contiguous && !t.is_contiguous()) {
+  // Prologue normally handles non-contiguous layouts in-graph, so contiguify is
+  // skipped when it's enabled. int64 is the exception: it executes on the packed
+  // int32[..., 2] physical view, which the prologue's strided transforms can't
+  // express (they'd leave an i64 tensor where the NEFF expects i32[..., 2], an
+  // i64↔i32x2 boundary mismatch). So always contiguify non-contiguous int64 —
+  // DispatchContiguousImpl's CPU-roundtrip yields a clean contiguous int64 that
+  // the packed view binds correctly.
+  const bool force_contig = (t.scalar_type() == c10::ScalarType::Long);
+  if ((!skip_contiguous || force_contig) && !t.is_contiguous()) {
     TORCH_NEURONX_DISPATCH_DEBUG("[PreprocessSingleTensor] ", debug_label, " making contiguous");
     t = t.contiguous();
     changed = true;
@@ -97,7 +106,8 @@ static bool PreprocessSingleTensor(at::Tensor& t, const torch::Device& target_de
 // ═══════════════════════════════════════════════════════════════
 
 void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
-                    const std::unordered_set<size_t>& static_argnums, bool skip_contiguous) {
+                    const std::unordered_set<size_t>& static_argnums, bool skip_contiguous,
+                    const std::string& op_name) {
   // ── Step 1: Determine target device from first non-scalar Neuron tensor ──
   torch::Device target_device(c10::DeviceType::PrivateUse1,
                               static_cast<c10::DeviceIndex>(at::neuron::current_device()));
@@ -164,9 +174,9 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     bool convert_scalar = !is_kwarg || is_number_kwarg;
 
     if (arg.isInt() && convert_scalar) {
-      static const bool native_int64 = IsNativeInt64Enabled();
+      bool use_int64 = SupportsNativeInt64(op_name);
       auto val = arg.toInt();
-      auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
+      auto int_dtype = use_int64 ? torch::kInt64 : torch::kInt32;
       auto t = torch::tensor(val, torch::TensorOptions().dtype(int_dtype)).to(target_device);
       args[i] = c10::IValue(std::move(t));
       TORCH_NEURONX_DISPATCH_DEBUG("[PreprocessArgs] ", debug_label, " int scalar → ", int_dtype,
@@ -192,8 +202,8 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
       if (scalar.isBoolean()) {
         t = torch::tensor(scalar.toBool(), torch::TensorOptions().dtype(torch::kBool));
       } else if (scalar.isIntegral(/*includeBool=*/false)) {
-        static const bool native_int64 = IsNativeInt64Enabled();
-        auto int_dtype = native_int64 ? torch::kInt64 : torch::kInt32;
+        bool use_int64 = SupportsNativeInt64(op_name);
+        auto int_dtype = use_int64 ? torch::kInt64 : torch::kInt32;
         t = torch::tensor(scalar.toLong(), torch::TensorOptions().dtype(int_dtype));
       } else {
         t = torch::tensor(scalar.toDouble(), torch::TensorOptions().dtype(torch::kFloat32));

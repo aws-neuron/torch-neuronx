@@ -31,7 +31,7 @@ namespace dispatch {
  */
 void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
                     const std::unordered_set<size_t>& static_argnums = {},
-                    bool skip_contiguous = false);
+                    bool skip_contiguous = false, const std::string& op_name = "");
 
 }  // namespace dispatch
 }  // namespace torch_neuronx

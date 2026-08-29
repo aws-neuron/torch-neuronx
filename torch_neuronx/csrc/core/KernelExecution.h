@@ -473,10 +473,21 @@ class XLACompilableKernelExecution
  protected:
   bool ValidateImpl() const override;
 
+ private:
+  // Returns true when any input or output context has dtype Long (i64).
+  // Used to gate the int64-policy compile-flag emission so that ops
+  // whose I/O has no int64 don't pick up int64-related compiler flags.
+  // See implementation comment in KernelExecution.cpp for rationale.
+  static bool HasInt64IO(const std::vector<TensorContext>& input_contexts,
+                         const std::vector<TensorContext>& output_contexts);
+
  public:
   // Get XLA compilation configuration from environment.
-  // Public so precompile paths can match the eager dispatch's persistent cache key.
-  static std::string GetXLAAdditionalArgs();
+  // ``has_int64_io`` gates int64-policy flag emission; defaults to true to
+  // preserve legacy behavior for any caller that hasn't been updated to
+  // pass the flag.
+  static std::string GetXLAAdditionalArgs(const std::string& op_name = "",
+                                          bool has_int64_io = true);
   static std::string GetXLAOptimizationLevel();
 
  private:

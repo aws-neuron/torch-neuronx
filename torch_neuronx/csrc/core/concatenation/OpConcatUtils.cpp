@@ -198,6 +198,24 @@ static int64_t getNumElements(mlir::RankedTensorType tensorType) {
   return total;
 }
 
+// Detect an int64 packed/unpacked representation boundary between a producer
+// output and a consumer input: one side is unpacked int64 (tensor<...xi64>),
+// the other is the packed physical view (tensor<...x2xi32>). In the native
+// int64 cascade these two representations legitimately coexist (NATIVE ops emit
+// S64 int64; packed/DOWNCAST ops use int32[...,2]); such a pair must not be
+// fused, but the ops are correct when run separately (the consumer's input
+// binding re-packs the int64).
+static bool IsInt64PackUnpackBoundary(mlir::Type a, mlir::Type b) {
+  auto ta = mlir::dyn_cast<mlir::RankedTensorType>(a);
+  auto tb = mlir::dyn_cast<mlir::RankedTensorType>(b);
+  if (!ta || !tb) return false;
+  const bool a_i64 = ta.getElementType().isInteger(64);
+  const bool a_i32 = ta.getElementType().isInteger(32);
+  const bool b_i64 = tb.getElementType().isInteger(64);
+  const bool b_i32 = tb.getElementType().isInteger(32);
+  return (a_i64 && b_i32) || (a_i32 && b_i64);
+}
+
 /**
  * @brief Validates dependency compatibility between modules based on dependency analysis
  *
@@ -236,6 +254,18 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
       // Strict: exact type match required
       if (output_type != input_type) {
+        // int64 packed/unpacked boundary: in the native cascade a NATIVE op
+        // emits *unpacked* int64 (tensor<...xi64>) while a packed/DOWNCAST op
+        // expects the packed physical view (tensor<...x2xi32>). These can't be
+        // strictly linked, but the ops are individually correct when NOT fused
+        // — run separately, the consumer's input binding re-packs the int64.
+        // So skip the merge (return false) rather than fail the op. See
+        // native int64 packed/native representation handling.
+        if (IsInt64PackUnpackBoundary(output_type, input_type)) {
+          TORCH_NEURONX_DEBUG("Skipping merge: int64 packed/unpacked boundary at module1_output[",
+                              output_idx, "] -> module2_input[", input_idx, "]");
+          return false;
+        }
         throw std::runtime_error("Type mismatch in dependency: module1 output " +
                                  std::to_string(output_idx) + " (" + typeToString(output_type) +
                                  ") cannot connect to module2 input " + std::to_string(input_idx) +
@@ -269,6 +299,11 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
       // Strict: exact type match required
       if (output_type != input_type) {
+        if (IsInt64PackUnpackBoundary(output_type, input_type)) {
+          TORCH_NEURONX_DEBUG("Skipping merge: int64 packed/unpacked boundary at module2_output[",
+                              output_idx, "] -> module1_input[", input_idx, "]");
+          return false;
+        }
         throw std::runtime_error("Type mismatch in dependency: module2 output " +
                                  std::to_string(output_idx) + " (" + typeToString(output_type) +
                                  ") cannot connect to module1 input " + std::to_string(input_idx) +
