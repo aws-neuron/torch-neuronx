@@ -133,6 +133,17 @@ class TestDecompositionTable:
         assert tuple(res.shape) == (4, 8, 8)
         assert res.device.type == "meta"
 
+    def test_adaptive_avg_pool3d_backward_out_fake_registered(self):
+        """_adaptive_avg_pool3d_backward.out has a fake/meta impl so Dynamo can
+        trace it. The upstream meta kernel is broken for this overload and
+        raises a TypeError, so exercising the op on meta tensors must not raise."""
+        grad_output = torch.empty(1, 1, 2, 2, 2, device="meta")
+        self_t = torch.empty(1, 1, 4, 4, 4, device="meta")
+        out = torch.empty(1, 1, 4, 4, 4, device="meta")
+        res = torch.ops.aten._adaptive_avg_pool3d_backward.out(grad_output, self_t, out=out)
+        assert tuple(res.shape) == (1, 1, 4, 4, 4)
+        assert res.device.type == "meta"
+
 
 class TestCustomAsStridedDecomposition:
     """Test custom as_strided decomposition"""
@@ -1321,6 +1332,44 @@ class TestBmmDtypeOutDecompositionE2E:
 
         rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-3)
         torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestAdaptiveAvgPool3dBackwardOutDecompositionE2E:
+    """Test _adaptive_avg_pool3d_backward.out compiles end-to-end on Neuron via
+    the fake impl + the base decomposition."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_adaptive_avg_pool3d_backward_out_e2e(self, dtype):
+        torch.manual_seed(42)
+
+        # Output size are divisible in this test
+        # but the backward op is meant to be able to handle non-divisible sizes as well
+        input_shape = (2, 3, 4, 8, 8)
+        grad_shape = (2, 3, 2, 4, 4)
+
+        def fn(grad_output, self, out):
+            return torch.ops.aten._adaptive_avg_pool3d_backward.out(grad_output, self, out=out)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+
+        grad_cpu = torch.randn(grad_shape, dtype=torch.float32)
+        self_cpu = torch.randn(input_shape, dtype=torch.float32)
+
+        # CPU reference via the same .out op (eager dispatch has a real kernel).
+        expected = torch.empty(input_shape, dtype=torch.float32)
+        fn(grad_cpu, self_cpu, expected)
+
+        grad_n = grad_cpu.to(dtype).to("neuron")
+        self_n = self_cpu.to(dtype).to("neuron")
+        out_n = torch.empty(input_shape, dtype=dtype, device="neuron")
+        result = compiled_fn(grad_n, self_n, out_n)
+
+        if dtype == torch.bfloat16:
+            torch.testing.assert_close(result.cpu().float(), expected, rtol=1.6e-2, atol=1e-5)
+        else:
+            # float32: use assert_close's default float32 tolerances
+            torch.testing.assert_close(result.cpu(), expected)
 
 
 class TestClampPromotionDecomposition:
