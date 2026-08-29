@@ -1035,12 +1035,26 @@ def _adaptive_avg_pool3d_backward_impl(grad_output, self):
     return grad_input
 
 
+@_register_fake("aten::_adaptive_avg_pool3d_backward.out", override=True)
+def _adaptive_avg_pool3d_backward_out_fake(grad_output, self, *, out):
+    """Work around a broken upstream meta for this .out overload.
+
+    The upstream out-variant meta passes 'out' both positionally and as a
+    kwarg. The base meta then raises a TypeError during tracing. override=True
+    replaces that broken meta. NOTE: This is specific to this op and, as such, not a rule
+    for every .out overload.
+    """
+    return out
+
+
 @register_decomposition([aten._adaptive_avg_pool3d_backward])
 def adaptive_avg_pool3d_backward_decomp(grad_output, self):
     """Lower _adaptive_avg_pool3d_backward via three separable matmuls.
 
-    Registering the functional packet also covers the .out overload, so no
-    separate .out registration is needed (and adding one is a duplicate).
+    The decomposition covers the .out overload too, so it needs no separate
+    .out decomposition. The .out overload also has its own fake impl
+    (_adaptive_avg_pool3d_backward_out_fake), but only to work around a broken
+    upstream meta. This is not needed for every .out op.
     """
     return _adaptive_avg_pool3d_backward_impl(grad_output, self)
 
