@@ -34,13 +34,25 @@ _TILE_M = 128
 # Free-dim tile width in bytes/partition: the DMA saturation knee (cast_kernel's value).
 _TILE_H_BYTES = 4096
 
+# The free-dim `for seg` loop is unrolled statically by NKI (cap 10000, Reduce.h
+# kMaxUnrollIters). Cap the segment count well under that; wider copies are declined
+# upstream and fall back to the default lowering.
+_MAX_H_SEGMENTS = 8192
 
-def _h_segments(width, tile_size_h):
-    """Split ``width`` into tile_size_h-wide segments, final one short."""
+
+def width_within_unroll_budget(width, elem_bytes):
+    """False when ceil(width / knee) exceeds the unroll budget -> adapter declines."""
+    knee = _TILE_H_BYTES // elem_bytes
+    return -(-width // knee) <= _MAX_H_SEGMENTS
+
+
+def _h_segments(width, elem_bytes):
+    """Split ``width`` into knee-wide segments (final one short)."""
+    tile_h = _TILE_H_BYTES // elem_bytes
     starts, widths = [], []
     off = 0
     while off < width:
-        w = min(tile_size_h, width - off)
+        w = min(tile_h, width - off)
         starts.append(off)
         widths.append(w)
         off += w
@@ -145,7 +157,7 @@ def make_strided_copy_kernel(out_dtype, tile_m=_TILE_M):
 
         # Sized by the WIDER dtype so neither the load nor the store tile exceeds the knee.
         elem_bytes = max(_DTYPE_BYTES[str(base.dtype)], _DTYPE_BYTES[str(dt)])
-        h_starts, h_widths = _h_segments(width, _TILE_H_BYTES // elem_bytes)
+        h_starts, h_widths = _h_segments(width, elem_bytes)
 
         result = nl.ndarray((rows_static, out_width), dt, nl.shared_hbm)
 
