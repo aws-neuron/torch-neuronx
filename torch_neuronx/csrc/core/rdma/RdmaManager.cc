@@ -678,27 +678,46 @@ uint32_t RdmaManager::NextSeq(int src, int dst, int tag) {
 // ---------------------------------------------------------------------------
 namespace {
 
-// Resolve a user-visible VA to the HBM-backed NRT VA via NeuronCachingAllocator.
+// Resolve a storage base VA to the HBM-backed NRT VA via NeuronCachingAllocator.
 // findTensor() returns the bound nrt_tensor_t* (block->nrt_slice in the lazy
 // path). nrt_tensor_get_va gives the actual HBM VA registered with libfabric.
+//
+// storage_va must be the base allocation VA: it is the allocator registry key. A
+// view VA (the data_ptr of a tensor with a storage offset) has no entry.
 //
 // findTensor's "main thread only" comment refers to concurrent allocator
 // mutations from kAlloc/kDealloc — both also run on the engine thread (single
 // RuntimeWorker), so engine-thread reads are safe by sequential ordering.
-void* ResolveHbmVA(void* user_va) {
-  auto* tensor = c10_neuron::NeuronCachingAllocator::findTensor(user_va);
+void* ResolveHbmVA(void* storage_va) {
+  auto* tensor = c10_neuron::NeuronCachingAllocator::findTensor(storage_va);
   if (!tensor) {
-    TORCH_NEURONX_RDMA_ERROR("ResolveHbmVA: findTensor returned null for user_va=", user_va,
+    TORCH_NEURONX_RDMA_ERROR("ResolveHbmVA: findTensor returned null for storage_va=", storage_va,
                              " (kAlloc may not have run; check stream ordering)");
-    TORCH_CHECK(false, "RdmaManager: tensor not found for VA ", user_va);
+    TORCH_CHECK(false, "RdmaManager: tensor not found for VA ", storage_va);
   }
   void* hbm_va = nrt_tensor_get_va(tensor);
-  TORCH_NEURONX_RDMA_DEBUG("ResolveHbmVA: user_va=", user_va, " -> nrt_tensor=", tensor,
-                           " -> hbm_va=", hbm_va, " (same=", (user_va == hbm_va), ")");
+  TORCH_NEURONX_RDMA_DEBUG("ResolveHbmVA: storage_va=", storage_va, " -> nrt_tensor=", tensor,
+                           " -> hbm_va=", hbm_va, " (same=", (storage_va == hbm_va), ")");
   return hbm_va;
 }
 
 }  // namespace
+
+void* RdmaManager::ResolveEntryVAs(std::vector<P2PEntry>& entries, void* (*resolve)(void*)) {
+  void* first_base_va = nullptr;
+  for (auto& e : entries) {
+    // A zero-size entry moves no bytes and carries no VA to resolve.
+    if (e.size == 0) {
+      e.nrt_va = nullptr;
+      continue;
+    }
+    void* base_va = resolve(e.storage_va);
+    e.nrt_va = static_cast<char*>(base_va) + e.offset_bytes;
+    // Fabric init needs a real storage NRT VA.
+    if (first_base_va == nullptr) first_base_va = base_va;
+  }
+  return first_base_va;
+}
 
 // ---------------------------------------------------------------------------
 // PrepareBatch
@@ -738,24 +757,17 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries, int64_t timeout_m
   TORCH_NEURONX_RDMA_INFO("PrepareBatch: ", entries.size(), " entries, rank=", rank);
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& e = entries[i];
-    TORCH_NEURONX_RDMA_DEBUG(
-        "PrepareBatch:   entry[", i, "] kind=", (e.kind == P2PEntry::Kind::kSend ? "SEND" : "RECV"),
-        " user_va=", e.user_va, " size=", e.size, " peer=", e.peer, " tag=", e.tag);
+    TORCH_NEURONX_RDMA_DEBUG("PrepareBatch:   entry[", i,
+                             "] kind=", (e.kind == P2PEntry::Kind::kSend ? "SEND" : "RECV"),
+                             " storage_va=", e.storage_va, " offset_bytes=", e.offset_bytes,
+                             " size=", e.size, " peer=", e.peer, " tag=", e.tag);
   }
 
   // Resolve VAs first; the first one drives lazy fabric init.
-  void* first_real_va = nullptr;
-  for (auto& e : entries) {
-    if (e.size == 0) {
-      e.nrt_va = nullptr;
-      continue;
-    }
-    e.nrt_va = ResolveHbmVA(e.user_va);
-    if (first_real_va == nullptr) first_real_va = e.nrt_va;
-  }
+  void* first_real_va = ResolveEntryVAs(entries, ResolveHbmVA);
   // Lazy fabric init needs a real HBM VA. Only call when this batch has a non-zero-size entry.
   // An all-zero-size batch has no fabric work to do and no resolvable VA, so calling ResolveHbmVA
-  // on its null user_va would fault.
+  // on its null storage_va would fault.
   if (first_real_va != nullptr) {
     EnsureInitialized(first_real_va);
   }
@@ -947,7 +959,7 @@ void RdmaManager::PrepareBatch(std::vector<P2PEntry>& entries, int64_t timeout_m
       TORCH_CHECK(sw.peer_rank != rank,
                   "RdmaManager: same-rank P2P should be handled before reaching the engine "
                   "(NeuronBackend::endCoalescing). Got peer rank == self (",
-                  rank, ") for entry user_va=", e.user_va);
+                  rank, ") for entry storage_va=", e.storage_va);
       auto reg = EnsureBufferRegistered(e.nrt_va, e.size);
       TORCH_CHECK(reg.ok(), "RdmaManager: register send buffer failed: ", reg.error);
       fid_mr* mr = FindMR(e.nrt_va, e.size);

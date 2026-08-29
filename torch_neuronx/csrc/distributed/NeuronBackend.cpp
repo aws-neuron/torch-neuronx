@@ -472,6 +472,17 @@ void SubmitP2POp(std::vector<::neuron::P2PEntry> entries, int device_idx, int64_
   at::neuron::SubmitOperationContext(stream, std::move(context));
 }
 
+// Address a tensor for RDMA as storage base VA + byte offset.
+::neuron::P2PEntry MakeP2PEntry(::neuron::P2PEntry::Kind kind, const at::Tensor& tensor, int peer,
+                                int tag) {
+  return {kind,
+          const_cast<void*>(tensor.storage().data()),
+          static_cast<size_t>(tensor.numel() * tensor.element_size()),
+          peer,
+          tag,
+          static_cast<size_t>(tensor.storage_offset() * tensor.element_size())};
+}
+
 }  // namespace
 
 void NeuronBackend::EnsureRdmaInit(at::Tensor& /*tensor*/, int /*peer_global*/) {
@@ -523,8 +534,7 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::send(std::vector<at::Tensor>& tens
   }
 
   std::vector<::neuron::P2PEntry> entries{
-      {::neuron::P2PEntry::Kind::kSend, tensor.data_ptr(),
-       static_cast<size_t>(tensor.numel() * tensor.element_size()), dst_global, tag}};
+      MakeP2PEntry(::neuron::P2PEntry::Kind::kSend, tensor, dst_global, tag)};
 
   auto work = CreateWork(/*outputs=*/{tensor}, /*inputs=*/{tensor}, c10d::OpType::SEND,
                          /*async_op=*/true);
@@ -563,8 +573,7 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::recv(std::vector<at::Tensor>& tens
   }
 
   std::vector<::neuron::P2PEntry> entries{
-      {::neuron::P2PEntry::Kind::kRecv, tensor.data_ptr(),
-       static_cast<size_t>(tensor.numel() * tensor.element_size()), src_global, tag}};
+      MakeP2PEntry(::neuron::P2PEntry::Kind::kRecv, tensor, src_global, tag)};
 
   auto work = CreateWork(/*outputs=*/{tensor}, /*inputs=*/{tensor}, c10d::OpType::RECV,
                          /*async_op=*/true);
@@ -636,11 +645,10 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::endCoalescing() {
     }
     if (op.peer_global == global_rank_) continue;  // SEND with same-peer (paired above)
 
-    remote_entries.push_back({op.op == c10d::OpType::SEND ? ::neuron::P2PEntry::Kind::kSend
-                                                          : ::neuron::P2PEntry::Kind::kRecv,
-                              op.tensor.data_ptr(),
-                              static_cast<size_t>(op.tensor.numel() * op.tensor.element_size()),
-                              op.peer_global, op.tag});
+    remote_entries.push_back(MakeP2PEntry(op.op == c10d::OpType::SEND
+                                              ? ::neuron::P2PEntry::Kind::kSend
+                                              : ::neuron::P2PEntry::Kind::kRecv,
+                                          op.tensor, op.peer_global, op.tag));
     remote_tensors.push_back(op.tensor);
   }
 
