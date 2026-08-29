@@ -45,20 +45,23 @@ struct SendContext : fi_context2 {
   bool is_mailbox{false};
 };
 
-// One entry of a P2P batch. user_va is resolved to nrt_va inside PrepareBatch
+// One entry of a P2P batch. storage_va is resolved to nrt_va inside PrepareBatch
 // using NeuronCachingAllocator::findTensor + nrt_tensor_get_va — required
 // under lazy allocation, where data_ptr() is an mmap placeholder until the
 // kAlloc op binds the slice.
 struct P2PEntry {
   enum class Kind { kSend, kRecv };
   Kind kind;
-  void* user_va;
+  // Base VA of the tensor's storage
+  void* storage_va;
   size_t size;
   int peer;
   int tag;
+  // Byte offset of the tensor in that storage: storage_offset * element_size
+  size_t offset_bytes = 0;
 
   // Filled by PrepareBatch:
-  void* nrt_va = nullptr;
+  void* nrt_va = nullptr;    // resolved VA: storage HBM VA + offset_bytes
   uint32_t transfer_id = 0;  // recv only — matches FI_REMOTE_CQ_DATA imm
   bool prepared = false;
   // Set true by DrainAndPending the first time a recv's transfer_id is found
@@ -141,6 +144,10 @@ class RdmaManager {
   RdmaStatus EnsureRegistered(const HBMInfo& info);
   RdmaStatus EnsureBufferRegistered(void* addr, size_t size, int device_id = 0);
   fid_mr* FindMR(void* addr, size_t size);
+  // Fill nrt_va for every entry of a batch: resolve the storage base, then add the
+  // view offset. Returns the HBM base VA of the first entry that moves bytes or
+  // nullptr for an all-zero-size batch.
+  static void* ResolveEntryVAs(std::vector<P2PEntry>& entries, void* (*resolve)(void*));
   // Non-blocking AV insert: returns false (defer) if the peer hasn't published its
   // endpoint yet. On success caches + returns the fi_addr via *out. Uses store
   // check() (never blocks) before the one-time get()/fi_av_insert.

@@ -101,13 +101,34 @@ class FakeStore : public c10d::Store {
 };
 
 neuron::P2PEntry ZeroSizeRecv(int tag, int peer = kPeerRank) {
-  return neuron::P2PEntry{neuron::P2PEntry::Kind::kRecv, /*user_va=*/nullptr, /*size=*/0, peer,
+  return neuron::P2PEntry{neuron::P2PEntry::Kind::kRecv, /*storage_va=*/nullptr, /*size=*/0, peer,
                           tag};
 }
 
 neuron::P2PEntry ZeroSizeSend(int tag, int peer = kPeerRank) {
-  return neuron::P2PEntry{neuron::P2PEntry::Kind::kSend, /*user_va=*/nullptr, /*size=*/0, peer,
+  return neuron::P2PEntry{neuron::P2PEntry::Kind::kSend, /*storage_va=*/nullptr, /*size=*/0, peer,
                           tag};
+}
+
+// Allocation from the allocator registry
+constexpr uintptr_t kStorageVA = 0x1000;
+// Mapped NRT HBM VA
+constexpr uintptr_t kHbmVA = 0x7F0000000000ULL;
+
+// Stub for ResolveHbmVA
+void* FakeResolveHbmVA(void* storage_va) {
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(storage_va), kStorageVA);
+  return reinterpret_cast<void*>(kHbmVA);
+}
+
+// A send that starts offset_bytes into kStorageVA
+neuron::P2PEntry SendAtOffset(size_t offset_bytes, size_t size) {
+  return neuron::P2PEntry{neuron::P2PEntry::Kind::kSend,
+                          reinterpret_cast<void*>(kStorageVA),
+                          size,
+                          kPeerRank,
+                          /*tag=*/0,
+                          offset_bytes};
 }
 
 }  // namespace
@@ -166,6 +187,9 @@ class RdmaManagerTest : public ::testing::Test {
   uint32_t nextSeq(int src, int dst, int tag) { return mgr().NextSeq(src, dst, tag); }
   static uint64_t tagChannelKey(int peer, int tag) { return RdmaManager::TagChannelKey(peer, tag); }
   static uint32_t ringDepth(uint32_t s, uint32_t r) { return RdmaManager::RingDepth(s, r); }
+  static void* resolveEntryVAs(std::vector<P2PEntry>& entries, void* (*resolve)(void*)) {
+    return RdmaManager::ResolveEntryVAs(entries, resolve);
+  }
   static constexpr uint32_t kMailboxSlots = RdmaManager::kMailboxSlots;
 
   c10::intrusive_ptr<FakeStore> store_;
@@ -267,6 +291,55 @@ TEST_F(RdmaManagerTest, RingDepthIsSymmetricUnderAsymmetricCounts) {
       EXPECT_EQ(ringDepth(s, r), ringDepth(r, s)) << "asymmetry at s=" << s << " r=" << r;
     }
   }
+}
+
+// ===========================================================================
+// Entry addressing: storage base VA + view offset -> nrt_va.
+// ===========================================================================
+
+TEST_F(RdmaManagerTest, EntryAtStorageBaseAddressesHbmBase) {
+  std::vector<neuron::P2PEntry> entries{SendAtOffset(/*offset_bytes=*/0, /*size=*/32)};
+  EXPECT_EQ(resolveEntryVAs(entries, FakeResolveHbmVA), reinterpret_cast<void*>(kHbmVA));
+  EXPECT_EQ(entries[0].nrt_va, reinterpret_cast<void*>(kHbmVA));
+}
+
+TEST_F(RdmaManagerTest, EntryWithViewOffsetAddressesWithOffset) {
+  constexpr size_t kOffset = 8;
+  std::vector<neuron::P2PEntry> entries{SendAtOffset(kOffset, /*size=*/8)};
+  resolveEntryVAs(entries, FakeResolveHbmVA);
+  EXPECT_EQ(entries[0].nrt_va, reinterpret_cast<void*>(kHbmVA + kOffset));
+}
+
+TEST_F(RdmaManagerTest, EachEntryInABatchKeepsOwnOffset) {
+  std::vector<neuron::P2PEntry> entries{SendAtOffset(0, 8), SendAtOffset(8, 8),
+                                        SendAtOffset(56, 8)};
+  resolveEntryVAs(entries, FakeResolveHbmVA);
+  EXPECT_EQ(entries[0].nrt_va, reinterpret_cast<void*>(kHbmVA));
+  EXPECT_EQ(entries[1].nrt_va, reinterpret_cast<void*>(kHbmVA + 8));
+  EXPECT_EQ(entries[2].nrt_va, reinterpret_cast<void*>(kHbmVA + 56));
+}
+
+TEST_F(RdmaManagerTest, LazyFabricInitGetsBaseVA) {
+  std::vector<neuron::P2PEntry> entries{SendAtOffset(/*offset_bytes=*/64, /*size=*/16)};
+  EXPECT_EQ(resolveEntryVAs(entries, FakeResolveHbmVA), reinterpret_cast<void*>(kHbmVA));
+}
+
+TEST_F(RdmaManagerTest, ZeroSizeEntryKeepsNullVAAndNeverResolved) {
+  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(/*tag=*/600)};
+  void* first = resolveEntryVAs(entries, [](void*) -> void* {
+    ADD_FAILURE() << "a zero-size entry has no VA to resolve";
+    return nullptr;
+  });
+  EXPECT_EQ(first, nullptr);
+  EXPECT_EQ(entries[0].nrt_va, nullptr);
+}
+
+TEST_F(RdmaManagerTest, FabricInitVAComesFromTheFirstRealVA) {
+  std::vector<neuron::P2PEntry> entries{ZeroSizeSend(/*tag=*/601),
+                                        SendAtOffset(/*offset_bytes=*/16, /*size=*/4)};
+  EXPECT_EQ(resolveEntryVAs(entries, FakeResolveHbmVA), reinterpret_cast<void*>(kHbmVA));
+  EXPECT_EQ(entries[0].nrt_va, nullptr);
+  EXPECT_EQ(entries[1].nrt_va, reinterpret_cast<void*>(kHbmVA + 16));
 }
 
 // ===========================================================================
