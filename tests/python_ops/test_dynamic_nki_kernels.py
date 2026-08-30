@@ -82,6 +82,21 @@ def _assert_dynamic_ran(op_name, min_execs=1):
 
 
 @contextlib.contextmanager
+def _static_lowering():
+    """Run the block on the default lowering. ``get_dynamic_nki_entry`` re-reads the env var per
+    call, so flipping it is enough -- the C++ pre-check just gets None back."""
+    prev = os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS")
+    os.environ["TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS"] = "0"
+    try:
+        yield
+    finally:
+        if prev is None:
+            del os.environ["TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS"]
+        else:
+            os.environ["TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS"] = prev
+
+
+@contextlib.contextmanager
 def _assert_dynamic_skipped(op_name):
     """Assert the dynamic kernel did NOT run (op declined -> default lowering)."""
     e = _entry(op_name)
@@ -203,15 +218,87 @@ def _sum_spec(**flags):
     return OpSpec("sum", build, lambda x: x.sum(dim=1, keepdim=True), **flags)
 
 
-def _compare_spec(name, fn, other=0.0, **flags):
-    """Compare-with-scalar: bool output, other=0.0 so the mask is a mix. The reference is
-    fp32 because both neuron paths compare in fp32 -- a bf16 one disagrees at boundaries."""
+def _compare_spec(name, fn, other=0.0, plant=False, **flags):
+    """Compare-with-scalar. The reference is fp32 because both neuron paths compare in fp32 -- a
+    bf16 one disagrees at boundaries. ``plant`` writes ``other`` into a third of the columns so
+    eq/ne see a mixed mask."""
 
     def build(dtype, *, rows=512, h=2048):
         x = torch.randn(1, rows, h, dtype=dtype) / 8
+        if plant:
+            x[..., ::3] = other
         return (x.to("neuron"),), fn(x.float(), other)
 
     return OpSpec(name, build, lambda x: fn(x, other), tol=(0, 0), non_128=False, **flags)
+
+
+def _compare_tensor_spec(name, fn, **flags):
+    """The .Tensor overload: two same-shape operands, a third of the columns copied across so
+    eq/ne see equal values."""
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(1, rows, h, dtype=dtype) / 8
+        y = torch.randn(1, rows, h, dtype=dtype) / 8
+        y[..., ::3] = x[..., ::3]
+        return (x.to("neuron"), y.to("neuron")), fn(x.float(), y.float())
+
+    return OpSpec(
+        name,
+        build,
+        lambda x, y: fn(x, y),
+        tol=(0, 0),
+        non_128=False,
+        min_rows=128,
+        label=f"{name}_tensor",
+        **flags,
+    )
+
+
+def _logical_and_spec(bool_operands, **flags):
+    """bool operands take the packed kernel, float operands the mask kernel -- the ALU evaluates
+    ``(a != 0) & (b != 0)``, hence the planted zeros. tol=(0, 0): no numeric error term."""
+
+    def build(dtype, *, rows=512, h=2048):
+        if bool_operands:
+            a = torch.rand(1, rows, h) > 0.5
+            b = torch.rand(1, rows, h) > 0.5
+        else:
+            a = torch.randn(1, rows, h, dtype=dtype) / 8
+            b = torch.randn(1, rows, h, dtype=dtype) / 8
+            a[..., ::4] = 0.0
+            b[..., ::3] = 0.0
+        return (a.to("neuron"), b.to("neuron")), torch.logical_and(a, b)
+
+    return OpSpec(
+        "logical_and",
+        build,
+        torch.logical_and,
+        dtypes=(torch.bool,) if bool_operands else tuple(_DTYPES),
+        tol=(0, 0),
+        min_rows=128,
+        label="logical_and_bool" if bool_operands else "logical_and_float",
+        **flags,
+    )
+
+
+def _div_spec(form, **flags):
+    """div by a same-shape tensor, a [*, 1] column, or a scalar; divisors stay away from zero.
+
+    The reference mirrors the hardware (``a * reciprocal(b)`` in fp32, which is also what the
+    static lowering does), so tol=(0, 0) holds and no 1-ULP slack can hide a mis-tiled result.
+    Accuracy of recip-then-multiply is asserted separately in test_dynamic_nki_div_accuracy."""
+    divisor_scalar = 3.5
+
+    def build(dtype, *, rows=512, h=2048):
+        x = torch.randn(1, rows, h, dtype=dtype) / 8
+        if form == "scalar":
+            return (x.to("neuron"),), (x.float() * (1.0 / divisor_scalar)).to(dtype)
+        shape = (1, rows, h) if form == "tensor" else (1, rows, 1)
+        y = (torch.randn(*shape, dtype=dtype) / 8).abs() + 0.05
+        return (x.to("neuron"), y.to("neuron")), (x.float() * y.float().reciprocal()).to(dtype)
+
+    run = (lambda x: torch.div(x, divisor_scalar)) if form == "scalar" else torch.div
+    return OpSpec("div", build, run, tol=(0, 0), min_rows=128, label=f"div_{form}", **flags)
 
 
 def _to_copy_spec(dst_dtype, **flags):
@@ -371,6 +458,8 @@ def _bitwise_or_spec(**flags):
     return OpSpec("bitwise_or", build, torch.bitwise_or, dtypes=(torch.bool,), tol=(0, 0), **flags)
 
 
+_CMP_NAMES = ["ge", "lt", "ne", "le", "eq"]
+
 _OP_SPECS = [
     _unary_spec("silu", torch.nn.functional.silu, arbitrary_h=True, compile_once=True),
     _unary_spec("exp", torch.exp, arbitrary_h=True, compile_once=True),
@@ -385,8 +474,20 @@ _OP_SPECS = [
     _bitwise_or_spec(arbitrary_h=True, compile_once=True),
     _compare_spec("ge", torch.ge, arbitrary_h=True, compile_once=True),
     _compare_spec("lt", torch.lt, arbitrary_h=True, compile_once=True),
-    _compare_spec("ne", torch.ne, arbitrary_h=True, compile_once=True),
+    _compare_spec("ne", torch.ne, arbitrary_h=True, compile_once=True, plant=True),
     _compare_spec("le", torch.le, arbitrary_h=True, compile_once=True),
+    _compare_spec("eq", torch.eq, arbitrary_h=True, compile_once=True, plant=True),
+    # the .Tensor overload of each: same kernel family, second full-width operand
+    _compare_tensor_spec("ge", torch.ge, arbitrary_h=True, compile_once=True),
+    _compare_tensor_spec("lt", torch.lt),
+    _compare_tensor_spec("ne", torch.ne),
+    _compare_tensor_spec("le", torch.le),
+    _compare_tensor_spec("eq", torch.eq, arbitrary_h=True, compile_once=True),
+    _logical_and_spec(True, arbitrary_h=True, compile_once=True),
+    _logical_and_spec(False, arbitrary_h=True, compile_once=True),
+    _div_spec("tensor", arbitrary_h=True, compile_once=True),
+    _div_spec("row", arbitrary_h=True, compile_once=True),
+    _div_spec("scalar", arbitrary_h=True, compile_once=True),
     _binary_spec("add", torch.add, compile_once=True),
     _binary_spec("sub", torch.sub, compile_once=True),
     _binary_spec("mul", torch.mul),
@@ -556,9 +657,15 @@ class TestDynamicNkiKernels:
         ), "recompiled across non-128 counts (padded dim leaked into compile_key?)"
 
     # ── comparison-specific: plan shapes, arbitrary M, NEFF reuse, overloads ──
-    _CMP_FNS: ClassVar = {"ge": torch.ge, "lt": torch.lt, "ne": torch.ne, "le": torch.le}
+    _CMP_FNS: ClassVar = {
+        "ge": torch.ge,
+        "lt": torch.lt,
+        "ne": torch.ne,
+        "le": torch.le,
+        "eq": torch.eq,
+    }
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_plan_shapes(self, name):
         """The plan's shapes: [1, seq] and 1-D collapse to [numel, 1], [rows, H]
         keeps the last dim as H."""
@@ -569,7 +676,7 @@ class TestDynamicNkiKernels:
                 got = fn(x, 0.0).cpu()
             torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0)
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_arbitrary_m_no_pad(self, name):
         """Any M >= 128, no padding: the tail tile covers the remainder. rem=1 and
         rem=127 included; the whole sweep must stay on one NEFF."""
@@ -583,7 +690,7 @@ class TestDynamicNkiKernels:
             torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0, msg=f"M={m}")
         assert len(entry._compiled) - compiled_before <= 1, "recompiled across M values"
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_m_below_one_tile_declines(self, name):
         """M < 128 leaves no room for the tail tile -> declined."""
         fn = self._CMP_FNS[name]
@@ -592,7 +699,7 @@ class TestDynamicNkiKernels:
             got = fn(x, 0.0).cpu()
         torch.testing.assert_close(got, fn(x.cpu().float(), 0.0), rtol=0, atol=0)
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_no_recompile_on_seqlen(self, name):
         """Warm-restart scenario: same op, different seq length (plan #8/#10 go
         512 -> 4096). One NEFF, including seq lengths that are not 128-multiples."""
@@ -610,7 +717,7 @@ class TestDynamicNkiKernels:
         assert entry._exec_count - exec_before == len(seqs), f"{name} skipped a seq"
         assert len(entry._compiled) - compiled_before <= 1, f"{name}: recompiled across seq lengths"
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_scalar_no_recompile(self, name):
         """The threshold is a runtime operand, not baked: distinct scalars must NOT
         add NEFFs. (H is unique to this test so sibling tests can't mask a miss.)"""
@@ -630,17 +737,70 @@ class TestDynamicNkiKernels:
             f"into the compile_key"
         )
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
+    def test_dynamic_nki_compare_tensor_plan_shapes(self, name):
+        """The .Tensor overload on the plan's shapes, including the 1-D / [1, seq] cases that
+        collapse to [numel, 1]."""
+        fn = self._CMP_FNS[name]
+        for shape in ((1, 512), (512,), (6144, 720), (1001, 313)):
+            x = (torch.randn(*shape, dtype=torch.bfloat16) / 8).to("neuron")
+            y = (torch.randn(*shape, dtype=torch.bfloat16) / 8).to("neuron")
+            with _assert_dynamic_ran(name):
+                got = fn(x, y).cpu()
+            expected = fn(x.cpu().float(), y.cpu().float())
+            torch.testing.assert_close(got, expected, rtol=0, atol=0, msg=f"shape={shape}")
+
+    @pytest.mark.parametrize("name", _CMP_NAMES)
+    def test_dynamic_nki_compare_tensor_no_recompile_on_seqlen(self, name):
+        """Warm restart: one NEFF across seq lengths, 128-multiples or not."""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+        seqs = (512, 4096, 777, 4097, 256)
+        for seq in seqs:
+            x = (torch.randn(seq, 128, dtype=torch.bfloat16) / 8).to("neuron")
+            y = (torch.randn(seq, 128, dtype=torch.bfloat16) / 8).to("neuron")
+            got = fn(x, y).cpu()
+            expected = fn(x.cpu().float(), y.cpu().float())
+            torch.testing.assert_close(got, expected, rtol=0, atol=0, msg=f"seq={seq}")
+        assert entry._exec_count - exec_before == len(seqs), f"{name} skipped a seq"
+        assert len(entry._compiled) - compiled_before <= 1, f"{name}: recompiled across seqs"
+
+    @pytest.mark.parametrize("name", _CMP_NAMES)
+    def test_dynamic_nki_compare_overloads_are_separate_neffs(self, name):
+        """Scalar and tensor `other` are different kernels, so the overload must be in the
+        compile_key -- one NEFF each."""
+        fn = self._CMP_FNS[name]
+        entry = _entry(name)
+        h = 1178  # unique to this test, so sibling specs can't mask a miss
+        x = (torch.randn(256, h, dtype=torch.bfloat16) / 8).to("neuron")
+        y = (torch.randn(256, h, dtype=torch.bfloat16) / 8).to("neuron")
+        keys_before = set(entry._compiled)
+        fn(x, 0.0).cpu()
+        fn(x, y).cpu()
+        added = set(entry._compiled) - keys_before
+        assert added == {(h, torch.bfloat16, False), (h, torch.bfloat16, True)}, added
+
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_tensor_operand_declines(self, name):
-        """The .Tensor overload (tensor `other`) isn't a scalar compare -> declined."""
+        """Operands one access pattern can't read: broadcast shape, dtype mismatch, or a 0-d
+        device tensor (reading its value would sync)."""
         fn = self._CMP_FNS[name]
         x = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
-        y = (torch.randn(256, 2048, dtype=torch.bfloat16) / 8).to("neuron")
-        with _assert_dynamic_skipped(name):
-            got = fn(x, y).cpu()
-        torch.testing.assert_close(got, fn(x.cpu().float(), y.cpu().float()), rtol=0, atol=0)
+        others = (
+            torch.randn(1, 2048, dtype=torch.bfloat16).to("neuron"),  # broadcast
+            torch.randn(256, 2048, dtype=torch.float32).to("neuron"),  # dtype mismatch
+            torch.tensor(0.5, dtype=torch.bfloat16).to("neuron"),  # 0-d on device
+        )
+        for other in others:
+            assert not _entry(name).can_handle(x, other), f"took {tuple(other.shape)}"
+            with _assert_dynamic_skipped(name):
+                got = fn(x, other).cpu()
+            expected = fn(x.cpu().float(), other.cpu().float())
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_nonfinite_declines(self, name):
         """NaN/inf compare semantics on the ALU are unverified -> declined."""
         fn = self._CMP_FNS[name]
@@ -649,7 +809,7 @@ class TestDynamicNkiKernels:
             with _assert_dynamic_skipped(name):
                 fn(x, other).cpu()
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_out_writes_in_place(self, name):
         """Unpadded, so the kernel writes into out= directly -- result aliases it."""
         fn = self._CMP_FNS[name]
@@ -660,7 +820,7 @@ class TestDynamicNkiKernels:
         assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
         torch.testing.assert_close(buf.cpu(), fn(x.cpu().float(), 0.0), rtol=0, atol=0)
 
-    @pytest.mark.parametrize("name", ["ge", "lt", "ne", "le"])
+    @pytest.mark.parametrize("name", _CMP_NAMES)
     def test_dynamic_nki_compare_noncontiguous_out_is_honored(self, name):
         """out= must hold the result and be the returned tensor (the `Tensor(a!) out`
         contract), non-contiguous included. can_handle declines a dest it can't alias --
@@ -684,6 +844,154 @@ class TestDynamicNkiKernels:
         assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
 
     # ── add-specific declining / routing (not in the op table) ──
+    # ── logical_and: two kernels behind one entry (bool packed / float mask) ──
+    def test_dynamic_nki_logical_and_plan_shape(self):
+        """Plan #56: [6144, 720] bool masks, warm -> cold row count on one NEFF. A 1-byte operand
+        load with a dynamic offset is exactly what the int16 view exists to fix."""
+        entry = _entry("logical_and")
+        compiled_before = len(entry._compiled)
+        for rows in (6144, 12288, 6145):
+            a = torch.rand(rows, 720) > 0.5
+            b = torch.rand(rows, 720) > 0.5
+            with _assert_dynamic_ran("logical_and"):
+                got = torch.logical_and(a.to("neuron"), b.to("neuron")).cpu()
+            ref = torch.logical_and(a, b)
+            torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=f"rows={rows}")
+        assert len(entry._compiled) - compiled_before <= 1, "recompiled across row counts"
+
+    def test_dynamic_nki_logical_and_odd_h_declines_for_bool_only(self):
+        """The int16 view needs an even H; float operands load at full width, so odd H is fine."""
+        entry = _entry("logical_and")
+        a_bool = (torch.rand(256, 721) > 0.5).to("neuron")
+        b_bool = (torch.rand(256, 721) > 0.5).to("neuron")
+        assert not entry.can_handle(a_bool, b_bool)
+        with _assert_dynamic_skipped("logical_and"):
+            got = torch.logical_and(a_bool, b_bool).cpu()
+        torch.testing.assert_close(got, torch.logical_and(a_bool.cpu(), b_bool.cpu()))
+
+        a = (torch.randn(256, 721, dtype=torch.bfloat16) / 8).to("neuron")
+        b = (torch.randn(256, 721, dtype=torch.bfloat16) / 8).to("neuron")
+        with _assert_dynamic_ran("logical_and"):
+            got = torch.logical_and(a, b).cpu()
+        torch.testing.assert_close(got, torch.logical_and(a.cpu(), b.cpu()), rtol=0, atol=0)
+
+    def test_dynamic_nki_logical_and_mixed_dtype_declines(self):
+        """One access pattern serves both operands, so a promoted bool/float pair declines."""
+        entry = _entry("logical_and")
+        a = (torch.rand(256, 720) > 0.5).to("neuron")
+        b = (torch.randn(256, 720, dtype=torch.bfloat16) / 8).to("neuron")
+        assert not entry.can_handle(a, b)
+        with _assert_dynamic_skipped("logical_and"):
+            got = torch.logical_and(a, b).cpu()
+        torch.testing.assert_close(got, torch.logical_and(a.cpu(), b.cpu()), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("bool_operands", [True, False], ids=["bool", "float"])
+    def test_dynamic_nki_logical_and_out_writes_in_place(self, bool_operands):
+        """Nothing is padded, so out= backs the output directly -- including the bool dest the
+        packed kernel writes through an int16 view."""
+        if bool_operands:
+            a = (torch.rand(256, 720) > 0.5).to("neuron")
+            b = (torch.rand(256, 720) > 0.5).to("neuron")
+        else:
+            a = (torch.randn(256, 720, dtype=torch.bfloat16) / 8).to("neuron")
+            b = (torch.randn(256, 720, dtype=torch.bfloat16) / 8).to("neuron")
+        buf = torch.empty(256, 720, dtype=torch.bool).to("neuron")
+        with _assert_dynamic_ran("logical_and"):
+            res = torch.logical_and(a, b, out=buf)
+        assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
+        torch.testing.assert_close(buf.cpu(), torch.logical_and(a.cpu(), b.cpu()), rtol=0, atol=0)
+
+    # ── div: three divisor forms, one NEFF each ──
+    def test_dynamic_nki_div_plan_shapes(self):
+        """Plan #38's [512,4] / [512,1] and larger reruns: one NEFF for every row count."""
+        entry = _entry("div")
+        compiled_before = len(entry._compiled)
+        for rows in (512, 4096, 513):
+            x = torch.randn(rows, 4, dtype=torch.bfloat16) / 8
+            d = (torch.randn(rows, 1, dtype=torch.bfloat16) / 8).abs() + 0.05
+            with _assert_dynamic_ran("div"):
+                got = torch.div(x.to("neuron"), d.to("neuron")).cpu()
+            ref = (x.float() * d.float().reciprocal()).to(torch.bfloat16)
+            torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=f"rows={rows}")
+        assert len(entry._compiled) - compiled_before <= 1, "recompiled across row counts"
+
+    def test_dynamic_nki_div_scalar_no_recompile(self):
+        """The divisor column is a runtime operand, so distinct scalars must not add NEFFs. H is
+        unique to this test so sibling specs can't mask a miss."""
+        entry = _entry("div")
+        h = 1102
+        x = (torch.randn(256, h, dtype=torch.bfloat16) / 8).to("neuron")
+        torch.div(x, 2.0).cpu()  # compile the (h, bf16, scalar) NEFF
+        compiled_before = len(entry._compiled)
+        for other in (0.3, -1.5, 7.25, 2.0):
+            got = torch.div(x, other).cpu()
+            ref = (x.cpu().float() * (1.0 / other)).to(torch.bfloat16)
+            torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=f"other={other}")
+        assert len(entry._compiled) == compiled_before, "a distinct divisor compiled a NEFF"
+
+    @pytest.mark.parametrize("dtype", _DTYPES, ids=[_DTYPE_ID[d] for d in _DTYPES])
+    def test_dynamic_nki_div_accuracy(self, dtype):
+        """a * reciprocal(b) in fp32 lands on the correctly rounded quotient exactly for
+        bf16/fp16, and within one ULP for fp32 (the reciprocal's own rounding)."""
+        x = torch.randn(256, 512, dtype=dtype) / 8
+        y = (torch.randn(256, 512, dtype=dtype) / 8).abs() + 0.05
+        with _assert_dynamic_ran("div"):
+            got = torch.div(x.to("neuron"), y.to("neuron")).cpu()
+        exact = (x.double() / y.double()).to(dtype)
+        if dtype is torch.float32:
+            torch.testing.assert_close(got, exact, rtol=2**-23, atol=0)
+        else:
+            torch.testing.assert_close(got, exact, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("form", ["tensor", "row"])
+    def test_dynamic_nki_div_matches_static_lowering(self, form):
+        """Bit-for-bit against the default lowering, which does the same recip-then-multiply.
+        Not the scalar form: static rounds the divisor to the operand dtype first, the dynamic
+        path keeps the fp32 value (and is the closer of the two)."""
+        x = torch.randn(300, 256, dtype=torch.bfloat16) / 8
+        shape = (300, 256) if form == "tensor" else (300, 1)
+        y = (torch.randn(*shape, dtype=torch.bfloat16) / 8).abs() + 0.05
+        xn, yn = x.to("neuron"), y.to("neuron")
+        entry = _entry("div")
+        with _assert_dynamic_ran("div"):
+            dynamic = torch.div(xn, yn).cpu()
+        # Look the entry up before the toggle: get_dynamic_nki_entry is itself flag-gated.
+        exec_before = entry._exec_count
+        with _static_lowering():
+            static = torch.div(xn, yn).cpu()
+        assert entry._exec_count == exec_before, "flag off but the dynamic kernel still ran"
+        torch.testing.assert_close(dynamic, static, rtol=0, atol=0)
+
+    def test_dynamic_nki_div_by_zero_matches_torch(self):
+        """The ALU produces inf / -inf / nan just as torch does, so a zero divisor needs no gate."""
+        x = torch.tensor([[1.0, -2.0, 0.0, 3.0]] * 256, dtype=torch.float32)
+        z = torch.zeros(256, 4, dtype=torch.float32)
+        with _assert_dynamic_ran("div"):
+            got = torch.div(x.to("neuron"), z.to("neuron")).cpu()
+        torch.testing.assert_close(got, torch.div(x, z), rtol=0, atol=0, equal_nan=True)
+
+    def test_dynamic_nki_div_declines(self):
+        """rounding_mode, a 0-d device tensor divisor (reading it would sync), and a broadcast
+        the kernel can't tile."""
+        entry = _entry("div")
+        x = (torch.randn(256, 64, dtype=torch.bfloat16) / 8).to("neuron")
+        assert not entry.can_handle(x, 2.0, rounding_mode="floor")
+        assert not entry.can_handle(x, torch.tensor(2.0, dtype=torch.bfloat16).to("neuron"))
+        assert not entry.can_handle(x, (torch.randn(1, 64, dtype=torch.bfloat16)).to("neuron"))
+        with _assert_dynamic_skipped("div"):
+            got = torch.div(x, 2.0, rounding_mode="floor").cpu()
+        torch.testing.assert_close(got, torch.div(x.cpu(), 2.0, rounding_mode="floor"))
+
+    def test_dynamic_nki_div_out_writes_in_place(self):
+        """Unpadded, so the kernel writes into out= directly -- result aliases it."""
+        x = (torch.randn(256, 720, dtype=torch.bfloat16) / 8).to("neuron")
+        buf = torch.empty(256, 720, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("div"):
+            res = torch.div(x, 3.5, out=buf)
+        assert res.data_ptr() == buf.data_ptr(), "out= was not written in place"
+        ref = (x.cpu().float() * (1.0 / 3.5)).to(torch.bfloat16)
+        torch.testing.assert_close(buf.cpu(), ref, rtol=0, atol=0)
+
     def test_dynamic_nki_add_alpha_declines(self):
         # alpha != 1 can't be honored by the a+b kernel -> can_handle rejects -> fallback.
         x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)
