@@ -31,6 +31,10 @@ def mm_block_size_n(num_tile_k: int) -> int:
     return _MM_BLOCK_N_CANDIDATES[-1]
 
 
+# One [_TILE_M, C] zero block for each (C, dtype, device), so a pad never allocates a
+# tensor whose shape depends on the token count.
+_ZERO_TILE_CACHE: dict[tuple[int, torch.dtype, str, int], torch.Tensor] = {}
+
 # Memoized [[num_tiles]] int32 device tensors: torch.tensor(..., device="neuron")
 # does a host->device copy every call, but the value only depends on num_tiles.
 # Keyed by (num_tiles, device.type, device.index); kernels read it read-only.
@@ -51,6 +55,17 @@ def _ceil_to_tile(n: int) -> int:
     return -(-int(n) // _TILE_M) * _TILE_M
 
 
+def _zero_tile(C: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:  # noqa: N803
+    """One cached [_TILE_M, C] block of zeros for each (C, dtype, device). Read-only:
+    callers copy out of it, so it stays zero for the life of the process."""
+    key = (int(C), dtype, device.type, device.index if device.index is not None else -1)
+    t = _ZERO_TILE_CACHE.get(key)
+    if t is None:
+        t = torch.zeros(_TILE_M, C, dtype=dtype, device=device)
+        _ZERO_TILE_CACHE[key] = t
+    return t
+
+
 def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
     """Zero-pad [r, C] up to [target_rows, C] (r <= target_rows). Used to pad the
     index/data to the baked source size T (gather/scatter) or the dynamic-M input
@@ -59,6 +74,14 @@ def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
     if r == target_rows:
         return t_2d
     C = t_2d.shape[-1]  # noqa: N806
+    # A 128-multiple ceiling puts every padded row in the last tile, so zero only that
+    # fixed-size block. `torch.zeros(target_rows, C)` would key a NEFF on target_rows,
+    # which moves with the token count; a copy_ carries neither row count nor offset.
+    if target_rows >= _TILE_M and target_rows - r < _TILE_M:
+        out = torch.empty(target_rows, C, dtype=t_2d.dtype, device=t_2d.device)
+        out[target_rows - _TILE_M :] = _zero_tile(C, t_2d.dtype, t_2d.device)
+        out[:r] = t_2d
+        return out
     padded = torch.zeros(target_rows, C, dtype=t_2d.dtype, device=t_2d.device)
     padded[:r] = t_2d
     return padded

@@ -1583,6 +1583,99 @@ class TestDynamicNkiKernels:
             odd_w = torch.empty(256, lnc * 4 + 1, dtype=torch.bfloat16, device="neuron")
             assert _can_handle_mm(odd_a, odd_w) is False
 
+    # Generalized mm_k: M and N are baked, so the kernel peels a short final tile.
+    # A decline is not free here. This op is the MoE backward dW, so a decline becomes a
+    # `prologue` recompile. DSv3-16B at TP4 has M or N = 1408/4 = 352 on every expert.
+    @pytest.mark.parametrize(
+        "M, N",
+        [
+            (2048, 4096),  # both aligned (regression)
+            (2048, 512),  # smallest aligned N
+            (2048, 352),  # dsv3 16B TP4 w1/w3 dW: N below one n-tile
+            (352, 2048),  # dsv3 16B TP4 w2 dW: M = 128 + 128 + 96
+            (352, 352),  # both dims ragged
+            (96, 130),  # no full tile in either dim
+            (128, 4096),  # single m-tile, 8 full n-tiles
+            (129, 513),  # 1-wide m-tail and n-tail (smallest remainders)
+        ],
+    )
+    def test_dynamic_nki_mm_k_generalized_shapes(self, M, N):  # noqa: N803
+        """grad_weight = x_e.T @ dout for a ragged M and N, at a K of 2 contraction tiles."""
+        K = 200  # noqa: N806  (K_ceil = 256)
+        g = torch.Generator().manual_seed(M + N)
+        x = torch.randn(K, M, dtype=torch.bfloat16, generator=g) / 8
+        d = torch.randn(K, N, dtype=torch.bfloat16, generator=g) / 8
+        ref = x.float().t() @ d.float()
+        mat1 = x.to("neuron").t()  # stride (1, M) -> _resolve_entry routes to mm_k
+        with _assert_dynamic_ran("mm_k"):
+            got = torch.mm(mat1, d.to("neuron")).cpu().float()
+        torch.testing.assert_close(got, ref, rtol=3e-2, atol=3e-2)
+
+    def test_dynamic_nki_mm_k_no_recompile_across_k(self):
+        """One NEFF for each (M, N) at the DSv3 dW shapes. Every per-expert token count
+        reuses it, also a count below one contraction tile."""
+        mm_k = _entry("mm_k")
+        for M, N in ((2048, 352), (352, 2048)):  # noqa: N806
+            compiled = None
+            for K in (46, 130, 200, 384, 500):  # noqa: N806
+                x = (torch.randn(K, M, dtype=torch.bfloat16) / 8).to("neuron")
+                d = (torch.randn(K, N, dtype=torch.bfloat16) / 8).to("neuron")
+                with _assert_dynamic_ran("mm_k"):
+                    torch.mm(x.t(), d)
+                torch_neuronx.synchronize()
+                if compiled is None:
+                    compiled = len(mm_k._compiled)
+                assert len(mm_k._compiled) == compiled, (
+                    f"mm_k recompiled at M={M} N={N} K={K}: NEFFs "
+                    f"{compiled} -> {len(mm_k._compiled)}"
+                )
+
+    def test_dynamic_nki_pad_rows_compiles_nothing_per_count(self):
+        """`_pad_rows_to` must not key a NEFF on target_rows. A 128-multiple ceiling puts
+        every padded row in the last tile, so only that fixed block needs zeroing."""
+        import torch_neuronx._C as _C
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapter_utils import (
+            _ceil_to_tile,
+            _pad_rows_to,
+        )
+
+        def keys():
+            return {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+
+        C = 2048  # noqa: N806
+        warm = (torch.randn(46, C, dtype=torch.bfloat16) / 8).to("neuron")
+        _pad_rows_to(warm, _ceil_to_tile(46)).sum().to("cpu")
+        before = keys()
+        for K in (200, 384, 500, 700):  # noqa: N806
+            src = (torch.randn(K, C, dtype=torch.bfloat16) / 8).to("neuron")
+            out = _pad_rows_to(src, _ceil_to_tile(K))
+            torch_neuronx.synchronize()
+            assert tuple(out.shape) == (_ceil_to_tile(K), C)
+            torch.testing.assert_close(out[:K].cpu(), src.cpu(), rtol=0, atol=0)
+            assert bool((out[K:].cpu() == 0).all()), f"pad rows not zero at K={K}"
+        new = sorted(keys() - before)
+        assert not new, f"pad compiled {len(new)} new NEFF(s): {new}"
+
+    def test_dynamic_nki_mm_k_over_capacity_declines(self):
+        """Decline an N that is wider than the [128, N] SBUF buffer. Also decline a zero
+        extent."""
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapter_utils import (
+            _MM_RESIDENT_BUDGET,
+        )
+        from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapters.matmul_k import (
+            _can_handle_mm_k,
+        )
+
+        nb = {"dtype": torch.bfloat16, "device": "neuron"}
+        n_max = _MM_RESIDENT_BUDGET // 2  # bf16: 2 bytes/element/partition
+        mat1 = torch.empty(2048, 200, **nb)
+        assert _can_handle_mm_k(mat1, torch.empty(200, 4096, **nb)) is True
+        assert _can_handle_mm_k(mat1, torch.empty(200, n_max, **nb)) is True
+        assert _can_handle_mm_k(mat1, torch.empty(200, n_max + 1, **nb)) is False
+        # K == 0 has nothing to contract. N == 0 has no output column.
+        assert _can_handle_mm_k(torch.empty(2048, 0, **nb), torch.empty(0, 352, **nb)) is False
+        assert _can_handle_mm_k(mat1, torch.empty(200, 0, **nb)) is False
+
     # backward ops asserted on (mm/mm_k = grad_input/grad_weight).
     MOE_BWD_OPS: ClassVar = [
         "mm",
