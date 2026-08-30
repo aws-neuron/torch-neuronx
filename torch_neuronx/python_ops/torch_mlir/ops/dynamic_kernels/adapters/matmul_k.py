@@ -5,14 +5,22 @@ K-major kernel takes x_e=[K,M], dout=[K,N] and contracts the K partition dim via
 dynamic-count loop, so one NEFF serves any 128-multiple K. mat1=[M,K] is passed as
 x_e=mat1ᵀ=[K,M]. compile_key=(M,N). Registered as "mm_k"; the dispatcher routes an
 aten::mm with a transposed mat1 (the grad_weight signature) here.
+
+M and N do not need tile alignment. The kernel peels a short final tile. A decline is not
+free here. This op is the MoE backward dW, so a decline becomes a `prologue` recompile.
 """
 
 import torch
 
-from ..adapter_utils import _TILE_M, _ceil_to_tile, _compile_or_load_neff, _pad_rows_to
+from ..adapter_utils import (
+    _MM_RESIDENT_BUDGET,
+    _TILE_M,
+    _ceil_to_tile,
+    _compile_or_load_neff,
+    _pad_rows_to,
+)
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
-_MM_NBLOCK = 512  # dynamic_k kernel n-tile
 _K_COMPILE = 128  # one K-tile; runtime K supplied via num_k_tiles
 
 
@@ -29,7 +37,10 @@ def _can_handle_mm_k(mat1, mat2, out=None) -> bool:
     K2, N = mat2.shape  # noqa: N806
     if K != K2 or K == 0:  # K (contraction) dynamic — any K > 0, prepare_io pads it
         return False
-    if M % _TILE_M != 0 or N % _MM_NBLOCK != 0:  # noqa: SIM103  (M, N baked)
+    if M == 0 or N == 0:
+        return False
+    # The kernel stages the output zero-init in one [_TILE_M, N] SBUF buffer.
+    if N * mat1.element_size() > _MM_RESIDENT_BUDGET:  # noqa: SIM103
         return False
     return True
 
