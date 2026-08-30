@@ -14,8 +14,10 @@ def register_all():
         cast,
         comparison,
         concat,
+        div,
         elementwise,
         gather,
+        logical,
         matmul,
         matmul_k,
         reduction,
@@ -36,3 +38,5 @@ def register_all():
     where.register()
     bitwise.register()
     comparison.register()
+    logical.register()
+    div.register()

@@ -143,6 +143,66 @@ def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
     return torch.empty(M, H, dtype=dtype, device=device)
 
 
+def _device_key(device):
+    return (device.type, device.index if device.index is not None else -1)
+
+
+# Memoized like _NUM_TILES_CACHE: the value depends only on M.
+_CTRL_CACHE: dict = {}
+
+
+def _ctrl_tensor(m: int, device) -> torch.Tensor:
+    """[2, 1] int32 = [[whole 128-row tiles], [tail tile's row offset = M - 128]]."""
+    key = (int(m), *_device_key(device))
+    t = _CTRL_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([[m // _TILE_M], [m - _TILE_M]], dtype=torch.int32, device=device)
+        _CTRL_CACHE[key] = t
+    return t
+
+
+def _int16_dest_buffer(dest, M, H, device):  # noqa: N803
+    """[M, H//2] int16 buffer for a packed-bool NEFF. ``_dest_buffer`` needs a dtype match, but
+    out= is bool here; a contiguous bool dest backs it byte for byte, so view it as int16 and
+    write in place."""
+    if _dest_reusable(dest, M, H, torch.bool, device):
+        return dest.reshape(M, H).view(torch.int16)
+    return torch.empty(M, H // 2, dtype=torch.int16, device=device)
+
+
+def _scalar_operand(other):
+    """``other`` as a Python float when it is a scalar operand, else None.
+
+    The C++ dispatch path (the default) boxes a Python scalar as a 0-d float64 CPU tensor while
+    the Python path keeps a ``float``; gating on ``isinstance(other, Tensor)`` alone therefore
+    declines the .Scalar overload in production. A 0-d tensor on the DEVICE is not a scalar
+    operand: reading it host-side would sync every call.
+    """
+    if isinstance(other, torch.Tensor):
+        if other.dim() == 0 and other.device.type == "cpu":
+            return float(other)
+        return None
+    return float(other)
+
+
+def _dynamic_mh(x):
+    """(M, H) with the runtime-dynamic dim on M; H is baked. A leading product of >= one row tile
+    keeps the last dim as H ([6144, 720]); otherwise the last dim is the varying one, so collapse
+    to [numel, 1] ([1, seq] / [seq])."""
+    n = x.numel()
+    last = x.shape[-1]
+    if x.dim() >= 2 and last != 0 and (n // last) >= _TILE_M:
+        return n // last, last
+    return n, 1
+
+
+def _as_2d(t, M, H):  # noqa: N803
+    """[M, H] contiguous view. The .contiguous() is the only shape-keyed op left on this path,
+    so contiguous inputs must skip it."""
+    t_2d = t.reshape(M, H)
+    return t_2d if t_2d.is_contiguous() else t_2d.contiguous()
+
+
 def _compile_or_load_neff(kernel, graph_name, example_inputs, outputs):
     """Compile (cold) or load (warm) a dynamic NKI kernel at min tile size.
 

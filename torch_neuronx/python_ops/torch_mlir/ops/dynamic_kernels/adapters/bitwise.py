@@ -22,6 +22,7 @@ from ..adapter_utils import (
     _TILE_M,
     _compile_or_load_neff,
     _hidden_compile_key,
+    _int16_dest_buffer,
     _num_tiles_tensor,
     _pad_or_contig,
 )
@@ -74,24 +75,6 @@ def _compile_fn(compile_key):
 
     kernel = TorchMlirKernel(torch_fn=wrappers.dynamic_bitwise_or_nki, op_name=_GRAPH_NAME)
     return _compile_or_load_neff(kernel, _GRAPH_NAME, (a, b, nm), out)
-
-
-def _int16_dest_buffer(dest, M_ceil, H, device):  # noqa: N803
-    """Return the [M_ceil, H//2] int16 buffer the NEFF writes into.
-
-    ``_dest_buffer`` requires ``dest.dtype == dtype``, but out= is bool while the
-    kernel writes int16. A contiguous bool dest still backs it byte for byte, so
-    view it as int16 to write in place and skip dispatch's copy-back.
-    """
-    if (
-        dest is not None
-        and dest.dtype == torch.bool
-        and dest.device.type == device.type
-        and dest.numel() == M_ceil * H
-        and dest.is_contiguous()
-    ):
-        return dest.reshape(M_ceil, H).view(torch.int16)
-    return torch.empty(M_ceil, H // 2, dtype=torch.int16, device=device)
 
 
 def _prepare_io(input_a, input_b, dest=None, **_):
