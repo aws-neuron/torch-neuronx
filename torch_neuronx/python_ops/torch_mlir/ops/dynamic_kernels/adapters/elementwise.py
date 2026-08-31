@@ -26,7 +26,8 @@ from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 # ── per-op can_handle (kept separate; NOT merged into the factory) ──
 def _can_handle_unary(x, out=None) -> bool:
-    """silu / exp / sin / cos: one 2-D+ neuron tensor, supported dtype, M % 128 == 0."""
+    """silu / exp / sin / cos / sigmoid / log / neg: one 2-D+ neuron tensor,
+    supported dtype, M % 128 == 0."""
     return _can_handle_elementwise_2d(x)
 
 
