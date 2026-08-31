@@ -188,8 +188,10 @@ def _scalar_operand(other):
 def _dynamic_mh(x):
     """(M, H) with the runtime-dynamic dim on M; H is baked. A leading product of >= one row tile
     keeps the last dim as H ([6144, 720]); otherwise the last dim is the varying one, so collapse
-    to [numel, 1] ([1, seq] / [seq])."""
+    to [numel, 1] ([1, seq] / [seq]). A 0-dim scalar has no last dim -> return [numel, 1]."""
     n = x.numel()
+    if x.dim() == 0:
+        return n, 1
     last = x.shape[-1]
     if x.dim() >= 2 and last != 0 and (n // last) >= _TILE_M:
         return n // last, last

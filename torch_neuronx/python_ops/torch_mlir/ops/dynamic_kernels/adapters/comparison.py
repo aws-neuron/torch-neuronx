@@ -97,6 +97,8 @@ def _can_handle_compare(x, other, out=None, **_) -> bool:
             return False
     elif not math.isfinite(_scalar_operand(other)):  # NaN/inf ALU semantics unverified
         return False
+    if x.dim() == 0:
+        return False
     M, H = _dynamic_mh(x)  # noqa: N806
     if M < _TILE_M:
         return False

@@ -63,6 +63,8 @@ def _can_handle_logical_and(input_a, input_b, out=None, **_) -> bool:
     # torch promotes mixed dtypes; one access pattern serves both operands here, so decline.
     if input_b.dtype != input_a.dtype or input_b.shape != input_a.shape:
         return False
+    if input_a.dim() == 0:
+        return False
     M, H = _dynamic_mh(input_a)  # noqa: N806
     if M < _TILE_M:
         return False
