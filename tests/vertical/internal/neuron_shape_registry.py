@@ -1,8 +1,8 @@
 """Op-specific shape registry backed by a consolidated CSV.
 
 CSV format:
-    op_name,arg_shapes,source_model,count
-    aten::linear,"{""input"":[1,2048,4096],""weight"":[11008,4096],""bias"":null}",llama-7b,47
+    op_name,arg_shapes,source_model,count,capture_paths
+    aten::linear,"{""input"":[1,2048,4096],""weight"":[11008,4096],""bias"":null}",llama-7b,47,
 
 Deduplicates on (op_name, arg_shapes). Merges counts across models.
 """
@@ -14,6 +14,7 @@ import functools
 import json
 import os
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from math import prod
 from pathlib import Path
@@ -31,6 +32,10 @@ class OpShapeEntry:
     op_name: str
     arg_shapes: dict[str, tuple[int, ...] | None]
     sources: dict[str, int] = field(default_factory=dict)  # model → count
+
+    # Capture paths this shape was actually seen on, e.g. {"eager"}, {"compiled"} or both.
+    # Property for a model-traced entry only; Empty for builtin/manual entries.
+    paths: set[str] = field(default_factory=set)
 
     @property
     def total_count(self) -> int:
@@ -71,8 +76,12 @@ class NeuronShapeRegistry:
         arg_shapes: dict[str, tuple[int, ...] | list[int] | None],
         source: str = "manual",
         count: int = 1,
+        paths: Iterable[str] = (),
     ) -> None:
-        """Register a shape combination. Deduplicates and merges counts."""
+        """Register a shape combination. Deduplicates and merges counts.
+
+        ``paths``: the paths that an op shape was captured from.
+        """
         normalized = {
             k: tuple(v) if isinstance(v, list | tuple) else v for k, v in arg_shapes.items()
         }
@@ -82,8 +91,10 @@ class NeuronShapeRegistry:
         if key in self._entries[op_name]:
             existing = self._entries[op_name][key]
             existing.sources[source] = existing.sources.get(source, 0) + count
+            existing.paths.update(paths)
         else:
             entry.sources[source] = count
+            entry.paths.update(paths)
             self._entries[op_name][key] = entry
 
     def get(self, op_name: str, model: str | None = None) -> list[OpShapeEntry]:
@@ -127,6 +138,7 @@ class NeuronShapeRegistry:
                     arg_shapes=entry["arg_shapes"],
                     source=source,
                     count=entry.get("count", 1),
+                    paths=entry.get("capture_paths", ()),
                 )
                 n += 1
         return n
@@ -141,6 +153,7 @@ class NeuronShapeRegistry:
                     arg_shapes=json.loads(row["arg_shapes"]),
                     source=row.get("source_model", "csv"),
                     count=int(row.get("count", 1)),
+                    paths=(row.get("capture_paths") or "").split(),
                 )
                 n += 1
         return n
@@ -150,11 +163,12 @@ class NeuronShapeRegistry:
         n = 0
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["op_name", "arg_shapes", "source_model", "count"])
+            writer.writerow(["op_name", "arg_shapes", "source_model", "count", "capture_paths"])
             for op_name in sorted(self._entries):
                 for entry in sorted(self._entries[op_name].values(), key=lambda e: -e.total_count):
+                    capture_paths = " ".join(sorted(entry.paths))
                     for source, count in sorted(entry.sources.items()):
-                        writer.writerow([op_name, entry.shapes_key, source, count])
+                        writer.writerow([op_name, entry.shapes_key, source, count, capture_paths])
                         n += 1
         return n
 
@@ -177,9 +191,6 @@ class NeuronShapeRegistry:
 
         This replaces the runtime ``.out`` / ``.default`` fallbacks in
         NeuronOpInfo with a one-time, auditable transformation of the registry.
-
-        Source attribution is preserved so ``shape_registry_model`` vs
-        ``shape_registry_default`` classification in the test continues to work.
 
         Runs once over the registry; cost is O(|registry| x overloads_per_base)
         schema compatibility checks (~13 ms on ~800 ops / ~1360 targets).
@@ -221,7 +232,7 @@ class NeuronShapeRegistry:
                     if not _entry_compatible_with_schema(entry.arg_shapes, tgt_schema):
                         continue
                     for source, count in entry.sources.items():
-                        self.register(tgt_name, entry.arg_shapes, source, count)
+                        self.register(tgt_name, entry.arg_shapes, source, count, entry.paths)
                     propagated += 1
         return propagated
 
@@ -389,14 +400,14 @@ def _entry_compatible_with_schema(arg_shapes: dict, tgt_schema) -> bool:
 
 # Load all shape defaults (hand-crafted + auto-generated).
 #
-# Model-traced shape sets live in the same registry as the builtin defaults. Registering them
-# is opt-in: ``NEURON_TRACED_MODEL`` (set by ``--traced-model``) is an allowlist, empty by
-# default. Adding a model to the registry doesn't impact existing runs.
+# The accuracy smoke test subsets live in the same registry as the builtin defaults.
+# Registering them is opt-in: ``NEURON_TRACED_MODEL`` (set by ``--traced-model``) is an
+# allowlist, and it is empty by default. A new subset does not impact the existing runs.
 def _load_defaults():
     from .neuron_shape_defaults_generated import register_all_defaults
 
     traced = [m.strip() for m in os.environ.get("NEURON_TRACED_MODEL", "").split(",") if m.strip()]
-    register_all_defaults(SHAPE_REGISTRY.register, traced_models=traced)
+    register_all_defaults(SHAPE_REGISTRY.register, smoke_subsets=traced)
 
 
 _load_defaults()

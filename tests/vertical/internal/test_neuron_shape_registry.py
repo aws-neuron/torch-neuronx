@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 from .neuron_shape_defaults_generated import (
-    QWEN3_235B_A22B,
-    TRACED_MODEL_OPS,
+    QWEN3_235B_EP64_TP4,
+    QWEN3_235B_EP64_TP4_NO_SHAPE_OPS,
+    QWEN3_235B_EP64_TP4_OP_MODE,
+    SMOKE_SUBSET_OP_MODE,
+    SMOKE_SUBSET_OPS,
     register_all_defaults,
 )
 from .neuron_shape_registry import BUILTIN_SOURCE, NeuronShapeRegistry
@@ -112,6 +115,26 @@ class TestNeuronShapeRegistry:
         reg = NeuronShapeRegistry()
         assert reg.get("aten::nonexistent") == []
 
+    # ── capture paths ────────────────────────────────────────────────────────
+
+    def test_capture_paths_union_on_dedup_and_stay_out_of_sources(self):
+        """A ``path`` is a separate field than ``sources``"""
+        reg = NeuronShapeRegistry()
+        shapes = {"self": (32, 64), "mat2": (64, 32)}
+        reg.register("aten::mm", shapes, source="llama", count=10, paths=("eager",))
+        reg.register("aten::mm", shapes, source="llama", count=2, paths=("compiled",))
+        entry = reg.get("aten::mm")[0]
+        assert entry.paths == {"compiled", "eager"}
+        assert entry.sources == {"llama": 12}
+        assert entry.total_count == 12  # the captured count, not once per path
+        assert reg.models() == ["llama"]
+
+    def test_entries_without_paths_stay_empty(self):
+        """Builtin and manual shapes have no paths field; The path set stay empty"""
+        reg = NeuronShapeRegistry()
+        reg.register("aten::mm", {"self": (8, 8), "mat2": (8, 8)}, source=BUILTIN_SOURCE)
+        assert reg.get("aten::mm")[0].paths == set()
+
     # ── CSV round-trip ───────────────────────────────────────────────────────
 
     def test_save_and_load_csv(self):
@@ -127,6 +150,7 @@ class TestNeuronShapeRegistry:
             arg_shapes={"input": (1, 2048, 4096), "weight": (11008, 4096), "bias": None},
             source="llama",
             count=47,
+            paths=("eager", "compiled"),
         )
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
@@ -146,6 +170,8 @@ class TestNeuronShapeRegistry:
         assert len(linear_entries) == 1
         assert linear_entries[0].arg_shapes["bias"] is None
         assert linear_entries[0].total_count == 47
+        assert linear_entries[0].paths == {"compiled", "eager"}  # survives the round-trip
+        assert mm_entries[0].paths == set()
 
         Path(path).unlink()
 
@@ -166,6 +192,7 @@ class TestNeuronShapeRegistry:
         assert rows[0]["op_name"] == "aten::mm"
         assert rows[0]["source_model"] == "test"
         assert rows[0]["count"] == "7"
+        assert rows[0]["capture_paths"] == ""
         shapes = json.loads(rows[0]["arg_shapes"])
         assert shapes["self"] == [32, 64]
 
@@ -328,30 +355,27 @@ class TestModelFilter:
         assert len(reg.get("aten::amax.out", model="qwen3-235b")) == 1
 
 
-# ── Model shape sets: the --traced-model registration gate ───────────────────
+class TestSmokeSubsetRegistrationGate:
+    """``register_all_defaults(smoke_subsets=...)``.
 
-
-class TestModelShapeSets:
-    """``register_all_defaults(traced_models=...)``.
-
-    The gate is what keeps a model set out of the shared pool until a run asks for it.
+    The gate is what keeps a subset out of the shared pool until a run asks for it.
     Without it the new entries would compete in the top-N-by-size cap in
     ``NeuronOpInfo._registry_entries`` and displace shapes the coverage suites measure
     today, so "off by default" is the property under test.
     """
 
     @staticmethod
-    def _register(traced_models):
+    def _register(smoke_subsets):
         reg = NeuronShapeRegistry()
-        register_all_defaults(reg.register, traced_models=traced_models)
+        register_all_defaults(reg.register, smoke_subsets=smoke_subsets)
         return reg
 
     def test_no_model_registers_only_builtin(self):
         assert self._register(()).models() == []
 
     def test_naming_a_set_registers_it_on_top_of_builtin(self):
-        reg = self._register([QWEN3_235B_A22B])
-        assert QWEN3_235B_A22B in reg.models()
+        reg = self._register([QWEN3_235B_EP64_TP4])
+        assert QWEN3_235B_EP64_TP4 in reg.models()
         # builtin is still there -- the set adds, it does not replace
         assert len(reg.get("aten::mm", model=BUILTIN_SOURCE)) > 0
 
@@ -360,10 +384,10 @@ class TestModelShapeSets:
         empty allowlist both yield exactly the builtin pool."""
         explicit_empty = self._register(())
         default_arg = NeuronShapeRegistry()
-        register_all_defaults(default_arg.register)  # no traced_models kwarg at all
+        register_all_defaults(default_arg.register)  # no smoke_subsets kwarg at all
         assert len(default_arg) == len(explicit_empty)
         assert default_arg.all_ops() == explicit_empty.all_ops()
-        assert len(explicit_empty) < len(self._register([QWEN3_235B_A22B]))
+        assert len(explicit_empty) < len(self._register([QWEN3_235B_EP64_TP4]))
 
     def test_unknown_model_raises_rather_than_registering_nothing(self):
         """A typo must not read as a clean run over zero shapes."""
@@ -371,14 +395,103 @@ class TestModelShapeSets:
             self._register(["qwen3-235b"])  # real name uses underscores
 
     def test_declared_op_set_matches_what_was_registered(self):
-        """``TRACED_MODEL_OPS`` is what the accuracy suite sweeps, so it must not drift from
-        the entries ``TRACED_MODEL_SHAPES`` actually registers."""
-        reg = self._register([QWEN3_235B_A22B])
-        registered = {op for op in reg.all_ops() if reg.get(op, model=QWEN3_235B_A22B)}
+        reg = self._register([QWEN3_235B_EP64_TP4])
+        registered = {op for op in reg.all_ops() if reg.get(op, model=QWEN3_235B_EP64_TP4)}
         # all_ops(model=) additionally reports propagated .out/.default overloads, so the
         # declared set is a subset -- every declared op must be present, none missing.
-        assert TRACED_MODEL_OPS[QWEN3_235B_A22B] <= registered
-        assert len(TRACED_MODEL_OPS[QWEN3_235B_A22B]) == 46
+        declared = SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]
+        assert declared - set(QWEN3_235B_EP64_TP4_NO_SHAPE_OPS) <= registered
+        assert len(declared) == 89
+
+
+class TestSmokeSubsetOpModesAndCapturePaths:
+    """
+    ``op_mode`` is per **op** property:
+      - ``eager_only``, only seen in eager dispatch op;
+      - ``compile_only``, only seen in AOT graphs decomposed op;
+      - ``both_modes``, show in both modes.
+    ``path`` is per **entry shape** property: which path (eager/compile) observed that
+    exact op shape call.
+    """
+
+    @staticmethod
+    def _register():
+        reg = NeuronShapeRegistry()
+        register_all_defaults(reg.register, smoke_subsets=[QWEN3_235B_EP64_TP4])
+        return reg
+
+    def test_op_set_is_exactly_the_op_mode_map(self):
+        assert SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4] == frozenset(QWEN3_235B_EP64_TP4_OP_MODE)
+        assert SMOKE_SUBSET_OP_MODE[QWEN3_235B_EP64_TP4] is QWEN3_235B_EP64_TP4_OP_MODE
+        assert set(QWEN3_235B_EP64_TP4_OP_MODE.values()) == {
+            "eager_only",
+            "compile_only",
+            "both_modes",
+        }
+
+    def test_every_declared_op_registers_a_shape_or_is_declared_shapeless(self):
+        """A declared op with no entries reports ``no_input_sample`` rather than vanishing, so
+        it has to be named in ``QWEN3_235B_EP64_TP4_NO_SHAPE_OPS``"""
+        reg = self._register()
+        declared = SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]
+        shapeless = {op for op in declared if not reg.get(op, model=QWEN3_235B_EP64_TP4)}
+        assert shapeless == set(QWEN3_235B_EP64_TP4_NO_SHAPE_OPS)
+
+    @staticmethod
+    def _paths(entry) -> set[str]:
+        return set(entry.paths)
+
+    def test_every_entry_carries_a_measured_capture_path(self):
+        reg = self._register()
+        for op in SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]:
+            for entry in reg.get(op, model=QWEN3_235B_EP64_TP4):
+                paths = self._paths(entry)
+                assert paths, f"{op} {entry.arg_shapes} has no capture path"
+                assert paths <= {"eager", "compiled"}, sorted(paths)
+
+    def test_capture_paths_stay_inside_the_op_mode(self):
+        reg = self._register()
+        allowed = {
+            "eager_only": {"eager"},
+            "compile_only": {"compiled"},
+            "both_modes": {"eager", "compiled"},
+        }
+        for op, mode in QWEN3_235B_EP64_TP4_OP_MODE.items():
+            for entry in reg.get(op, model=QWEN3_235B_EP64_TP4):
+                paths = self._paths(entry)
+                assert paths <= allowed[mode], f"{op} ({mode}) has paths {sorted(paths)}"
+
+    def test_both_paths_carry_shapes_that_the_other_does_not(self):
+        reg = self._register()
+        eager, compiled = set(), set()
+        for op in SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]:
+            for entry in reg.get(op, model=QWEN3_235B_EP64_TP4):
+                key = (op, repr(sorted(entry.arg_shapes.items(), key=str)))
+                paths = self._paths(entry)
+                if "eager" in paths:
+                    eager.add(key)
+                if "compiled" in paths:
+                    compiled.add(key)
+        assert eager - compiled, "no eager-only shapes: per-shape capture paths were lost"
+        assert compiled - eager, "no compiled-only shapes: per-shape capture paths were lost"
+        assert eager & compiled, "no shape seen on both paths"
+
+    def test_no_float_dtype_pins_and_no_captured_device_in_registry(self):
+        reg = self._register()
+
+        def specs(value):
+            if isinstance(value, dict):
+                yield value
+            elif isinstance(value, list | tuple):
+                for v in value:
+                    yield from specs(v)
+
+        for op in SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]:
+            for entry in reg.get(op, model=QWEN3_235B_EP64_TP4):
+                assert "device" not in entry.arg_shapes, op
+                for spec in specs(list(entry.arg_shapes.values())):
+                    dtype = str(spec.get("dtype") or "")
+                    assert not dtype.startswith("float"), f"{op} pins {dtype}"
 
 
 # ── Propagation to compatible overloads ─────────────────────────────────────

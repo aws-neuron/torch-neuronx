@@ -35,6 +35,7 @@ ROW_FIELDS = [
     "cell_id",
     "op",
     "op_group",
+    "op_mode",
     "dtype",
     "path",
     "arg_shapes",
