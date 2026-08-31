@@ -18,6 +18,7 @@ from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
 from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
 from .exp_kernel import exp_kernel
 from .gather_kernel import gather_kernel
+from .log_kernel import log_kernel
 from .mul_kernel import mul_kernel
 from .neg_kernel import neg_kernel
 from .ones_like_kernel import ones_like_kernel
@@ -51,6 +52,9 @@ _wrapped_silu = wrap_nki(silu_kernel)
 _wrapped_exp = wrap_nki(exp_kernel)
 _wrapped_cos = wrap_nki(cos_kernel)
 _wrapped_sin = wrap_nki(sin_kernel)
+_wrapped_sigmoid = wrap_nki(sigmoid_kernel)
+_wrapped_log = wrap_nki(log_kernel)
+_wrapped_neg = wrap_nki(neg_kernel)
 _wrapped_mul = wrap_nki(mul_kernel)
 _wrapped_sum = wrap_nki(sum_kernel)
 _wrapped_cat = wrap_nki(cat_kernel)
@@ -113,6 +117,21 @@ def dynamic_cos_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> to
 @nki_op("dynamic_nki::sin", mutates_args={})
 def dynamic_sin_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
     return _wrapped_sin[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::sigmoid", mutates_args={})
+def dynamic_sigmoid_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_sigmoid[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::log", mutates_args={})
+def dynamic_log_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_log[_GRID](input_tensor, num_m_tiles)
+
+
+@nki_op("dynamic_nki::neg", mutates_args={})
+def dynamic_neg_nki(input_tensor: torch.Tensor, num_m_tiles: torch.Tensor) -> torch.Tensor:
+    return _wrapped_neg[_GRID](input_tensor, num_m_tiles)
 
 
 @nki_op("dynamic_nki::mul", mutates_args={})
