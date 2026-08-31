@@ -24,6 +24,7 @@ from nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib.core.attention.attention_cte import attention_cte
 from torch._decomp import get_decompositions
 
+from torch_neuronx import _interpolation_maps as interpolation_maps
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool, _getenv_int
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
@@ -178,17 +179,9 @@ neuron_decompositions = get_decompositions(
         aten.max_unpool3d,
         aten.split_with_sizes_copy,
         aten._adaptive_avg_pool2d,
-        # Upsample/interpolate forward ops. PyTorch's built-in
-        # decompositions for nearest2d and bicubic2d lower correctly on Neuron,
-        # so we pull them in directly. Registering the functional packet also
-        # covers the .vec and (via functionalization) .out overloads.
-        # NOTE: the linear-family builtins (bilinear2d/linear1d/trilinear3d)
-        # produce incorrect results on Neuron (~99% mismatch vs CPU), so those
-        # are handled by the custom separable-matmul decompositions below
-        # instead of being registered here.
-        aten.upsample_nearest2d,
-        aten.upsample_bicubic2d,
-        aten._upsample_nearest_exact2d,
+        # upsample/interpolate is registered explicitly below (see
+        # _interpolation_maps), not pulled in: PyTorch's nearest builtin casts its
+        # index map to int without a floor, which samples the wrong pixel on Neuron.
         # count_nonzero, multi_margin_loss, and multilabel_margin_loss_forward
         # all have correct built-in decompositions wrapped with ``@out_wrapper``,
         # so pulling in the packet covers both the ``.default`` and the
@@ -6399,47 +6392,6 @@ def polygamma_decomp(n, x):
     return sign * factor * aten.special_zeta.default(s_tensor, x)
 
 
-def _nearest_src_index(out_size, in_size, scale, device):
-    """Map each output index to its nearest source index.
-
-    Mirrors aten's ``compute_scales_value`` + ``nearest_neighbor_compute_source_index``:
-    ``src = min(floor(dst * s), in_size - 1)`` where ``s`` is the explicit
-    reciprocal scale when provided, else ``in_size / out_size``.
-    """
-    s = (1.0 / scale) if scale is not None else (float(in_size) / float(out_size))
-    dst = torch.arange(out_size, dtype=torch.float32, device=device)
-    src = torch.floor(dst * s).to(torch.long)
-    return torch.clamp(src, 0, in_size - 1)
-
-
-@register_decomposition([aten.upsample_nearest2d_backward.default])
-def upsample_nearest2d_backward_decomposition(
-    grad_output, output_size, input_size, scales_h=None, scales_w=None
-):
-    """Decompose upsample_nearest2d backward into scatter-add gathers.
-
-    The backward of nearest-neighbor upsampling routes
-    each output gradient back to the single source pixel it was copied from, so
-    the gradient is a scatter-add over the nearest-index maps for H and W. We
-    accumulate over H first (smaller intermediate) then over W.
-    """
-    N, C, H, W = input_size
-    oh, ow = grad_output.shape[-2:]
-    dev = grad_output.device
-
-    ih = _nearest_src_index(oh, H, scales_h, dev)
-    iw = _nearest_src_index(ow, W, scales_w, dev)
-
-    go = grad_output.reshape(N, C, oh, ow)
-
-    tmp_h = torch.zeros(N, C, H, ow, dtype=grad_output.dtype, device=dev)
-    tmp_h = tmp_h.scatter_add(2, ih.view(1, 1, oh, 1).expand(N, C, oh, ow), go)
-
-    out = torch.zeros(N, C, H, W, dtype=grad_output.dtype, device=dev)
-    out = out.scatter_add(3, iw.view(1, 1, 1, ow).expand(N, C, H, ow), tmp_h)
-    return out
-
-
 def _linear_resample_matrix(in_size, out_size, scale, align_corners, antialias, device, dtype):
     """Build a 1-D linear resampling weight matrix of shape ``(out_size, in_size)``.
 
@@ -6517,18 +6469,71 @@ def _resolve_vec_sizes(in_spatial, output_size, scale_factors):
     return sizes, list(scale_factors)
 
 
+# --- upsample / interpolate: forward + backward ---
+# Thin wrappers over _interpolation_maps.py (shared with the eager path).
+
+
+@register_decomposition([aten.upsample_nearest1d.default])
+def upsample_nearest1d_decomposition(self, output_size, scales=None):
+    return interpolation_maps.nearest_forward(
+        self, output_size, [scales], exact=False, short_circuit=False
+    )
+
+
+@register_decomposition([aten.upsample_nearest1d.vec])
+def upsample_nearest1d_vec_decomposition(input, output_size, scale_factors):
+    sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
+    return upsample_nearest1d_decomposition(input, sizes, scales[0])
+
+
+@register_decomposition([aten._upsample_nearest_exact1d.default])
+def upsample_nearest_exact1d_decomposition(self, output_size, scales=None):
+    return interpolation_maps.nearest_forward(
+        self, output_size, [scales], exact=True, short_circuit=False
+    )
+
+
+@register_decomposition([aten._upsample_nearest_exact1d.vec])
+def upsample_nearest_exact1d_vec_decomposition(input, output_size, scale_factors):
+    sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
+    return upsample_nearest_exact1d_decomposition(input, sizes, scales[0])
+
+
+@register_decomposition([aten.upsample_nearest2d.default])
+def upsample_nearest2d_decomposition(self, output_size, scales_h=None, scales_w=None):
+    return interpolation_maps.nearest_forward(
+        self, output_size, [scales_h, scales_w], exact=False, short_circuit=True
+    )
+
+
+@register_decomposition([aten.upsample_nearest2d.vec])
+def upsample_nearest2d_vec_decomposition(input, output_size, scale_factors):
+    sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
+    return upsample_nearest2d_decomposition(input, sizes, scales[0], scales[1])
+
+
+@register_decomposition([aten._upsample_nearest_exact2d.default])
+def upsample_nearest_exact2d_decomposition(self, output_size, scales_h=None, scales_w=None):
+    return interpolation_maps.nearest_forward(
+        self, output_size, [scales_h, scales_w], exact=True, short_circuit=False
+    )
+
+
+@register_decomposition([aten._upsample_nearest_exact2d.vec])
+def upsample_nearest_exact2d_vec_decomposition(input, output_size, scale_factors):
+    sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
+    return upsample_nearest_exact2d_decomposition(input, sizes, scales[0], scales[1])
+
+
 @register_decomposition([aten.upsample_linear1d.default])
 def upsample_linear1d_decomposition(self, output_size, align_corners, scales=None):
-    """Decompose 1-D linear upsample as a single separable matmul."""
-    (ow,) = output_size
-    in_w = self.shape[-1]
-    ww = _linear_resample_matrix(in_w, ow, scales, align_corners, False, self.device, self.dtype)
-    return torch.einsum("oi,nci->nco", ww, self)
+    return interpolation_maps.bimode_forward(
+        self, output_size, align_corners, [scales], cubic=False
+    )
 
 
 @register_decomposition([aten.upsample_linear1d.vec])
 def upsample_linear1d_vec_decomposition(input, output_size, align_corners, scale_factors):
-    """Decompose the .vec overload by resolving sizes/scales then delegating."""
     sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
     return upsample_linear1d_decomposition(input, sizes, align_corners, scales[0])
 
@@ -6537,19 +6542,136 @@ def upsample_linear1d_vec_decomposition(input, output_size, align_corners, scale
 def upsample_bilinear2d_decomposition(
     self, output_size, align_corners, scales_h=None, scales_w=None
 ):
-    """Decompose 2-D bilinear upsample as two separable matmuls."""
-    oh, ow = output_size
-    in_h, in_w = self.shape[-2:]
-    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, False, self.device, self.dtype)
-    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, False, self.device, self.dtype)
-    return torch.einsum("oi,ncij,wj->ncow", wh, self, ww)
+    return interpolation_maps.bimode_forward(
+        self, output_size, align_corners, [scales_h, scales_w], cubic=False
+    )
 
 
 @register_decomposition([aten.upsample_bilinear2d.vec])
 def upsample_bilinear2d_vec_decomposition(input, output_size, align_corners, scale_factors):
-    """Decompose the .vec overload by resolving sizes/scales then delegating."""
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_bilinear2d_decomposition(input, sizes, align_corners, scales[0], scales[1])
+
+
+@register_decomposition([aten.upsample_bicubic2d.default])
+def upsample_bicubic2d_decomposition(
+    self, output_size, align_corners, scales_h=None, scales_w=None
+):
+    return interpolation_maps.bimode_forward(
+        self, output_size, align_corners, [scales_h, scales_w], cubic=True
+    )
+
+
+@register_decomposition([aten.upsample_bicubic2d.vec])
+def upsample_bicubic2d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
+    return upsample_bicubic2d_decomposition(input, sizes, align_corners, scales[0], scales[1])
+
+
+@register_decomposition([aten.upsample_nearest1d_backward.default])
+def upsample_nearest1d_backward_decomposition(grad_output, output_size, input_size, scales=None):
+    return interpolation_maps.nearest_backward(
+        grad_output, output_size, input_size, [scales], exact=False
+    )
+
+
+@register_decomposition([aten._upsample_nearest_exact1d_backward.default])
+def upsample_nearest_exact1d_backward_decomposition(
+    grad_output, output_size, input_size, scales=None
+):
+    return interpolation_maps.nearest_backward(
+        grad_output, output_size, input_size, [scales], exact=True
+    )
+
+
+@register_decomposition([aten.upsample_nearest2d_backward.default])
+def upsample_nearest2d_backward_decomposition(
+    grad_output, output_size, input_size, scales_h=None, scales_w=None
+):
+    return interpolation_maps.nearest_backward(
+        grad_output, output_size, input_size, [scales_h, scales_w], exact=False
+    )
+
+
+@register_decomposition([aten._upsample_nearest_exact2d_backward.default])
+def upsample_nearest_exact2d_backward_decomposition(
+    grad_output, output_size, input_size, scales_h=None, scales_w=None
+):
+    return interpolation_maps.nearest_backward(
+        grad_output, output_size, input_size, [scales_h, scales_w], exact=True
+    )
+
+
+@register_decomposition([aten.upsample_linear1d_backward.default])
+def upsample_linear1d_backward_decomposition(
+    grad_output, output_size, input_size, align_corners, scales=None
+):
+    return interpolation_maps.bimode_backward(
+        grad_output, output_size, input_size, align_corners, [scales], cubic=False
+    )
+
+
+@register_decomposition([aten.upsample_bilinear2d_backward.default])
+def upsample_bilinear2d_backward_decomposition(
+    grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
+):
+    return interpolation_maps.bimode_backward(
+        grad_output, output_size, input_size, align_corners, [scales_h, scales_w], cubic=False
+    )
+
+
+@register_decomposition([aten.upsample_bicubic2d_backward.default])
+def upsample_bicubic2d_backward_decomposition(
+    grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
+):
+    return interpolation_maps.bimode_backward(
+        grad_output, output_size, input_size, align_corners, [scales_h, scales_w], cubic=True
+    )
+
+
+_UPSAMPLE_FORWARD_PACKETS = (
+    aten.upsample_nearest1d,
+    aten.upsample_nearest2d,
+    aten._upsample_nearest_exact1d,
+    aten._upsample_nearest_exact2d,
+    aten.upsample_linear1d,
+    aten.upsample_bilinear2d,
+    aten.upsample_bicubic2d,
+)
+
+
+def _release_upsample_builtin_python_decompositions():
+    """Stop PyTorch's own upsample decompositions from shadowing ours.
+
+    PyTorch publishes these decompositions both in the global decomposition table
+    (which a backend table overrides) and as ``py_impl(Autograd)`` /
+    ``py_impl(CompositeImplicitAutograd)`` kernels on the op. AOTAutograd traces
+    under ``enable_python_dispatcher()``, where those kernels resolve above
+    ``__torch_dispatch__`` (the only place the decomposition table is consulted),
+    so the registrations above are dead until these keys are removed.
+
+    We pop rather than repoint: popping restores the C++ CompositeImplicitAutograd
+    route (``.vec`` -> ``.default`` -> our decomposition), leaves PyTorch's global
+    table intact for other backends, and keeps ``Meta`` for fake-tensor tracing.
+    ``make_fx`` runs without the python dispatcher and so will not reveal the
+    shadowing; only a real compile does. Pinned by ``TestDecompositionRouting``.
+    """
+    from torch._C import DispatchKey
+
+    shadowing_keys = (DispatchKey.Autograd, DispatchKey.CompositeImplicitAutograd)
+    for packet in _UPSAMPLE_FORWARD_PACKETS:
+        for overload_name in packet.overloads():
+            overload = getattr(packet, overload_name)
+            popped = False
+            for key in shadowing_keys:
+                if key in overload.py_kernels:
+                    del overload.py_kernels[key]
+                    popped = True
+            if popped:
+                overload._dispatch_cache.clear()
+
+
+_release_upsample_builtin_python_decompositions()
 
 
 @register_decomposition([aten.upsample_trilinear3d.default])

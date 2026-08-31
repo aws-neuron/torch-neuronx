@@ -96,6 +96,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*ReproTests::test_add_sub_alpha_out*",
             "*ReproTests::test_addr_alpha_beta_out*",
             "*ReproTests::test_dynamic_shape_disable_duck_size*",
+            "*UnspecTests::test_unspec_float_precision*",
             "SubclassTests::test_tensor_subclass_TwoTensor_nested",
             "TestTwoTensorSubclass::test_tensor_subclass_TwoTensor_nested",
         ],

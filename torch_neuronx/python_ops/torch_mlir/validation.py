@@ -3,6 +3,12 @@
 import torch
 
 
+def aten_scalar_type_name(dtype):
+    """ATen ScalarType spelling of a dtype (e.g. 'Long', not 'torch.int64'), for
+    "not implemented for '<dtype>'" messages matching the CPU kernels."""
+    return torch.empty((), dtype=dtype).type().rsplit(".", 1)[-1].removesuffix("Tensor")
+
+
 def validate_inplace_broadcast(destination, *operands, **_kwargs):
     """Reject broadcasts that would expand an in-place destination."""
     if not isinstance(destination, torch.Tensor):

@@ -335,6 +335,13 @@ ATEN_COMPLEX_DTYPE_UNSUPPORTED = [
 # cannot remove the marker without upstream patching, so we skip these
 # tests on Neuron to avoid false XPASS failures.
 ATEN_UPSTREAM_STRICT_XFAIL_PASSES_ON_NEURON = [
+    # Upstream's comprehensive_failures marks uint8 bilinear interpolate as
+    # xfail with the comment "off by one error". The Neuron lowering reproduces
+    # aten's half-up rounding and its narrowing after each 1-D pass, so it matches
+    # element for element and the test succeeds unexpectedly. (uint8 *bicubic* is
+    # still off by one and its upstream xfail continues to hold.)
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_interpolate_bilinear_neuron_uint8",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_upsample_bilinear_neuron_uint8",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace__foreach_lerp_neuron_int64",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace__foreach_sub_neuron_float64",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace__foreach_sub_neuron_int64",
@@ -378,16 +385,10 @@ ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT = [
     "test_ops.py::TestCommonNEURON::test_dtypes_masked_normalize_neuron",
 ]
 
-# No Neuron lowering for upsample_bilinear2d / upsample_bicubic2d
-ATEN_UPSAMPLINGBIMODE2D_NO_LOWERING = [
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bicubic_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bicubic_memory_format1_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bilinear_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_False_mode_bilinear_memory_format1_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bicubic_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bicubic_memory_format1_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bilinear_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_False_align_corners_True_mode_bilinear_memory_format1_neuron",
+# No Neuron lowering for the anti-aliased _upsample_bilinear2d_aa /
+# _upsample_bicubic2d_aa pair. The antialias=False subtests lower natively
+# via upsample_bilinear2d / upsample_bicubic2d and are no longer skipped.
+ATEN_UPSAMPLINGBIMODE2D_AA_NO_LOWERING = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format0_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format1_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bilinear_memory_format0_neuron",
