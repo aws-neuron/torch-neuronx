@@ -7,6 +7,7 @@ try:
     from nkilib.experimental.foreach import l1_norm_kernel, l2_norm_kernel, linf_norm_kernel
 
     from torch_neuronx.nki_hop import nki_op, wrap_nki
+    from torch_neuronx.utils import get_logical_neuron_cores
 
     _l2_norm_kernel = wrap_nki(l2_norm_kernel)
     _l1_norm_kernel = wrap_nki(l1_norm_kernel)
@@ -17,7 +18,7 @@ try:
         orig_dtype = data.dtype
         if data.dtype == torch.float64:
             data = data.float()
-        result = _l2_norm_kernel[(2,)](data, data.numel())
+        result = _l2_norm_kernel[(int(get_logical_neuron_cores()),)](data, data.numel())
         return result.to(orig_dtype) if orig_dtype == torch.float64 else result
 
     @nki_op("torch_neuronx::l1_norm", mutates_args={})
@@ -25,7 +26,7 @@ try:
         orig_dtype = data.dtype
         if data.dtype == torch.float64:
             data = data.float()
-        result = _l1_norm_kernel[(2,)](data, data.numel())
+        result = _l1_norm_kernel[(int(get_logical_neuron_cores()),)](data, data.numel())
         return result.to(orig_dtype) if orig_dtype == torch.float64 else result
 
     @nki_op("torch_neuronx::linf_norm", mutates_args={})
@@ -33,7 +34,7 @@ try:
         orig_dtype = data.dtype
         if data.dtype == torch.float64:
             data = data.float()
-        result = _linf_norm_kernel[(2,)](data, data.numel())
+        result = _linf_norm_kernel[(int(get_logical_neuron_cores()),)](data, data.numel())
         return result.to(orig_dtype) if orig_dtype == torch.float64 else result
 
     _has_nki_norm_kernels = True
