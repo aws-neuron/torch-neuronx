@@ -411,4 +411,21 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         tests=s.ATEN_UPSAMPLINGBIMODE2D_NO_LOWERING,
     ),
+    SkipGroup(
+        reason=(
+            "The upstream test makes a tensor with 65 dimensions. These masked"
+            " reductions build their mask with torch.ones, so a 65-dimension"
+            " aten::ones reaches neuronx-cc, which supports a maximum of 64."
+            " The test still passes, because the RuntimeError it asserts comes"
+            " from the host check in ATen/WrapDimUtilsMulti.h. The compilation"
+            " failure stays queued and appears in a later test. A skip stops the"
+            " dispatch. An xfail keeps the dispatch, so the test still queues"
+            " the error."
+        ),
+        tests=[
+            "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_mean_neuron",
+            "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_std_neuron",
+            "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_var_neuron",
+        ],
+    ),
 ]

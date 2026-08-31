@@ -201,6 +201,31 @@ def _reset_fx_tracing_flag():
     torch.fx._symbolic_trace._is_fx_tracing_flag = False
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    """Charge a queued async Neuron error to the test that caused it.
+
+    Drain in the call phase, not in teardown. A raise in the call phase obeys
+    the test's own xfail or skip marker. A raise in teardown makes an unmarked
+    test an ERROR.
+    """
+    result = yield
+
+    # Skip the drain for a --forked run. These are the distributed suites.
+    # --forked gives each test its own child process, so a queued error cannot
+    # reach the next test. The child also does not set a rank, so synchronize()
+    # raises "rank has not been set" and fails a test that passed.
+    if item.config.getoption("forked", False):
+        return result
+
+    import torch_neuronx
+
+    if not torch_neuronx.is_neuron_runtime_initialized():
+        return result
+    torch_neuronx.synchronize()
+    return result
+
+
 def pytest_configure(config):
     """Apply Neuron-specific patches after the torch._internal overlay.
 

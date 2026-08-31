@@ -111,7 +111,6 @@ COMPILER_ERROR_NEURON = [
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_conv_transpose3d_neuron_float64",
-    "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_var_neuron",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_2d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_grid_sample_neuron_float64",
