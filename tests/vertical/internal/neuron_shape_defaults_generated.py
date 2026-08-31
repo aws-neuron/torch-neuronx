@@ -6,14 +6,13 @@
 from .neuron_op_info import TENSOR_LIST_DEFAULT_COUNT as _N
 
 
-def register_all_defaults(r, traced_models=()):
+def register_all_defaults(r, smoke_subsets=()):
     """Register all shape entries (756 total).
 
-    ``traced_models`` names model-traced shape sets to register on top of the builtin defaults
-    (see ``TRACED_MODEL_SHAPES``). It is empty by default so a plain run sees exactly the
-    builtin pool it always has; naming one model uses ``--traced-model``. Keeping this an
-    allowlist rather than a default-on, which make model added ops not impact
-    pre-existing vertical tests.
+    ``smoke_subsets`` names the accuracy smoke test subsets to register on top of the builtin
+    defaults (see ``SMOKE_SUBSET_SHAPES``). It is an allowlist and it is empty by default, so a
+    plain run sees exactly the builtin pool it always has. ``--traced-model`` names a subset.
+    The allowlist keeps the ops of a subset out of the pre-existing vertical tests.
     """
 
     # Elementwise (self-only ops)
@@ -5297,2723 +5296,1669 @@ def register_all_defaults(r, traced_models=()):
     # ops stay as no_input_sample (honest: "can't test with current framework")
     # rather than producing misleading failed_lowering rows.
 
-    # Model-traced sets, opt-in via --traced-model. Unknown names fail loud.
-    for _name in traced_models:
+    # Accuracy smoke test subsets, opt-in via --traced-model. An unknown name fails loud.
+    for _name in smoke_subsets:
         try:
-            _register_model = TRACED_MODEL_SHAPES[_name]
+            _register_model = SMOKE_SUBSET_SHAPES[_name]
         except KeyError:
             raise KeyError(
-                f"unknown --traced-model {_name!r}; available: {sorted(TRACED_MODEL_SHAPES)}"
+                f"unknown --traced-model {_name!r}; available: {sorted(SMOKE_SUBSET_SHAPES)}"
             ) from None
         _register_model(r)
 
 
-# Qwen3-235B-A22B traced shape sets from the NeuronTorchTitan ``upstream_jul08`` trace
-# (dump_model_ops.py, forward+backward), restricted to the shared 54-op reference set.
-# 46 of those 54 are registered here; the other 8 -- add.Scalar, arange.start, clamp_min,
-# le.Scalar, logical_and, mean.dim, pow.Tensor_Scalar, split.Tensor -- are absent because the
-# upstream_jul08 branch emits different overloads for them (e.g. arange / split_with_sizes /
-# mean.dim vs .Scalar variants), so there are no traced shapes to register. Ops that currently
-# fail the Frobenius ratio are KEPT (not dropped) -- they surface per-cell in the CSV
-# (fro_ratio_verdict) and are tracked for RCA rather than hidden by shrinking the set.
-QWEN3_235B_A22B_EAGER = "qwen3_235b_a22b_eager"
+# ── Accuracy smoke test subset ────────────────────────────────────────────────
+#
+# This is a smoke test subset. It is not a model onboarding framework. Do not add a model
+# here to get accuracy coverage for that model. The first subset comes from a Qwen3-235B
+# EP64/TP4 capture, You can extend the subset, but the intent is one small frozen subset.
+#
+# Captured end-to-end from NeuronTorchTitan ``qwen3_235b_6layers_ep64_nle1_tp4_neuron_ep`` on
+# trn3-dev1.48xlarge: SelectiveAC, seq_len 2048.
+#
+# **Op mode** property of ops type
+#
+#   eager_only   -- seen in eager dispatch, never in a post-AOT graph.
+#   compile_only -- post-AOT graphs only, i.e. introduced by AOT. Either a decomposition
+#                   product (``aten::sigmoid`` from ``aten::silu``; ``aten::mm`` and
+#                   ``aten::t`` in backward graphs from ``aten::linear_backward``) or a
+#                   functionalization rewrite (``aten::index_put`` is the out-of-place form of
+#                   eager-only ``aten::index_put_``).
+#   both_modes   -- seen in eager dispatch **and** in a post-AOT graph.
+#
+# **Capture path** property of test *shape*
+#
+#   e.g. eager / compiled / both, which path the test shape is captured.
+#
+# These two axes are not interchangeable.
+#
+# **Entry count.** Entries include 328 distinct shapes (trimmed down w/ top 10 per op
+# of largest tensor sizes of collected).
+#
+# **No float dtype keys.** Int/bool specs are pinned because an index or mask operand sampled
+# as bfloat16 is rejected by the op.
+#
+# **Gap.** Known zero-shape op: ``aten::bmm``. Its captured entries are global shapes over the
+# 512Mi cap, we still register this op, report result will say ``no_input_sample``, so we can
+# follow up fix instead of silently ignore.
+QWEN3_235B_EP64_TP4 = "qwen3_235b_ep64_tp4"
 
-QWEN3_235B_A22B_EAGER_OPS = frozenset(
-    {
-        "aten::_softmax",
-        "aten::_to_copy",
-        "aten::add.Tensor",
-        "aten::add_.Tensor",
-        "aten::arange",
-        "aten::bitwise_and.Tensor",
-        "aten::cat",
-        "aten::cumsum",
-        "aten::div.Tensor",
-        "aten::eq.Scalar",
-        "aten::eq.Tensor",
-        "aten::exp",
-        "aten::floor_divide",
-        "aten::full",
-        "aten::gather",
-        "aten::ge.Scalar",
-        "aten::index.Tensor",
-        "aten::linear",
-        "aten::max",
-        "aten::max.dim",
-        "aten::maximum",
-        "aten::min",
-        "aten::mul.Tensor",
-        "aten::neg",
-        "aten::new_zeros",
-        "aten::ones_like",
-        "aten::silu",
-        "aten::silu_backward",
-        "aten::slice_backward",
-        "aten::stack",
-        "aten::sub.Tensor",
-        "aten::where.self",
-        "aten::zeros",
-        "aten::zeros_like",
-    }
-)
-
-
-def _register_qwen3_235b_a22b_eager(r):
-    """Qwen3-235B-A22B eager_dispatch traced shapes: 251 entries over 34 ops.
-
-    Source: NeuronTorchTitan ``upstream_jul08`` Qwen3-235B trace (dump_model_ops.py,
-    eager_dispatch path, forward+backward), restricted to the shared model op set. Includes
-    ops that currently fail the Frobenius ratio -- those are visible per-cell in the CSV
-    (fro_ratio_verdict) and tracked for RCA, not dropped from the traced set."""
-    r(
-        "aten::_softmax",
-        {"dim": -1, "half_to_float": False, "self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (1024, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (8, 1536, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (8, 4096, 1536)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (1024, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (8, 1536, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (8, 4096, 1536)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bool", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "int32", "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "int64", "self": {"dtype": "float32", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "int64", "self": {"dtype": "int64", "shape": (2,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {"other": 1e-20, "self": {"dtype": "float32", "shape": (1, 128, 1)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 1)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128,)},
-            "self": {"dtype": "float32", "shape": (128,)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (8,)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::add_.Tensor",
-        {"other": {"dtype": "int64", "shape": (8,)}, "self": {"dtype": "float32", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::arange",
-        {"dtype": "int64", "end": 8},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::bitwise_and.Tensor",
-        {"other": {"dtype": "bool", "shape": (128,)}, "self": {"dtype": "bool", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": -1,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 4, 64)},
-                {"dtype": "float32", "shape": (1, 128, 4, 64)},
-            ),
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": -1,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 64, 64)},
-                {"dtype": "float32", "shape": (1, 128, 64, 64)},
-            ),
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": 3,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 4, 16, 128)},
-                {"dtype": "float32", "shape": (1, 128, 4, 1, 128)},
-                {"dtype": "float32", "shape": (1, 128, 4, 1, 128)},
-            ),
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::cumsum",
-        {"dim": 0, "dtype": "int32", "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": 128, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": {"dtype": "float32", "shape": ()}, "self": {"dtype": "float32", "shape": ()}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::div.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::eq.Scalar",
-        {"other": -100, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::eq.Scalar",
-        {"other": 0, "self": {"dtype": "float32", "shape": ()}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::eq.Tensor",
-        {
-            "other": {"dtype": "int64", "shape": (8,)},
-            "self": {"dtype": "int64", "shape": (1, 128, 8, 1)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::eq.Tensor",
-        {"other": {"dtype": "int64", "shape": (8,)}, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::exp",
-        {"self": {"dtype": "float32", "shape": (128, 1)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::exp",
-        {"self": {"dtype": "float32", "shape": (128, 384)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::exp",
-        {"self": {"dtype": "float32", "shape": (128, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::floor_divide",
-        {"other": 8, "self": {"dtype": "int64", "shape": (1024,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::full",
-        {"dtype": "float32", "fill_value": float("-inf"), "size": (128, 1)},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int64", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int64", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int64", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": 0,
-            "index": {"dtype": "int64", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 0, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 0, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 102400, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 102400, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 106496, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 106496, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 110592, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 110592, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 114688, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 114688, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 118784, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 118784, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 12288, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 12288, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 122880, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 122880, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 126976, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 126976, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 131072, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 131072, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 135168, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 135168, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 139264, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 139264, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 143360, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 143360, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 147456, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 147456, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 151552, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 151552, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 16384, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 16384, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 20480, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 20480, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 24576, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 24576, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 28672, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 28672, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 32768, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 32768, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 36864, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 36864, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 4096, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 4096, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 40960, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 40960, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 45056, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 45056, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 49152, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 49152, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 53248, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 53248, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 57344, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 57344, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 61440, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 61440, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 65536, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 65536, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 69632, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 69632, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 73728, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 73728, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 77824, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 77824, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 8192, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 8192, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 81920, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 81920, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 86016, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 86016, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 90112, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 90112, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 94208, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 94208, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 98304, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::ge.Scalar",
-        {"other": 98304, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (1024,)},),
-            "self": {"dtype": "float32", "shape": (1024,)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (1024,)},),
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "weight": {"dtype": "float32", "shape": (151936, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "weight": {"dtype": "float32", "shape": (8, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "weight": {"dtype": "float32", "shape": (9216, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 8192)},
-            "weight": {"dtype": "float32", "shape": (4096, 8192)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::max",
-        {"self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::max.dim",
-        {"dim": -1, "keepdim": True, "self": {"dtype": "float32", "shape": (128, 384)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::max.dim",
-        {"dim": -1, "keepdim": True, "self": {"dtype": "float32", "shape": (128, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::maximum",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 1)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::min",
-        {"self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {"other": 1.0, "self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {"other": 128, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "bfloat16", "shape": (1024, 1536)},
-            "self": {"dtype": "bfloat16", "shape": (1024, 1536)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": ()},
-            "self": {"dtype": "float32", "shape": (128, 151936)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": ()},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": ()},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 1)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 1)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128,)},
-            "self": {"dtype": "float32", "shape": (128,)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 4, 64)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 64, 64)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {
-            "dtype": "float32",
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-            "size": (128, 4096),
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {"dtype": "float32", "self": {"dtype": "float32", "shape": (1024,)}, "size": (1024,)},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {"self": {"dtype": "float32", "shape": (1, 128, 8)}, "size": (1, 128, 8)},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::ones_like",
-        {"self": {"dtype": "float32", "shape": ()}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::silu",
-        {"self": {"dtype": "bfloat16", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::silu_backward",
-        {
-            "grad_output": {"dtype": "bfloat16", "shape": (1024, 1536)},
-            "self": {"dtype": "bfloat16", "shape": (1024, 1536)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::slice_backward",
-        {
-            "dim": 3,
-            "end": 64,
-            "grad_output": {"dtype": "float32", "shape": (1, 128, 4, 64)},
-            "input_sizes": (1, 128, 4, 128),
-            "start": 0,
-            "step": 1,
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::slice_backward",
-        {
-            "dim": 3,
-            "end": 64,
-            "grad_output": {"dtype": "float32", "shape": (1, 128, 64, 64)},
-            "input_sizes": (1, 128, 64, 128),
-            "start": 0,
-            "step": 1,
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::slice_backward",
-        {
-            "dim": 3,
-            "end": 9223372036854775807,
-            "grad_output": {"dtype": "float32", "shape": (1, 128, 4, 64)},
-            "input_sizes": (1, 128, 4, 128),
-            "start": 64,
-            "step": 1,
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::slice_backward",
-        {
-            "dim": 3,
-            "end": 9223372036854775807,
-            "grad_output": {"dtype": "float32", "shape": (1, 128, 64, 64)},
-            "input_sizes": (1, 128, 64, 128),
-            "start": 64,
-            "step": 1,
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::stack",
-        {"tensors": ({"dtype": "int64", "shape": ()}, {"dtype": "int64", "shape": ()})},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 0, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 0, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 102400, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 102400, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 106496, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 106496, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 110592, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 110592, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 114688, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 114688, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 118784, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 118784, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 12288, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 12288, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 122880, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 122880, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 126976, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 126976, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 131072, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 131072, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 135168, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 135168, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 139264, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 139264, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 143360, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 143360, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 147456, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 147456, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 151552, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 151552, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 16384, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 16384, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 20480, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 20480, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 24576, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 24576, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 28672, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 28672, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 32768, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 32768, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 36864, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 36864, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 4096, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 4096, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 40960, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 40960, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 45056, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 45056, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 49152, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 49152, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 53248, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 53248, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 57344, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 57344, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 61440, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 61440, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 65536, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 65536, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 69632, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 69632, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 73728, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 73728, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 77824, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 77824, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 8192, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 8192, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 81920, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 81920, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 86016, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 86016, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 90112, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 90112, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 94208, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 94208, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 98304, "self": {"dtype": "int32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {"other": 98304, "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 1)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 1)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 384)},
-            "self": {"dtype": "float32", "shape": (128, 384)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128, 4096)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::where.self",
-        {
-            "condition": {"dtype": "bool", "shape": ()},
-            "other": {"dtype": "float32", "shape": ()},
-            "self": {"dtype": "float32", "shape": ()},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::where.self",
-        {
-            "condition": {"dtype": "bool", "shape": (128,)},
-            "other": {"dtype": "int64", "shape": (128,)},
-            "self": {"dtype": "int64", "shape": (128,)},
-        },
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::zeros",
-        {"dtype": "float32", "size": (128, 1)},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::zeros",
-        {"dtype": "float32", "size": (128,)},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::zeros_like",
-        {"self": {"dtype": "float32", "shape": ()}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::zeros_like",
-        {"self": {"dtype": "float32", "shape": (128, 384)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-    r(
-        "aten::zeros_like",
-        {"self": {"dtype": "float32", "shape": (128, 4096)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=2,
-    )
-    r(
-        "aten::zeros_like",
-        {"self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_EAGER,
-        count=1,
-    )
-
-
-QWEN3_235B_A22B_COMPILED = "qwen3_235b_a22b_compiled"
-
-QWEN3_235B_A22B_COMPILED_OPS = frozenset(
-    {
-        "aten::_softmax",
-        "aten::_to_copy",
-        "aten::add.Tensor",
-        "aten::arange",
-        "aten::bmm",
-        "aten::cat",
-        "aten::constant_pad_nd",
-        "aten::cumsum",
-        "aten::div.Tensor",
-        "aten::eq.Tensor",
-        "aten::exp",
-        "aten::floor_divide",
-        "aten::full",
-        "aten::gather",
-        "aten::index.Tensor",
-        "aten::le.Tensor",
-        "aten::linear",
-        "aten::logical_not",
-        "aten::max.dim",
-        "aten::maximum",
-        "aten::minimum",
-        "aten::mm",
-        "aten::mul.Tensor",
-        "aten::neg",
-        "aten::new_ones",
-        "aten::new_zeros",
-        "aten::ones",
-        "aten::rsub.Scalar",
-        "aten::sigmoid",
-        "aten::sub.Tensor",
-        "aten::tril",
-        "aten::triu",
-        "aten::zeros_like",
-    }
-)
-
-
-def _register_qwen3_235b_a22b_compiled(r):
-    """Qwen3-235B-A22B compiled_fx traced shapes: 113 entries over 33 ops.
-
-    Source: NeuronTorchTitan ``upstream_jul08`` Qwen3-235B trace (dump_model_ops.py,
-    compiled_fx path, forward+backward), restricted to the shared model op set. Includes
-    ops that currently fail the Frobenius ratio -- those are visible per-cell in the CSV
-    (fro_ratio_verdict) and tracked for RCA, not dropped from the traced set."""
-    r(
-        "aten::_softmax",
-        {"dim": -1, "half_to_float": False, "self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (1024, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (8, 1536, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "bfloat16", "self": {"dtype": "float32", "shape": (8, 4096, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (1024, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (8, 1536, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "bfloat16", "shape": (8, 4096, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "float32", "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "int32", "self": {"dtype": "int64", "shape": (128,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::_to_copy",
-        {"dtype": "int64", "self": {"dtype": "float32", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {"other": 1, "self": {"dtype": "float32", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {"other": 1e-20, "self": {"dtype": "float32", "shape": (1, 128, 1)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 1)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (8,)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::add.Tensor",
-        {"other": {"dtype": "int64", "shape": (8,)}, "self": {"dtype": "float32", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::arange",
-        {"dtype": "int64", "end": 8},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::arange",
-        {"end": 8},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::bmm",
-        {
-            "mat2": {"dtype": "bfloat16", "shape": (8, 1536, 4096)},
-            "self": {"dtype": "bfloat16", "shape": (8, 128, 1536)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::bmm",
-        {
-            "mat2": {"dtype": "bfloat16", "shape": (8, 4096, 1536)},
-            "self": {"dtype": "bfloat16", "shape": (8, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::bmm",
-        {
-            "mat2": {"dtype": "float32", "shape": (64, 128, 128)},
-            "self": {"dtype": "float32", "shape": (64, 128, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": -1,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 4, 64)},
-                {"dtype": "float32", "shape": (1, 128, 4, 64)},
-            ),
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": -1,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 64, 64)},
-                {"dtype": "float32", "shape": (1, 128, 64, 64)},
-            ),
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::cat",
-        {
-            "dim": 3,
-            "tensors": (
-                {"dtype": "float32", "shape": (1, 128, 4, 16, 128)},
-                {"dtype": "float32", "shape": (1, 128, 4, 1, 128)},
-                {"dtype": "float32", "shape": (1, 128, 4, 1, 128)},
-            ),
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::constant_pad_nd",
-        {"pad": (0, 64), "self": {"dtype": "float32", "shape": (1, 128, 4, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::constant_pad_nd",
-        {"pad": (0, 64), "self": {"dtype": "float32", "shape": (1, 128, 64, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::constant_pad_nd",
-        {"pad": (64, 0), "self": {"dtype": "float32", "shape": (1, 128, 4, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::constant_pad_nd",
-        {"pad": (64, 0), "self": {"dtype": "float32", "shape": (1, 128, 64, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::cumsum",
-        {"dim": 0, "dtype": "int32", "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": 128, "self": {"dtype": "float32", "shape": (1, 128, 4, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": 128, "self": {"dtype": "float32", "shape": (1, 128, 64, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": 128, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {"other": 4096, "self": {"dtype": "float32", "shape": (1, 128, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::div.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::div.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::eq.Tensor",
-        {
-            "other": {"dtype": "int64", "shape": (8,)},
-            "self": {"dtype": "int64", "shape": (1, 128, 8, 1)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::eq.Tensor",
-        {"other": {"dtype": "int64", "shape": (8,)}, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::exp",
-        {"self": {"dtype": "float32", "shape": (1, 64, 128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::floor_divide",
-        {"other": 128, "self": {"dtype": "int32", "shape": (8, 1)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::floor_divide",
-        {"other": 8, "self": {"dtype": "int64", "shape": (1024,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::full",
-        {"dtype": "int64", "fill_value": 0, "size": ()},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::full",
-        {"dtype": "int64", "fill_value": 7, "size": ()},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": -1,
-            "index": {"dtype": "int64", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::gather",
-        {
-            "dim": 0,
-            "index": {"dtype": "int64", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (1, 128)},),
-            "self": {"dtype": "float32", "shape": (151936, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (1024,)},),
-            "self": {"dtype": "float32", "shape": (1024,)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (1024,)},),
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (128,)},),
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (128,)},),
-            "self": {"dtype": "int64", "shape": (128,)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (8,)},),
-            "self": {"dtype": "bfloat16", "shape": (8, 1536, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::index.Tensor",
-        {
-            "indices": ({"dtype": "int64", "shape": (8,)},),
-            "self": {"dtype": "bfloat16", "shape": (8, 4096, 1536)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::le.Tensor",
-        {"other": {"dtype": "int64", "shape": (8,)}, "self": {"dtype": "int32", "shape": (8, 1)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "weight": {"dtype": "float32", "shape": (8, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "weight": {"dtype": "float32", "shape": (9216, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::linear",
-        {
-            "input": {"dtype": "float32", "shape": (1, 128, 8192)},
-            "weight": {"dtype": "float32", "shape": (4096, 8192)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::logical_not",
-        {"self": {"dtype": "bool", "shape": (128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::max.dim",
-        {"dim": -1, "keepdim": True, "self": {"dtype": "float32", "shape": (1, 64, 128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::maximum",
-        {"other": {"dtype": "int64", "shape": ()}, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::minimum",
-        {"other": {"dtype": "int64", "shape": ()}, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (128, 4096)},
-            "self": {"dtype": "float32", "shape": (8, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (128, 4096)},
-            "self": {"dtype": "float32", "shape": (9216, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (128, 8192)},
-            "self": {"dtype": "float32", "shape": (4096, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (4096, 8192)},
-            "self": {"dtype": "float32", "shape": (128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (8, 4096)},
-            "self": {"dtype": "float32", "shape": (128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mm",
-        {
-            "mat2": {"dtype": "float32", "shape": (9216, 4096)},
-            "self": {"dtype": "float32", "shape": (128, 9216)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {"other": 0.08838834764831845, "self": {"dtype": "float32", "shape": (1, 64, 128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {"other": 1.0, "self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {"other": 128, "self": {"dtype": "int64", "shape": (8,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "bfloat16", "shape": (1024, 1536)},
-            "self": {"dtype": "bfloat16", "shape": (1024, 1536)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 1, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 64, 1)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 1)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 1536)},
-            "self": {"dtype": "float32", "shape": (1024, 1536)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1024, 4096)},
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128,)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (128,)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::mul.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (4096,)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 4, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 64, 64)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (1, 128, 8)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::neg",
-        {"self": {"dtype": "float32", "shape": (128,)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::new_ones",
-        {
-            "dtype": "bool",
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-            "size": (128, 128),
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {
-            "dtype": "float32",
-            "self": {"dtype": "float32", "shape": (1024, 4096)},
-            "size": (128, 4096),
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {"dtype": "float32", "self": {"dtype": "float32", "shape": (1024,)}, "size": (1024,)},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::new_zeros",
-        {"self": {"dtype": "float32", "shape": (1, 128, 8)}, "size": (1, 128, 8)},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::ones",
-        {"dtype": "bool", "size": (128, 128)},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::rsub.Scalar",
-        {"other": 1, "self": {"dtype": "float32", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::sigmoid",
-        {"self": {"dtype": "float32", "shape": (1024, 1536)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 4096)},
-            "self": {"dtype": "float32", "shape": (1, 128, 4096)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-            "self": {"dtype": "float32", "shape": (1, 128, 64, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 128, 8)},
-            "self": {"dtype": "float32", "shape": (1, 128, 8)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128, 1)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=2,
-    )
-    r(
-        "aten::sub.Tensor",
-        {
-            "other": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-            "self": {"dtype": "float32", "shape": (1, 64, 128, 128)},
-        },
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::tril",
-        {"self": {"dtype": "bool", "shape": (128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::triu",
-        {"diagonal": 1, "self": {"dtype": "bool", "shape": (128, 128)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-    r(
-        "aten::zeros_like",
-        {"self": {"dtype": "float32", "shape": (128, 4096)}},
-        source=QWEN3_235B_A22B_COMPILED,
-        count=1,
-    )
-
-
-QWEN3_235B_A22B = "qwen3_235b_a22b"
-
-# Single public model name. ``--traced-model qwen3_235b_a22b`` registers BOTH capture paths
-# (eager + compiled) in one run. Each entry is tagged with two sources: the base model name
-# (so the run selects it) AND its path (``..._eager`` / ``..._compiled``), which the accuracy
-# suite reads off the entry to split results into one CSV per path. The per-path names are not
-# exposed as ``--traced-model`` options.
-QWEN3_235B_A22B_OPS = QWEN3_235B_A22B_EAGER_OPS | QWEN3_235B_A22B_COMPILED_OPS
-
-
-def _register_qwen3_235b_a22b(r):
-    def _dual(op, arg_shapes, source="", count=1):
-        # base source -> --traced-model selection; path source -> per-path CSV split
-        r(op, arg_shapes, source=QWEN3_235B_A22B, count=count)
-        r(op, arg_shapes, source=source, count=count)
-
-    _register_qwen3_235b_a22b_eager(_dual)
-    _register_qwen3_235b_a22b_compiled(_dual)
-
-
-# Model-traced shape sets, keyed by the name ``--traced-model`` accepts (base name only).
-TRACED_MODEL_SHAPES = {
-    QWEN3_235B_A22B: _register_qwen3_235b_a22b,
+QWEN3_235B_EP64_TP4_OP_MODE = {
+    "aten::_foreach_copy_": "eager_only",
+    "aten::_foreach_mul_.Tensor": "eager_only",
+    "aten::_foreach_norm.Scalar": "eager_only",
+    "aten::_fused_rms_norm": "both_modes",
+    "aten::_fused_rms_norm_backward": "eager_only",
+    "aten::_grouped_mm": "eager_only",
+    "aten::_scaled_dot_product_fused_attention_overrideable": "eager_only",
+    "aten::_scaled_dot_product_fused_attention_overrideable_backward": "eager_only",
+    "aten::_softmax": "both_modes",
+    "aten::_softmax_backward_data": "eager_only",
+    "aten::_to_copy": "both_modes",
+    "aten::_unsafe_view": "compile_only",
+    "aten::add.Tensor": "both_modes",
+    "aten::add_.Tensor": "eager_only",
+    "aten::all": "eager_only",
+    "aten::amax": "both_modes",
+    "aten::any.dim": "both_modes",
+    "aten::arange": "both_modes",
+    "aten::as_strided": "eager_only",
+    "aten::bitwise_and.Tensor": "eager_only",
+    "aten::bitwise_or.Tensor": "both_modes",
+    "aten::bmm": "compile_only",
+    "aten::cat": "both_modes",
+    "aten::clamp": "eager_only",
+    "aten::clone": "both_modes",
+    "aten::constant_pad_nd": "compile_only",
+    "aten::copy_": "both_modes",
+    "aten::cumsum": "both_modes",
+    "aten::detach": "both_modes",
+    "aten::div.Tensor": "both_modes",
+    "aten::embedding": "eager_only",
+    "aten::embedding_dense_backward": "eager_only",
+    "aten::eq.Tensor": "both_modes",
+    "aten::exp": "both_modes",
+    "aten::expand": "both_modes",
+    "aten::floor_divide": "both_modes",
+    "aten::full": "both_modes",
+    "aten::gather": "both_modes",
+    "aten::ge.Scalar": "both_modes",
+    "aten::index.Tensor": "both_modes",
+    "aten::index_put": "compile_only",
+    "aten::index_put_": "eager_only",
+    "aten::le.Scalar": "both_modes",
+    "aten::le.Tensor": "both_modes",
+    "aten::linalg_vector_norm": "eager_only",
+    "aten::linear": "both_modes",
+    "aten::linear_backward": "eager_only",
+    "aten::log": "both_modes",
+    "aten::lt.Scalar": "both_modes",
+    "aten::maximum": "compile_only",
+    "aten::mean": "eager_only",
+    "aten::minimum": "compile_only",
+    "aten::mm": "compile_only",
+    "aten::mul.Tensor": "both_modes",
+    "aten::ne.Scalar": "both_modes",
+    "aten::neg": "both_modes",
+    "aten::new_zeros": "both_modes",
+    "aten::one_hot": "both_modes",
+    "aten::ones_like": "eager_only",
+    "aten::pow.Tensor_Scalar": "eager_only",
+    "aten::pow_.Scalar": "eager_only",
+    "aten::reciprocal": "eager_only",
+    "aten::remainder.Scalar": "both_modes",
+    "aten::rsub.Scalar": "compile_only",
+    "aten::scalar_tensor": "eager_only",
+    "aten::scatter_add": "both_modes",
+    "aten::select.int": "eager_only",
+    "aten::sigmoid": "compile_only",
+    "aten::sign": "eager_only",
+    "aten::silu": "eager_only",
+    "aten::silu_backward": "eager_only",
+    "aten::slice.Tensor": "both_modes",
+    "aten::slice_backward": "eager_only",
+    "aten::split.Tensor": "eager_only",
+    "aten::split_with_sizes": "eager_only",
+    "aten::squeeze.dim": "both_modes",
+    "aten::stack": "eager_only",
+    "aten::sub.Tensor": "both_modes",
+    "aten::sum": "both_modes",
+    "aten::sum.dim_IntList": "both_modes",
+    "aten::t": "compile_only",
+    "aten::topk": "both_modes",
+    "aten::transpose.int": "both_modes",
+    "aten::unsqueeze": "both_modes",
+    "aten::view": "both_modes",
+    "aten::where.self": "both_modes",
+    "aten::zero_": "eager_only",
+    "aten::zeros": "both_modes",
+    "aten::zeros_like": "both_modes",
 }
 
-TRACED_MODEL_OPS = {
-    QWEN3_235B_A22B: QWEN3_235B_A22B_OPS,
+QWEN3_235B_EP64_TP4_OPS = frozenset(QWEN3_235B_EP64_TP4_OP_MODE)
+
+# Ops registered w/ no shape: e.g. ``aten::bmm``'s entry traced shapes are over the
+# 512Mi cap. Define it as no shape input to track ops w/ input_sample generation issues;
+# the report verdict shows ``no_input_sample`` instead of silently skipping.
+QWEN3_235B_EP64_TP4_NO_SHAPE_OPS = frozenset(
+    {
+        "aten::bmm",
+    }
+)
+
+
+# Register op shapes. The "path" routes the entry result as a row in generated csv
+# file. e.g. "both" will make that row write to both "op_accuracy_eager_*.csv" and
+# "op_accuracy_compiled_*.csv".
+def _register_qwen3_235b_ep64_tp4(r):
+    def t(op, arg_shapes, count=1, path="eager"):
+        paths = ("eager", "compiled") if path == "both" else (path,)
+        r(op, arg_shapes, source=QWEN3_235B_EP64_TP4, count=count, paths=paths)
+
+    t(
+        "aten::_foreach_copy_",
+        {
+            "self": [(589824,), (524288,), (8,), (8,), (16384,), (256,), (256,)],
+            "src": [(589824,), (524288,), (8,), (8,), (16384,), (256,), (256,)],
+        },
+        count=60,
+        path="eager",
+    )
+    t("aten::_foreach_copy_", {"self": [(9723904,)], "src": [(9723904,)]}, count=9, path="eager")
+    t("aten::_foreach_copy_", {"self": [(256,)], "src": [(256,)]}, count=6, path="eager")
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": (),
+            "self": [
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+            ],
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "ord": 2.0,
+            "self": [
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+                (64, 1536, 4096),
+                (64, 4096, 1536),
+                (64, 1536, 4096),
+            ],
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 2048, 4096), "normalized_shape": (4096,), "weight": (4096,)},
+        count=75,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 2048, 4, 128), "normalized_shape": (128,), "weight": (128,)},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 2048, 64, 128), "normalized_shape": (128,), "weight": (128,)},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 512, 4096), "normalized_shape": (4096,), "weight": (4096,)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 2048, 16, 128), "normalized_shape": (128,), "weight": (128,)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {"eps": 1e-06, "input": (1, 2048, 1, 128), "normalized_shape": (128,), "weight": (128,)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": (1, 2048, 4096),
+            "input": (1, 2048, 4096),
+            "normalized_shape": (4096,),
+            "output_mask": (True, True),
+            "rstd": (1, 2048, 1),
+            "weight": (4096,),
+        },
+        count=39,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": (1, 2048, 4, 128),
+            "input": (1, 2048, 4, 128),
+            "normalized_shape": (128,),
+            "output_mask": (True, True),
+            "rstd": (1, 2048, 4, 1),
+            "weight": (128,),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": (1, 2048, 64, 128),
+            "input": (1, 2048, 64, 128),
+            "normalized_shape": (128,),
+            "output_mask": (True, True),
+            "rstd": (1, 2048, 64, 1),
+            "weight": (128,),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "mat2": (1, 4096, 1536),
+            "offs": {"dtype": "int32", "high": 2, "low": 1, "multiple_of": 32768, "shape": (1,)},
+            "self": (32768, 4096),
+        },
+        count=90,
+        path="eager",
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "mat2": (1, 1536, 4096),
+            "offs": {"dtype": "int32", "high": 2, "low": 1, "multiple_of": 32768, "shape": (1,)},
+            "self": (32768, 1536),
+        },
+        count=72,
+        path="eager",
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "mat2": (32768, 4096),
+            "offs": {"dtype": "int32", "high": 2, "low": 1, "multiple_of": 1536, "shape": (1,)},
+            "self": (1536, 32768),
+        },
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "mat2": (32768, 1536),
+            "offs": {"dtype": "int32", "high": 2, "low": 1, "multiple_of": 4096, "shape": (1,)},
+            "self": (4096, 32768),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": True,
+            "key": (1, 1, 2048, 128),
+            "query": (1, 16, 2048, 128),
+            "scale": 0.08838834764831845,
+            "value": (1, 1, 2048, 128),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable_backward",
+        {
+            "attn_bias": None,
+            "cum_seq_k": None,
+            "cum_seq_q": None,
+            "dropout_p": 0.0,
+            "grad_input_mask": (True, True, True, False),
+            "grad_out": (1, 16, 2048, 128),
+            "is_causal": True,
+            "key": (1, 1, 2048, 128),
+            "logsumexp": (1, 16, 2048),
+            "max_k": 2048,
+            "max_q": 2048,
+            "out": (1, 16, 2048, 128),
+            "philox_offset": {"dtype": "int32", "shape": ()},
+            "philox_seed": {"dtype": "int32", "shape": ()},
+            "query": (1, 16, 2048, 128),
+            "scale": 0.08838834764831845,
+            "value": (1, 1, 2048, 128),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::_softmax",
+        {"dim": -1, "half_to_float": False, "self": (1, 2048, 64)},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::_softmax",
+        {"dim": -1, "half_to_float": False, "self": (1, 512, 64)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {"dim": -1, "grad_output": (1, 2048, 64), "input_dtype": 6, "output": (1, 2048, 64)},
+        count=18,
+        path="eager",
+    )
+    t("aten::_to_copy", {"dtype": 15, "self": (1, 2048, 64, 128)}, count=3456, path="eager")
+    t("aten::_to_copy", {"dtype": 15, "self": (256, 37984)}, count=1536, path="both")
+    t("aten::_to_copy", {"dtype": 6, "self": (1, 2048, 64, 128)}, count=1188, path="eager")
+    t("aten::_to_copy", {"dtype": 6, "self": (4096, 4096)}, count=1188, path="both")
+    t("aten::_to_copy", {"dtype": 15, "self": (4096, 4096)}, count=1188, path="both")
+    t("aten::_to_copy", {"dtype": 15, "self": (1, 2048, 4096)}, count=1155, path="eager")
+    t("aten::_to_copy", {"dtype": 6, "self": (1, 2048, 4096)}, count=36, path="eager")
+    t("aten::_to_copy", {"dtype": 6, "self": (256, 37984)}, count=24, path="both")
+    t("aten::_to_copy", {"dtype": 6, "self": (32768, 1536)}, count=1, path="compiled")
+    t("aten::_to_copy", {"dtype": 15, "self": (32768, 1536)}, count=1, path="compiled")
+    t(
+        "aten::_unsafe_view",
+        {"self": (1, 16, 16, 128), "size": (1, 16, 2048)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::_unsafe_view", {"self": (512, 4096), "size": (1, 512, 4096)}, count=1, path="compiled")
+    t(
+        "aten::_unsafe_view",
+        {"self": (2048, 2048), "size": (1, 2048, 2048)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::_unsafe_view",
+        {"self": (2048, 4096), "size": (1, 2048, 4096)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 2048, 4096), "self": (1, 2048, 4096)},
+        count=126,
+        path="eager",
+    )
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 2048, 64, 128), "self": (1, 2048, 64, 128)},
+        count=72,
+        path="eager",
+    )
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 2048, 4, 128), "self": (1, 2048, 4, 128)},
+        count=72,
+        path="eager",
+    )
+    t("aten::add.Tensor", {"other": (64,), "self": (1, 2048, 64)}, count=36, path="eager")
+    t("aten::add.Tensor", {"other": (256, 37984), "self": (256, 37984)}, count=24, path="both")
+    t("aten::add.Tensor", {"other": (32768, 4096), "self": (32768, 4096)}, count=18, path="both")
+    t("aten::add.Tensor", {"other": (), "self": (32768, 1536)}, count=1, path="compiled")
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 2048, 16, 128), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 512, 4096), "self": (1, 512, 4096)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::add.Tensor",
+        {"other": (1, 2048, 1, 128), "self": (1, 2048, 1, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::add_.Tensor",
+        {"other": {"dtype": "int64", "shape": (64,)}, "self": (64,)},
+        count=36,
+        path="eager",
+    )
+    t("aten::add_.Tensor", {"other": (64,), "self": (64,)}, count=18, path="eager")
+    t(
+        "aten::add_.Tensor",
+        {"other": {"dtype": "int64", "shape": ()}, "self": {"dtype": "int64", "shape": ()}},
+        count=3,
+        path="eager",
+    )
+    t("aten::all", {"self": {"dtype": "bool", "shape": (1, 2048)}}, count=36, path="eager")
+    t("aten::amax", {"dim": (-1,), "keepdim": True, "self": (256, 37984)}, count=24, path="both")
+    t(
+        "aten::any.dim",
+        {"dim": -2, "self": {"dtype": "bool", "shape": (1, 2048, 8, 64)}},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::any.dim",
+        {"dim": -2, "self": {"dtype": "bool", "shape": (1, 512, 8, 64)}},
+        count=1,
+        path="compiled",
+    )
+    t("aten::arange", {"end": 4096, "pin_memory": False}, count=4608, path="both")
+    t("aten::arange", {"dtype": 3, "end": 4096, "pin_memory": False}, count=2304, path="both")
+    t("aten::arange", {"dtype": 4, "end": 64, "pin_memory": False}, count=2304, path="both")
+    t("aten::arange", {"end": 256, "pin_memory": False}, count=1536, path="both")
+    t(
+        "aten::as_strided",
+        {
+            "self": (1, 2048, 16, 128),
+            "size": (1, 2048, 18, 128),
+            "storage_offset": 0,
+            "stride": (4718592, 2304, 128, 1),
+        },
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {
+            "self": (18874368,),
+            "size": (1, 1536, 4096),
+            "storage_offset": 0,
+            "stride": (6291456, 4096, 1),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {
+            "self": (18874368,),
+            "size": (1, 1536, 4096),
+            "storage_offset": 12582912,
+            "stride": (6291456, 4096, 1),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {
+            "self": (18874368,),
+            "size": (1, 4096, 1536),
+            "storage_offset": 6291456,
+            "stride": (6291456, 1536, 1),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {
+            "self": (6291456,),
+            "size": (1, 1536, 4096),
+            "storage_offset": 0,
+            "stride": (6291456, 4096, 1),
+        },
+        count=12,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {"self": (9723904,), "size": (2374, 4096), "storage_offset": 0, "stride": (4096, 1)},
+        count=6,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {"self": (9437184,), "size": (2304, 4096), "storage_offset": 0, "stride": (4096, 1)},
+        count=6,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {"self": (8388608,), "size": (4096, 2048), "storage_offset": 0, "stride": (2048, 1)},
+        count=6,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {
+            "self": (6291456,),
+            "size": (1, 4096, 1536),
+            "storage_offset": 0,
+            "stride": (6291456, 1536, 1),
+        },
+        count=6,
+        path="eager",
+    )
+    t(
+        "aten::as_strided",
+        {"self": (155582464,), "size": (37984, 4096), "storage_offset": 0, "stride": (4096, 1)},
+        count=2,
+        path="eager",
+    )
+    t(
+        "aten::bitwise_and.Tensor",
+        {
+            "other": {"dtype": "bool", "shape": (1, 2048)},
+            "self": {"dtype": "bool", "shape": (1, 2048)},
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::bitwise_or.Tensor",
+        {"other": {"dtype": "bool", "shape": (256,)}, "self": {"dtype": "bool", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::cat",
+        {"tensors": [(1, 512, 4096), (1, 512, 4096), (1, 512, 4096), (1, 512, 4096)]},
+        count=96,
+        path="both",
+    )
+    t(
+        "aten::cat",
+        {"dim": -1, "tensors": [(1, 2048, 4, 64), (1, 2048, 4, 64)]},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::cat",
+        {"dim": -1, "tensors": [(1, 2048, 64, 64), (1, 2048, 64, 64)]},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::cat",
+        {"dim": 3, "tensors": [(1, 2048, 1, 16, 128), (1, 2048, 1, 1, 128), (1, 2048, 1, 1, 128)]},
+        count=18,
+        path="both",
+    )
+    t(
+        "aten::cat",
+        {"tensors": [(1, 64), (1, 64), (1, 64), (1, 64), (1, 64), (1, 64)]},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::cat",
+        {"dim": -1, "tensors": [(1, 2048, 16, 64), (1, 2048, 16, 64)]},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::cat",
+        {"dim": -1, "tensors": [(1, 2048, 1, 64), (1, 2048, 1, 64)]},
+        count=1,
+        path="compiled",
+    )
+    t("aten::clamp", {"max": 1.0, "min": None, "self": ()}, count=6, path="eager")
+    t(
+        "aten::clamp",
+        {"max": 37983, "min": 0, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t("aten::clone", {"self": (512, 8, 4096)}, count=36, path="both")
+    t("aten::clone", {"self": (1, 2048, 16, 128)}, count=1, path="compiled")
+    t("aten::clone", {"self": (1, 2048, 1, 128)}, count=1, path="compiled")
+    t("aten::clone", {"self": (1, 16, 16, 128)}, count=1, path="compiled")
+    t("aten::clone", {"self": (1, 512, 64)}, count=1, path="compiled")
+    t("aten::constant_pad_nd", {"pad": (64, 0), "self": (1, 2048, 1, 64)}, count=1, path="compiled")
+    t("aten::constant_pad_nd", {"pad": (0, 64), "self": (1, 2048, 1, 64)}, count=1, path="compiled")
+    t(
+        "aten::constant_pad_nd",
+        {"pad": (64, 0), "self": (1, 2048, 16, 64)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::constant_pad_nd",
+        {"pad": (0, 64), "self": (1, 2048, 16, 64)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::copy_", {"self": (6291456,), "src": (6291456,)}, count=108, path="eager")
+    t("aten::copy_", {"self": (1, 256, 4096), "src": (1, 256, 4096)}, count=24, path="eager")
+    t("aten::copy_", {"self": (18874368,), "src": (18874368,)}, count=18, path="eager")
+    t("aten::copy_", {"self": (64,), "src": (64,)}, count=1, path="compiled")
+    t(
+        "aten::cumsum",
+        {"dim": 0, "dtype": 3, "self": {"dtype": "int32", "shape": (1,)}},
+        count=36,
+        path="both",
+    )
+    t(
+        "aten::cumsum",
+        {"dim": 0, "self": {"dtype": "int64", "shape": (4096, 64)}},
+        count=36,
+        path="both",
+    )
+    t("aten::detach", {"self": (32768, 1536)}, count=72, path="eager")
+    t("aten::detach", {"self": (9216, 4096)}, count=60, path="eager")
+    t("aten::detach", {"self": (4096, 8192)}, count=60, path="eager")
+    t("aten::detach", {"self": (64, 1536, 4096)}, count=48, path="eager")
+    t("aten::detach", {"self": (32768, 4096)}, count=36, path="eager")
+    t("aten::detach", {"self": (1, 2048, 64, 128)}, count=36, path="eager")
+    t("aten::detach", {"self": (1, 2048, 8192)}, count=36, path="eager")
+    t("aten::detach", {"self": (64, 4096, 1536)}, count=24, path="eager")
+    t("aten::detach", {"self": (1, 2048, 9216)}, count=18, path="eager")
+    t("aten::detach", {"self": (4096, 4096)}, count=18, path="eager")
+    t("aten::div.Tensor", {"other": (1, 2048, 1), "self": (1, 2048, 8)}, count=90, path="eager")
+    t("aten::div.Tensor", {"other": (), "self": ()}, count=48, path="eager")
+    t("aten::div.Tensor", {"other": (), "self": (18874368,)}, count=18, path="eager")
+    t(
+        "aten::div.Tensor",
+        {"other": {"dtype": "int64", "shape": ()}, "self": ()},
+        count=3,
+        path="eager",
+    )
+    t("aten::div.Tensor", {"other": (1, 512, 1), "self": (1, 512, 8)}, count=1, path="compiled")
+    t("aten::div.Tensor", {"other": (), "self": (1, 512, 4096)}, count=1, path="compiled")
+    t("aten::div.Tensor", {"other": (), "self": (1, 2048, 1, 128)}, count=1, path="compiled")
+    t("aten::div.Tensor", {"other": (), "self": (1, 2048, 16, 128)}, count=1, path="compiled")
+    t(
+        "aten::embedding",
+        {"indices": {"dtype": "int64", "shape": (1, 2048)}, "weight": (37984, 4096)},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": (1, 2048, 4096),
+            "indices": {"dtype": "int64", "shape": (1, 2048)},
+            "num_weights": 37984,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::eq.Tensor",
+        {
+            "other": {"dtype": "int64", "shape": (64,)},
+            "self": {"dtype": "int64", "shape": (1, 2048, 8, 1)},
+        },
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::eq.Tensor",
+        {
+            "other": {"dtype": "int64", "shape": (64,)},
+            "self": {"dtype": "int64", "shape": (1, 512, 8, 1)},
+        },
+        count=1,
+        path="compiled",
+    )
+    t("aten::exp", {"self": (256, 37984)}, count=48, path="both")
+    t("aten::expand", {"self": (512, 1, 4096), "size": (512, 8, 4096)}, count=36, path="both")
+    t(
+        "aten::expand",
+        {"self": {"dtype": "int64", "shape": (4096, 1)}, "size": (-1, 4096)},
+        count=36,
+        path="both",
+    )
+    t("aten::expand", {"self": (1, 2048, 1), "size": (1, 2048, 8)}, count=18, path="eager")
+    t(
+        "aten::expand",
+        {"self": (256, 128, 4096), "size": (256, 128, 4096)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::expand",
+        {"self": (256, 128, 1536), "size": (256, 128, 1536)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::expand", {"self": (1, 512, 1), "size": (1, 512, 8)}, count=1, path="compiled")
+    t(
+        "aten::floor_divide",
+        {"other": (), "self": {"dtype": "int64", "shape": (4096,)}},
+        count=72,
+        path="both",
+    )
+    t("aten::floor_divide", {"other": (), "self": (1, 64)}, count=36, path="both")
+    t("aten::floor_divide", {"other": (), "self": (64,)}, count=18, path="eager")
+    t(
+        "aten::floor_divide",
+        {"other": (), "self": {"dtype": "int32", "shape": (1, 1)}},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::full",
+        {"dtype": 3, "fill_value": 32768, "pin_memory": False, "size": (1,)},
+        count=2304,
+        path="both",
+    )
+    t(
+        "aten::full",
+        {"dtype": 3, "fill_value": 4096, "pin_memory": False, "size": (4096, 64)},
+        count=2304,
+        path="both",
+    )
+    t(
+        "aten::full",
+        {"dtype": 4, "fill_value": 0, "pin_memory": False, "size": ()},
+        count=64,
+        path="compiled",
+    )
+    t(
+        "aten::full",
+        {"dtype": 6, "fill_value": 0, "pin_memory": False, "size": ()},
+        count=64,
+        path="compiled",
+    )
+    t(
+        "aten::gather",
+        {"dim": -1, "index": {"dtype": "int64", "shape": (1, 2048, 8)}, "self": (1, 2048, 64)},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::gather",
+        {"dim": -1, "index": {"dtype": "int64", "shape": (256, 1)}, "self": (256, 37984)},
+        count=24,
+        path="both",
+    )
+    t(
+        "aten::gather",
+        {"dim": 0, "index": {"dtype": "int64", "shape": (4096, 4096)}, "self": (2048, 4096)},
+        count=18,
+        path="both",
+    )
+    t(
+        "aten::gather",
+        {"dim": -1, "index": {"dtype": "int64", "shape": (1, 512, 8)}, "self": (1, 512, 64)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 37984, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 75968, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 113952, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 151936, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 0, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 37984, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 75968, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::ge.Scalar",
+        {"other": 113952, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::index.Tensor",
+        {"indices": [{"dtype": "int64", "shape": (2048,)}], "self": (2048, 256)},
+        count=36,
+        path="both",
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "shape": (4096,)}, {"dtype": "int64", "shape": (4096,)}],
+            "self": {"dtype": "int64", "shape": (4096, 64)},
+        },
+        count=36,
+        path="both",
+    )
+    t(
+        "aten::index_put",
+        {
+            "indices": [{"dtype": "int64", "shape": (4096,)}, {"dtype": "int64", "shape": (4096,)}],
+            "self": {"dtype": "int32", "shape": (4096, 64)},
+            "values": {"dtype": "int32", "shape": (4096,)},
+        },
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::index_put",
+        {
+            "indices": [{"dtype": "bool", "shape": (256,)}],
+            "self": {"dtype": "int64", "shape": (256,)},
+            "values": {"dtype": "int64", "shape": ()},
+        },
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::index_put",
+        {"indices": [{"dtype": "bool", "shape": (256, 1)}], "self": (256, 1), "values": ()},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::index_put",
+        {
+            "indices": [{"dtype": "int64", "shape": (256,)}, {"dtype": "int64", "shape": (256,)}],
+            "self": (256, 37984),
+            "values": (256,),
+        },
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::index_put_",
+        {
+            "indices": [{"dtype": "bool", "shape": (256,)}],
+            "self": {"dtype": "int64", "shape": (256,)},
+            "values": {"dtype": "int64", "shape": ()},
+        },
+        count=48,
+        path="eager",
+    )
+    t(
+        "aten::index_put_",
+        {
+            "indices": [{"dtype": "int64", "shape": (4096,)}, {"dtype": "int64", "shape": (4096,)}],
+            "self": {"dtype": "int32", "shape": (4096, 64)},
+            "values": {"dtype": "int32", "shape": (4096,)},
+        },
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::index_put_",
+        {"indices": [{"dtype": "bool", "shape": (256, 1)}], "self": (256, 1), "values": ()},
+        count=24,
+        path="eager",
+    )
+    t(
+        "aten::index_put_",
+        {
+            "indices": [{"dtype": "int64", "shape": (256,)}, {"dtype": "int64", "shape": (256,)}],
+            "self": (256, 37984),
+            "values": (256,),
+        },
+        count=24,
+        path="eager",
+    )
+    t(
+        "aten::le.Scalar",
+        {"other": 2047, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::le.Tensor",
+        {"other": {"dtype": "int64", "shape": (256,)}, "self": {"dtype": "int32", "shape": (1, 1)}},
+        count=1,
+        path="compiled",
+    )
+    t("aten::linalg_vector_norm", {"ord": 2.0, "self": (18,)}, count=3, path="eager")
+    t("aten::linalg_vector_norm", {"ord": 2.0, "self": (45,)}, count=3, path="eager")
+    t("aten::linear", {"input": (1, 2048, 4096), "weight": (64, 4096)}, count=36, path="eager")
+    t("aten::linear", {"input": (1, 2048, 4096), "weight": (9216, 4096)}, count=18, path="eager")
+    t("aten::linear", {"input": (1, 2048, 8192), "weight": (4096, 8192)}, count=18, path="eager")
+    t("aten::linear", {"input": (1, 2048, 4096), "weight": (2304, 4096)}, count=1, path="compiled")
+    t("aten::linear", {"input": (1, 2048, 2048), "weight": (4096, 2048)}, count=1, path="compiled")
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": (1, 2048, 9216),
+            "output_mask": (True, True, False),
+            "self": (1, 2048, 4096),
+            "weight": (9216, 4096),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": (1, 2048, 4096),
+            "output_mask": (True, True, False),
+            "self": (1, 2048, 8192),
+            "weight": (4096, 8192),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": (1, 2048, 64),
+            "output_mask": (True, True, False),
+            "self": (1, 2048, 4096),
+            "weight": (64, 4096),
+        },
+        count=18,
+        path="eager",
+    )
+    t("aten::log", {"self": (256, 1)}, count=24, path="both")
+    t("aten::log", {"self": (16, 128, 16)}, count=1, path="compiled")
+    t(
+        "aten::lt.Scalar",
+        {"other": 0, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 37984, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 75968, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 113952, "self": {"dtype": "int64", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 37984, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 75968, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 113952, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::lt.Scalar",
+        {"other": 151936, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::maximum",
+        {"other": {"dtype": "int64", "shape": ()}, "self": {"dtype": "int64", "shape": (256,)}},
+        count=1,
+        path="compiled",
+    )
+    t("aten::mean", {"self": (64,)}, count=36, path="eager")
+    t(
+        "aten::minimum",
+        {"other": {"dtype": "int64", "shape": ()}, "self": {"dtype": "int64", "shape": (256,)}},
+        count=1,
+        path="compiled",
+    )
+    t("aten::mm", {"mat2": (64, 4096), "self": (512, 64)}, count=1, path="compiled")
+    t("aten::mm", {"mat2": (512, 4096), "self": (64, 512)}, count=1, path="compiled")
+    t("aten::mm", {"mat2": (4096, 2048), "self": (2048, 4096)}, count=1, path="compiled")
+    t("aten::mm", {"mat2": (2048, 2048), "self": (4096, 2048)}, count=1, path="compiled")
+    t("aten::mm", {"mat2": (2304, 4096), "self": (2048, 2304)}, count=1, path="compiled")
+    t("aten::mm", {"mat2": (2048, 4096), "self": (2304, 2048)}, count=1, path="compiled")
+    t(
+        "aten::mul.Tensor",
+        {"other": (1, 2048, 1, 128), "self": (1, 2048, 64, 128)},
+        count=108,
+        path="eager",
+    )
+    t("aten::mul.Tensor", {"other": (32768, 1536), "self": (32768, 1536)}, count=73, path="both")
+    t("aten::mul.Tensor", {"other": (4096, 1), "self": (4096, 4096)}, count=54, path="both")
+    t("aten::mul.Tensor", {"other": (256, 1), "self": (256, 37984)}, count=24, path="both")
+    t("aten::mul.Tensor", {"other": (4096, 4096), "self": (4096, 4096)}, count=18, path="both")
+    t("aten::mul.Tensor", {"other": (1, 2048, 1), "self": (1, 2048, 4096)}, count=6, path="eager")
+    t(
+        "aten::mul.Tensor",
+        {"other": (1, 2048, 1, 128), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::mul.Tensor", {"other": (128,), "self": (1, 2048, 16, 128)}, count=1, path="compiled")
+    t(
+        "aten::mul.Tensor",
+        {"other": (1, 2048, 16, 1), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::mul.Tensor",
+        {"other": (1, 2048, 16, 128), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::ne.Scalar",
+        {"other": -100, "self": {"dtype": "int64", "shape": (256,)}},
+        count=96,
+        path="both",
+    )
+    t(
+        "aten::ne.Scalar",
+        {"other": -100, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t("aten::neg", {"self": (1, 2048, 4, 64)}, count=54, path="eager")
+    t("aten::neg", {"self": (1, 2048, 64, 64)}, count=54, path="eager")
+    t("aten::neg", {"self": (256,)}, count=24, path="both")
+    t("aten::neg", {"self": (1, 2048, 8)}, count=18, path="eager")
+    t("aten::neg", {"self": (1, 2048, 16, 64)}, count=1, path="compiled")
+    t("aten::neg", {"self": (1, 2048, 1, 64)}, count=1, path="compiled")
+    t("aten::neg", {"self": (16, 128, 16)}, count=1, path="compiled")
+    t("aten::neg", {"self": (1, 512, 8)}, count=1, path="compiled")
+    t("aten::new_zeros", {"self": (1, 2048, 8), "size": (1, 2048, 64)}, count=18, path="eager")
+    t(
+        "aten::new_zeros",
+        {"dtype": 6, "pin_memory": False, "self": (1, 2048, 4096), "size": ()},
+        count=3,
+        path="eager",
+    )
+    t("aten::new_zeros", {"self": (1, 512, 8), "size": (1, 2048, 64)}, count=1, path="compiled")
+    t(
+        "aten::one_hot",
+        {"num_classes": 64, "self": {"dtype": "int64", "shape": (4096,)}},
+        count=36,
+        path="both",
+    )
+    t("aten::ones_like", {"pin_memory": False, "self": ()}, count=24, path="eager")
+    t("aten::pow.Tensor_Scalar", {"exponent": 2.0, "self": ()}, count=6, path="eager")
+    t("aten::pow_.Scalar", {"exponent": 0.5, "self": ()}, count=3, path="eager")
+    t("aten::reciprocal", {"self": ()}, count=6, path="eager")
+    t(
+        "aten::remainder.Scalar",
+        {"other": 512, "self": {"dtype": "int64", "shape": (4096,)}},
+        count=36,
+        path="both",
+    )
+    t("aten::rsub.Scalar", {"other": 1, "self": (32768, 1536)}, count=1, path="compiled")
+    t("aten::scalar_tensor", {"dtype": 4, "s": 0}, count=6144, path="eager")
+    t("aten::scalar_tensor", {"dtype": 6, "s": 0}, count=4608, path="eager")
+    t(
+        "aten::scatter_add",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": (4096, 4096)},
+            "self": (2048, 4096),
+            "src": (4096, 4096),
+        },
+        count=36,
+        path="both",
+    )
+    t(
+        "aten::scatter_add",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": (1, 2048, 8)},
+            "self": (1, 2048, 64),
+            "src": (1, 2048, 8),
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::scatter_add",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": (1, 512, 8)},
+            "self": (1, 512, 64),
+            "src": (1, 512, 8),
+        },
+        count=1,
+        path="compiled",
+    )
+    t("aten::select.int", {"dim": 0, "index": 0, "self": (6, 64)}, count=3, path="eager")
+    t("aten::select.int", {"dim": 0, "index": 1, "self": (6, 64)}, count=3, path="eager")
+    t("aten::select.int", {"dim": 0, "index": 2, "self": (6, 64)}, count=3, path="eager")
+    t("aten::select.int", {"dim": 0, "index": 3, "self": (6, 64)}, count=3, path="eager")
+    t("aten::select.int", {"dim": 0, "index": 4, "self": (6, 64)}, count=3, path="eager")
+    t("aten::select.int", {"dim": 0, "index": 5, "self": (6, 64)}, count=3, path="eager")
+    t("aten::sigmoid", {"self": (32768, 1536)}, count=1, path="compiled")
+    t("aten::sign", {"self": (64,)}, count=18, path="eager")
+    t("aten::silu", {"self": (32768, 1536)}, count=36, path="eager")
+    t(
+        "aten::silu_backward",
+        {"grad_output": (32768, 1536), "self": (32768, 1536)},
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 2048, "self": (1, 2048, 4096), "start": 0},
+        count=78,
+        path="both",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 3, "end": 64, "self": (1, 2048, 64, 128), "start": 0},
+        count=54,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 3, "end": 9223372036854775807, "self": (1, 2048, 64, 128), "start": 64},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 3, "end": 128, "self": (1, 2048, 64, 128), "start": 64},
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 256, "self": (1, 2048, 4096), "start": 0},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 1280, "self": (1, 2048, 4096), "start": 1024},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 1536, "self": (1, 2048, 4096), "start": 1280},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 1792, "self": (1, 2048, 4096), "start": 1536},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 2048, "self": (1, 2048, 4096), "start": 1792},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice.Tensor",
+        {"dim": 1, "end": 512, "self": (1, 2048, 4096), "start": 256},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 64,
+            "grad_output": (1, 2048, 4, 64),
+            "input_sizes": (1, 2048, 4, 128),
+            "start": 0,
+            "step": 1,
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": (1, 2048, 4, 64),
+            "input_sizes": (1, 2048, 4, 128),
+            "start": 64,
+            "step": 1,
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 64,
+            "grad_output": (1, 2048, 64, 64),
+            "input_sizes": (1, 2048, 64, 128),
+            "start": 0,
+            "step": 1,
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": (1, 2048, 64, 64),
+            "input_sizes": (1, 2048, 64, 128),
+            "start": 64,
+            "step": 1,
+        },
+        count=18,
+        path="eager",
+    )
+    t(
+        "aten::split.Tensor",
+        {"dim": 1, "self": (1, 2048, 4096), "split_size": 512},
+        count=96,
+        path="eager",
+    )
+    t(
+        "aten::split_with_sizes",
+        {"self": (1131024,), "split_sizes": (589824, 524288, 8, 8, 16384, 256, 256)},
+        count=60,
+        path="eager",
+    )
+    t(
+        "aten::split_with_sizes",
+        {"dim": -2, "self": (1, 2048, 1, 18, 128), "split_sizes": (16, 1, 1)},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::split_with_sizes",
+        {"self": (9723904,), "split_sizes": (9723904,)},
+        count=9,
+        path="eager",
+    )
+    t("aten::split_with_sizes", {"self": (256,), "split_sizes": (256,)}, count=6, path="eager")
+    t(
+        "aten::split_with_sizes",
+        {
+            "dim": 1,
+            "self": (1, 2048, 4096),
+            "split_sizes": (256, 256, 256, 256, 256, 256, 256, 256),
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::split_with_sizes",
+        {
+            "dim": 1,
+            "self": {"dtype": "int64", "shape": (1, 2048)},
+            "split_sizes": (256, 256, 256, 256, 256, 256, 256, 256),
+        },
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::squeeze.dim",
+        {"dim": 0, "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=36,
+        path="eager",
+    )
+    t("aten::squeeze.dim", {"dim": -1, "self": (256, 1)}, count=24, path="both")
+    t("aten::squeeze.dim", {"dim": 1, "self": (512, 1, 4096)}, count=18, path="both")
+    t("aten::stack", {"tensors": [{"dtype": "int64", "shape": (2048,)}]}, count=9, path="eager")
+    t(
+        "aten::stack",
+        {"tensors": [(), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ()]},
+        count=3,
+        path="eager",
+    )
+    t("aten::stack", {"tensors": [()]}, count=3, path="eager")
+    t(
+        "aten::sub.Tensor",
+        {"other": (), "self": {"dtype": "int64", "shape": (256,)}},
+        count=192,
+        path="both",
+    )
+    t("aten::sub.Tensor", {"other": (256, 1), "self": (256, 37984)}, count=48, path="both")
+    t(
+        "aten::sub.Tensor",
+        {"other": (), "self": {"dtype": "int64", "shape": (4096,)}},
+        count=36,
+        path="both",
+    )
+    t("aten::sub.Tensor", {"other": (), "self": (256,)}, count=24, path="both")
+    t("aten::sub.Tensor", {"other": (), "self": (64,)}, count=18, path="eager")
+    t(
+        "aten::sub.Tensor",
+        {"other": (), "self": {"dtype": "int64", "shape": (1, 2048)}},
+        count=12,
+        path="eager",
+    )
+    t(
+        "aten::sub.Tensor",
+        {"other": (1, 2048, 16, 128), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::sub.Tensor",
+        {"other": (1, 512, 4096), "self": (1, 512, 4096)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::sub.Tensor",
+        {"other": (1, 2048, 1, 128), "self": (1, 2048, 1, 128)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::sub.Tensor", {"other": (1, 512, 64), "self": (1, 512, 64)}, count=1, path="compiled")
+    t("aten::sum", {"self": (256,)}, count=24, path="both")
+    t("aten::sum", {"self": {"dtype": "bool", "shape": (1, 2048)}}, count=3, path="eager")
+    t("aten::sum", {"self": (1,)}, count=3, path="eager")
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (0,), "self": {"dtype": "int64", "shape": (4096, 64)}},
+        count=36,
+        path="both",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (-1,), "keepdim": True, "self": (256, 37984)},
+        count=24,
+        path="both",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (1,), "keepdim": True, "self": (512, 8, 4096)},
+        count=18,
+        path="both",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (1,), "keepdim": True, "self": (4096, 4096)},
+        count=18,
+        path="both",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (3,), "keepdim": True, "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (0, 1, 2), "self": (1, 2048, 16, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (2,), "keepdim": True, "self": (1, 512, 4096)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::sum.dim_IntList", {"dim": (0, 1), "self": (1, 512, 4096)}, count=1, path="compiled")
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (3,), "keepdim": True, "self": (1, 2048, 1, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {"dim": (0, 1, 2), "self": (1, 2048, 1, 128)},
+        count=1,
+        path="compiled",
+    )
+    t("aten::t", {"self": (512, 64)}, count=1, path="compiled")
+    t("aten::t", {"self": (2048, 4096)}, count=1, path="compiled")
+    t("aten::t", {"self": (2048, 2304)}, count=1, path="compiled")
+    t(
+        "aten::topk",
+        {"dim": -1, "k": 8, "largest": True, "self": (1, 2048, 64), "sorted": False},
+        count=18,
+        path="eager",
+    )
+    t("aten::topk", {"k": 8, "self": (1, 512, 64)}, count=1, path="compiled")
+    t(
+        "aten::transpose.int",
+        {"dim0": -2, "dim1": -1, "self": (1, 1536, 4096)},
+        count=144,
+        path="both",
+    )
+    t(
+        "aten::transpose.int",
+        {"dim0": -2, "dim1": -1, "self": (1, 4096, 1536)},
+        count=126,
+        path="both",
+    )
+    t(
+        "aten::transpose.int",
+        {"dim0": 1, "dim1": 2, "self": (1, 2048, 1, 128)},
+        count=72,
+        path="both",
+    )
+    t(
+        "aten::transpose.int",
+        {"dim0": 1, "dim1": 2, "self": (1, 16, 2048, 128)},
+        count=54,
+        path="both",
+    )
+    t(
+        "aten::transpose.int",
+        {"dim0": 1, "dim1": 2, "self": (1, 2048, 16, 128)},
+        count=54,
+        path="both",
+    )
+    t("aten::transpose.int", {"dim0": -2, "dim1": -1, "self": (32768, 1536)}, count=36, path="both")
+    t(
+        "aten::transpose.int",
+        {"dim0": 1, "dim1": 2, "self": (1, 1, 2048, 128)},
+        count=36,
+        path="both",
+    )
+    t("aten::transpose.int", {"dim0": -2, "dim1": -1, "self": (32768, 4096)}, count=18, path="both")
+    t(
+        "aten::transpose.int",
+        {"dim0": -2, "dim1": -1, "self": (1, 16, 2048, 128)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::transpose.int",
+        {"dim0": -2, "dim1": -1, "self": (1, 16, 128, 2048)},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::unsqueeze",
+        {"dim": -1, "self": {"dtype": "bool", "shape": (256,)}},
+        count=48,
+        path="both",
+    )
+    t("aten::unsqueeze", {"dim": 1, "self": (512, 4096)}, count=36, path="both")
+    t(
+        "aten::unsqueeze",
+        {"dim": -1, "self": {"dtype": "int64", "shape": (1, 2048, 8)}},
+        count=36,
+        path="eager",
+    )
+    t(
+        "aten::unsqueeze",
+        {"dim": -1, "self": {"dtype": "int64", "shape": (256,)}},
+        count=24,
+        path="both",
+    )
+    t("aten::unsqueeze", {"dim": 0, "self": (64,)}, count=18, path="eager")
+    t(
+        "aten::unsqueeze",
+        {"dim": -1, "self": {"dtype": "bool", "shape": (1, 2048)}},
+        count=3,
+        path="eager",
+    )
+    t(
+        "aten::unsqueeze",
+        {"dim": -1, "self": {"dtype": "int64", "shape": (1, 512, 8)}},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::unsqueeze",
+        {"dim": 1, "self": {"dtype": "int32", "shape": (1,)}},
+        count=1,
+        path="compiled",
+    )
+    t(
+        "aten::view",
+        {"self": (1, 2048, 9216), "size": (1, 2048, -1, 18, 128)},
+        count=36,
+        path="eager",
+    )
+    t("aten::view", {"self": (155582464,), "size": (16, -1)}, count=24, path="eager")
+    t(
+        "aten::view",
+        {"self": (1, 2048, 4, 18, 128), "size": (1, 2048, 9216)},
+        count=18,
+        path="eager",
+    )
+    t("aten::view", {"self": (37984, 4096), "size": (37984, 4096)}, count=6, path="eager")
+    t("aten::view", {"self": (32768, 4096), "size": (256, 128, 4096)}, count=1, path="compiled")
+    t("aten::view", {"self": (256, 128, 4096), "size": (256, 128, 4096)}, count=1, path="compiled")
+    t("aten::view", {"self": (256, 128, 4096), "size": (32768, 4096)}, count=1, path="compiled")
+    t("aten::view", {"self": (256, 128, 1536), "size": (256, 128, 1536)}, count=1, path="compiled")
+    t("aten::view", {"self": (256, 128, 1536), "size": (32768, 1536)}, count=1, path="compiled")
+    t("aten::view", {"self": (32768, 1536), "size": (256, 128, 1536)}, count=1, path="compiled")
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": (256,)},
+            "other": {"dtype": "int64", "shape": ()},
+            "self": {"dtype": "int64", "shape": (256,)},
+        },
+        count=48,
+        path="both",
+    )
+    t(
+        "aten::where.self",
+        {"condition": {"dtype": "bool", "shape": (256, 1)}, "other": (), "self": ()},
+        count=24,
+        path="both",
+    )
+    t(
+        "aten::where.self",
+        {"condition": {"dtype": "bool", "shape": (256,)}, "other": (), "self": (256,)},
+        count=24,
+        path="both",
+    )
+    t("aten::zero_", {"self": (64,)}, count=18, path="eager")
+    t("aten::zeros", {"dtype": 6, "pin_memory": False, "size": ()}, count=4032, path="eager")
+    t(
+        "aten::zeros",
+        {"dtype": 15, "pin_memory": False, "size": (2048, 4096)},
+        count=2304,
+        path="both",
+    )
+    t("aten::zeros", {"dtype": 3, "size": (1, 64)}, count=1152, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (4096,)}, count=26, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (128,)}, count=24, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (256, 37984)}, count=24, path="both")
+    t("aten::zeros_like", {"pin_memory": False, "self": (64, 1536, 4096)}, count=24, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (4096, 8192)}, count=12, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (64, 4096, 1536)}, count=12, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (64, 4096)}, count=12, path="eager")
+    t("aten::zeros_like", {"pin_memory": False, "self": (9216, 4096)}, count=12, path="eager")
+    t(
+        "aten::zeros_like",
+        {"dtype": 6, "pin_memory": False, "self": (1, 2048, 4096)},
+        count=3,
+        path="eager",
+    )
+
+
+# ── provenance ───────────────────────────────────────────────────────────────────────────────
+# The block above is generated output of ``gen_ep64_registry.py --model qwen3_235b_ep64_tp4``
+# from the reference branch ``opcap/qwen3-235b-ep64``. Details in ``tests/vertical/README.md``.
+
+
+# The accuracy smoke test subsets, named by ``--traced-model``. A key is the subset name, and
+# it carries the model and the distributed degrees of the capture (``ep64_tp4``).
+SMOKE_SUBSET_SHAPES = {
+    QWEN3_235B_EP64_TP4: _register_qwen3_235b_ep64_tp4,
+}
+
+SMOKE_SUBSET_OPS = {
+    QWEN3_235B_EP64_TP4: QWEN3_235B_EP64_TP4_OPS,
+}
+
+# Op mode per subset, e.g. ``aten::silu`` is ``eager_only`` in this subset because AOT lowers
+# it to sigmoid+mul. The mode tells you if an op exists in eager, in compile, or in both.
+SMOKE_SUBSET_OP_MODE = {
+    QWEN3_235B_EP64_TP4: QWEN3_235B_EP64_TP4_OP_MODE,
 }

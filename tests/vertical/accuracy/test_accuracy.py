@@ -5,7 +5,7 @@ Runs the reference and the device path **in one process**.
 ``--traced-model`` is required -- the sweep is per-model, no model input fails loudly::
 
     pytest tests/vertical/accuracy/test_accuracy.py \\
-        --traced-model qwen3_235b_a22b --max-shapes-per-op 0 \\
+        --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 \\
         -n 32 --tb=no -q 2>&1 | tee accuracy_$(date +%Y%m%d_%H%M%S).log
 
 **Not a gate.** Every cell emits a row and the test passes as long as cells ran.
@@ -13,6 +13,7 @@ Runs the reference and the device path **in one process**.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -30,7 +31,10 @@ from internal.common import allocate_to_device as _allocate_to_device
 from internal.common import classify_error as _classify_error
 from internal.common import flatten_tensors as _flatten_tensors
 from internal.neuron_op_info import _resolve_op
-from internal.neuron_shape_defaults_generated import QWEN3_235B_A22B, TRACED_MODEL_OPS
+from internal.neuron_shape_defaults_generated import (
+    SMOKE_SUBSET_OP_MODE,
+    SMOKE_SUBSET_OPS,
+)
 from internal.target_ops import TARGET_ATEN_OP_GROUP
 
 from .budgets import EXCLUDED_GROUPS, error_budget
@@ -53,16 +57,29 @@ logger = logging.getLogger(__name__)
 _NO_MODEL = None
 
 
+@functools.cache
+def _selected_model() -> str | None:
+    """The ``--traced-model`` name that actually selected an op set, or ``None``."""
+    for name in (os.environ.get("NEURON_TRACED_MODEL") or "").split(","):
+        name = name.strip()
+        if SMOKE_SUBSET_OPS.get(name):
+            return name
+    return None
+
+
 def _registry_ops() -> list[str]:
     """Ops to sweep: the declared op list by ``--traced-model``.
     Selecting nothing is a loud failure, in ``_op_params``.
     """
-    for name in (os.environ.get("NEURON_TRACED_MODEL") or "").split(","):
-        declared = TRACED_MODEL_OPS.get(name.strip())
-        if declared:
-            return sorted(declared)
+    model = _selected_model()
+    return sorted(SMOKE_SUBSET_OPS[model]) if model else []
 
-    return []
+
+def _op_mode(op_name: str) -> str:
+    """``eager_only`` / ``compile_only`` / ``both_modes`` for this op in the selected subset's
+    capture, or ``""`` when the subset declares no mode partition.
+    """
+    return (SMOKE_SUBSET_OP_MODE.get(_selected_model()) or {}).get(op_name, "")
 
 
 def _op_params():
@@ -84,6 +101,7 @@ def _blank_row(op_name: str, op_group: str, arg_shapes: dict, dtype_name: str, c
         "cell_id": cell,
         "op": op_name,
         "op_group": op_group,
+        "op_mode": _op_mode(op_name),
         "dtype": dtype_name,
         "path": None,
         "arg_shapes": arg_shapes,
@@ -129,13 +147,9 @@ def _exact_match_units(dev_outs, ref_outs) -> tuple[dict, dict]:
 
 
 def _cell_paths(entry) -> list:
-    """Capture-path labels an entry belongs to, from its source tags. ``--traced-model
-    qwen3_235b_a22b`` tags each entry with the base model source plus its path source
-    ``qwen3_235b_a22b_<path>``; this returns e.g. ``["eager"]``, ``["compiled"]``, or both
-    for a shape traced in both paths. ``[None]`` for non-model runs (one unsplit CSV)."""
-    prefix = QWEN3_235B_A22B + "_"
-    labels = sorted(s[len(prefix) :] for s in entry.sources if s.startswith(prefix))
-    return labels or [None]
+    """Capture paths an entry was traced on: e.g. ``["eager"]``,``["compiled"]``, or both.
+    ``[None]`` when the entry carries no capture path, e.g. builtin shapes."""
+    return sorted(entry.paths) or [None]
 
 
 def _worst_fro_ratio(dev_outs, base_outs, ref_outs):
@@ -285,7 +299,7 @@ class TestOpAccuracy:
         if op_name is _NO_MODEL:
             pytest.fail(
                 "no op set selected: pass --traced-model with one of "
-                f"{sorted(TRACED_MODEL_OPS)}."
+                f"{sorted(SMOKE_SUBSET_OPS)}."
             )
 
         op_group = TARGET_ATEN_OP_GROUP.get(op_name, "unknown")

@@ -16,7 +16,7 @@ tests/vertical/
 │   ├── __init__.py
 │   ├── target_ops.py               # Curated list of ~1362 target ATen ops
 │   ├── neuron_shape_registry.py    # Op-specific shape registry (CSV/JSON backed)
-│   ├── neuron_shape_defaults_generated.py  # Auto-generated shapes + model-traced sets
+│   ├── neuron_shape_defaults_generated.py  # Auto-generated shapes + smoke test subsets
 │   ├── neuron_op_info.py           # NeuronOpInfo extending PyTorch OpInfo
 │   ├── neuron_op_db.py             # build_neuron_op_db() merging all sources
 │   ├── generate_op_shape_registry.py       # Tool: cache keys → op_shape_registry.json
@@ -96,27 +96,31 @@ fp32 reduction over 4096 values drifts ~64 units. Those cells report `no_gate`.
 python -m pytest tests/vertical/accuracy/test_metrics.py -q
 
 # Phase 2 -- on-device sweep against a model's traced op+shape list.
-# qwen3_235b_a22b is traced BOTH ways (eager + compiled); one run writes one CSV per
-# path: op_accuracy_eager_<ts>.csv and op_accuracy_compiled_<ts>.csv.
+# The set is traced BOTH ways (eager + compiled); one run writes one CSV per path:
+# op_accuracy_eager_<ts>.csv and op_accuracy_compiled_<ts>.csv. Rows carry op_mode.
 python -m pytest tests/vertical/accuracy/test_accuracy.py \
-    --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -n 32 --tb=no -q
+    --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 32 --tb=no -q
+
+# The same set at fp32. Both dtypes (bf16,fp32) sweep every op, unless explicitly passing --dtypes
+python -m pytest tests/vertical/accuracy/test_accuracy.py \
+    --traced-model qwen3_235b_ep64_tp4 --dtypes float32 --max-shapes-per-op 0 -n 32 --tb=no -q
 
 # A single op, verbose
 python -m pytest "tests/vertical/accuracy/test_accuracy.py::TestOpAccuracy::test_op[aten::bmm]" \
-    --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -s --log-cli-level=INFO
+    --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -s --log-cli-level=INFO
 
 # Include shapes above the shared 512Mi-element guard (NeuronOpInfo._MAX_TENSOR_ELEMS).
-# For qwen3_235b_a22b that guard drops the 151936-vocab lm_head projections in
-# mm / linear / index.Tensor, at 622M elements each.
+# No entry in qwen3_235b_ep64_tp4 hits it -- the largest tensor arg in the set is the 64-expert
+# MoE weight stack at 64x1536x4096 = 402M elements -- so this is a knob for future sets.
 NEURON_MAX_TENSOR_ELEMS=700000000 python -m pytest tests/vertical/accuracy/test_accuracy.py \
-    --traced-model qwen3_235b_a22b --max-shapes-per-op 0 -n 32 --tb=no -q
+    --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 32 --tb=no -q
 ```
 
-**`--traced-model` is required.** It does two things — registers that set's shapes, and
+**`--traced-model` is required.** It does two things — registers smoke test subset's shapes, and
 restricts the run to them. Both are needed: registering alone would leave the op's `builtin`
-shapes in the pool as well, so the sweep would report more cells than the set has entries and
+shapes in the pool as well, so the sweep would report more cells than the subset has entries and
 would not be purely model-shaped. `--model-shapes-only` excludes `builtin` but cannot separate
-two model sets registered together; `--traced-model` selects exactly one.
+two subsets registered together; `--traced-model` selects exactly one.
 
 **Not a gate.** `test_op` passes as long as cells ran; the verdict lives in the CSV. An op
 that could not be measured stays visible as a `status` rather than being folded into a pass.
@@ -139,6 +143,7 @@ stays recomputable without re-running it either.
 |--------|-------------|
 | `cell_id` | 16-hex-char id of `(op, arg_shapes, dtype)`. Excludes the seed — the seed is derived from it |
 | `op` / `op_group` | Full ATen op name; `TARGET_ATEN_OP_GROUP` category |
+| `op_mode` | Which capture mode saw the op name in the capture: `eager_only` / `compile_only` / `both_modes`. Empty for subsets that declare no mode partition. Distinct from `op_group`, which sets the budget |
 | `dtype` | Input dtype the cell was measured at |
 | `path` | Capture path the cell came from (`eager` / `compiled`); the split key for the per-path CSVs |
 | `arg_shapes` | JSON of the registry entry used. The source for any shape-derived figure — the suite no longer extracts a reduction width itself |
@@ -272,8 +277,8 @@ Per-cell rows are merged into one timestamped `dynamic_collectives_<timestamp>.c
 
 Register in `internal/neuron_shape_registry.py` or `internal/neuron_shape_defaults_generated.py`.
 Entries added at the top level of `register_all_defaults` join the builtin pool every suite
-sees; to add shapes that only one sweep picks up, put them in a model set instead (see
-[Model-traced shape sets](#model-traced-shape-sets)).
+sees; to add shapes that only one sweep picks up, put them in a smoke test subset instead (see
+[Accuracy smoke test subsets](#accuracy-smoke-test-subsets)).
 
 ```python
 SHAPE_REGISTRY.register(
@@ -299,37 +304,106 @@ SHAPE_REGISTRY.register(
 
 ## Loading Shapes from Model Traces
 
-### Model-traced shape sets
+### Accuracy smoke test subsets
 
-A traced model's op+shape list is checked in to
+**Scope.** A subset is a small frozen op set for accuracy smoke tests. This is not a model
+onboarding framework. Do not add a model here to get accuracy coverage for that model. The
+first subset comes from a Qwen3-235B EP64/TP4 capture, You can repurpose or extend the subset,
+but the intent is one small frozen subset.
+
+The op+shape list of a subset is checked in to
 `internal/neuron_shape_defaults_generated.py`, alongside the builtin defaults, so there is
-one registry source rather than a second file to keep in sync. Each set contributes three
+one registry source rather than a second file to keep in sync. Each subset contributes four
 module-level names:
 
 | Name | Purpose |
 |------|---------|
-| `TRACED_MODEL_SHAPES[<name>]` | The register function. `<name>` is what `--traced-model` accepts |
-| `TRACED_MODEL_OPS[<name>]` | The frozenset of ops the set actually traced |
+| `SMOKE_SUBSET_SHAPES[<name>]` | The register function. `<name>` is what `--traced-model` accepts |
+| `SMOKE_SUBSET_OPS[<name>]` | The frozenset of ops the subset actually traced |
+| `SMOKE_SUBSET_OP_MODE[<name>]` | Optional. `{op: mode}` for subsets that partition by capture mode; drives the `op_mode` CSV column |
 | `<NAME>` | The source tag its entries carry, so `SHAPE_REGISTRY.get(op, model=<NAME>)` works |
 
-Currently: `qwen3_235b_a22b` — 315 unique entries over 46 ops (eager 34 / compiled 33
-capture paths), deduplicated on `(op_name, arg_shapes)` with counts summed. It's the
-upstream_jul08 trace intersected with the shared 54-op reference set; the 8 unshared ops
-aren't traced by upstream_jul08. Ops failing the Frobenius ratio are kept and tracked
-per-cell in the CSV (fro_ratio_verdict), not dropped.
+`qwen3_235b_ep64_tp4` — 328 unique entries over 89 ops, from an end-to-end 64-rank capture of
+`qwen3_235b_6layers_ep64_nle1_tp4_neuron_ep` (EP64 / 64 experts / top-8, TP4 × FSDP16,
+SelectiveAC, seq 2048) on trn3.
 
-**Registering a set is opt-in and off by default.** `register_all_defaults(r, traced_models=())`
+The ops capture kit is on origin branch `opcap/qwen3-235b-ep64`, that branch's `tests/vertical/tools/opcap/README.md` has the procedure, the regeneration steps and the known gaps:
+
+```sh
+git fetch origin opcap/qwen3-235b-ep64
+git show 16c27852:tests/vertical/tools/opcap/README.md
+```
+
+The subset is categorized on **two independent axes**.
+
+**Axis 1 — `op_mode`, per op.** Which capture mode ever saw the op *name* at all:
+
+| mode | meaning | ops |
+|------|---------|-----|
+| `eager_only` | seen in eager dispatch, never in a post-AOT graph | 33 |
+| `compile_only` | post-AOT graphs only — introduced by AOT, never in model source | 10 |
+| `both_modes` | seen in eager dispatch *and* in a post-AOT graph | 46 |
+
+The full per-op attribution is in `tools/opcap/README.md` on the pinned
+`opcap/qwen3-235b-ep64` commit.
+
+**Axis 2 — capture path, per shape.** Which capture path actually observed *that exact call*,
+recorded per cell during capture and carried on the entry as `OpShapeEntry.paths` (`eager` /
+`compiled`, or both). This is the split key for the per-path CSVs: a cell traced on both paths is
+measured once per path, and `accuracy/conftest.py` routes the results to
+`op_accuracy_eager_<ts>.csv` and `op_accuracy_compiled_<ts>.csv` accordingly. A run whose entries
+carry no path at all (builtin shapes, no `--traced-model`) is unsplit and writes the single
+`op_accuracy_<ts>.csv`.
+
+One constraint: a shape cannot have a path the op was never seen on, so an `eager_only` op's entries
+are all eager and a `compile_only` op's are all compiled. A `both_modes` op is a mix — some shapes
+were only seen in compile and some shape only in eager. The path allows us to track back where the
+specific op shape is traced from.
+
+`--max-shapes-per-op 0` is right for this set because the op shape registry is already pruned
+with top-10 largest tensor cap, which leaves only 328 entries, and `aten::bmm` is declared in `QWEN3_235B_EP64_TP4_NO_SHAPE_OPS`, because the captured entries shapes is over the cap, so it
+reports one `no_input_sample` in result CSV.
+
+**Registering a subset is opt-in and off by default.** `register_all_defaults(r, smoke_subsets=())`
 takes an allowlist, and `--traced-model` is the only thing that fills it. That makes the gate
-fail safe: adding a model to the generated module cannot change what any existing suite
+fail safe: adding a subset to the generated module cannot change what any existing suite
 measures until a run names it. Without the gate the new entries would join the shared
 op-keyed pool and compete in the top-N-by-size cap in `NeuronOpInfo._registry_entries`,
 silently displacing shapes the coverage suites measure today. An unknown `--traced-model` name
 raises loudly.
 
-Use `TRACED_MODEL_OPS[<name>]` — not `SHAPE_REGISTRY.all_ops(model=<name>)` — when you need the
-list of ops a set traced. `propagate_to_compatible_overloads` copies entries *and their
+Use `SMOKE_SUBSET_OPS[<name>]` — not `SHAPE_REGISTRY.all_ops(model=<name>)` — when you need the
+list of ops a subset traced. `propagate_to_compatible_overloads` copies entries *and their
 source tag* onto schema-compatible `.out` / `.default` overloads, so `all_ops(model=)`
 reports those synthesized overloads too (more ops rather than the actually traced).
+
+### Provenance pin
+
+The `qwen3_235b_ep64_tp4` block in `internal/neuron_shape_defaults_generated.py` is generated output of
+`tests/vertical/tools/opcap/gen_ep64_registry.py --model qwen3_235b_ep64_tp4`, which lives
+on origin branch `opcap/qwen3-235b-ep64`.
+
+```sh
+# commit 7b73b5dc5eb4e7f68dfdc925701d3d528dbc747f
+git fetch origin opcap/qwen3-235b-ep64
+git show 7b73b5dc:tests/vertical/tools/opcap/README.md
+```
+
+sha256 (first 16) of the inputs and generators, so a re-derivation can be checked against the
+block without trusting the branch pointer (paths relative to `tests/vertical/tools/opcap/`):
+
+| sha256[:16] | file |
+|---|---|
+| `3b0c326890d2a731` | `captures/qwen3_235b_ep64_tp4/opcap_shapes.json` |
+| `2902ae97407c846a` | `captures/qwen3_235b_ep64_tp4/opcap_ops.json` |
+| `fcc04d5752454cfe` | `gen_ep64_registry.py` |
+| `112d7e62bb36da88` | `gen_shape_registry.py` |
+
+To reproduce: check that commit out, `python gen_ep64_registry.py --model qwen3_235b_ep64_tp4 -o
+/tmp/block.py`, `ruff format --line-length 100 /tmp/block.py`, and diff against the block — it is
+byte-for-byte identical. Nothing inside the block is hand-edited; regenerate and re-splice, then
+update this pin. The capture procedure, the known gaps and the per-op mode attribution live in
+that branch's `tests/vertical/tools/opcap/README.md`.
 
 ### End-to-end workflow
 
@@ -361,7 +435,7 @@ reports those synthesized overloads too (more ops rather than the actually trace
 | Option | Description |
 |--------|-------------|
 | `--shape-registry <path>` | JSON shape registry file to load into `SHAPE_REGISTRY`, tagged `model_trace`. For a one-off trace that isn't checked in |
-| `--traced-model <names>` | Comma-separated checked-in shape set(s) (keys of `TRACED_MODEL_SHAPES`). Registers them *and* restricts the run to them. Omit it and none are registered. Stricter than `--model-shapes-only`, which only excludes `builtin` and so still mixes every registered set together |
+| `--traced-model <names>` | Comma-separated smoke test subset(s) (keys of `SMOKE_SUBSET_SHAPES`). Registers them *and* restricts the run to them. Omit it and none are registered. Stricter than `--model-shapes-only`, which only excludes `builtin` and so still mixes every registered subset together |
 | `--model-shapes-only` | For ops with model-traced shapes, skip builtin/default shapes |
 | `--max-shapes-per-op <n>` | Cap per op to the top-N entries by max tensor element count. `0` disables the cap |
 
@@ -369,21 +443,21 @@ reports those synthesized overloads too (more ops rather than the actually trace
 
 ```python
 from internal.neuron_shape_defaults_generated import (
-    TRACED_MODEL_OPS,
-    QWEN3_235B_A22B,
+    SMOKE_SUBSET_OPS,
+    QWEN3_235B_EP64_TP4,
     register_all_defaults,
 )
 from internal.neuron_shape_registry import SHAPE_REGISTRY, NeuronShapeRegistry
 
 # The process-wide registry holds builtin defaults, plus whatever --traced-model named.
-SHAPE_REGISTRY.models()  # -> [] with no --traced-model; ["qwen3_235b_a22b"] with it
+SHAPE_REGISTRY.models()  # -> [] with no --traced-model; ["qwen3_235b_ep64_tp4"] with it
 
-# A private registry with one model set registered on top of the builtin defaults.
+# A private registry with one subset registered on top of the builtin defaults.
 reg = NeuronShapeRegistry()
-register_all_defaults(reg.register, traced_models=[QWEN3_235B_A22B])
-# that model's entries only, and the ops it traced (see the caveat above)
-reg.get("aten::linear", model=QWEN3_235B_A22B)
-TRACED_MODEL_OPS[QWEN3_235B_A22B]
+register_all_defaults(reg.register, smoke_subsets=[QWEN3_235B_EP64_TP4])
+# that subset's entries only, and the ops it traced (see the caveat above)
+reg.get("aten::linear", model=QWEN3_235B_EP64_TP4)
+SMOKE_SUBSET_OPS[QWEN3_235B_EP64_TP4]
 
 # Load a one-off trace from JSON. Source defaults to the filename stem.
 SHAPE_REGISTRY.load_json("llama7b_shapes.json")

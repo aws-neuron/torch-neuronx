@@ -113,8 +113,8 @@ def pytest_addoption(parser):
         "--traced-model",
         default=None,
         help=(
-            "Comma-separated model-traced shape set(s) to enable, e.g. qwen3_235b_a22b "
-            "An unknown name is an error rather than an empty selection."
+            "Comma-separated accuracy smoke test subset(s) to enable, e.g. "
+            "qwen3_235b_ep64_tp4. An unknown name is an error rather than an empty selection."
         ),
     )
     parser.addoption(
