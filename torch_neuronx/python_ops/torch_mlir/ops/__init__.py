@@ -11,6 +11,7 @@ from .creation import *  # noqa: F403
 from .foreach_copy import *  # noqa: F403
 from .foreach_ops import *  # noqa: F403
 from .indexing import *  # noqa: F403
+from .interpolation import *  # noqa: F403
 from .linear_algebra import *  # noqa: F403
 from .logical import *  # noqa: F403
 from .loss import *  # noqa: F403

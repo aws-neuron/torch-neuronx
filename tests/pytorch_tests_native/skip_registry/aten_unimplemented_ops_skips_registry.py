@@ -162,7 +162,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         match_target="test_method",
     ),
     # ═══════════════════════════════════════════════════════════════
-    # NN ops not natively lowered on Neuron (41 ops).
+    # NN ops not natively lowered on Neuron (33 ops).
     # ═══════════════════════════════════════════════════════════════
     # Includes pooling variants (avg_pool1d/2d/3d + backward,
     # max_pool*_with_indices + backward, adaptive_max_pool2d/3d +
@@ -172,10 +172,10 @@ SKIP_GROUPS: list[SkipGroup] = [
     # _native_batch_norm_legit_functional, batch_norm_backward,
     # native_batch_norm), loss functions (binary_cross_entropy[_backward],
     # huber_loss, smooth_l1_loss, soft_margin_loss, multi_margin_loss,
-    # nll_loss2d_forward/backward), upsample variants (upsample_bicubic2d,
-    # upsample_linear1d, upsample_nearest1d, upsample_nearest2d_backward,
-    # upsample_trilinear3d, _upsample_bilinear2d_aa_backward,
-    # _upsample_nearest_exact1d), and prelu family (prelu, _prelu_kernel,
+    # nll_loss2d_forward/backward), the upsample variants still without a
+    # lowering (upsample_trilinear3d and the anti-aliased _upsample_bilinear2d_aa
+    # / _upsample_bicubic2d_aa pair with their backwards), and prelu family
+    # (prelu, _prelu_kernel,
     # _prelu_kernel_backward).
     # Core NN ops ARE supported natively: max_pool, native_layer_norm,
     # native_group_norm, native_dropout, convolution, linear.
@@ -195,7 +195,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*__upsample_bicubic2d_aa_backward_neuron*",
             "*__upsample_bilinear2d_aa_neuron*",
             "*__upsample_bilinear2d_aa_backward_neuron*",
-            "*__upsample_nearest_exact1d_neuron*",
             "*_adaptive_max_pool2d_neuron*",
             "*_adaptive_max_pool2d_backward_neuron*",
             "*_adaptive_max_pool3d_neuron*",
@@ -220,13 +219,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_prelu_neuron*",
             "*_smooth_l1_loss_neuron*",
             "*_soft_margin_loss_neuron*",
-            "*_upsample_bicubic2d_neuron*",
-            "*_upsample_bicubic2d_backward_neuron*",
-            "*_upsample_bilinear2d_neuron*",
-            "*_upsample_bilinear2d_backward_neuron*",
-            "*_upsample_linear1d_neuron*",
-            "*_upsample_nearest1d_neuron*",
-            "*_upsample_nearest2d_backward_neuron*",
             "*_upsample_trilinear3d_neuron*",
         ],
         match_target="test_method",

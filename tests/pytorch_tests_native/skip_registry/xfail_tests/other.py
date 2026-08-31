@@ -36,6 +36,7 @@ OTHER = [
     "GraphDededuplicationTests::test_param_transfer_to_submodule",
     "GraphDededuplicationTests::test_tuple_return",
     "HOPCacheTests::test_checkpoint_with_dropout_caches_correctly",
+    "HasDecompTest::test_aten_core_operators",
     "HasDecompTest::test_has_decomposition",
     "HasDecompTest::test_mm_decompose_mm_dde",
     "HigherOrderOpVmapGuardTests::test_linearize_recompiles",

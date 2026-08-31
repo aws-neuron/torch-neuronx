@@ -132,7 +132,6 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_grid_sample_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_group_norm_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_instance_norm_neuron_float64",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_interpolate_area_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_interpolate_bilinear_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_interpolate_linear_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_interpolate_trilinear_neuron_float64",

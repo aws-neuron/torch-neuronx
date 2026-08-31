@@ -6,6 +6,7 @@ import struct
 import torch
 
 from ..operation_registry import register_aten
+from ..validation import aten_scalar_type_name
 
 # Neuron's hardware exp and cos are inaccurate: measured max rel error on trn2
 # in fp32 is 1.0e-05 for exp and 5.9e-05 for cos, vs 8e-08 for sin/tanh (fp32
@@ -367,15 +368,6 @@ def torch_ceil(self, out=None):
     return torch.ceil(self)
 
 
-def _aten_scalar_type_name(dtype):
-    """ATen ScalarType spelling of a dtype (e.g. 'Long', not 'torch.int64').
-
-    Derived from Tensor.type() ('torch.LongTensor') rather than hardcoded so it
-    tracks any future torch rename automatically.
-    """
-    return torch.empty((), dtype=dtype).type().rsplit(".", 1)[-1].removesuffix("Tensor")
-
-
 def _validate_floor(self, out=None):
     """Reject an out= tensor whose dtype doesn't match the input.
 
@@ -387,8 +379,8 @@ def _validate_floor(self, out=None):
     """
     if out is not None and out.dtype != self.dtype:
         raise RuntimeError(
-            f"Found dtype {_aten_scalar_type_name(out.dtype)} but expected "
-            f"{_aten_scalar_type_name(self.dtype)}"
+            f"Found dtype {aten_scalar_type_name(out.dtype)} but expected "
+            f"{aten_scalar_type_name(self.dtype)}"
         )
 
 

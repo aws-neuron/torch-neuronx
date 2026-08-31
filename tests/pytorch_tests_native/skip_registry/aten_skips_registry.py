@@ -406,10 +406,10 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "No Neuron lowering for the upsample_bilinear2d / upsample_bicubic2d /"
-            " _upsample_bilinear2d_aa / _upsample_bicubic2d_aa ops."
+            "No Neuron lowering for the anti-aliased _upsample_bilinear2d_aa /"
+            " _upsample_bicubic2d_aa ops."
         ),
-        tests=s.ATEN_UPSAMPLINGBIMODE2D_NO_LOWERING,
+        tests=s.ATEN_UPSAMPLINGBIMODE2D_AA_NO_LOWERING,
     ),
     SkipGroup(
         reason=(

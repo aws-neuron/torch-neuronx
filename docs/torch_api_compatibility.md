@@ -697,9 +697,9 @@
 |253|TripletMarginWithDistanceLoss|CPU_FALLBACK|Falls back (aten::norm.out)|
 |254|torch.nn.PixelShuffle|Y|Forward runs on Neuron|
 |255|torch.nn.PixelUnshuffle|Y|Forward runs on Neuron (via F.pixel_unshuffle)|
-|256|torch.nn.Upsample|CPU_FALLBACK|Falls back (aten::upsample)|
-|257|UpsamplingNearest2d|CPU_FALLBACK|Falls back (aten::upsample)|
-|258|UpsamplingBilinear2d|CPU_FALLBACK|Falls back (aten::upsample)|
+|256|torch.nn.Upsample|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
+|257|UpsamplingNearest2d|Y|Native MLIR impl|
+|258|UpsamplingBilinear2d|Y|Native MLIR impl|
 |259|torch.nn.ChannelShuffle|CPU_FALLBACK|Falls back (aten::channel_shuffle)|
 |260|torch.nn.DataParallel|Y|Pure Python container/infrastructure|
 |261|torch.nn.parallel.DistributedDataParallel|Y|Pure Python distributed methods|
@@ -910,10 +910,10 @@
 |104|F.pixel_shuffle|Y|Decomposes to reshape + permute (supported)|
 |105|F.pixel_unshuffle|Y|Decomposes to reshape + permute (supported)|
 |106|F.pad|Y|Uses aten::constant_pad_nd (registered on Neuron)|
-|107|F.interpolate|CPU_FALLBACK|Falls back to CPU|
-|108|F.upsample|CPU_FALLBACK|Falls back to CPU|
-|109|F.upsample_nearest|CPU_FALLBACK|Falls back to CPU|
-|110|F.upsample_bilinear|CPU_FALLBACK|Falls back to CPU|
+|107|F.interpolate|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
+|108|F.upsample|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
+|109|F.upsample_nearest|Y|Native MLIR impl|
+|110|F.upsample_bilinear|Y|Native MLIR impl|
 |111|F.grid_sample|CPU_FALLBACK|Falls back to CPU (aten::grid_sampler_2d)|
 |112|F.affine_grid|CPU_FALLBACK|In-place fill_ on non-contiguous tensor falls back to CPU|
 

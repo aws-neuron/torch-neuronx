@@ -4054,6 +4054,138 @@ def register_all_defaults(r, smoke_subsets=()):
         source="builtin",
     )
     r(
+        "aten::upsample_nearest1d_backward",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_nearest1d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_upsample_nearest_exact1d_backward",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_upsample_nearest_exact1d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_linear1d_backward",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "align_corners": False,
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_linear1d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 256),
+            "output_size": [256],
+            "input_size": [1, 64, 128],
+            "align_corners": False,
+            "scales": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_upsample_nearest_exact2d_backward",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_upsample_nearest_exact2d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_bilinear2d_backward",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "align_corners": False,
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_bilinear2d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "align_corners": False,
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_bicubic2d_backward",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "align_corners": False,
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_bicubic2d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 64, 64),
+            "output_size": _ups2d_out,
+            "input_size": [1, 64, 32, 32],
+            "align_corners": False,
+            "scales_h": None,
+            "scales_w": None,
+        },
+        source="builtin",
+    )
+    r(
         "aten::upsample_nearest2d_backward",
         {
             "grad_output": (1, 64, 64, 64),
