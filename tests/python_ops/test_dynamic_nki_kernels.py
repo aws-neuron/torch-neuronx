@@ -992,6 +992,18 @@ class TestDynamicNkiKernels:
         ref = (x.cpu().float() * (1.0 / 3.5)).to(torch.bfloat16)
         torch.testing.assert_close(buf.cpu(), ref, rtol=0, atol=0)
 
+    def test_dynamic_nki_div_scalar_tensor_dividend_declines(self):
+        """A 0-d scalar dividend has no last dim; can_handle must decline it (not raise)
+        and fall back to the static lowering."""
+        entry = _entry("div")
+        x = torch.tensor(7.5, dtype=torch.bfloat16).to("neuron")  # 0-dim, dim()==0
+        assert x.dim() == 0
+        # can_handle must not raise and must decline (scalar -> M=1 < _TILE_M).
+        assert not entry.can_handle(x, 2.0)
+        with _assert_dynamic_skipped("div"):
+            got = torch.div(x, 2.0).cpu()
+        torch.testing.assert_close(got, torch.div(x.cpu(), 2.0))
+
     def test_dynamic_nki_add_alpha_declines(self):
         # alpha != 1 can't be honored by the a+b kernel -> can_handle rejects -> fallback.
         x, y = self._bf16_neuron(self.SHAPE, self.SHAPE)

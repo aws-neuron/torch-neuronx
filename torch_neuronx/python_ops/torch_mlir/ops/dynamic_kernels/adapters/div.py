@@ -99,6 +99,8 @@ def _can_handle_div(x, other, *, rounding_mode=None, out=None, **_) -> bool:
     mode = _mode(x, other)
     if mode is None:
         return False
+    if x.dim() == 0:
+        return False
     M, H = _dynamic_mh(x)  # noqa: N806
     if M < _TILE_M:
         return False
