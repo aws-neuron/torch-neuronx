@@ -1906,6 +1906,131 @@ public:
   }
 };
 
+// aten::gelu(Tensor self, *, str approximate="none") -> Tensor
+// Lower to the hardware GELU activation instead of the erf/tanh polynomial that
+// TorchToStablehlo would otherwise emit:
+//   approximate="none" -> stablehlo.custom_call @AwsNeuronGelu
+//   approximate="tanh" -> stablehlo.custom_call @AwsNeuronGeluApprxTanh
+class ConvertNeuronGeluOp : public OpConversionPattern<Torch::AtenGeluOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::AtenGeluOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Value input = adaptor.getOperands()[0];
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType) {
+      return rewriter.notifyMatchFailure(op, "input must be ranked tensor");
+    }
+    // GELU is a floating-point activation. Do not match an integer or bool
+    // input. The default lowering rejects it, as PyTorch does.
+    if (!isa<mlir::FloatType>(inputType.getElementType())) {
+      return rewriter.notifyMatchFailure(op, "gelu input must be floating-point");
+    }
+
+    // Select the custom-call target from the `approximate` string arg.
+    auto approxOp = op.getApproximate().getDefiningOp<Torch::ConstantStrOp>();
+    if (!approxOp) {
+      return rewriter.notifyMatchFailure(op, "approximate must be a constant str");
+    }
+    StringRef target;
+    if (approxOp.getValue() == "none") {
+      target = "AwsNeuronGelu";
+    } else if (approxOp.getValue() == "tanh") {
+      target = "AwsNeuronGeluApprxTanh";
+    } else {
+      return rewriter.notifyMatchFailure(op, "unknown gelu approximate mode");
+    }
+
+    Value convertedInput =
+        hlo::promoteType(rewriter, loc, input, inputType.getElementType());
+    SmallVector<Value> convertedOperands = {convertedInput};
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+
+    auto callTargetName = rewriter.getStringAttr(target);
+
+    auto customGelu = stablehlo::CustomCallOp::create(
+        rewriter, op.getLoc(), convertedType, convertedOperands, callTargetName,
+        false,   // has_side_effect
+        nullptr, // backend_config
+        stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+        nullptr, // called_computations
+        nullptr, // operand_layouts
+        nullptr, // result_layouts
+        nullptr  // output_operand_aliases
+    );
+    rewriter.replaceOp(op, customGelu.getResult(0));
+    return success();
+  }
+};
+
+// aten::gelu_backward(Tensor grad_output, Tensor self, *, str approximate) -> Tensor
+//   %d = stablehlo.custom_call @AwsNeuronGeluBackward(self)   // gelu'(x), 1 operand
+//   %r = stablehlo.multiply(grad_output, %d)                  // chain rule
+class ConvertNeuronGeluBackwardOp
+    : public OpConversionPattern<Torch::AtenGeluBackwardOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::AtenGeluBackwardOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    auto approxOp = op.getApproximate().getDefiningOp<Torch::ConstantStrOp>();
+    if (!approxOp) {
+      return rewriter.notifyMatchFailure(op, "approximate must be a constant str");
+    }
+    if (approxOp.getValue() != "none") {
+      // Only the exact (erf) backward has an intrinsic; tanh is decomposed.
+      return rewriter.notifyMatchFailure(op, "only exact gelu_backward is a custom call");
+    }
+
+    Value gradOutput = adaptor.getOperands()[0];
+    Value self = adaptor.getOperands()[1];
+    auto selfType = dyn_cast<RankedTensorType>(self.getType());
+    if (!selfType) {
+      return rewriter.notifyMatchFailure(op, "self must be a ranked tensor");
+    }
+    // GELU is a floating-point activation. Do not match an integer or bool
+    // input. The default lowering rejects it, as PyTorch does.
+    if (!isa<mlir::FloatType>(selfType.getElementType())) {
+      return rewriter.notifyMatchFailure(op, "gelu_backward input must be floating-point");
+    }
+
+    Value convertedSelf =
+        hlo::promoteType(rewriter, loc, self, selfType.getElementType());
+    Value convertedGrad =
+        hlo::promoteType(rewriter, loc, gradOutput, selfType.getElementType());
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+
+    // dinput = gelu'(self)  -- single-operand custom call (matches NxDI)
+    auto callTargetName = rewriter.getStringAttr("AwsNeuronGeluBackward");
+    auto dInput = stablehlo::CustomCallOp::create(
+        rewriter, loc, convertedType, ValueRange{convertedSelf}, callTargetName,
+        /*has_side_effect=*/false, /*backend_config=*/nullptr,
+        stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+        /*called_computations=*/nullptr, /*operand_layouts=*/nullptr,
+        /*result_layouts=*/nullptr, /*output_operand_aliases=*/nullptr);
+
+    // grad_input = grad_output * gelu'(self)
+    Value gradInput =
+        stablehlo::MulOp::create(rewriter, loc, convertedGrad, dInput.getResult(0));
+
+    rewriter.replaceOp(op, gradInput);
+    return success();
+  }
+};
+
 // Doubles as the conversion-legality predicate, so it must decline exactly what
 // matchAndRewrite below cannot build: an op it turns down stays legal and keeps
 // its max.dim lowering.
@@ -1991,7 +2116,6 @@ public:
         nullptr, // result_layouts
         nullptr  // output_operand_aliases
     );
-
     Type resultType = getTypeConverter()->convertType(op.getType());
     if (!resultType) {
       return rewriter.notifyMatchFailure(op, "failed to convert result type");
@@ -2464,6 +2588,12 @@ public:
 
       target.addIllegalOp<Torch::AtenSiluOp>();
       patterns.add<ConvertNeuronSiluOp>(typeConverter, context);
+
+      target.addIllegalOp<Torch::AtenGeluOp>();
+      patterns.add<ConvertNeuronGeluOp>(typeConverter, context);
+
+      target.addIllegalOp<Torch::AtenGeluBackwardOp>();
+      patterns.add<ConvertNeuronGeluBackwardOp>(typeConverter, context);
 
       // Dynamically legal, unlike its neighbours: see argmaxUsesCustomCall.
       target.addDynamicallyLegalOp<Torch::AtenArgmaxOp>(

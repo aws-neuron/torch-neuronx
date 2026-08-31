@@ -11,6 +11,8 @@ import pytest
 import torch
 import torch._dynamo
 
+from torch_neuronx.neuron_dynamo_backend.stablehlo_executor import UnsupportedCustomCallError
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -149,6 +151,15 @@ def _compile_and_compare(model, *inputs):
 # ---------------------------------------------------------------------------
 
 
+def _is_unsupported_custom_call(exc):
+    """Return True if the exception chain has an UnsupportedCustomCallError."""
+    while exc is not None:
+        if isinstance(exc, UnsupportedCustomCallError):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 @pytest.mark.parametrize("backend,factory,input_shapes,dtype", _make_params())
 def test_stablehlo_executors(backend, factory, input_shapes, dtype):
     torch.manual_seed(0)
@@ -160,6 +171,12 @@ def test_stablehlo_executors(backend, factory, input_shapes, dtype):
         model.eval()
         inputs = [torch.randn(shape, dtype=dtype) for shape in input_shapes]
         _compile_and_compare(model, *inputs)
+    except Exception as e:
+        # The StableHLO reference interpreter has no implementation for a
+        # custom call, for example @AwsNeuronGelu. Skip this case.
+        if _is_unsupported_custom_call(e):
+            pytest.skip(str(e))
+        raise
     finally:
         _clear_backend_env()
         torch._dynamo.reset()
