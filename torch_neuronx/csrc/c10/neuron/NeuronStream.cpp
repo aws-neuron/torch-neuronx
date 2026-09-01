@@ -129,9 +129,7 @@ StreamImpl* GetStreamImplById(c10::DeviceIndex device_index, c10::StreamId strea
   TORCH_CHECK(device_index >= 0 && device_index < kMaxDevices, "Device index ",
               static_cast<int>(device_index), " out of range [0, ", kMaxDevices, ")");
 
-  if (c10_neuron::is_compile_only()) {
-    EnsureDeviceStreamState(device_index);
-  }
+  EnsureDeviceStreamState(device_index);
   TORCH_CHECK(default_streams[device_index] != nullptr, "Stream pool not initialized for device ",
               static_cast<int>(device_index));
 

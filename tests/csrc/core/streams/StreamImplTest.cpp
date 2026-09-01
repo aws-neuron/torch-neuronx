@@ -95,6 +95,14 @@ TEST_F(StreamImplTest, BasicConstruction) {
   EXPECT_EQ(stream_->stream_id, 1);
 }
 
+TEST_F(StreamImplTest, StreamLookupLazilyInitializesStateOutsideCompileOnly) {
+  CleanupStreamPools();
+  c10_neuron::set_compile_only(false);
+
+  auto stream = getDefaultNeuronStream(0);
+  EXPECT_NE(stream.get_stream_impl(), nullptr);
+}
+
 // Test Query on empty stream
 TEST_F(StreamImplTest, QueryEmptyStream) { EXPECT_TRUE(stream_->Query()); }
 
