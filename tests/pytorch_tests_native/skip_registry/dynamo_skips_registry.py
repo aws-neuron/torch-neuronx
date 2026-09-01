@@ -131,4 +131,26 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_repros.py::*ReproTests::test_guard_tag_safe_tensor_metadata_segfault*",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Triton not available on Neuron backend. These decomposition-numerics"
+            " tests call pytest.xfail('Triton not available') at runtime; Neuron"
+            " has no Triton backend, so skip them rather than record a runtime"
+            " xfail that can never flip to pass."
+        ),
+        tests=[
+            "TestDynamoDecompositionsNumericsNEURON::test_add_scalar_alpha_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_add_tensor_alpha_fma_matches_aten_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_add_tensor_alpha_numerics_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcdiv__backward_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcdiv__tensor_value_backward_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcdiv_tensor_value_numerics_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul__backward_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul__tensor_value_backward_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul_scalar_value_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul_tensor_value_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul_tensor_value_numerics_neuron",
+            "TestDynamoDecompositionsNumericsNEURON::test_addcmul_value_1_fma_matches_aten_neuron",
+        ],
+    ),
 ]
