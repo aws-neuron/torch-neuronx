@@ -23,6 +23,7 @@ import pytest
 import torch
 
 import torch_neuronx
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 _DTYPES = [torch.bfloat16, torch.float32, torch.float16]
 _DTYPE_ID = {
@@ -2217,3 +2218,225 @@ class TestDynamicBlockStridedGather:
         torch.testing.assert_close(
             dst.cpu(), wide.cpu()[:, :block_size].contiguous(), rtol=0, atol=0
         )
+
+
+# grouped_mm ragged (pad-free) path. Unaligned offs by itself proves the ragged impl
+# ran: the aligned impls' validate_offs raises on unaligned rather than declining.
+_GMM_RAGGED_CASES = [
+    # (r, d1, d2, g) -- d1 % 128 == 0 and r >= 128 are kernel constraints
+    (384, 256, 128, 4),
+    (1024, 512, 352, 8),
+    (2048, 256, 128, 16),
+    # A last group with many tiles alongside earlier single-tile groups at unaligned
+    # bases. Caught a shared-weight-buffer hazard that the cases above do not reach.
+    (2048, 512, 352, 8),
+]
+
+_GMM_RAGGED_KINDS = [
+    "even",
+    "first_takes_all",
+    "last_takes_all",
+    "one_row_each",
+    "just_under_128",
+    "aligned",  # the ragged kernel must also handle the easy case
+    "random",
+]
+
+
+def _gmm_ragged_offs(total, g, kind, seed=0):
+    """Group boundaries with no alignment. `kind` names the routing pattern."""
+    if kind == "even":
+        offs = [min(total, (i + 1) * (total // g)) for i in range(g)]
+    elif kind == "first_takes_all":
+        offs = [total] * g
+    elif kind == "last_takes_all":
+        offs = [0] * (g - 1) + [total]
+    elif kind == "one_row_each":
+        offs = [min(i + 1, total) for i in range(g)]
+    elif kind == "just_under_128":
+        offs = [min(total, (i + 1) * 128 - 1) for i in range(g)]
+    elif kind == "aligned":
+        offs = [min(total, (i + 1) * 128) for i in range(g)]
+    else:  # random, unaligned
+        gen = torch.Generator().manual_seed(seed)
+        cuts = torch.randint(0, total + 1, (g - 1,), generator=gen)
+        offs = torch.sort(cuts).values.tolist()
+    offs = [*offs[: g - 1], total]
+    return torch.tensor(offs, dtype=torch.int32)
+
+
+@pytest.mark.skipif(
+    not _FLAG_ON,
+    reason="dynamic NKI disabled — export TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 to run",
+)
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+class TestGroupedMMRagged:
+    """Pad-free grouped_mm: arbitrary offs, no alignment requirement.
+
+    The aligned path is covered by test_grouped_mm.py, which runs with the flag off.
+    """
+
+    @pytest.mark.parametrize("kind", _GMM_RAGGED_KINDS)
+    @pytest.mark.parametrize("r, d1, d2, g", _GMM_RAGGED_CASES)
+    def test_ragged_2d_3d(self, r, d1, d2, g, kind):
+        """a (r, d1) @ b (g, d1, d2) -> (r, d2) with unaligned offs."""
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((r, d1), dtype=dtype) / d1**0.5
+        b = torch.randn((g, d1, d2), dtype=dtype) / d1**0.5
+        offs = _gmm_ragged_offs(r, g, kind)
+
+        # fp32 oracle: the kernel accumulates wider than bf16.
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        with track_neuron_ops():
+            result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+            assert_op_runs_on_neuron("aten::_grouped_mm")
+
+        assert result.dtype == dtype, "ragged 2Dx3D must return the input dtype"
+        assert result.shape == (r, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("kind", _GMM_RAGGED_KINDS)
+    @pytest.mark.parametrize("t, d1, d2, g", _GMM_RAGGED_CASES)
+    def test_ragged_2d_2d(self, t, d1, d2, g, kind):
+        """a (d1, t) @ b (t, d2) -> (g, d1, d2) with unaligned offs."""
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((d1, t), dtype=dtype) / t**0.5
+        b = torch.randn((t, d2), dtype=dtype) / t**0.5
+        offs = _gmm_ragged_offs(t, g, kind)
+
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        with track_neuron_ops():
+            result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+            assert_op_runs_on_neuron("aten::_grouped_mm")
+
+        assert result.dtype == dtype, "ragged 2Dx2D must return the input dtype"
+        assert result.shape == (g, d1, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("d1", [352, 200, 96])
+    def test_ragged_2d_3d_short_contraction(self, d1):
+        """Contraction dim that is not a multiple of 128, so the last chunk is short.
+
+        352 is the MoE hidden dim per shard at TP4, i.e. the down projection's
+        contraction; 96 is a single short chunk. Only the 2Dx3D form allows this; the
+        2Dx2D d1 is a different axis. Neuron needs a row stride that is a multiple of
+        16 bytes, so d1 must stay a multiple of 8 for bfloat16.
+        """
+        r, d2, g = 1024, 256, 8
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((r, d1), dtype=dtype) / d1**0.5
+        b = torch.randn((g, d1, d2), dtype=dtype) / d1**0.5
+        offs = _gmm_ragged_offs(r, g, "random")
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        with track_neuron_ops():
+            result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+            assert_op_runs_on_neuron("aten::_grouped_mm")
+
+        assert result.shape == (r, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("d2", [1280, 2048])
+    def test_ragged_2d_3d_wide_output(self, d2):
+        """Per-core output share above the 512 moving-operand limit, so it tiles.
+
+        Every other case has a share <= 512 and one tile, leaving the final tile's
+        width uncomputed.
+        """
+        r, d1, g = 384, 256, 4
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((r, d1), dtype=dtype) / d1**0.5
+        b = torch.randn((g, d1, d2), dtype=dtype) / d1**0.5
+        offs = _gmm_ragged_offs(r, g, "just_under_128")
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+
+        assert result.shape == (r, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("g", [128, 129, 256])
+    def test_ragged_2d_2d_many_groups(self, g):
+        """g at and past one partition block: the 2Dx2D schedule is computed in blocks
+        of 128 experts, so a boundary crossing must not shift the table."""
+        d1, t, d2 = 256, 2048, 128
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((d1, t), dtype=dtype) / t**0.5
+        b = torch.randn((t, d2), dtype=dtype) / t**0.5
+        offs = _gmm_ragged_offs(t, g, "random")
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+
+        assert result.shape == (g, d1, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("form", ["2d3d", "2d2d"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_ragged_dtypes(self, dtype, form):
+        """_RAGGED_DTYPES admits fp16 and fp32 for both forms, so cover both."""
+        n, d1, d2, g = 384, 256, 128, 4
+        torch.manual_seed(0)
+        if form == "2d3d":
+            a = (torch.randn((n, d1), dtype=torch.float32) / d1**0.5).to(dtype)
+            b = (torch.randn((g, d1, d2), dtype=torch.float32) / d1**0.5).to(dtype)
+            expected_shape = (n, d2)
+        else:
+            a = (torch.randn((d1, n), dtype=torch.float32) / n**0.5).to(dtype)
+            b = (torch.randn((n, d2), dtype=torch.float32) / n**0.5).to(dtype)
+            expected_shape = (g, d1, d2)
+        offs = _gmm_ragged_offs(n, g, "random")
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+        rtol, atol = _TOL[dtype]
+
+        result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+
+        assert result.dtype == dtype
+        assert result.shape == expected_shape
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "opts",
+        [{"bias": True}, {"out_dtype": torch.float32}],
+        ids=["bias", "out_dtype"],
+    )
+    def test_ragged_declines_unsupported_options(self, opts):
+        """The kernels add no bias and always return the input dtype, so a call asking
+        for either must fall through rather than silently ignoring it."""
+        from torch_neuronx.python_ops.grouped_mm import GroupedMMRaggedNKIImpl
+
+        r, d1, d2, g = 384, 256, 128, 4
+        a = torch.empty((r, d1), dtype=torch.bfloat16, device="meta")
+        b = torch.empty((g, d1, d2), dtype=torch.bfloat16, device="meta")
+        offs = torch.empty((g,), dtype=torch.int32, device="meta")
+        impl = GroupedMMRaggedNKIImpl()
+
+        assert impl.can_handle(a, b, offs), "baseline call must be accepted"
+
+        kwargs = dict(opts)
+        if kwargs.pop("bias", None):
+            kwargs["bias"] = torch.empty((d2,), dtype=torch.bfloat16, device="meta")
+        assert not impl.can_handle(a, b, offs, **kwargs)
+
+    def test_ragged_no_recompile_across_routings(self):
+        """Routing is data, not shape: offs values change every step at fixed shapes."""
+        r, d1, d2, g = 2048, 512, 352, 8
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = (torch.randn((r, d1), dtype=dtype) / d1**0.5).to("neuron")
+        b = (torch.randn((g, d1, d2), dtype=dtype) / d1**0.5).to("neuron")
+
+        def step(seed):
+            offs = _gmm_ragged_offs(r, g, "random", seed=seed).to("neuron")
+            torch._grouped_mm(a, b, offs)
+            torch_neuronx.synchronize()
+
+        got = _recompiling_ops(step, warm_seed=1, probe_seeds=(5, 9, 13))
+        assert not got, f"routing change must not recompile, got {sorted(got)}"
