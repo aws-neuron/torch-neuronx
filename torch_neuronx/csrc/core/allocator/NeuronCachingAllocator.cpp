@@ -427,6 +427,12 @@ void neuron_deleter(void* ctx) {
     {
       std::lock_guard<std::mutex> lock(info->recorded_streams_mutex);
       info->recorded_streams.insert(info->allocation_stream.id());
+      // Record the current (free-time) stream. A cross-stream consumer
+      // (for example an FSDP2 reduce-scatter output) can free this buffer from
+      // a stream other than the allocation stream.
+      // TODO - revert once https://github.com/pytorch/pytorch/pull/193686 lands upstream
+      info->recorded_streams.insert(
+          at::neuron::getCurrentNeuronStream(static_cast<c10::DeviceIndex>(device)).id());
       dealloc_streams.assign(info->recorded_streams.begin(), info->recorded_streams.end());
     }
 
