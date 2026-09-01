@@ -215,3 +215,13 @@ def torch_addcdiv(input, tensor1, tensor2, value=1, out=None):
         )
     torch.broadcast_tensors(input, tensor1, tensor2)
     return input + value * tensor1 / tensor2
+
+
+@register_aten(["aten::ldexp.Tensor", "aten::ldexp.out"])
+def torch_ldexp(self, other, out=None):
+    return torch.ops.aten.ldexp(self, other)
+
+
+@register_aten(["aten::rsub.Tensor", "aten::rsub.Tensor_out"], static_argnames=("alpha",))
+def torch_rsub(self, other, alpha=1, out=None):
+    return torch.ops.aten.rsub(self, other, alpha=alpha)

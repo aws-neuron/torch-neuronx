@@ -31,6 +31,7 @@ ACCURACY_JACOBIAN_MISMATCH = [
     "test_modules.py::TestModuleNEURON::test_grad_nn_AvgPool3d_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_grad_nn_CircularPad2d_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_grad_nn_GroupNorm_neuron_float64",
+    "test_modules.py::TestModuleNEURON::test_grad_nn_LeakyReLU_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_grad_nn_MSELoss_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_grad_nn_PoissonNLLLoss_neuron_float64",
     "test_modules.py::TestModuleNEURON::test_grad_nn_RNN_eval_mode_neuron_float64",

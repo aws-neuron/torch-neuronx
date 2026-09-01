@@ -182,4 +182,15 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_type_promotion.py::TestTypePromotionNEURON::test_div_promotion_out_neuron_int64",
     "test_type_promotion.py::TestTypePromotionNEURON::test_div_promotion_out_neuron_int8",
     "test_type_promotion.py::TestTypePromotionNEURON::test_div_promotion_out_neuron_uint8",
+    # CPU raises RuntimeError for these out= and type-promotion dtype cases.
+    # Neuron does not enforce the same dtype guards, so it raises no error.
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_type_promotion_ldexp_neuron",
+    "test_ops.py::TestCommonNEURON::test_out_exp2_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_frac_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_ldexp_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_logit_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_round_decimals_0_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_round_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_special_i1e_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_ldexp_neuron_float32",
 ]

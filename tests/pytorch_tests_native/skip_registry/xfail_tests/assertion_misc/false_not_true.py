@@ -413,4 +413,19 @@ ASSERTION_MISC_FALSE_NOT_TRUE = [
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_preserve_channels_last_neuron",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_strided_mismatched_stride_shape_neuron",
     "test_utils.py::TestDeviceLazyInitNEURON::test_fork_poison_on_lazy_init_neuron",
+    # The _refs reference value is farther from the float64 golden than the
+    # Neuron float32 result. The closeness check then fails.
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_frac_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_celu_neuron_bfloat16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_celu_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_celu_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardsigmoid_neuron_bfloat16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardsigmoid_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardsigmoid_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_special_logit_neuron_bfloat16",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_frac_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_celu_neuron_bfloat16",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_celu_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_celu_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_special_logit_neuron_bfloat16",
 ]
