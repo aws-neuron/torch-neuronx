@@ -187,6 +187,55 @@ public:
 };
 } // namespace
 
+// This legalization is for floor, ceil, and round on floating-point data.
+// stablehlo floor, ceil, and round_nearest_even lower through an int32
+// conversion in neuronx-cc. That conversion clamps a float32 value outside the
+// int32 range to +/-2^31. It also returns 2^31 for nan. For |x| >= 2^23 a
+// float32 has no fractional bits. The value is already an integer, so floor,
+// ceil, and round are the identity. Return the input for those values and for
+// nan to avoid the clamp.
+namespace {
+template <typename AtenOpT, typename StablehloOpT>
+class ConvertAtenRoundLikeFPOnlyOp : public OpConversionPattern<AtenOpT> {
+public:
+  using OpConversionPattern<AtenOpT>::OpConversionPattern;
+  using OpAdaptor = typename AtenOpT::Adaptor;
+  LogicalResult
+  matchAndRewrite(AtenOpT op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value self = adaptor.getSelf();
+    auto selfTy = dyn_cast<TensorType>(self.getType());
+    if (!selfTy)
+      return op.emitError("only Tensor types supported in StableHLO");
+    if (!isa<mlir::FloatType>(selfTy.getElementType()))
+      return op.emitError(
+          "only floating-point datatype legalization supported");
+
+    auto loc = op.getLoc();
+    auto outTy = cast<TensorType>(
+        OpConversionPattern<AtenOpT>::getTypeConverter()->convertType(
+            op.getType()));
+
+    Value result = StablehloOpT::create(rewriter, loc, outTy, self);
+
+    // large = |self| >= 2^23
+    Value threshold = hlo::getConstantLike(rewriter, loc, 8388608.0, self);
+    Value absSelf = stablehlo::AbsOp::create(rewriter, loc, self);
+    Value large = stablehlo::CompareOp::create(
+        rewriter, loc, absSelf, threshold, stablehlo::ComparisonDirection::GE);
+    result = stablehlo::SelectOp::create(rewriter, loc, large, self, result);
+
+    // isNan = self != self. Restore nan, which the clamp turns into 2^31.
+    Value isNan = stablehlo::CompareOp::create(
+        rewriter, loc, self, self, stablehlo::ComparisonDirection::NE);
+    result = stablehlo::SelectOp::create(rewriter, loc, isNan, self, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+} // namespace
+
 // These legalizations are for unary ops with promoting to floating point
 // datatypes.
 namespace {
@@ -2881,14 +2930,14 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
   INSERT_UNARY_PATTERN(AtenExpm1Op, stablehlo::Expm1Op);
 #undef INSERT_UNARY_PATTERN
 
-#define INSERT_UNARY_FPONLY_PATTERN(AtenOp, StablehloOp)                       \
+#define INSERT_UNARY_ROUND_LIKE_PATTERN(AtenOp, StablehloOp)                   \
   target.addIllegalOp<AtenOp>();                                               \
-  patterns.add<ConvertAtenUnaryFPOnlyOp<AtenOp, StablehloOp>>(typeConverter,   \
-                                                              context)
-  INSERT_UNARY_FPONLY_PATTERN(AtenCeilOp, stablehlo::CeilOp);
-  INSERT_UNARY_FPONLY_PATTERN(AtenFloorOp, stablehlo::FloorOp);
-  INSERT_UNARY_FPONLY_PATTERN(AtenRoundOp, stablehlo::RoundNearestEvenOp);
-#undef INSERT_UNARY_FPONLY_PATTERN
+  patterns.add<ConvertAtenRoundLikeFPOnlyOp<AtenOp, StablehloOp>>(             \
+      typeConverter, context)
+  INSERT_UNARY_ROUND_LIKE_PATTERN(AtenCeilOp, stablehlo::CeilOp);
+  INSERT_UNARY_ROUND_LIKE_PATTERN(AtenFloorOp, stablehlo::FloorOp);
+  INSERT_UNARY_ROUND_LIKE_PATTERN(AtenRoundOp, stablehlo::RoundNearestEvenOp);
+#undef INSERT_UNARY_ROUND_LIKE_PATTERN
 
 #define INSERT_UNARY_PROMOTE_TO_FP_PATTERN(AtenOp, StablehloOp)                \
   target.addIllegalOp<AtenOp>();                                               \
