@@ -129,7 +129,6 @@ neuron_decompositions = get_decompositions(
         aten.addmv,
         aten.sinc,
         aten.vdot,
-        aten.take,
         aten.xlogy,
         aten.special_xlog1py,
         aten.special_entr,
@@ -276,6 +275,23 @@ def angle_decomp(x):
         x = x.to(torch.get_default_dtype())
     result = torch.where(x < 0, torch.full_like(x, math.pi), torch.zeros_like(x))
     return torch.where(torch.isnan(x), x, result)
+
+
+@register_decomposition([aten.take])
+def take_decomposition(self, index):
+    """Static-shape take; the built-in decomp is index-advanced and breaks a 0-d index.
+
+    take(self, index) gathers self.flatten() at index; the output shape equals
+    index.shape. PyTorch's built-in decomposition uses ``self.flatten()[index]``,
+    whose advanced-index path makes an unbacked size for a 0-d index and fails
+    the Neuron data-dependent guard. Flatten, gather with index_select, then
+    reshape to index.shape. This keeps every shape static, so a 0-d or empty
+    index works. Normalize a negative index with the static ``numel``.
+    """
+    flat = self.reshape(-1)
+    idx = index.reshape(-1)
+    idx = torch.where(idx < 0, idx + flat.numel(), idx)
+    return torch.index_select(flat, 0, idx).reshape(index.shape)
 
 
 def _zero_result(shape, a, b):
