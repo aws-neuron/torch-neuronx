@@ -1120,7 +1120,7 @@ class TestDynamicNkiKernels:
             ([37, 400, 60, 511], 352),  # sub-tile blocks mixed with full ones
             ([8, 17, 120], 352),  # every block below one tile
             ([0, 400, 0, 250], 2048),  # an empty expert contributes no rows
-            ([1, 400, 129], 352),  # a 1-row block: the copy declines, the concat holds
+            ([1, 400, 129], 352),  # a 1-row block: one token routed to an expert
         ],
     )
     def test_dynamic_nki_cat_row_dim(self, counts, width):
@@ -1469,24 +1469,13 @@ class TestDynamicNkiKernels:
             len(entry._compiled) - compiled_before <= 1
         ), f"{op} recompiled across ragged counts {rows}"
 
-    @pytest.mark.parametrize("rows", [1])
-    def test_dynamic_nki_copy_sub_tile_declines(self, rows):
-        """A single row is the one sub-tile count with no dynamic path: strided_plan drops
-        extent-1 dims. 2..127 rows DO run; this declines to one fixed [1, H] NEFF."""
-        src = torch.randn(rows, 2048, dtype=torch.bfloat16) / 8
-        dst = torch.zeros(rows, 2048, dtype=torch.bfloat16).to("neuron")
-        with _assert_dynamic_skipped("copy_"):
-            dst.copy_(src.to("neuron"))
-        torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
-
     # ── sub-tile M: the same strided kernel, built with tile_m == 1 ──
     @pytest.mark.parametrize(
         "dtype",
         [torch.bfloat16, torch.float16, torch.float32, torch.int32],
         ids=["bf16", "fp16", "fp32", "int32"],
     )
-    # rows=1 is excluded: a [1, H] slice of [1, 2H] is contiguous (extent-1 leading dim),
-    # so it is not a strided case at all and declines like any sub-tile contiguous copy.
+    # rows=1 excluded: a [1, H] slice is contiguous, so it is the contiguous test's case.
     @pytest.mark.parametrize("rows", [2, 16, 64, 100, 119, 127])
     def test_dynamic_nki_copy_sub_tile_strided_src(self, rows, dtype):
         """A sub-tile M takes the strided kernel's tile_m == 1 variant, which walks single
@@ -1500,7 +1489,7 @@ class TestDynamicNkiKernels:
             dst_n.copy_(src_n)
         torch.testing.assert_close(dst_n.cpu(), wide[:, :1024].contiguous(), rtol=0, atol=0)
 
-    @pytest.mark.parametrize("rows", [2, 64, 127])  # 1 row has no plan: see _declines
+    @pytest.mark.parametrize("rows", [1, 2, 64, 127])
     def test_dynamic_nki_copy_sub_tile_contiguous_src(self, rows):
         """A CONTIGUOUS sub-tile copy takes the row-walking variant too: the cast kernel's
         tail would start at row M - 128. Declining would compile per row count."""
@@ -1530,6 +1519,23 @@ class TestDynamicNkiKernels:
             fill(counts)
         new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
         assert not new, f"recompiled for a new block size / offset: {sorted(new)}"
+
+    def test_dynamic_nki_copy_single_row_shares_the_sub_tile_neff(self):
+        """A 1-row block is what a 1-token MoE expert hands the dim-0 concat. It must reuse
+        the row-walking NEFF; a fixed [1, H] one was DSv3's residual per-run copy_ pair."""
+        import torch_neuronx._C as _C
+
+        for width in (352, 2048):
+            buf = torch.empty(200, width, dtype=torch.bfloat16).to("neuron")
+            warm = _exact_src(64, width, torch.bfloat16)
+            buf[:64].copy_(warm.to("neuron"))
+            before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+            one = _exact_src(1, width, torch.bfloat16)
+            with _assert_dynamic_ran("copy_"):
+                buf[70:71].copy_(one.to("neuron"))
+            torch.testing.assert_close(buf[70:71].cpu(), one, rtol=0, atol=0)
+            new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
+            assert not new, f"the 1-row copy compiled its own NEFF: {sorted(new)}"
 
     def test_dynamic_nki_copy_sub_tile_strided_src_no_recompile(self):
         """One NEFF per (width, dyn_stride, dtype) covers every sub-tile row count."""

@@ -83,9 +83,7 @@ def _can_handle_cat_rows(tensors, dim=0, out=None) -> bool:
         if n == 0:
             continue  # no rows, no copy
         M += n  # noqa: N806
-        # n == 1 is the one count copy_ can't take (strided_plan drops extent-1 dims);
-        # allowed because its fallback is the single fixed shape [1, H].
-        if n != 1 and not _can_handle_copy(t, t):
+        if not _can_handle_copy(t, t):
             return False
     if M == 0:
         return False
