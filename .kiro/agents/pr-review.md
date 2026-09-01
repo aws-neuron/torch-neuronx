@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Reviewer agent that judges a torch-neuronx draft PR (or local branch) by following the /pr-review runbook — design quality, test adequacy, backward compatibility of the public surface, security, and correct use of project infrastructure (@neuron_op / @register_aten, cast policy, NEFF cache, torch.compile backend constraints, xfail registry) — then publishes a COMMENT review. Feedback-only: never edits code, pushes, marks a PR ready, or merges. Spawned per-PR by aten-lowering-orchestrator and upstream-debugger-orchestrator, and usable standalone from a main session.
+description: Reviewer agent that judges a torch-neuronx draft PR (or local branch) by following the /pr-review runbook, covering design quality, test adequacy, backward compatibility of the public surface, security, and correct use of project infrastructure (@neuron_op / @register_aten, cast policy, NEFF cache, torch.compile backend constraints, xfail registry), then publishes a COMMENT review. Feedback-only; never edits code, pushes, marks a PR ready, or merges. Spawned per-PR by aten-lowering-orchestrator and upstream-debugger-orchestrator, and usable standalone from a main session.
 tools: Read, Grep, Glob, Bash
 model: opus
 ---

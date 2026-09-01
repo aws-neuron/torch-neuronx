@@ -1,6 +1,6 @@
 ---
 name: agent-isolation
-description: Run multiple AI debug agents on the same Neuron host in parallel without collisions, and pick the right dispatch tier (parallel-streaming / parallel-with-worktrees-and-hardware-queue / sequential) for a given batch. Provides agent-run (per-agent core slice + port window + cache + temp scoping), provision-worktree (per-agent isolated checkout with editable-install MAPPING rewrite), with-hw-lock (host-wide flock for hardware commands), and the retro-derived rules (cancel-cascade trap, completion-manifest write-first, branch-tracking fix, _all_cores tests, hardcoded port literals). The ONLY use case is launching multiple independent debug agents in parallel on the same trn2 host — each with its own core slice, port window, caches, and (Tier 2) worktree + venv. Use when an orchestrator wants to fan out N debugger subagents, or when the user says "run agents in parallel" / "use agent-run" / "core slicing". Do NOT use it for anything inside a single agent, including `pytest -n` / xdist parallelism — those workers share that one agent's slice, CWD, caches, and venv and are coordinated by pytest itself, so no isolation kit is needed.
+description: Run multiple AI debug agents on the same Neuron host in parallel without collisions, and pick the right dispatch tier (parallel-streaming / parallel-with-worktrees-and-hardware-queue / sequential) for a given batch. Provides agent-run (per-agent core slice + port window + cache + temp scoping), provision-worktree (per-agent isolated checkout with editable-install MAPPING rewrite), with-hw-lock (a host-wide flock that serializes a whole-host hardware command), and the retro-derived rules (cancel-cascade trap, completion-manifest write-first, branch-tracking fix, _all_cores tests, hardcoded port literals). The ONLY use case is launching multiple independent debug agents in parallel on the same trn2 host — each with its own core slice, port window, caches, and (Tier 2) worktree + venv. Use when an orchestrator wants to fan out N debugger subagents, or when the user says "run agents in parallel" / "use agent-run" / "core slicing". Do NOT use it for anything inside a single agent, including `pytest -n` / xdist parallelism — those workers share that one agent's slice, CWD, caches, and venv and are coordinated by pytest itself, so no isolation kit is needed.
 ---
 
 # Run multiple debug agents in parallel on one Neuron host
@@ -21,7 +21,7 @@ The three tiers, top to bottom (each tier subsumes the next as fallback):
 | Tier | Debug parallelism | Workdir | Hardware commands |
 |---|---|---|---|
 | **1 — parallel + streaming review** | N agents, disjoint core slices | shared CWD | parallel (slices are disjoint) |
-| **2 — parallel + worktrees + hw queue** | N agents, disjoint core slices | per-agent git worktree | serialized via `with-hw-lock` |
+| **2 — parallel + worktrees + hw queue** | N agents, disjoint core slices | per-agent git worktree | unit/coverage lanes run in parallel on disjoint `agent-run` slices; a whole-host command serializes via `with-hw-lock`; the upstream runner is single-tenant (whole host, one at a time) |
 | **3 — sequential** | 1 agent at a time | shared CWD | n/a (only one agent) |
 
 In **all three tiers**, Phase 2 review streams: as soon as a Phase-1
@@ -123,11 +123,15 @@ same source file — e.g. two categories both editing
 `torch_neuronx/python_ops/torch_mlir/ops/indexing.py`), or when the
 orchestrator detected an actual conflict mid-batch.
 
-Each agent gets a private worktree from `provision-worktree` and any
-hardware command goes through `with-hw-lock`:
+Each agent gets a private worktree from `provision-worktree`. The unit and
+coverage lanes run under `agent-run` on disjoint core slices. A whole-host
+command (the upstream runner, a `csrc` build) goes through `with-hw-lock`:
 
 ```bash
-# Per-agent setup (orchestrator does this once per category before spawn):
+# Per-agent setup (orchestrator does this once per category before spawn).
+# Activate the venv FIRST: provision-worktree copies the ACTIVE venv
+# ($VIRTUAL_ENV), then a repo-root .venv. A shared host venv (for example
+# /opt/torch-neuronx/.venv) is only found if it is active here.
 eval "$(.kiro/skills/agent-isolation/scripts/provision-worktree "$SLUG")"
 # now WORKTREE, BRANCH, VENV are exported
 
@@ -135,17 +139,36 @@ eval "$(.kiro/skills/agent-isolation/scripts/provision-worktree "$SLUG")"
 cd "$WORKTREE"                     # load-bearing — see "CWD pinning" below
 source .venv/bin/activate
 
-# Hardware-touching command:
+# Unit / coverage lane — a disjoint slice; these trees honor the slice.
+# agent-run pins each xdist worker to one core in the slice (no with-hw-lock):
 .kiro/skills/agent-isolation/scripts/agent-run 0 4 -- \
-    .kiro/skills/agent-isolation/scripts/with-hw-lock -- \
     pytest tests/python_ops/test_<op>.py
+
+.kiro/skills/agent-isolation/scripts/agent-run 8 4 -- \
+    python -m pytest tests/vertical/... -k <op>
+
+# Whole-host command (a csrc build): serialize it with with-hw-lock.
+.kiro/skills/agent-isolation/scripts/with-hw-lock -- ./tools/build
 ```
 
-The `with-hw-lock` wrapper acquires an exclusive flock on
-`/tmp/agent/hw.lock`, so even though many agents are making progress in
-parallel (writing tests, editing source, composing PR bodies), only one
-agent runs hardware work at a time. Slice assignments still apply — the
-lock is just additional serialization on top.
+`with-hw-lock` takes an exclusive whole-host `flock` on `/tmp/agent/hw.lock`
+(override with `AGENT_HW_LOCK`), so only one wrapped command runs at a time. Wrap
+a **whole-host** command in it (the upstream runner, a `csrc` build). Do NOT wrap
+the unit or coverage lane in it: those lanes parallelize on disjoint `agent-run`
+slices, so a host lock would serialize them for no reason. Each xdist worker gets
+one core in the slice from the `agent_core_isolation` plugin that `agent-run`
+loads.
+
+**The upstream runner is single-tenant.** `run_upstream_tests.py`
+self-parallelizes with xdist, and the tree's
+`conftest._setup_neuron_worker_for_xdist` OVERWRITES `NEURON_RT_VISIBLE_CORES`
+from each worker GLOBAL index — so the runner claims cores `0..N-1` and ignores
+any `agent-run` slice. Run it on the whole host, one at a time, only after the
+unit lanes release their cores. Wrap it in `with-hw-lock` so two runner instances
+cannot overlap. A live unit lane holds cores but not the host lock, so gate the
+runner on a device-free check first
+(`.kiro/skills/aten-lowering-orchestrator/scripts/neuron_devices_free.py`) — that
+gate, not the lock, is what stops the runner from colliding with a live unit lane.
 
 ### Why the worktree (and the editable-install rewrite)
 
@@ -157,8 +180,11 @@ machinery has cached the *original* repo root in
 canonical checkout's source — the worktree is silently wrong.
 
 `provision-worktree` rewrites the MAPPING + nukes stale `.pyc` (which
-embed absolute paths in `co_filename`) + symlinks build artifacts that
-aren't tracked but are needed at import time (`build/`, `CMakeCache.txt`).
+embed absolute paths in `co_filename`) + symlinks the untracked artifacts
+that a fresh checkout lacks but `import torch_neuronx` needs: `build/`,
+`CMakeCache.txt`, and every in-tree compiled `.so` (`torch_neuronx/_C.so`
+and the torch-mlir `_mlir_libs/*.so`). The MAPPING points imports at the
+worktree, so the `.so` must exist there at the same relative path.
 
 ### CWD pinning — load-bearing
 
@@ -203,7 +229,7 @@ debugger is also serializing.
 |---|---|
 | `scripts/agent-run` | Per-agent core/port/cache/temp scoping + cancel-safe SIGTERM trap. Used in Tier 1 and Tier 2. |
 | `scripts/provision-worktree` | Per-agent isolated checkout for Tier 2: worktree + venv copy + editable-install MAPPING rewrite + .pyc nuke + branch tracking + build-artifact symlinks. |
-| `scripts/with-hw-lock` | flock-based serializer for hardware commands. Tier 2 only. |
+| `scripts/with-hw-lock` | whole-host `flock` that serializes a hardware command (the upstream runner, a `csrc` build). Tier 2 only. |
 | `scripts/lib/agent_port_isolation.py` | pytest plugin auto-loaded by `agent-run` via `PYTEST_PLUGINS`. Patches `_BASE_MASTER_PORT` for the repo's `DistributedTester` and sets `MASTER_PORT` for upstream tests. No-op if `AGENT_PORT_OFFSET` is unset. |
 
 ## What the wrapper does (mechanics)
@@ -248,7 +274,10 @@ trn2.48xlarge (64 logical cores, 1 host network namespace, 1 /tmp)
 │     Agent A: cores 0-3   ports 30500-30531  /tmp/agent/c0/   /tmp/worktrees/<slug-A>/
 │     Agent B: cores 4-7   ports 30628-30659  /tmp/agent/c4/   /tmp/worktrees/<slug-B>/
 │     Agent C: cores 8-11  ports 30756-30787  /tmp/agent/c8/   /tmp/worktrees/<slug-C>/
-│     (hardware commands queue on /tmp/agent/hw.lock)
+│     (unit/coverage lanes run at the same time on disjoint agent-run slices;
+│      a whole-host command serializes on /tmp/agent/hw.lock; the upstream
+│      runner is single-tenant — whole host, one at a time, after the unit
+│      lanes release their cores)
 │
 └── Tier 3:
       Agent X: full machine, canonical checkout, run to completion, then Agent Y, ...

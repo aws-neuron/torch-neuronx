@@ -69,13 +69,33 @@ except Exception:
     sys.exit(0)  # unparseable -> don't interfere
 
 
+def _effective_cwd(command):
+    """Directory the git command actually runs in.
+
+    The harness reports the tool cwd as the project root, even when the command
+    is `cd <worktree> && git ...`. Resolving the branch from the project root
+    then reads a worktree commit as a commit on the project branch (main) and
+    blocks it. Honor an explicit `git -C <dir>` or a leading `cd <dir> &&`, so
+    the guard reads the branch where the commit lands. A path this cannot
+    resolve (for example an unexpanded variable) returns None and the caller
+    falls back, so the guard fails open, never on a false positive.
+    """
+    m = re.search(r"\bgit\s+-C\s+(['\"]?)([^'\"\s]+)\1", command)
+    if m:
+        return m.group(2)
+    m = re.match(r"\s*cd\s+(['\"]?)([^'\"&]+?)\1\s*&&", command)
+    if m:
+        return m.group(2).strip()
+    return None
+
+
 def current_branch():
     """Branch HEAD points at, or None if detached / not a repo / git error.
 
     Fail-open: any problem resolving the branch returns None and the branch guard
     simply doesn't fire -- a guard bug must never block legitimate work.
     """
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = _effective_cwd(cmd) or payload.get("cwd") or os.getcwd()
 
     def git(*a):
         return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, timeout=5)

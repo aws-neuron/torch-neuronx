@@ -22,6 +22,18 @@ at the start of every run — it is this skill's memory. **Do not** write anythi
 to your own personal/local memory; a generalizable lesson goes into `lessons.md`
 (via the orchestrator's retro), an op-specific quirk into that op's PR body.
 
+**Under the orchestrator — durable handoff, not live memory.** When the
+orchestrator spawns you, your context must live in **artifacts**, because a fix
+round respawns a fresh Implementer onto your worktree, not the live you. So: work
+in the worktree the orchestrator gives you and never destroy it; keep
+`agent_artifacts/<slug>/handoff.json` current (chosen decomposition, overloads
+registered, what you tried and rejected, current failing `checks[]`, next-step
+hypothesis); and treat `completion.json` as a **contract** — write `state`,
+`round`, `ready_for_verify` (false until every artifact is final), and refresh the
+`heartbeat` timestamp every step. Writing `completion.json` with `ready_for_verify:
+true` is your final action of a round and the ONLY signal that you are ready to be
+graded. Do not open the PR; the orchestrator gates it on the verifier.
+
 **Speed / long-running commands:** the device and the build are the bottleneck,
 not you. Any command that can exceed a foreground timeout — `./tools/build` cold,
 NEFF compiles, an upstream suite — must be launched in the **background** and
@@ -52,26 +64,9 @@ args), not the graph.** When iterating, vary the shape or set
 
 ---
 
-## Step 0 — Start the baselines, then work while they run (do this first)
+## Step 0 — Confirm the op isn't already handled (do this first)
 
-The device is single-tenant and it is the bottleneck; authoring is not. Start
-the pristine-main baselines in the background **before** writing any code, so
-every later failure is attributable without a second 20-minute run.
-
-```bash
-cd <repo-root>                          # your torch-neuronx checkout
-git fetch origin main
-git worktree add /tmp/main-baseline origin/main     # keeps your branch editable
-cd /tmp/main-baseline
-# the exact -k selection you will use later, else the baseline is not comparable
-python -m pytest tests/pytorch_tests_native/test/test_nn.py -k "<op>" \
-    -q -n 64 -p no:randomly --tb=no -rf > /tmp/<op>_main_baseline.txt 2>&1 &
-```
-
-Save the result into the repo dir (`.kiro/<suite>_main_baseline.txt`) so it
-survives `/tmp` cleanup, and **delete it before committing**.
-
-Then confirm the op isn't already handled:
+Before you write code, confirm the op is not already lowered on `main`:
 
 ```bash
 ./tools/list-implemented-ops | grep -i <op>
@@ -292,47 +287,144 @@ Prove a new guard isn't vacuous: reintroduce the bug and watch it fail.
 
 ## Step 4 — Run the upstream suites (the real gate)
 
-**First discover which files actually contain your op's tests — by code, not from a
-static list.** OpInfo names are generated at collection, so a static grep misses
-them and a fixed file list runs suites that don't touch your op. Collect-only over
-the whole tree (cheap: no execution), then boundary-match the op name and bucket by
-file. The boundary regex is the same one the verifier uses (`_op_keyword_matches`),
-so `pow` won't drag in `float_power` / `linalg_matrix_power`.
+> **Who runs this.** Standalone (a human invoked this skill), you run this step.
+> **Under the orchestrator you do NOT run the upstream suite.** It is
+> single-tenant, so the orchestrator runs one central lane after every
+> Implementer releases its cores. You produce only the collection artifacts
+> (`op_files.txt`, `op_nodeids.txt`) so the lane knows what to run. See the
+> orchestrator SKILL "Central upstream lane".
+
+**Set up the upstream tests once, at the branch that matches the installed torch.**
+The runner clones the tests on first use, but its `--pytorch-fork-branch` defaults to
+`main`. The `main` overlay of `torch/testing/_internal` uses symbols that a release
+torch does not have (for example `torch.bcomplex32`), and conftest keeps **no backup**
+of the overlay. A clone at the wrong branch breaks `import torch` *host-wide* until you
+restore it by hand. To avoid this, clone the fork yourself at the matching branch and
+populate `test/` before any run. Then the runner finds `test/` and skips its own clone,
+so the branch flag is moot and the trap cannot fire.
 
 ```bash
-# ~ a few min for --collect-only; do it once, reuse the file set for every run below.
-python -m pytest tests/pytorch_tests_native/test/ -k "<op>" \
-    --collect-only -q --continue-on-collection-errors -p no:randomly 2>/dev/null \
-  | grep -iE '(^|[^a-z0-9])<op>([^a-z0-9]|$)' \
-  | awk -F'::' '{print $1}' | sort -u > /tmp/<op>_files.txt
-cat /tmp/<op>_files.txt        # the exact files to run — usually 1-4, not 7
+# Derive the branch from the installed torch: release/pt_{major}{minor}.
+# importlib.metadata reads the version WITHOUT importing torch.
+FORK_BRANCH="release/pt_$(python -c 'from importlib.metadata import version; v=version("torch").split("+")[0].split("."); print(v[0]+v[1])')"
+echo "$FORK_BRANCH"      # e.g. torch 2.13.0+cpu -> release/pt_213
+git clone https://github.com/amazon-contributing/upstream-to-pytorch.git /workspace/upstream-to-pytorch
+git -C /workspace/upstream-to-pytorch checkout "$FORK_BRANCH"
+python tests/pytorch_tests_native/clone_device_agnostic_tests.py --source-repo /workspace/upstream-to-pytorch
 ```
 
-Then run **only those files**, filtered to your op:
+If `test/` is already present (baked into the image, or from a prior setup) the runner
+skips the clone and you can go straight to discovery. On a fresh dev pod without the
+one-time setup, pass `--pytorch-fork-branch "$FORK_BRANCH"` to the runner so it clones
+the correct branch.
+
+**Next, discover which files actually contain your op's tests.** Never collect the
+whole `test/` tree. A whole-tree `--collect-only` is NOT cheap: pytest collects all
+~183 files before `-k` filters, and the OpInfo files (`test_ops`, `test_decomp`,
+`test_meta`) plus the ufunc files parametrize across the entire OpInfo database x
+dtypes at collection time. One file alone (`test_unary_ufuncs.py`) takes ~77s and
+builds 22k items to keep a few hundred. The whole tree is 20+ minutes and often does
+not finish. Measured on the pilot host.
+
+Scope the candidate files first, then collect only those:
+
+1. The OpInfo-driven files always apply (the op comes from `@ops(op_db)`, not a
+   literal name, so grep cannot find it there): `test_ops.py test_decomp.py
+   test_meta.py`.
+2. The ufunc file carries the op name in source, so a filesystem grep finds it
+   fast (no import): `grep -rlwE '<op>' tests/pytorch_tests_native/test/*.py`.
+   Keep `test_unary_ufuncs.py` (unary) or `test_binary_ufuncs.py` (binary). Do
+   NOT add `test_torch.py`: it is huge, slow to collect, and its op tests are
+   generic, not the OpInfo gate.
+
+Collect the nodeids per file, in SEQUENCE, each under a per-file `timeout`. Do
+NOT run a pytest process per file in parallel over the same venv: the
+`conftest.py` overlay (`_overlay_torch_internal`) does a destructive swap of
+`site-packages/torch/testing/_internal`, so two masters race and fail with
+`ImportError` / `INTERNALERROR`. A per-file cap keeps the fast files even if one
+file is slow. Separate ops have separate venvs, so the ops MAY run in parallel.
+Filter to real nodeids (`^<test-dir>/...::`) — pytest prints warnings on stdout
+that otherwise pollute `op_files.txt` with non-test paths. The combined 4-file
+collect is ~10 min; measured on the pilot host, `test_ops.py` is the long pole.
+Each per-file collect (`test_ops` / `test_meta` ~3.5-4 min) exceeds a 2-min
+foreground timeout, so run this loop in the background (the long-running rule).
+
+```bash
+T=tests/pytorch_tests_native/test
+: > /tmp/<op>_nodeids.txt
+for f in test_ops.py test_decomp.py test_meta.py test_unary_ufuncs.py; do    # unary example
+  timeout 420 python -m pytest "$T/$f" -k "<op>" --collect-only -q \
+      -p no:randomly --continue-on-collection-errors 2>/dev/null \
+    | grep -E "^$T/.*::" | grep -iE '(^|[^a-z0-9])<op>([^a-z0-9]|$)' \
+    >> /tmp/<op>_nodeids.txt
+done
+sort -u -o /tmp/<op>_nodeids.txt /tmp/<op>_nodeids.txt
+awk -F'::' '{print $1}' /tmp/<op>_nodeids.txt | sort -u > /tmp/<op>_files.txt
+```
+
+The older single combined invocation also works, but it loses everything if it
+hits the cap:
+
+```bash
+FILES="$T/test_ops.py $T/test_decomp.py $T/test_meta.py $T/test_unary_ufuncs.py"
+timeout 600 python -m pytest $FILES -k "<op>" --collect-only -q \
+    -p no:randomly --continue-on-collection-errors 2>/tmp/<op>_collect.err \
+  | grep -E "^$T/.*::" | grep -iE '(^|[^a-z0-9])<op>([^a-z0-9]|$)' > /tmp/<op>_nodeids.txt
+awk -F'::' '{print $1}' /tmp/<op>_nodeids.txt | sort -u > /tmp/<op>_files.txt
+```
+
+The boundary regex is the same one the verifier uses (`_op_keyword_matches`), so
+`pow` does not drag in `float_power` / `linalg_matrix_power`.
+
+`/tmp/<op>_nodeids.txt` is the `op_nodeids.txt` artifact. Collect ONCE and reuse it
+for every run below (Step 4 recipe) — do not re-collect per run.
+
+Then run **only those files** (usually 1-4, e.g. `test_ops` /
+`test_binary_ufuncs` / `test_unary_ufuncs` for a pointwise op), driven by the
+**explicit collected nodeids** — not `-k` re-scanning all ~9 files (that collects
+2000+ irrelevant items every run). The nodeids are already the `op_nodeids.txt`
+artifact from the collect-only step; feed that list so pytest runs exactly your
+op's tests:
+
+The upstream runner is **single-tenant**: it self-parallelizes with xdist, and
+its conftest overwrites `NEURON_RT_VISIBLE_CORES` from each worker global index,
+so it always claims cores `0..N-1` and **ignores any `agent-run` slice**. It owns
+the whole host. So run it only when the host is idle, gate on a device-free
+check, and never run two instances at once. `with-hw-lock` serializes runner
+instances, but a *sliced* unit test that holds a core still collides — the
+device-free gate is the real guard.
 
 ```bash
 CACHE=/tmp/cache_<op>; mkdir -p $CACHE/{hlo,neff,tmp}
-NUM_WORKERS=64 PYTEST_ADDOPTS="-k '<op>' -p no:randomly" \
+# Gate: confirm no process holds a Neuron device. The runner needs the whole host.
+python3 .kiro/skills/aten-lowering-orchestrator/scripts/neuron_devices_free.py || {
+  echo "devices busy — wait, then retry"; exit 1; }
+# The runner launches a BARE `pytest` resolved via PATH. Under the orchestrator
+# (a worktree) put the overlaid venv first (the shared /opt venv is not overlaid:
+# cannot import get_unsupported_dtypes_for_device). In a worktree: WT=$PWD.
+# Standalone: skip this export -- the active /opt venv already resolves
+# torch_neuronx to this checkout with get_unsupported_dtypes_for_device importable.
+export VIRTUAL_ENV=$WT/.venv PATH=$WT/.venv/bin:$PATH
+# Reuse the collected nodeids — one line each; run_upstream_tests.py forwards them.
+NUM_WORKERS=64 PYTEST_ADDOPTS="-p no:randomly" \
 TORCH_NEURONX_HLO_CACHE_DIR=$CACHE/hlo TORCH_NEURONX_NEFF_CACHE_DIR=$CACHE/neff TMPDIR=$CACHE/tmp \
-  .claude/skills/agent-isolation/scripts/with-hw-lock -- \
-  uv run python tests/pytorch_tests_native/runner/run_upstream_tests.py \
+  .kiro/skills/agent-isolation/scripts/with-hw-lock -- \
+  python tests/pytorch_tests_native/runner/run_upstream_tests.py \
       --output-dir /tmp/reports/<op> --total-timeout 7200 \
-      --pytorch-fork-branch release/pt_212 \   # MUST match installed torch — see note below
-      $(sed 's#tests/pytorch_tests_native/test/##' /tmp/<op>_files.txt)   # add --runxfail to PYTEST_ADDOPTS for the runxfail leg
+      $(sed 's#tests/pytorch_tests_native/test/##' /tmp/<op>_nodeids.txt)   # add --runxfail to PYTEST_ADDOPTS for the runxfail leg
+      # test/ is already populated (setup above), so no --pytorch-fork-branch is
+      # needed. On a fresh pod without setup, add: --pytorch-fork-branch "$FORK_BRANCH"
 ```
 
-The runner clones the upstream tests on first use, and its `--pytorch-fork-branch`
-**defaults to `main`, which is wrong for torch 2.12** (the repo default is intentionally
-unchanged — this is handled here in the runbook, not in repo code). **Always pass the
-branch matching the installed torch**: derive it as `release/pt_{major}{minor}` — get the
-version without importing torch via
-`python -c "from importlib.metadata import version; print(version('torch'))"` (e.g.
-`2.12.1+cpu` → `release/pt_212`). The `main` fork's `torch/testing/_internal` overlay
-references symbols absent from torch 2.12 (e.g. `torch.bcomplex32`), and conftest's
-overlay keeps **no backup**, so cloning the wrong branch breaks `import torch`
-*host-wide* until hand-restored. If `test/` already exists (baked into the Docker/CI
-image) the clone is skipped entirely and the flag is moot — this bites only fresh
-dev-pod clones.
+If the runner can't take raw nodeids, fall back to the discovered file list
+(`/tmp/<op>_files.txt`) with `-k '<op>'` in `PYTEST_ADDOPTS` — still only those
+files, never the whole tree.
+
+**Global-invariant leg.** If your change registers a decomposition or edits
+dispatch state (`py_kernels` pop/repoint, gotcha #5), also run the whole-registry
+snapshot tests unfiltered: `python -m pytest
+tests/pytorch_tests_native/test/test_decomp.py::HasDecompTest`. A `-k <op>` filter
+deselects them, but the merge queue runs them. They are CPU-only (no NEFF).
 
 `--continue-on-collection-errors` absorbs the ~5 pre-existing `import file mismatch`
 collection errors (see below); they are not yours. If `/tmp/<op>_files.txt` is empty,
@@ -365,9 +457,16 @@ upstream runner *only*, because only that path preloads the `env_lock.so` shim:
 
 | Tier | Command | Workers |
 |---|---|---|
-| Unit (`tests/python_ops/…`, e2e) | bare `pytest … -n <N>` under `with-hw-lock` | `-n 16` (bare pytest has no shim; don't push to 64) |
-| Vertical (`tests/vertical/…`) | `pytest` **directly** (not `run-test-parallel` — it `--ignore`s the tree) under `with-hw-lock` | `-n 16` |
-| Upstream (`tests/pytorch_tests_native/…`) | `run_upstream_tests.py` (above) | `NUM_WORKERS=64`, retry-at-4 |
+| Unit (`tests/python_ops/…`, e2e) | bare `pytest … -n <N>` under `agent-run` | `-n` = slice size at most (see below); bare pytest has no shim, so don't push to 64 |
+| Vertical (`tests/vertical/…`) | `pytest` **directly** (not `run-test-parallel` — it `--ignore`s the tree) under `agent-run` | `-n` = slice size at most |
+| Upstream (`tests/pytorch_tests_native/…`) | `run_upstream_tests.py` (above) | `NUM_WORKERS=64`, retry-at-4. Single-tenant: whole host, device-gated, never two at once, no `agent-run` slice |
+
+**Set `-n` to the core-slice size, not higher.** On the bare-pytest lanes,
+`agent-run` loads the `agent_core_isolation` plugin, which pins each xdist worker
+to ONE distinct core in the slice. So a slice of size S (from `agent-run BASE S`)
+runs `-n S` cleanly. `-n` above S gives the extra workers no free core, and they
+fail runtime init with "cores busy". `NEURON_RT_VISIBLE_CORES` indexes LOGICAL
+cores, so on an LNC=2 host a slice `8-15` is 8 logical cores (not 4).
 
 Efficiency rules that avoid re-runs:
 
@@ -406,7 +505,9 @@ Efficiency rules that avoid re-runs:
 **Strongest signal: does it reproduce for pure integer dtypes?** If yes it is a
 real bug, not precision.
 
-Before believing a failure is yours, **check the baseline from Step 0**. Then:
+Before you decide a failure is yours, confirm it is not pre-existing. Re-run only
+the failing nodeids on a pristine `origin/main` checkout, or check the
+orchestrator's list of known pre-existing failures. Then:
 
 - **"Unexpected success" is not a failure** — it means an *upstream*
   `@unittest.expectedFailure` / OpInfo `xfail` no longer holds because your
@@ -548,17 +649,18 @@ with an empty `test-results/` is the ECR image-scan gate, not your code.
 
 ## Acceptance checklist
 
-When this op is lowered in a batch, the **objective** items below (1–3, 5, 7,
+When this op is lowered in a batch, the **objective** items below (1–3, 5, 6, 7,
 and 4 for a differentiable op) are graded by
 `.kiro/skills/aten-lowering-orchestrator/scripts/verify_op_acceptance.py`
 from artifacts you produce — a script-computed verdict, not a self-assessment.
-Produce the artifacts it expects (upstream pytest-json with **and** without
-`--runxfail`, a registry snapshot, the eager **and** compile vertical coverage
-CSVs, the unit-test rc) so the verifier can confirm you didn't silence a test.
+Produce the artifacts it expects: a registry snapshot, the eager **and** compile
+vertical coverage CSVs, and the unit-test rc. Standalone, you also produce the
+upstream pytest-json with **and** without `--runxfail`; under the orchestrator
+the central lane produces those. The verifier confirms you did not silence a test.
 Item 6 (both execution paths) is gated too: the verifier grades the compile-path
 CSV with its own status vocabulary (`supported`, not `runs_on_neuron`), and if
-you added a decomposition it must be run under `--require-compile`. Items 4,
-8–12 are your own discipline; the reviewer checks them.
+you added a decomposition it must be run under `--require-compile`. Items 8–12
+are your own discipline; the reviewer checks them.
 
 1. Unit tests pass **and** assert the op runs on Neuron in every device test.
 2. All upstream tests for the op pass, or are registry-categorized with a correct

@@ -1,6 +1,6 @@
 ---
 name: aten-lowering-orchestrator
-description: Batch controller for lowering a LIST of ATen ops to Neuron in parallel — the entry point for "lower these N ops, 10 at a time". Fans out one Implementer subagent per op (runs the aten-op-lowering runbook end-to-end), grades each with a deterministic, script-computed acceptance verdict (verify_op_acceptance.py — NOT an LLM), opens a draft PR only after the verdict is PASS, then has a SEPARATE reviewer subagent run /pr-review and publish. Enforces "no cheating": upstream tests are the source of truth, new skips/xfails are rejected unless their reason is on the platform-limitation allowlist. Use when the user gives you a set of ops to lower rather than a single op. Companion to `aten-op-lowering` (per-op runbook), `pr-review`, `pytorch-upstream-test-debugger`, and `agent-isolation` (parallelism substrate).
+description: Batch controller for lowering a LIST of ATen ops to Neuron in parallel — the entry point for "lower these N ops, 10 at a time". Fans out one Implementer subagent per op (runs the aten-op-lowering runbook for the lowering, unit tests, and coverage), grades each with a deterministic, script-computed acceptance verdict (verify_op_acceptance.py — NOT an LLM), opens a draft PR only after the verdict is PASS, then has a SEPARATE reviewer subagent run /pr-review and publish. Enforces "no cheating": upstream tests are the source of truth, new skips/xfails are rejected unless their reason is on the platform-limitation allowlist. Use when the user gives you a set of ops to lower rather than a single op. Companion to `aten-op-lowering` (per-op runbook), `pr-review`, `pytorch-upstream-test-debugger`, and `agent-isolation` (parallelism substrate).
 ---
 
 # ATen lowering orchestrator
@@ -18,10 +18,11 @@ has published a `/pr-review`.
 
 ## Skills
 
-- `/aten-op-lowering` — the per-op runbook. Each **Implementer** subagent runs
-  this end-to-end (baselines → lowering → unit tests → upstream `-n 64` →
-  fix-vs-xfail triage → perf/vertical → registry → draft PR). Read it so you
-  know what artifacts the Implementer produces.
+- `/aten-op-lowering` — the per-op runbook. Under this orchestrator each
+  **Implementer** subagent runs only the local part: lowering, unit tests,
+  vertical coverage, and the collection artifacts. The orchestrator runs the
+  single-tenant upstream lane and gates the draft PR (see Phase 1). Read the
+  runbook so you know what artifacts the Implementer produces.
 - `/pytorch-upstream-test-debugger` — the fix-verify loop the lowering skill
   delegates to when a *pre-existing* upstream failure blocks an op.
 - `/pr-review` — reviews a PR for quality, BC, security, correct infra use.
@@ -33,14 +34,33 @@ has published a `/pr-review`.
   **Read this before Phase 1 to pick a dispatch tier.**
 - `/torch-neuronx-docs` — shared read-only subsystem knowledge base.
 
+## Background jobs — bound them, then verify
+
+Every background job (collection, upstream leg) can hang or run for
+hours. Follow this rule for each one.
+
+1. Give the job a hard `timeout`. A capped job that dies is recoverable; an
+   unbounded job is not.
+2. Do not wait for a completion signal alone. A job that never ends never sends
+   one. Poll on a fixed cadence (about every 60-90s) against a deadline.
+3. On each poll, check the process AND the expected output file. A live process
+   with an empty output at 99% CPU is a runaway (for example, a whole-tree
+   collect). Kill it and fix the scope; do not keep waiting.
+4. Never launch a whole-filesystem scan (`find / ...`). Search a known root.
+5. Kill a stale job before you start its replacement. Leftover jobs waste cores.
+
 ## The deterministic verifier — read this first
 
 `scripts/verify_op_acceptance.py` is the technical core of the anti-cheat
-design. It runs **nothing on hardware and calls no model**: the orchestrator (or
-the Implementer, under the orchestrator's instruction) runs the tests on the
-Trn2 host and drops **named artifacts**; the verifier consumes them, diffs the
+design. It runs **nothing on hardware and calls no model**: the **Implementer**
+runs the unit and coverage tests, the **orchestrator** runs the upstream lane,
+and each drops **named artifacts**; the verifier CONSUMES them, diffs the
 skip/xfail registry, and emits a machine-readable verdict. **The pass/fail is
-computed by code, never by an LLM.**
+computed by code, never by an LLM.** Because the verdict comes from the
+Implementer's pytest-json (which it cannot forge), the
+orchestrator does **not** re-run the on-device suites to grade — consuming the
+artifacts preserves anti-cheat AND saves the wall-clock of a second ~90-min run.
+Re-run a leg only on INFRA_RETRY or an explicit adversarial re-run.
 
 Two subcommands:
 
@@ -55,7 +75,6 @@ python3 "$VERIFY" snapshot-registry --repo-root /tmp/main-baseline \
 python3 "$VERIFY" verify --op "aten::<op>" \
     --upstream-report            agent_artifacts/<slug>/upstream.json \
     --upstream-report-runxfail   agent_artifacts/<slug>/upstream_runxfail.json \
-    --baseline-upstream-report   "$BATCH_ROOT/baseline_upstream_<op>.json" \
     --candidate-registry         agent_artifacts/<slug>/candidate_registry.json \
     --baseline-registry          "$BATCH_ROOT/baseline_registry.json" \
     --op-nodeids                 agent_artifacts/<slug>/op_nodeids.txt \
@@ -90,7 +109,7 @@ Exit code **0 = PASS, 1 = FAIL, 2 = INFRA_RETRY, 3 = usage error.** Read
 
 | Check | Passes when | Cheat it catches |
 |---|---|---|
-| `upstream` | every op-relevant upstream test passes, AND (when a `--runxfail` leg is supplied) no test **that passed on baseline** now fails under `--runxfail` (delta-scoped — pre-existing platform-limit xfails are ignored), AND no op-relevant test is newly skipped/xfailed vs baseline. The `--runxfail` leg is required only when the op added a skip/xfail; omit it otherwise | xfail-masking a **newly**-failing test; XPASS; silently skipping the op's tests |
+| `upstream` | every op-relevant upstream test passes (no failure, no XPASS). When the op added a skip/xfail, the orchestrator also runs the `--runxfail` leg as an **advisory** signal; the `registry` check (below) is the hard gate on new skip/xfail entries. The `--runxfail` leg is produced only when the op added a skip/xfail | a failing op test; XPASS (stale xfail); a new skip/xfail (caught by `registry`) |
 | `registry` | no new skip/xfail whose `reason` is off the allowlist; the op is not left matched by a non-allowlisted group **that this candidate introduced** (delta-scoped vs baseline — pre-existing family groups are not re-graded) | "passing" an op by silencing its tests |
 | `dispatch` | eager vertical coverage `status == runs_on_neuron` | shipping a CPU fallback |
 | `correctness` | eager vertical coverage `correctness_test == pass` — a genuine `fail` is **downgraded to non-gating** when every op-relevant upstream test (valid OpInfo inputs, incl. gradcheck) already passes: that's a coverage-harness input bug, not a lowering defect (advisory `correctness_harness_suspect`) | wrong values on device — but *not* the harness feeding invalid synthetic inputs |
@@ -98,7 +117,7 @@ Exit code **0 = PASS, 1 = FAIL, 2 = INFRA_RETRY, 3 = usage error.** Read
 | `backward` / `backward_compile` | for a differentiable op (`--differentiable`), each named `--backward-op` shows `runs_on_neuron` (eager) / `supported` (compile, when a row exists — else auto-derived) | a differentiable op shipping a forward-only lowering whose separate backward op silently CPU-falls-back |
 | `unit_tests` | the op's unit-test file exited rc 0 | — |
 | `coverage_row` | the op family is present in `target_ops.py` | op silently gets no vertical row |
-| `roofline` | **advisory — never blocks.** Records `roofline_ratio`; flags an over-threshold value (default **2.0×**) for the PR body; `--require-roofline` promotes it to a FAIL only for trusted (mm/matmul-like) batches | — (perf is a human call; the theoretical model mis-predicts compute-bound families) |
+| `roofline` | **advisory — never blocks.** Records `roofline_ratio`; flags an over-threshold value (default **2.0x**) for the PR body. `--require-roofline` is accepted but currently inert (reserved for a future GPU-baseline check) | — (perf is a human call; the theoretical model mis-predicts compute-bound families) |
 
 A gating check with **no artifact provided** is `not_provided` and — unless you
 pass `--strict-missing` — is treated as a **FAIL**, so a missing measurement can
@@ -123,43 +142,26 @@ oracle pass is a cheat, not a fix** — the fixed shape set stays fixed.
 
 ### Roofline is ADVISORY — reported, never blocks (threshold 2.0×)
 
-`roofline_ratio` is always recorded and an over-threshold value (default
-`--roofline-threshold` 2.0×) is **flagged for the PR body**, but it **never blocks**.
-The theoretical model uses *peak* HBM bandwidth / FLOPs and mis-predicts whole op
-families — transcendental pointwise ops (`pow`, `exp`, `erf`, `gelu`) are
-compute-bound yet tagged `elementwise`, so an over-threshold ratio recurs
-family-wide (e.g. shipped `pow.Tensor_Scalar` 12.7×, `pow.Tensor_Tensor` 737×) and
-is **not attributable to a single lowering**. Gating on it produced only false
-positives, so perf is a human call:
-
-- The verifier records the ratio + a `roofline_flag` and the Implementer explains
-  it in the PR body (achieved ratio, `bound`, and why — often a model mismatch for
-  a compute-bound op, not a regression). The reviewer decides.
-- **Dispatch + correctness stay hard gates** (`runs_on_neuron` + `correctness_test
-  == pass`, eager and compile). Those are the real "does it work on device" bar.
-- If you want automated perf protection back, gate on **candidate-vs-baseline for
-  the same op** (did *this* lowering slow *this* op down?), not an absolute model.
-- Pass `--require-roofline` to promote an over-threshold ratio to a FAIL for a
-  batch where the model is trusted (mm/matmul-like). Altering the trusted-category
-  set or a handler shows up in the diff (reviewed code), same as the allowlist.
+`roofline_ratio` is always recorded; an over-threshold value (default 2.0x) is
+**flagged for the PR body** but **never blocks**. The theoretical model uses peak
+HBM bandwidth / FLOPs and mis-predicts whole op families (compute-bound pointwise
+ops tagged `elementwise`), so a high ratio recurs family-wide and is not
+attributable to one lowering. Dispatch + correctness stay the hard gates.
+`--require-roofline` is accepted but currently inert; roofline is always
+advisory. The flag is reserved for a future candidate-vs-GPU-baseline regression
+check, which is where automated perf protection belongs.
 
 ### Performance optimization pass — reuses `dynamic-kernel-optimize`, advisory
 
-The Implementer doesn't just *measure* perf, it *optimizes* it before opening the
-PR (Step 6 of `aten-op-lowering`), so a slow-but-correct lowering is caught in the
-loop instead of forcing a rewrite after a later profile. It reuses
-`dynamic-kernel-optimize`'s **profiling method** and the lowering-applicable subset
-of its `optimization_tips.md` as reference — **not** its NKI-kernel authoring loop:
-profile → on a headroom signal, one lowering-level change (redundant copy/cast,
-output layout/stride, cheaper decomposition, tiling) → rebuild → re-measure → accept
-on a real speedup / revert → log, **capped at 3 cycles**. Accept/revert is driven by
-*relative* improvement (this iteration vs the last), so no absolute target is
-needed. Each accepted change is gated on the **fast** correctness signal (unit +
-vertical correctness), with the full upstream suite run **once** after the last
-accepted change — not per cycle. The agent never writes or edits NKI kernels; a win that would need one is
-flagged advisory for a human. It doesn't block — the profiler signal
-(bottleneck-engine occupancy + achieved-vs-ideal traffic) is recorded for the
-reviewer, same as the roofline flag.
+The Implementer optimizes perf before opening the PR (Step 6 of `aten-op-lowering`),
+so a slow-but-correct lowering is caught in the loop. It reuses
+`dynamic-kernel-optimize`'s profiling method and the lowering-applicable subset of
+its `optimization_tips.md`, not its NKI-kernel authoring loop: profile, make one
+lowering-level change (redundant copy/cast, layout/stride, cheaper decomposition,
+tiling), rebuild, re-measure, then accept on a real speedup or revert, capped at 3
+cycles. Each accepted change is gated on the fast correctness signal (unit +
+vertical); the full upstream suite runs **once** after the last change. The agent
+never writes NKI kernels; a win that needs one is flagged advisory. It never blocks.
 
 ### Advisory (reported in `verdict.json`, NEVER blocks)
 
@@ -229,8 +231,8 @@ mkdir -p "$BATCH_ROOT"
 ```
 
 `<batch_id>` is user-supplied or a slug you pick once and reuse. The baseline
-registry snapshot, per-op baseline upstream reports, and the final report live
-here. Per-op artifacts stay at `agent_artifacts/<slug>/`.
+registry snapshot and the final report live here. Per-op artifacts stay at
+`agent_artifacts/<slug>/`.
 
 ## Phased execution
 
@@ -240,11 +242,8 @@ here. Per-op artifacts stay at `agent_artifacts/<slug>/`.
    batches learned. Apply it, and pass it to each Implementer.
 1. **Normalize** the op list; assign each a `<slug>` (op name, `.`→`_`).
 2. **Baseline (once per batch).** In a pristine `origin/main` worktree, snapshot
-   the registry to `$BATCH_ROOT/baseline_registry.json` and start the
-   per-op pristine-main upstream baselines in the background (the lowering
-   skill's Step 0). Save each to `$BATCH_ROOT/baseline_upstream_<op>.json`.
-   These make "newly-skipped vs baseline" and "was this already failing"
-   answerable without a second 20-minute run.
+   the registry to `$BATCH_ROOT/baseline_registry.json`. The `registry` check
+   diffs the candidate against this to find newly-added skip/xfail entries.
 3. **Triage open PRs** exactly as `upstream-debugger-orchestrator` Phase 0:
    `gh pr list --state open --json ...` and match by branch (`lower/<slug>` or
    `fix/<slug>`), title/body op mention, or files-touched. A covered op is
@@ -262,14 +261,28 @@ Tier 2 (parallel, per-op worktrees + `with-hw-lock`) → Tier 3 (sequential
 fallback). Lowering edits shared source (`torch_neuronx/python_ops/...`,
 `decompositions.py`, the registry) far more than the debugger does, so **prefer
 Tier 2** when two ops in the batch touch the same family file — its worktrees
-prevent edit collisions. Announce the picked tier and the per-op core-slice
-assignments up front.
+prevent edit collisions. Announce the picked tier and the per-op core-lane
+assignments up front (unit/coverage lane sliced, 4 cores; the upstream suite is
+**not** sliced — see the next rule).
+
+**The upstream suite is single-tenant. Split the two lanes on the host:**
+
+- **Unit + coverage lane (parallel, sliced).** Implementers run their unit tests
+  and the vertical coverage on disjoint `agent-run` core slices. These trees
+  honor `NEURON_RT_VISIBLE_CORES`, so they parallelize.
+- **Upstream lane (one runner, whole host, serialized).** `run_upstream_tests.py`
+  self-parallelizes with xdist and its conftest `_setup_neuron_worker_for_xdist`
+  **overwrites** `NEURON_RT_VISIBLE_CORES` from each worker global index, so it
+  always claims cores `0..N-1` and **ignores any `agent-run` slice**. Two runs
+  collide with `Failed to initialize Neuron Runtime`. Run it one op at a time, only
+  after every Implementer releases its cores, gated on a device-free check. Never
+  wrap it in `agent-run`. See "Central upstream lane" below for the exact steps.
 
 **Cap parallel spawns at ≤ 8 hardware-bound Implementers per parallel-Agent
 call; dispatch larger batches in waves.** (Same cancel-blast-radius reasoning as
-`upstream-debugger-orchestrator`.) Even at batch size 10, the host hardware lock
-serializes the on-device phases (compile/run), so true concurrency during those
-phases is often < 10 — that is expected, not a failure.
+`upstream-debugger-orchestrator`.) The unit/coverage lane parallelizes across
+slices; the upstream lane serializes on the whole host after that lane finishes,
+so on-device time is finite. Cap and wave.
 
 #### Shared C++ code and builds (read before running a C++-touching batch)
 
@@ -313,43 +326,99 @@ What this means in practice:
 
 For each op marked `open`, spawn an **Implementer** subagent
 (`subagent_type: aten-op-lowering` if available, else `general-purpose` told to
-follow `/aten-op-lowering`; `model: "opus"`). The Implementer runs the runbook
-end-to-end and must drop these artifacts under `agent_artifacts/<slug>/` (this
-is the verifier's contract — spell it out in the prompt):
+follow `/aten-op-lowering`; `model: "opus"`). The Implementer runs the local
+part of the runbook (lowering, unit tests, coverage) and must drop these
+artifacts under `agent_artifacts/<slug>/` (this is the verifier's contract —
+spell it out in the prompt):
 
 | Artifact | How the Implementer makes it |
 |---|---|
-| `op_files.txt` | discover the files by code, not a static list: `pytest tests/pytorch_tests_native/test/ -k "<op>" --collect-only -q --continue-on-collection-errors 2>/dev/null \| grep -iE '(^\|[^a-z0-9])<op>([^a-z0-9]\|$)' \| awk -F'::' '{print $1}' \| sort -u`. Run every leg below over `$(cat op_files.txt)`, not a fixed 7-file list |
-| `upstream.json` | `pytest $(cat op_files.txt) -k "<op>" -n 64 -p no:randomly --json-report --json-report-file=agent_artifacts/<slug>/upstream.json` |
-| `upstream_runxfail.json` | **conditional** — the same selection with `--runxfail`. Produce it only if the op added a skip/xfail (registry diff non-empty) or a `tests/pytorch_tests_native/test/` file changed; otherwise omit it (the plain green run + empty registry diff already prove nothing is masked). Full-suite `--runxfail` is a CI backstop |
-| `op_nodeids.txt` | `pytest $(cat op_files.txt) -k "<op>" --collect-only -q` (the op-left-skipped check) |
+| `op_files.txt` | scope the candidate files, then collect only those. NEVER collect the whole tree (20+ min, often no finish). Always include `test_ops.py test_decomp.py test_meta.py` (OpInfo-driven, grep cannot find the op there); add the ufunc file the grep finds: `grep -rlwE '<op>' tests/pytorch_tests_native/test/*.py` -> keep `test_unary_ufuncs.py` or `test_binary_ufuncs.py`. See `/aten-op-lowering` "discover which files". Run every leg below over `$(cat op_files.txt)`, not a fixed 7-file list |
+| `upstream.json` | **The orchestrator produces this, not the Implementer.** It runs in the central single-tenant upstream lane (below), after every Implementer releases its cores. The Implementer only produces `op_files.txt` / `op_nodeids.txt` so the lane knows what to run |
+| `upstream_runxfail.json` | **conditional, also central.** The upstream lane produces it only if the op added a skip/xfail (registry diff non-empty) or a `tests/pytorch_tests_native/test/` file changed; otherwise it is omitted (the plain green run + empty registry diff already prove nothing is masked). Full-suite `--runxfail` is a CI backstop |
+| `op_nodeids.txt` | `pytest $(cat op_files.txt) -k "<op>" --collect-only -q` (the op-left-skipped check). Collect one file at a time in sequence, each under a per-file `timeout` (see `/aten-op-lowering`). Do not run one pytest per file in parallel over the same venv — the conftest overlay swap races (`ImportError`/`INTERNALERROR`) |
 | `candidate_registry.json` | `verify_op_acceptance.py snapshot-registry --repo-root . --out ...` from the candidate checkout |
 | `target_ops_coverage.csv` | the `tests/vertical/test_target_ops_coverage.py` CSV for the op (copied out of the repo root — it's written there) |
 | `target_ops_compile_coverage.csv` | the `tests/vertical/test_target_ops_compile_coverage.py` CSV for the op (compile path). Always produce it; pass `--require-compile` only when the op has a decomposition |
 | `unit_rc.txt` | the exit code of the op's unit-test run |
-| `completion.json` | terminal status: `done` / `blocked` / `no-repro` / `regressed` (write `in_progress` at Step 1). Backward detection lives in `autograd_probe.json` (below), not here |
+| `completion.json` | the **completion contract** (below): at least `state` (a lifecycle state), `round` (int), `ready_for_verify` (bool), and a `heartbeat` it refreshes every step. Its final write per round is the ONLY done-signal. Backward detection lives in `autograd_probe.json`, not here |
+| `handoff.json` | the **durable handoff** (below): chosen decomposition, overloads registered, what it tried and rejected, current failing `checks[]`, next-step hypothesis. A fresh Implementer resumes from this + the persisted worktree |
 | `autograd_probe.json` | `probe_op_autograd.py` output from Step 1: `differentiable`, `backward_kind`, `backward_ops`. The verifier reads this via `--autograd-probe` |
 
 **Do NOT open the PR in the Implementer yet** — the draft PR opens only after a
 PASS verdict (below). Tell the Implementer this explicitly; the base
 `aten-op-lowering` skill opens the PR at its Step 7, so the prompt must override:
-"stop after producing artifacts + completion.json; the orchestrator gates the PR
-on the verifier."
+"stop after producing artifacts + `handoff.json` + `completion.json`; the
+orchestrator gates the PR on the verifier."
 
-**Verify (independent, deterministic).** As soon as an Implementer reports
-`done`, run `verify_op_acceptance.py verify` for that op (this is cheap and
-model-free — you may run it inline, or spawn a fresh **Verifier** subagent with
-NO implementation context if you want an adversarial re-run of the on-device
-measurements). Read `verdict.json`:
+**Do NOT run the upstream `-n 64` leg in the Implementer.** The upstream suite is
+single-tenant (see the lane rule above). Tell the Implementer to stop after the
+lowering, the unit tests, the vertical coverage, and the collection artifacts
+(`op_files.txt`, `op_nodeids.txt`). The orchestrator runs the upstream lane.
+
+#### Central upstream lane (single-tenant, serialized, device-gated)
+
+Run this once, after the parallel Implementer wave finishes and every Implementer
+releases its cores. For each op, in sequence:
+
+1. Gate on the host: `python3 .kiro/skills/aten-lowering-orchestrator/scripts/neuron_devices_free.py`.
+   If it exits 1 (busy), a job still holds a core. Find and stop it, then retry.
+2. Put the op's overlaid venv on `PATH`: `export VIRTUAL_ENV=$WT/.venv PATH=$WT/.venv/bin:$PATH`.
+3. Run the runner over that op's nodeids, whole host: `NUM_WORKERS=64 python
+   tests/pytorch_tests_native/runner/run_upstream_tests.py --output-dir /tmp/rep_<op>
+   --total-timeout 3600 $(cat op_nodeids.txt)`. Copy the non-retry
+   `test_results_*.json` to `agent_artifacts/<slug>/upstream.json`.
+4. Produce `upstream_runxfail.json` the same way (with `PYTEST_ADDOPTS=--runxfail`)
+   only when the op added a skip/xfail.
+5. **Global-invariant leg** (only if the op registered a decomposition or edited
+   dispatch state; see `handoff.json`). Run the whole-registry snapshot tests
+   unfiltered: `python -m pytest
+   tests/pytorch_tests_native/test/test_decomp.py::HasDecompTest`. A `-k <op>`
+   filter deselects them, but the merge queue runs them. They are CPU-only (no
+   NEFF). A new failure means the dispatch surgery changed a global invariant:
+   narrow it, or add a documented xfail to the skip registry.
+
+Do not overlap step 3 across ops. One runner at a time owns the host.
+
+#### Durable handoff and the completion contract
+
+The Implementer's context lives in **artifacts, not agent memory** — this is what
+makes a crashed or timed-out agent recoverable.
+
+- **Durable handoff (fix rounds).** Each Implementer runs in a Tier-2 worktree
+  that **persists** across rounds, and writes `handoff.json` (chosen
+  decomposition, overloads registered, what it tried and rejected, current failing
+  `checks[]`, next-step hypothesis). To drive a fix round, spawn a **FRESH**
+  `aten-op-lowering` Implementer onto that worktree + `handoff.json`; it resumes
+  deterministically. Do this instead of resuming a live instance — it is strictly
+  more robust (agents crash/time out even where a resume mechanism exists). If the
+  runtime provides `SendMessage`, it is an optional fast-path to re-drive a live
+  instance, but the loop must never depend on it.
+- **Completion contract (when to verify).** The Implementer's **final action each
+  round is writing `completion.json`** with at least `state`, `round`,
+  `ready_for_verify`, and a `heartbeat` it refreshes every step. Gate the Verifier
+  on the spawn's completion notification AND `completion.json.ready_for_verify ==
+  true`. **NEVER infer "done" from process or filesystem state** (see the hard
+  rule). The `heartbeat` is for the watchdog only — stale past the wall-clock
+  budget = hung; fresh = still working — it is not a done-signal.
+
+**Verify (CONSUME the artifacts; do NOT re-run).** When
+`completion.json.ready_for_verify` is true, run `verify_op_acceptance.py verify`
+for that op against the artifacts (the upstream reports from the central lane, the
+coverage CSVs and `unit_rc` from the Implementer). The verify is cheap and
+model-free (you may run it inline). Re-run a leg ONLY on INFRA_RETRY or explicit
+distrust — an adversarial re-run in a fresh **Verifier** subagent with NO
+implementation context (see "The deterministic verifier"). Read `verdict.json`:
 
 - **PASS** → proceed to PR (Phase 1 → PR step).
 - **INFRA_RETRY** (exit 2) → re-run the failing on-device step **once** through
   `agent-run ... with-hw-lock`, then re-verify. If it flakes twice, treat as
   FAIL and surface it.
-- **FAIL** → hand the specific failing checks (`verdict.json` `checks[]`) back to
-  the **same** Implementer for a bounded number of rounds (≤ 3). Re-verify each
-  round. Do not loosen the bar to make it pass — if the only way to green is a
-  disallowed skip/xfail, the op is **blocked** (Phase "Blocked ops").
+- **FAIL** → hand the specific failing checks (`verdict.json` `checks[]`) back via
+  `handoff.json` to a **fresh** Implementer on the persisted worktree, for a
+  bounded number of rounds (≤ 3). Re-verify each round. Do not loosen the bar to
+  make it pass — if the only way to green is a disallowed skip/xfail, the op is
+  **blocked** (Phase "Blocked ops").
 
 **PR (only after PASS).** Instruct the Implementer to open a **draft** PR:
 branch `lower/<slug>` off `origin/main`; body = custom summary (results table
@@ -362,10 +431,9 @@ falls back to CPU, so its compatibility row must change. The PR must flip the
 op's `neuron_compatible` value in `docs/torch_api_compatibility.md` from
 `CPU_FALLBACK` to `Y` (with a one-phrase limitation for anything that still
 falls back — measured with `track_neuron_ops`, not guessed), and add any new env
-var to `docs/environment_variables.md`. **Either the Implementer or the
-Reviewer may make this edit:** the Implementer should do it as part of the PR;
-if it's missing, the Phase-2 Reviewer flags it and (since it's a cosmetic
-doc-only change) may push the one-line flip directly rather than bouncing the PR.
+var to `docs/environment_variables.md`. **The Implementer makes this edit** as
+part of the PR. If it is missing, the Phase-2 Reviewer flags it in the review and
+a fresh Implementer adds the flip; the Reviewer never edits or pushes.
 
 ### Phase 2 — Review (streams per op)
 
@@ -377,9 +445,10 @@ batch. For each op with an open PR, spawn a **Reviewer** subagent
 `REQUEST_CHANGES` will 422). Keep hardware-bound Implementer spawns and
 read-only Reviewer spawns in **separate** parallel-Agent calls.
 
-If the review raises substantive issues, hand them back to the Implementer
-(bounded rounds, new commits — never force-push), then re-verify **and**
-re-review. The PR stays draft for the human to merge.
+If the review raises substantive issues, hand them back via `handoff.json` to a
+fresh Implementer on the persisted worktree (bounded rounds, new commits — never
+force-push), then re-verify **and** re-review. The PR stays draft for the human to
+merge.
 
 ### Blocked ops
 
@@ -414,11 +483,13 @@ differently:
 
 Handling, in priority order:
 
-1. **Avoid it at batch planning (preferred for semantic overlap).** You already
-   cluster by family at intake — take it further: when two ops lower the **same
-   family** or share a new helper, give them to **one Implementer → one PR**, not
-   two. One PR adding both variants sidesteps the conflict and reviews as one
-   coherent change.
+1. **Avoid it at batch planning (preferred for shared-FILE overlap).** When two
+   ops edit the **same file / same hunk** or share a **new helper**, give them to
+   **one Implementer → one PR** — parallel editing collides even across worktrees,
+   so one author is correct and the PR reviews as one coherent change. Ops that
+   merely lower the same *family* into *different* hunks stay **separate parallel
+   Implementers**; if they still belong on one PR, the orchestrator integrates
+   their commits (cherry-pick / branch merge) rather than serializing the work.
 2. **Independent PRs + proposed merge order (default for everything else).**
    After Implementers finish, compute each PR's touched files
    (`git diff --name-only origin/main...lower/<slug>`) and build the overlap
@@ -467,9 +538,19 @@ Next actions:
   catch xfail-masking and XPASS.
 - **The verdict is computed by `verify_op_acceptance.py`, not by you or any
   subagent.** No PR opens on an op whose verdict is not PASS.
+- **"Done" is an explicit flag, never an inference.** Gate the Verifier only on
+  the completion notification AND `completion.json.ready_for_verify == true`.
+  **BANNED as a done-signal: process-sniffing (no pytest running), diff/`git diff`
+  quiescence, artifact mtimes going quiet.** They grade a moving target while the
+  Implementer is still editing. The `heartbeat` is for the watchdog, not for
+  completion.
+- **Consume, don't re-run.** Grade from the Implementer's pytest-json via the
+  script gate; re-run a leg only on INFRA_RETRY or an adversarial re-run (see
+  "The deterministic verifier").
 - **Separation of powers:** Implementer ≠ Verifier ≠ Reviewer. Distinct
   subagent contexts. The Verifier/Reviewer never inherit the Implementer's
-  rationalizations.
+  rationalizations. A fix round respawns a **fresh** Implementer from the durable
+  handoff (worktree + `handoff.json`), never a general-purpose agent.
 - **A new skip/xfail is legal only if its reason is on
   `references/platform-limitations.md`.** Changing that allowlist or the
   verifier script is a **reviewed diff** (CODEOWNERS / `pr-review`) — an agent
@@ -518,7 +599,7 @@ Next actions:
 | Situation | Skill |
 |---|---|
 | Pick a dispatch tier + run agents in parallel without collisions | `/agent-isolation` |
-| Lower one op end-to-end (Phase 1 Implementer) | `/aten-op-lowering` |
+| Lower one op (Phase 1 Implementer) | `/aten-op-lowering` |
 | Fix a pre-existing upstream failure blocking an op | `/pytorch-upstream-test-debugger` |
 | Grade an op against the objective bar (before PR) | `scripts/verify_op_acceptance.py` |
 | Review a draft PR (Phase 2 Reviewer) | `/pr-review` |

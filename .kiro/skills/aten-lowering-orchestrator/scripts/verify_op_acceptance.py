@@ -2,11 +2,12 @@
 """Deterministic acceptance verifier for a single ATen op lowering.
 
 This script is the *grader* for the aten-lowering-orchestrator. It does NOT run
-anything on hardware and it contains NO model calls: the orchestrator runs the
-tests on the Trn2 host (via the agent-isolation skill) and produces named
-artifacts; this script consumes those artifacts, diffs the skip/xfail registry,
-and emits a machine-readable verdict. The pass/fail decision is computed here,
-by code -- never by an LLM. That is the anti-cheat guarantee.
+anything on hardware and it contains NO model calls: the Implementer runs the
+unit and coverage tests and the orchestrator runs the upstream lane on the Trn2
+host (via the agent-isolation skill), and each produces named artifacts; this
+script consumes those artifacts, diffs the skip/xfail registry, and emits a
+machine-readable verdict. The pass/fail decision is computed here, by code --
+never by an LLM. That is the anti-cheat guarantee.
 
 Two subcommands:
 
@@ -22,9 +23,12 @@ Two subcommands:
       orchestrator should re-run once before trusting), 3 = usage error.
 
 GATING criteria (block a PR from being marked ready):
-  * upstream       -- every op-relevant upstream test passes, AND still passes
-                      under --runxfail (no xfail masking a real failure), AND
-                      no op-relevant test is newly skipped/xfailed vs baseline.
+  * upstream       -- every op-relevant upstream test passes (no failure, no
+                      XPASS). When a --baseline-upstream-report is supplied it
+                      also gates the --runxfail leg (no xfail masks a real
+                      failure) and newly-skipped tests vs baseline. The workflow
+                      does not produce that baseline, so the --runxfail leg is
+                      advisory and the registry check gates new skip/xfails.
   * registry       -- no new skip/xfail entry whose reason is not on the
                       platform-limitation allowlist; the op does not remain
                       matched by a non-allowlisted skip/xfail group.
@@ -69,14 +73,14 @@ GATING criteria (block a PR from being marked ready):
   * unit_tests     -- the op's unit-test file exited rc 0.
   * coverage_row   -- the op is present in tests/vertical/internal/target_ops.py.
   * roofline       -- measured roofline_ratio vs --roofline-threshold (default
-                      2.0). ADVISORY: the ratio is always recorded and an
+                      2.0). ADVISORY ONLY: the ratio is always recorded and an
                       over-threshold value is flagged for the PR, but it NEVER
                       blocks -- the theoretical model mis-predicts whole families
                       (compute-bound transcendental ops tagged "elementwise"), so
                       the number is for human review, not gating. Dispatch +
                       correctness are the hard vertical gates. --require-roofline
-                      promotes an over-threshold ratio to a FAIL for batches where
-                      the model is trusted (mm/matmul-like).
+                      is accepted but currently inert; it is reserved for a future
+                      candidate-vs-GPU-baseline regression check.
 
 ADVISORY (reported, never blocking): compile time, raw roofline timings.
 
@@ -110,32 +114,6 @@ OK = "ok"
 FAILED = "failed"
 NOT_PROVIDED = "not_provided"
 INFRA = "infra"
-
-# Roofline categories whose handler in tests/vertical/internal/roofline.py models
-# the op's real memory traffic / FLOPs, so the ratio is trustworthy enough to GATE
-# on. "elementwise" is included but the coverage harness only labels an op
-# "elementwise" when it is genuinely pointwise (PyTorch pointwise tag / _foreach_);
-# ops that merely fell through to the elementwise default are labeled "unknown".
-# A blank/"unknown" category means the roofline doesn't cleanly fit the op, so the
-# ratio is recorded but NOT gated (human review) unless --require-roofline forces it.
-ROOFLINE_TRUSTED_CATEGORIES = frozenset(
-    {
-        "mm",
-        "bmm",
-        "addmm",
-        "baddbmm",
-        "linear",
-        "matmul",
-        "sdpa",
-        "sdpa_backward",
-        "reduction",
-        "softmax",
-        "norm",
-        "embedding",
-        "copy",
-        "elementwise",
-    }
-)
 
 # Signatures in a test's longrepr/message that indicate environment skew rather
 # than a real defect (see pytorch-upstream-test-debugger: stale overlay, etc.).
@@ -828,7 +806,7 @@ def check_compile(v: Verdict, op: str, args) -> None:
         )
         v.add(Check("compile_correctness", gate_missing, NOT_PROVIDED, "no --compile-coverage-csv"))
         return
-    row = _coverage_row(args.compile_coverage_csv, op)
+    row, _exact = _coverage_row(args.compile_coverage_csv, op)
     if row is None:
         v.add(
             Check(
@@ -986,7 +964,7 @@ def check_backward(v: Verdict, op: str, args) -> None:
     else:
         bad, infra, ok_ops = [], [], []
         for b in bops:
-            row = _coverage_row(args.coverage_csv, b)
+            row, _exact = _coverage_row(args.coverage_csv, b)
             if row is None:
                 bad.append(f"{b}: absent from eager coverage CSV (add it to target_ops.py)")
                 continue
@@ -1018,7 +996,7 @@ def check_backward(v: Verdict, op: str, args) -> None:
     c_bad, c_ok = [], []
     present = False
     for b in bops:
-        row = _coverage_row(args.compile_coverage_csv, b)
+        row, _exact = _coverage_row(args.compile_coverage_csv, b)
         if row is None:
             continue
         present = True
@@ -1045,26 +1023,23 @@ def check_backward(v: Verdict, op: str, args) -> None:
 
 
 def check_roofline(v: Verdict, op: str, args) -> None:
-    """ADVISORY by default: measured exec time vs the op's theoretical roofline
-    (--roofline-threshold, default 2.0x) is recorded and flagged, but never blocks
-    a PR. The theoretical model mis-predicts whole op families (transcendental
-    pointwise ops are compute-bound yet tagged "elementwise"), so an over-threshold
-    ratio recurs family-wide -- including already-shipped variants -- and is not
-    attributable to a single lowering. A human justifies perf in the PR; automated
-    perf protection, if wanted, belongs in a candidate-vs-baseline regression check,
-    not an absolute model. Dispatch + correctness (the gating vertical checks) stay
-    hard gates. --require-roofline promotes an over-threshold ratio to a FAIL for a
-    batch where the model is trusted (e.g. mm/matmul only).
+    """ADVISORY ONLY: roofline never gates the verdict. The measured exec time vs
+    the op's theoretical roofline (--roofline-threshold, default 2.0x) is recorded
+    and an over-threshold value is flagged for the PR, but it never blocks. The
+    theoretical model mis-predicts whole op families (transcendental pointwise ops
+    are compute-bound yet tagged "elementwise"), so an over-threshold ratio recurs
+    family-wide -- including already-shipped variants -- and is not attributable to
+    a single lowering. Dispatch + correctness (the gating vertical checks) stay the
+    hard gates. Automated perf protection, when we add it, belongs in a
+    candidate-vs-GPU-baseline regression check, not this absolute model.
+    --require-roofline is accepted but currently inert; it is reserved for that
+    future baseline check.
     """
     thr = args.roofline_threshold
     if not args.coverage_csv:
-        v.add(
-            Check(
-                "roofline", bool(args.require_roofline), NOT_PROVIDED, "no --coverage-csv supplied"
-            )
-        )
+        v.add(Check("roofline", False, NOT_PROVIDED, "no --coverage-csv supplied"))
         return
-    row = _coverage_row(args.coverage_csv, op)
+    row, _exact = _coverage_row(args.coverage_csv, op)
     rr = row.get("roofline_ratio", "") if row else ""
     category = (row.get("roofline_category", "") if row else "").strip()
     v.advisory["roofline_ratio"] = rr
@@ -1075,49 +1050,15 @@ def check_roofline(v: Verdict, op: str, args) -> None:
     except ValueError:
         ratio = None
 
-    trusted = category in ROOFLINE_TRUSTED_CATEGORIES
-
     if ratio is None:
-        # Not measured / no handler. Non-blocking by default (the handler lives
-        # in reviewed code; its absence is a known advisory gap, not a hidden
-        # regression).
         v.advisory["roofline_flag"] = (
             "roofline_ratio unavailable -- not measured or no handler in internal/roofline.py"
         )
         v.add(
-            Check(
-                "roofline",
-                bool(args.require_roofline),
-                NOT_PROVIDED,
-                f"roofline_ratio unavailable (threshold {thr}x)",
-            )
-        )
-        return
-    if not trusted and not args.require_roofline:
-        # The op fell through to the generic estimate; the number is unreliable,
-        # so record it but don't gate -- a human decides whether the perf is fine.
-        v.advisory["roofline_flag"] = (
-            f"roofline_ratio={ratio} recorded but NOT gated: category="
-            f"{category or 'unknown'} has no trustworthy roofline handler "
-            "(op isn't a clean fit) -- human review"
-        )
-        v.add(
-            Check(
-                "roofline",
-                False,
-                NOT_PROVIDED,
-                f"roofline_ratio={ratio} advisory (category={category or 'unknown'}, "
-                "no trustworthy handler); recorded for human review",
-            )
+            Check("roofline", False, NOT_PROVIDED, f"roofline_ratio unavailable (threshold {thr}x)")
         )
         return
     if ratio > thr:
-        # Roofline is ADVISORY by default: the theoretical model (memory-bound
-        # bandwidth / peak FLOPs) mis-predicts whole op families -- transcendental
-        # pointwise ops (pow/exp/erf/gelu) are compute-bound yet tagged
-        # "elementwise", so a >thr ratio recurs family-wide (incl. already-shipped
-        # variants) and is not attributable to a single lowering. Report it loudly
-        # and let a human justify in the PR; only --require-roofline makes it gate.
         v.advisory["roofline_flag"] = (
             f"roofline_ratio={ratio} exceeds {thr}x (category={category or 'unknown'}, "
             f"bound={row.get('bound', '')}) -- justify in the PR (may be a model "
@@ -1126,17 +1067,17 @@ def check_roofline(v: Verdict, op: str, args) -> None:
         v.add(
             Check(
                 "roofline",
-                bool(args.require_roofline),
-                FAILED if args.require_roofline else NOT_PROVIDED,
+                False,
+                NOT_PROVIDED,
                 f"roofline_ratio={ratio} exceeds {thr}x "
                 f"(category={category or 'unknown'}, bound={row.get('bound', '')}); "
-                + ("optimize or justify" if args.require_roofline else "advisory -- justify in PR"),
+                "advisory -- justify in PR",
             )
         )
     else:
         v.add(
             Check(
-                "roofline", True, OK, f"roofline_ratio={ratio} within {thr}x (category={category})"
+                "roofline", False, OK, f"roofline_ratio={ratio} within {thr}x (category={category})"
             )
         )
 
@@ -1291,17 +1232,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--roofline-threshold",
         type=float,
         default=2.0,
-        help="max allowed roofline_ratio (default 2.0); a measured ratio above "
-        "this is a gating FAIL. The roofline uses PEAK bandwidth/FLOPs, so a "
-        "perfect kernel already sits ~1.2-1.35x; 2.0x leaves headroom while "
-        "still catching real regressions",
+        help="advisory roofline_ratio flag threshold (default 2.0); a measured "
+        "ratio above this is recorded and flagged for the PR, but it never gates. "
+        "The roofline uses PEAK bandwidth/FLOPs, so a perfect kernel already sits "
+        "~1.2-1.35x; 2.0x leaves headroom",
     )
     w.add_argument(
         "--require-roofline",
         action="store_true",
-        help="gate the roofline even when it is missing OR the op's category "
-        "has no trustworthy handler (default: those cases are non-blocking, "
-        "surfaced for human review)",
+        help="accepted but currently INERT; roofline is always advisory. Reserved "
+        "for a future candidate-vs-GPU-baseline regression check",
     )
     w.add_argument(
         "--strict-missing",

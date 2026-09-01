@@ -74,7 +74,10 @@ export TMPDIR="${AGENT_ROOT}/tmp"
 # tests. The plugin is loaded via PYTEST_PLUGINS and lives on PYTHONPATH.
 export AGENT_PORT_OFFSET="${PORT_OFFSET}"
 export PYTHONPATH="${PLUGIN_DIR}:${PYTHONPATH:-}"
-export PYTEST_PLUGINS="${PYTEST_PLUGINS:+${PYTEST_PLUGINS},}agent_port_isolation"
+# agent_core_isolation pins each xdist worker to a distinct core in the slice,
+# so `pytest -n` on the bare-pytest lanes does not make every worker request
+# the whole slice and collide. It is a no-op outside xdist / the native tree.
+export PYTEST_PLUGINS="${PYTEST_PLUGINS:+${PYTEST_PLUGINS},}agent_port_isolation,agent_core_isolation"
 
 mkdir -p "${AGENT_ROOT}/hlo" "${AGENT_ROOT}/neff" "${TMPDIR}"
 
