@@ -1,6 +1,6 @@
 ---
 name: aten-op-lowering
-description: Implementer agent that adds a native Neuron lowering for ONE ATen op end-to-end by following the /aten-op-lowering runbook — reference extraction, the lowering, unit tests, upstream suites under -n 64, fix-vs-xfail triage, registry hygiene, perf/vertical coverage, docs, and a draft PR from the template. Use for "implement aten::<op>", "lower <op> to Neuron", "this op falls back to CPU". Spawned per-op by aten-lowering-orchestrator, and usable standalone from a main session.
+description: Implementer agent that adds a native Neuron lowering for ONE ATen op by following the /aten-op-lowering runbook, covering reference extraction, the lowering, unit tests, fix-vs-xfail triage, registry hygiene, perf/vertical coverage, and docs. Standalone it also runs the single-tenant upstream suite and opens the draft PR. Under aten-lowering-orchestrator it stops before the upstream run and the PR, and drops artifacts so the orchestrator runs the central upstream lane and gates the draft PR. Use for "implement aten::<op>", "lower <op> to Neuron", "this op falls back to CPU". Spawned per-op by aten-lowering-orchestrator, and usable standalone from a main session.
 tools: Read, Grep, Glob, Bash, TodoWrite
 model: opus
 ---
@@ -15,9 +15,9 @@ can spawn (and a human can invoke directly).
 ## Skills
 
 - `/aten-op-lowering` — the ordered runbook you execute. Read it first: the 6
-  platform gotchas, Step 0 baselines, the lowering, unit tests, the upstream
-  suites (the real gate), fix-vs-xfail triage, the registry contract, perf +
-  vertical coverage, docs, and the draft PR.
+  platform gotchas, the lowering, unit tests, the upstream suites (the real
+  gate), fix-vs-xfail triage, the registry contract, perf + vertical coverage,
+  docs, and the draft PR.
 - `/pytorch-upstream-test-debugger` — delegate here when a **pre-existing**
   upstream failure (not caused by your op) blocks the suite.
 - `/torch-neuronx-docs` — subsystem contracts (`04-python-ops.md`, `05-csrc.md`,
@@ -32,19 +32,28 @@ Step 7 — open the draft PR yourself.
 prompt will tell you to **stop before opening the PR** and instead drop a fixed
 artifact set so its deterministic verifier can grade you first. When you see
 that instruction, honor it: the PR opens only after the script returns a PASS
-verdict. Produce these under `agent_artifacts/<slug>/`:
+verdict. Your context must live in **artifacts, not memory** — a fix round
+respawns a fresh Implementer onto your worktree + `handoff.json`, so keep both
+current and never destroy the worktree. `completion.json` is a contract: refresh
+its `heartbeat` every step and set `ready_for_verify: true` only as your final
+action, once every artifact is final. Produce these under `agent_artifacts/<slug>/`:
+
+Do **NOT** run the upstream `-n 64` leg and do **NOT** produce `upstream.json` /
+`upstream_runxfail.json`. The upstream suite is single-tenant; the orchestrator
+runs the central upstream lane after every Implementer releases its cores. You
+produce only the collection artifacts below so the lane knows what to run.
 
 | Artifact | How |
 |---|---|
-| `upstream.json` | `pytest ... -k "<op>" -n 64 -p no:randomly --json-report --json-report-file=.../upstream.json` |
-| `upstream_runxfail.json` | the **same** selection with `--runxfail` |
-| `op_nodeids.txt` | `pytest ... -k "<op>" --collect-only -q` |
+| `op_files.txt` | scope the candidate files first (always `test_ops.py test_decomp.py test_meta.py` + the ufunc file `grep -rlwE '<op>' .../test/*.py` finds); never the whole tree |
+| `op_nodeids.txt` | collect one file at a time in sequence, each under a per-file `timeout`: `pytest <file> -k "<op>" --collect-only -q`. Never one pytest per file in parallel over the same venv (the conftest overlay swap races) |
 | `autograd_probe.json` | `probe_op_autograd.py --op aten::<op> --out ...` — run at Step 1; tells you (and the verifier) if a backward must be lowered |
 | `candidate_registry.json` | `verify_op_acceptance.py snapshot-registry --repo-root . --out ...` |
 | `target_ops_coverage.csv` | the eager vertical coverage CSV for the op (copied out of the repo root) |
 | `target_ops_compile_coverage.csv` | the compile-path vertical coverage CSV (`test_target_ops_compile_coverage.py`); tell the orchestrator `--require-compile` if you added a decomposition |
 | `unit_rc.txt` | exit code of the op's unit-test run |
-| `completion.json` | terminal status (`done`/`blocked`/`no-repro`/`regressed`); write `in_progress` at Step 1. Backward detection lives in `autograd_probe.json`, not here |
+| `handoff.json` | durable handoff so a fresh Implementer can resume on your worktree: chosen decomposition, overloads registered, what you tried and rejected, current failing `checks[]`, next-step hypothesis |
+| `completion.json` | completion contract: `state`, `round` (int), `ready_for_verify` (bool), and a `heartbeat` you refresh every step. Its write with `ready_for_verify: true` is your final action of a round and the only "ready to grade" signal. Backward detection lives in `autograd_probe.json`, not here |
 
 ## Non-negotiables (from the skill + acceptance criteria)
 
@@ -76,14 +85,13 @@ verdict. Produce these under `agent_artifacts/<slug>/`:
   gradient test with an allowlisted platform-limitation reason so a human sees it.
 - **Add the op to `tests/vertical/internal/target_ops.py` with a shape row**
   (and a row for each backward op of a differentiable op).
-- **Perf within the roofline gate — where it applies.** The verifier fails an op
-  whose `roofline_ratio` exceeds the threshold (default 2.0×) **only when the op
-  has a trustworthy roofline handler** (`roofline_category` is a real category,
-  not the generic-elementwise fallthrough). Measure it (Step 6); if it's over and
-  gated, optimize (see gotcha #2, the minor-axis `index_add` blowup) rather than
-  shipping it slow. If your op falls through to `unknown` (no clean category), the
-  ratio is recorded for human review, not gated — don't grind against a number
-  the model can't compute for your op; note the best-achieved value and move on.
+- **Perf is advisory — the roofline never blocks.** The verifier records
+  `roofline_ratio` (default threshold 2.0x) and flags an over-threshold value for
+  the PR body, but it never FAILs the op on perf. (`--require-roofline` exists but
+  is currently inert; it is reserved for a future GPU-baseline check.) Measure it
+  (Step 6); if it's over, optimize (see gotcha #2, the minor-axis `index_add`
+  blowup) rather than shipping it slow. If your op falls through to `unknown`, the
+  number is unreliable — note the best-achieved value and move on.
 - **If you edit `csrc/`:** rebuild with `./tools/build` before importing or
   testing (a stale `.so` silently tests old behavior), and run
   `./tools/run-cpp-test`. **Under the orchestrator (a worktree), you must

@@ -51,75 +51,92 @@ the allowlist to pass the op; that's a human-reviewed diff. Widening it silently
 is the exact cheat the verifier exists to stop.
 
 ### `static_argnums` is for graph-changing args, not every scalar
-Symptom: an op recompiles (a new NEFF) on every distinct scalar value at runtime,
-or a reviewer asks "does this need to be static?". Root cause: a plain numeric arg
-was marked `static_argnums`/`static_argnames` though it only feeds arithmetic — it
-changes the *numbers*, not the *graph*. Fix: mark static ONLY if the value changes
-output shape or lets the compiler specialize (e.g. `pow`'s constant *exponent*, or
-`alpha`/`rounding_mode`). A plain scalar *operand* (like `pow.Scalar`'s base, #1670)
-is not — pass it as a 0-d runtime tensor, as `mul.Scalar` does. Applies to any
-scalar-operand overload.
+Symptom: a new NEFF on every distinct scalar value (runtime recompile). Root cause:
+a plain numeric arg was marked static though it only feeds arithmetic (changes the
+numbers, not the graph). Fix: mark static ONLY if it changes output shape or lets
+the compiler specialize (`pow`'s exponent, `alpha`, `rounding_mode`); pass a scalar
+operand (`pow.Scalar`'s base, #1670) as a 0-d runtime tensor, like `mul.Scalar`.
 
 ### One decorator for functional + `.out`; no `output_params` for a single `out`
-Symptom: a separate `_out` function carrying `output_params=("out",)`, or a review
-comment asking why it exists (#1579). Root cause: on the C++ `register_aten` path
-the dispatcher already aliases `out=` and preserves its dtype — `output_params` is
-a no-op there. Fix: fold functional + `.out` into one decorator (addcmul/addcdiv/
-div/lerp). Reserve `output_params` for multi-output ops with non-`out` names
-(`out0`/`grad_input`) or `@neuron_op`/`python_dispatch` ops. A *separate* function
-is warranted only when an overload needs a different `static_argnums`/`output_params`
-— those are read from the group's first registration and apply to all its overloads.
+Symptom: a separate `_out` function with `output_params=("out",)` (#1579). Root
+cause: the C++ `register_aten` path already aliases `out=` and keeps its dtype, so
+`output_params` is a no-op. Fix: fold functional + `.out` into one decorator
+(addcmul/div/lerp); reserve `output_params` for multi-output/non-`out` names or
+`@neuron_op` ops; split overloads only for differing static args.
 
-### float64/double is a known platform limit — recognize it fast, never chase it (esp. on a backward)
-Symptom: an on-device suite hangs for tens of minutes on `*_float64` / `*_double` variants
-(often a *backward*, e.g. `test_dtypes` / `test_meta`), and the agent keeps re-running it. Root
-cause: Neuron has no native fp64 — the emulation compiles pathologically slowly, and fp64 is an
-**allowlisted** platform limitation (`float64|double …(precision|not)`), not a lowering bug. Fix:
-treat a float64-only timeout/failure as the known limit immediately — do NOT escalate timeouts or
-rewrite the lowering. Keep the fp64 variants xfailed/skipped with the allowlisted float64 reason
-(citing the fp64 gap). Critically: when you remove a **blanket** "unimplemented" skip to enable an
-op, its fp64 variants unmask and hang — re-add a NARROW float64 platform-limit xfail for them
-(including the non-parametrized `test_dtypes`, which sweeps fp64 in) in the same change, and exclude
-fp64 from device sweeps where the harness allows.
+### float64/double is a known platform limit — recognize it fast, never chase it
+Symptom: an on-device suite hangs for tens of minutes on `*_float64`/`*_double`
+(often a backward, `test_dtypes`/`test_meta`). Root cause: Neuron has no native
+fp64; emulation compiles pathologically slowly. It is allowlisted, not a bug. Fix:
+xfail the fp64 variants with the float64 reason; never escalate timeouts. When you
+remove a blanket "unimplemented" skip, re-add a NARROW fp64 xfail (incl. `test_dtypes`).
 
 ### Escalating the timeout on a re-run is a failure signal, not progress (watchdog)
-Symptom: an Implementer spends hours re-running one on-device step (`test_dtypes`, an upstream leg)
-with a larger `--timeout` each time. Root cause: it treated a known-limit hang (usually fp64) as a
-flake and looped, violating the INFRA_RETRY "one re-run, not a loop" rule. Fix (Implementer): one
-re-run max; if it hangs again, classify (fp64 → known limit, xfail it; anything else → surface),
-never bump the timeout blindly. Fix (orchestrator): give each Implementer a wall-clock budget and
-POLL its artifact mtimes/process age on a cadence — don't only await the completion event. If it is
-stuck on one step past the budget with no new artifacts, send a course-correction (or stop and
-reassess) rather than letting it burn hours.
+Symptom: an Implementer re-runs one on-device step for hours, bumping `--timeout`
+each time. Root cause: it treated a known-limit hang (usually fp64) as a flake and
+looped. Fix (Implementer): one re-run max, then classify (fp64 is the known limit,
+xfail it; else surface), never bump the timeout. Fix (orchestrator): set a
+wall-clock budget and poll heartbeat for LIVENESS only, not completion.
 
 ### A name-filtered test pass is not acceptance — find callers by dispatch, not by name
-Symptom: an op's own tests and `verify_op_acceptance.py` are green, yet the
-merge-queue full unit suite fails in an unrelated-looking test — RoPE for
-`pow.Scalar` (#1670), the generic `out=` harness for `fill_.Scalar` (#1702). Root
-cause: the gate selects tests by op *name* (`-k <op>` / `_op_keyword_matches` on the
-upstream nodeid), but transitive callers reach the op through a Python operator or
-composite (`**`→pow.Scalar, `full_like`→fill_.Scalar, `/`→div, indexing→index), so
-their nodeids never contain the name and are skipped. This is not a fixable-with-a-
-table problem: every op with a non-name spelling is exposed (arithmetic `+ - * / //
-% ** @`, comparisons, `*_like`, indexing) plus any hand-written Neuron unit test
-(rope) that has no OpInfo `_neuron` marker at all. Fix: never treat a name-filtered
-pass as acceptance. Run the local unit suite un-filtered (`run-test-parallel
---skip-distributed`) as the backstop — once per batch in the orchestrator (~95 min,
-amortized), not per op. To locate callers without a maintained alias table, run
-candidate tests once with PyTorch dispatch logging on and grep the trace for
-`aten::<op>` — ground truth, zero upkeep.
+Symptom: an op's own tests are green, yet the full unit suite fails elsewhere (RoPE
+for `pow.Scalar` #1670; `out=` harness for `fill_.Scalar` #1702). Root cause: `-k
+<op>` misses transitive callers that reach the op via an operator/composite (`**`,
+`full_like`, `/`, indexing). Fix: run the unit suite un-filtered once per batch
+(`run-test-parallel --skip-distributed`); find callers with dispatch logging.
 
 ### Lowering an op downgrades its decomposition consumers to fp32 — xfail the fp64 casualties
-Symptom: after a lowering merges, a *different* op's `*_float64` upstream test
-regresses (pow.Scalar → `logspace_*_float64`, #1670) — and only the full suite
-catches it (this is the numeric half of "a name-filtered test pass is not
-acceptance"). Root cause: the consumer decomposes *into* the newly-lowered op
-(`logspace` = `base**linspace` → pow.Scalar), so it flips from an fp64-accurate
-CPU fallback to an on-device fp32 compute and then misses the fp64 CPU oracle at
-1e-7 by ~1 ULP. Fix: this is the allowlisted float64 limit (see the float64
-lesson), not a bug — add a NARROW `*_float64` xfail for the *consumer*, sibling
-to the op's own fp64 entries and to any already-lowered analog (logspace's fix
-sits beside linspace's); keep forward numerics covered positively at fp32
-tolerance by the op's unit tests. Enumerate the consumers up front instead of
-waiting for the merge queue: `grep -rn "torch\.<op>\|\*\*" $(python -c 'import
-torch,os;print(os.path.dirname(torch.__file__))')/_refs /_decomp`.
+Symptom: after a lowering merges, a different op's `*_float64` test regresses
+(pow.Scalar breaks `logspace_*_float64`, #1670); only the full suite catches it.
+Root cause: the consumer decomposes into the new op, flipping from an fp64 CPU
+fallback to on-device fp32, missing the oracle by ~1 ULP. Fix: allowlisted fp64
+limit; add a NARROW `*_float64` xfail for the consumer; enumerate consumers via grep.
+
+### Done is an explicit flag, not a quiet filesystem
+Symptom: the orchestrator started the Verifier while the Implementer was still
+editing. Root cause: completion was inferred from process/diff quiescence (no
+pytest, settled `git diff`, quiet mtimes). Fix: gate the Verifier only on the
+completion notification AND `completion.json.ready_for_verify == true`; keep context
+in artifacts and respawn a FRESH Implementer. Heartbeat is liveness, not completion.
+
+### Don't double-run the upstream leg — the verifier consumes the pytest-json
+Symptom: the orchestrator re-ran the ~90-min upstream leg to "grade" after already
+running it once in the central lane, doubling hardware time. Root cause: re-running
+on-device instead of trusting the artifacts. Fix: `verify_op_acceptance.py` computes
+the verdict from the pytest-json, which cannot be forged, so consuming it preserves
+anti-cheat WITHOUT a re-run. Re-run only on INFRA_RETRY or an adversarial re-run.
+
+### Shard Neuron cores into lanes and fan out per-op Implementers
+Symptom: unit/coverage/upstream runs serialized on one host lock, and N ops ran as
+one serial mega-Implementer. Root cause: a single coarse host lock, and conflating
+"one PR" with "one Implementer". Fix: run the unit/coverage lane in parallel on
+disjoint `agent-run` core slices; give independent ops separate parallel Tier-2
+Implementers. The upstream suite does NOT share the host with the unit lane (next).
+
+### The upstream runner is single-tenant; gate it on a device-free check
+Symptom: two upstream runs (or an upstream run plus a sliced unit test) both fail
+with `Failed to initialize Neuron Runtime`. Root cause: the runner's conftest
+OVERWRITES `NEURON_RT_VISIBLE_CORES` from each worker global index, so it claims
+cores `0..N-1` and ignores any slice. Fix: run it whole-host, one at a time, only
+after cores free, gated on `neuron_devices_free.py`; never wrap it in `agent-run`.
+
+### Collect nodeids scoped to a few files, in ONE pytest process
+Symptom: a whole-tree `-k <op> --collect-only` ran 24+ min and never finished; a
+per-file parallel workaround hit `ImportError`/`INTERNALERROR`. Root cause: the
+collect gathers ~183 files before `-k` (OpInfo files parametrize across the DB),
+and `conftest` swaps `_internal` destructively so parallel masters race. Fix: scope
+to `test_ops/test_decomp/test_meta` + the grep-found ufunc file, collect in ONE run.
+
+### Bound every background job and verify it, do not block on a signal
+Symptom: a collect job ran 24 min and a `find / ...` scan ran 62 min, both abandoned
+while "waiting for the completion notification". Root cause: a job that never
+finishes never notifies, so the wait is unbounded. Fix: give each job a hard
+`timeout`; poll every ~60-90s against a deadline; check the process AND its output
+file (99% CPU + empty output is a runaway); never scan the whole filesystem.
+
+### Run whole-registry snapshot tests unfiltered after dispatch surgery
+Symptom: `test_decomp.py::HasDecompTest` failed in the merge queue, though the per-op
+run passed. Root cause: the per-op run uses `-k <op>`, which deselects every
+whole-registry snapshot test whose name lacks the op string. Fix: after any
+decomposition registration or `py_kernels` pop/repoint, run `HasDecompTest`
+unfiltered (CPU-only); then narrow the surgery or add a documented xfail.

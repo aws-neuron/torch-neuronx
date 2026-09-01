@@ -34,6 +34,7 @@ Patterns are matched case-insensitively as regex/substring against the group's
 - `nested tensor|nestedtensor`         — nested tensors unsupported
 - `mkldnn|onednn`                      — CPU-backend-specific layout
 - `upstream test bug`                  — the upstream test itself is wrong (MUST cite an upstream issue/PR)
+- `dtype superset|wider dtype set than aten|aten reference kernel (lacks|does not support)` — Neuron supports more dtypes than aten's OpInfo table claims, because aten's own reference kernel cannot run them (for example `_upsample_bilinear2d_aa` for bf16/fp16). Use this ONLY for a `test_dtypes` divergence from a proven dtype superset. The PR MUST prove each extra dtype bit-close against an fp32/fp64 oracle in a passing unit test. Do NOT use it when Neuron supports FEWER dtypes than aten, or for a wrong value on a dtype aten does claim.
 
 ## Not allowed (examples — these must be FIXED, never skipped)
 
@@ -43,3 +44,5 @@ Patterns are matched case-insensitively as regex/substring against the group's
 - Layout / stride / non-contiguous handling bugs
 - "flaky" / "timeout" without a root cause (investigate; fix or file + link an issue)
 - A skip/xfail added to the op you are currently implementing (removes the point of the work)
+- Neuron supporting FEWER dtypes than aten, or a wrong value on a dtype aten does claim (a real gap; fix it, do not use the dtype-superset reason)
+- A generic "opinfo broken" bucket (a broken OpInfo is usually a real lowering gap; investigate it per op and give a detailed, per-op reason)

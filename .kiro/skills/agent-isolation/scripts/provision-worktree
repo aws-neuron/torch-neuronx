@@ -34,7 +34,7 @@
 #
 # Steps:
 #   1. git worktree add /tmp/worktrees/<slug>      (off BASE_REF)
-#   2. cp -a .venv /tmp/worktrees/<slug>/.venv     (separate site-packages)
+#   2. cp -a <active venv> /tmp/worktrees/<slug>/.venv  (separate site-packages)
 #   3. rewrite MAPPING in __editable___torch_neuronx_*_finder.py
 #   4. nuke stale .pyc under the worktree's torch_neuronx/
 #   5. set up branch tracking: branch is fix/<slug> in the worktree, BUT
@@ -42,8 +42,14 @@
 #      create` requires the local branch to track its remote counterpart;
 #      we explicitly clear the upstream so `git push -u origin <branch>`
 #      will succeed when the agent gets to the push step.
-#   6. symlink build artifacts that aren't tracked but are needed at import
-#      time (build/, CMakeCache.txt) — the C++ extension's .so lives here.
+#   6. symlink build artifacts and the in-tree compiled .so that git does
+#      not track (build/, CMakeCache.txt, torch_neuronx/_C.so, the
+#      torch-mlir _mlir_libs/*.so). A fresh worktree has the tracked python
+#      sources but not these, so `import torch_neuronx` fails without them.
+#
+# Venv source: the script uses the ACTIVE venv ($VIRTUAL_ENV) first, then a
+# repo-root .venv. On a host with a shared venv (for example
+# /opt/torch-neuronx/.venv), activate it before you run this script.
 
 set -euo pipefail
 
@@ -92,11 +98,20 @@ git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKTREE" "$BASE_REF" >/dev/null
 
 # 2. Copy the venv. cp -a preserves symlinks, perms, and ownership.
 #    A separate venv gives the agent its own site-packages so a lint-fix
-#    install in one agent doesn't bleed into another.
-if [[ -d "$REPO_ROOT/.venv" ]]; then
-    cp -a "$REPO_ROOT/.venv" "$WORKTREE/.venv"
+#    install in one agent doesn't bleed into another. It also lets us
+#    rewrite this worktree's finder MAPPING without touching other agents.
+#    Prefer the ACTIVE venv, then a repo-root .venv. This host may use a
+#    shared venv (for example /opt/torch-neuronx/.venv), not a repo-root one.
+VENV_SRC=""
+if [[ -n "${VIRTUAL_ENV:-}" && -d "$VIRTUAL_ENV" ]]; then
+    VENV_SRC="$VIRTUAL_ENV"
+elif [[ -d "$REPO_ROOT/.venv" ]]; then
+    VENV_SRC="$REPO_ROOT/.venv"
+fi
+if [[ -n "$VENV_SRC" ]]; then
+    cp -a "$VENV_SRC" "$WORKTREE/.venv"
 else
-    echo "warning: no .venv at $REPO_ROOT — agent will need to create one" >&2
+    echo "warning: no active venv and no $REPO_ROOT/.venv — activate a venv first" >&2
 fi
 
 # 3. Rewrite the editable-install MAPPING to point at the worktree.
@@ -140,9 +155,14 @@ find "$WORKTREE/.venv" -name '*.pyc' -delete 2>/dev/null || true
 #    eventual `git push -u origin <branch>` sets it correctly.
 git -C "$WORKTREE" branch --unset-upstream "$BRANCH" 2>/dev/null || true
 
-# 6. Symlink C++ build artifacts. These aren't tracked by git but are
-#    required for `import torch_neuronx` to find the compiled .so. If they
-#    don't exist, the agent will need to rebuild — log a warning.
+# 6. Symlink build artifacts and the in-tree compiled .so. These aren't
+#    tracked by git, so a fresh worktree checkout does not have them, but
+#    `import torch_neuronx` needs them. The .so live IN the tree
+#    (torch_neuronx/_C.so, third_party/torch-mlir/.../_mlir_libs/*.so),
+#    not only under build/. The finder MAPPING rewrite in step 3 points
+#    imports at the worktree, so the .so must exist at the same relative
+#    path there. Symlink every .so the canonical tree has that the worktree
+#    lacks (skip .venv, .git, and build to keep the scan fast).
 for artifact in build CMakeCache.txt; do
     if [[ -e "$REPO_ROOT/$artifact" && ! -e "$WORKTREE/$artifact" ]]; then
         ln -s "$REPO_ROOT/$artifact" "$WORKTREE/$artifact"
@@ -151,6 +171,23 @@ done
 
 if [[ ! -e "$WORKTREE/build" ]]; then
     echo "warning: no $REPO_ROOT/build to symlink — agent will need to rebuild C++" >&2
+fi
+
+so_linked=0
+while IFS= read -r so; do
+    rel="${so#"$REPO_ROOT"/}"
+    dest="$WORKTREE/$rel"
+    if [[ ! -e "$dest" ]]; then
+        mkdir -p "$(dirname "$dest")"
+        ln -s "$so" "$dest"
+        so_linked=$((so_linked + 1))
+    fi
+done < <(find "$REPO_ROOT" \
+    \( -path "$REPO_ROOT/.venv" -o -path "$REPO_ROOT/.git" -o -path "$REPO_ROOT/build" \) -prune \
+    -o -name '*.so' -print)
+
+if [[ "$so_linked" -eq 0 ]]; then
+    echo "warning: no in-tree .so found to symlink — check the build is complete" >&2
 fi
 
 # Output: the orchestrator parses these.
