@@ -196,8 +196,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Torch-MLIR lowering failure at aten.uniform"),
         tests=[
             "DynamicShapesReproTests::test_tensor_uniform_dynamic_shapes",
-            "*ReproTests::test_randint_out_dynamic*",
-            "*UnspecTests::test_exponential*",
             "*UnspecTests::test_shape_graph_break*",
         ],
     ),
@@ -206,7 +204,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesReproTests::test_list_reverse_dynamic_shapes",
             "DynamicShapesReproTests::test_ones_out_dynamic_dynamic_shapes",
-            "*ReproTests::test_ones_out_dynamic*",
         ],
     ),
     SkipGroup(
@@ -404,7 +401,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Neuron backend returns unexpected number of outputs " "or wrong error type"),
         tests=[
             "AotAutogradFallbackTests::test_mutation",
-            "*DefaultsTests::test_is_vmapped_mutated_tensor_tensor*",
             "DynamicShapesAotAutogradFallbackTests::test_call_fn_with_non_const_inputs_aot_unsafe_dynamic_shapes",
         ],
     ),

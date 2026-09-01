@@ -153,4 +153,52 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestDynamoDecompositionsNumericsNEURON::test_addcmul_value_1_fma_matches_aten_neuron",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "neuronx-cc rejects a dynamic shape (error NCC_EMOD025). Each test"
+            " compiles a graph that has an unbounded parameter dimension, for"
+            " example f32[?] or s64[?,?]. The Neuron compiler needs static shapes."
+            " These tests cannot pass, so skip them."
+        ),
+        tests=[
+            "FunctionTests::test_foreach_norm_inf_dynamic",
+            "NestedGraphBreaksFunctionTests::test_foreach_norm_inf_dynamic_nested_graph_breaks",
+            "MiscTests::test_dim_order",
+            "MiscTests::test_item_changes_new_shape",
+            "NestedGraphBreaksMiscTests::test_item_changes_new_shape_nested_graph_breaks",
+            "NestedGraphBreaksDefaultsTests::test_is_tensor_tensor_nested_graph_breaks",
+            "ReproTests::test_randint_out_dynamic",
+            "NestedGraphBreaksReproTests::test_randint_out_dynamic_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "neuronx-cc cannot convert the StableHLO module to HLO (error"
+            " NCC_EMOD023). Each test builds a dynamic or data-dependent shape"
+            " graph (automatic dynamic, unbacked SymInts, or a shape taken from"
+            " tensor values). The StableHLO then has dynamic-shape operations that"
+            " HLO does not support. The Neuron compiler needs static shapes, so"
+            " these tests cannot pass. Skip them."
+        ),
+        tests=[
+            "DefaultsTests::test_is_vmapped_mutated_tensor_tensor",
+            "NestedGraphBreaksDefaultsTests::test_is_vmapped_mutated_tensor_tensor_nested_graph_breaks",
+            "MiscTests::test_bound_shape_checks",
+            "ReproTests::test_ones_out_dynamic",
+            "NestedGraphBreaksReproTests::test_ones_out_dynamic_nested_graph_breaks",
+            "ReproTests::test_zeros_out_dynamic",
+            "NestedGraphBreaksReproTests::test_zeros_out_dynamic_nested_graph_breaks",
+            "ReproTests::test_unsqueeze_mul_strides",
+            "UnspecTests::test_exponential",
+            "NestedGraphBreaksUnspecTests::test_exponential",
+            "NestedGraphBreaksUnspecTests::test_exponential_nested_graph_breaks",
+            "UnspecTests::test_argmin_coerces_symint_to_intlist_spec",
+            "UnspecTests::test_mark_unbacked",
+            "UnspecTests::test_mark_unbacked_channels_last",
+            "ViewTests::test_tensor_view_with_tensor_args",
+            "ViewTests::test_tensor_view_with_tensor_shape_params",
+            "ViewTests::test_torch_reshape_with_tensor_shape_params",
+            "ViewTests::test_view_with_tensor_shape_params",
+        ],
+    ),
 ]
