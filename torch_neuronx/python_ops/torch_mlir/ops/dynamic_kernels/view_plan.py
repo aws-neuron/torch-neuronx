@@ -42,8 +42,13 @@ def strided_plan(t, rows) -> StridedPlan | None:
     # starts at row `rows - tile_m`, so below one full tile the kernel walks single rows.
     tile_m = _TILE_M if rows >= _TILE_M else 1
 
-    # Extent-1 dims address nothing, whatever their stride.
-    dims = [(int(e), int(s)) for e, s in zip(t.shape, t.stride(), strict=True) if e != 1]
+    # Extent-1 dims address nothing, whatever their stride -- except the leading one when
+    # `rows` is 1, which IS the varying dim: dropping it would lose the plan entirely.
+    dims = [
+        (int(e), int(s))
+        for i, (e, s) in enumerate(zip(t.shape, t.stride(), strict=True))
+        if e != 1 or (i == 0 and rows == 1)
+    ]
 
     # Trailing stride-0 dims are a fan-out: one source element feeds `fanout` columns.
     # The kernel replicates in SBUF, so the DMA itself never reads stride 0.
