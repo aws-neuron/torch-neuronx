@@ -36,8 +36,7 @@
       "items": [
         "distributed/pipelining"
       ],
-      "num_workers": 8,
-      "soft_fail": true
+      "num_workers": 8
     },
     {
       "items": [

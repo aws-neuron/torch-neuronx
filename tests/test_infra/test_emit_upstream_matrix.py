@@ -105,17 +105,6 @@ def test_default_config_exists_and_has_full_coverage():
     )
 
 
-def test_default_config_soft_fails_only_dedicated_pp_node():
-    with open(CONFIG_DIR / DEFAULT_DIST_CONFIG) as f:
-        dist = json.load(f)
-
-    nodes_by_items = {tuple(node["items"]): node for node in expand_distribution_config(dist)}
-
-    assert nodes_by_items[("distributed/pipelining",)]["soft_fail"] is True
-    assert nodes_by_items[("distributed/fsdp",)]["soft_fail"] is False
-    assert nodes_by_items[("distributed/_composable",)]["soft_fail"] is False
-
-
 def test_smoke_config_exists_and_is_minimal():
     path = CONFIG_DIR / "upstream_pytorch_test_distribution_config.smoke.json"
     assert path.is_file(), f"Smoke config missing: {path}"
