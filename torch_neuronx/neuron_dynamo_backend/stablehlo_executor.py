@@ -11,11 +11,6 @@ from torch_mlir._mlir_libs._stablehlo import eval_module
 
 logger = logging.getLogger(__name__)
 
-
-class UnsupportedCustomCallError(NotImplementedError):
-    """The StableHLO reference interpreter has no implementation for a custom call."""
-
-
 MLIR_TYPE_STR_TO_TORCH_DTYPE = {
     "f32": torch.float32,
     "f64": torch.float64,
@@ -201,19 +196,10 @@ class StableHLOInterpreterExecutor:
 
         buf = io.StringIO()
         self.stablehlo_mlir.operation.print(file=buf, enable_debug_info=False)
-        module_text = buf.getvalue()
-        logger.info(f"StableHLO module:\n{module_text}")
+        logger.info(f"StableHLO module:\n{buf.getvalue()}")
         logger.info(f"Inputs ({len(attrs)}):")
         for i, a in enumerate(attrs):
             logger.info(f"  arg{i}: {a.type}")
-
-        # The reference interpreter has no implementation for a custom call.
-        # It aborts the process. Raise a catchable error instead.
-        custom_calls = sorted(set(re.findall(r"stablehlo\.custom_call\s+@(\w+)", module_text)))
-        if custom_calls:
-            raise UnsupportedCustomCallError(
-                f"StableHLO interpreter has no custom call: {custom_calls}. Use a compiler backend."
-            )
 
         try:
             results = eval_module(self.stablehlo_mlir, attrs)

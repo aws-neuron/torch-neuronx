@@ -115,6 +115,7 @@ neuron_decompositions = get_decompositions(
         aten.fill.Tensor,
         aten.index_add,
         aten.native_dropout_backward,
+        aten.gelu_backward,
         aten.threshold_backward,
         aten._log_softmax_backward_data,
         aten._softmax_backward_data,
@@ -2358,24 +2359,6 @@ def linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
     result = torch.where(has_nan, torch.full_like(result, float("nan")), result)
 
     return result
-
-
-_NATIVE_GELU_BACKWARD = get_decompositions([aten.gelu_backward])[aten.gelu_backward.default]
-
-
-@register_decomposition([aten.gelu_backward])
-def _gelu_backward_fallback(grad_output, self, approximate="none"):
-    """Route exact GELU backward to the @AwsNeuronGeluBackward custom-call; decompose tanh.
-
-    For approximate="none" return NotImplemented so aten.gelu_backward is left
-    intact and lowered by TorchToNeuron (ConvertNeuronGeluBackwardOp) to
-    @AwsNeuronGeluBackward (the local derivative) followed by a multiply with
-    grad_output -- matching NxDI's Gelu.backward. There is no tanh-backward
-    intrinsic, so approximate="tanh" falls back to the standard decomposition.
-    """
-    if approximate == "none":
-        return NotImplemented
-    return _NATIVE_GELU_BACKWARD(grad_output, self, approximate)
 
 
 @register_decomposition([aten.sigmoid_backward.default])
