@@ -87,6 +87,20 @@ class TestDecompositionTable:
         # Should be the same as neuron_decompositions
         assert decomp_table is decompositions.neuron_decompositions
 
+    def test_take_custom_decomposition_registered(self):
+        """take uses the custom static-shape decomposition and is not shadowed.
+
+        A py_impl at Autograd / CompositeImplicitAutograd would resolve above
+        __torch_dispatch__ and make the table entry dead, so check the op is
+        clean and the table points at our function."""
+        assert torch.ops.aten.take.default in decompositions.neuron_decompositions
+        assert callable(decompositions.neuron_decompositions[torch.ops.aten.take.default])
+        packet = torch.ops.aten.take
+        for overload in packet.overloads():
+            keys = [str(k) for k in getattr(packet, overload).py_kernels]
+            assert "Autograd" not in keys
+            assert "CompositeImplicitAutograd" not in keys
+
     def test_bmm_dtype_decomposition_registered(self):
         """bmm.dtype decomp is registered."""
         assert torch.ops.aten.bmm.dtype in decompositions.neuron_decompositions
@@ -5863,6 +5877,54 @@ class TestTakeDecompositionE2E:
         idx = torch.randint(0, numel, (5,))
         result = compiled_fn(x_cpu.to("neuron"), idx.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu, idx), rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("shape", [(), (1,), (4, 8)])
+    def test_take_0d_index_e2e(self, shape):
+        """Regression: a 0-d (scalar) index made the built-in take decomposition
+        build an unbacked size and fail the Neuron data-dependent guard. The
+        static-shape decomposition keeps the shape static, so a 0-d index works.
+        """
+        torch.manual_seed(42)
+
+        def fn(x, idx):
+            return torch.take(x, idx)
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randn(shape)
+        idx = torch.tensor(0)  # 0-d index
+        result = compiled_fn(x_cpu.to("neuron"), idx.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu, idx), rtol=1e-4, atol=1e-4)
+
+    def test_take_negative_index_e2e(self):
+        """take normalizes a negative index against the flat numel."""
+        torch.manual_seed(42)
+
+        def fn(x, idx):
+            return torch.take(x, idx)
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randn(3, 3)
+        idx = torch.tensor([-1, -4, -7])  # valid negatives into numel=9
+        result = compiled_fn(x_cpu.to("neuron"), idx.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu, idx), rtol=1e-4, atol=1e-4)
+
+    def test_take_out_variant_e2e(self):
+        """The .out overload functionalizes to the same functional take, so the
+        one decomposition covers it. The written buffer must match the value."""
+        torch.manual_seed(42)
+
+        def fn(x, idx, out):
+            return torch.ops.aten.take.out(x, idx, out=out)
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.randn(4, 8)
+        idx = torch.randint(0, 32, (5,))
+        out_cpu = torch.empty(5)
+        result = compiled_fn(x_cpu.to("neuron"), idx.to("neuron"), out_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu, idx, out_cpu), rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
