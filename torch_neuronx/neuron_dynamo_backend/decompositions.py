@@ -24,6 +24,7 @@ from nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib.core.attention.attention_cte import attention_cte
 from torch._decomp import get_decompositions
 
+from torch_neuronx import _im2col_maps as im2col_maps
 from torch_neuronx import _interpolation_maps as interpolation_maps
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool, _getenv_int
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
@@ -119,7 +120,6 @@ neuron_decompositions = get_decompositions(
         aten._softmax_backward_data,
         aten.select_backward,
         aten.softplus_backward,
-        aten.col2im,  # accuracy mismatch on neuron, pending NCF-486
         aten.lerp,
         aten.elu,
         aten.elu_backward,
@@ -6705,12 +6705,23 @@ def upsample_bilinear2d_aa_decomposition(
     filter widening enabled in the weight matrix. Handles both align_corners
     values (the matrix builder reproduces aten's degenerate AA+align_corners
     behavior bit-exactly).
+
+    The blend runs in a float accumulator (fp32 for fp16/bf16/uint8) and narrows
+    once, so Neuron gains the bf16/fp16 path aten's CPU kernel lacks. For a uint8
+    output the width pass is narrowed before the height pass, matching aten's
+    per-pass kernel (a tap matrix built in uint8 would round every weight to 0/1).
     """
     oh, ow = output_size
     in_h, in_w = self.shape[-2:]
-    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, True, self.device, self.dtype)
-    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, True, self.device, self.dtype)
-    return torch.einsum("oi,ncij,wj->ncow", wh, self, ww)
+    acc = interpolation_maps.resample_dtype(self)
+    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, True, self.device, acc)
+    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, True, self.device, acc)
+    result = self if self.dtype == acc else self.to(acc)
+    result = torch.einsum("ncij,wj->nciw", result, ww)  # width (innermost) first
+    if not self.is_floating_point():
+        result = interpolation_maps.round_into_range(result, self.dtype)
+    result = torch.einsum("oi,nciw->ncow", wh, result)
+    return interpolation_maps.to_result_dtype(result, self.dtype)
 
 
 @register_decomposition([aten._upsample_bilinear2d_aa.vec])
@@ -6728,17 +6739,33 @@ def upsample_bilinear2d_aa_backward_decomposition(
     """Decompose AA bilinear backward as the transpose of the forward matmuls.
 
     Forward is ``out = Wh @ x @ Ww^T``; the gradient wrt the input is therefore
-    ``Wh^T @ grad @ Ww``. Handles both align_corners values.
+    ``Wh^T @ grad @ Ww``. Handles both align_corners values. Floating-only, so
+    the blend runs in the float accumulator and narrows once, with no integral
+    rounding.
     """
     N, C, H, W = input_size
     oh, ow = grad_output.shape[-2:]
-    wh = _linear_resample_matrix(
-        H, oh, scales_h, align_corners, True, grad_output.device, grad_output.dtype
-    )
-    ww = _linear_resample_matrix(
-        W, ow, scales_w, align_corners, True, grad_output.device, grad_output.dtype
-    )
-    return torch.einsum("oi,ncow,wj->ncij", wh, grad_output, ww)
+    acc = interpolation_maps.resample_dtype(grad_output)
+    wh = _linear_resample_matrix(H, oh, scales_h, align_corners, True, grad_output.device, acc)
+    ww = _linear_resample_matrix(W, ow, scales_w, align_corners, True, grad_output.device, acc)
+    grad = grad_output if grad_output.dtype == acc else grad_output.to(acc)
+    result = torch.einsum("oi,ncow,wj->ncij", wh, grad, ww)
+    return interpolation_maps.to_result_dtype(result, grad_output.dtype)
+
+
+# im2col / col2im (F.unfold / F.fold). Thin wrappers over _im2col_maps.py, which
+# the eager path also calls. col2im replaces PyTorch's builtin decomposition,
+# which mismatched on Neuron (NCF-486).
+
+
+@register_decomposition([aten.im2col.default])
+def im2col_decomposition(self, kernel_size, dilation, padding, stride):
+    return im2col_maps.im2col_forward(self, kernel_size, dilation, padding, stride)
+
+
+@register_decomposition([aten.col2im.default])
+def col2im_decomposition(self, output_size, kernel_size, dilation, padding, stride):
+    return im2col_maps.col2im_forward(self, output_size, kernel_size, dilation, padding, stride)
 
 
 # ── _trilinear — 3-input tensor contraction used by nn.Bilinear ──────────

@@ -2505,6 +2505,175 @@ class TestFoldDecompositionE2E:
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestUnfoldDecompositionE2E:
+    """E2E tests for torch.nn.functional.unfold (aten::im2col) via torch.compile.
+
+    Complements the fold (col2im) suite above. Covers the general overlapping
+    gather path and — the case the customer's windowed-attention reshape hits —
+    the non-overlapping ``kernel == stride`` fast path that lowers to a
+    view+permute with no gather.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,kernel_size,stride,padding,dilation",
+        [
+            ((1, 1, 4, 4), (2, 2), 1, 0, 1),  # default overlapping
+            ((2, 3, 8, 8), (3, 3), 2, 1, 1),  # stride + padding, overlapping
+            ((1, 2, 8, 8), (3, 3), 1, 0, 2),  # dilation
+            ((2, 4, 10, 10), (3, 3), 2, 1, 1),  # all combined
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_unfold_general(self, shape, kernel_size, stride, padding, dilation, dtype):
+        torch.manual_seed(42)
+
+        def unfold_fn(x):
+            return torch.nn.functional.unfold(
+                x, kernel_size, dilation=dilation, padding=padding, stride=stride
+            )
+
+        compiled_fn = torch.compile(unfold_fn, backend="neuron")
+        x_cpu = torch.randn(*shape, dtype=dtype)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        result_cpu = unfold_fn(x_cpu)
+        result_neuron = compiled_fn(x_neuron)
+
+        rtol = 1e-1 if dtype == torch.bfloat16 else (1e-2 if dtype == torch.float16 else 1e-4)
+        atol = 3e-1 if dtype == torch.bfloat16 else (1e-2 if dtype == torch.float16 else 1e-4)
+        torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "shape,kernel_size",
+        [
+            ((2, 3, 8, 8), (2, 2)),  # tiles 4x4 blocks exactly
+            ((1, 4, 12, 9), (4, 3)),  # non-square kernel tiling exactly
+            ((2, 8, 6, 6), (3, 3)),  # multi-channel exact tiling
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_unfold_non_overlapping_fastpath(self, shape, kernel_size, dtype):
+        """kernel == stride, unit dilation, exact tiling -> view+permute, no gather."""
+        torch.manual_seed(42)
+
+        def unfold_fn(x):
+            return torch.nn.functional.unfold(x, kernel_size, stride=kernel_size)
+
+        compiled_fn = torch.compile(unfold_fn, backend="neuron")
+        x_cpu = torch.randn(*shape, dtype=dtype)
+        x_neuron = x_cpu.detach().clone().to("neuron")
+
+        result_cpu = unfold_fn(x_cpu)
+        result_neuron = compiled_fn(x_neuron)
+
+        rtol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+        atol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=rtol, atol=atol)
+
+    def test_unfold_backward(self):
+        """unfold backward (col2im) matches CPU."""
+        torch.manual_seed(42)
+
+        def unfold_sum(x):
+            return torch.nn.functional.unfold(x, (2, 2), stride=2).sum()
+
+        compiled_fn = torch.compile(unfold_sum, backend="neuron")
+        x_cpu = torch.randn(1, 3, 8, 8, requires_grad=True)
+        x_neuron = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        unfold_sum(x_cpu).backward()
+        compiled_fn(x_neuron).backward()
+
+        torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+    def test_registered(self):
+        assert torch.ops.aten.im2col.default in decompositions.neuron_decompositions
+        assert torch.ops.aten.col2im.default in decompositions.neuron_decompositions
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestFoldOverlapAccumulation:
+    """Regression guard for col2im overlap accumulation (ticket NCF-486).
+
+    ``col2im`` lowers to ``stablehlo.scatter`` with an add reduction over
+    non-unique indices. A compiler bug once rewrote that add scatter to a plain
+    store, so overlapping fold windows overwrote instead of summed. The result
+    was still close in magnitude, so a loose tolerance hid it.
+
+    These tests use overlapping windows (``stride < kernel``) and integer
+    payloads, then compare bit-exact. A dropped add reduction changes an integer
+    sum by a whole unit, so an exact compare fails hard.
+    """
+
+    def test_overlap_accumulation_exact(self):
+        """Exact NCF-486 case: fold((4,4),(3,3)) of arange, known-correct sums."""
+        x = torch.arange(36, dtype=torch.float32).reshape(1, 9, 4)
+
+        def fold_fn(t):
+            return torch.nn.functional.fold(t, (4, 4), (3, 3))
+
+        compiled_fn = torch.compile(fold_fn, backend="neuron")
+        result_neuron = compiled_fn(x.detach().to("neuron")).cpu()
+
+        # Overlapping 3x3 windows on a 4x4 image. The interior pixels sum many
+        # taps; an overwrite bug would drop those sums.
+        expected = torch.tensor(
+            [
+                [0.0, 5.0, 13.0, 9.0],
+                [14.0, 38.0, 54.0, 32.0],
+                [38.0, 86.0, 102.0, 56.0],
+                [26.0, 57.0, 65.0, 35.0],
+            ]
+        ).reshape(1, 1, 4, 4)
+        torch.testing.assert_close(result_neuron, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "output_size,kernel_size,stride",
+        [
+            ((5, 5), (3, 3), 1),  # heavy overlap, up to 9 taps per pixel
+            ((7, 7), (3, 3), 2),  # partial overlap
+            ((6, 8), (2, 3), 1),  # non-square, overlap
+        ],
+    )
+    def test_overlap_accumulation_dtypes(self, dtype, output_size, kernel_size, stride):
+        """Overlapping fold, integer payloads, bit-exact against CPU.
+
+        Small integers stay exact in fp16/bf16 (sums stay below the exact-integer
+        limit), so an exact compare is legitimate and catches a dropped add.
+        """
+        torch.manual_seed(0)
+        ho = (output_size[0] - kernel_size[0]) // stride + 1
+        wo = (output_size[1] - kernel_size[1]) // stride + 1
+        c_times_k = kernel_size[0] * kernel_size[1]
+        # Bound the payload so every accumulated sum stays exact in bf16 (< 256).
+        x_cpu = torch.randint(-4, 5, (1, c_times_k, ho * wo)).to(dtype)
+
+        def fold_fn(t):
+            return torch.nn.functional.fold(t, output_size, kernel_size, stride=stride)
+
+        compiled_fn = torch.compile(fold_fn, backend="neuron")
+        result_cpu = fold_fn(x_cpu)
+        result_neuron = compiled_fn(x_cpu.detach().clone().to("neuron")).cpu()
+        torch.testing.assert_close(result_neuron, result_cpu, rtol=0, atol=0)
+
+    def test_backward_overlap_accumulation_exact(self):
+        """unfold backward is col2im. Overlapping windows must sum the gradient."""
+        torch.manual_seed(0)
+        # Overlapping 3x3 windows, unit stride: interior gradients accumulate.
+        x_cpu = torch.randint(-4, 5, (1, 2, 5, 5)).float().requires_grad_(True)
+        x_neuron = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        def unfold_sum(t):
+            return (torch.nn.functional.unfold(t, (3, 3)) ** 2).sum()
+
+        compiled_fn = torch.compile(unfold_sum, backend="neuron")
+        unfold_sum(x_cpu).backward()
+        compiled_fn(x_neuron).backward()
+        torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 class TestSelectBackwardDecompositionE2E:
     """End-to-end tests for select_backward decomposition using torch.compile with neuron backend"""
 
@@ -7543,6 +7712,47 @@ class TestUpsampleBilinear2dAADecomposition:
         result = decompositions.upsample_bilinear2d_aa_decomposition(x, list(out_hw), True)
         expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, list(out_hw), True)
         torch.testing.assert_close(result, expected)
+
+    @pytest.mark.parametrize("out_hw", [(4, 4), (5, 7), (24, 24)])
+    def test_uint8_matches_aten(self, out_hw):
+        """uint8 blends in a float accumulator and rounds per pass like aten.
+
+        The matrix must be built in the float accumulator, not the input dtype —
+        a uint8 tap matrix rounds every weight to 0/1 and destroys the blend.
+        aten's uint8 kernel narrows between the two separable passes, so the
+        result matches within one ULP (allowed off-by-one, as the framework's
+        exact-match uses the same per-pass rounding).
+        """
+        x = torch.randint(0, 256, (2, 3, 16, 16), dtype=torch.uint8)
+        result = decompositions.upsample_bilinear2d_aa_decomposition(x, list(out_hw), False)
+        expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, list(out_hw), False)
+        assert result.dtype == torch.uint8
+        torch.testing.assert_close(result, expected, atol=1, rtol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_narrow_float_accumulates_in_fp32(self, dtype):
+        """bf16/fp16 forward+backward accumulate in fp32 and narrow once.
+
+        This is the path aten's CPU antialias kernel lacks entirely (it raises
+        ``"compute_index_ranges_weights" not implemented for 'BFloat16'``), so the
+        reference is the fp32 decomposition downcast to the narrow dtype.
+        """
+        x32 = torch.randn(2, 3, 16, 16)
+        fwd_ref = decompositions.upsample_bilinear2d_aa_decomposition(x32, [8, 8], False)
+        fwd = decompositions.upsample_bilinear2d_aa_decomposition(x32.to(dtype), [8, 8], False)
+        assert fwd.dtype == dtype
+        torch.testing.assert_close(fwd.float(), fwd_ref, atol=3e-2, rtol=1e-2)
+
+        g32 = torch.randn(2, 3, 8, 8)
+        input_size = [2, 3, 16, 16]
+        bwd_ref = decompositions.upsample_bilinear2d_aa_backward_decomposition(
+            g32, [8, 8], input_size, False
+        )
+        bwd = decompositions.upsample_bilinear2d_aa_backward_decomposition(
+            g32.to(dtype), [8, 8], input_size, False
+        )
+        assert bwd.dtype == dtype
+        torch.testing.assert_close(bwd.float(), bwd_ref, atol=3e-2, rtol=1e-2)
 
     @pytest.mark.parametrize(
         "op",

@@ -26,8 +26,6 @@ ATEN_HANG_NEEDS_INVESTIGATION = [
     "test_comprehensive_nn_functional_interpolate_trilinear_neuron_bfloat16",
     "test_comprehensive_nn_functional_normalize_neuron_bfloat16",
     "test_comprehensive_nn_functional_pad_replicate_neuron_float64",
-    "test_comprehensive_nn_functional_unfold_neuron_bool",
-    "test_comprehensive_nn_functional_unfold_neuron_float16",
     "test_comprehensive_nn_functional_upsample_nearest_neuron_float64",
     "test_comprehensive_repeat_neuron_float64",
     "test_comprehensive_slice_scatter_neuron_float64",
@@ -385,16 +383,13 @@ ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT = [
     "test_ops.py::TestCommonNEURON::test_dtypes_masked_normalize_neuron",
 ]
 
-# No Neuron lowering for the anti-aliased _upsample_bilinear2d_aa /
-# _upsample_bicubic2d_aa pair. The antialias=False subtests lower natively
-# via upsample_bilinear2d / upsample_bicubic2d and are no longer skipped.
+# No Neuron lowering for the anti-aliased _upsample_bicubic2d_aa. The
+# antialias=False subtests lower natively via upsample_bicubic2d, and the
+# _upsample_bilinear2d_aa (mode=bilinear) subtests now lower via the AA
+# bilinear decomposition — both are no longer skipped.
 ATEN_UPSAMPLINGBIMODE2D_AA_NO_LOWERING = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format0_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format1_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bilinear_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bilinear_memory_format1_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format0_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format1_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bilinear_memory_format0_neuron",
-    "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bilinear_memory_format1_neuron",
 ]

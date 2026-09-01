@@ -547,8 +547,8 @@
 |103|torch.nn.LazyConvTranspose2d.cls_to_become|Y|Pure Python module method|
 |104|torch.nn.LazyConvTranspose3d|Y|Forward runs on Neuron (via F.conv_transpose3d)|
 |105|torch.nn.LazyConvTranspose3d.cls_to_become|Y|Pure Python module method|
-|106|torch.nn.Unfold|CPU_FALLBACK|Falls back (aten::im2col)|
-|107|torch.nn.Fold|CPU_FALLBACK|Falls back (aten::col2im)|
+|106|torch.nn.Unfold|Y|Native MLIR impl (aten::im2col)|
+|107|torch.nn.Fold|Y|Native MLIR impl (aten::col2im)|
 |108|torch.nn.MaxPool1d|CPU_FALLBACK|Falls back (aten::max_pool2d_with_indices.out)|
 |109|torch.nn.MaxPool2d|CPU_FALLBACK|Falls back (aten::max_pool2d_with_indices.out)|
 |110|torch.nn.MaxPool3d|CPU_FALLBACK|Falls back (aten::max_pool3d_with_indices)|
@@ -697,7 +697,7 @@
 |253|TripletMarginWithDistanceLoss|CPU_FALLBACK|Falls back (aten::norm.out)|
 |254|torch.nn.PixelShuffle|Y|Forward runs on Neuron|
 |255|torch.nn.PixelUnshuffle|Y|Forward runs on Neuron (via F.pixel_unshuffle)|
-|256|torch.nn.Upsample|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
+|256|torch.nn.Upsample|Y|Native MLIR impl; trilinear / nearest-3d / bicubic-antialias fall back|
 |257|UpsamplingNearest2d|Y|Native MLIR impl|
 |258|UpsamplingBilinear2d|Y|Native MLIR impl|
 |259|torch.nn.ChannelShuffle|CPU_FALLBACK|Falls back (aten::channel_shuffle)|
@@ -812,8 +812,8 @@
 |4|F.conv_transpose{1d|Y|Uses aten::convolution (registered on Neuron)|
 |5|2d|Y|Uses aten::convolution (registered on Neuron)|
 |6|3d}|Y|Uses aten::convolution (registered on Neuron)|
-|7|F.unfold|CPU_FALLBACK|Falls back to CPU (aten::im2col)|
-|8|F.fold|CPU_FALLBACK|Falls back to CPU (aten::col2im)|
+|7|F.unfold|Y|Native MLIR impl (aten::im2col)|
+|8|F.fold|Y|Native MLIR impl (aten::col2im)|
 |9|F.avg_pool1d|CPU_FALLBACK|Falls back to CPU (aten::avg_pool)|
 |10|F.avg_pool2d|CPU_FALLBACK|Falls back to CPU (aten::avg_pool)|
 |11|F.avg_pool3d|CPU_FALLBACK|Falls back to CPU (aten::avg_pool)|
@@ -910,8 +910,8 @@
 |104|F.pixel_shuffle|Y|Decomposes to reshape + permute (supported)|
 |105|F.pixel_unshuffle|Y|Decomposes to reshape + permute (supported)|
 |106|F.pad|Y|Uses aten::constant_pad_nd (registered on Neuron)|
-|107|F.interpolate|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
-|108|F.upsample|Y|Native MLIR impl; trilinear / nearest-3d / antialias=True fall back|
+|107|F.interpolate|Y|Native MLIR impl; trilinear / nearest-3d / bicubic-antialias fall back|
+|108|F.upsample|Y|Native MLIR impl; trilinear / nearest-3d / bicubic-antialias fall back|
 |109|F.upsample_nearest|Y|Native MLIR impl|
 |110|F.upsample_bilinear|Y|Native MLIR impl|
 |111|F.grid_sample|CPU_FALLBACK|Falls back to CPU (aten::grid_sampler_2d)|
