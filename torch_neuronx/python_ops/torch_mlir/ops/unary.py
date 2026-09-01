@@ -94,6 +94,13 @@ def _exp_reduced(x, exp_bias=0):
     the /4 in the reciprocal's denominator. The same logic gives sinh its sign.
     """
     k = torch.round(x / math.log(2.0))
+    # Clamp k to its meaningful range. exp overflows fp32 once k exceeds ~128,
+    # so the result is +inf beyond that regardless of k's exact value. A huge
+    # input gives a huge k, and 2**k * poly(r) then evaluates to nan instead of
+    # +inf. Clamping keeps the finite domain (|k| <= ~129) exact, forces a clean
+    # +inf past it, and decouples this reduction from round's large-value
+    # handling.
+    k = torch.clamp(k, min=-255.0, max=255.0)
     r = (x - k * _LN2_HI) - k * _LN2_LO
     poly = 1.0 + r * (
         1.0 + r * (0.5 + r * (1 / 6 + r * (1 / 24 + r * (1 / 120 + r * (1 / 720 + r / 5040)))))

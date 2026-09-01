@@ -11,6 +11,8 @@ The IR-level checks live in the torch-mlir LIT suite
 these tests assert the ops compile and run correctly on the Neuron device.
 """
 
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -156,3 +158,55 @@ class TestCompositeSpecialFunctionE2E:
         x_cpu = torch.rand(4, 8) + 1.1
         result = compiled_fn(x_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+class TestRoundFloorInt32ClampRegressionE2E:
+    """
+    stablehlo floor, ceil, and round_nearest_even lower through an int32
+    conversion in neuronx-cc. That conversion clamps a large fp32 value to
+    +/-2^31 and returns 2^31 for nan. For |x| >= 2^23 an fp32 has no fractional
+    bits, so the op is the identity. The torch-mlir lowering must return the
+    input for those values and for nan. torch.trunc has no direct pattern and
+    decomposes into floor/ceil, so it must inherit the fix.
+    """
+
+    # Exact integers in fp32. The values with |x| > 2^31 hit the old clamp, and
+    # the large negatives caught floor's sign flip. inf and nan check the
+    # passthrough guards.
+    _VALUES: ClassVar[list[float]] = [
+        2.0**23,
+        2.0**23 + 512,
+        2.0**24,
+        1.0e9,
+        3.0e9,
+        1.0e10,
+        1.0e15,
+        -(2.0**24),
+        -3.0e9,
+        -1.0e15,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+    ]
+
+    @pytest.mark.parametrize("op", [torch.round, torch.floor, torch.ceil, torch.trunc])
+    def test_large_magnitude_identity_e2e(self, op):
+        def fn(x):
+            return op(x)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.tensor(self._VALUES, dtype=torch.float32)
+        result = compiled_fn(x_cpu.to("neuron"))
+        # The values are already integers, so the op must return them unchanged.
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=0, atol=0, equal_nan=True)
+
+    def test_round_decimals_zero_e2e(self):
+        # round(decimals=0) routes through the same round lowering.
+        def fn(x):
+            return torch.round(x, decimals=0)
+
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        x_cpu = torch.tensor(self._VALUES, dtype=torch.float32)
+        result = compiled_fn(x_cpu.to("neuron"))
+        torch.testing.assert_close(result.cpu(), fn(x_cpu), rtol=0, atol=0, equal_nan=True)
