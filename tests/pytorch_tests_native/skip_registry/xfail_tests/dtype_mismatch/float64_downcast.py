@@ -158,4 +158,33 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_type_promotion.py::TestTypePromotionNEURON::test_result_type_neuron_uint8_bfloat16",
     "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_pinverse_neuron_float32",
     "test_tensor_creation_ops.py::TestRandomTensorCreationNEURON::test_uniform_from_to_neuron_float64",
+    # Neuron has no float64 (docs/packed_int64_design.md). It runs these ops in
+    # float32. The forward and gradient results, and the test_decomp float64
+    # reference, do not match the float64 CPU value. Same limit as the entries
+    # above.
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_celu_neuron_float64",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_celu_neuron_float64",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardsigmoid_neuron_float64",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_celu_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_exp2_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_ldexp_neuron_float64",
+    "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_logit_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_ldexp_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_exp2_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_ldexp_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_neg_3_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_frac_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_round_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_0_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_float64",
+    "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_float64",
 ]

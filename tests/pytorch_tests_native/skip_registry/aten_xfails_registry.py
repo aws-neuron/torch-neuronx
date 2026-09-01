@@ -150,6 +150,79 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Extremal inputs feed inf and NaN to celu, hardsigmoid, logit, round,"
+            " and round.decimals. Neuron and the CPU _refs golden disagree on inf"
+            " and NaN handling. Real-range inputs pass. These boundary cases are"
+            " not wrong lowerings."
+        ),
+        tests=[
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_logit_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_neg_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_neg_3_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Large finite inputs to round and frac. At that magnitude the float"
+            " mantissa has no fraction bits, so the result is precision-bound, not"
+            " incorrect. The normal and small ranges pass."
+        ),
+        tests=[
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_frac_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_frac_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_round_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_round_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_0_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_0_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_float32",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Low precision in bfloat16 and float16 for celu, round.decimals, and"
+            " the ldexp decomposition cross-reference. Only these low-precision"
+            " dtypes exceed the strict tolerance. The float32 normal and small"
+            " ranges pass."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_ldexp_neuron_bfloat16",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_ldexp_neuron_float16",
+            "test_decomp.py::TestDecompNEURON::test_quick_ldexp_neuron_bfloat16",
+            "test_decomp.py::TestDecompNEURON::test_quick_ldexp_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_nn_functional_celu_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_round_decimals_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_small_nn_functional_celu_neuron_bfloat16",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "[accuracy.tensor_not_equal] Tensor values differ due to reduced precision on Neuron"
         ),
         tests=x.ACCURACY_TENSOR_NOT_EQUAL,
@@ -323,9 +396,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_huber_loss_neuron_float32",
-            "test_decomp.py::TestDecompNEURON::test_quick_logit_neuron_bfloat16",
             "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_binary_cross_entropy_neuron_float16",
-            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_hardsigmoid_neuron_float32",
         ],
     ),
     SkipGroup(

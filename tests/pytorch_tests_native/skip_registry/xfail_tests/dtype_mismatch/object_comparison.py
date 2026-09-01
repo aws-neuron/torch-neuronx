@@ -176,4 +176,16 @@ DTYPE_MISMATCH_OBJECT_COMPARISON = [
     "test_type_promotion.py::TestTypePromotionNEURON::test_clamp_type_promotion_neuron_int32_float64_float64",
     "test_type_promotion.py::TestTypePromotionNEURON::test_clamp_type_promotion_neuron_int32_float64_int32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_linalg_pinv_neuron_float32",
+    # test_decomp compares the decomposition against a float64 reference and
+    # checks each intermediate dtype. Neuron down-casts 64-bit types on entry.
+    # The check then reports "torch.float64 != torch.float32" for these cases.
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_logit_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_logit_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_logit_neuron_float32",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_celu_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_celu_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_celu_neuron_float32",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_hardsigmoid_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_hardsigmoid_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_hardsigmoid_neuron_float32",
 ]

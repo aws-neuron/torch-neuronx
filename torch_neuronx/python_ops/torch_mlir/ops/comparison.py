@@ -136,3 +136,8 @@ def torch_minimum(self, other, out=None):
 @register_aten(["aten::maximum", "aten::maximum.out"])
 def torch_maximum(self, other, out=None):
     return torch.maximum(self, other)
+
+
+@register_aten(["aten::isposinf", "aten::isposinf.out"])
+def torch_isposinf(self, out=None):
+    return torch.ops.aten.isposinf(self)

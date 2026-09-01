@@ -89,3 +89,36 @@ def torch_log_sigmoid_forward(self, output=None, buffer=None):
 )
 def torch_log_sigmoid_backward(grad_output, self, buffer, grad_input=None):
     return torch.ops.aten.log_sigmoid_backward(grad_output, self, buffer)
+
+
+@register_aten(["aten::celu", "aten::celu.out"], static_argnames=("alpha",))
+def torch_celu(self, alpha=1.0, out=None):
+    return torch.ops.aten.celu(self, alpha)
+
+
+@register_aten(["aten::leaky_relu", "aten::leaky_relu.out"], static_argnames=("negative_slope",))
+def torch_leaky_relu(self, negative_slope=0.01, out=None):
+    return torch.ops.aten.leaky_relu(self, negative_slope)
+
+
+@register_aten(["aten::leaky_relu_"], static_argnames=("negative_slope",))
+def torch_leaky_relu_(self, negative_slope=0.01):
+    return torch.ops.aten.leaky_relu(self, negative_slope)
+
+
+@register_aten(["aten::hardsigmoid", "aten::hardsigmoid.out"])
+def torch_hardsigmoid(self, out=None):
+    return torch.ops.aten.hardsigmoid(self)
+
+
+@register_aten(["aten::hardsigmoid_"])
+def torch_hardsigmoid_(self):
+    return torch.ops.aten.hardsigmoid(self)
+
+
+@register_aten(
+    ["aten::hardsigmoid_backward", "aten::hardsigmoid_backward.grad_input"],
+    output_params=("grad_input",),
+)
+def torch_hardsigmoid_backward(grad_output, self, grad_input=None):
+    return torch.ops.aten.hardsigmoid_backward.default(grad_output, self)

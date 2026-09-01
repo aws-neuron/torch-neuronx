@@ -6,7 +6,11 @@ import struct
 import torch
 
 from ..operation_registry import register_aten
-from ..validation import aten_scalar_type_name
+from ..validation import (
+    aten_scalar_type_name,
+    validate_float_only_dtype,
+    validate_round_dtype,
+)
 
 # Neuron's hardware exp and cos are inaccurate: measured max rel error on trn2
 # in fp32 is 1.0e-05 for exp and 5.9e-05 for cos, vs 8e-08 for sin/tanh (fp32
@@ -450,3 +454,62 @@ def torch_reciprocal(a, out=None):
     if not a.is_floating_point() and not a.is_complex():
         a = a.to(torch.get_default_dtype())
     return torch.reciprocal(a)
+
+
+@register_aten(["aten::exp2", "aten::exp2.out"])
+def torch_exp2(self, out=None):
+    return torch.ops.aten.exp2(self)
+
+
+@register_aten(["aten::exp2_"])
+def torch_exp2_(self):
+    return torch.ops.aten.exp2(self)
+
+
+@register_aten(
+    ["aten::frac", "aten::frac.out", "aten::frac_"],
+    validate_static_inputs=validate_float_only_dtype,
+)
+def torch_frac(self, out=None):
+    return torch.ops.aten.frac(self)
+
+
+@register_aten(
+    ["aten::round", "aten::round.out", "aten::round_"],
+    validate_static_inputs=validate_round_dtype,
+)
+def torch_round(self, out=None):
+    return torch.ops.aten.round(self)
+
+
+@register_aten(
+    ["aten::round.decimals", "aten::round.decimals_out", "aten::round_.decimals"],
+    static_argnames=("decimals",),
+    validate_static_inputs=validate_float_only_dtype,
+)
+def torch_round_decimals(self, decimals, out=None):
+    return torch.ops.aten.round(self, decimals=decimals)
+
+
+@register_aten(["aten::logit", "aten::logit.out"], static_argnames=("eps",))
+def torch_logit(self, eps=None, out=None):
+    return torch.ops.aten.logit(self, eps)
+
+
+@register_aten(["aten::logit_"], static_argnames=("eps",))
+def torch_logit_(self, eps=None):
+    return torch.ops.aten.logit(self, eps)
+
+
+@register_aten(
+    ["aten::logit_backward", "aten::logit_backward.grad_input"],
+    output_params=("grad_input",),
+    static_argnames=("eps",),
+)
+def torch_logit_backward(grad_output, self, eps=None, grad_input=None):
+    return torch.ops.aten.logit_backward.default(grad_output, self, eps)
+
+
+@register_aten(["aten::special_i1e", "aten::special_i1e.out"])
+def torch_special_i1e(self, out=None):
+    return torch.ops.aten.special_i1e(self)

@@ -181,7 +181,7 @@
 |174|torch.erfc|CPU_FALLBACK|aten::erfc not registered|
 |175|torch.erfinv|Y|Native MLIR impl (polynomial approximation)|
 |176|torch.exp|Y|Native MLIR impl|
-|177|torch.exp2|CPU_FALLBACK|aten::exp2 not registered|
+|177|torch.exp2|Y|Native MLIR impl|
 |178|torch.expm1|CPU_FALLBACK|aten::expm1 not registered|
 |179|torch.fake_quantize_per_channel_affine|CPU_FALLBACK|Quantization not supported|
 |180|torch.fake_quantize_per_tensor_affine|CPU_FALLBACK|Quantization not supported|
@@ -190,11 +190,11 @@
 |183|torch.floor|CPU_FALLBACK|aten::floor not registered|
 |184|torch.floor_divide|Y|Native MLIR impl|
 |185|torch.fmod|CPU_FALLBACK|aten::fmod not registered|
-|186|torch.frac|CPU_FALLBACK|aten::frac not registered|
+|186|torch.frac|Y|Native MLIR impl|
 |187|torch.frexp|CPU_FALLBACK|aten::frexp not registered|
 |188|torch.gradient|CPU_FALLBACK|Pure Python but uses unsupported ops|
 |189|torch.imag|Y|Metadata operation|
-|190|torch.ldexp|CPU_FALLBACK|aten::ldexp not registered|
+|190|torch.ldexp|Y|Native MLIR impl|
 |191|torch.lerp|Y|Native MLIR impl|
 |192|torch.lgamma|CPU_FALLBACK|aten::lgamma not registered|
 |193|torch.log|Y|Native MLIR impl|
@@ -207,7 +207,7 @@
 |200|torch.logical_not|Y|Native MLIR impl|
 |201|torch.logical_or|Y|Native MLIR impl|
 |202|torch.logical_xor|Y|Native MLIR impl|
-|203|torch.logit|CPU_FALLBACK|aten::logit not registered|
+|203|torch.logit|Y|Native MLIR impl|
 |204|torch.hypot|CPU_FALLBACK|aten::hypot not registered|
 |205|torch.i0|CPU_FALLBACK|aten::i0 not registered|
 |206|torch.igamma|CPU_FALLBACK|aten::igamma not registered|
@@ -229,7 +229,7 @@
 |222|torch.real|Y|Metadata operation|
 |223|torch.reciprocal|Y|Native MLIR impl|
 |224|torch.remainder|Y|Native MLIR impl|
-|225|torch.round|CPU_FALLBACK|aten::round not registered|
+|225|torch.round|Y|Native MLIR impl|
 |226|torch.rsqrt|Y|Native MLIR impl|
 |227|torch.sigmoid|Y|Native MLIR impl|
 |228|torch.sign|Y|Native MLIR impl|
@@ -289,7 +289,7 @@
 |282|torch.isfinite|Y|Native MLIR impl|
 |283|torch.isin|CPU_FALLBACK|aten::isin not registered|
 |284|torch.isinf|Y|Native MLIR impl|
-|285|torch.isposinf|CPU_FALLBACK|aten::isposinf not registered|
+|285|torch.isposinf|Y|Native MLIR impl|
 |286|torch.isneginf|Y|Native MLIR impl|
 |287|torch.isnan|Y|Native MLIR impl|
 |288|torch.isreal|Y|Metadata check only|
@@ -582,10 +582,10 @@
 |138|torch.nn.ConstantPad3d|Y|Forward runs on Neuron|
 |139|torch.nn.ELU|CPU_FALLBACK|Falls back (aten::elu.out)|
 |140|torch.nn.Hardshrink|CPU_FALLBACK|Falls back (aten::hardshrink.out)|
-|141|torch.nn.Hardsigmoid|CPU_FALLBACK|Falls back (aten::hardsigmoid.out)|
+|141|torch.nn.Hardsigmoid|Y|Native MLIR impl|
 |142|torch.nn.Hardtanh|CPU_FALLBACK|Falls back (aten::hardtanh)|
 |143|torch.nn.Hardswish|CPU_FALLBACK|Falls back (aten::hardswish)|
-|144|torch.nn.LeakyReLU|CPU_FALLBACK|Falls back (aten::leaky_relu.out)|
+|144|torch.nn.LeakyReLU|Y|Native MLIR impl|
 |145|torch.nn.LogSigmoid|CPU_FALLBACK|Falls back (aten::log_sigmoid_forward)|
 |146|torch.nn.MultiheadAttention|Y|Forward runs on Neuron|
 |147|torch.nn.MultiheadAttention.forward|Y|Pure Python module method|
@@ -595,7 +595,7 @@
 |151|torch.nn.ReLU6|CPU_FALLBACK|Falls back (aten::hardtanh)|
 |152|torch.nn.RReLU|CPU_FALLBACK|Falls back (aten::rrelu_with_noise)|
 |153|torch.nn.SELU|CPU_FALLBACK|Falls back (aten::elu.out)|
-|154|torch.nn.CELU|CPU_FALLBACK|Falls back (aten::elu.out)|
+|154|torch.nn.CELU|Y|Native MLIR impl|
 |155|torch.nn.GELU|Y|Forward runs on Neuron|
 |156|torch.nn.Sigmoid|Y|Forward runs on Neuron|
 |157|torch.nn.SiLU|Y|Forward runs on Neuron|
@@ -845,9 +845,9 @@
 |37|F.elu|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
 |38|F.elu_|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
 |39|F.selu|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
-|40|F.celu|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
-|41|F.leaky_relu|CPU_FALLBACK|Falls back to CPU (aten::leaky_relu.out)|
-|42|F.leaky_relu_|CPU_FALLBACK|Falls back to CPU (aten::leaky_relu.out)|
+|40|F.celu|Y|Native MLIR impl|
+|41|F.leaky_relu|Y|Native MLIR impl|
+|42|F.leaky_relu_|Y|Native MLIR impl|
 |43|F.prelu|CPU_FALLBACK|Falls back to CPU (aten::_prelu_kernel)|
 |44|F.rrelu|CPU_FALLBACK|Falls back to CPU (aten::rrelu_with_noise)|
 |45|F.rrelu_|CPU_FALLBACK|Falls back to CPU (aten::rrelu_with_noise)|
@@ -865,7 +865,7 @@
 |57|F.log_softmax|Y|Uses aten::_log_softmax (registered on Neuron)|
 |58|F.tanh|Y|Uses aten::tanh (registered on Neuron)|
 |59|F.sigmoid|Y|Uses aten::sigmoid (registered on Neuron)|
-|60|F.hardsigmoid|CPU_FALLBACK|Falls back to CPU (aten::hardsigmoid.out)|
+|60|F.hardsigmoid|Y|Native MLIR impl|
 |61|F.silu|Y|Uses aten::silu (registered on Neuron)|
 |62|F.mish|CPU_FALLBACK|Falls back to CPU (aten::mish.out)|
 |63|F.batch_norm|CPU_FALLBACK|Falls back to CPU (aten::native_batch_norm)|
@@ -1119,8 +1119,8 @@
 |196|Tensor.floor_divide_|Y|Native MLIR impl / In-place|
 |197|Tensor.fmod|CPU_FALLBACK|Falls back to CPU|
 |198|Tensor.fmod_|CPU_FALLBACK|Falls back to CPU|
-|199|Tensor.frac|CPU_FALLBACK|Falls back to CPU|
-|200|Tensor.frac_|CPU_FALLBACK|Falls back to CPU|
+|199|Tensor.frac|Y|Native MLIR impl|
+|200|Tensor.frac_|Y|Native MLIR impl|
 |201|Tensor.frexp|CPU_FALLBACK|No native Neuron impl|
 |202|Tensor.gather|Y|Native MLIR impl + Python impl registered|
 |203|Tensor.gcd|CPU_FALLBACK|No native Neuron impl|
@@ -1170,7 +1170,7 @@
 |247|Tensor.isclose|Y|Decomposes to eq, abs, mul, add, le (all supported)|
 |248|Tensor.isfinite|Y|Native MLIR impl|
 |249|Tensor.isinf|Y|Native MLIR impl|
-|250|Tensor.isposinf|CPU_FALLBACK|No native Neuron impl|
+|250|Tensor.isposinf|Y|Native MLIR impl|
 |251|Tensor.isneginf|Y|Native MLIR impl|
 |252|Tensor.isnan|Y|Native MLIR impl|
 |253|Tensor.is_contiguous|Y|Metadata/dtype checks|
@@ -1190,8 +1190,8 @@
 |267|Tensor.kthvalue|CPU_FALLBACK|No native Neuron impl|
 |268|Tensor.lcm|CPU_FALLBACK|No native Neuron impl|
 |269|Tensor.lcm_|CPU_FALLBACK|No native Neuron impl|
-|270|Tensor.ldexp|CPU_FALLBACK|No native Neuron impl|
-|271|Tensor.ldexp_|CPU_FALLBACK|No native Neuron impl|
+|270|Tensor.ldexp|Y|Native MLIR impl|
+|271|Tensor.ldexp_|Y|Native MLIR impl|
 |272|Tensor.le|Y|Native MLIR impl|
 |273|Tensor.le_|Y|Native MLIR impl|
 |274|Tensor.less_equal|Y|Native MLIR impl|
@@ -1221,8 +1221,8 @@
 |298|Tensor.logical_or_|Y|Native MLIR impl / In-place|
 |299|Tensor.logical_xor|Y|Native MLIR impl / In-place|
 |300|Tensor.logical_xor_|Y|Native MLIR impl / In-place|
-|301|Tensor.logit|CPU_FALLBACK|No native Neuron impl|
-|302|Tensor.logit_|CPU_FALLBACK|No native Neuron impl|
+|301|Tensor.logit|Y|Native MLIR impl|
+|302|Tensor.logit_|Y|Native MLIR impl|
 |303|Tensor.long|Y|Auto-cast: int64 → int32 with warning|
 |304|Tensor.lt|Y|Native MLIR impl|
 |305|Tensor.lt_|Y|Native MLIR impl|
@@ -1331,8 +1331,8 @@
 |408|Tensor.retains_grad|Y|Autograd metadata|
 |409|Tensor.roll|CPU_FALLBACK|Falls back to CPU (aten::roll)|
 |410|Tensor.rot90|Y|Supported via decomposition/torch-mlir lowering|
-|411|Tensor.round|CPU_FALLBACK|Falls back to CPU (aten::round.out)|
-|412|Tensor.round_|CPU_FALLBACK|Falls back to CPU (aten::round.out)|
+|411|Tensor.round|Y|Native MLIR impl|
+|412|Tensor.round_|Y|Native MLIR impl|
 |413|Tensor.rsqrt|Y|Native MLIR impl|
 |414|Tensor.rsqrt_|Y|Native MLIR impl|
 |415|Tensor.scatter|Y|Native MLIR impl|

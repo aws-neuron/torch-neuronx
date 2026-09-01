@@ -89,6 +89,24 @@ UNARY_DTYPE_LIST = {
     torch.logical_not: [torch.bool],  # logical_not returns bool unless specified otherwise
 }
 
+# Unary and activation pointwise ops enabled through the Torch-MLIR passthrough
+# registrations. These need op-specific inputs, so they do not fit UNARY_OPS_LIST:
+# logit needs a (0, 1) domain. The upstream OpInfo suite covers dtypes, out=, and
+# non-contiguity. This list only guards that each op routes through the trace/lower
+# path and does not fall back to CPU. The binary ops (rsub, ldexp) and the isposinf
+# predicate live in their family test files (test_sub, test_ldexp, test_isposinf).
+_unit = torch.rand(8) * 0.8 + 0.1  # (0, 1) domain for logit
+POINTWISE_OPS = [
+    ("aten::celu", lambda x: torch.ops.aten.celu(x), torch.randn(8)),
+    ("aten::leaky_relu", lambda x: torch.ops.aten.leaky_relu(x), torch.randn(8)),
+    ("aten::round", lambda x: torch.ops.aten.round(x), torch.randn(8)),
+    ("aten::frac", lambda x: torch.ops.aten.frac(x), torch.randn(8)),
+    ("aten::hardsigmoid", lambda x: torch.ops.aten.hardsigmoid(x), torch.randn(8)),
+    ("aten::logit", lambda x: torch.ops.aten.logit(x), _unit),
+    ("aten::exp2", lambda x: torch.ops.aten.exp2(x), torch.randn(8)),
+    ("aten::special_i1e", lambda x: torch.ops.aten.special_i1e(x), torch.randn(8)),
+]
+
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
 class TestUnaryElementwiseOp:
@@ -105,6 +123,14 @@ class TestUnaryElementwiseOp:
             result = op(input_tensor)
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron(f"aten::{op.__name__}")
+
+    @pytest.mark.parametrize("op_name, fn, x", POINTWISE_OPS, ids=[o[0] for o in POINTWISE_OPS])
+    def test_pointwise_runs_on_neuron(self, op_name, fn, x, device):
+        """Test each passthrough pointwise op routes to Neuron, not CPU."""
+        with track_neuron_ops():
+            fn(x.to(device))
+            torch.neuron.synchronize()
+        assert_op_runs_on_neuron(op_name)
 
     @pytest.mark.parametrize("op_name", UNARY_INPLACE_OPS_LIST)
     def test_unary_inplace_runs_on_neuron(self, op_name, device):
