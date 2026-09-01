@@ -49,6 +49,22 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Neuron intentionally supports a wider dtype set than aten's CPU"
+            " anti-aliased kernel for _upsample_bilinear2d_aa. The CPU AA kernel"
+            " raises NotImplementedError for bfloat16/float16 (its"
+            " compute_index_ranges_weights has no reduced-precision path), so the"
+            " OpInfo dtype table omits them; the Neuron decomposition builds the"
+            " resample matrix and accumulates the matmul in fp32, so bf16/fp16"
+            " work correctly in both forward and backward. test_dtypes flags this"
+            " superset as a failure. xfail (not skip) so that an xpass fires if"
+            " upstream ever adds bf16/fp16 to the OpInfo table and the two align."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_dtypes__upsample_bilinear2d_aa_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Error-expectation test: the test asserts a specific op-native error"
             " message (e.g., 'torch.frexp() only supports floating-point dtypes'),"
             " but Neuron's CPU fallback layer intercepts complex-dtype inputs"

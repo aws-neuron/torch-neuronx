@@ -264,3 +264,47 @@ def torch_upsample_bicubic2d_backward(
     return aten.upsample_bicubic2d_backward.default(
         grad_output, output_size, input_size, align_corners, scales_h, scales_w
     )
+
+
+# Anti-aliased bilinear. The bodies dispatch to .default; the decomposition in
+# decompositions.py rewrites it under make_fx. Allowing bf16/fp16 (not only
+# fp32/fp64/uint8 like aten's CPU kernel) is deliberate: the matmul accumulates
+# in fp32, so Neuron gains the path the CPU kernel lacks.
+
+
+@register_aten(
+    ["aten::_upsample_bilinear2d_aa", "aten::_upsample_bilinear2d_aa.out"],
+    output_params=("out",),
+    static_argnums=(1, 2, 3, 4),
+    validate_static_inputs=_make_validator("_upsample_bilinear2d_aa", allow_uint8=True),
+    lowering_result_transform=_make_output_stride_transform(aten._upsample_bilinear2d_aa),
+)
+def torch_upsample_bilinear2d_aa(
+    self, output_size, align_corners, scales_h=None, scales_w=None, out=None
+):
+    return aten._upsample_bilinear2d_aa.default(
+        self, output_size, align_corners, scales_h, scales_w
+    )
+
+
+@register_aten(
+    [
+        "aten::_upsample_bilinear2d_aa_backward",
+        "aten::_upsample_bilinear2d_aa_backward.grad_input",
+    ],
+    output_params=("grad_input",),
+    static_argnums=(1, 2, 3, 4, 5),
+    validate_static_inputs=_make_validator("_upsample_bilinear2d_aa_backward", allow_uint8=False),
+)
+def torch_upsample_bilinear2d_aa_backward(
+    grad_output,
+    output_size,
+    input_size,
+    align_corners,
+    scales_h=None,
+    scales_w=None,
+    grad_input=None,
+):
+    return aten._upsample_bilinear2d_aa_backward.default(
+        grad_output, output_size, input_size, align_corners, scales_h, scales_w
+    )

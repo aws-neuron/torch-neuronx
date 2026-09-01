@@ -10,6 +10,7 @@ from .copy import *  # noqa: F403
 from .creation import *  # noqa: F403
 from .foreach_copy import *  # noqa: F403
 from .foreach_ops import *  # noqa: F403
+from .im2col import *  # noqa: F403
 from .indexing import *  # noqa: F403
 from .interpolation import *  # noqa: F403
 from .linear_algebra import *  # noqa: F403

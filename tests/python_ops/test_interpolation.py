@@ -1009,3 +1009,101 @@ class TestFunctionalInterface:
         with track_neuron_ops():
             got = module(x.to("neuron"))
         torch.testing.assert_close(got.cpu(), expected)
+
+
+# ═════════════════════════ anti-aliased bilinear ═════════════════════════
+# aten's CPU AA kernel raises for fp16/bf16, so for those dtypes the reference
+# is the fp32 CPU result, not a same-dtype CPU run. This is the crash the Neuron
+# path fixes: the customer models could not run the op on CPU in bf16 at all.
+
+# ((in_h, in_w), (out_h, out_w), (scales_h, scales_w))
+AA_2D_CFGS = [
+    ((8, 8), (4, 4), (None, None)),  # 2x downsample, antialias active
+    ((10, 7), (5, 4), (None, None)),  # non-square downsample
+    ((9, 9), (3, 3), (None, None)),  # 3x downsample
+    ((8, 8), (8, 8), (None, None)),  # identity
+    ((4, 4), (8, 8), (None, None)),  # upsample
+]
+
+
+class TestAntiAliasedBilinearForward:
+    """aten::_upsample_bilinear2d_aa forward on Neuron."""
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    @pytest.mark.parametrize("in_hw,out_hw,scales", AA_2D_CFGS)
+    def test_fp32_values(self, align_corners, in_hw, out_hw, scales):
+        x = torch.randn(2, 3, *in_hw)
+        expected = aten._upsample_bilinear2d_aa(x, list(out_hw), align_corners, *scales)
+        with track_neuron_ops():
+            got = aten._upsample_bilinear2d_aa(x.to("neuron"), list(out_hw), align_corners, *scales)
+            _assert_ran_on_device(aten._upsample_bilinear2d_aa)
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("in_hw,out_hw,scales", AA_2D_CFGS)
+    def test_reduced_precision_matches_fp32_oracle(self, dtype, in_hw, out_hw, scales):
+        """fp16/bf16 run on Neuron but crash on CPU, so compare to the fp32 CPU oracle."""
+        x = torch.randn(2, 3, *in_hw)
+        if tuple(in_hw) != tuple(out_hw):
+            # A real resample crashes on CPU for narrow dtypes. aten short-circuits
+            # out == in to a copy that never reaches the unimplemented kernel.
+            with pytest.raises(NotImplementedError, match="not implemented"):
+                aten._upsample_bilinear2d_aa(x.to(dtype), list(out_hw), False, *scales)
+        oracle = aten._upsample_bilinear2d_aa(x, list(out_hw), False, *scales)
+        with track_neuron_ops():
+            got = aten._upsample_bilinear2d_aa(
+                x.to(dtype).to("neuron"), list(out_hw), False, *scales
+            )
+            _assert_ran_on_device(aten._upsample_bilinear2d_aa)
+        assert got.dtype == dtype
+        tol = (
+            {"atol": 5e-2, "rtol": 5e-2}
+            if dtype == torch.bfloat16
+            else {"atol": 1e-2, "rtol": 1e-2}
+        )
+        torch.testing.assert_close(got.cpu().float(), oracle, **tol)
+
+    @pytest.mark.parametrize("in_hw,out_hw", [((8, 8), (4, 4)), ((7, 5), (3, 4))])
+    def test_uint8_matches_cpu(self, in_hw, out_hw):
+        x = torch.randint(0, 256, (2, 3, *in_hw), dtype=torch.uint8)
+        expected = aten._upsample_bilinear2d_aa(x, list(out_hw), False)
+        with track_neuron_ops():
+            got = aten._upsample_bilinear2d_aa(x.to("neuron"), list(out_hw), False)
+            _assert_ran_on_device(aten._upsample_bilinear2d_aa)
+        assert got.dtype == torch.uint8
+        diff = (got.cpu().to(torch.int16) - expected.to(torch.int16)).abs()
+        assert diff.max().item() <= 1
+
+
+class TestAntiAliasedBilinearBackward:
+    """aten::_upsample_bilinear2d_aa_backward on Neuron. Floating point only."""
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    @pytest.mark.parametrize("in_hw,out_hw,scales", AA_2D_CFGS)
+    def test_fp32_values(self, align_corners, in_hw, out_hw, scales):
+        op = aten._upsample_bilinear2d_aa_backward
+        grad = torch.randn(2, 3, *out_hw)
+        input_size = [2, 3, *in_hw]
+        expected = op(grad, list(out_hw), input_size, align_corners, *scales)
+        with track_neuron_ops():
+            got = op(grad.to("neuron"), list(out_hw), input_size, align_corners, *scales)
+            _assert_ran_on_device(op)
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("in_hw,out_hw,scales", AA_2D_CFGS)
+    def test_reduced_precision_matches_fp32_oracle(self, dtype, in_hw, out_hw, scales):
+        op = aten._upsample_bilinear2d_aa_backward
+        grad = torch.randn(2, 3, *out_hw)
+        input_size = [2, 3, *in_hw]
+        oracle = op(grad, list(out_hw), input_size, False, *scales)
+        with track_neuron_ops():
+            got = op(grad.to(dtype).to("neuron"), list(out_hw), input_size, False, *scales)
+            _assert_ran_on_device(op)
+        assert got.dtype == dtype
+        tol = (
+            {"atol": 5e-2, "rtol": 5e-2}
+            if dtype == torch.bfloat16
+            else {"atol": 1e-2, "rtol": 1e-2}
+        )
+        torch.testing.assert_close(got.cpu().float(), oracle, **tol)
