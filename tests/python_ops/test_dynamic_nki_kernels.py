@@ -1661,6 +1661,54 @@ class TestDynamicNkiKernels:
             len(entry._compiled) - compiled_before <= 1
         ), "recompiled across n (did n leak into the compile_key?)"
 
+    # ── MoE combine: many-to-one scatter_add (N = T*top_k) via gather-reduce ──
+
+    @staticmethod
+    def _combine_case(T, top_k, H, *, seed=0):  # noqa: N803
+        """Expert-sorted combine inputs: routed[N,H], expanded index[N,H], and the
+        torch.scatter_add reference into a zeros [T,H] buffer. N = T*top_k."""
+        g = torch.Generator().manual_seed(seed)
+        n = T * top_k
+        # each token appears exactly top_k times, shuffled into expert-sorted order
+        token_ids = torch.arange(T).repeat(top_k)[torch.randperm(n, generator=g)]
+        src = torch.randn(n, H, generator=g, dtype=torch.bfloat16) / 8
+        index = token_ids.reshape(n, 1).expand(n, H)
+        ref = torch.zeros(T, H, dtype=torch.float32)
+        ref.scatter_add_(0, index.to(torch.int64), src.float())
+        return src, index, ref
+
+    def test_dynamic_nki_combine_scatter_add_correct(self):
+        """Many-to-one combine (N = T*top_k, top_k=6 rows per token) matches
+        torch.scatter_add and runs the gather-reduce kernel (not a fallback)."""
+        T, top_k, H = 512, 6, 2048  # noqa: N806
+        src, index, ref = self._combine_case(T, top_k, H)
+        out = torch.zeros(T, H, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("scatter_add_"):
+            out.scatter_add_(0, index.to("neuron"), src.to("neuron"))
+        torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_dynamic_nki_combine_no_recompile_across_routing(self):
+        """One NEFF per (T, top_k, H, dtype): at fixed T the combine reuses it as
+        routing (the index values) changes. T is baked (kernel output/APs are
+        traced at T), so distinct T compile distinct NEFFs — but T is a static
+        model dim, so a real run has one combine shape."""
+        T, top_k, H = 512, 6, 2048  # noqa: N806
+        entry = _entry("scatter_add_")
+        compiled_before = len(entry._compiled)
+        exec_before = entry._exec_count
+
+        seeds = (0, 1, 2, 3)  # same T, different routing (index values) each time
+        for seed in seeds:
+            src, index, ref = self._combine_case(T, top_k, H, seed=seed)
+            out = torch.zeros(T, H, dtype=torch.bfloat16).to("neuron")
+            out.scatter_add_(0, index.to("neuron"), src.to("neuron"))
+            torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
+
+        assert entry._exec_count - exec_before == len(seeds), "combine did not run every case"
+        assert (
+            len(entry._compiled) - compiled_before <= 1
+        ), "combine recompiled across routing (did the index values leak into the key?)"
+
     def test_dynamic_nki_gather_non_row_index_declines(self):
         """Only a free-dim-constant index on dim 0 is a row gather. A per-element
         index falls back to the default lowering and stays correct."""

@@ -24,6 +24,12 @@ from ..adapter_utils import (
 from ..registry import DynamicNkiEntry, register_dynamic_nki
 
 
+def _is_combine_pattern(T, n):  # noqa: N803
+    """MoE combine: many-to-one, n = T*top_k rows summed into T token rows
+    (top_k >= 2). Distinct from the unique-target n <= T scatter."""
+    return T > 0 and n > T and n % T == 0 and (n // T) >= 2
+
+
 def _can_handle_scatter_add(self, dim, index, src, out=None) -> bool:
     if not all(isinstance(t, torch.Tensor) for t in (self, index, src)):
         return False
@@ -39,25 +45,60 @@ def _can_handle_scatter_add(self, dim, index, src, out=None) -> bool:
     if H == 0:  # H is arbitrary — kernel tiles the free dim at trace time
         return False
     n = src.shape[0]
-    # n rows scattered as ceil(n/128) whole 128-tiles; data/index padded to T, so
-    # the padded count ceil(n/128)*128 must still fit within T target rows.
-    if n == 0 or _ceil_to_tile(n) > T:
+    if n == 0 or index.shape[0] != n:
         return False
-    # index is [n, H] expanded (stride 0 on dim1) or [n,1]; both give per-row idx.
-    if index.shape[0] != n:  # noqa: SIM103
+    # (A) MoE combine (many-to-one) -> gather-reduce; (B) unique-target n<=T.
+    if _is_combine_pattern(T, n):
+        return True
+    if _ceil_to_tile(n) > T:  # noqa: SIM103
         return False
     return True
 
 
 def _scatter_add_compile_key(self, dim, index, src, out=None, **_):
-    """compile_key = (T, H, dtype) of the target. T is baked only under the
-    current pad-to-T scheme — it must leave the key if we adopt register-count
-    APs (then T becomes runtime-dynamic like n)."""
+    """Unique path: (T, H, dtype). Combine path: ("combine", top_k, H, dtype) —
+    T/N are runtime-dynamic (loop count), so one NEFF serves any routing."""
+    T = int(self.shape[0])  # noqa: N806
+    n = int(src.shape[0])
+    if _is_combine_pattern(T, n):
+        # T baked: the kernel's output [T,D] and loop APs are traced at compile
+        # time, so the NEFF must match the runtime T. T is a static model dim
+        # (tokens), so this is still one NEFF per model in practice.
+        return ("combine", T, n // T, int(self.shape[1]), self.dtype)
     return (int(self.shape[0]), int(self.shape[1]), self.dtype)
 
 
 def _compile_scatter_add(compile_key) -> tuple[bytes, str]:
     from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+
+    # Combine path: ("combine", T, top_k, H, dtype) -> gather-reduce kernel.
+    if isinstance(compile_key, tuple) and len(compile_key) == 5 and compile_key[0] == "combine":
+        from torch_neuronx.utils import get_logical_neuron_cores
+
+        from ..wrappers import dynamic_combine_gather_reduce_nki
+
+        _, T, top_k, H, dtype = compile_key  # noqa: N806
+        # LNC row-tile sharding: pad T so every program runs equal token tiles.
+        P = int(get_logical_neuron_cores())  # noqa: N806
+        row_group = _TILE_M * P
+        T_ceil = -(-T // row_group) * row_group  # noqa: N806
+        routed = torch.empty(T * top_k, H, dtype=dtype, device="meta")
+        inv_idx = torch.zeros(T_ceil, top_k, dtype=torch.int32, device="meta")
+        outbuf = torch.empty(T_ceil, H, dtype=dtype, device="meta")
+        nt = torch.tensor([[T_ceil // row_group]], dtype=torch.int32, device="meta")
+        kernel = TorchMlirKernel(
+            torch_fn=dynamic_combine_gather_reduce_nki,
+            op_name="dynamic_nki_combine_gather_reduce",
+        )
+        # Aliased in-place kernel (out_buffer is operand#2, alias {2:0}): NEFF output
+        # set = declared output0 (fresh) + aliased out_buffer. Pass both.
+        fresh = torch.empty(T_ceil, H, dtype=dtype, device="meta")
+        return _compile_or_load_neff(
+            kernel,
+            "dynamic_nki_combine_gather_reduce",
+            (routed, inv_idx, outbuf, nt),
+            (fresh, outbuf),
+        )
 
     from ..wrappers import dynamic_scatter_add_nki
 
@@ -77,14 +118,43 @@ def _compile_scatter_add(compile_key) -> tuple[bytes, str]:
     )
 
 
-def _prepare_scatter_add_io(self, dim, index, src, dest=None, **_) -> tuple[tuple, tuple, int]:
-    """All tensors padded to baked T; padded data=0 is a no-op add; padded
-    indices=0 touches row 0 with 0 add (harmless). num_m_tiles = ceil(n / 128);
-    rows n..ceil(n) fall in the zero-padded region -> no-op add too. outbuf IS
-    self (in-place)."""
+def _prepare_scatter_add_io(self, dim, index, src, dest=None, in_place=False, **_):
+    """Combine path (n = T*top_k): build inv_idx[T, top_k] (source rows per token)
+    and gather-reduce. in_place (scatter_add_) writes into self; out-of-place
+    (scatter_add, a torch custom-op) accumulates into a fresh clone (no-alias rule).
+    Unique path (n <= T): pad-to-T in-place scatter."""
     T, H = self.shape  # noqa: N806
     device = self.device
     n = src.shape[0]
+
+    if _is_combine_pattern(T, n):
+        from torch_neuronx.utils import get_logical_neuron_cores
+
+        top_k = n // T
+        token_ids = index[:, 0].reshape(n).to(torch.int32)
+        # inv_idx[t] = the source rows feeding token t. Stable argsort groups a
+        # token's rows contiguously; this re-derives token_indices_experts_sorted_N
+        # (already computed upstream) — reuse it if the metadata is ever plumbed here.
+        # TODO: assumes every token appears exactly top_k times (dropless, EP=1,
+        # non-SP). Token dropping / SP break the [T, top_k] reshape — gate or
+        # generalize to a segment-sum before enabling those layouts.
+        order = torch.argsort(token_ids, stable=True)
+        inv_idx = order.reshape(T, top_k).to(torch.int32)
+        # LNC row-tile sharding: pad token rows to row_group so every program runs
+        # equal tiles. Padded inv_idx rows -> 0 (gather row 0, harmless; sliced off).
+        P = int(get_logical_neuron_cores())  # noqa: N806
+        row_group = _TILE_M * P
+        T_ceil = -(-T // row_group) * row_group  # noqa: N806
+        inv_idx = _pad_rows_to(inv_idx, T_ceil)
+        num_t_tiles = _num_tiles_tensor(T_ceil // row_group, device)
+        # The kernel does out_buffer += gather_reduce.
+        #  - in_place scatter_add_: out_buffer IS self (written back in place) when
+        #    unpadded (T is a row_group multiple, true for the MoE token count).
+        #  - out-of-place scatter_add: out_buffer is a fresh clone so the result
+        #    does not alias self (torch custom-op aliasing constraint).
+        outbuf = self if in_place and T_ceil == T else _pad_rows_to(self.clone(), T_ceil)
+        fresh = torch.empty(T_ceil, H, dtype=self.dtype, device=device)
+        return (src.contiguous(), inv_idx, outbuf, num_t_tiles), (fresh, outbuf), n
 
     idx_1d = index[:, 0].reshape(n, 1).to(torch.int32)
     idx = _pad_rows_to(idx_1d, T)
@@ -100,8 +170,11 @@ def _prepare_scatter_add_io(self, dim, index, src, dest=None, **_) -> tuple[tupl
 
 
 def _reshape_scatter_add_output(outputs, original_args):
-    """Return outputs[1] (the aliased in-place target `self`)."""
-    return outputs[1]
+    """Return the aliased in-place target (outputs[1]). The combine path pads it
+    to a row-group multiple (LNC sharding); slice back to T = self.shape[0]."""
+    result = outputs[1]
+    T = original_args[0].shape[0]  # noqa: N806
+    return result[:T] if result.shape[0] != T else result
 
 
 # ── index_put: self[idx] += values (dim 0), same kernel as scatter_add ──
@@ -165,13 +238,17 @@ def _prepare_index_put_io(self, indices, values, accumulate=False, unsafe=False,
 
 
 def register():
-    for _sa_name in ("scatter_add", "scatter_add_"):
+    # scatter_add_ is in-place (writes self); scatter_add is out-of-place (must
+    # not alias self). Same kernel/keys; the combine prepare_io differs on in_place.
+    import functools
+
+    for _sa_name, _in_place in (("scatter_add_", True), ("scatter_add", False)):
         register_dynamic_nki(
             _sa_name,
             DynamicNkiEntry(
                 compile_fn=_compile_scatter_add,
                 can_handle=_can_handle_scatter_add,
-                prepare_io=_prepare_scatter_add_io,
+                prepare_io=functools.partial(_prepare_scatter_add_io, in_place=_in_place),
                 reshape_output=_reshape_scatter_add_output,
                 compile_key_fn=_scatter_add_compile_key,
             ),
