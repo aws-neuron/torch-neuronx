@@ -84,3 +84,26 @@ def get_dynamic_nki_entry(op_name: str) -> DynamicNkiEntry | None:
     if os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") != "1":
         return None
     return _registry.get(op_name)
+
+
+def get_dynamic_nki_usage() -> dict[str, dict]:
+    """Report the dynamic NKI kernels that ran in this process, per ATen op.
+
+    An op appears only after it executes. ``kernels`` names the NEFFs it compiled; a
+    composite op (dim-0 cat) has none of its own, because it runs other ops' kernels.
+    Not flag-gated: the registry is already empty when the feature is off.
+    """
+    usage = {}
+    for op_name, entry in _registry.items():
+        if not entry._exec_count:
+            continue
+        ms = entry._exec_ms
+        usage[op_name] = {
+            "exec_count": entry._exec_count,
+            "neffs": len(entry._compiled),
+            "kernels": sorted({key.split("--")[0] for _hlo, key in entry._compiled.values()}),
+            "m_min": min(ms) if ms else None,
+            "m_max": max(ms) if ms else None,
+            "m_distinct": len(ms),
+        }
+    return usage

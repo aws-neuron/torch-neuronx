@@ -7,6 +7,7 @@ kernel is needed. Covers:
   - register / get round-trip, gated by the env flag
   - get_compiled memoizes ONE NEFF per compile_key; distinct keys -> distinct NEFFs
   - compile_key_fn None -> single NEFF under key None
+  - get_dynamic_nki_usage reports only executed ops, with their NEFF names
   - kwarg handling: out=/grad_input= as dest (offered to the gate as `out`, never in the
     compile_key), framework params dropped, op kwargs forwarded, can_handle as the gate
 """
@@ -18,6 +19,7 @@ import torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.dispatch_entry as
 from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import (
     DynamicNkiEntry,
     get_dynamic_nki_entry,
+    get_dynamic_nki_usage,
     register_dynamic_nki,
 )
 
@@ -90,6 +92,50 @@ class TestDynamicNkiRegistry:
         # An entry without compile_key_fn set exposes None (dispatch passes None).
         e = _entry([])
         assert e.compile_key_fn is None
+
+
+class TestDynamicNkiUsage:
+    """get_dynamic_nki_usage names only the ops that ran, with the NEFFs they compiled.
+
+    The registry is process-global, so each test asserts on its own op name only.
+    """
+
+    def _entry_that_ran(self, cache_key, ms):
+        """A registered entry that compiled ``cache_key`` and executed at each M in ``ms``."""
+        e = DynamicNkiEntry(
+            compile_fn=lambda _key: (b"hlo", cache_key),
+            can_handle=lambda *a, **k: True,
+            prepare_io=lambda *a, **k: ((), (), 0),
+        )
+        if cache_key is not None:
+            e.get_compiled()
+        for m in ms:
+            e.record_exec(m)
+        return e
+
+    def test_unused_op_is_absent(self):
+        register_dynamic_nki("usage_unused_stub", _entry([]))
+        assert "usage_unused_stub" not in get_dynamic_nki_usage()
+
+    def test_executed_op_reports_counts_and_kernel_name(self):
+        e = self._entry_that_ran("dynamic_nki_exp--p64--_[128,4096]:BFloat16", [256, 384, 256])
+        register_dynamic_nki("usage_ran_stub", e)
+        assert get_dynamic_nki_usage()["usage_ran_stub"] == {
+            "exec_count": 3,
+            "neffs": 1,
+            "kernels": ["dynamic_nki_exp"],
+            "m_min": 256,
+            "m_max": 384,
+            "m_distinct": 2,
+        }
+
+    def test_composite_op_reports_no_kernel_of_its_own(self):
+        # A run_fn op runs through other ops' kernels, so it compiles no NEFF itself.
+        register_dynamic_nki("usage_composite_stub", self._entry_that_ran(None, [64]))
+        got = get_dynamic_nki_usage()["usage_composite_stub"]
+        assert got["kernels"] == []
+        assert got["neffs"] == 0
+        assert got["exec_count"] == 1
 
 
 class FakeTensor:
