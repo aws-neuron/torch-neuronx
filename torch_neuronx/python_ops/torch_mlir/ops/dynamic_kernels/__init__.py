@@ -13,6 +13,8 @@ dispatch path is inert.
 
 from torch_neuronx.utils import use_dynamic_nki_kernels
 
+from .registry import get_dynamic_nki_usage
+
 # Register dynamic NKI adapters when the feature is enabled. Per-op adapters are
 # optional: the dispatch infrastructure (registry + kernel.py fast path) ships
 # standalone and adapters register on top of it when present. Presence is checked
