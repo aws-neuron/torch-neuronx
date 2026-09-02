@@ -68,10 +68,10 @@ Run any block under `torch.compile` with the neuron backend by passing `--exec_m
 python run_benchmarks.py --block llama --preset llama-7b --exec_mode compile
 ```
 
-To run a compile group config locally:
+To run the Qwen3 group without enforcing a hardware golden:
 
 ```bash
-python run_group.py --config group_configs/qwen3_compile.json --skip-mfu-threshold
+python run_group.py --config group_configs/qwen3.json --platform trn2 --skip-mfu-threshold
 ```
 
 ### Run with TP
