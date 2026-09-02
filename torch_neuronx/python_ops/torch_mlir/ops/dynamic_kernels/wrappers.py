@@ -13,6 +13,7 @@ from .add_kernel import add_kernel
 from .bitwise_or_kernel import bitwise_or_kernel
 from .cast_kernel import cast_kernel_bf16, cast_kernel_fp16, cast_kernel_fp32
 from .cat_kernel import cat_kernel
+from .combine_gather_reduce_kernel import combine_gather_reduce_kernel
 from .cos_kernel import cos_kernel
 from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
 from .dynamic_m_matmul_kernel import dynamic_m_matmul_kernel
@@ -72,6 +73,7 @@ _wrapped_matmul = wrap_nki(dynamic_m_matmul_kernel)
 _wrapped_matmul_k = wrap_nki(dynamic_k_matmul_kernel)
 _wrapped_silu_bwd = wrap_nki(silu_bwd_kernel)
 _wrapped_gather = wrap_nki(gather_kernel)
+_wrapped_combine_gather_reduce = wrap_nki(combine_gather_reduce_kernel)
 _wrapped_scatter_add = wrap_nki(scatter_add_kernel)
 _wrapped_ones_like = wrap_nki(ones_like_kernel)
 _wrapped_where = wrap_nki(where_kernel)
@@ -254,6 +256,17 @@ def dynamic_gather_nki(
     source: torch.Tensor, indices: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_gather[_GRID](source, indices, num_m_tiles)
+
+
+@nki_op("dynamic_nki::combine_gather_reduce", mutates_args={"out_buffer"})
+def dynamic_combine_gather_reduce_nki(
+    routed: torch.Tensor,
+    inv_idx: torch.Tensor,
+    out_buffer: torch.Tensor,
+    num_t_tiles: torch.Tensor,
+) -> torch.Tensor:
+    """MoE combine: out_buffer[t] += sum_k routed[inv_idx[t,k]] (in-place)."""
+    return _wrapped_combine_gather_reduce[_GRID](routed, inv_idx, out_buffer, num_t_tiles)
 
 
 @nki_op("dynamic_nki::scatter_add", mutates_args={"output_buffer"})
