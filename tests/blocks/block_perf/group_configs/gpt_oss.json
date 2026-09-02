@@ -4,9 +4,18 @@
       "benchmark_runs": 20,
       "block": "gpt_oss_transformer",
       "id": "gpt-oss-tp4-fsdp16",
-      "mfu_baseline": 6.91,
-      "mfu_baseline_date": "2026-05-04",
-      "mfu_threshold": 6.22,
+      "mfu": {
+        "trn2": {
+          "baseline": 6.91,
+          "baseline_date": "2026-05-04",
+          "threshold": 6.22
+        },
+        "trn3pds-b1": {
+          "baseline": 9.23,
+          "baseline_date": "2026-08-27",
+          "threshold": 8.31
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "gpt-oss-20b-tp_fsdp",
@@ -18,9 +27,18 @@
       "benchmark_runs": 20,
       "block": "gpt_oss_transformer",
       "id": "gpt-oss-tp1-fsdp64",
-      "mfu_baseline": 18.37,
-      "mfu_baseline_date": "2026-04-24",
-      "mfu_threshold": 16.53,
+      "mfu": {
+        "trn2": {
+          "baseline": 18.37,
+          "baseline_date": "2026-04-24",
+          "threshold": 16.53
+        },
+        "trn3pds-b1": {
+          "baseline": 23.98,
+          "baseline_date": "2026-08-27",
+          "threshold": 21.58
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "gpt-oss-20b-fsdp",
@@ -32,9 +50,18 @@
       "benchmark_runs": 20,
       "block": "gpt_oss_transformer",
       "id": "gpt-oss-tp4",
-      "mfu_baseline": 15.62,
-      "mfu_baseline_date": "2026-04-25",
-      "mfu_threshold": 14.06,
+      "mfu": {
+        "trn2": {
+          "baseline": 15.62,
+          "baseline_date": "2026-04-25",
+          "threshold": 14.06
+        },
+        "trn3pds-b1": {
+          "baseline": 19.95,
+          "baseline_date": "2026-08-27",
+          "threshold": 17.96
+        }
+      },
       "n_layers": 4,
       "nproc": 4,
       "preset": "gpt-oss-20b-tp",
@@ -47,9 +74,18 @@
       "block": "gpt_oss_transformer",
       "exec_mode": "compile",
       "id": "gpt-oss-tp4-fsdp16-compile",
-      "mfu_baseline": 13.82,
-      "mfu_baseline_date": "2026-06-02",
-      "mfu_threshold": 13.13,
+      "mfu": {
+        "trn2": {
+          "baseline": 13.82,
+          "baseline_date": "2026-06-02",
+          "threshold": 13.13
+        },
+        "trn3pds-b1": {
+          "baseline": 21.96,
+          "baseline_date": "2026-08-27",
+          "threshold": 19.76
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "gpt-oss-20b-tp_fsdp",
@@ -62,9 +98,18 @@
       "block": "gpt_oss_transformer",
       "exec_mode": "compile",
       "id": "gpt-oss-tp1-fsdp64-compile",
-      "mfu_baseline": 22.47,
-      "mfu_baseline_date": "2026-05-29",
-      "mfu_threshold": 20.22,
+      "mfu": {
+        "trn2": {
+          "baseline": 22.47,
+          "baseline_date": "2026-05-29",
+          "threshold": 20.22
+        },
+        "trn3pds-b1": {
+          "baseline": 25.44,
+          "baseline_date": "2026-08-27",
+          "threshold": 22.9
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "gpt-oss-20b-fsdp",
@@ -77,9 +122,13 @@
       "block": "gpt_oss_transformer",
       "exec_mode": "compile",
       "id": "gpt-oss-tp4-compile",
-      "mfu_baseline": 48.98,
-      "mfu_baseline_date": "2026-06-02",
-      "mfu_threshold": 46.53,
+      "mfu": {
+        "trn2": {
+          "baseline": 48.98,
+          "baseline_date": "2026-06-02",
+          "threshold": 46.53
+        }
+      },
       "n_layers": 4,
       "nproc": 4,
       "preset": "gpt-oss-20b-tp",

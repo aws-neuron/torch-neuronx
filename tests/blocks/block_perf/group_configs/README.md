@@ -1,41 +1,39 @@
 # Block Perf Group Configs
 
-## MFU Threshold and Regression Gating
+## Source-Controlled Goldens
 
-Each test entry has three MFU-related fields:
+MFU goldens are checked into the group config JSON files. Benchmark runs read these values but never update them automatically.
+
+Each active `torchrun` test has an `mfu` object keyed by hardware platform:
 
 | Field | Purpose |
 |-------|---------|
-| `mfu_threshold` | Gate value passed directly to `--mfu-threshold` (= baseline × 0.95) |
-| `mfu_baseline` | The true measured MFU when the threshold was last set |
-| `mfu_baseline_date` | Date of that measurement (YYYY-MM-DD) |
+| `mfu.<platform>.threshold` | Gate value passed to `--mfu-threshold` |
+| `mfu.<platform>.baseline` | Benchmark-reported MFU when the threshold was captured |
+| `mfu.<platform>.baseline_date` | Capture date in `YYYY-MM-DD` format |
 
-`mfu_threshold` includes a 5% regression tolerance — if actual MFU drops below
-this value, the test fails and blocks the PR.
+New thresholds use `baseline * 0.90`, providing 10% regression tolerance. Existing TRN2 thresholds are preserved as captured; some newer entries use 5% tolerance. The reusable workflow can apply an additional multiplier, such as the nightly workflow's `0.95`, without changing the checked-in golden.
 
-**MFU is derived from the MEDIAN iteration time**, not the mean. A rare isolated
-latency outlier in a single iteration can inflate the mean enough to trip the gate
-on unrelated changes; the median ignores such outliers and reflects steady-state
-throughput. When measuring a new baseline, read the `MFU` value the benchmark
-reports (already median-based) — do not recompute it from the mean/average.
+MFU is derived from the median iteration time, not the mean. A rare latency outlier can inflate the mean and trip the gate on an unrelated change, while the median reflects steady-state throughput. Use the MFU value reported by the benchmark rather than recomputing it from average latency.
 
-## How to Update
+## How To Update
 
-When perf legitimately improves:
+1. Run the complete group config on the target platform with `warmup_runs=20`, `benchmark_runs=20`, and `--skip-mfu-threshold`.
+2. Verify that every active case passed and retain the result JSON files plus image, source commit, driver, runtime, compiler, and collectives versions.
+3. Update the target platform entry for each measured test:
+   - `threshold`: reported MFU multiplied by `0.90`
+   - `baseline`: reported MFU
+   - `baseline_date`: capture date
+4. Call out the platform, image, source commit, and changed goldens in the PR description.
 
-1. Measure the new MFU from a CI run
-2. In the relevant JSON config, update:
-   - `mfu_threshold` → `new_mfu × 0.95`
-   - `mfu_baseline` → `new_mfu` (the true measured value)
-   - `mfu_baseline_date` → today's date (YYYY-MM-DD)
-3. Call out the change in the PR description
+Do not copy a golden from another hardware platform.
 
 ## Current Baselines
 
-### Eager mode
+### TRN2 Eager
 
-| Test | Baseline | Threshold (×0.95) | Date |
-|------|----------|------------------|------|
+| Test | Baseline | Threshold | Date |
+|------|----------|-----------|------|
 | qwen3-tp4-fsdp16 | 9.96% | 8.97% | 2026-04-29 |
 | qwen3-tp1-fsdp64 | 24.14% | 21.73% | 2026-04-28 |
 | qwen3-tp4 | 23.92% | 21.53% | 2026-04-25 |
@@ -43,33 +41,46 @@ When perf legitimately improves:
 | gpt-oss-tp1-fsdp64 | 18.37% | 16.53% | 2026-04-24 |
 | gpt-oss-tp4 | 15.62% | 14.06% | 2026-04-25 |
 
-### Compile mode (`exec_mode: compile`)
+### TRN2 Compile
 
-| Test | Baseline | Threshold (×0.95) | Date |
-|------|----------|------------------|------|
+| Test | Baseline | Threshold | Date |
+|------|----------|-----------|------|
+| qwen3-tp4-fsdp16-compile | 24.60% | 22.14% | 2026-07-10 |
 | qwen3-tp1-fsdp64-compile | 30.99% | 27.89% | 2026-05-29 |
-| qwen3-tp4-fsdp16-compile | 23.57% | 22.39% | 2026-06-02 |
 | qwen3-tp4-compile | 54.30% | 51.58% | 2026-06-02 |
-| gpt-oss-tp1-fsdp64-compile | 22.47% | 20.22% | 2026-05-29 |
 | gpt-oss-tp4-fsdp16-compile | 13.82% | 13.13% | 2026-06-02 |
+| gpt-oss-tp1-fsdp64-compile | 22.47% | 20.22% | 2026-05-29 |
 | gpt-oss-tp4-compile | 48.98% | 46.53% | 2026-06-02 |
 
-Baselines computed from a single full warmup_runs=20/benchmark_runs=20 pass;
-threshold = `baseline × 0.95`.
+### TRN3PDS B1 Eager
 
-TP4 compile-mode tests were previously skipped due to a non-contiguous DTensor view
-error under `torch.compile` (PyTorch issue #173041). This is fixed via
-`force_local_contiguous()` in the block definitions (ported from NeuronTorchTitan
-`torchtitan/models/common/attention.py`).
+| Test | Baseline | Threshold (x0.90) | Date |
+|------|----------|-------------------|------|
+| qwen3-tp4-fsdp16 | 14.30% | 12.87% | 2026-08-27 |
+| qwen3-tp1-fsdp64 | 32.76% | 29.48% | 2026-08-27 |
+| qwen3-tp4 | 32.72% | 29.45% | 2026-08-27 |
+| gpt-oss-tp4-fsdp16 | 9.23% | 8.31% | 2026-08-27 |
+| gpt-oss-tp1-fsdp64 | 23.98% | 21.58% | 2026-08-27 |
+| gpt-oss-tp4 | 19.95% | 17.96% | 2026-08-27 |
 
-## Config structure
+### TRN3PDS B1 Compile
 
-Eager and compile-mode tests for each model are co-located in a single JSON:
+| Test | Baseline | Threshold (x0.90) | Date |
+|------|----------|-------------------|------|
+| qwen3-tp4-fsdp16-compile | 32.93% | 29.64% | 2026-08-27 |
+| qwen3-tp1-fsdp64-compile | 37.99% | 34.19% | 2026-08-27 |
+| qwen3-tp4-compile | 71.80% | 64.62% | 2026-08-27 |
+| gpt-oss-tp4-fsdp16-compile | 21.96% | 19.76% | 2026-08-27 |
+| gpt-oss-tp1-fsdp64-compile | 25.44% | 22.90% | 2026-08-27 |
 
-- `qwen3.json` — all Qwen3 tests (eager + compile)
-- `gpt_oss.json` — all GPT-OSS tests (eager + compile)
-- `infra.json` — singlecore (eager + compile) and collective benchmarks
+The B1 baselines were captured on `trn3-dev1.48xlarge` from one full `warmup_runs=20` and `benchmark_runs=20` pass. `gpt-oss-tp4-compile` remains skipped because it times out in GitHub CI, so no B1 golden is recorded for that case.
 
-Tests with `exec_mode: compile` run the block wrapped in
-`torch.compile(backend="neuron")`; the first warmup run absorbs compile cost.
-Tests without `exec_mode` (or `exec_mode: eager`) run in standard eager mode.
+## Config Structure
+
+Eager and compile tests for each model are co-located in one JSON file:
+
+- `qwen3.json`: all active Qwen3 eager and compile tests
+- `gpt_oss.json`: all GPT-OSS eager and compile tests, including the intentionally skipped TP4 compile case
+- `infra.json`: single-core eager and compile tests plus collective benchmarks; these are correctness/performance runs without MFU gates
+
+Tests with `exec_mode: compile` wrap the block in `torch.compile(backend="neuron")`; the first warmup run absorbs compile cost. Tests without `exec_mode`, or with `exec_mode: eager`, use standard eager execution.

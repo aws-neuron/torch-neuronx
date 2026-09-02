@@ -11,7 +11,27 @@ import time
 from pathlib import Path
 
 
-def build_command(test, skip_mfu_threshold, mfu_threshold_multiplier=1.0):
+def get_mfu_threshold(test, platform):
+    platform_mfu = test.get("mfu", {}).get(platform)
+    if not platform_mfu or "threshold" not in platform_mfu:
+        raise ValueError(f"Missing MFU threshold for test '{test['id']}' on platform '{platform}'")
+    return float(platform_mfu["threshold"])
+
+
+def validate_mfu_thresholds(tests, platform):
+    missing = []
+    for test in tests:
+        if test.get("skip") or test.get("runner", "torchrun") != "torchrun":
+            continue
+        platform_mfu = test.get("mfu", {}).get(platform)
+        if not platform_mfu or "threshold" not in platform_mfu:
+            missing.append(f"{test['id']}/{platform}")
+
+    if missing:
+        raise ValueError(f"Missing MFU thresholds for: {', '.join(missing)}")
+
+
+def build_command(test, platform, skip_mfu_threshold, mfu_threshold_multiplier=1.0):
     runner = test.get("runner", "torchrun")
 
     if runner == "torchrun":
@@ -35,8 +55,8 @@ def build_command(test, skip_mfu_threshold, mfu_threshold_multiplier=1.0):
             "--output_file",
             f"outputs/{test['id']}.json",
         ]
-        if not skip_mfu_threshold and test.get("mfu_threshold"):
-            effective = float(test["mfu_threshold"]) * mfu_threshold_multiplier
+        if not skip_mfu_threshold:
+            effective = get_mfu_threshold(test, platform) * mfu_threshold_multiplier
             cmd.extend(["--mfu-threshold", f"{effective:.6f}"])
         if test.get("exec_mode"):
             cmd.extend(["--exec_mode", test["exec_mode"]])
@@ -88,8 +108,8 @@ def build_command(test, skip_mfu_threshold, mfu_threshold_multiplier=1.0):
         return None
 
 
-def run_test(test, skip_mfu_threshold, timeout, mfu_threshold_multiplier=1.0):
-    cmd = build_command(test, skip_mfu_threshold, mfu_threshold_multiplier)
+def run_test(test, platform, skip_mfu_threshold, timeout, mfu_threshold_multiplier=1.0):
+    cmd = build_command(test, platform, skip_mfu_threshold, mfu_threshold_multiplier)
     if cmd is None:
         print(f"[{test['id']}] ERROR: unknown runner '{test.get('runner')}'")
         return False
@@ -120,13 +140,19 @@ def run_test(test, skip_mfu_threshold, timeout, mfu_threshold_multiplier=1.0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--platform",
+        choices=("trn2", "trn3pds-b1"),
+        default="trn2",
+        help="Hardware platform whose MFU threshold should be enforced.",
+    )
     parser.add_argument("--skip-mfu-threshold", action="store_true")
     parser.add_argument(
         "--mfu-threshold-multiplier",
         type=float,
         default=1.0,
-        help="Multiplier on per-test mfu_threshold. <1.0 loosens the gate. "
-        "Used by nightly to enforce regressions with extra headroom (e.g. 0.95).",
+        help="Multiplier on the selected platform threshold. <1.0 loosens the "
+        "gate. Used by nightly for extra headroom (e.g. 0.95).",
     )
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
@@ -135,6 +161,11 @@ def main():
         config = json.load(f)
 
     tests = config["tests"]
+    if not args.skip_mfu_threshold:
+        try:
+            validate_mfu_thresholds(tests, args.platform)
+        except ValueError as exc:
+            parser.error(str(exc))
     Path("outputs").mkdir(exist_ok=True)
 
     results = []
@@ -145,7 +176,11 @@ def main():
             print(f"\n[{test['id']}] SKIPPED{suffix}")
             continue
         passed = run_test(
-            test, args.skip_mfu_threshold, args.timeout, args.mfu_threshold_multiplier
+            test,
+            args.platform,
+            args.skip_mfu_threshold,
+            args.timeout,
+            args.mfu_threshold_multiplier,
         )
         results.append((test["id"], passed))
 

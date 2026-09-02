@@ -4,9 +4,18 @@
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
       "id": "qwen3-tp4-fsdp16",
-      "mfu_baseline": 9.96,
-      "mfu_baseline_date": "2026-04-29",
-      "mfu_threshold": 8.97,
+      "mfu": {
+        "trn2": {
+          "baseline": 9.96,
+          "baseline_date": "2026-04-29",
+          "threshold": 8.97
+        },
+        "trn3pds-b1": {
+          "baseline": 14.3,
+          "baseline_date": "2026-08-27",
+          "threshold": 12.87
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "qwen3-8b-tp_fsdp",
@@ -18,9 +27,18 @@
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
       "id": "qwen3-tp1-fsdp64",
-      "mfu_baseline": 24.14,
-      "mfu_baseline_date": "2026-04-28",
-      "mfu_threshold": 21.73,
+      "mfu": {
+        "trn2": {
+          "baseline": 24.14,
+          "baseline_date": "2026-04-28",
+          "threshold": 21.73
+        },
+        "trn3pds-b1": {
+          "baseline": 32.76,
+          "baseline_date": "2026-08-27",
+          "threshold": 29.48
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "qwen3-8b-fsdp",
@@ -32,9 +50,18 @@
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
       "id": "qwen3-tp4",
-      "mfu_baseline": 23.92,
-      "mfu_baseline_date": "2026-04-25",
-      "mfu_threshold": 21.53,
+      "mfu": {
+        "trn2": {
+          "baseline": 23.92,
+          "baseline_date": "2026-04-25",
+          "threshold": 21.53
+        },
+        "trn3pds-b1": {
+          "baseline": 32.72,
+          "baseline_date": "2026-08-27",
+          "threshold": 29.45
+        }
+      },
       "n_layers": 4,
       "nproc": 4,
       "preset": "qwen3-8b-tp",
@@ -47,9 +74,18 @@
       "block": "qwen3_torchtitan",
       "exec_mode": "compile",
       "id": "qwen3-tp4-fsdp16-compile",
-      "mfu_baseline": 24.6,
-      "mfu_baseline_date": "2026-07-10",
-      "mfu_threshold": 22.14,
+      "mfu": {
+        "trn2": {
+          "baseline": 24.6,
+          "baseline_date": "2026-07-10",
+          "threshold": 22.14
+        },
+        "trn3pds-b1": {
+          "baseline": 32.93,
+          "baseline_date": "2026-08-27",
+          "threshold": 29.64
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "qwen3-8b-tp_fsdp",
@@ -62,9 +98,18 @@
       "block": "qwen3_torchtitan",
       "exec_mode": "compile",
       "id": "qwen3-tp1-fsdp64-compile",
-      "mfu_baseline": 30.99,
-      "mfu_baseline_date": "2026-05-29",
-      "mfu_threshold": 27.89,
+      "mfu": {
+        "trn2": {
+          "baseline": 30.99,
+          "baseline_date": "2026-05-29",
+          "threshold": 27.89
+        },
+        "trn3pds-b1": {
+          "baseline": 37.99,
+          "baseline_date": "2026-08-27",
+          "threshold": 34.19
+        }
+      },
       "n_layers": 4,
       "nproc": 64,
       "preset": "qwen3-8b-fsdp",
@@ -77,9 +122,18 @@
       "block": "qwen3_torchtitan",
       "exec_mode": "compile",
       "id": "qwen3-tp4-compile",
-      "mfu_baseline": 54.3,
-      "mfu_baseline_date": "2026-06-02",
-      "mfu_threshold": 51.58,
+      "mfu": {
+        "trn2": {
+          "baseline": 54.3,
+          "baseline_date": "2026-06-02",
+          "threshold": 51.58
+        },
+        "trn3pds-b1": {
+          "baseline": 71.8,
+          "baseline_date": "2026-08-27",
+          "threshold": 64.62
+        }
+      },
       "n_layers": 4,
       "nproc": 4,
       "preset": "qwen3-8b-tp",
