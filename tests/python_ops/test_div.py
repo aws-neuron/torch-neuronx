@@ -22,6 +22,26 @@ class TestDiv:
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("aten::div")
 
+    @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.int16, torch.int32])
+    def test_div_integer_exact_quotient(self, dtype, rounding_mode):
+        """Integer floor/trunc division must be exact for every operand pair.
+
+        Regression: the fp32 divide rounds an exact integer quotient down to
+        k-eps (e.g. 122/122 -> 0.99999994), so floor/trunc previously returned
+        k-1. Sweep the full small-magnitude grid (incl. a == b and negatives)
+        and compare against CPU.
+        """
+        with track_neuron_ops():
+            lo = 0 if dtype == torch.uint8 else -30
+            vals = list(range(lo, 50))
+            a = torch.tensor([av for av in vals for bv in vals if bv != 0], dtype=dtype)
+            b = torch.tensor([bv for _ in vals for bv in vals if bv != 0], dtype=dtype)
+            expected = torch.div(a, b, rounding_mode=rounding_mode)
+            result = torch.div(a.to("neuron"), b.to("neuron"), rounding_mode=rounding_mode)
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::div")
+
     @pytest.mark.parametrize("rounding_mode", [None, "floor", "trunc"])
     def test_div_basic(self, rounding_mode):
         """Test basic element-wise division"""
