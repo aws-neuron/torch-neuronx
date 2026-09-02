@@ -1259,6 +1259,59 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
   TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] popped args", " op=", op_name,
                                " num_args=", num_args, " has_lower=", !reg.lower_func.is_none());
 
+  {
+    // A python-number operand arrives as a wrapped-number float64 0-dim tensor.
+    // Neuron mis-infers the output dtype (picks up float64) UNLESS a dim>0
+    // floating tensor operand anchors it: ones(4,half)+1.0 already yields half,
+    // but a 0-dim half tensor + 1.0, or an int/bool tensor + 1.0, wrongly yields
+    // float64. So rewrite a wrapped float64 0-dim scalar to the correct weak
+    // dtype ONLY when there is no dim>0 floating tensor operand; when one is
+    // present, leave the scalar alone -- Neuron already infers correctly and
+    // narrowing the scalar to that dtype would overflow (half(70000)=inf) or
+    // lose precision (bf16 x/d != x*(1/d)). The target is the widest standard
+    // floating operand dtype (a 0-dim half stays half), else Float (int/bool ->
+    // default float32). Only standard floats {Double,Float,Half,BFloat16} feed
+    // promoteTypes -- never uint16/uint32/uint64/float8 (they throw
+    // "Unsupported ScalarType").
+    bool has_wrapped_double = false;
+    bool has_multidim_float = false;
+    c10::optional<c10::ScalarType> float_operand_dtype;
+    for (const auto& a : args) {
+      if (!a.isTensor()) continue;
+      const auto& t = a.toTensor();
+      if (!t.defined()) continue;
+      if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
+        if (t.dim() == 0 && t.scalar_type() == c10::ScalarType::Double) {
+          has_wrapped_double = true;
+        }
+        continue;
+      }
+      const auto st = t.scalar_type();
+      if (st == c10::ScalarType::Double || st == c10::ScalarType::Float ||
+          st == c10::ScalarType::Half || st == c10::ScalarType::BFloat16) {
+        if (t.dim() > 0) has_multidim_float = true;
+        float_operand_dtype =
+            float_operand_dtype ? c10::promoteTypes(*float_operand_dtype, st) : st;
+      } else if (c10::isFloatingType(st)) {
+        if (t.dim() > 0) has_multidim_float = true;
+      }
+    }
+    if (has_wrapped_double && !has_multidim_float) {
+      c10::ScalarType weak_dtype =
+          float_operand_dtype ? *float_operand_dtype : c10::ScalarType::Float;
+      if (weak_dtype != c10::ScalarType::Double) {
+        for (auto& a : args) {
+          if (!a.isTensor()) continue;
+          const auto& t = a.toTensor();
+          if (t.defined() && t.dim() == 0 && t.scalar_type() == c10::ScalarType::Double &&
+              t.unsafeGetTensorImpl()->is_wrapped_number()) {
+            a = c10::IValue(t.to(weak_dtype));
+          }
+        }
+      }
+    }
+  }
+
   // Empty tensors (numel()==0) cannot be compiled by the Neuron compiler.
   if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
     return;
