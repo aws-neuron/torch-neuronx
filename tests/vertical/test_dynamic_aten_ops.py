@@ -89,30 +89,95 @@ _CSV_COLUMNS = [
 ]
 
 
-def _discover_ops() -> dict[str, str]:
-    """Map each dynamic-NKI adapter's short key to the full aten op to sweep.
+def _neuron_op_nki_impl(full_op: str):
+    """Highest-priority @neuron_op impl for ``full_op`` that routes to a dynamic
+    NKI kernel (``get_lower_func`` returns non-None, or an ``*NKIImpl``), else None.
 
-    Returns ``{short -> full}`` (e.g. ``add -> aten::add.Tensor``) for every
-    adapter that has registry shapes; keys without shapes are skipped. The full op
-    is the SHAPE_REGISTRY entry with that base, preferring functional overloads
-    over ``.out``/``.Scalar``."""
+    grouped_mm et al. dispatch via ``_NEURON_OPS_REGISTRY`` (priority impls), not
+    the ``dynamic_kernels`` adapter ``_registry``, so there is no ``_exec_count``;
+    the worker proves routing with ``can_handle`` instead.
+    """
+    try:
+        from torch_neuronx.python_ops.auto_registration import _NEURON_OPS_REGISTRY
+    except Exception:
+        return None
+    info = _NEURON_OPS_REGISTRY.get(full_op)
+    if not info:
+        return None
+    best = None
+    for impl_cls in info.get("implementations", []):
+        try:
+            inst = impl_cls()
+        except Exception:
+            continue
+        # A dynamic-NKI impl exposes get_lower_func() returning a callable (the
+        # NKI routing hook); the MLIR fallback returns None / lacks it.
+        lower = getattr(inst, "get_lower_func", None)
+        is_nki = (lower is not None and lower() is not None) or type(inst).__name__.endswith(
+            "NKIImpl"
+        )
+        if not is_nki:
+            continue
+        pri = getattr(inst, "priority", 0) or 0
+        if best is None or pri > best[0]:
+            best = (pri, inst)
+    return best[1] if best else None
+
+
+def _discover_ops() -> tuple[dict[str, str], set[str]]:
+    """Find every dynamic-NKI op with SHAPE_REGISTRY shapes to sweep.
+
+    Returns ``(ops, neuron_op_shorts)`` where ``ops`` maps short key -> full aten
+    op, covering both dispatch systems: the ``dynamic_kernels`` adapter registry
+    and the ``_NEURON_OPS_REGISTRY`` priority impls (e.g. ``_grouped_mm``).
+    ``neuron_op_shorts`` lists the latter, whose routing the worker proves via
+    ``can_handle`` rather than ``_exec_count``.
+    """
     from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.adapters import register_all
     from torch_neuronx.python_ops.torch_mlir.ops.dynamic_kernels.registry import _registry
 
     register_all()
     base = lambda op: op.replace("aten::", "").split(".", 1)[0]  # noqa: E731
-    ops = {}
-    for short in sorted(_registry):
+
+    def _match(short):
         matches = sorted(
             (op for op in SHAPE_REGISTRY.all_ops() if base(op) == short),
             key=lambda o: ("out" in o, "Scalar" in o, o),
         )
-        if matches:
-            ops[short] = matches[0]
-    return ops
+        return matches[0] if matches else None
+
+    ops = {}
+    # (1) dynamic_kernels adapters — take precedence (adapter _exec_count proof).
+    for short in sorted(_registry):
+        full = _match(short)
+        if full:
+            ops[short] = full
+
+    # (2) @neuron_op priority-registry dynamic NKI kernels (e.g. grouped_mm).
+    neuron_op_shorts: set[str] = set()
+    try:
+        from torch_neuronx.python_ops.auto_registration import _NEURON_OPS_REGISTRY
+
+        neuron_op_registry = _NEURON_OPS_REGISTRY
+    except ImportError:
+        # auto_registration is optional (absent in some minimal envs); skip the
+        # neuron_op-registry sweep and keep the adapter-registry ops.
+        neuron_op_registry = {}
+
+    for full_op in sorted(neuron_op_registry):
+        short = base(full_op)
+        if short in ops:  # adapter already covers it — don't double-count
+            continue
+        if _neuron_op_nki_impl(full_op) is None:  # no dynamic-NKI impl
+            continue
+        full = _match(short)
+        if full:
+            ops[short] = full
+            neuron_op_shorts.add(short)
+    return ops, neuron_op_shorts
 
 
-_OPS = _discover_ops()
+_OPS, _NEURON_OP_SHORTS = _discover_ops()
 
 _DTYPES_TO_TEST = (torch.bfloat16,)
 
@@ -257,6 +322,28 @@ def _dynamic_entry(op: str):
         return None
 
 
+def _neuron_op_routes_to_nki(op: str, dev_inputs, dev_kwargs) -> bool | None:
+    """Routing proof for @neuron_op priority-registry kernels (no ``_exec_count``).
+
+    grouped_mm et al. dispatch via the auto_registration priority impls; the NKI
+    kernel is selected when the highest-priority NKI impl's ``can_handle`` returns
+    True for the (translated) inputs — the same "the NKI kernel will serve this"
+    signal that ``_exec_count > before`` gives for adapter ops. Returns None if
+    the dynamic-NKI flag is off or the impl can't be resolved.
+    """
+    if os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") != "1":
+        return None
+    inst = _neuron_op_nki_impl(_OPS[op])
+    if inst is None:
+        return None
+    try:
+        impl_args, impl_kwargs = inst.translate_args(*dev_inputs, **dev_kwargs)
+        res = inst.can_handle(*impl_args, **impl_kwargs)
+        return bool(res[0] if isinstance(res, tuple) else res)
+    except Exception:
+        return None
+
+
 def _is_worker() -> bool:
     return os.environ.get("AOP_WORKER") == "1"
 
@@ -317,9 +404,13 @@ def worker() -> None:
         def run(ins=dev_inputs, kw=dev_kwargs):
             return resolved(*ins, **kw)
 
-        # exec-count probe (dynamic mode): detect a silent fallback to the
-        # default lowering (numerically correct but NOT the dynamic NKI kernel).
-        entry = _dynamic_entry(op) if mode == "dynamic" else None
+        # Routing proof (dynamic mode): did the op run on the NKI kernel, or
+        # silently fall back to the default lowering? Two dispatch systems, two
+        # signals — adapter ops diff entry._exec_count across the run; @neuron_op
+        # priority ops (grouped_mm) have no counter, so can_handle stands in.
+        # Snapshot the adapter counter here; ``ran`` is computed after the run.
+        is_neuron_op = op in _NEURON_OP_SHORTS
+        entry = _dynamic_entry(op) if (mode == "dynamic" and not is_neuron_op) else None
         exec_before = entry._exec_count if entry is not None else None
 
         # (1) COLD profiled run: compile + load + execute inside the profiler.
@@ -343,8 +434,12 @@ def worker() -> None:
             torch.neuron.synchronize()
         result["ttf_ms"] = round((time.perf_counter() - t0) * 1000, 3)
 
-        if entry is not None:
-            result["ran"] = entry._exec_count > exec_before
+        if mode == "dynamic":
+            result["ran"] = (
+                _neuron_op_routes_to_nki(op, dev_inputs, dev_kwargs)
+                if is_neuron_op
+                else (entry._exec_count > exec_before if entry is not None else None)
+            )
 
         # (2) correctness vs CPU reference. out_dev is a single run; for the
         # in-place scatter_add_ the out buffer started at zeros, so it holds a
@@ -371,7 +466,13 @@ def worker() -> None:
         result["error"] = result["error"] or f"{type(e).__name__}: {e!s}"[:200]
 
     if mode == "dynamic" and not result["error"]:
-        if entry is None:
+        if is_neuron_op:
+            # @neuron_op path: routing proven by can_handle (result["ran"]).
+            if result["ran"] is None:
+                result["error"] = "dynamic NKI impl not resolved (flag not effective?)"
+            elif result["ran"] is False:
+                result["error"] = "dynamic kernel did not run (fell back to default lowering)"
+        elif entry is None:
             result["error"] = "dynamic registry entry missing (flag not effective?)"
         elif result["ran"] is False:
             result["error"] = "dynamic kernel did not run (fell back to default lowering)"
@@ -478,7 +579,7 @@ def _run_op_cells(op: str, profile_dir: str, env_base: dict, now: str) -> list[d
         for dtype in _DTYPES_TO_TEST:
             d = _run_job(op, idx, dtype, "dynamic", profile_dir, env_base)
             s = _run_job(op, idx, dtype, "static", profile_dir, env_base)
-            err = d.get("error") or s.get("error") or ""
+            err = d.get("error") or ""
             cell = f"{op}_{shape_s}_{_DTYPES[dtype]}"
             rows.append(
                 {
