@@ -3063,6 +3063,41 @@ def register_all_defaults(r, smoke_subsets=()):
         },
         source="builtin",
     )
+    # DeepSeek-V3-16B MoE forward grouped_mm (2Dx3D ragged): a[R,d1] @ b[E,d1,d2].
+    # R=T*top_k=24576, E=64, h=2048, moe_intermediate=1408. offs [E] cumulative,
+    # sorted, x128-aligned (high=192 -> max 192*128=24448 ~ R).
+    r(
+        "aten::_grouped_mm",  # DeepSeek gate/up: [R,D] @ [E,D,I] -> [R,I]
+        {
+            "self": {"shape": (24576, 2048), "dtype": "bfloat16"},
+            "mat2": {"shape": (64, 2048, 1408), "dtype": "bfloat16"},
+            "offs": {
+                "shape": (64,),
+                "dtype": "int",
+                "low": 0,
+                "high": 192,
+                "multiple_of": 128,
+                "sorted": True,
+            },
+        },
+        source="builtin",
+    )
+    r(
+        "aten::_grouped_mm",  # DeepSeek down: [R,I] @ [E,I,D] -> [R,D]
+        {
+            "self": {"shape": (24576, 1408), "dtype": "bfloat16"},
+            "mat2": {"shape": (64, 1408, 2048), "dtype": "bfloat16"},
+            "offs": {
+                "shape": (64,),
+                "dtype": "int",
+                "low": 0,
+                "high": 192,
+                "multiple_of": 128,
+                "sorted": True,
+            },
+        },
+        source="builtin",
+    )
     r(
         "aten::embedding",
         {

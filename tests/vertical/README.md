@@ -63,6 +63,8 @@ python -m pytest tests/vertical/test_dynamic_aten_ops.py -n 8 --tb=no -q
 # Run a single op
 python -m pytest "tests/vertical/test_dynamic_aten_ops.py::TestDynamicAtenOps::test_op[aten::mm]" -v -s
 
+python -m pytest "tests/vertical/test_dynamic_aten_ops.py::TestDynamicAtenOps::test_op[aten::_grouped_mm]" -v -s
+
 # Run ops matching a pattern
 python -m pytest tests/vertical/test_dynamic_aten_ops.py -v -k "silu or mm"
 
@@ -192,8 +194,8 @@ python -m pytest tests/vertical/test_dynamic_collectives.py -v -s
 # budget (64 on TRN2 at LNC=2):
 AG_CORE_BLOCK=4 python -m pytest tests/vertical/test_dynamic_collectives.py -k tp -n 4 -v -s
 
-# Run a single cell (id is <config>-<h>x<w>)
-python -m pytest "tests/vertical/test_dynamic_collectives.py::test_dynamic_allgather[tp-8192x4096]" -v -s
+# Run a single cell
+python -m pytest "tests/vertical/test_dynamic_collectives.py::test_dynamic_collectives[all_gather-tp-8192x4096-bfloat16]" -v -s -n 1
 
 # or directly as a driver (launches the torchruns itself):
 NEURON_LOGICAL_NC_CONFIG=2 AG_CSV=/tmp/ag.csv python3 tests/vertical/test_dynamic_collectives.py
