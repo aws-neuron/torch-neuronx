@@ -83,11 +83,11 @@ def norms(actual: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
     return {
         "max_abs_err": float(diff.abs().max()) if diff.numel() else 0.0,
         "max_abs_ref": float(r.abs().max()) if r.numel() else 0.0,
-        # Frobenius (L2) norms for the fro-ratio metric -- raw/absolute, matching ModuScope's
+        # Frobenius (L2) norms for the frobenius-ratio metric -- raw/absolute, matching ModuScope's
         # check_3tensor_result gate (the shared ||ref|| cancels in the ratio). Not the L-inf
         # rel-err.
-        "fro_abs_err": float(torch.linalg.vector_norm(diff)) if diff.numel() else 0.0,
-        "fro_abs_ref": float(torch.linalg.vector_norm(r)) if r.numel() else 0.0,
+        "frobenius_abs_err": float(torch.linalg.vector_norm(diff)) if diff.numel() else 0.0,
+        "frobenius_abs_ref": float(torch.linalg.vector_norm(r)) if r.numel() else 0.0,
     }
 
 
@@ -117,11 +117,11 @@ def rel_err_units(n: dict[str, float], unit: float) -> dict[str, float]:
 
 
 # ── frobenius ratio ──────────────────────────────────────────────────────────
-# A cell is FroVerdict.OVER above this. Not a gate -- it only labels the CSV verdict.
-FRO_RATIO_THRESHOLD = 1.1
+# A cell is FrobeniusVerdict.OVER above this. Not a gate -- it only labels the CSV verdict.
+FROBENIUS_RATIO_THRESHOLD = 1.1
 
 
-class FroVerdict(str, Enum):
+class FrobeniusVerdict(str, Enum):
     """Frobenius-ratio verdict codes written to the CSV. Subclasses ``str`` so the CSV
     cell stays human-readable while callers can compare against enum members."""
 
@@ -130,20 +130,20 @@ class FroVerdict(str, Enum):
     INVALID = "invalid"
 
 
-def fro_ratio(fro_trn: float, fro_cpu: float) -> float:
+def frobenius_ratio(frobenius_trn: float, frobenius_cpu: float) -> float:
     """Device error over the ideal-baseline error, both against a higher-precision reference:
 
-        fro_ratio = ||trn_low - ref_high||_F / ||cpu_low - ref_high||_F
+        frobenius_ratio = ||trn_low - ref_high||_F / ||cpu_low - ref_high||_F
 
     where ``low`` is the candidate dtype and ``high`` is the next precision up
-    (bf16 -> fp32, fp32 -> fp64). ``fro_trn`` = numerator (device at ``low`` vs the ``high``
-    reference); ``fro_cpu`` = denominator (same op on CPU at ``low`` vs that reference, the
+    (bf16 -> fp32, fp32 -> fp64). ``frobenius_trn`` = numerator (device at ``low`` vs the ``high``
+    reference); ``frobenius_cpu`` = denominator (same op on CPU at ``low`` vs that reference, the
     "ideal" rounding a reference device would show). ~1.0 means the device matches the
     baseline's rounding at that dtype; >1.0 means it adds error on top.
 
-    Guards the denominator: ``fro_cpu == 0`` (bit-exact CPU baseline, no scale to normalize
+    Guards the denominator: ``frobenius_cpu == 0`` (bit-exact CPU baseline, no scale to normalize
     against) -> 0.0 if the device is also exact, else ``inf`` -- never a divide-by-zero.
     """
-    if fro_cpu == 0.0:
-        return 0.0 if fro_trn == 0.0 else float("inf")
-    return fro_trn / fro_cpu
+    if frobenius_cpu == 0.0:
+        return 0.0 if frobenius_trn == 0.0 else float("inf")
+    return frobenius_trn / frobenius_cpu

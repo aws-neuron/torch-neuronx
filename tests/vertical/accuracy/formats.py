@@ -45,7 +45,7 @@ class NumericFormat:
         """
         Run ``op`` on inputs cast to ``dtype`` (defaults to ``self.reference_dtype`` -- fp32 for
         bf16 inputs, fp64 for fp32 inputs). Callers can pass an explicit dtype to override, e.g.
-        the fro-ratio baseline reruns at ``self.dtype`` for the same-precision CPU baseline.
+        the frobenius-ratio baseline reruns at ``self.dtype`` for the same-precision CPU baseline.
         The caller must have generated the sample *at* ``self.dtype`` already.
         """
         target = self.reference_dtype if dtype is None else dtype

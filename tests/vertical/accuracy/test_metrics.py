@@ -17,10 +17,10 @@ from .budgets import ARITHMETIC_BUDGET_UNITS, error_budget
 from .conftest import _cell
 from .formats import BF16, FP32, get_format
 from .metrics import (
-    FRO_RATIO_THRESHOLD,
-    FroVerdict,
+    FROBENIUS_RATIO_THRESHOLD,
+    FrobeniusVerdict,
     cell_id,
-    fro_ratio,
+    frobenius_ratio,
     norms,
     rel_err_units,
     seed_for,
@@ -329,13 +329,13 @@ class TestCsvCell:
 
 
 class TestFroRatio:
-    """fro_ratio = ||trn_low - ref_high|| / ||cpu_low - ref_high|| (low = candidate dtype,
+    """frobenius_ratio = ||trn_low - ref_high|| / ||cpu_low - ref_high|| (low = candidate dtype,
     high = next precision up: bf16 -> fp32, fp32 -> fp64)."""
 
     def test_ratio_is_candidate_over_baseline(self):
-        assert fro_ratio(2.0, 1.0) == 2.0
-        assert fro_ratio(1.0, 1.0) == 1.0
-        assert fro_ratio(0.5, 1.0) == 0.5
+        assert frobenius_ratio(2.0, 1.0) == 2.0
+        assert frobenius_ratio(1.0, 1.0) == 1.0
+        assert frobenius_ratio(0.5, 1.0) == 0.5
 
     @pytest.mark.parametrize(
         "num, denom, expected",
@@ -349,47 +349,47 @@ class TestFroRatio:
     )
     def test_numerator_denominator_magnitude_combinations(self, num, denom, expected):
         """num large/small x denom large/small -- ratio is scale-free (only their quotient)."""
-        assert fro_ratio(num, denom) == pytest.approx(expected)
+        assert frobenius_ratio(num, denom) == pytest.approx(expected)
 
     def test_bitexact_baseline_has_no_scale(self):
-        assert fro_ratio(0.0, 0.0) == 0.0  # device also exact -> ok
-        assert fro_ratio(1e-9, 0.0) == math.inf  # device drifts off a perfect baseline
+        assert frobenius_ratio(0.0, 0.0) == 0.0  # device also exact -> ok
+        assert frobenius_ratio(1e-9, 0.0) == math.inf  # device drifts off a perfect baseline
 
     def test_from_norms_matches_manual(self):
         ref = torch.full((4096,), 1.0, dtype=torch.float64)
         cand = ref + 2.0 * U_BF16
         base = ref + 1.0 * U_BF16
-        num = norms(cand, ref)["fro_abs_err"]
-        den = norms(base, ref)["fro_abs_err"]
-        assert fro_ratio(num, den) == pytest.approx(2.0, rel=1e-6)
+        num = norms(cand, ref)["frobenius_abs_err"]
+        den = norms(base, ref)["frobenius_abs_err"]
+        assert frobenius_ratio(num, den) == pytest.approx(2.0, rel=1e-6)
 
     def test_norms_now_carry_frobenius(self):
         n = norms(torch.zeros(4, dtype=torch.float64), torch.ones(4, dtype=torch.float64))
-        assert {"max_abs_err", "max_abs_ref", "fro_abs_err", "fro_abs_ref"} <= set(n)
-        assert n["fro_abs_err"] == pytest.approx(2.0)  # ||[-1,-1,-1,-1]||_2 = 2
+        assert {"max_abs_err", "max_abs_ref", "frobenius_abs_err", "frobenius_abs_ref"} <= set(n)
+        assert n["frobenius_abs_err"] == pytest.approx(2.0)  # ||[-1,-1,-1,-1]||_2 = 2
 
     def test_threshold_default(self):
-        assert FRO_RATIO_THRESHOLD == 1.1
+        assert FROBENIUS_RATIO_THRESHOLD == 1.1
 
     def test_verdict_enum_values(self):
         # str subclass keeps the CSV cell human-readable ("within" etc.) while callers
-        # can still compare against FroVerdict.WITHIN for typo-safety.
-        assert FroVerdict.WITHIN.value == "within"
-        assert FroVerdict.OVER.value == "over"
-        assert FroVerdict.INVALID.value == "invalid"
-        assert FroVerdict.WITHIN == "within"
+        # can still compare against FrobeniusVerdict.WITHIN for typo-safety.
+        assert FrobeniusVerdict.WITHIN.value == "within"
+        assert FrobeniusVerdict.OVER.value == "over"
+        assert FrobeniusVerdict.INVALID.value == "invalid"
+        assert FrobeniusVerdict.WITHIN == "within"
 
 
 class TestReferenceDtype:
     """Each format references the next precision up (bf16 -> fp32, fp32 -> fp64), so the
-    fro-ratio denominator is non-zero even for fp32."""
+    frobenius-ratio denominator is non-zero even for fp32."""
 
     def test_reference_dtypes(self):
         assert BF16.reference_dtype == torch.float32
         assert FP32.reference_dtype == torch.float64
 
     def test_fp32_reference_runs_in_fp64(self):
-        """A no-op fp32 reference would zero the fro-ratio denominator; fp64 keeps it real."""
+        """A no-op fp32 reference would zero the frobenius-ratio denominator; fp64 keeps it real."""
 
         class _FakeSample:
             """Minimal stand-in for a SampleInput: reference() only reads input/args/kwargs."""
