@@ -39,6 +39,9 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import Re
 from torch_neuronx.neuron_dynamo_backend.fx.passes.replace_device_mesh_placeholders import (
     ReplaceDeviceMeshPlaceholders,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.rewrite_row_scatter_add import (
+    RewriteRowScatterAdd,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
     ShardIndexInjection,
     VocabShardingSPMD,
@@ -80,6 +83,9 @@ def post_aot_processing(
     flex_attention_pass = FlexAttentionLegalization(config)
     functionalize_pass = FunctionalizeCopyInplacePass(config)
     legalize_bool_scalars_pass = LegalizeBoolScalars(config)
+    # Runs before LegalizeIndexIndices so the negative-index normalization
+    # in that pass covers the rewritten aten.index_put nodes.
+    rewrite_row_scatter_add_pass = RewriteRowScatterAdd(config)
     legalize_index_indices_pass = LegalizeIndexIndices(config)
     remove_none_outputs = RemoveNoneOutputs(config)
     replace_device_mesh = ReplaceDeviceMeshPlaceholders(config)
@@ -97,6 +103,7 @@ def post_aot_processing(
             flex_attention_pass,
             functionalize_pass,
             legalize_bool_scalars_pass,
+            rewrite_row_scatter_add_pass,
             legalize_index_indices_pass,
             remove_none_outputs,
             replace_device_mesh,
