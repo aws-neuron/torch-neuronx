@@ -224,12 +224,17 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
     (E,) = offs.shape
     C_MAX = (T + TOK - 1) // TOK
     W = 4
-    NDT = D1 // D1T
+    # D1 tiles. The last is short when D1 % D1T != 0; its extent stays a constant.
+    NDT = (D1 + D1T - 1) // D1T
+    NFULL_D1 = D1 // D1T
     # One program per logical NeuronCore, each owning a disjoint D2 slice.
     num_progs = nl.num_programs(0)
     prog_id = nl.program_id(0)
     assert D2 % num_progs == 0, f"{D2=} must be divisible by {num_progs=}"
     PD2 = D2 // num_progs
+    # Output width tiles: PD2 is the moving operand free dim, limited to 512.
+    F2T = min(PD2, 512)
+    NF2 = (PD2 + F2T - 1) // F2T
     # Accumulator stays fp32; only the store narrows to the input dtype.
     out = nl.ndarray((E, D1, D2), b.dtype, nl.shared_hbm)
 
@@ -313,7 +318,7 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
             a_all = nl.ndarray((D1T, NDT * TOK), a.dtype, nl.sbuf)
             aT = nl.ndarray((TOK, D1T), a.dtype, nl.sbuf)
             ps_t = nl.ndarray((TOK, D1T), a.dtype, nl.psum)
-            ps = nl.ndarray((D1T, PD2), nl.float32, nl.psum)
+            ps = nl.ndarray((D1T, F2T), nl.float32, nl.psum)
 
             nisa.register_store(c_sb, c)
             base_row = g * C_MAX * W
@@ -348,33 +353,61 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
             )
             nisa.tensor_scalar(b_tile, b_tile, nl.multiply, mask)
 
-            nisa.dma_copy(
-                a_all.ap([[NDT * TOK, D1T], [TOK, NDT], [1, TOK]]),
-                a.ap(
-                    [[T, D1T], [D1T * T, NDT], [1, TOK]],
-                    0,
-                    scalar_offset=base_sb,
-                    indirect_dim=1,
-                ),
-            )
+            if NFULL_D1:
+                nisa.dma_copy(
+                    a_all.ap([[NDT * TOK, D1T], [TOK, NFULL_D1], [1, TOK]]),
+                    a.ap(
+                        [[T, D1T], [D1T * T, NFULL_D1], [1, TOK]],
+                        0,
+                        scalar_offset=base_sb,
+                        indirect_dim=1,
+                    ),
+                )
+            if NFULL_D1 < NDT:
+                nisa.dma_copy(
+                    a_all.ap([[NDT * TOK, D1 - NFULL_D1 * D1T], [1, TOK]], NFULL_D1 * TOK),
+                    a.ap(
+                        [[T, D1 - NFULL_D1 * D1T], [1, TOK]],
+                        NFULL_D1 * D1T * T,
+                        scalar_offset=base_sb,
+                        indirect_dim=1,
+                    ),
+                )
 
             for i in range(NDT):
-                nisa.nc_transpose(ps_t, a_all.ap([[NDT * TOK, D1T], [1, TOK]], i * TOK))
-                nisa.tensor_copy(aT, ps_t)
-                nisa.nc_matmul(ps, aT, b_tile, accumulate=False)
-                acc_i = acc.ap([[NDT * PD2, D1T], [1, PD2]], i * PD2)
-                nisa.tensor_tensor(acc_i, acc_i, ps, nl.add)
+                dw = min(D1T, D1 - i * D1T)
+                aT_ap = aT.ap([[D1T, TOK], [1, dw]])
+                nisa.nc_transpose(
+                    ps_t.ap([[D1T, TOK], [1, dw]]),
+                    a_all.ap([[NDT * TOK, dw], [1, TOK]], i * TOK),
+                )
+                nisa.tensor_copy(aT_ap, ps_t.ap([[D1T, TOK], [1, dw]]))
+                for j in range(NF2):
+                    fw = min(F2T, PD2 - j * F2T)
+                    ps_ap = ps.ap([[F2T, dw], [1, fw]])
+                    nisa.nc_matmul(
+                        ps_ap,
+                        aT_ap,
+                        b_tile.ap([[PD2, TOK], [1, fw]], j * F2T),
+                        accumulate=False,
+                    )
+                    acc_i = acc.ap([[NDT * PD2, dw], [1, fw]], i * PD2 + j * F2T)
+                    nisa.tensor_tensor(acc_i, acc_i, ps_ap, nl.add)
 
         nl.fori_loop(0, n_reg, body)
 
-        narrow = nl.ndarray((D1T, PD2), b.dtype, nl.sbuf)
+        narrow = nl.ndarray((D1T, F2T), b.dtype, nl.sbuf)
         for i in range(NDT):
-            nisa.tensor_copy(narrow, acc.ap([[NDT * PD2, D1T], [1, PD2]], i * PD2))
-            nisa.dma_copy(
-                out.ap(
-                    [[D2, D1T], [1, PD2]],
-                    g * D1 * D2 + i * D1T * D2 + prog_id * PD2,
-                ),
-                narrow,
-            )
+            dw = min(D1T, D1 - i * D1T)
+            for j in range(NF2):
+                fw = min(F2T, PD2 - j * F2T)
+                narrow_ap = narrow.ap([[F2T, dw], [1, fw]])
+                nisa.tensor_copy(narrow_ap, acc.ap([[NDT * PD2, dw], [1, fw]], i * PD2 + j * F2T))
+                nisa.dma_copy(
+                    out.ap(
+                        [[D2, dw], [1, fw]],
+                        g * D1 * D2 + i * D1T * D2 + prog_id * PD2 + j * F2T,
+                    ),
+                    narrow_ap,
+                )
     return out
