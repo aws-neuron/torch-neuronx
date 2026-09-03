@@ -492,8 +492,7 @@ void OperationExecutionEngine::RuntimeWorker() {
       for (auto device : devices) {
         ForEachStreamImpl(device, [&](StreamImpl* stream_impl) -> bool {
           OperationContext* operation = stream_impl->GetNextOperationToSchedule();
-          if (operation != nullptr) {
-            DispatchAsyncExecutionTask(operation);
+          if (operation != nullptr && DispatchAsyncExecutionTask(operation)) {
             work_found = true;
           }
           return false;
@@ -1235,7 +1234,7 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   return false;
 }
 
-void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* operation) noexcept {
+bool OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* operation) noexcept {
   auto* stream = operation->stream;
   const std::string operation_name = operation->GetOpName();
 
@@ -1244,15 +1243,16 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
     // cached NEFF, it denotes a failed compilation. Propagate the exception for
     // recovery (e.g. CPU fallback). Ensure that prior ops complete first.
     if (operation->RequiresCompilation() && !operation->GetCompilableKernel().HasCachedNeff()) {
-      if (!stream->HasPendingAsyncOperations()) {
-        auto& kernel = operation->GetCompilableKernel();
-        std::string error_msg = kernel.IsFailedCompilation()
-                                    ? kernel.GetCompilationError()
-                                    : "NEFF creation failed for operation: " + operation_name;
-        stream->HandleErrorWithCleanup(operation,
-                                       torch_neuronx::CompilationRuntimeException(error_msg));
+      if (stream->HasPendingAsyncOperations()) {
+        return false;
       }
-      return;
+      auto& kernel = operation->GetCompilableKernel();
+      std::string error_msg = kernel.IsFailedCompilation()
+                                  ? kernel.GetCompilationError()
+                                  : "NEFF creation failed for operation: " + operation_name;
+      stream->HandleErrorWithCleanup(operation,
+                                     torch_neuronx::CompilationRuntimeException(error_msg));
+      return true;
     }
 
     // Capture dispatch start for profiler on first attempt only — retries (e.g., event_wait
@@ -1275,18 +1275,21 @@ void OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* oper
         torch_neuronx::logOperationExecuted(concat_op->GetOpName());
       }
     }
+    return scheduled;
   } catch (const torch_neuronx::ExecutionRuntimeException& e) {
     if (operation->dispatch_slot >= 0 && operation->xu_type >= 0) {
       xu_slot_bitmask_[stream->device_index][operation->xu_type] &=
           ~(1u << operation->dispatch_slot);
     }
     stream->HandleErrorWithCleanup(operation, e);
+    return true;
   } catch (...) {
     if (operation->dispatch_slot >= 0 && operation->xu_type >= 0) {
       xu_slot_bitmask_[stream->device_index][operation->xu_type] &=
           ~(1u << operation->dispatch_slot);
     }
     stream->HandleErrorWithExceptionPtr(operation, std::current_exception());
+    return true;
   }
 }
 

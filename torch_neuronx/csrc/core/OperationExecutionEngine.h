@@ -186,9 +186,6 @@ class OperationExecutionEngine {
   // Write to completion_efd_ with EINTR retry
   void WriteEventfd();
 
-  // Process a single async execution task (schedule without waiting)
-  void DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
-
   // Lazily construct host_worker_pool_ on first kHost dispatch. Idempotent;
   // guarded by host_worker_pool_init_mutex_. Runs on the runtime worker
   // thread (sole caller of ScheduleOperation). See host_worker_pool_.
@@ -224,6 +221,10 @@ class OperationExecutionEngine {
   void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
   bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
   bool ScheduleAllocOperation(OperationContext* op, StreamImpl* stream);
+
+  // Process one async task without waiting. Returns true only when dispatch
+  // advanced queue state, so a throttled task does not keep the worker spinning.
+  bool DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
 
   // Move ops onto each target stream->runtime_queue_ in the order of
   // `partitioned_raws`. `owners` maps each raw pointer to its shared_ptr;
