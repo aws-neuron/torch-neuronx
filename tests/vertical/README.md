@@ -97,15 +97,16 @@ fp32 reduction over 4096 values drifts ~64 units. Those cells report `no_gate`.
 # Phase 1 -- the error model only. No device, unit test for accuracy related classes.
 python -m pytest tests/vertical/accuracy/test_metrics.py -q
 
-# Phase 2 -- on-device sweep against a model's traced op+shape list.
-# The set is traced BOTH ways (eager + compiled); one run writes one CSV per path:
-# op_accuracy_eager_<ts>.csv and op_accuracy_compiled_<ts>.csv. Rows carry op_mode.
+# Phase 2 -- on-device sweep against a model's traced op+shape list. --max-shapes-per-op 0
+# sweeps every registered shape; the dtype sweep defaults to both bf16 and fp32.
+# qwen3_235b_ep64_tp4 is traced BOTH ways (eager + compiled); one run writes one CSV per
+# path: op_accuracy_eager_<ts>.csv and op_accuracy_compiled_<ts>.csv.
 python -m pytest tests/vertical/accuracy/test_accuracy.py \
     --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 32 --tb=no -q
 
-# The same set at fp32. Both dtypes (bf16,fp32) sweep every op, unless explicitly passing --dtypes
+# One dtype only
 python -m pytest tests/vertical/accuracy/test_accuracy.py \
-    --traced-model qwen3_235b_ep64_tp4 --dtypes float32 --max-shapes-per-op 0 -n 32 --tb=no -q
+    --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 --dtypes bfloat16 -n 32 --tb=no -q
 
 # A single op, verbose
 python -m pytest "tests/vertical/accuracy/test_accuracy.py::TestOpAccuracy::test_op[aten::bmm]" \
@@ -118,20 +119,42 @@ NEURON_MAX_TENSOR_ELEMS=700000000 python -m pytest tests/vertical/accuracy/test_
     --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 32 --tb=no -q
 ```
 
-**`--traced-model` is required.** It does two things — registers smoke test subset's shapes, and
-restricts the run to them. Both are needed: registering alone would leave the op's `builtin`
-shapes in the pool as well, so the sweep would report more cells than the subset has entries and
-would not be purely model-shaped. `--model-shapes-only` excludes `builtin` but cannot separate
-two subsets registered together; `--traced-model` selects exactly one.
+**`--traced-model` is required** — with no model the sweep fails loudly. It does two things —
+registers that set's shapes, and restricts the run to them. Both are needed: registering alone
+would leave the op's `builtin` shapes in the pool as well, so the sweep would report more cells
+than the set has entries and would not be purely model-shaped. `--model-shapes-only` excludes
+`builtin` but cannot separate two model sets registered together; the traced model selects
+exactly one.
 
-**Not a gate.** `test_op` passes as long as cells ran; the verdict lives in the CSV. An op
-that could not be measured stays visible as a `status` rather than being folded into a pass.
+**`--max-shapes-per-op`** caps the shapes swept per op: `0` sweeps **all** registered shapes; a
+positive `n` keeps only the `n` largest-tensor shapes per op. **`--dtypes`** defaults to both
+bf16 and fp32; pass a comma-separated subset to narrow it.
+
+**This gates on both metrics.** Each `(op, dtype)` is its own item; it fails if any cell is
+over/invalid on the **rel-err budget** (bf16 only — fp32 has no rel-err verdict, `no_gate`) or
+on the **Frobenius ratio** (every dtype). Every cell still emits a CSV row regardless. A cell
+with an empty verdict — a device/lowering error (`failed_lowering`, …), `no_input_sample`,
+`unresolved`, `no_reference` — is shown as `other` in the panel (never folded into a pass) but
+is **not gated**: op runnability/lowering is owned by the vertical coverage suites
+(`test_target_ops_*`); this accuracy suite only judges onboarded ops that actually run.
+
+### CI
+
+Runs as a first-class trn2 check in **PR Checks** (`pull.yml`, peer to the ATen/CPP suites) and
+in **Dependency Guard** (`dependency-guard.yml`, blocks stable-image promotion). Each job runs
+one command: `--traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0` over both dtypes.
+`NEURON_ACCURACY_OUTPUT_DIR=outputs/accuracy` puts the
+per-path CSV(s) + a `step_summary.md` metrics panel under the uploaded artifact; the panel is
+posted to the GitHub job summary via the `append-step-summary` action. It has two head-level
+metrics — **relative error** (gates bf16) and **Frobenius ratio** (gates every dtype) — each
+split by dtype into a Tests (ops+shapes) and an Ops table over
+pass/fail/xfail/skip/xpass/other, plus per-(metric, dtype) failing-cell tables.
 
 ### Accuracy-specific pytest options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--dtypes` | `bfloat16` | Comma-separated input dtypes to sweep. fp32 cells are measured but not gated (`no_gate`) |
+| `--dtypes` | `bfloat16,float32` | Comma-separated input dtypes to sweep. fp32 has no rel-err verdict (`no_gate`) but is gated on the Frobenius ratio |
 | `--seed-base` | `0` | Re-roll every cell's input draw while keeping cells independent |
 
 ## Op Accuracy CSV
@@ -152,9 +175,9 @@ stays recomputable without re-running it either.
 | `unit` | The input format's unit roundoff `2**-precision` = 1/2 ULP (bf16 → `0.00390625`). Multiply `max_rel_err_units` by this to get the raw relative error |
 | `max_rel_err_units` | **The measurement.** Normwise relative error, L-inf: `(max\|T-R\| / max\|R\|) / unit` |
 | `budget_units` | **The threshold.** `2.0` for arithmetic, `0.0` for bit-exact groups, empty when not gated |
-| `verdict` | `within`, `over`, `invalid`, or empty when `status != ok` |
+| `relative_norm_verdict` | `within`, `over`, `invalid`, or empty when `status != ok` |
 | `max_abs_err` / `max_abs_ref` | The two raw absolute scalars `max_rel_err_units` is computed from |
-| `fro_abs_err_base` / `fro_ratio` / `fro_ratio_verdict` | Frobenius-ratio metric: denominator `‖cpu_low − ref_high‖`, the ratio `‖trn_low − ref_high‖ / ‖cpu_low − ref_high‖`, and its verdict (`within`/`over`/`invalid`, gate 1.1) |
+| `frobenius_abs_err_base` / `frobenius_ratio` / `frobenius_ratio_verdict` | Frobenius-ratio metric: denominator `‖cpu_low − ref_high‖`, the ratio `‖trn_low − ref_high‖ / ‖cpu_low − ref_high‖`, and its verdict (`within`/`over`/`invalid`, gate 1.1) |
 | `seed` | RNG seed, derived from `cell_id` + `--seed-base` |
 | `gates` | JSON of the shape-selection knobs in effect (`max_shapes_per_op`, `shape_registry`, `traced_model`, ...) |
 | `status` | See below |
@@ -172,7 +195,7 @@ stays recomputable without re-running it either.
 
 | Status | Meaning |
 |--------|---------|
-| `ok` | Cell measured; read `verdict` |
+| `ok` | Cell measured; read `relative_norm_verdict` |
 | `no_gate` | Measured, but the dtype is fp32 or finer, where a flat rounding bound is not the right instrument. Stays countable rather than passing silently |
 | `excluded` | `random` group — two correct RNG implementations disagree elementwise |
 | `no_input_sample` | The op's schema could not be satisfied from the registry entry |
@@ -439,7 +462,7 @@ that branch's `tests/vertical/tools/opcap/README.md`.
 | `--shape-registry <path>` | JSON shape registry file to load into `SHAPE_REGISTRY`, tagged `model_trace`. For a one-off trace that isn't checked in |
 | `--traced-model <names>` | Comma-separated smoke test subset(s) (keys of `SMOKE_SUBSET_SHAPES`). Registers them *and* restricts the run to them. Omit it and none are registered. Stricter than `--model-shapes-only`, which only excludes `builtin` and so still mixes every registered subset together |
 | `--model-shapes-only` | For ops with model-traced shapes, skip builtin/default shapes |
-| `--max-shapes-per-op <n>` | Cap per op to the top-N entries by max tensor element count. `0` disables the cap |
+| `--max-shapes-per-op <n>` | Cap per op to the top-N entries by max tensor element count. `0` (or negative) disables the cap — sweep **all** shapes registered for the op |
 
 ### Programmatic usage
 

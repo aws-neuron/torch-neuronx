@@ -527,6 +527,8 @@ class NeuronOpInfo(OpInfo):
         max_per_op = int(os.environ.get("NEURON_MAX_SHAPES_PER_OP", "10"))
         if self.op_name in self._SLOW_COMPILE_OPS:
             max_per_op = min(max_per_op, self._SLOW_COMPILE_MAX_SHAPES)
+        # max_per_op <= 0 disables the cap: select ALL shapes registered for this op (no top-N
+        # truncation). max_per_op > 0 keeps only the N largest-tensor shapes.
         if max_per_op > 0 and len(entries) > max_per_op:
             entries = sorted(
                 entries,
