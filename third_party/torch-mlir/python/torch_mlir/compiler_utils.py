@@ -85,6 +85,8 @@ def run_pipeline_with_repro_report(
     module, pipeline: str, description: str, enable_ir_printing: bool = False
 ):
     """Runs `pipeline` on `module`, with a nice repro report if it fails."""
+    # get_asm can fail. Keep a defined value for the error path.
+    asm_for_error_report = None
     saved_stderr_fd = os.dup(2)
     read_fd, write_fd = os.pipe()
     os.dup2(write_fd, 2)
@@ -112,12 +114,24 @@ def run_pipeline_with_repro_report(
         # - if we do have have colliding filenames, writes should at least
         #   avoid being racy.
         debug_path = get_debug_dump_path(module)
-        with open(debug_path, "w") as f:
-            f.write(asm_for_error_report)
+        if asm_for_error_report is not None:
+            with open(debug_path, "w") as f:
+                f.write(asm_for_error_report)
         debug_options = "-mlir-print-ir-after-all -mlir-disable-threading"
         # Put something descriptive here even if description is empty.
 
-        stderr_out = os.read(read_fd, ERROR_MSG_MAX_LENGTH).decode()
+        # Warning: a blocking read here deadlocks. This process keeps the pipe
+        # write ends open (fd 2 and write_fd), so the read never gets EOF. An
+        # exception that emits no MLIR diagnostic leaves the pipe empty.
+        # Use a non-blocking read.
+        os.set_blocking(read_fd, False)
+        try:
+            stderr_out = os.read(read_fd, ERROR_MSG_MAX_LENGTH).decode()
+        except BlockingIOError:
+            stderr_out = ""
+        if not stderr_out:
+            # The exception holds the only copy of the error text.
+            stderr_out = f"{type(e).__name__}: {e}"
         message = f"""\
                 Failed Torch-MLIR {description}: {stderr_out}
                 """
@@ -128,7 +142,7 @@ def run_pipeline_with_repro_report(
                 Add '{debug_options}' to get the IR dump for debugging purpose.
                 """
         trimmed_message = "\n" + "\n".join([m.lstrip() for m in message.split("\n")])
-        raise TorchMlirCompilerError(trimmed_message) from None
+        raise TorchMlirCompilerError(trimmed_message) from e
     finally:
         os.dup2(saved_stderr_fd, 2)
         os.close(saved_stderr_fd)
