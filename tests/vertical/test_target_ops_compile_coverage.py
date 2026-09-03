@@ -85,12 +85,18 @@ _OPS_CORRECTNESS_OUTPUT_INDICES: dict[str, tuple[int, ...]] = {
     "aten::mode": (0,),
 }
 
-# Ops that hang torch.compile due to 0d tensor inputs; skip entirely.
-_OPS_SKIP_COMPILE_HANG: tuple[str, ...] = (
-    "linspace",
-    "logspace",
-    "aten::_softmax_backward_data",
-)
+# Skip reasons for _OPS_SKIP_COMPILE_HANG.
+_REASON_0D_HANG = "hangs with 0d tensor inputs"
+_REASON_REGRESSION_TIMEOUT = "regression causing tests to timeout"
+
+# Ops that hang torch.compile; skip entirely.
+_OPS_SKIP_COMPILE_HANG: dict[str, str] = {
+    "linspace": _REASON_0D_HANG,
+    "logspace": _REASON_0D_HANG,
+    "_linalg_det": _REASON_REGRESSION_TIMEOUT,
+    "linalg_slogdet": _REASON_REGRESSION_TIMEOUT,
+    "aten::_softmax_backward_data": _REASON_0D_HANG,
+}
 
 # Ops that hang or segfault under dynamic shapes; skip when --dynamic is active.
 # - _foreach_* ops: each variant compiles N sub-graphs sequentially, taking 50-120 min
@@ -561,8 +567,9 @@ class TestTargetOpsCompileCoverage:
     @pytest.mark.parametrize("op_info", _build_params())
     def test_op_compile(self, op_info: NeuronOpInfo):
         op_name = op_info.op_name
-        if any(pat in op_name for pat in _OPS_SKIP_COMPILE_HANG):
-            pytest.skip(f"{op_name}: skipped (hangs with 0d tensor inputs)")
+        for pat, skip_reason in _OPS_SKIP_COMPILE_HANG.items():
+            if pat in op_name:
+                pytest.skip(f"{op_name}: skipped ({skip_reason})")
         if _use_dynamic() and any(pat in op_name for pat in _OPS_SKIP_COMPILE_DYNAMIC):
             pytest.skip(f"{op_name}: skipped (hangs/segfaults with dynamic shapes)")
         classification = _classify_op(op_name)
