@@ -7589,7 +7589,7 @@ def _lu_factor_unrolled(a):
         # Partial pivot: row (>= k) with the largest |lu[..., :, k]| at/below k.
         col_k = lu[..., k]  # (*batch, n)
         masked = torch.where(rows >= k, torch.abs(col_k), torch.full_like(col_k, -1.0))
-        piv = torch.argmax(masked, dim=-1)  # (*batch,)
+        piv = torch.max(masked, dim=-1).indices  # (*batch,)
         pivot_steps.append(piv)
 
         # Build a row permutation that swaps row k <-> row piv, then gather.
