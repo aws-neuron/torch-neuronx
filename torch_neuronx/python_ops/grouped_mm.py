@@ -15,8 +15,8 @@ from .torch_mlir.op_impl import TorchMlirOpImpl
 
 _RAGGED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _TILE = 128
-# Moving-operand free-dim limit on the Tensor Engine. The 2Dx3D kernel tiles its
-# output width against this; the 2Dx2D kernel does not, so d2 must fit in one.
+# Moving-operand free-dim limit on the Tensor Engine. Both kernels tile their output
+# width against this, so it bounds a resident buffer, not the caller's shape.
 _MOVING_FMAX = 512
 # SBUF is 192 KiB per partition; leave headroom for the per-iteration scratch.
 _SBUF_BUDGET = 160 * 1024
@@ -116,25 +116,24 @@ def _ragged_shapes_ok(a, b, offs) -> bool:
         d1, t = a.shape
         tb, d2 = b.shape
         g = offs.shape[0]
-        if t != tb or d1 % _TILE != 0 or t < _TILE:
+        if t != tb or t < _TILE:
             return False
         if d2 % lnc != 0:
             return False
-        # This kernel does not tile d2: it is the moving operand's free dim in a
-        # single matmul, so it must fit the engine limit.
-        if d2 > _MOVING_FMAX:
-            return False
         chunks = (t + _TILE - 1) // _TILE
-        tiles = d1 // _TILE
+        tiles = (d1 + _TILE - 1) // _TILE
         # Widest free dims: the schedule tables span ceil(t/128), the token block spans
-        # d1, and the accumulator spans (d1 / 128) * (d2 / lnc).
-        if chunks > _FREE_MAX or d1 > _FREE_MAX or tiles * (d2 // lnc) > _FREE_MAX:
+        # ceil(d1 / 128) * 128, and the accumulator spans ceil(d1 / 128) * (d2 / lnc).
+        if chunks > _FREE_MAX or tiles * _TILE > _FREE_MAX:
+            return False
+        if tiles * (d2 // lnc) > _FREE_MAX:
             return False
         # One budget for everything resident at once: the schedule tables and per-group
         # vectors coexist with the fp32 accumulator and the token block, so checking any
         # of them alone lets a large t and g pass separately and overflow together.
         resident = (_SCHED_TABLES * chunks + _SCHED_VECS_2D2D * g) * 4
-        resident += tiles * d2 * 4 + itemsize * (tiles * _TILE + 2 * d2)
+        resident += tiles * d2 * 4
+        resident += itemsize * (tiles * _TILE + d2 + min(d2, _MOVING_FMAX))
         return resident <= _SBUF_BUDGET
     return False
 

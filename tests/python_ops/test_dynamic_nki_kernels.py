@@ -2271,7 +2271,7 @@ class TestDynamicBlockStridedGather:
 # grouped_mm ragged (pad-free) path. Unaligned offs by itself proves the ragged impl
 # ran: the aligned impls' validate_offs raises on unaligned rather than declining.
 _GMM_RAGGED_CASES = [
-    # (r, d1, d2, g) -- d1 % 128 == 0 and r >= 128 are kernel constraints
+    # (r, d1, d2, g) -- r >= 128 is a kernel constraint
     (384, 256, 128, 4),
     (1024, 512, 352, 8),
     (2048, 256, 128, 16),
@@ -2422,6 +2422,36 @@ class TestGroupedMMRagged:
         result_ref = torch._grouped_mm(a.float(), b.float(), offs)
 
         result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+
+        assert result.shape == (g, d1, d2)
+        torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("kind", ["random", "one_row_each", "aligned"])
+    @pytest.mark.parametrize(
+        "d1, d2",
+        [
+            (352, 128),  # short final D1 tile only
+            (256, 2048),  # d2 past the moving free-dim limit only
+            (352, 2048),  # both, as a DeepSeek-V3 w1/w3 weight gradient does
+        ],
+    )
+    def test_ragged_2d_2d_wgrad_shapes(self, d1, d2, kind):
+        """The 2Dx2D shapes a MoE backward pass asks for.
+
+        A weight gradient has a (d_out, tokens) and b (tokens, d_in), so d1 and d2 are
+        free of the 128 and 512 limits.
+        """
+        t, g = 2048, 8
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        a = torch.randn((d1, t), dtype=dtype) / t**0.5
+        b = torch.randn((t, d2), dtype=dtype) / t**0.5
+        offs = _gmm_ragged_offs(t, g, kind)
+        result_ref = torch._grouped_mm(a.float(), b.float(), offs)
+
+        with track_neuron_ops():
+            result = torch._grouped_mm(a.to("neuron"), b.to("neuron"), offs.to("neuron"))
+            assert_op_runs_on_neuron("aten::_grouped_mm")
 
         assert result.shape == (g, d1, d2)
         torch.testing.assert_close(result.float().cpu(), result_ref, rtol=1.6e-2, atol=1e-2)
