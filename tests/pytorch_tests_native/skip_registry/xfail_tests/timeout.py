@@ -840,4 +840,9 @@ TIMEOUT = [
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcmul_slowpath_outplace_neuron_float64",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_clamp_min_slowpath_inplace_neuron_int16",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_clamp_min_slowpath_inplace_neuron_int64",
+    # Dep-guard -n64 cold-cache compile timeouts (>800s). xfailed to unblock the
+    # dep-guard pipeline while we root-cause it. Tracked in P504222983.
+    "test_ops.py::TestCommonNEURON::test_dtypes__refs_eye_neuron",
+    "test_ops.py::TestCommonNEURON::test_dtypes_nn_functional_max_unpool2d_grad_neuron",
+    "test_ops.py::TestCommonNEURON::test_dtypes_nn_functional_unfold_neuron",
 ]
