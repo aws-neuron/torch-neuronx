@@ -25,11 +25,14 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
   using OperationExecutionEngine::DecrementExecutionQueueDepth;
   using OperationExecutionEngine::dispatch_mutex_;
   using OperationExecutionEngine::dispatch_queue_;
+  using OperationExecutionEngine::DispatchAsyncExecutionTask;
   using OperationExecutionEngine::execution_queue_depth_;
+  using OperationExecutionEngine::max_inflight_per_xu_;
   using OperationExecutionEngine::MoveToRuntimeQueueInOrder;
   using OperationExecutionEngine::pending_async_ops_count_;
   using OperationExecutionEngine::ProcessCompletions;
   using OperationExecutionEngine::ScheduleOperation;
+  using OperationExecutionEngine::xu_inflight_counts_;
 
   // Test-only: push directly onto stream->runtime_queue_, bypassing the worker.
   void InjectIntoRuntimeQueue(StreamImpl* stream, std::shared_ptr<OperationContext> op) {
