@@ -59,7 +59,35 @@ def _div_compute(x, y, rounding_mode=None):
         result = xx / yy
         return result.to(x.dtype) if up else result
 
-    result = xx // yy if rounding_mode == "floor" else torch.trunc(xx / yy)
+    # Integer floor/trunc division must be exact. A plain float divide rounds an
+    # exact integer quotient down to k-eps in fp32 (e.g. 122/122 -> 0.99999994), so
+    # ``xx // yy`` / ``trunc(xx / yy)`` yield k-1 for those inputs. For integer
+    # operands recover the exact quotient from the integer remainder (exact in fp32
+    # for the int32-widened, small-magnitude values); keep the float path for floats.
+    _x_int = isinstance(x, torch.Tensor) and not x.dtype.is_floating_point and x.dtype != torch.bool
+    _y_int = (not isinstance(y, torch.Tensor)) or (
+        not y.dtype.is_floating_point and y.dtype != torch.bool
+    )
+    if _x_int and _y_int:
+        xf = xx.float()
+        yf = (
+            yy.float()
+            if isinstance(yy, torch.Tensor)
+            else torch.tensor(float(yy), device=xf.device, dtype=torch.float32)
+        )
+        ax, ay = xf.abs(), yf.abs()
+        qa = torch.trunc(ax / ay)
+        ra = ax - qa * ay
+        # Correct the fp32 rounding so qa == floor(|x| / |y|) exactly (ra in [0, ay)).
+        qa = qa + (ra >= ay).to(qa.dtype) - (ra < 0).to(qa.dtype)
+        ra = ax - qa * ay
+        sgn = torch.sign(xf) * torch.sign(yf)
+        result = sgn * qa
+        if rounding_mode == "floor":
+            # floor rounds toward -inf: a negative non-exact quotient steps down one.
+            result = result - ((sgn < 0) & (ra != 0)).to(result.dtype)
+    else:
+        result = xx // yy if rounding_mode == "floor" else torch.trunc(xx / yy)
 
     if not isinstance(yy, torch.Tensor):
         yy = torch.tensor(yy, device=xx.device, dtype=xx.dtype)

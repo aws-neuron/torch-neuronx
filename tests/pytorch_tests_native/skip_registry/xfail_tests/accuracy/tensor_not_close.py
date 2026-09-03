@@ -10,7 +10,6 @@ ACCURACY_TENSOR_NOT_CLOSE = [
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_nonfinite_neuron_float64",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_numpy_neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_numpy_neuron_float64",
-    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_numpy_neuron_int8",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_lerp_neuron_float64",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig___rmod___neuron_float16",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_expand___rmod___neuron_float16",
