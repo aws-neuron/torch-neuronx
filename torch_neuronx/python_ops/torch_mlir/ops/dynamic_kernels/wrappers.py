@@ -13,6 +13,7 @@ from .add_kernel import add_kernel
 from .bitwise_or_kernel import bitwise_or_kernel
 from .cast_kernel import cast_kernel_bf16, cast_kernel_fp16, cast_kernel_fp32
 from .cat_kernel import cat_kernel
+from .cat_rows_fused_kernel import cat_rows_fused_kernel
 from .combine_gather_reduce_kernel import combine_gather_reduce_kernel
 from .cos_kernel import cos_kernel
 from .dynamic_k_matmul_kernel import dynamic_k_matmul_kernel
@@ -153,6 +154,22 @@ def dynamic_cat_nki(
     input_a: torch.Tensor, input_b: torch.Tensor, num_m_tiles: torch.Tensor
 ) -> torch.Tensor:
     return _wrapped_cat[_GRID](input_a, input_b, num_m_tiles)
+
+
+# One wrapped kernel per arity: the K-operand signature is generated per K.
+_wrapped_cat_rows_fused: dict[int, object] = {}
+
+
+# A Tensor[] parameter is ONE schema argument for any K; K positional tensors would
+# exceed the custom-op schema's 64-argument cap at the arities an MoE concat reaches.
+@nki_op("dynamic_nki::cat_rows_fused", mutates_args={})
+def dynamic_cat_rows_fused_nki(inputs: list[torch.Tensor]) -> torch.Tensor:
+    k = len(inputs)
+    wrapped = _wrapped_cat_rows_fused.get(k)
+    if wrapped is None:
+        wrapped = wrap_nki(cat_rows_fused_kernel(k))
+        _wrapped_cat_rows_fused[k] = wrapped
+    return wrapped[_GRID](*inputs)
 
 
 # Dtype cast (_to_copy / copy_); the adapter picks the wrapper by target dtype.

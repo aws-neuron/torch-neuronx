@@ -1076,7 +1076,8 @@ class TestDynamicNkiKernels:
     # ── cat-specific, two shapes. FREE DIM: 2-input last-dim concat (backward of
     # .chunk(2, -1)) on one NEFF; N-D flattens leading dims; unequal widths OK; >2
     # tensors and dtype-or-lead mismatch decline. ROW DIM: K-input dim-0 concat
-    # (TorchTitan's MoE for-loop) as K composite copies, so no row count is baked;
+    # (TorchTitan's MoE for-loop) as K composite copies, so no row count is baked, or as
+    # one fused NEFF when every source has a single row;
     # a strided input or any middle dim declines. ──
     @pytest.mark.parametrize(
         "shape_a,shape_b",
@@ -1171,6 +1172,95 @@ class TestDynamicNkiKernels:
             step()
         new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
         assert not new, f"recompiled for new per-expert counts: {sorted(new)}"
+
+    # ── fused dim-0 concat: exactly one row per source. Each result row offset is then a
+    # compile-time constant, which is what lets ONE NEFF move every source HBM->HBM with
+    # no SBUF stage. Any other row count keeps the K composite copies. ──
+    @pytest.mark.parametrize(
+        "count,rest",
+        [
+            (4, (1024, 2048)),  # the DTensor reduce-scatter cat: 4 MiB per source
+            (2, (352,)),
+            (3, (64, 352)),
+            (64, (2048,)),
+        ],
+    )
+    def test_dynamic_nki_cat_rows_fused(self, count, rest):
+        parts = [(torch.randn(1, *rest, dtype=torch.bfloat16) / 8) for _ in range(count)]
+        ref = torch.cat(parts, dim=0)
+        nrn = [p.to("neuron") for p in parts]
+        torch.neuron.synchronize()
+        copies = _entry("copy_")._exec_count
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat(nrn, dim=0).cpu()
+        assert _entry("copy_")._exec_count == copies, "the fused NEFF must issue no copy_"
+        assert got.shape == ref.shape, f"{got.shape} != {ref.shape}"
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: _DTYPE_ID[d])
+    def test_dynamic_nki_cat_rows_fused_dtypes(self, dtype):
+        """The dtype is baked in the key, and the DMA only moves bytes: all exact."""
+        parts = [_exact_src(1, 352, dtype) for _ in range(3)]
+        ref = torch.cat(parts, dim=0)
+        nrn = [p.to("neuron") for p in parts]
+        torch.neuron.synchronize()
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat(nrn, dim=0).cpu()
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_rows_two_row_blocks_stay_composite(self):
+        """2 rows per source is outside the fused gate, so the K copies still run — the
+        path a routing with moving row counts needs."""
+        parts = [(torch.randn(2, 352, dtype=torch.bfloat16) / 8).to("neuron") for _ in range(3)]
+        torch.neuron.synchronize()
+        copies = _entry("copy_")._exec_count
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat(parts, dim=0).cpu()
+        assert _entry("copy_")._exec_count - copies == 3
+        ref = torch.cat([p.cpu() for p in parts], dim=0)
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_rows_fused_no_recompile(self):
+        """K and H are the only baked dims, so the same shape compiles exactly once."""
+        import torch_neuronx._C as _C
+
+        def cat4():
+            parts = [
+                (torch.randn(1, 64, 352, dtype=torch.bfloat16) / 8).to("neuron") for _ in range(4)
+            ]
+            assert torch.cat(parts, dim=0).shape == (4, 64, 352)
+
+        cat4()  # warm: one fused NEFF for (K=4, H=22528)
+        before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
+        for _ in range(3):
+            cat4()
+        new = {e["cache_key"] for e in _C._get_compilation_cache_entries()} - before
+        assert not new, f"the fused concat recompiled: {sorted(new)}"
+
+    def test_dynamic_nki_cat_rows_fused_out(self):
+        """out= is written in place: the destination IS the NEFF's result buffer."""
+        parts = [(torch.randn(1, 352, dtype=torch.bfloat16) / 8).to("neuron") for _ in range(3)]
+        dest = torch.empty(3, 352, dtype=torch.bfloat16, device="neuron")
+        torch.neuron.synchronize()
+        with _assert_dynamic_ran("cat"):
+            got = torch.cat(parts, dim=0, out=dest)
+        assert got.data_ptr() == dest.data_ptr()
+        ref = torch.cat([p.cpu() for p in parts], dim=0)
+        torch.testing.assert_close(dest.cpu(), ref, rtol=0, atol=0)
+
+    def test_dynamic_nki_cat_rows_fused_backward(self):
+        """The fused NEFF runs below autograd, so cat's backward still works."""
+        parts = [torch.randn(1, 352) for _ in range(3)]
+        w = torch.randn(3, 352)
+        cpu_leaves = [p.clone().requires_grad_(True) for p in parts]
+        (torch.cat(cpu_leaves, dim=0) * w).sum().backward()
+
+        nrn_leaves = [p.to(torch.bfloat16).to("neuron").requires_grad_(True) for p in parts]
+        with _assert_dynamic_ran("cat"):
+            out = torch.cat(nrn_leaves, dim=0)
+        (out.float() * w.to("neuron")).sum().backward()
+        for got, ref in zip(nrn_leaves, cpu_leaves, strict=True):
+            torch.testing.assert_close(got.grad.float().cpu(), ref.grad, rtol=2e-2, atol=2e-2)
 
     def test_dynamic_nki_cat_row_dim_backward(self):
         """The composite copies run below autograd, so cat's backward still works."""
