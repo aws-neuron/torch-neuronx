@@ -1463,7 +1463,7 @@ OTHER = [
     "test_torch.py::TestTorchDeviceTypeNEURON::test_tensor_storage_type_neuron_int64",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_tensor_storage_type_neuron_int8",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_tensor_storage_type_neuron_uint8",
-    "test_type_promotion.py::TestTypePromotionNEURON::test_alpha_mismatch_neuron",
+    "test_type_promotion.py::TestTypePromotion*NEURON::test_alpha_mismatch_neuron",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_abs_signed_zero_neuron_float32",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_abs_signed_zero_neuron_float64",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_nonzero_static_neuron",
