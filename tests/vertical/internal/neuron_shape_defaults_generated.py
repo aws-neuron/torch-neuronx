@@ -3422,27 +3422,31 @@ def register_all_defaults(r, smoke_subsets=()):
     # Bucketize / searchsorted
     r(
         "aten::bucketize.Tensor",
-        {"self": (256, 256), "boundaries": (32,)},
+        {"self": (256, 256), "boundaries": {"shape": (32,), "sorted": True}},
         source="builtin",
     )
     r(
         "aten::bucketize.Scalar",
-        {"self": 0.5, "boundaries": (32,)},
+        {"self": 0.5, "boundaries": {"shape": (32,), "sorted": True}},
         source="builtin",
     )
     r(
         "aten::bucketize.Scalar_out",
-        {"self": 0.5, "boundaries": (32,), "out": {"shape": (), "dtype": "long"}},
+        {
+            "self": 0.5,
+            "boundaries": {"shape": (32,), "sorted": True},
+            "out": {"shape": (), "dtype": "long"},
+        },
         source="builtin",
     )
     r(
         "aten::searchsorted.Tensor",
-        {"sorted_sequence": (32,), "self": (256, 256)},
+        {"sorted_sequence": {"shape": (32,), "sorted": True}, "self": (256, 256)},
         source="builtin",
     )
     r(
         "aten::searchsorted.Scalar",
-        {"sorted_sequence": (32,), "self": 0.5},
+        {"sorted_sequence": {"shape": (32,), "sorted": True}, "self": 0.5},
         source="builtin",
     )
 
