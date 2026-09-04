@@ -122,7 +122,7 @@ COMPILER_ERROR_NEURON = [
     "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int8",
     "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_t_copy_neuron_float32",
     "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fn",
-    "test_sort_and_select.py::TestSortAndSelectNEURON::test_topk_neuron",
+    "test_sort_and_select.py::TestSortAndSelect*NEURON::test_topk_neuron",
     "test_transformers.py::TestSDPAFailureModesNEURON::test_sdpa_unbacked_no_dde_neuron",
     # [NCC_IBCG901] BIRCodeGenLoop assertion error:
     # Too many strides!" when lowering aten::convolution with strided weights.
