@@ -6,7 +6,6 @@ from .aten_skips import (
     ATEN_CONV_BACKWARD_NRT_CORRUPTION as ATEN_CONV_BACKWARD_NRT_CORRUPTION,
 )
 from .aten_skips import ATEN_FOREACH_WORKER_CRASH as ATEN_FOREACH_WORKER_CRASH
-from .aten_skips import ATEN_HANG_NEEDS_INVESTIGATION as ATEN_HANG_NEEDS_INVESTIGATION
 from .aten_skips import ATEN_INT64_OVERFLOW as ATEN_INT64_OVERFLOW
 from .aten_skips import ATEN_SEGFAULT as ATEN_SEGFAULT
 from .aten_skips import (

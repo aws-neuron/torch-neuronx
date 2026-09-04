@@ -19,8 +19,11 @@ SKIP_GROUPS: list[SkipGroup] = [
         reason=(
             "FFT ops and complex dtypes (cfloat, cdouble, chalf)"
             " are not supported on Neuron hardware. Includes tests that"
-            " primarily exercise complex output ops (polar, linalg_eigvals,"
-            " stft) or iterate all dtypes including complex."
+            " primarily exercise complex output ops (polar, linalg_eig,"
+            " linalg_eigvals, stft) or iterate all dtypes including complex."
+            " Also covers linalg_eig/eigvals backward and forward-mode AD:"
+            " their backward pass produces complex intermediates"
+            " (aten::_linalg_solve_ex) that Neuron cannot execute natively."
         ),
         patterns=["*cdouble*", "*cfloat*", "*chalf*", "*complex*", "*fft_*"],
         match_target="test_method",
@@ -207,13 +210,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             " subsequent test_full_backward_hook_double_backward"
         ),
         tests=s.ATEN_CHECKPOINT_DATAPARALLEL_LEAK,
-    ),
-    SkipGroup(
-        reason=(
-            "Needs investigation: Skipping as these tests are hanging and the"
-            " pytest timeout does not kill them"
-        ),
-        tests=s.ATEN_HANG_NEEDS_INVESTIGATION,
     ),
     SkipGroup(
         reason=(

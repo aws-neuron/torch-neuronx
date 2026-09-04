@@ -187,4 +187,11 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_float64",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_float64",
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_float64",
+    # foreach ops: float64 inputs downcast to float32 on Neuron; parity check
+    # against CPU float64 reference fails due to precision loss.
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_add_fastpath_outplace_neuron_float64",
+    # int64 inputs downcast to int32 on Neuron; sqrt result diverges from CPU int64.
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_sqrt_fastpath_inplace_neuron_int64",
+    # uint8 addcdiv: integer division semantics differ after downcast.
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_inplace_neuron_uint8",
 ]

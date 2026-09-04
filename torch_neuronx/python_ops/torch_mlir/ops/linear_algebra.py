@@ -12,16 +12,19 @@ def torch_dot(tensor1, tensor2, out=None):
 
 @register_aten(["aten::mv", "aten::mv.out"])
 def torch_mv(mat, vec, out=None):
+    _reject_bool_matmul("mv", mat, vec)
     return torch.mv(mat, vec)
 
 
 @register_aten(["aten::mm", "aten::mm.out"])
 def torch_mm(mat1, mat2, out=None):
+    _reject_bool_matmul("mm", mat1, mat2)
     return torch.mm(mat1, mat2)
 
 
 @register_aten(["aten::bmm", "aten::bmm.out"])
 def torch_bmm(batch1, batch2, out=None):
+    _reject_bool_matmul("bmm", batch1, batch2)
     return torch.bmm(batch1, batch2)
 
 
@@ -44,29 +47,17 @@ _TYPE_META_NAMES = {
 }
 
 
-def _reject_bool_operands(input, batch1, batch2):
-    """Reject bool operands, which CPU refuses but the device path accepts.
+def _reject_bool_matmul(op_name: str, *tensors: object) -> None:
+    """Raise if any tensor operand has dtype bool.
 
-    CPU raises ``NotImplementedError: "baddbmm" not implemented for 'Bool'``.
-    On Neuron the matmul lowers happily for bool, so without this guard
-    ``baddbmm`` reports bool as a *working* dtype and OpInfo's
-    ``test_dtypes_baddbmm`` fails with "dtypes worked in forward but are not
-    listed by the OpInfo: {torch.bool}".
-
-    The message is CPU's byte-for-byte: OpInfo error tests regex-match it, and
-    the offending argument is visible in the traceback anyway.
-
-    Scoped to baddbmm rather than the whole matmul family: bmm/mm/addmm/matmul
-    diverge from CPU on bool identically, but their ``test_dtypes_*`` OpInfo
-    tests are all skipped under ``ATEN_SEGFAULT``
-    (tests/pytorch_tests_native/skip_registry/skipped_tests/aten_skips.py), so
-    widening the guard would change four shared ops' behavior with no upstream
-    test able to confirm the resulting dtype set. That cleanup has to start by
-    fixing the segfault skip, which is out of scope here.
+    CPU refuses bool for all matmul-family ops. Neuron lowers them without
+    error, so without this guard ``test_dtypes_*`` reports bool as a working
+    dtype and fails with "dtypes worked in forward but are not listed by the
+    OpInfo: {torch.bool}".
     """
-    for tensor in (input, batch1, batch2):
-        if isinstance(tensor, torch.Tensor) and tensor.dtype is torch.bool:
-            raise NotImplementedError("\"baddbmm\" not implemented for 'Bool'")
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.dtype is torch.bool:
+            raise NotImplementedError(f"\"{op_name}\" not implemented for 'Bool'")
 
 
 def _check_out_dtype(expected, out):
@@ -91,12 +82,8 @@ def _check_out_dtype(expected, out):
 
 
 def _validate_baddbmm(input, batch1, batch2, *_args, out=None, **_kwargs):
-    """Guard bool operands and the ``out=`` dtype for ``baddbmm``/``.out``.
-
-    ``beta``/``alpha`` are keyword-only in the schema, so they arrive in
-    ``_kwargs``; ``_args`` is kept for robustness if that ever changes.
-    """
-    _reject_bool_operands(input, batch1, batch2)
+    """Guard bool operands and the ``out=`` dtype for ``baddbmm``/``.out``."""
+    _reject_bool_matmul("baddbmm", input, batch1, batch2)
     operands = [t for t in (input, batch1, batch2) if isinstance(t, torch.Tensor)]
     if len({t.dtype for t in operands}) != 1:
         # CPU rejects mismatched operand dtypes ("Input dtypes must be the
@@ -109,13 +96,8 @@ def _validate_baddbmm(input, batch1, batch2, *_args, out=None, **_kwargs):
 
 
 def _validate_baddbmm_dtype(input, batch1, batch2, out_dtype=None, *_args, out=None, **_kwargs):
-    """Same guards for ``.dtype``/``.dtype_out``, whose result dtype is ``out_dtype``.
-
-    ``out_dtype`` is positional arg 3 in these schemas (``beta``/``alpha`` stay
-    keyword-only), and the operands are cast to it before the matmul, so the
-    result dtype is ``out_dtype`` regardless of the operand dtypes.
-    """
-    _reject_bool_operands(input, batch1, batch2)
+    """Same guards for ``.dtype``/``.dtype_out``, whose result dtype is ``out_dtype``."""
+    _reject_bool_matmul("baddbmm", input, batch1, batch2)
     if isinstance(out_dtype, torch.dtype):
         _check_out_dtype(out_dtype, out)
 
@@ -189,6 +171,7 @@ def torch_baddbmm_dtype(input, batch1, batch2, out_dtype, beta=1, alpha=1, out=N
 
 @register_aten(["aten::addmm", "aten::addmm.out"], static_argnames=("beta", "alpha"))
 def torch_addmm(input, mat1, mat2, beta=1, alpha=1, out=None):
+    _reject_bool_matmul("addmm", input, mat1, mat2)
     # Validate that mat1 and mat2 are 2D tensors
     if mat1.dim() != 2:
         raise RuntimeError(f"Expected 2D tensor for mat1, got {mat1.dim()}D")
@@ -220,6 +203,7 @@ def torch_addmm(input, mat1, mat2, beta=1, alpha=1, out=None):
 )
 def torch_addmv(self, mat, vec, beta=1, alpha=1, out=None):
     """Decomposed implementation of addmv: beta * self + alpha * (mat @ vec)"""
+    _reject_bool_matmul("addmv", self, mat, vec)
     orig_dtype = self.dtype
     mv_result = torch.matmul(mat, vec)
     if alpha != 1:
