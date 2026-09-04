@@ -19,6 +19,7 @@ try:
     )
 
     from torch_neuronx.nki_hop import nki_op, wrap_nki
+    from torch_neuronx.utils import get_logical_neuron_cores
 
     _add_scalar_kernel = wrap_nki(add_scalar_kernel)
     _sub_scalar_kernel = wrap_nki(sub_scalar_kernel)
@@ -44,39 +45,51 @@ try:
     # Callers must handle 0-dim scalar tensors before invoking these ops.
     @nki_op("torch_neuronx::add_scalar", mutates_args={})
     def add_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
-        return _add_scalar_kernel[(2,)](data, _scalar_tensor(scalar_tensor), data.numel())
+        return _add_scalar_kernel[(int(get_logical_neuron_cores()),)](
+            data, _scalar_tensor(scalar_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::sub_scalar", mutates_args={})
     def sub_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
-        return _sub_scalar_kernel[(2,)](data, _scalar_tensor(scalar_tensor), data.numel())
+        return _sub_scalar_kernel[(int(get_logical_neuron_cores()),)](
+            data, _scalar_tensor(scalar_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::mul_scalar", mutates_args={})
     def mul_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
-        return _mul_scalar_kernel[(2,)](data, _scalar_tensor(scalar_tensor), data.numel())
+        return _mul_scalar_kernel[(int(get_logical_neuron_cores()),)](
+            data, _scalar_tensor(scalar_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::div_scalar", mutates_args={})
     def div_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
-        return _div_scalar_kernel[(2,)](data, _scalar_tensor(scalar_tensor), data.numel())
+        return _div_scalar_kernel[(int(get_logical_neuron_cores()),)](
+            data, _scalar_tensor(scalar_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::add_tensor", mutates_args={})
     def add_tensor_nki(
         data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor
     ) -> torch.Tensor:
-        return _add_tensor_kernel[(2,)](data1, data2, _scalar_tensor(alpha_tensor), data1.numel())
+        return _add_tensor_kernel[(int(get_logical_neuron_cores()),)](
+            data1, data2, _scalar_tensor(alpha_tensor), data1.numel()
+        )
 
     @nki_op("torch_neuronx::sub_tensor", mutates_args={})
     def sub_tensor_nki(
         data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor
     ) -> torch.Tensor:
-        return _sub_tensor_kernel[(2,)](data1, data2, _scalar_tensor(alpha_tensor), data1.numel())
+        return _sub_tensor_kernel[(int(get_logical_neuron_cores()),)](
+            data1, data2, _scalar_tensor(alpha_tensor), data1.numel()
+        )
 
     @nki_op("torch_neuronx::mul_tensor", mutates_args={})
     def mul_tensor_nki(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        return _mul_tensor_kernel[(2,)](data1, data2, data1.numel())
+        return _mul_tensor_kernel[(int(get_logical_neuron_cores()),)](data1, data2, data1.numel())
 
     @nki_op("torch_neuronx::div_tensor", mutates_args={})
     def div_tensor_nki(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        return _div_tensor_kernel[(2,)](data1, data2, data1.numel())
+        return _div_tensor_kernel[(int(get_logical_neuron_cores()),)](data1, data2, data1.numel())
 
     @nki_op("torch_neuronx::addcdiv", mutates_args={})
     def addcdiv_nki(
@@ -85,7 +98,9 @@ try:
         data2: torch.Tensor,
         value_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        return _addcdiv_kernel[(2,)](data, data1, data2, _scalar_tensor(value_tensor), data.numel())
+        return _addcdiv_kernel[(int(get_logical_neuron_cores()),)](
+            data, data1, data2, _scalar_tensor(value_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::addcmul", mutates_args={})
     def addcmul_nki(
@@ -94,7 +109,9 @@ try:
         data2: torch.Tensor,
         value_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        return _addcmul_kernel[(2,)](data, data1, data2, _scalar_tensor(value_tensor), data.numel())
+        return _addcmul_kernel[(int(get_logical_neuron_cores()),)](
+            data, data1, data2, _scalar_tensor(value_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::lerp", mutates_args={})
     def lerp_nki(
@@ -102,11 +119,13 @@ try:
         end: torch.Tensor,
         weight_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        return _lerp_kernel[(2,)](data, end, _scalar_tensor(weight_tensor), data.numel())
+        return _lerp_kernel[(int(get_logical_neuron_cores()),)](
+            data, end, _scalar_tensor(weight_tensor), data.numel()
+        )
 
     @nki_op("torch_neuronx::sqrt", mutates_args={})
     def sqrt_nki(data: torch.Tensor) -> torch.Tensor:
-        return _sqrt_kernel[(2,)](data, data.numel())
+        return _sqrt_kernel[(int(get_logical_neuron_cores()),)](data, data.numel())
 
     SCALAR_NKI_OPS = {
         "add": add_scalar_nki,

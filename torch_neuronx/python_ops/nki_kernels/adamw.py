@@ -7,6 +7,7 @@ try:
     from nkilib.experimental.optimizer import adam_kernel, adamw_kernel
 
     from torch_neuronx.nki_hop import nki_op, wrap_nki
+    from torch_neuronx.utils import get_logical_neuron_cores
 
     _wrapped_adam = wrap_nki(adam_kernel)
     _wrapped_adamw = wrap_nki(adamw_kernel)
@@ -26,7 +27,7 @@ try:
         eps: float,
         amsgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _wrapped_adam[(2,)](
+        return _wrapped_adam[(int(get_logical_neuron_cores()),)](
             param,
             grad,
             exp_avg,
@@ -57,7 +58,7 @@ try:
         eps: float,
         amsgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _wrapped_adamw[(2,)](
+        return _wrapped_adamw[(int(get_logical_neuron_cores()),)](
             param,
             grad,
             exp_avg,
