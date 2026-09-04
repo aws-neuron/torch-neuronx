@@ -620,4 +620,34 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_abs_big_number_neuron_int64",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Neuron sqrt is not IEEE-754 correctly rounded (undershoots exact"
+            " squares); sqrt is a mandated correctly-rounded op. tril/triu_indices"
+            " floor(sqrt) drops to the wrong integer at row boundaries, and"
+            " linalg_vector_norm's pow(.,0.5) (same sqrt kernel) exceeds the fp64"
+            " tolerance. Compiler bug P496209905 / NCC-9408; temp xfail until sqrt"
+            " is correctly rounded."
+        ),
+        tests=[
+            # tril_indices -- floor(sqrt) off-by-one at exact-square boundaries
+            "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int32",
+            "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int64",
+            # triu_indices -- same decomposition (relocated from accuracy.tensor_not_equal)
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int32",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int64",
+            "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int32",
+            "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int64",
+            # linalg_vector_norm -- pow(.,0.5) == the same sqrt kernel, vs fp64 tol
+            "test_decomp.py::TestDecompNEURON::test_quick_linalg_vector_norm_neuron_float64",
+        ],
+    ),
 ]

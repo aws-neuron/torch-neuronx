@@ -438,4 +438,12 @@ BLOCKLIST: list[SkipGroup] = [
         reason=("Tests majorly use backend=fake not relevant to Neuron"),
         tests=["distributed/tensor/debug/test_debug_mode.py"],
     ),
+    SkipGroup(
+        reason=(
+            "dynamo list-semantics tests meant for CPU only: they assert"
+            " compiled == eager with an exact ==, not applicable on Neuron."
+            " NCC-9408."
+        ),
+        tests=["dynamo/test_list.py"],
+    ),
 ]
