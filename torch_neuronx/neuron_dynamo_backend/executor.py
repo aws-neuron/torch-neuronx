@@ -220,6 +220,25 @@ class Executor:
             else:
                 yield output
 
+    def _writeback_downcast_aliases(self, inputs, neuron_outputs, tensors):
+        """Write fp64 aliased-out results back into the caller's buffer.
+
+        An fp64 out= input is downcast to fp32 by a copy, so the NEFF writes the
+        shadow, not the caller's tensor. int64 downcasts via a storage-sharing
+        view and is already correct, so it's skipped.
+        """
+        for out_idx, caller_in_idx in self.copy_back_map.items():
+            orig = inputs[caller_in_idx]
+            shadow = neuron_outputs[out_idx]
+            if (
+                isinstance(orig, torch.Tensor)
+                and orig.dtype == torch.float64
+                and shadow.dtype == torch.float32
+            ):
+                orig.copy_(shadow)
+                tensors[out_idx] = orig
+        return tensors
+
     def __call__(self, *inputs) -> tuple[torch.Tensor, ...]:
         """Execute the compiled graph using cache-based execution.
 
@@ -272,6 +291,7 @@ class Executor:
         )
 
         tensors = self._process_outputs(neuron_outputs)
+        tensors = self._writeback_downcast_aliases(inputs, neuron_outputs, tensors)
 
         if self.retain_device:
             # Apply copy-back from NEFF outputs directly back to caller inputs
