@@ -312,6 +312,65 @@ TEST_F(CompilationCacheKeyTest, BuildCompilerExtensionIncludesCompilerVersion) {
 }
 
 // ============================================================================
+// WLO (Weight Layout Optimization): a trailing "|wlo" on the base key makes WLO part of the key
+// identity, so a WLO NEFF (weights relaid out) never shares a cache entry with a non-WLO NEFF of
+// the same graph. The suffix rides through the in-memory key and, via the inferred wlo_enabled_,
+// the compiler config (BuildCompilerExtension). Fixture flag is on (HLO-content).
+// ============================================================================
+
+TEST_F(CompilationCacheKeyTest, WloFlagDefaultsToOff) {
+  // A base key without the "|wlo" suffix is non-WLO, leaving the key byte-identical to any other
+  // non-WLO key so every existing (non-WLO) call site is unaffected.
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  EXPECT_EQ(non_wlo.GetKey(), "op");  // no suffix
+  EXPECT_EQ(non_wlo.BuildCompilerExtension().find("_wlo"), std::string::npos);
+}
+
+TEST_F(CompilationCacheKeyTest, WloEnabledSuffixesInMemoryKey) {
+  // WLO is signalled by a trailing "|wlo" on the incoming base key; the key preserves it verbatim.
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  EXPECT_EQ(non_wlo.GetKey(), "op");
+  EXPECT_EQ(wlo.GetKey(), "op|wlo");
+  // Distinct in-memory identity -> distinct entries in the string-keyed cache map.
+  EXPECT_NE(non_wlo, wlo);
+}
+
+TEST_F(CompilationCacheKeyTest, WloEnabledAppendsCompilerExtensionSuffix) {
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  EXPECT_EQ(wlo.BuildCompilerExtension(), non_wlo.BuildCompilerExtension() + "_wlo");
+}
+
+TEST_F(CompilationCacheKeyTest, WloDistinctPersistentKeyWithIdenticalHloBytes) {
+  // Flag-on mode hashes hlo_bytes || config. Even with byte-identical HLO, a WLO
+  // and non-WLO compile must not collide, because WLO-ness is folded into the config.
+  // This is the robustness guarantee that does not depend on the WLO annotation
+  // surviving in the hashed HLO bytes.
+  std::vector<uint8_t> hlo = {0x01, 0x02, 0x03, 0x04};
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", &hlo, CacheKeySource::TORCH_COMPILE);
+  auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", &hlo, CacheKeySource::TORCH_COMPILE);
+  const std::string* pk_non_wlo = non_wlo.GetPersistentKey();
+  const std::string* pk_wlo = wlo.GetPersistentKey();
+  ASSERT_NE(pk_non_wlo, nullptr);
+  ASSERT_NE(pk_wlo, nullptr);
+  EXPECT_NE(*pk_non_wlo, *pk_wlo);
+}
+
+TEST_F(CompilationCacheKeyTest, WloAndNonWloAreDistinctMapEntries) {
+  // A WLO and non-WLO key for the same graph coexist as separate cache entries and never
+  // overwrite each other.
+  std::unordered_map<CompilationCacheKey, std::string> cache;
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  cache[non_wlo] = "plain_neff";
+  cache[wlo] = "relaid_neff";
+  EXPECT_EQ(cache.size(), 2);
+  EXPECT_EQ(cache[non_wlo], "plain_neff");
+  EXPECT_EQ(cache[wlo], "relaid_neff");
+}
+
+// ============================================================================
 // Legacy key path: TORCH_NEURONX_NEFF_KEY_FROM_HLO unset/!="1".
 // Persistent key derives from base_key + compiler_config (production default).
 // HLO bytes are not required, and changing them does not affect the key.
@@ -404,6 +463,18 @@ TEST_F(CompilationCacheKeyLegacyKeyTest, FlagSwitchProducesDifferentPersistentKe
   std::string pk_on = *key_on.GetPersistentKey();
 
   EXPECT_NE(pk_off, pk_on);
+}
+
+TEST_F(CompilationCacheKeyLegacyKeyTest, WloDistinctPersistentKey) {
+  // Flag-off (default/prod) mode hashes base_key || config. The "|wlo" suffix is folded
+  // into both, so WLO and non-WLO get distinct persistent keys here too.
+  auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
+  const std::string* pk_non_wlo = non_wlo.GetPersistentKey();
+  const std::string* pk_wlo = wlo.GetPersistentKey();
+  ASSERT_NE(pk_non_wlo, nullptr);
+  ASSERT_NE(pk_wlo, nullptr);
+  EXPECT_NE(*pk_non_wlo, *pk_wlo);
 }
 
 int main(int argc, char** argv) {

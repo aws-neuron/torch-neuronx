@@ -16,6 +16,7 @@ from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
 from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
+from torch._guards import TracingContext
 from torch.utils._filelock import FileLock
 
 from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job, get_lock_timeout
@@ -37,6 +38,7 @@ from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
     apply_input_mutations,
     apply_output_mutations,
     get_alias_output_buffer_map,
+    translate_input_indices_to_neff,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
     post_aot_processing,
@@ -71,6 +73,7 @@ def _compile_fx_to_stablehlo(
     segment_id: str,
     job: CompilationJob,
     alias_buffer_map: dict[int, int] | None = None,
+    static_input_indices: list[int] | None = None,
 ):
     """Convert an FX GraphModule to StableHLO MLIR.
 
@@ -81,6 +84,8 @@ def _compile_fx_to_stablehlo(
         segment_id (str): Segment ID for statistics tracking.
         job (CompilationJob): Compilation job for artifact management.
         alias_buffer_map (dict[int, int] | None): NEFF output→input aliasing hints.
+        static_input_indices (list[int] | None): WLO — indices of static weights the
+            compiler may transpose (stamped as transposable_weight_idx). None disables WLO.
 
     Returns:
         tuple: (stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec)
@@ -96,6 +101,7 @@ def _compile_fx_to_stablehlo(
         example_inputs,
         alias_buffer_map,
         job=job,
+        static_input_indices=static_input_indices,
     )
     logger.debug("FX Graph to StableHLO conversion completed")
 
@@ -214,6 +220,7 @@ def _lower_fx_to_stablehlo(
     model_name: str,
     pre_processing_analysis_info=None,
     run_fx_passes: bool = True,
+    options=None,
 ) -> _Lowering:
     """Front half of the shared lowering core: FX passes -> FX→StableHLO.
 
@@ -288,9 +295,21 @@ def _lower_fx_to_stablehlo(
         alias_buffer_map=alias_buffer_map,
     )
 
+    # WLO: when weight_layout_optimization is enabled, mark the static weight
+    # inputs the compiler may transpose.
+    static_input_indices = _wlo_static_input_indices(
+        options, example_inputs, get_aot_graph_name(), pass_mutations
+    )
+
     try:
         stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
-            gm, example_inputs, model_name, segment_id, job, alias_buffer_map
+            gm,
+            example_inputs,
+            model_name,
+            segment_id,
+            job,
+            alias_buffer_map,
+            static_input_indices=static_input_indices,
         )
     except Exception as stablehlo_err:
         raise _StableHLOError(stablehlo_err, analysis) from stablehlo_err
@@ -322,6 +341,9 @@ def _lower_stablehlo_to_neff(analysis: _Lowering, *, model_name: str, options=No
         use_tensorizer=use_tensorizer_backend,
     )
     analysis.cache_key = compile_graph.compile()
+    # WLO weight transforms are not recovered here: for a WLO graph compile() submits async and
+    # returns a "|wlo" cache_key; the wrapped_neff.hlo sidecar is fetched + parsed lazily when the
+    # executor is first built (cache_artifact.NeuronOutputCode._get_executor).
     return analysis
 
 
@@ -548,6 +570,62 @@ def _make_fallback_fn(
     return fallback_fn
 
 
+def _filter_wlo_indices(static_input_indices, example_inputs):
+    """Keep only the floating-point weight inputs (the ones the compiler transposes)."""
+    if not static_input_indices:
+        return None
+
+    filtered = [
+        i
+        for i in static_input_indices
+        if isinstance(example_inputs[i], torch.Tensor) and example_inputs[i].dtype.is_floating_point
+    ]
+    dropped = set(static_input_indices) - set(filtered)
+    if dropped:
+        logger.debug(
+            f"WLO: excluding non-floating-point inputs {sorted(dropped)} from weight "
+            "layout optimization (only floating-point weights are transposed)."
+        )
+    return filtered or None
+
+
+def _wlo_static_input_indices(options, example_inputs, aot_name, pass_mutations):
+    """Compute the NEFF-space static-weight indices eligible for WLO, or None if disabled.
+
+    WLO is opt-in (options["weight_layout_optimization"]) and applies to inference and
+    forward graphs (not backward/joint).
+    """
+    wlo_enabled = options is not None and options.get("weight_layout_optimization", False)
+    if not wlo_enabled:
+        return None
+
+    graph_type = aot_name.rsplit("_", 1)[0].rsplit("_", 1)[-1] if "__" in aot_name else ""
+    if graph_type not in ("inference", "forward"):
+        logger.warning(
+            f"WLO: weight_layout_optimization=True but graph_type='{graph_type}' "
+            f"(name={aot_name}); WLO applies to inference and forward graphs only and is "
+            "being SKIPPED (it does not apply to backward/joint graphs)."
+        )
+        return None
+
+    ctx = TracingContext.try_get()
+    fw_metadata = ctx.fw_metadata if ctx else None
+    static_input_indices = (
+        list(fw_metadata.static_input_indices)
+        if fw_metadata and fw_metadata.static_input_indices
+        else None
+    )
+    caller_indices = _filter_wlo_indices(static_input_indices, example_inputs)
+    if not caller_indices:
+        return None
+
+    neff_indices = translate_input_indices_to_neff(caller_indices, pass_mutations)
+    removed = len(caller_indices) - len(neff_indices)
+    if removed:
+        logger.debug(f"WLO: {removed} weight(s) were removed by FX passes and dropped from WLO.")
+    return neff_indices or None
+
+
 def neuron_backend_fx_compiler(
     gm: torch.fx.GraphModule, example_inputs, pre_processing_analysis_info=None, options=None
 ):
@@ -604,6 +682,8 @@ def neuron_backend_fx_compiler(
 
         try:
             # Two-stage lowering; debug paths exit between stages.
+            # WLO (weight_layout_optimization) is handled inside
+            # _lower_fx_to_stablehlo, which is why options is threaded through.
             try:
                 low = _lower_fx_to_stablehlo(
                     gm,
@@ -611,6 +691,7 @@ def neuron_backend_fx_compiler(
                     job,
                     model_name=model_name,
                     pre_processing_analysis_info=pre_processing_analysis_info,
+                    options=options,
                 )
             except _StableHLOError as err:
                 if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
@@ -643,7 +724,9 @@ def neuron_backend_fx_compiler(
                 hilo_ig_wrapper._boxed_call = True
                 return hilo_ig_wrapper
 
-            # Stage 2: StableHLO -> NEFF (async submit; sets low.cache_key).
+            # Stage 2: StableHLO -> NEFF (async submit; sets low.cache_key. For WLO the cache_key
+            # carries a "|wlo" suffix and the sidecar/weight-transforms are fetched lazily in the
+            # executor — see NeuronOutputCode._get_executor).
             low = _lower_stablehlo_to_neff(low, model_name=model_name, options=options)
 
             # Compile-only: return CompilationArtifact handle (no execution).

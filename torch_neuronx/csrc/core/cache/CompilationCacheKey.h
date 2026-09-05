@@ -63,6 +63,10 @@ class CompilationCacheKey {
    * @param optimization_level Optimization level
    * @param hlo_bytes_ptr Pointer to raw hlo bytes data
    * @param source Which frontend produced this (metadata only, not part of key)
+   *
+   * Weight Layout Optimization (WLO) is inferred from a trailing "|wlo" on base_key, so every
+   * construction site (incl. NeffDirectKernelExecution / put_neff_cache / get_neff_cache) stays
+   * consistent without threading a separate flag.
    */
   CompilationCacheKey(const std::string& base_key, const std::string& compiler_args,
                       const std::string& optimization_level,
@@ -191,6 +195,9 @@ class CompilationCacheKey {
 
   // Source frontend (for logging/metrics only, not part of identity).
   CacheKeySource source_ = CacheKeySource::UNKNOWN;
+
+  // WLO compile; folded into the cache key.
+  bool wlo_enabled_ = false;
 
   // Persistent key (computed lazily on first GetPersistentKey() call).
   mutable std::string persistent_key_;

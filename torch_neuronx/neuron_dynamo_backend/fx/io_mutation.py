@@ -429,6 +429,22 @@ def apply_output_mutations(
     return values
 
 
+def translate_input_indices_to_neff(
+    input_indices: list[int],
+    pass_mutations: list[PassMutations],
+) -> list[int]:
+    """Map caller/original-space input indices to NEFF-space (post-pass) indices.
+
+    Applies the FX passes' input ADD/REMOVE mutations forward — the same transform
+    apply_input_mutations performs on values — so an index in the original input space
+    is mapped to its position in the NEFF input space the compiler and executor use.
+    Indices a pass removed map to None and are dropped. With no shifting mutations this
+    is the identity.
+    """
+    translated, _ = _translate_indices(list(input_indices), [], pass_mutations, forward=True)
+    return [idx for idx in translated if idx is not None]
+
+
 __all__ = [
     "TRANSFORM_REGISTRY",
     "IOMutation",
@@ -439,4 +455,5 @@ __all__ = [
     "get_alias_output_buffer_map",
     "get_mutation_copy_back_inputs",
     "rebase_pre_aot_pass_mutations",
+    "translate_input_indices_to_neff",
 ]

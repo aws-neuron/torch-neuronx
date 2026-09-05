@@ -104,16 +104,34 @@ class NeuronOutputCode(OutputCode):
                 )
             hlo_bytes = entry.hlo_bytes
 
-        # compile_graph is async but will hit the NEFF persistent cache
+        # compile_graph is async but will hit the NEFF persistent cache. For a WLO graph (key ends
+        # in "|wlo") re-submit on the WLO path so a persistent cache hit repopulates the
+        # wrapped_neff.hlo sidecar (CompilationCache only loads it from the persistent sidecar cache
+        # when the kernel RequiresWrappedNeffHlo). Without this, a cross-process warm load would
+        # recover an empty sidecar and run the relaid NEFF against untransformed weights.
         torch_neuronx._C.compile_graph(
             key,
             hlo_bytes,
             self.has_collectives,
+            wlo=key.endswith("|wlo"),
         )
 
     def _get_executor(self):
         if self._executor is None:
             self._ensure_neff_loaded()
+
+            # WLO: the wrapped_neff.hlo sidecar was deferred at compile time to keep the submit
+            # async. Fetch + parse it now that the NEFF is loaded/compiled so the Executor can
+            # relay weights. Non-WLO keys skip this. The "|wlo" suffix is the serialized WLO marker;
+            # the sidecar comes from the in-memory entry (cold) or persistent sidecar cache (warm).
+            wlo_transforms: list = []
+            key = self.cache_key or self.hlo_cache_key
+            if key.endswith("|wlo"):
+                from torch_neuronx.neuron_dynamo_backend.compile import _parse_wrapped_neff_hlo
+
+                sidecar = torch_neuronx._C.get_wrapped_neff_hlo(key)
+                wlo_transforms = _parse_wrapped_neff_hlo(sidecar)
+                logger.debug(f"WLO: discovered {len(wlo_transforms)} weight transforms (lazy)")
 
             from torch_neuronx.neuron_dynamo_backend.executor import Executor
 
@@ -126,6 +144,7 @@ class NeuronOutputCode(OutputCode):
                 retain_device=self.retain_device,
                 pass_mutations=self.pass_mutations,
                 alias_buffer_map=self.alias_buffer_map,
+                wlo_transforms=wlo_transforms,
             )
         return self._executor
 

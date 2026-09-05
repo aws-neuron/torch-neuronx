@@ -957,7 +957,7 @@ TEST_F(KernelExecutionTest, NRTReduceOpEnumValues) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -966,7 +966,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, CompileMode::kTensorizer);
 
   // CompileToNeff should throw since we don't have real compiler
   try {
@@ -980,7 +980,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerWithEmptyBytes) {
   std::vector<uint8_t> empty_bytes;
-  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_FALSE(kernel.IsValid());
 }

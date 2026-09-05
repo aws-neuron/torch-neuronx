@@ -6,7 +6,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
+from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph, _parse_wrapped_neff_hlo
+
+
+def _wlo_mlir(has_wlo: bool):
+    """A MagicMock MLIR module whose attributes report the WLO annotation
+    (mhlo.frontend_attributes) present/absent, matching CompileGraph.compile's gate."""
+    mlir = MagicMock()
+    mlir.operation.attributes.__contains__.return_value = has_wlo
+    return mlir
 
 
 @pytest.fixture
@@ -186,3 +194,124 @@ class TestCompileGraph:
         assert content_key == expected
         assert ":" in content_key
         assert "version_hash_v1" in content_key
+
+
+class TestCompileGraphWLO:
+    """Test the Weight Layout Optimization branch of CompileGraph.compile()."""
+
+    @patch("torch_neuronx.neuron_dynamo_backend.compile._parse_wrapped_neff_hlo")
+    @patch("torch_neuronx._C.get_wrapped_neff_hlo")
+    @patch("torch_neuronx._C.compile_graph")
+    def test_wlo_path_submits_async_and_defers_sidecar(
+        self, mock_compile, mock_get_sidecar, mock_parse
+    ):
+        """When the module carries the WLO annotation, compile() submits with wlo=True on a "|wlo"
+        key and returns the handle WITHOUT fetching/parsing the sidecar — that is deferred to the
+        executor build (get_wrapped_neff_hlo blocks, so fetching here would serialize compiles)."""
+        mock_compile.return_value = "wlo_handle|wlo"
+
+        with patch("io.BytesIO", return_value=MagicMock(getvalue=lambda: b"mlir")):
+            cg = CompileGraph(_wlo_mlir(has_wlo=True), "m", "s", "g")
+            result = cg.compile()
+
+        assert result == "wlo_handle|wlo"
+        mock_compile.assert_called_once()
+        assert mock_compile.call_args.kwargs.get("wlo") is True  # submitted on the WLO path
+        assert mock_compile.call_args.args[0].endswith("|wlo")  # WLO marker on the base key
+        # Sidecar fetch/parse are deferred to NeuronOutputCode._get_executor, not done in compile().
+        mock_get_sidecar.assert_not_called()
+        mock_parse.assert_not_called()
+
+    @patch("torch_neuronx.neuron_dynamo_backend.compile._parse_wrapped_neff_hlo")
+    @patch("torch_neuronx._C.get_wrapped_neff_hlo")
+    @patch("torch_neuronx._C.compile_graph")
+    def test_non_wlo_path_no_suffix_no_sidecar(self, mock_compile, mock_get_sidecar, mock_parse):
+        """Without the WLO annotation, compile() uses the plain compile_graph (no wlo, no "|wlo"
+        suffix) and never touches the sidecar."""
+        mock_compile.return_value = "handle"
+
+        with patch("io.BytesIO", return_value=MagicMock(getvalue=lambda: b"mlir")):
+            cg = CompileGraph(_wlo_mlir(has_wlo=False), "m", "s", "g")
+            result = cg.compile()
+
+        assert result == "handle"
+        mock_compile.assert_called_once()
+        assert mock_compile.call_args.kwargs.get("wlo", False) is False  # not the WLO path
+        assert not mock_compile.call_args.args[0].endswith("|wlo")  # no WLO marker
+        mock_get_sidecar.assert_not_called()
+        mock_parse.assert_not_called()
+
+    def test_wlo_annotation_in_serialized_bytes_fails_closed(self):
+        """Bytes taken as canonical MLIR never take the live WLO path; if they carry the
+        WLO annotation, compile() fails closed rather than compiling a WLO graph as non-WLO."""
+        cg = CompileGraph(
+            b'module { mhlo.frontend_attributes = {transposable_weight_idx = "0"} }', "m", "s", "g"
+        )
+        with pytest.raises(RuntimeError, match="WLO annotation"):
+            cg.compile()
+
+    @patch("torch_neuronx.neuron_dynamo_backend.compile._parse_wrapped_neff_hlo", return_value=[])
+    @patch("torch_neuronx._C.get_wrapped_neff_hlo", return_value=b"")
+    @patch("torch_neuronx._C.compile_graph", return_value="h")
+    def test_wlo_key_is_non_wlo_key_plus_suffix(
+        self, mock_compile, mock_get_sidecar, mock_parse, hlo_content_key_enabled
+    ):
+        """WLO and non-WLO compiles of the same MLIR share the same base content key; the WLO key is
+        exactly that key plus the "|wlo" marker (shared _content_key via _submit_mlir_bytes[_wlo]).
+        The C++ CompilationCacheKey infers wlo_enabled from this suffix in one place."""
+        with patch("io.BytesIO", return_value=MagicMock(getvalue=lambda: b"same_mlir")):
+            CompileGraph(_wlo_mlir(has_wlo=False), "m", "s", "g").compile()
+            CompileGraph(_wlo_mlir(has_wlo=True), "m", "s", "g").compile()
+
+        non_wlo_key = mock_compile.call_args_list[0].args[0]
+        wlo_key = mock_compile.call_args_list[1].args[0]
+        assert wlo_key == non_wlo_key + "|wlo"
+
+
+class TestParseWrappedNeffHlo:
+    """Test _parse_wrapped_neff_hlo — the subprocess boundary around wlo_hlo_parser.py."""
+
+    def test_empty_bytes_returns_empty(self):
+        """No sidecar bytes (compiler chose no relayout) -> no transforms, no subprocess."""
+        with patch("subprocess.run") as mock_run:
+            assert _parse_wrapped_neff_hlo(b"") == []
+            mock_run.assert_not_called()
+
+    def test_success_parses_json_stdout(self):
+        """returncode 0 with JSON stdout -> parsed list of transforms.
+
+        subprocess is imported *inside* the function, so we patch the global
+        subprocess.run (which the local `import subprocess` resolves to), not a
+        module attribute on compile."""
+        transforms = [{"input_index": 1, "reshape": [2, 8], "transpose": [1, 0]}]
+        import json
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=json.dumps(transforms), stderr=""
+            )
+            assert _parse_wrapped_neff_hlo(b"hlo_bytes") == transforms
+
+    def test_empty_stdout_returns_empty(self):
+        """returncode 0 but empty stdout (parser found no transposes) -> []."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="  \n", stderr="")
+            assert _parse_wrapped_neff_hlo(b"hlo_bytes") == []
+
+    def test_parser_failure_raises(self):
+        """FAIL CLOSED: a parser subprocess failure must raise, not return [] --
+        the NEFF expects relaid weights, so silently applying none is wrong output."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+            with pytest.raises(RuntimeError, match="WLO: HLO parsing failed"):
+                _parse_wrapped_neff_hlo(b"hlo_bytes")
+
+    def test_parser_timeout_raises(self):
+        """FAIL CLOSED: a hung parser must not block compilation forever -- a
+        timeout raises rather than hanging or silently returning no transforms."""
+        import subprocess
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="parser", timeout=120)
+            with pytest.raises(RuntimeError, match="WLO: HLO parsing timed out"):
+                _parse_wrapped_neff_hlo(b"hlo_bytes")

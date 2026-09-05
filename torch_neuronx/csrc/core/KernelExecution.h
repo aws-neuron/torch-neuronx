@@ -318,6 +318,14 @@ class CompilableKernelExecution {
   // Compilation-specific interface
   virtual std::vector<uint8_t> CompileToNeff() const = 0;
 
+  // NEFF bytes + optional wrapped_neff.hlo. Default (non-WLO) returns an empty sidecar;
+  // WLO kernels override to also return the weight-layout-transform protobuf.
+  virtual CompileResult CompileToNeffResult() const {
+    return CompileResult{CompileToNeff(), /*wrapped_neff_hlo=*/{}};
+  }
+
+  virtual bool RequiresWrappedNeffHlo() const { return false; }
+
   // Returns the HLO/StableHLO bytes for this kernel.
   // Used to compute hash for persistent cache keys.
   // Returns empty vector if HLO is not available (e.g., NeffDirectKernelExecution).
@@ -494,13 +502,22 @@ class XLACompilableKernelExecution
   std::vector<uint8_t> hlo_bytes_;
 };
 
+// Compile path for a torch.compile graph. These modes are mutually exclusive; using an enum
+// (rather than two trailing bool params) also keeps string-literal calls from binding here
+// instead of the explicit-config constructor below (const char* -> bool would outrank
+// const char* -> std::string, silently reinterpreting compiler flags as booleans).
+//   kStandard  : StableHLO -> NEFF via neuronx-cc (the common path).
+//   kTensorizer: the experimental Linalg/tensorizer backend (use_tensorizer).
+//   kWlo       : Weight Layout Optimization (emits + consumes wrapped_neff.hlo).
+enum class CompileMode { kStandard, kTensorizer, kWlo };
+
 // torch.compile compilation kernels.
 class CompileOnlyKernelExecution : public CompilableKernelExecution, public NeuronKernelExecution {
  public:
   // Default constructor uses GetCompileAdditionalArgs() / GetCompileOptimizationLevel().
   CompileOnlyKernelExecution(const std::string& base_cache_key,
                              const std::vector<uint8_t>& mlir_bytes, bool has_collectives,
-                             bool use_tensorizer = false);
+                             CompileMode mode = CompileMode::kStandard);
 
   // Constructor with explicit compiler config overrides. When additional_args/optimization_level
   // are non-empty, they replace the defaults. Use
@@ -512,6 +529,13 @@ class CompileOnlyKernelExecution : public CompilableKernelExecution, public Neur
                              const std::string& optimization_level, bool use_tensorizer = false);
 
   std::vector<uint8_t> CompileToNeff() const override;
+
+  // WLO override: compiles once via NeuronCompiler::CompileHloToNeffWithWlo and returns
+  // both the NEFF and the wrapped_neff.hlo protobuf. Only active when wlo_enabled_ is set;
+  // otherwise falls back to the base (NEFF-only) behavior.
+  CompileResult CompileToNeffResult() const override;
+
+  bool RequiresWrappedNeffHlo() const override { return wlo_enabled_; }
 
   const std::vector<uint8_t>& GetHloBytes() const override { return mlir_bytes_; }
 
@@ -537,7 +561,8 @@ class CompileOnlyKernelExecution : public CompilableKernelExecution, public Neur
 
  private:
   std::vector<uint8_t> mlir_bytes_;
-  bool use_tensorizer_;
+  bool use_tensorizer_ = false;
+  bool wlo_enabled_ = false;
   // Captured at submit time so async compile uses the correct target/LNC.
   std::string platform_target_;
   std::string logical_neuron_cores_;

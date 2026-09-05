@@ -10,7 +10,7 @@ ServiceCompilationBackend::ServiceCompilationBackend(const std::string& socket_p
   }
 }
 
-std::vector<uint8_t> ServiceCompilationBackend::Compile(
+CompileResult ServiceCompilationBackend::Compile(
     const std::vector<uint8_t>& hlo_bytes, const std::string& ir_type, const std::string& op_name,
     const std::string& cache_key, const std::string& optimization_level,
     const std::string& additional_args, CompileFn /*compile_fn*/) {
@@ -21,7 +21,10 @@ std::vector<uint8_t> ServiceCompilationBackend::Compile(
     throw std::runtime_error(error.empty() ? "Compilation failed: service returned empty NEFF"
                                            : error);
   }
-  return neff_bytes;
+  // The service protocol does not (yet) return wrapped_neff.hlo — see TODO(wlo-service) in the
+  // header. WLO-enabled compiles are kept on the local backend, so this empty wrapped_neff_hlo is
+  // only ever produced for non-WLO compiles that do not consume it.
+  return CompileResult{std::move(neff_bytes), /*wrapped_neff_hlo=*/{}};
 }
 
 }  // namespace at::neuron

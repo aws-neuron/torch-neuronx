@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "torch_neuronx/csrc/core/compilation/CacheEntry.h"
+
 namespace at::neuron {
 
 // Configuration for neuronx-cc compilation.
@@ -28,6 +30,9 @@ struct CompilationConfig {
   static CompilationConfig FromEnvironment();
 };
 
+// CompileResult (NEFF + optional wrapped_neff.hlo) is defined in CacheEntry.h so the compile
+// contract can be shared without depending on this header.
+
 // NeuronCompiler provides functionality to compile modules to NEFF format
 // using the neuronx-cc compiler subprocess. This class handles the entire
 // compilation pipeline from input bytes to executable NEFF files.
@@ -49,6 +54,12 @@ class NeuronCompiler {
   // Throws:
   //   std::runtime_error if compilation fails or neuronx-cc is not found
   static std::vector<uint8_t> CompileHloToNeff(
+      const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
+      const std::string& ir_type = "StableHLO", const std::string& op_name = "",
+      const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");
+
+  // Compiles and returns both NEFF and wrapped_neff.hlo for WLO transform extraction.
+  static CompileResult CompileHloToNeffWithWlo(
       const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
       const std::string& ir_type = "StableHLO", const std::string& op_name = "",
       const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");

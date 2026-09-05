@@ -3,6 +3,7 @@ NEFF execution for TorchNeuronEager async runtime
 """
 
 import logging
+import math
 from typing import Final
 
 import torch
@@ -19,6 +20,10 @@ from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
     TensorSpec,
+)
+from torch_neuronx.neuron_dynamo_backend.wlo_contract import (
+    WLOContractError,
+    validate_transform,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ class Executor:
         retain_device: bool = False,
         pass_mutations: list[PassMutations] | None = None,
         alias_buffer_map: dict[int, int] | None = None,
+        wlo_transforms: list | None = None,
     ):
         """Initialize executor with cache key and I/O specifications.
 
@@ -58,6 +64,9 @@ class Executor:
             retain_device (bool): Whether to cast results back to the input device (default: False)
             pass_mutations (list[PassMutations] | None): Per-pass input/output mutations.
             alias_buffer_map (dict[int, int] | None): NEFF output→input index map for buffer reuse.
+            wlo_transforms (list | None): Weight-layout relayout rules discovered at compile
+                time. Each rule follows the shared contract in wlo_contract (reshape = target
+                dims, transpose = permutation of the reshape rank); see _prepare_inputs.
         """
         self.graph_name = graph_name
         self.cache_key = cache_key
@@ -69,6 +78,18 @@ class Executor:
         self.copy_back_map = get_mutation_copy_back_inputs(self.pass_mutations)
 
         self.retain_device = retain_device
+
+        self.wlo_transforms = wlo_transforms or []
+        self._wlo_cache: dict[int, tuple[int, torch.Tensor]] = {}
+
+        for t in self.wlo_transforms:
+            validate_transform(t)
+            if not 0 <= t["input_index"] < len(self.io_spec.inputs):
+                raise WLOContractError(
+                    f"WLO transform input_index {t['input_index']} out of range for a graph "
+                    f"with {len(self.io_spec.inputs)} input(s); the relayout rules do not match "
+                    "this graph (likely a stale or mismatched cache entry)"
+                )
 
         logger.debug(
             f"Executor initialized: cache_key={cache_key}, has_collectives={has_collectives}"
@@ -128,6 +149,40 @@ class Executor:
                     tensor = tensor.view(self.INT_64_TO_32[tensor.dtype])
             elif tensor.dtype == torch.float64:
                 tensor = tensor.to(torch.float32)
+
+            if self.wlo_transforms:
+                for t in self.wlo_transforms:
+                    if t["input_index"] == i:
+                        ptr = inp.data_ptr() if isinstance(inp, torch.Tensor) else id(inp)
+                        cached = self._wlo_cache.get(i)
+                        if cached is not None and cached[0] == ptr:
+                            tensor = cached[1]
+                        else:
+                            original_shape = tensor.shape
+                            reshape_numel = math.prod(t["reshape"])
+                            if reshape_numel != tensor.numel():
+                                raise RuntimeError(
+                                    f"WLO: transform for input {i} expects {reshape_numel} "
+                                    f"elements (reshape={t['reshape']}) but the runtime tensor "
+                                    f"has {tensor.numel()} (shape={tuple(original_shape)}, "
+                                    f"dtype={tensor.dtype}). The weight-layout rules do not "
+                                    "match this input; refusing to relayout."
+                                )
+                            # Apply the wlo_contract relayout: reshape to the target
+                            # dims, permute, then materialize the optimal byte layout
+                            # with contiguous(). The final reshape is the compiler's
+                            # reshape-back -- reconstructed from original_shape, which
+                            # always equals the weight's original shape -- so the NEFF
+                            # still sees the original shape with only the bytes relaid out.
+                            tensor = (
+                                tensor.reshape(t["reshape"])
+                                .permute(t["transpose"])
+                                .contiguous()
+                                .reshape(original_shape)
+                            )
+                            self._wlo_cache[i] = (ptr, tensor)
+                        break
+
             yield tensor
 
     def _process_outputs(self, outputs):

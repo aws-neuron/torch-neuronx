@@ -5,6 +5,7 @@ Dispatches to compilation worker.
 
 import hashlib
 import io
+import json
 import logging
 import os
 import threading
@@ -84,6 +85,16 @@ def _serialize_mlir_module(mlir, *, use_tensorizer: bool = False) -> bytes:
     return bytecode_buffer.getvalue()
 
 
+def _content_key(mlir_bytes: bytes) -> str:
+    """Compute the NEFF content key for serialized MLIR."""
+    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
+        return hashlib.sha256(mlir_bytes).hexdigest()
+
+    from torch_neuronx.utils import global_version_hash
+
+    return hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
+
+
 def _submit_mlir_bytes(
     mlir_bytes: bytes,
     *,
@@ -91,18 +102,35 @@ def _submit_mlir_bytes(
     use_tensorizer: bool = False,
 ) -> str:
     """Submit serialized MLIR and track its NEFF cache key."""
-    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
-        content_key = hashlib.sha256(mlir_bytes).hexdigest()
-    else:
-        from torch_neuronx.utils import global_version_hash
-
-        content_key = hashlib.sha256(mlir_bytes).hexdigest() + ":" + global_version_hash()
-
     exec_handle = torch_neuronx._C.compile_graph(
-        content_key,
+        _content_key(mlir_bytes),
         mlir_bytes,
         has_collectives,
         use_tensorizer=use_tensorizer,
+    )
+    _add_compiled_cache_key(ArtifactType.NEURON_NEFF, exec_handle)
+    return exec_handle
+
+
+def _submit_mlir_bytes_wlo(mlir_bytes: bytes, *, has_collectives: bool) -> str:
+    """Submit serialized MLIR via the async WLO path and return its execution handle.
+
+    The base key carries a "|wlo" suffix: the C++ CompilationCacheKey infers wlo_enabled from it
+    in one place, so the persistent key stays consistent across every construction site (compile,
+    NeffDirectKernelExecution, put/get_neff_cache).
+
+    The wrapped_neff.hlo sidecar is deliberately NOT fetched here. get_wrapped_neff_hlo blocks until
+    the async compile finishes, which would serialize WLO compiles and defeat the async submit.
+    Instead the sidecar is fetched and parsed lazily when the executor is first built
+    (cache_artifact.NeuronOutputCode._get_executor), letting the compile overlap with the rest of
+    the torch.compile pipeline. The "|wlo" suffix on the returned handle is the marker that path
+    keys off.
+    """
+    exec_handle = torch_neuronx._C.compile_graph(
+        _content_key(mlir_bytes) + "|wlo",
+        mlir_bytes,
+        has_collectives,
+        wlo=True,
     )
     _add_compiled_cache_key(ArtifactType.NEURON_NEFF, exec_handle)
     return exec_handle
@@ -185,8 +213,72 @@ class CompileGraph:
                 "Serialized MLIR does not support use_tensorizer=True; the "
                 "tensorizer path requires the in-process MLIR module."
             )
-        return _submit_mlir_bytes(
-            self.serialize(),
-            has_collectives=self.has_collectives,
-            use_tensorizer=self.use_tensorizer,
+
+        has_wlo = not isinstance(self.mlir, bytes | bytearray) and (
+            "mhlo.frontend_attributes" in self.mlir.operation.attributes
         )
+        mlir_bytes = self.serialize()
+
+        if not has_wlo and b"transposable_weight_idx" in mlir_bytes:
+            raise RuntimeError(
+                "WLO annotation (transposable_weight_idx) found in serialized MLIR that did not "
+                "take the WLO path — likely resumed from a cache that must not carry "
+                "WLO-annotated modules"
+            )
+
+        if not has_wlo:
+            return _submit_mlir_bytes(
+                mlir_bytes,
+                has_collectives=self.has_collectives,
+                use_tensorizer=self.use_tensorizer,
+            )
+
+        # WLO: submit async and return the handle. The wrapped_neff.hlo sidecar (and the weight
+        # transforms parsed from it) is fetched lazily at executor-build time, not here — see
+        # _submit_mlir_bytes_wlo. The "|wlo" handle carries the marker the executor keys off.
+        exec_handle = _submit_mlir_bytes_wlo(mlir_bytes, has_collectives=self.has_collectives)
+        logger.debug(
+            f"WLO: async submit complete, sidecar deferred; execution_cache_key={exec_handle}"
+        )
+        return exec_handle
+
+
+def _parse_wrapped_neff_hlo(hlo_bytes: bytes) -> list[dict]:
+    """Parse wrapped_neff.hlo protobuf to extract weight transforms.
+
+    Runs in a subprocess to avoid protobuf descriptor conflicts.
+    Returns list of dicts: {input_index, reshape, transpose}
+    """
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    if not hlo_bytes:
+        return []
+
+    with tempfile.NamedTemporaryFile(suffix=".hlo", delete=False) as f:
+        f.write(hlo_bytes)
+        hlo_path = f.name
+
+    try:
+        parser_module = Path(__file__).parent / "wlo_hlo_parser.py"
+        try:
+            result = subprocess.run(
+                [sys.executable, str(parser_module), hlo_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError("WLO: HLO parsing timed out after 120s") from e
+    finally:
+        Path(hlo_path).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"WLO: HLO parsing failed: {result.stderr[-300:]}")
+
+    output = result.stdout.strip()
+    if not output:
+        return []
+    return json.loads(output)

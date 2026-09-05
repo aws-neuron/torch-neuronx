@@ -1988,16 +1988,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("cache_key"), py::arg("python_stack_trace"), py::arg("has_collectives"),
       py::arg("cpu_fallback_context") = py::none(), py::arg("hierarchy_string") = "");
 
-  // torch.compile: compile MLIR to NEFF and store in cache.
   m.def(
       "compile_graph",
       [](const std::string& base_cache_key, py::bytes mlir_bytes, bool has_collectives,
-         bool use_tensorizer) -> std::string {
+         bool use_tensorizer, bool wlo) -> std::string {
+        if (wlo && use_tensorizer) {
+          throw std::runtime_error(
+              "compile_graph: wlo=True is not supported with use_tensorizer=True");
+        }
         std::string_view mlir_str = mlir_bytes.cast<std::string_view>();
         std::vector<uint8_t> mlir_vec(mlir_str.begin(), mlir_str.end());
 
+        auto mode = wlo ? at::neuron::CompileMode::kWlo
+                        : (use_tensorizer ? at::neuron::CompileMode::kTensorizer
+                                          : at::neuron::CompileMode::kStandard);
         auto compile_kernel = std::make_unique<at::neuron::CompileOnlyKernelExecution>(
-            base_cache_key, mlir_vec, has_collectives, use_tensorizer);
+            base_cache_key, mlir_vec, has_collectives, mode);
         std::string cache_key = compile_kernel->GetCompileKey();
 
         auto context =
@@ -2008,8 +2014,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         at::neuron::SubmitOperationContext(stream, std::move(context));
         return cache_key;
       },
-      "Compile MLIR to NEFF and store in cache, return final cache key", py::arg("base_cache_key"),
-      py::arg("mlir_bytes"), py::arg("has_collectives"), py::arg("use_tensorizer") = false);
+      "Compile MLIR to NEFF and store in cache, return final cache key (wlo=True emits a "
+      "wrapped_neff.hlo sidecar recoverable via get_wrapped_neff_hlo)",
+      py::arg("base_cache_key"), py::arg("mlir_bytes"), py::arg("has_collectives"),
+      py::arg("use_tensorizer") = false, py::arg("wlo") = false);
+
+  m.def(
+      "get_wrapped_neff_hlo",
+      [](const std::string& cache_key) -> py::bytes {
+        std::vector<uint8_t> wrapped_hlo;
+        {
+          py::gil_scoped_release release;
+          auto& cache = at::neuron::NeuronResourceManager::Instance().GetCompilationCache();
+          wrapped_hlo = cache.GetWrappedNeffHlo(cache_key);
+        }
+        return py::bytes(reinterpret_cast<const char*>(wrapped_hlo.data()), wrapped_hlo.size());
+      },
+      "Wait for the WLO compile of cache_key and return its wrapped_neff.hlo sidecar bytes",
+      py::arg("cache_key"));
 
   // Expose the eager dispatch's compiler configuration so precompile paths can use it.
   // Returns (additional_args, optimization_level) matching XLACompilableKernelExecution.
