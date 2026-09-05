@@ -202,7 +202,13 @@ def build_pytest_argv(
     for ign in args.ignore:
         argv.append(f"--ignore={TEST_ROOT}/{ign}")
     argv.extend(extra)
-    argv.extend(f"{TEST_ROOT}/{item}" for item in args.items)
+    # The "torch_test_root_files" sentinel resolves to the test root itself so pytest
+    # collects the whole directory.  Every dedicated-node item is already in
+    # args.ignore for this node (populated by expand_distribution_config).
+    argv.extend(
+        TEST_ROOT if item == "torch_test_root_files" else f"{TEST_ROOT}/{item}"
+        for item in args.items
+    )
     return argv
 
 

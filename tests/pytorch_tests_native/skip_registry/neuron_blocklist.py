@@ -446,4 +446,54 @@ BLOCKLIST: list[SkipGroup] = [
         ),
         tests=["dynamo/test_list.py"],
     ),
+    SkipGroup(
+        reason="Uncovered directories — not applicable to Neuron device execution",
+        tests=[
+            "autograd",  # CPython GC lifecycle tests, not device ops
+            "cpython",  # CPython stdlib tests via Dynamo; top-level path missing (dynamo/cpython listed)  # noqa: E501
+            "metal",  # Apple Metal GPU
+            "spincli",  # Meta-internal spin CLI tool
+        ],
+    ),
+    SkipGroup(
+        reason="CUDA, Triton, or pure infrastructure — no Neuron device execution",
+        tests=[
+            # CUDA-specific
+            "test_cuda_graph_debug.py",
+            "test_cuda_graph_utils.py",
+            # Triton/inductor
+            "test_triton_utils.py",
+            "test_appending_byte_serializer.py",  # module: inductor internal serializer
+            # Threading and CPU topology
+            "test_tsan.py",  # thread sanitizer
+            "test_openmp.py",  # OpenMP CPU threading
+            "test_numa_binding.py",  # NUMA CPU topology
+            # Network-dependent
+            "test_hub.py",  # downloads models from GitHub at runtime
+            # Pure infrastructure, no device
+            "test_tensorboard.py",
+            "test_throughput_benchmark.py",
+            "test_functional_autograd_benchmark.py",  # launches benchmark subprocesses
+            "test_compile_benchmark_util.py",  # module: dynamo benchmark utility
+            "test_torch_config_hash_determinism.py",  # config hash strings, CPU only
+            "test_file_check.py",  # FileCheck IR string matcher
+            "test_function_schema.py",  # ATen schema parsing
+            "test_sympy_utils.py",  # symbolic math utilities, CPU only
+            "test_public_bindings.py",  # torch.__all__ API surface check
+            "test_inspect_utils.py",  # module: fx introspection utilities
+            "test_comparison_utils.py",  # module: internals testing utilities
+            "test_utils_filelock.py",  # file lock utility
+            "test_per_overload_api.py",  # ATen per-overload API metadata
+            "test_native_functions.py",  # ATen native function schema validation
+            "test_monitor.py",  # oncall: r2p monitoring infrastructure
+            "test_schema_check.py",  # oncall: jit schema validation
+            "test_extension_utils.py",  # extension loading utilities, CPU only
+            "test_multiprocessing.py",  # CPU multiprocessing (fork/spawn/shared memory)
+            "test_multiprocessing_spawn.py",  # CPU multiprocessing spawn
+            "test_utils_config_module.py",  # torch config module infrastructure
+            # Typing stubs only
+            "test_type_hints.py",
+            "test_typing.py",
+        ],
+    ),
 ]
