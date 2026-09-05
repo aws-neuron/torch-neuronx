@@ -165,6 +165,7 @@ def convert_fx_to_stablehlo(
     aliasing_info: dict[int, int] | None = None,
     *,
     job: CompilationJob | None = None,
+    static_input_indices: list[int] | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
     """
     Convert FX GraphModule to StableHLO using torch-mlir with collective support
@@ -270,4 +271,10 @@ def convert_fx_to_stablehlo(
         _set_dynamic_dim_constraints(raw_module, dynamic_dim_constraints)
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
+    if static_input_indices:
+        idx_str = ",".join(str(i) for i in static_input_indices)
+        with raw_module.context:
+            raw_module.operation.attributes["mhlo.frontend_attributes"] = mlir_ir.DictAttr.get(
+                {"transposable_weight_idx": mlir_ir.StringAttr.get(idx_str)}
+            )
     return raw_module, io_spec, cast_spec

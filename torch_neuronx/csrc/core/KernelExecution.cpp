@@ -191,7 +191,9 @@ std::string CompileOnlyKernelExecution::GetCompileOptimizationLevel() {
 
 CompileOnlyKernelExecution::CompileOnlyKernelExecution(const std::string& base_cache_key,
                                                        const std::vector<uint8_t>& mlir_bytes,
-                                                       bool has_collectives, bool use_tensorizer)
+                                                       bool has_collectives, CompileMode mode)
+    // WLO identity rides on the "|wlo" suffix of base_cache_key (added by the frontend), which
+    // CompilationCacheKey inspects; no separate flag is threaded through the key.
     : CompilableKernelExecution(CompilationCacheKey(base_cache_key, GetCompileAdditionalArgs(),
                                                     GetCompileOptimizationLevel(), &mlir_bytes_,
                                                     CacheKeySource::TORCH_COMPILE),
@@ -199,7 +201,8 @@ CompileOnlyKernelExecution::CompileOnlyKernelExecution(const std::string& base_c
                                 has_collectives),
       NeuronKernelExecution("torch_compile", -1, false),
       mlir_bytes_(mlir_bytes),
-      use_tensorizer_(use_tensorizer),
+      use_tensorizer_(mode == CompileMode::kTensorizer),
+      wlo_enabled_(mode == CompileMode::kWlo),
       platform_target_(utils::GetPlatformTarget()),
       logical_neuron_cores_(utils::GetLogicalNeuronCores()) {}
 
@@ -237,6 +240,35 @@ std::vector<uint8_t> CompileOnlyKernelExecution::CompileToNeff() const {
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string(use_tensorizer_ ? "Linalg" : "StableHLO") +
                              " to NEFF compilation failed: " + std::string(e.what()));
+  }
+}
+
+CompileResult CompileOnlyKernelExecution::CompileToNeffResult() const {
+  // Non-WLO kernels: NEFF only, empty wrapped_neff.hlo.
+  if (!wlo_enabled_) {
+    return CompileResult{CompileToNeff(), /*wrapped_neff_hlo=*/{}};
+  }
+
+  if (mlir_bytes_.empty()) throw std::invalid_argument("Cannot compile: no MLIR bytes available");
+
+  // WLO does not support the tensorizer/Linalg route; that path emits no wrapped_neff.hlo.
+  if (use_tensorizer_) {
+    throw std::runtime_error(
+        "WLO (weight_layout_optimization) is not supported with the tensorizer backend");
+  }
+
+  try {
+    CompilationConfig config{.framework = "XLA",
+                             .platform_target = platform_target_,
+                             .logical_neuron_cores = logical_neuron_cores_,
+                             .optimization_level = GetOptimizationLevel(),
+                             .additional_args = GetAdditionalArgs()};
+    return NeuronCompiler::CompileHloToNeffWithWlo(mlir_bytes_, config, "StableHLO",
+                                                   "torch_compile_wlo", GetCompileKey(),
+                                                   "CompileOnlyKernelExecution");
+  } catch (const std::exception& e) {
+    throw std::runtime_error("StableHLO to NEFF (WLO) compilation failed: " +
+                             std::string(e.what()));
   }
 }
 

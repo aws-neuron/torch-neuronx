@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 #include "torch_neuronx/csrc/core/cache/CacheUtils.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
@@ -18,11 +19,21 @@ namespace {
 // 0xFF is chosen because it cannot appear in valid UTF-8 strings.
 constexpr uint8_t kFieldSeparator = 0xFF;
 
+// Marker that the frontend appends to a base key for a Weight Layout Optimization compile.
+// WLO is inferred from this suffix in one place, so every CompilationCacheKey construction site
+// (torch.compile, NeffDirectKernelExecution, put/get_neff_cache) derives the same identity.
+constexpr std::string_view kWloSuffix = "|wlo";
+
+bool WloEnabledFromKey(const std::string& base_key) {
+  return base_key.size() >= kWloSuffix.size() &&
+         base_key.compare(base_key.size() - kWloSuffix.size(), kWloSuffix.size(), kWloSuffix) == 0;
+}
+
 }  // namespace
 
 std::string CompilationCacheKey::BuildCompilerExtension() const {
   return platform_target_ + "_" + logical_neuron_cores_ + "_" + optimization_level_ + "_" +
-         compiler_args_ + "_v" + compiler_version_;
+         compiler_args_ + "_v" + compiler_version_ + (wlo_enabled_ ? "_wlo" : "");
 }
 
 const char* CompilationCacheKey::SourceName(CacheKeySource source) {
@@ -48,10 +59,11 @@ CompilationCacheKey::CompilationCacheKey(const std::string& base_key,
       logical_neuron_cores_(utils::GetLogicalNeuronCores()),
       compiler_version_(utils::GetCompilerVersion()),
       hlo_bytes_ptr_(hlo_bytes_ptr),
-      source_(source) {}
+      source_(source),
+      wlo_enabled_(WloEnabledFromKey(base_key_)) {}
 
 CompilationCacheKey::CompilationCacheKey(const std::string& key, CacheKeySource source)
-    : base_key_(key), source_(source) {}
+    : base_key_(key), source_(source), wlo_enabled_(WloEnabledFromKey(key)) {}
 
 const std::string* CompilationCacheKey::GetPersistentKey() const {
   if (base_key_.empty()) {

@@ -14,6 +14,12 @@ from torch.fx.passes.pass_manager import PassManager
 from tests.neuron_dynamo_backend.unit.utils.test_utils import get_aot_graphs
 from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.neuron_dynamo_backend import backend
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+    translate_input_indices_to_neff,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dynamic_shape_analysis import (
     DynamicShapeAnalysis,
 )
@@ -81,6 +87,7 @@ class TestCompileFxToStablehlo:
                 example_inputs,
                 None,
                 job=job,
+                static_input_indices=None,
             )
 
             # Verify stablehlo file was saved to debug directory
@@ -1117,7 +1124,7 @@ class TestMakeFallbackFn:
 
         fn = backend._make_fallback_fn(mock_gm, pass_mutations=pass_mutations)
 
-        t0, t1, t2, t3, t4 = [torch.randn(i + 1) for i in range(5)]
+        t0, t1, t2, t3, t4 = (torch.randn(i + 1) for i in range(5))
         fn([t0, t1, t2, t3, t4])
 
         args = mock_gm.forward.call_args[0]
@@ -1384,3 +1391,87 @@ class TestHasCollectivesInGraph:
         gm = self._graph_with_call(torch.ops._c10d_functional.all_reduce.default)
 
         assert backend._has_collectives_in_graph(gm) is True
+
+
+class TestFilterWloIndices:
+    """_filter_wlo_indices keeps only floating-point weight inputs (caller space).
+
+    Only float weights are transposed by the compiler, and the runtime's int64->int32
+    .view() would change a 64-bit input's element count before the relayout runs, so
+    non-float (and non-tensor) inputs are excluded. Index-space shifts from FX passes
+    are no longer handled here — they are remapped in _wlo_static_input_indices.
+    """
+
+    def test_none_or_empty_returns_none(self):
+        assert backend._filter_wlo_indices(None, []) is None
+        assert backend._filter_wlo_indices([], [torch.randn(2)]) is None
+
+    def test_keeps_only_floating_point_tensors(self):
+        # 0=non-tensor(mesh), 1=fp32, 2=int64, 3=bf16, 4=fp64
+        example_inputs = [
+            MagicMock(),
+            torch.randn(4, 6),
+            torch.arange(8, dtype=torch.int64).reshape(4, 2),
+            torch.randn(3, 3, dtype=torch.bfloat16),
+            torch.randn(2, 2, dtype=torch.float64),
+        ]
+        result = backend._filter_wlo_indices([0, 1, 2, 3, 4], example_inputs)
+        assert result == [1, 3, 4]  # non-tensor and int64 dropped; all float kinds kept
+
+    def test_no_float_candidates_returns_none(self):
+        example_inputs = [torch.arange(8, dtype=torch.int64).reshape(4, 2)]
+        assert backend._filter_wlo_indices([0], example_inputs) is None
+
+
+class TestWloIndexRemap:
+    """WLO weight indices are remapped from caller/original space to the NEFF/post-pass
+    space (via translate_input_indices_to_neff) so WLO survives FX passes that add/remove
+    placeholders — where the previous implementation disabled WLO entirely."""
+
+    @staticmethod
+    def _pm(input_mutations):
+        return PassMutations(pass_name="p", input_mutations=input_mutations)
+
+    def test_identity_when_no_mutations(self):
+        assert translate_input_indices_to_neff([1, 3], []) == [1, 3]
+
+    def test_add_at_or_below_shifts_up(self):
+        # a placeholder added at index 0 pushes weights [1,3] -> [2,4]
+        pm = self._pm([IOMutation(kind=MutationKind.ADD, indices=[0], transform_key="none")])
+        assert translate_input_indices_to_neff([1, 3], [pm]) == [2, 4]
+
+    def test_remove_below_shifts_down(self):
+        # removing index 0 pulls weights [1,3] -> [0,2]
+        pm = self._pm([IOMutation(kind=MutationKind.REMOVE, indices=[0])])
+        assert translate_input_indices_to_neff([1, 3], [pm]) == [0, 2]
+
+    def test_remove_at_weight_drops_it(self):
+        # removing index 1 drops that weight; 3 shifts down to 2
+        pm = self._pm([IOMutation(kind=MutationKind.REMOVE, indices=[1])])
+        assert translate_input_indices_to_neff([1, 3], [pm]) == [2]
+
+    def test_add_above_all_weights_is_noop(self):
+        pm = self._pm([IOMutation(kind=MutationKind.ADD, indices=[4], transform_key="none")])
+        assert translate_input_indices_to_neff([1, 3], [pm]) == [1, 3]
+
+    def test_multiple_passes_compose_in_order(self):
+        # pass A adds at 0 ([1,3]->[2,4]); pass B removes at 0 ([2,4]->[1,3])
+        add = self._pm([IOMutation(kind=MutationKind.ADD, indices=[0], transform_key="none")])
+        rem = self._pm([IOMutation(kind=MutationKind.REMOVE, indices=[0])])
+        assert translate_input_indices_to_neff([1, 3], [add, rem]) == [1, 3]
+
+    def test_wlo_static_input_indices_applies_remap(self):
+        # end-to-end: options on, inference graph, float weights at caller [1,2], an FX
+        # pass adds a placeholder at 0 -> stamped NEFF indices shift up to [2,3].
+        example_inputs = [MagicMock(), torch.randn(2, 2), torch.randn(2, 2)]
+        pm = self._pm([IOMutation(kind=MutationKind.ADD, indices=[0], transform_key="none")])
+        fake_ctx = MagicMock()
+        fake_ctx.fw_metadata.static_input_indices = [1, 2]
+        with patch.object(backend.TracingContext, "try_get", return_value=fake_ctx):
+            result = backend._wlo_static_input_indices(
+                {"weight_layout_optimization": True},
+                example_inputs,
+                "model__0_inference_0",
+                [pm],
+            )
+        assert result == [2, 3]

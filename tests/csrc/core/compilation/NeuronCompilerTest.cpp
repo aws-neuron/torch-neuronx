@@ -28,7 +28,8 @@ class MockCompilerHelper {
   // Creates a mock neuronx-cc script in a bin/ subdirectory to avoid collision
   // with the neuronx-cc/ workdir hierarchy created by GetCompilationWorkdir.
   static std::string CreateMockScript(const std::string& temp_dir, int exit_code,
-                                      const std::string& output_content = "") {
+                                      const std::string& output_content = "",
+                                      const std::string& sidecar_content = "") {
     std::string bin_dir = temp_dir + "/bin";
     std::filesystem::create_directories(bin_dir);
     std::string script_path = bin_dir + "/neuronx-cc";
@@ -42,6 +43,10 @@ class MockCompilerHelper {
              << "  [[ \"${!i}\" == \"--output\" ]] && { j=$((i+1)); echo -n '" << output_content
              << "' > \"${!j}\"; break; }\n"
              << "done\n";
+    }
+    // WLO: emit a wrapped_neff.hlo sidecar in the workdir (the compiler's cwd).
+    if (exit_code == 0 && !sidecar_content.empty()) {
+      script << "echo -n '" << sidecar_content << "' > wrapped_neff.hlo\n";
     }
     script << "exit " << exit_code << "\n";
     script.close();
@@ -67,6 +72,12 @@ class NeuronCompilerTest : public ::testing::Test {
   void SetupMockCompiler(int exit_code = 0, const std::string& output = "mock_neff") {
     MockCompilerHelper::CreateMockScript(temp_dir_, exit_code, output);
     // Use bin/ subdirectory in PATH to avoid collision with neuronx-cc/ workdir
+    setenv("PATH", (temp_dir_ + "/bin:" + original_path_).c_str(), 1);
+  }
+
+  // Mock compiler that also emits a wrapped_neff.hlo sidecar (for the WLO path).
+  void SetupMockCompilerWithSidecar(const std::string& output, const std::string& sidecar) {
+    MockCompilerHelper::CreateMockScript(temp_dir_, 0, output, sidecar);
     setenv("PATH", (temp_dir_ + "/bin:" + original_path_).c_str(), 1);
   }
 
@@ -418,7 +429,7 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) 
     lines.push_back(line);
   }
 
-  ASSERT_EQ(lines.size(), 8u);
+  ASSERT_EQ(lines.size(), 9u);
   EXPECT_EQ(lines[0], "test_op");
   EXPECT_EQ(lines[1], "test_cache_key");
   EXPECT_EQ(lines[2], "TestKernel");
@@ -427,6 +438,7 @@ TEST_F(NeuronCompilerTest, PreserveArtifacts_MetadataTxtContainsExpectedFields) 
   EXPECT_EQ(lines[5], "2");
   EXPECT_EQ(lines[6], "-O2");
   EXPECT_EQ(lines[7], "StableHLO");
+  EXPECT_EQ(lines[8], "wlo_disabled");
 
   // Verify compiler.txt content
   std::ifstream compiler_args_file(workdirs[0] + "/compiler.txt");
@@ -844,6 +856,51 @@ TEST_F(NeuronCompilerTest, CompilerTxt_NoQuotesForSimpleArgs) {
       << "Simple args should appear without quotes. Got: " << content;
   EXPECT_EQ(content.find("'--model-type"), std::string::npos)
       << "Simple args should not be quoted. Got: " << content;
+}
+
+TEST_F(NeuronCompilerTest, CompileHloToNeffWithWlo_ReturnsNeffAndSidecar) {
+  SetupMockCompilerWithSidecar("wlo_neff_data", "wrapped_hlo_bytes");
+
+  std::vector<uint8_t> hlo = {0x01, 0x02, 0x03, 0x04};
+  CompileResult result = NeuronCompiler::CompileHloToNeffWithWlo(hlo, CreateTestConfig());
+
+  EXPECT_EQ(std::string(result.neff_bytes.begin(), result.neff_bytes.end()), "wlo_neff_data");
+  EXPECT_EQ(std::string(result.wrapped_neff_hlo.begin(), result.wrapped_neff_hlo.end()),
+            "wrapped_hlo_bytes");
+}
+
+TEST_F(NeuronCompilerTest, CompileHloToNeffWithWlo_EmptySidecarWhenCompilerEmitsNone) {
+  // No wrapped_neff.hlo produced (compiler chose no relayout): NEFF still returned, sidecar empty.
+  SetupMockCompiler(0, "wlo_neff_no_sidecar");
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  CompileResult result = NeuronCompiler::CompileHloToNeffWithWlo(hlo, CreateTestConfig());
+
+  EXPECT_EQ(std::string(result.neff_bytes.begin(), result.neff_bytes.end()), "wlo_neff_no_sidecar");
+  EXPECT_TRUE(result.wrapped_neff_hlo.empty());
+}
+
+TEST_F(NeuronCompilerTest, CompileHloToNeffWithWlo_WritesMetadataAndCompilerTxtUnderPreserve) {
+  // Parity with CompileHloToNeff: the WLO path writes both metadata.txt and compiler.txt when
+  // artifact preservation is on.
+  SetupMockCompilerWithSidecar("wlo_neff", "wlo_sidecar");
+  setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1", 1);
+  setenv("TORCH_NEURONX_DEBUG_DIR", temp_dir_.c_str(), 1);
+
+  std::vector<uint8_t> hlo = {0x01, 0x02};
+  NeuronCompiler::CompileHloToNeffWithWlo(hlo, CreateTestConfig());
+
+  auto workdirs = FindWorkdirs(temp_dir_);
+  ASSERT_EQ(workdirs.size(), 1u);
+  VerifyMetadataFiles(workdirs[0]);  // metadata.txt AND compiler.txt
+
+  // The WLO flag (last metadata line) records that WLO was requested.
+  std::ifstream metadata_file(workdirs[0] + "/metadata.txt");
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(metadata_file, line)) lines.push_back(line);
+  ASSERT_EQ(lines.size(), 9u);
+  EXPECT_EQ(lines[8], "wlo_enabled");
 }
 
 int main(int argc, char** argv) {

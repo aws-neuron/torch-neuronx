@@ -699,6 +699,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "WloCompileResultTest",
+    srcs = ["core/compilation/WloCompileResultTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
     name = "CompilationThreadPoolTest",
     srcs = ["core/compilation/CompilationThreadPoolTest.cpp"],
     deps = ["//:compilation"],

@@ -29,8 +29,12 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
 
   static void ResetCompileCounter() { GetCompileCounter().store(0); }
 
-  MockNeuronKernelExecution(const std::string& cache_key)
-      : CompilableKernelExecution(cache_key, "", "", false), hlo_bytes_({'H', 'L', 'O', '_'}) {
+  MockNeuronKernelExecution(const std::string& cache_key, bool wlo_enabled = false)
+      // WLO identity rides on the "|wlo" suffix of the base key, which CompilationCacheKey infers.
+      : CompilableKernelExecution(CompilationCacheKey(wlo_enabled ? cache_key + "|wlo" : cache_key,
+                                                      "", "", nullptr, CacheKeySource::UNKNOWN),
+                                  "", "", false),
+        hlo_bytes_({'H', 'L', 'O', '_'}) {
     hlo_bytes_.insert(hlo_bytes_.end(), cache_key.begin(), cache_key.end());
     GetCompilationCacheKey().SetHloBytesPtr(&hlo_bytes_);
   }
@@ -2415,6 +2419,133 @@ TEST_F(CompilationCacheTest, CrossCommitReuse_SameHloDifferentBaseKeyHitsPersist
   // No new compile — persistent cache served the previous NEFF.
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
   EXPECT_TRUE(k2.HasCachedNeff());
+}
+
+// WLO mock kernel: advertises RequiresWrappedNeffHlo and emits a wrapped_neff.hlo
+// sidecar of a configurable size alongside the (base-class) NEFF, so we can assert
+// the sidecar is stored on the cache entry and counted in memory accounting.
+class WloMockKernelExecution : public MockNeuronKernelExecution {
+ public:
+  WloMockKernelExecution(const std::string& cache_key, size_t sidecar_size)
+      : MockNeuronKernelExecution(cache_key, /*wlo_enabled=*/true), sidecar_size_(sidecar_size) {}
+
+  bool RequiresWrappedNeffHlo() const override { return true; }
+  CompileResult CompileToNeffResult() const override {
+    return CompileResult{CompileToNeff(), std::vector<uint8_t>(sidecar_size_, 0xAB)};
+  }
+
+ private:
+  size_t sidecar_size_;
+};
+
+TEST_F(CompilationCacheTest, WrappedNeffHloIsStoredAndCounted) {
+  // A WLO compile stores the wrapped_neff.hlo sidecar on the cache entry...
+  WloMockKernelExecution wlo_kernel("wlo_key", /*sidecar_size=*/4096);
+  cache_->GetOrCompileNeff(wlo_kernel, /*stream_id=*/1);
+
+  auto entry = cache_->GetEntry(wlo_kernel.GetCompileKey());
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->wrapped_neff_hlo.size(), 4096u);
+
+  // ...and that sidecar counts toward the cache's memory footprint. Compare against
+  // a fresh cache holding a non-WLO entry with the SAME NEFF (identical cache key ->
+  // identical MockNeuronKernelExecution NEFF bytes), whose sidecar is empty. The only
+  // difference is the 4096-byte sidecar, so the WLO cache must report more memory.
+  auto plain_cache = std::make_unique<CompilationCache>();
+  MockNeuronKernelExecution plain_kernel("wlo_key");
+  plain_cache->GetOrCompileNeff(plain_kernel, /*stream_id=*/1);
+
+  EXPECT_GT(cache_->GetMemoryUsageBytes(), plain_cache->GetMemoryUsageBytes());
+}
+
+TEST_F(CompilationCacheTest, ZeroTransformWloHitsPersistentCacheAcrossInstances) {
+  // A WLO compile that yields NO transforms (empty wrapped_neff.hlo) must still be a
+  // cacheable positive — a fresh process must hit the persistent cache, not recompile every
+  // run. The version-tagged sidecar marker is what makes the empty case distinguishable from
+  // "sidecar missing".
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  WloMockKernelExecution k1("zero_xform_wlo", /*sidecar_size=*/0);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+  auto e1 = cache_->GetEntry(k1.GetCompileKey());
+  ASSERT_NE(e1, nullptr);
+  EXPECT_TRUE(e1->wrapped_neff_hlo.empty());  // zero transforms
+
+  // Fresh instance on the same persistent dir simulates a new process.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  WloMockKernelExecution k2("zero_xform_wlo", /*sidecar_size=*/0);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);  // hit, no recompile
+  EXPECT_TRUE(k2.HasCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, WloSidecarRecoveredAcrossInstances) {
+  // A WLO compile with N transforms persists the sidecar; a fresh process recovers the
+  // exact payload (version marker stripped) without recompiling.
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  WloMockKernelExecution k1("nonzero_xform_wlo", /*sidecar_size=*/128);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  WloMockKernelExecution k2("nonzero_xform_wlo", /*sidecar_size=*/128);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);  // hit, no recompile
+
+  auto e2 = fresh_cache->GetEntry(k2.GetCompileKey());
+  ASSERT_NE(e2, nullptr);
+  EXPECT_EQ(e2->wrapped_neff_hlo, std::vector<uint8_t>(128, 0xAB));  // payload recovered, no marker
+}
+
+TEST_F(CompilationCacheTest, WloAndNonWloSameCacheKeyDoNotCollide) {
+  // Same base cache_key, one non-WLO and one WLO. Because WLO-ness is part of the key, they
+  // occupy distinct entries — a WLO request is never served the non-WLO NEFF.
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  MockNeuronKernelExecution plain("shared_key");
+  cache_->GetOrCompileNeff(plain, /*stream_id=*/1);
+
+  WloMockKernelExecution wlo("shared_key", /*sidecar_size=*/64);
+  cache_->GetOrCompileNeff(wlo, /*stream_id=*/1);
+
+  // Two distinct entries, two compiles — no collision.
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2);
+  EXPECT_NE(plain.GetCompileKey(), wlo.GetCompileKey());
+  auto wlo_entry = cache_->GetEntry(wlo.GetCompileKey());
+  ASSERT_NE(wlo_entry, nullptr);
+  EXPECT_EQ(wlo_entry->wrapped_neff_hlo.size(), 64u);
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloReturnsSidecar) {
+  // After a WLO compile completes, GetWrappedNeffHlo returns the entry's wrapped_neff.hlo sidecar.
+  WloMockKernelExecution wlo("wlo_fetch", /*sidecar_size=*/64);
+  cache_->GetOrCompileNeff(wlo, /*stream_id=*/1);
+  EXPECT_EQ(cache_->GetWrappedNeffHlo(wlo.GetCompileKey()), std::vector<uint8_t>(64, 0xAB));
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloFailsClosedWhenAbsent) {
+  // No pending compile and no cached entry -> after the bounded wait for an async submit to
+  // register, fail closed rather than return an empty (wrong) sidecar that would run a relaid NEFF
+  // against untransformed weights. A short timeout keeps the test fast.
+  EXPECT_THROW(cache_->GetWrappedNeffHlo("no_such_key", std::chrono::milliseconds(50)),
+               std::runtime_error);
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloWaitsForAsyncRegistration) {
+  // A' fix: the WLO fetch can run before the async submit has registered the pending compile.
+  // GetWrappedNeffHlo must WAIT for the key to appear (rather than fail immediately). Here a
+  // producer thread compiles shortly after we begin waiting; the fetch should block, then return
+  // the sidecar once the compile is registered/completed.
+  WloMockKernelExecution wlo("wlo_async_fetch", /*sidecar_size=*/32);
+  std::thread producer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cache_->GetOrCompileNeff(wlo, /*stream_id=*/2);
+  });
+  auto sidecar = cache_->GetWrappedNeffHlo(wlo.GetCompileKey(), std::chrono::seconds(10));
+  producer.join();
+  EXPECT_EQ(sidecar, std::vector<uint8_t>(32, 0xAB));
 }
 
 int main(int argc, char** argv) {

@@ -122,7 +122,7 @@ class TestNeuronOutputCode:
             patch("torch_neuronx.python_ops.compilation.hlo_cache.get") as mock_hlo_get,
         ):
             oc._ensure_neff_loaded()
-            mock_compile.assert_called_once_with("key123", b"embedded", False)
+            mock_compile.assert_called_once_with("key123", b"embedded", False, wlo=False)
             mock_hlo_get.assert_not_called()
 
     def test_ensure_neff_loaded_falls_back_to_hlo_cache(self):
@@ -143,7 +143,7 @@ class TestNeuronOutputCode:
             patch("torch_neuronx._C.compile_graph") as mock_compile,
         ):
             oc._ensure_neff_loaded()
-            mock_compile.assert_called_once_with("key123", b"from_cache", False)
+            mock_compile.assert_called_once_with("key123", b"from_cache", False, wlo=False)
 
     def test_ensure_neff_loaded_raises_when_both_miss(self):
         """_ensure_neff_loaded should raise when hlo_bytes is empty and HLO cache misses."""
@@ -153,6 +153,70 @@ class TestNeuronOutputCode:
             pytest.raises(RuntimeError, match="HLO cache miss"),
         ):
             oc._ensure_neff_loaded()
+
+
+class TestNeuronOutputCodeWLO:
+    """WLO async-sidecar path: the wrapped_neff.hlo fetch/parse is deferred from compile() to
+    executor-build time (NeuronOutputCode._get_executor), keyed off the "|wlo" cache-key suffix."""
+
+    def _make_output_code(self, **kwargs):
+        defaults = {
+            "graph_name": "m",
+            "has_collectives": False,
+            "hlo_bytes": b"embedded",
+        }
+        defaults.update(kwargs)
+        return NeuronOutputCode(**defaults)
+
+    def test_ensure_neff_loaded_resubmits_wlo_for_wlo_key(self):
+        """A "|wlo" key must re-submit on the WLO path so a persistent cache hit repopulates the
+        wrapped_neff.hlo sidecar (CompilationCache only loads it when the kernel requires it).
+        Otherwise a cross-process warm load would run the relaid NEFF with no transforms."""
+        oc = self._make_output_code(cache_key="graph:hash|wlo")
+        with patch("torch_neuronx._C.compile_graph") as mock_compile:
+            oc._ensure_neff_loaded()
+        mock_compile.assert_called_once_with("graph:hash|wlo", b"embedded", False, wlo=True)
+
+    def test_ensure_neff_loaded_no_wlo_for_plain_key(self):
+        """A non-WLO key must re-submit on the plain path (wlo=False)."""
+        oc = self._make_output_code(cache_key="graph:hash")
+        with patch("torch_neuronx._C.compile_graph") as mock_compile:
+            oc._ensure_neff_loaded()
+        mock_compile.assert_called_once_with("graph:hash", b"embedded", False, wlo=False)
+
+    def test_get_executor_fetches_and_parses_sidecar_lazily_for_wlo(self):
+        """For a "|wlo" key, _get_executor fetches the sidecar via get_wrapped_neff_hlo, parses it,
+        and passes the transforms to the Executor — all lazily, after _ensure_neff_loaded."""
+        oc = self._make_output_code(cache_key="graph:hash|wlo")
+        transforms = [{"input_index": 0, "reshape": [4, 3], "transpose": [1, 0]}]
+        with (
+            patch("torch_neuronx._C.compile_graph"),
+            patch("torch_neuronx._C.get_wrapped_neff_hlo", return_value=b"sidecar") as mock_get,
+            patch(
+                "torch_neuronx.neuron_dynamo_backend.compile._parse_wrapped_neff_hlo",
+                return_value=transforms,
+            ) as mock_parse,
+            patch("torch_neuronx.neuron_dynamo_backend.executor.Executor") as mock_executor,
+        ):
+            oc._get_executor()
+
+        mock_get.assert_called_once_with("graph:hash|wlo")
+        mock_parse.assert_called_once_with(b"sidecar")
+        assert mock_executor.call_args.kwargs["wlo_transforms"] == transforms
+
+    def test_get_executor_no_sidecar_for_non_wlo(self):
+        """For a non-WLO key, _get_executor never fetches a sidecar and builds the Executor with no
+        transforms."""
+        oc = self._make_output_code(cache_key="graph:hash")
+        with (
+            patch("torch_neuronx._C.compile_graph"),
+            patch("torch_neuronx._C.get_wrapped_neff_hlo") as mock_get,
+            patch("torch_neuronx.neuron_dynamo_backend.executor.Executor") as mock_executor,
+        ):
+            oc._get_executor()
+
+        mock_get.assert_not_called()
+        assert mock_executor.call_args.kwargs["wlo_transforms"] == []
 
 
 class TestLoadGuardsStateTracingFix:

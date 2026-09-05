@@ -70,7 +70,8 @@ class CompilationCache {
   // Args:
   //   kernel_execution: Execution context containing IR and receiving compiled NEFF
   //   stream_id: Stream identifier for logging and debugging
-  void GetOrCompileNeff(const CompilableKernelExecution& kernel_execution, uint32_t stream_id);
+  std::shared_ptr<CacheEntry> GetOrCompileNeff(const CompilableKernelExecution& kernel_execution,
+                                               uint32_t stream_id);
 
   // Async compilation with callback. Delegates to the active CompilationBackend.
   //
@@ -159,6 +160,11 @@ class CompilationCache {
   // Thread-safe. Used by MegaCache integration to retrieve NEFF info.
   std::shared_ptr<CacheEntry> GetEntry(const std::string& cache_key) const;
 
+  // Recovers the wrapped_neff.hlo sidecar for a WLO compile submitted asynchronously (stream path
+  // with wlo=true).
+  std::vector<uint8_t> GetWrappedNeffHlo(
+      const std::string& cache_key, std::chrono::milliseconds timeout = std::chrono::seconds(300));
+
   // Creates a managed pointer to NEFF bytes with automatic lifecycle tracking.
   //
   // The returned pointer automatically marks the cache entry as active during
@@ -199,6 +205,12 @@ class CompilationCache {
   };
   std::unordered_map<std::string, PendingCompilation> pending_compilations_;
 
+  // Signaled (under cache_mutex_) whenever a key becomes pending or cached, so an async WLO
+  // fetch (GetWrappedNeffHlo) can wait for the stream worker to register the just-submitted
+  // compile instead of racing ahead of it. condition_variable_any because cache_mutex_ is a
+  // shared_mutex.
+  std::condition_variable_any cache_cv_;
+
   // Tracks active entries to prevent eviction of in-use NEFFs.
   mutable std::shared_mutex active_entries_mutex_;
   std::unordered_set<std::string> active_cache_keys_;
@@ -220,8 +232,17 @@ class CompilationCache {
   // Persistent cache backend (NFS/local disk)
   std::unique_ptr<PersistentCacheBackend> persistent_cache_;
 
+  // Persistent sidecar cache for WLO wrapped_neff.hlo, keyed by the same persistent key as the
+  // NEFF (distinct file extension). Lets a cross-process WLO cache hit recover the weight-layout
+  // transforms instead of silently running the relaid NEFF with none. Null when caching disabled.
+  std::unique_ptr<PersistentCacheBackend> wrapped_hlo_cache_;
+
   // Compilation backend (local per-rank or shared service)
   std::unique_ptr<CompilationBackend> backend_;
+
+  // Always-local backend, used to force WLO compiles in-process even when backend_ is the shared
+  // service (which cannot yet return wrapped_neff.hlo — see TODO(wlo-service)).
+  std::unique_ptr<CompilationBackend> local_backend_;
 
   // Thread pool for parallel compilation (submits to backend)
   std::unique_ptr<CompilationThreadPool> compilation_pool_;
@@ -292,9 +313,9 @@ class CompilationCache {
   //   cache_key: Cache key of the pending compilation
   //   kernel_execution: Execution context to receive the compiled NEFF
   //   stream_id: Stream identifier for logging
-  void WaitForPendingCompilation(const CompilationCacheKey& key,
-                                 const CompilableKernelExecution& kernel_execution,
-                                 uint32_t stream_id);
+  std::shared_ptr<CacheEntry> WaitForPendingCompilation(
+      const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution,
+      uint32_t stream_id);
 
   // Compiles IR to NEFF and notifies waiting threads.
   // Called when this thread is responsible for compilation (after CheckCacheAndCoordinateWork
@@ -306,8 +327,9 @@ class CompilationCache {
   //   stream_id: Stream identifier for logging
   //   persistent_cache_key: Persistent cache key for file locking and cache storage.
   //                         If nullptr, will be computed internally.
-  void Compile(const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution,
-               uint32_t stream_id);
+  std::shared_ptr<CacheEntry> Compile(const CompilationCacheKey& key,
+                                      const CompilableKernelExecution& kernel_execution,
+                                      uint32_t stream_id);
 
   // Performs actual compilation with file locking for cross-process coordination.
   // Acquires a file lock to prevent duplicate compilations across processes,
