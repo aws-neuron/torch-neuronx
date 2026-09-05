@@ -244,6 +244,72 @@ class TestMedianE2E:
         torch.testing.assert_close(neuron_out.cpu(), cpu_out, rtol=rtol, atol=atol)
 
 
+class TestTopkNanRegression:
+    """Regression for the @AwsNeuronTopK index clamp (TorchToNeuron).
+
+    On all-NaN input the Neuron topk custom call returns index -1 for every
+    slot. The lowering clamps the i64 index with max(idx, 0) before the
+    inverse permute, so a downstream scatter never receives an out-of-range
+    column (NRT 1006 indirect-DMA OOB on the MoE-router-weight gradient).
+
+    Do not compare against CPU: torch.topk on NaN is undefined. The
+    contract this test verifies is that no -1 sentinel escapes and the
+    downstream scatter runs to completion on device.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,k,dtype",
+        [
+            pytest.param((96, 512), 10, torch.bfloat16, id="moe-router-bf16"),
+            pytest.param((96, 512), 10, torch.float32, id="moe-router-f32"),
+            pytest.param((8, 128), 4, torch.bfloat16, id="small-bf16"),
+        ],
+    )
+    def test_topk_all_nan_indices_in_range(self, shape, k, dtype):
+        """Every returned index must be in [0, n) on all-NaN input."""
+        x = torch.full(shape, float("nan"), dtype=dtype)
+
+        def fn(t):
+            return torch.topk(t, k=k)
+
+        with torch.no_grad():
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            _, neuron_indices = compiled_fn(x.to("neuron"))
+
+        n = shape[-1]
+        idx = neuron_indices.cpu()
+        assert idx.dtype == torch.int64
+        assert idx.shape == (*shape[:-1], k)
+        assert bool((idx >= 0).all()), f"topk index below 0: min={idx.min().item()}"
+        assert bool((idx < n).all()), f"topk index >= n: max={idx.max().item()}"
+
+    def test_topk_all_nan_scatter_regression(self):
+        """Feed all-NaN topk indices into scatter and expect no device fault.
+
+        Before the clamp
+            zeros[96,n].scatter_(1, topk(nan)[1], ones)
+        tripped NRT 1006 on the router-weight gradient. With the clamp the
+        same graph must run to completion on device.
+        """
+        n = 512
+        k = 10
+        x = torch.full((96, n), float("nan"), dtype=torch.bfloat16)
+
+        def fn(t):
+            _, indices = torch.topk(t, k=k)
+            zeros = torch.zeros((96, n), dtype=torch.bfloat16, device=t.device)
+            ones = torch.ones((96, k), dtype=torch.bfloat16, device=t.device)
+            return zeros.scatter(1, indices, ones)
+
+        with torch.no_grad():
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            out = compiled_fn(x.to("neuron"))
+
+        out_cpu = out.cpu()
+        assert out.shape == (96, n)
+        assert bool(torch.isfinite(out_cpu).all()), "scatter output has non-finite values"
+
+
 class TestNanmedianE2E:
     """E2E tests for nanmedian decomposition."""
 

@@ -50,11 +50,13 @@ module {
 // CHECK:           %[[VAL_5:.*]] = torch.constant.bool true
 // CHECK:           %[[VAL_6:.*]] = stablehlo.negate %[[VAL_1]] : tensor<10x20x30xf32>
 // CHECK:           %[[VAL_7:.*]]:2 = stablehlo.custom_call @AwsNeuronTopK(%[[VAL_6]]) {backend_config = "6"} : (tensor<10x20x30xf32>) -> (tensor<10x20x6xf32>, tensor<10x20x6xi64>)
-// CHECK:           %[[VAL_8:.*]] = torch_c.from_builtin_tensor %[[VAL_7]]#1 : tensor<10x20x6xi64> -> !torch.vtensor<[10,20,6],si64>
-// CHECK:           %[[VAL_9:.*]] = stablehlo.negate %[[VAL_7]]#0 : tensor<10x20x6xf32>
-// CHECK:           %[[VAL_10:.*]] = torch_c.from_builtin_tensor %[[VAL_9]] : tensor<10x20x6xf32> -> !torch.vtensor<[10,20,6],f32>
-// CHECK:           return %[[VAL_10]], %[[VAL_8]] : !torch.vtensor<[10,20,6],f32>, !torch.vtensor<[10,20,6],si64>
-// CHECK:         }
+// The index output is clamped to [0, n) with max(idx, 0) so a degenerate -1
+// sentinel (all-NaN input) can never reach a downstream gather/scatter.
+// CHECK-DAG:       %[[ZERO:.*]] = stablehlo.constant dense<0> : tensor<10x20x6xi64>
+// CHECK-DAG:       %[[CLAMP:.*]] = stablehlo.maximum %[[VAL_7]]#1, %[[ZERO]] : tensor<10x20x6xi64>
+// CHECK-DAG:       %[[NEGVAL:.*]] = stablehlo.negate %[[VAL_7]]#0 : tensor<10x20x6xf32>
+// CHECK:           %[[IDXOUT:.*]] = torch_c.from_builtin_tensor %[[CLAMP]] : tensor<10x20x6xi64> -> !torch.vtensor<[10,20,6],si64>
+// CHECK:           return
 func.func @test_aten.topk$largest_false(%arg0: !torch.vtensor<[10,20,30],f32>) -> (!torch.vtensor<[10,20,6],f32>, !torch.vtensor<[10,20,6],si64>) {
     %int6 = torch.constant.int 6
     %int-1 = torch.constant.int -1
@@ -76,13 +78,13 @@ func.func @test_aten.topk$largest_false(%arg0: !torch.vtensor<[10,20,30],f32>) -
 // CHECK:           %[[VAL_6:.*]] = stablehlo.transpose %[[VAL_1]], dims = [0, 2, 1] : (tensor<10x20x30xf32>) -> tensor<10x30x20xf32>
 // CHECK:           %[[VAL_7:.*]] = stablehlo.negate %[[VAL_6]] : tensor<10x30x20xf32>
 // CHECK:           %[[VAL_8:.*]]:2 = stablehlo.custom_call @AwsNeuronTopK(%[[VAL_7]]) {backend_config = "6"} : (tensor<10x30x20xf32>) -> (tensor<10x30x6xf32>, tensor<10x30x6xi64>)
-// CHECK:           %[[VAL_9:.*]] = stablehlo.negate %[[VAL_8]]#0 : tensor<10x30x6xf32>
-// CHECK:           %[[VAL_10:.*]] = stablehlo.transpose %[[VAL_9]], dims = [0, 2, 1] : (tensor<10x30x6xf32>) -> tensor<10x6x30xf32>
-// CHECK:           %[[VAL_11:.*]] = torch_c.from_builtin_tensor %[[VAL_10]] : tensor<10x6x30xf32> -> !torch.vtensor<[10,6,30],f32>
-// CHECK:           %[[VAL_12:.*]] = stablehlo.transpose %[[VAL_8]]#1, dims = [0, 2, 1] : (tensor<10x30x6xi64>) -> tensor<10x6x30xi64>
-// CHECK:           %[[VAL_13:.*]] = torch_c.from_builtin_tensor %[[VAL_12]] : tensor<10x6x30xi64> -> !torch.vtensor<[10,6,30],si64>
-// CHECK:           return %[[VAL_11]], %[[VAL_13]] : !torch.vtensor<[10,6,30],f32>, !torch.vtensor<[10,6,30],si64>
-// CHECK:         }
+// The index output is clamped to [0, n) with max(idx, 0) before the inverse
+// transpose, so a degenerate -1 sentinel can never reach a downstream scatter.
+// CHECK-DAG:       %[[ZERO:.*]] = stablehlo.constant dense<0> : tensor<10x30x6xi64>
+// CHECK-DAG:       %[[CLAMP:.*]] = stablehlo.maximum %[[VAL_8]]#1, %[[ZERO]] : tensor<10x30x6xi64>
+// CHECK:           %[[IDXT:.*]] = stablehlo.transpose %[[CLAMP]], dims = [0, 2, 1] : (tensor<10x30x6xi64>) -> tensor<10x6x30xi64>
+// CHECK:           %[[IDXOUT:.*]] = torch_c.from_builtin_tensor %[[IDXT]] : tensor<10x6x30xi64> -> !torch.vtensor<[10,6,30],si64>
+// CHECK:           return
 func.func @test_aten.topk$other_dim(%arg0: !torch.vtensor<[10,20,30],f32>) -> (!torch.vtensor<[10,6,30],f32>, !torch.vtensor<[10,6,30],si64>) {
     %int6 = torch.constant.int 6
     %int1 = torch.constant.int 1
@@ -90,6 +92,28 @@ func.func @test_aten.topk$other_dim(%arg0: !torch.vtensor<[10,20,30],f32>) -> (!
     %true = torch.constant.bool true
     %values, %indices = torch.aten.topk %arg0, %int6, %int1, %false, %true : !torch.vtensor<[10,20,30],f32>, !torch.int, !torch.int, !torch.bool, !torch.bool -> !torch.vtensor<[10,6,30],f32>, !torch.vtensor<[10,6,30],si64>
     return %values, %indices : !torch.vtensor<[10,6,30],f32>, !torch.vtensor<[10,6,30],si64>
+}
+
+// -----
+
+// Regression: MoE-router top-k (largest, dim=-1). When the router logits are
+// all-NaN, @AwsNeuronTopK returns index -1 for every slot; that -1 must be
+// clamped to a valid position so the downstream routing-weight-grad scatter
+// never indexes column -1 (device NRT 1006 out-of-bounds).
+// CHECK-LABEL:   func.func @test_aten.topk$index_clamp(
+// CHECK:           %[[IN:.*]] = torch_c.to_builtin_tensor %{{.*}} : !torch.vtensor<[96,512],f32> -> tensor<96x512xf32>
+// CHECK:           %[[TOPK:.*]]:2 = stablehlo.custom_call @AwsNeuronTopK(%[[IN]]) {backend_config = "10"} : (tensor<96x512xf32>) -> (tensor<96x10xf32>, tensor<96x10xi64>)
+// CHECK-DAG:       %[[ZERO:.*]] = stablehlo.constant dense<0> : tensor<96x10xi64>
+// CHECK-DAG:       %[[CLAMP:.*]] = stablehlo.maximum %[[TOPK]]#1, %[[ZERO]] : tensor<96x10xi64>
+// CHECK:           %[[IDXOUT:.*]] = torch_c.from_builtin_tensor %[[CLAMP]] : tensor<96x10xi64> -> !torch.vtensor<[96,10],si64>
+// CHECK:           return
+func.func @test_aten.topk$index_clamp(%arg0: !torch.vtensor<[96,512],f32>) -> (!torch.vtensor<[96,10],f32>, !torch.vtensor<[96,10],si64>) {
+    %int10 = torch.constant.int 10
+    %int-1 = torch.constant.int -1
+    %true = torch.constant.bool true
+    %true_0 = torch.constant.bool true
+    %values, %indices = torch.aten.topk %arg0, %int10, %int-1, %true, %true_0 : !torch.vtensor<[96,512],f32>, !torch.int, !torch.int, !torch.bool, !torch.bool -> !torch.vtensor<[96,10],f32>, !torch.vtensor<[96,10],si64>
+    return %values, %indices : !torch.vtensor<[96,10],f32>, !torch.vtensor<[96,10],si64>
 }
 
 // -----
