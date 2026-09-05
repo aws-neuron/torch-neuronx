@@ -119,6 +119,13 @@
         "test_accelerator.py",
         "test_dataloader.py"
       ]
+    },
+    {
+      "comment": "Auto-discovery node. Runs every file not covered by dedicated nodes above and not in the blocklist. Automatically excludes all items listed in other nodes -- no manual sync needed. New upstream test files are picked up here on the next clone without any config change. soft_fail=true so failures in newly discovered tests do not block CI.",
+      "items": [
+        "torch_test_root_files"
+      ],
+      "soft_fail": true
     }
   ]
 }
