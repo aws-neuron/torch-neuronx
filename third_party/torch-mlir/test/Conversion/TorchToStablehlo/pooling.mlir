@@ -1120,7 +1120,10 @@ func.func @aten.im2col$uneven_kernel(%arg0: !torch.vtensor<[1,3,32,64],f32>) -> 
 // CHECK-LABEL:   func.func @torch.aten.cumsum$static_last_dim(
 // CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
 // CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
-// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<4x4xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<4x4xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<4x4xi64>, tensor<4x4xi64>) -> tensor<4x4xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<4x4xi1>) -> tensor<4x4xf32>
 // CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[INPUT]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<3x4xf32>, tensor<4x4xf32>) -> tensor<3x4xf32>
 // CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<3x4xf32> -> !torch.vtensor<[3,4],f32>
 // CHECK:           return %[[OUT]] : !torch.vtensor<[3,4],f32>
@@ -1138,7 +1141,10 @@ func.func @torch.aten.cumsum$static_last_dim(%arg0: !torch.vtensor<[3,4],f32>) -
 // CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
 // CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
 // CHECK:           %[[TRANSPOSED:.*]] = stablehlo.transpose %[[INPUT]], dims = [1, 0] : (tensor<3x4xf32>) -> tensor<4x3xf32>
-// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<3x3xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<3x3xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<3x3xi64>, tensor<3x3xi64>) -> tensor<3x3xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<3x3xi1>) -> tensor<3x3xf32>
 // CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[TRANSPOSED]], %[[TRIL]], contracting_dims = [1] x [0] : (tensor<4x3xf32>, tensor<3x3xf32>) -> tensor<4x3xf32>
 // CHECK:           %[[RESULT:.*]] = stablehlo.transpose %[[DOT]], dims = [1, 0] : (tensor<4x3xf32>) -> tensor<3x4xf32>
 // CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<3x4xf32> -> !torch.vtensor<[3,4],f32>
@@ -1205,7 +1211,10 @@ func.func @torch.aten.cumsum$dynamic_non_last_dim(%arg0: !torch.vtensor<[?,4],f3
 // CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[5],si32>) -> !torch.vtensor<[5],si64> {
 // CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[5],si32> -> tensor<5xi32>
 // CHECK:           %[[PROMOTED:.*]] = stablehlo.convert %[[INPUT]] : (tensor<5xi32>) -> tensor<5xi64>
-// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<5x5xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<5x5xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<5x5xi64>, tensor<5x5xi64>) -> tensor<5x5xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<5x5xi1>) -> tensor<5x5xi64>
 // CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[PROMOTED]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<5xi64>, tensor<5x5xi64>) -> tensor<5xi64>
 // CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<5xi64> -> !torch.vtensor<[5],si64>
 // CHECK:           return %[[OUT]] : !torch.vtensor<[5],si64>
@@ -1295,7 +1304,10 @@ func.func @torch.aten.cumsum$dynamic_int(%arg0: !torch.vtensor<[?],si32>) -> !to
 // CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[4],f16>) -> !torch.vtensor<[4],f32> {
 // CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4],f16> -> tensor<4xf16>
 // CHECK:           %[[PROMOTED:.*]] = stablehlo.convert %[[INPUT]] : (tensor<4xf16>) -> tensor<4xf32>
-// CHECK:           %[[TRIL:.*]] = stablehlo.constant dense<
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<4x4xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<4x4xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<4x4xi64>, tensor<4x4xi64>) -> tensor<4x4xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<4x4xi1>) -> tensor<4x4xf32>
 // CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[PROMOTED]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<4xf32>, tensor<4x4xf32>) -> tensor<4xf32>
 // CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<4xf32> -> !torch.vtensor<[4],f32>
 // CHECK:           return %[[OUT]] : !torch.vtensor<[4],f32>
@@ -1305,6 +1317,31 @@ func.func @torch.aten.cumsum$dtype_promotion(%arg0: !torch.vtensor<[4],f16>) -> 
     %int6 = torch.constant.int 6
     %0 = torch.aten.cumsum %arg0, %int0, %int6 : !torch.vtensor<[4],f16>, !torch.int, !torch.int -> !torch.vtensor<[4],f32>
     return %0 : !torch.vtensor<[4],f32>
+}
+
+// -----
+
+// Regression test: large static N must not materialize a dense [N, N] constant.
+// The prior static-N lowering emitted `stablehlo.constant dense<...> : tensor<NxNxf32>`
+// which for N=49152 produced a ~9.66 GB serialized attribute that broke hlo2penguin.
+// The iota + compare + convert form keeps the IR O(1) in N.
+// CHECK-LABEL:   func.func @torch.aten.cumsum$static_large_N(
+// CHECK-SAME:                               %[[VAL_0:.*]]: !torch.vtensor<[49152],f32>) -> !torch.vtensor<[49152],f32> {
+// CHECK:           %[[INPUT:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[49152],f32> -> tensor<49152xf32>
+// CHECK:           %[[ROW_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<49152x49152xi64>
+// CHECK:           %[[COL_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<49152x49152xi64>
+// CHECK:           %[[MASK:.*]] = stablehlo.compare LE, %[[ROW_IOTA]], %[[COL_IOTA]], SIGNED : (tensor<49152x49152xi64>, tensor<49152x49152xi64>) -> tensor<49152x49152xi1>
+// CHECK:           %[[TRIL:.*]] = stablehlo.convert %[[MASK]] : (tensor<49152x49152xi1>) -> tensor<49152x49152xf32>
+// CHECK:           %[[DOT:.*]] = stablehlo.dot_general %[[INPUT]], %[[TRIL]], contracting_dims = [0] x [0] : (tensor<49152xf32>, tensor<49152x49152xf32>) -> tensor<49152xf32>
+// CHECK:           %[[OUT:.*]] = torch_c.from_builtin_tensor %[[DOT]] : tensor<49152xf32> -> !torch.vtensor<[49152],f32>
+// CHECK:           return %[[OUT]] : !torch.vtensor<[49152],f32>
+// CHECK:         }
+// CHECK-NOT: stablehlo.constant dense<{{.*}}> : tensor<49152x49152x{{.*}}>
+func.func @torch.aten.cumsum$static_large_N(%arg0: !torch.vtensor<[49152],f32>) -> !torch.vtensor<[49152],f32> {
+    %int0 = torch.constant.int 0
+    %none = torch.constant.none
+    %0 = torch.aten.cumsum %arg0, %int0, %none : !torch.vtensor<[49152],f32>, !torch.int, !torch.none -> !torch.vtensor<[49152],f32>
+    return %0 : !torch.vtensor<[49152],f32>
 }
 
 // -----

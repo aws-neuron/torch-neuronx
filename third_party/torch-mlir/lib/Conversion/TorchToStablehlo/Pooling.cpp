@@ -1217,35 +1217,21 @@ LogicalResult ConvertAtenOp<AtenCumsumOp>::matchAndRewrite(
   // M[k][i] = 1 iff k <= i, so result[i] = sum_{k<=i} input[k] (prefix sum).
   Value trilMatrix;
   if (!isDynamic) {
-    auto trilType = RankedTensorType::get({N, N}, inputElemTy);
-    if (isa<FloatType>(inputElemTy)) {
-      auto floatTy = cast<FloatType>(inputElemTy);
-      SmallVector<APFloat> apData;
-      apData.reserve(N * N);
-      for (int64_t row = 0; row < N; ++row) {
-        for (int64_t col = 0; col < N; ++col) {
-          bool inMask = (row <= col);
-          apData.push_back(APFloat(floatTy.getFloatSemantics(),
-                                   inMask ? 1 : 0));
-        }
-      }
-      trilMatrix = stablehlo::ConstantOp::create(
-          rewriter, loc, DenseElementsAttr::get(trilType, apData))
-          .getResult();
-    } else {
-      auto intTy = cast<IntegerType>(inputElemTy);
-      SmallVector<APInt> apData;
-      apData.reserve(N * N);
-      for (int64_t row = 0; row < N; ++row) {
-        for (int64_t col = 0; col < N; ++col) {
-          bool inMask = (row <= col);
-          apData.push_back(APInt(intTy.getWidth(), inMask ? 1 : 0));
-        }
-      }
-      trilMatrix = stablehlo::ConstantOp::create(
-          rewriter, loc, DenseElementsAttr::get(trilType, apData))
-          .getResult();
-    }
+    auto staticNxNI64 = RankedTensorType::get({N, N}, rewriter.getI64Type());
+    Value rowIota = stablehlo::IotaOp::create(rewriter, loc, staticNxNI64, 0);
+    Value colIota = stablehlo::IotaOp::create(rewriter, loc, staticNxNI64, 1);
+
+    auto staticNxNI1 = RankedTensorType::get({N, N}, rewriter.getI1Type());
+    Value mask = stablehlo::CompareOp::create(
+        rewriter, loc, staticNxNI1, rowIota, colIota,
+        stablehlo::ComparisonDirectionAttr::get(
+            rewriter.getContext(), stablehlo::ComparisonDirection::LE),
+        stablehlo::ComparisonTypeAttr::get(
+            rewriter.getContext(), stablehlo::ComparisonType::SIGNED));
+
+    auto staticNxNElem = RankedTensorType::get({N, N}, inputElemTy);
+    trilMatrix =
+        stablehlo::ConvertOp::create(rewriter, loc, staticNxNElem, mask);
   } else {
     // Dynamic: generate tril at runtime using iota + compare + convert
     Value dimSize = tensor::DimOp::create(rewriter, loc, matmulInput,
