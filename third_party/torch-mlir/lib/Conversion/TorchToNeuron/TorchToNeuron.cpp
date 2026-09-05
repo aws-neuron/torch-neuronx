@@ -1732,6 +1732,14 @@ public:
       results[0] = stablehlo::NegOp::create(rewriter, loc, results[0]);
     }
 
+    // Clamp topk index to [0, n): @AwsNeuronTopK returns -1 on all-NaN slices.
+    {
+      auto indexType = cast<RankedTensorType>(results[1].getType());
+      Value zeroIdx = stablehlo::ConstantOp::create(
+          rewriter, loc, rewriter.getZeroAttr(indexType));
+      results[1] = stablehlo::MaxOp::create(rewriter, loc, results[1], zeroIdx);
+    }
+
     if (needsPermute) {
       SmallVector<int64_t> inversePermutation(inputRank);
       for (size_t i = 0; i < permutation.size(); ++i) {
