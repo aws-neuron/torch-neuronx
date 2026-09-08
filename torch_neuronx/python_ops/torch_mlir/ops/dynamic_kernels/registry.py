@@ -83,6 +83,21 @@ def register_dynamic_nki(op_name: str, entry: DynamicNkiEntry):
 def get_dynamic_nki_entry(op_name: str) -> DynamicNkiEntry | None:
     if os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") != "1":
         return None
+    # Minimal list of dynamic-NKI kernels to (a) avoid recompilation on the pure-TP4
+    # setup and (b) skip the slow serialized static index_put for grouped_mm-based MoE
+    _allow_list = {
+        "scatter_add",
+        "scatter_add_",
+        "_index_put_impl_",
+        "index",
+        "gather",
+    }
+    # TORCH_NEURONX_DYNAMIC_NKI_ALLOW_LIST gates the allowlist:
+    #   "1"          -> restrict to _allow_list dynamic NKI kernels.
+    #   "0" or unset -> skip the allowlist check; use ALL registered dynamic kernels.
+    _use_allow_list = os.environ.get("TORCH_NEURONX_DYNAMIC_NKI_ALLOW_LIST", "0") == "1"
+    if _use_allow_list and op_name not in _allow_list:
+        return None
     return _registry.get(op_name)
 
 

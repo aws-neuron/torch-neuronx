@@ -1777,6 +1777,18 @@ class TestDynamicNkiKernels:
             out.scatter_add_(0, index.to("neuron"), src.to("neuron"))
         torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
 
+    def test_dynamic_nki_combine_index_put_correct(self):
+        """Same many-to-one combine (N = T*top_k > T) reached via index_put_
+        (accumulate=True) — the row-gather backward path. It must route to the
+        gather-reduce kernel (not the slow static scatter) and match torch."""
+        T, top_k, H = 512, 6, 2048  # noqa: N806
+        src, index, ref = self._combine_case(T, top_k, H)
+        idx_1d = index[:, 0].contiguous()  # combine index is free-dim-constant; take col 0
+        out = torch.zeros(T, H, dtype=torch.bfloat16).to("neuron")
+        with _assert_dynamic_ran("_index_put_impl_"):
+            out.index_put_((idx_1d.to("neuron"),), src.to("neuron"), accumulate=True)
+        torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
+
     def test_dynamic_nki_combine_no_recompile_across_routing(self):
         """One NEFF per (T, top_k, H, dtype): at fixed T the combine reuses it as
         routing (the index values) changes. T is baked (kernel output/APs are
