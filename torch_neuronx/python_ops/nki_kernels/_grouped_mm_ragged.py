@@ -106,6 +106,7 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
             nisa.dma_copy(
                 a_tile,
                 a.ap([[D, M_TILE], [1, D]], 0, scalar_offset=base_sb, indirect_dim=0),
+                dge_mode=nisa.dge_mode.hwdge,
             )
             for c in range(NDC):
                 kc = min(DC, D - c * DC)
@@ -137,6 +138,7 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
                         indirect_dim=0,
                     ),
                     narrow.ap([[FT, M_TILE], [1, fw]]),
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
 
         def tail_body(i, g=g):
@@ -350,6 +352,7 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
                     scalar_offset=base_sb,
                     indirect_dim=0,
                 ),
+                dge_mode=nisa.dge_mode.hwdge,
             )
             nisa.tensor_scalar(b_tile, b_tile, nl.multiply, mask)
 
@@ -362,6 +365,7 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
                         scalar_offset=base_sb,
                         indirect_dim=1,
                     ),
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
             if NFULL_D1 < NDT:
                 nisa.dma_copy(
@@ -372,6 +376,7 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
                         scalar_offset=base_sb,
                         indirect_dim=1,
                     ),
+                    dge_mode=nisa.dge_mode.hwdge,
                 )
 
             for i in range(NDT):

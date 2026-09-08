@@ -211,13 +211,26 @@ def _can_handle_index_put(self, indices, values, accumulate=False, unsafe=False,
     if H == 0:
         return False
     n = values.shape[0]
-    if n == 0 or _ceil_to_tile(n) > T or idx.numel() != n:  # noqa: SIM103
+    if n == 0 or idx.numel() != n:
+        return False
+    # (A) MoE combine (many-to-one, n = T*top_k > T) -> gather-reduce; the autograd
+    # backward of a row gather (x[idx]) arrives here as index_put(accumulate). (B) the
+    # unique-target n<=T scatter. Reject only shapes that are neither.
+    if _is_combine_pattern(T, n):
+        return True
+    if _ceil_to_tile(n) > T:  # noqa: SIM103
         return False
     return True
 
 
 def _index_put_compile_key(self, indices, values, accumulate=False, unsafe=False, **_):
-    """compile_key = (T, H, dtype) — same NEFF as scatter_add."""
+    """Unique path: (T, H, dtype). Combine path (n = T*top_k > T): the ("combine", T,
+    top_k, H, dtype) 5-tuple so _compile_scatter_add routes to the gather-reduce kernel
+    (same NEFF as scatter_add's combine path)."""
+    T = int(self.shape[0])  # noqa: N806
+    n = int(values.shape[0])
+    if _is_combine_pattern(T, n):
+        return ("combine", T, n // T, int(self.shape[1]), self.dtype)
     return (int(self.shape[0]), int(self.shape[1]), self.dtype)
 
 
@@ -228,6 +241,11 @@ def _prepare_index_put_io(self, indices, values, accumulate=False, unsafe=False,
     n = values.shape[0]
 
     idx_1d = _index_to_int32(_index_put_index_1d(indices)).reshape(n, 1)
+    # Combine pattern (n = T*top_k > T, e.g. row-gather backward): reuse the scatter_add
+    # combine prep (inv_idx[T, top_k] gather-reduce) so it hits the fast combine kernel
+    # instead of a serialized scatter. dim=0, index shaped [n,1] like scatter_add expects.
+    if _is_combine_pattern(T, n):
+        return _prepare_scatter_add_io(self, 0, idx_1d, values, in_place=True)
     idx = _pad_or_contig(idx_1d, T)  # contiguous even when n == T (strided int32 alias otherwise)
     data = _pad_rows_to(values.contiguous(), T)
     nm = _num_tiles_tensor(_ceil_to_tile(n) // _TILE_M, device)
