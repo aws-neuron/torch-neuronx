@@ -121,6 +121,22 @@
       ]
     },
     {
+      "items": [
+        "test_as_strided.py",
+        "test_autograd_fallback.py",
+        "test_autoload.py",
+        "test_bmm_outer_product.py",
+        "test_flop_counter.py",
+        "test_functional_optim.py",
+        "test_module_tracker.py",
+        "test_stateless.py",
+        "test_subclass.py",
+        "test_tensor_iterator.py",
+        "test_torchfuzz_repros.py",
+        "test_type_info.py"
+      ]
+    },
+    {
       "comment": "Auto-discovery node. Runs every file not covered by dedicated nodes above and not in the blocklist. Automatically excludes all items listed in other nodes -- no manual sync needed. New upstream test files are picked up here on the next clone without any config change. soft_fail=true so failures in newly discovered tests do not block CI.",
       "items": [
         "torch_test_root_files"
