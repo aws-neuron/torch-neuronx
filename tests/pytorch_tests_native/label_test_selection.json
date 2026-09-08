@@ -18,7 +18,8 @@
         "test_binary_ufuncs.py",
         "test_linalg.py",
         "test_reductions.py",
-        "dynamo"
+        "dynamo",
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
       ],
       "kind": "items"
     },
@@ -51,7 +52,8 @@
         "test_binary_ufuncs.py",
         "test_linalg.py",
         "test_reductions.py",
-        "dynamo"
+        "dynamo",
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
       ],
       "kind": "items"
     },
