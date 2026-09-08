@@ -213,6 +213,19 @@ def _correctness_output_indices(op_name: str) -> tuple[int, ...] | None:
     return None
 
 
+def _is_rng_op(op) -> bool:
+    """Return True if the op reads the global RNG state.
+
+    An RNG op gives different values on the device and on the CPU oracle, so a
+    value comparison is not meaningful. Detect the op with PyTorch's own
+    ``nondeterministic_seeded`` tag, which marks each seeded random op.
+    """
+    try:
+        return torch.Tag.nondeterministic_seeded in op.tags
+    except (AttributeError, TypeError):
+        return False
+
+
 def _matches_float64_oracle(
     op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol, output_indices=None
 ) -> bool:
@@ -437,6 +450,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         # matching shapes/dtypes).
         if any(pat in op_name for pat in _OPS_SKIP_CPU_CORRECTNESS):
             out["correctness"] = "skip_slow_cpu"
+        elif _is_rng_op(op):
+            out["correctness"] = "skip_accuracy_check_rng"
         else:
             try:
                 cpu_args = tuple(
@@ -561,6 +576,8 @@ def _aggregate_compile_results(result: dict, per_shape: list[dict], classificati
             result["correctness_test"] = "pass"
         elif "skip_no_cpu" in correctness:
             result["correctness_test"] = "skip_no_cpu"
+        elif "skip_accuracy_check_rng" in correctness:
+            result["correctness_test"] = "skip_accuracy_check_rng"
 
 
 class TestTargetOpsCompileCoverage:
