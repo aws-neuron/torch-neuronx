@@ -72,6 +72,22 @@ WORKSPACE_ROOT = _find_workspace_root()
 # for items expanded into pytest targets.
 TEST_ROOT = "tests/pytorch_tests_native/test"
 
+
+_INTREE_TEST_PATHS = ["tests/pytorch_tests_native/neuron_compile_ops/"]
+
+
+def _resolve_item_path(path: str) -> str:
+    """Resolve a dist-config item/ignore. A repo-relative path (``tests/...``) is
+    used as-is so a node can target an in-tree suite; anything else resolves under
+    the cloned upstream TEST_ROOT."""
+    if path == "torch_test_root_files":
+        return TEST_ROOT
+    elif any(path.startswith(p) for p in _INTREE_TEST_PATHS):
+        return path
+    else:
+        return f"{TEST_ROOT}/{path}"
+
+
 # Defaults that mirror the bash script's env-var fallbacks.
 DEFAULT_NUM_WORKERS = 64
 DEFAULT_NUM_WORKERS_RETRY = 4
@@ -200,15 +216,9 @@ def build_pytest_argv(
     if args.shard_id is not None and args.num_shards is not None:
         argv.extend([f"--shard-id={args.shard_id}", f"--num-shards={args.num_shards}"])
     for ign in args.ignore:
-        argv.append(f"--ignore={TEST_ROOT}/{ign}")
+        argv.append(f"--ignore={_resolve_item_path(ign)}")
     argv.extend(extra)
-    # The "torch_test_root_files" sentinel resolves to the test root itself so pytest
-    # collects the whole directory.  Every dedicated-node item is already in
-    # args.ignore for this node (populated by expand_distribution_config).
-    argv.extend(
-        TEST_ROOT if item == "torch_test_root_files" else f"{TEST_ROOT}/{item}"
-        for item in args.items
-    )
+    argv.extend(_resolve_item_path(item) for item in args.items)
     return argv
 
 

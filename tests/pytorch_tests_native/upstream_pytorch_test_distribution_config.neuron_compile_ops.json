@@ -1,0 +1,11 @@
+{
+  "description": "Neuron in-tree torch.compile op suite only, for manual validation.",
+  "nodes": [
+    {
+      "items": [
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
+      ],
+      "num_shards": 2
+    }
+  ]
+}
