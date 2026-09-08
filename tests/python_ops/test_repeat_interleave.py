@@ -281,3 +281,16 @@ class TestRepeatInterleave:
 
         assert neuron_result.device.type == "neuron"
         torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+
+    def test_repeat_interleave_tensor_out_variant(self, device):
+        """Test aten::repeat_interleave.Tensor_out dispatches to Neuron."""
+        repeats = torch.tensor([2, 3, 1, 4], device=device)
+        output_size = int(torch.sum(repeats).item())  # 10
+        out = torch.empty(output_size, dtype=torch.int64, device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.repeat_interleave.Tensor_out(repeats, out=out)
+            assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
+
+        expected = torch.repeat_interleave(repeats.cpu())
+        torch.testing.assert_close(result.cpu(), expected)

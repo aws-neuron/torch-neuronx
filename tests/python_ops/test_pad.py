@@ -434,3 +434,24 @@ class TestPad:
 
         expected = torch.ops.aten.replication_pad3d(input_t, padding)
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @pytest.mark.parametrize(
+        "shape,padding",
+        [
+            ((1, 3, 8), [2, 2]),
+            ((2, 4, 16), [1, 3]),
+        ],
+    )
+    def test_replication_pad1d_out_variant(self, shape, padding):
+        """Test aten::replication_pad1d.out dispatches to Neuron."""
+        input_t = torch.randn(shape, device="neuron")
+        out_shape = list(shape)
+        out_shape[-1] += padding[0] + padding[1]
+        out = torch.empty(out_shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.replication_pad1d.out(input_t, padding, out=out)
+        assert_op_runs_on_neuron("aten::replication_pad1d")
+
+        expected = torch.ops.aten.replication_pad1d(input_t, padding)
+        torch.testing.assert_close(result.cpu(), expected.cpu())

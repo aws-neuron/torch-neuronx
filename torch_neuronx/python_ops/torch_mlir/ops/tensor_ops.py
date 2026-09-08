@@ -155,8 +155,8 @@ def torch_reflection_pad3d(input, padding, out=None):
     return torch.nn.functional.pad(input, padding, mode="reflect")
 
 
-@register_aten(["aten::replication_pad1d"], static_argnums=(1,))
-def torch_replication_pad1d(input, padding):
+@register_aten(["aten::replication_pad1d", "aten::replication_pad1d.out"], static_argnums=(1,))
+def torch_replication_pad1d(input, padding, out=None):
     return torch.nn.functional.pad(input, padding, mode="replicate")
 
 
@@ -244,6 +244,7 @@ def compute_repeat_interleave(input, repeats, dim=None, output_size=None):
 @register_aten(
     [
         "aten::repeat_interleave.Tensor",
+        "aten::repeat_interleave.Tensor_out",
     ],
     static_argnames=("output_size",),
     preprocessing=Preprocessing.VALUE_DEPENDENT,
@@ -252,7 +253,7 @@ def compute_repeat_interleave(input, repeats, dim=None, output_size=None):
     # constant, not an extra runtime input.
     relower_every_call=True,
 )
-def torch_repeat_interleave_tensor(repeats, output_size=None):
+def torch_repeat_interleave_tensor(repeats, output_size=None, out=None):
     """releat_interleave.Tensor variant is not supported in MLIR.
 
     Custom decomposition and preprocessing needed.
