@@ -201,4 +201,42 @@ SKIP_GROUPS: list[SkipGroup] = [
             "ViewTests::test_view_with_tensor_shape_params",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "These tests are xfailed upstream with @unittest.expectedFailure."
+            " The failure is a known upstream PyTorch/Dynamo limitation and is"
+            " device-independent."
+        ),
+        tests=[
+            "ComplexTests::test_incorrect_aliasing_semantics",
+            "DictTests::test_dict_construct_from_mapping_like",
+            "EnumTests::test_metaclass_custom_call",
+            "FunctionTests::test_itertools_islice_intlike",
+            "FunctionTests::test_partials_hasattr_set_attr",
+            "GeneratorTests::test_cleanup_throw",
+            "GeneratorTests::test_reconstruct_generator_tensor_mutation",
+            "GeneratorTests::test_zip_generator_2",
+            "GetItemTests::test_dict_unhashable_key",
+            "FuncTorchHigherOrderOpTests::test_vmap_side_effects_append_input",
+            "IdTests::test_id_dict_key_only_no_guard",
+            "InstallParamsWhenExport::test_user_defined_object",
+            "MiscTests::test_numpy_ufunc_out_graph_break",
+            "MiscTests::test_raise_guard_partial_constraint_across_break",
+            "MiscTests::test_return_obj___build_class__",
+            "MiscTests::test_typing_union_new_syntax_reconstruct",
+            "NestedGraphBreakTests::test_nested_decorated_function",
+            "NestedGraphBreakTests::test_nested_graph_break_in_custom_ctx_manager_init",
+            "ReproTests::test_lru_cache_tracing",
+            "ReproTests::test_maml_item_capture",
+            "ReproTests::test_method_dunder_dict_setitem",
+            "ReproTests::test_primtorch_no_graph_break",
+            "TestSqConcat::test_user_defined_deque_concat",
+            "TestSqConcat::test_user_defined_deque_inplace_concat",
+            "SubclassTests::test_recompile_with_symbool_inputs",
+            "TestTwoTensorSubclass::test_tensor_subclass_TwoTensor_return_multiple",
+            "UnspecTests::test_builtin_max_min",
+            "UnspecTests::test_specializing_numpy_float_in_control_flow",
+            "TestSlotsFromCPython::test_slots_special2_classcell",
+        ],
+    ),
 ]
