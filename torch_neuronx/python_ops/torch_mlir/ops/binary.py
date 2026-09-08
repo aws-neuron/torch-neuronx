@@ -125,7 +125,7 @@ def torch_mul(x, y, out=None):
     return torch.mul(x, y)
 
 
-@register_aten(["aten::mul_.Tensor"])
+@register_aten(["aten::mul_.Tensor", "aten::mul_.Scalar"])
 def torch_mul_inplace(x, y, out=None):
     """In-place multiply — no type promotion; result follows self's dtype."""
     return _inplace_result(torch.mul(x, y), x)
