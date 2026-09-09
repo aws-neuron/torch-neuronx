@@ -455,11 +455,43 @@ that branch's `tests/vertical/tools/opcap/README.md`.
        --shape-registry op_shape_registry.json --model-shapes-only --tb=no -q
    ```
 
+### Cache-key model shapes (committed)
+
+The model test suite runs the HuggingFace and torchtitan models in CI. Each job
+writes its Neuron compiler cache keys to a daily S3 folder. A generated function,
+`register_cache_key_shapes` in `internal/neuron_shape_defaults_generated.py`,
+holds the model shapes that this feed gives, one union per op, capped per op.
+
+The shapes load by default, so a plain run tests the model shapes too. Turn them
+off with `--no-cache-key-shapes` to isolate a regression:
+
+```sh
+python -m pytest tests/vertical/test_target_ops_coverage.py -n 64 \
+    --no-cache-key-shapes --tb=no -q
+```
+
+Regenerate the shapes offline. Do not fetch S3 at test time. The tool rewrites
+only the block between the sentinel comments in the generated file. The S3
+location has no default because the bucket moves. Pass it with
+`--bucket`/`--prefix`, or set `CACHE_KEY_SHAPES_BUCKET`/`CACHE_KEY_SHAPES_PREFIX`.
+
+```sh
+# From S3 (needs a read-only profile for the bucket):
+python tests/vertical/tools/refresh_cache_key_shapes.py \
+    --bucket <bucket> --prefix <prefix> --profile <aws-profile>
+
+# From a local folder of *_cache_keys.txt files:
+python tests/vertical/tools/refresh_cache_key_shapes.py --from-dir <dir>
+```
+
+Review the diff and commit the regenerated file.
+
 ### Pytest options
 
 | Option | Description |
 |--------|-------------|
 | `--shape-registry <path>` | JSON shape registry file to load into `SHAPE_REGISTRY`, tagged `model_trace`. For a one-off trace that isn't checked in |
+| `--no-cache-key-shapes` | Skip the committed cache-key model shapes (tagged `cache_keys`). The shapes load by default |
 | `--traced-model <names>` | Comma-separated smoke test subset(s) (keys of `SMOKE_SUBSET_SHAPES`). Registers them *and* restricts the run to them. Omit it and none are registered. Stricter than `--model-shapes-only`, which only excludes `builtin` and so still mixes every registered subset together |
 | `--model-shapes-only` | For ops with model-traced shapes, skip builtin/default shapes |
 | `--max-shapes-per-op <n>` | Cap per op to the top-N entries by max tensor element count. `0` (or negative) disables the cap — sweep **all** shapes registered for the op |

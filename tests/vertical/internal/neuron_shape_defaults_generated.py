@@ -7133,3 +7133,8713 @@ SMOKE_SUBSET_OPS = {
 SMOKE_SUBSET_OP_MODE = {
     QWEN3_235B_EP64_TP4: QWEN3_235B_EP64_TP4_OP_MODE,
 }
+
+
+# BEGIN GENERATED CACHE-KEY SHAPES
+# Do not edit by hand. Regenerate with tests/vertical/tools/refresh_cache_key_shapes.py.
+CACHE_KEY_SOURCE = "cache_keys"
+
+
+def register_cache_key_shapes(r):
+    """Register cache-key model shapes (145 ops, 739 shapes).
+
+    These come from the HuggingFace and torchtitan model runs in CI. Each model job
+    writes its Neuron compiler cache keys; each key records an op, its argument shapes,
+    and dtypes. refresh_cache_key_shapes.py maps those to op schema arg names, caps the
+    shapes per op, and regenerates this function. The vertical suite calls it by default
+    (opt out with --no-cache-key-shapes).
+    """
+
+    def t(op, arg_shapes, count=1, paths=()):
+        r(op, arg_shapes, source=CACHE_KEY_SOURCE, count=count, paths=paths)
+
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 2048]},
+                {"dtype": "bfloat16", "shape": [32]},
+                {"dtype": "bfloat16", "shape": [32]},
+                {"dtype": "bfloat16", "shape": [8192, 1, 4]},
+                {"dtype": "bfloat16", "shape": [12288, 2048]},
+                {"dtype": "bfloat16", "shape": [64, 2048]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 2048]},
+                {"dtype": "bfloat16", "shape": [32]},
+                {"dtype": "bfloat16", "shape": [32]},
+                {"dtype": "bfloat16", "shape": [8192, 1, 4]},
+                {"dtype": "bfloat16", "shape": [12288, 2048]},
+                {"dtype": "bfloat16", "shape": [64, 2048]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 4088]},
+                {"dtype": "bfloat16", "shape": [1536, 4088]},
+                {"dtype": "bfloat16", "shape": [1536]},
+                {"dtype": "bfloat16", "shape": [14016, 1536]},
+                {"dtype": "bfloat16", "shape": [576, 4088]},
+                {"dtype": "bfloat16", "shape": [512]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 4088]},
+                {"dtype": "bfloat16", "shape": [1536, 4088]},
+                {"dtype": "bfloat16", "shape": [1536]},
+                {"dtype": "bfloat16", "shape": [14016, 1536]},
+                {"dtype": "bfloat16", "shape": [576, 4088]},
+                {"dtype": "bfloat16", "shape": [512]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 3072]},
+                {"dtype": "bfloat16", "shape": [6144, 3072]},
+                {"dtype": "bfloat16", "shape": [1024, 3072]},
+                {"dtype": "bfloat16", "shape": [1024, 3072]},
+                {"dtype": "bfloat16", "shape": [3072, 6144]},
+                {"dtype": "bfloat16", "shape": [6144]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 3072]},
+                {"dtype": "bfloat16", "shape": [6144, 3072]},
+                {"dtype": "bfloat16", "shape": [1024, 3072]},
+                {"dtype": "bfloat16", "shape": [1024, 3072]},
+                {"dtype": "bfloat16", "shape": [3072, 6144]},
+                {"dtype": "bfloat16", "shape": [6144]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 4032]},
+                {"dtype": "bfloat16", "shape": [4352, 4032]},
+                {"dtype": "bfloat16", "shape": [4032, 2688]},
+                {"dtype": "bfloat16", "shape": [4096, 4032]},
+                {"dtype": "bfloat16", "shape": [4096, 4032]},
+                {"dtype": "bfloat16", "shape": [4032, 4096]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 4032]},
+                {"dtype": "bfloat16", "shape": [4352, 4032]},
+                {"dtype": "bfloat16", "shape": [4032, 2688]},
+                {"dtype": "bfloat16", "shape": [4096, 4032]},
+                {"dtype": "bfloat16", "shape": [4096, 4032]},
+                {"dtype": "bfloat16", "shape": [4032, 4096]},
+            ],
+        },
+        count=9,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [128]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [128]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.List",
+        {
+            "alpha": 1.0,
+            "other": [
+                {"dtype": "bfloat16", "shape": [3000, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [64]},
+            ],
+            "self": [
+                {"dtype": "bfloat16", "shape": [3000, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [1024, 4096]},
+                {"dtype": "bfloat16", "shape": [4096, 4096]},
+                {"dtype": "bfloat16", "shape": [64]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_add_.Scalar",
+        {
+            "scalar": 0.0,
+            "self": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+        },
+        count=78,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_add_.Scalar",
+        {
+            "scalar": 0.0,
+            "self": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "bfloat16", "shape": [12155200]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "float32", "shape": [12155200]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "bfloat16", "shape": [12154960]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-trn3",),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "float32", "shape": [12154960]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-trn3",),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "bfloat16", "shape": [12154880]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_copy_",
+        {"non_blocking": False, "self": {"dtype": "float32", "shape": [12154880]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async-hostcc",),
+    )
+    t(
+        "aten::_foreach_mul_.Tensor",
+        {
+            "other": {"dtype": "float64", "shape": []},
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_foreach_norm.Scalar",
+        {
+            "dtype": None,
+            "ord": 2.0,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 4096]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+            ],
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [8016, 4096]},
+                {"dtype": "float32", "shape": [256, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [1024, 1024]},
+                {"dtype": "float32", "shape": [896, 4096]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [80, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [160, 5120]},
+                {"dtype": "float32", "shape": [320, 2048]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [400, 5120]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 5120]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [2]},
+                {"dtype": "float32", "shape": [128, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+                {"dtype": "float32", "shape": [16, 5120]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_adamw_",
+        {
+            "amsgrad": False,
+            "beta1": 0.9,
+            "beta2": 0.95,
+            "eps": 1e-08,
+            "exp_avg_sqs": [
+                {"dtype": "float32", "shape": [2374, 4096]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+            ],
+            "exp_avgs": [
+                {"dtype": "float32", "shape": [2374, 4096]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+            ],
+            "found_inf": None,
+            "grad_scale": None,
+            "grads": [
+                {"dtype": "float32", "shape": [2374, 4096]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+            ],
+            "lr": 0.001,
+            "max_exp_avg_sqs": [],
+            "maximize": False,
+            "self": [
+                {"dtype": "float32", "shape": [2374, 4096]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [8]},
+                {"dtype": "float32", "shape": [64, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+                {"dtype": "float32", "shape": [16, 4096]},
+            ],
+            "state_steps": [
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+                {"dtype": "float32", "shape": []},
+            ],
+            "weight_decay": 0.1,
+        },
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 64, 128]},
+            "normalized_shape": [128],
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "normalized_shape": [5120],
+            "weight": {"dtype": "bfloat16", "shape": [5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "normalized_shape": [4096],
+            "weight": {"dtype": "bfloat16", "shape": [4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 32, 128]},
+            "normalized_shape": [128],
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 64, 128]},
+            "normalized_shape": [128],
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm",
+        {
+            "eps": 1e-06,
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 5120]},
+            "normalized_shape": [5120],
+            "weight": {"dtype": "bfloat16", "shape": [5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 8192, 64, 128]},
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 64, 128]},
+            "normalized_shape": [128],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 8192, 64, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "normalized_shape": [5120],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 8192, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "normalized_shape": [4096],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 8192, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 8192, 32, 128]},
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 32, 128]},
+            "normalized_shape": [128],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 8192, 32, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 4096, 64, 128]},
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 64, 128]},
+            "normalized_shape": [128],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 4096, 64, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [128]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_fused_rms_norm_backward",
+        {
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 4096, 5120]},
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 5120]},
+            "normalized_shape": [5120],
+            "output_mask": [True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 4096, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [16, 2048, 5120]},
+            "offs": {
+                "dtype": "int32",
+                "high": 49,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [16],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [6144, 2048]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [16, 5120, 2048]},
+            "offs": {
+                "dtype": "int32",
+                "high": 49,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [16],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [6144, 5120]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [128, 2048, 192]},
+            "offs": {
+                "dtype": "int32",
+                "high": 385,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [128],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [49152, 2048]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [64, 2048, 352]},
+            "offs": {
+                "dtype": "int32",
+                "high": 257,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [64],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [32768, 2048]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [128, 192, 2048]},
+            "offs": {
+                "dtype": "int32",
+                "high": 385,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [128],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [49152, 192]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::_grouped_mm",
+        {
+            "bias": None,
+            "mat2": {"dtype": "bfloat16", "shape": [64, 352, 2048]},
+            "offs": {
+                "dtype": "int32",
+                "high": 257,
+                "low": 0,
+                "multiple_of": 128,
+                "shape": [64],
+                "sorted": True,
+            },
+            "out_dtype": None,
+            "self": {"dtype": "bfloat16", "shape": [32768, 352]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": True,
+            "indices": [{"dtype": "int64", "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 4096, 4088]},
+            "unsafe": True,
+            "values": {"dtype": "bfloat16", "shape": [64, 4096, 4088]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": True,
+            "indices": [{"dtype": "int64", "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 2880, 5760]},
+            "unsafe": True,
+            "values": {"dtype": "bfloat16", "shape": [64, 2880, 5760]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": True,
+            "indices": [{"dtype": "int64", "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 4096, 4032]},
+            "unsafe": True,
+            "values": {"dtype": "bfloat16", "shape": [64, 4096, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": False,
+            "indices": [{"dtype": "int64", "shape": [16384]}, {"dtype": "int64", "shape": [16384]}],
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+            "unsafe": False,
+            "values": {"dtype": "float32", "shape": [16384]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": True,
+            "indices": [{"dtype": "int64", "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 3072, 3072]},
+            "unsafe": True,
+            "values": {"dtype": "bfloat16", "shape": [64, 3072, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_index_put_impl_",
+        {
+            "accumulate": True,
+            "indices": [{"dtype": "int64", "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 4088, 2048]},
+            "unsafe": True,
+            "values": {"dtype": "bfloat16", "shape": [64, 4088, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": False,
+            "key": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
+            "query": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
+            "return_debug_mask": False,
+            "scale": 1.0,
+            "value": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": False,
+            "key": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
+            "query": {"dtype": "float32", "shape": [1, 20, 448, 64]},
+            "return_debug_mask": False,
+            "scale": 1.0,
+            "value": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": True,
+            "key": {"dtype": "float32", "shape": [1, 20, 448, 64]},
+            "query": {"dtype": "float32", "shape": [1, 20, 448, 64]},
+            "return_debug_mask": False,
+            "scale": 1.0,
+            "value": {"dtype": "float32", "shape": [1, 20, 448, 64]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": True,
+            "key": {"dtype": "bfloat16", "shape": [1, 1, 96, 128]},
+            "query": {"dtype": "bfloat16", "shape": [1, 16, 96, 128]},
+            "return_debug_mask": False,
+            "scale": 0.0883883,
+            "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": True,
+            "key": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
+            "query": {"dtype": "bfloat16", "shape": [1, 8, 96, 256]},
+            "return_debug_mask": False,
+            "scale": 0.0625,
+            "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        {
+            "attn_bias": None,
+            "dropout_p": 0.0,
+            "is_causal": True,
+            "key": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
+            "query": {"dtype": "bfloat16", "shape": [1, 4, 96, 256]},
+            "return_debug_mask": False,
+            "scale": 0.0625,
+            "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax",
+        {"dim": -1, "half_to_float": False, "self": {"dtype": "float32", "shape": [16384, 128]}},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::_softmax",
+        {"dim": 1, "half_to_float": False, "self": {"dtype": "float32", "shape": [4096, 128]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_softmax",
+        {"dim": 1, "half_to_float": False, "self": {"dtype": "float32", "shape": [4096, 64]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_softmax",
+        {
+            "dim": -1,
+            "half_to_float": False,
+            "self": {"dtype": "float32", "shape": [1, 128, 32, 33]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax",
+        {
+            "dim": -1,
+            "half_to_float": False,
+            "self": {"dtype": "float32", "shape": [3, 1, 8, 16, 212]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax",
+        {"dim": -1, "half_to_float": False, "self": {"dtype": "float32", "shape": [1, 73, 32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": -1,
+            "grad_output": {"dtype": "float32", "shape": [16384, 128]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [16384, 128]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": 1,
+            "grad_output": {"dtype": "float32", "shape": [4096, 128]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [4096, 128]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": 1,
+            "grad_output": {"dtype": "float32", "shape": [4096, 64]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [4096, 64]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": -1,
+            "grad_output": {"dtype": "float32", "shape": [1, 128, 32, 33]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [1, 128, 32, 33]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": -1,
+            "grad_output": {"dtype": "float32", "shape": [3, 1, 8, 16, 212]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [3, 1, 8, 16, 212]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_softmax_backward_data",
+        {
+            "dim": -1,
+            "grad_output": {"dtype": "float32", "shape": [1, 73, 32, 32]},
+            "input_dtype": 6,
+            "output": {"dtype": "float32", "shape": [1, 73, 32, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 6,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "bfloat16", "shape": [8192, 151936]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 15,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": [8192, 151936]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 6,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 12154960]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 6,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 12154880]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 6,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 9723968]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::_to_copy",
+        {
+            "device": None,
+            "dtype": 6,
+            "layout": None,
+            "memory_format": None,
+            "non_blocking": False,
+            "pin_memory": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 9723904]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "bfloat16", "shape": [1000, 48]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "bfloat16", "shape": [1000, 5]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "int64", "shape": [32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "float32", "shape": [1, 448]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::abs",
+        {"self": {"dtype": "float32", "shape": [1, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [16384, 37984]},
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [8192, 37984]},
+            "self": {"dtype": "float32", "shape": [8192, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [8192, 32064]},
+            "self": {"dtype": "float32", "shape": [8192, 32064]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 50512]},
+            "self": {"dtype": "float32", "shape": [4096, 50512]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 37984]},
+            "self": {"dtype": "float32", "shape": [4096, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::add.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 25600]},
+            "self": {"dtype": "float32", "shape": [4096, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [151936, 4096]},
+            "self": {"dtype": "float32", "shape": [151936, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [151936, 2048]},
+            "self": {"dtype": "bfloat16", "shape": [151936, 2048]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [37984, 5120]},
+            "self": {"dtype": "float32", "shape": [37984, 5120]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [37984, 4096]},
+            "self": {"dtype": "float32", "shape": [37984, 4096]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [151936, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [151936, 1024]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::add_.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "bfloat16", "shape": [49152, 2048]},
+            "self": {"dtype": "bfloat16", "shape": [49152, 2048]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::addmm",
+        {
+            "alpha": 1,
+            "beta": 1,
+            "mat1": {"dtype": "bfloat16", "shape": [32, 768]},
+            "mat2": {"dtype": "bfloat16", "shape": [768, 3072]},
+            "self": {"dtype": "bfloat16", "shape": [3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::addmm",
+        {
+            "alpha": 1,
+            "beta": 1,
+            "mat1": {"dtype": "bfloat16", "shape": [32, 3072]},
+            "mat2": {"dtype": "bfloat16", "shape": [3072, 768]},
+            "self": {"dtype": "bfloat16", "shape": [768]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::addmm",
+        {
+            "alpha": 1,
+            "beta": 1,
+            "mat1": {"dtype": "bfloat16", "shape": [32, 768]},
+            "mat2": {"dtype": "bfloat16", "shape": [768, 2304]},
+            "self": {"dtype": "bfloat16", "shape": [2304]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::addmm",
+        {
+            "alpha": 1,
+            "beta": 1,
+            "mat1": {"dtype": "bfloat16", "shape": [32, 768]},
+            "mat2": {"dtype": "bfloat16", "shape": [768, 768]},
+            "self": {"dtype": "bfloat16", "shape": [768]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": [1, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": [1, 65]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": [1, 36]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": [1, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": [1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all",
+        {"self": {"dtype": "bool", "shape": []}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all.out",
+        {
+            "dim": 1,
+            "keepdim": False,
+            "out": {"dtype": "bool", "shape": [1, 4]},
+            "self": {"dtype": "bool", "shape": [1, 36, 4]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::all.out",
+        {
+            "dim": -1,
+            "keepdim": False,
+            "out": {"dtype": "bool", "shape": [1, 36]},
+            "self": {"dtype": "bool", "shape": [1, 36, 2]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [16384, 37984]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [8192, 37984]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [8192, 32064]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [4096, 50512]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [4096, 37984]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::amax",
+        {"dim": [1], "keepdim": True, "self": {"dtype": "float32", "shape": [4096, 25600]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [8192, 5120]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [8192, 4096]}},
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [8016, 4096]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [4096, 4096]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [2374, 5120]}},
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::any",
+        {"self": {"dtype": "bool", "shape": [2374, 4096]}},
+        count=12,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": 6, "end": 4096, "layout": None, "pin_memory": None},
+        count=15,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": None, "end": 8192, "layout": None, "pin_memory": None},
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": 6, "end": 8192, "layout": None, "pin_memory": None},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": None, "end": 4096, "layout": None, "pin_memory": None},
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": 3, "end": 128, "layout": None, "pin_memory": None},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::arange",
+        {"device": None, "dtype": None, "end": 2048, "layout": None, "pin_memory": None},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 128, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 2},
+        count=22,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 64, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 2},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 1024, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 16},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 12, "out": {"dtype": "float32", "shape": [0]}, "start": 0, "step": 2},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 32, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 1},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::arange.start_out",
+        {"end": 64, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 1},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::avg_pool2d",
+        {
+            "ceil_mode": False,
+            "count_include_pad": True,
+            "divisor_override": None,
+            "kernel_size": [1, 1],
+            "padding": 0,
+            "self": {"dtype": "float32", "shape": [1, 72, 8, 8]},
+            "stride": [1, 1],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "out": {"dtype": "bool", "shape": [1, 16, 96, 96]},
+            "self": {"dtype": "bool", "shape": [1, 16, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [4, 4096]},
+            "out": {"dtype": "bool", "shape": [4, 4096]},
+            "self": {"dtype": "bool", "shape": [4, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 1, 1, 96]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 1, 96, 1]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_and.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 1, 96]},
+            "out": {"dtype": "bool", "shape": [1, 96, 96]},
+            "self": {"dtype": "bool", "shape": [1, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [1, 16, 96, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [96, 384]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [1, 1, 96, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_not",
+        {"self": {"dtype": "bool", "shape": [32, 8]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [8192, 5120]},
+            "out": {"dtype": "bool", "shape": [8192, 5120]},
+            "self": {"dtype": "bool", "shape": [8192, 5120]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [8192, 4096]},
+            "out": {"dtype": "bool", "shape": [8192, 4096]},
+            "self": {"dtype": "bool", "shape": [8192, 4096]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [8016, 4096]},
+            "out": {"dtype": "bool", "shape": [8016, 4096]},
+            "self": {"dtype": "bool", "shape": [8016, 4096]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [4096, 4096]},
+            "out": {"dtype": "bool", "shape": [4096, 4096]},
+            "self": {"dtype": "bool", "shape": [4096, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [2374, 5120]},
+            "out": {"dtype": "bool", "shape": [2374, 5120]},
+            "self": {"dtype": "bool", "shape": [2374, 5120]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::bitwise_or.Tensor_out",
+        {
+            "other": {"dtype": "bool", "shape": [2374, 4096]},
+            "out": {"dtype": "bool", "shape": [2374, 4096]},
+            "self": {"dtype": "bool", "shape": [2374, 4096]},
+        },
+        count=12,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::bitwise_right_shift.Tensor_Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": [1, 32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_right_shift.Tensor_Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": [32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bitwise_right_shift.Tensor_Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": []}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 4088, 1]},
+            "self": {"dtype": "bfloat16", "shape": [64, 4096, 4088]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 2880, 5760]},
+            "self": {"dtype": "bfloat16", "shape": [64, 1, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 4032, 1]},
+            "self": {"dtype": "bfloat16", "shape": [64, 4096, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 3072, 1]},
+            "self": {"dtype": "bfloat16", "shape": [64, 3072, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 2048, 1]},
+            "self": {"dtype": "bfloat16", "shape": [64, 4088, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::bmm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [64, 2880, 2880]},
+            "self": {"dtype": "bfloat16", "shape": [64, 1, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 0,
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [32768, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 0,
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [24576, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 1,
+            "tensors": [
+                {"dtype": "float32", "shape": [8, 8, 128, 5120]},
+                {"dtype": "float32", "shape": [8, 1, 128, 5120]},
+                {"dtype": "float32", "shape": [8, 1, 128, 5120]},
+            ],
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 1,
+            "tensors": [
+                {"dtype": "float32", "shape": [4, 16, 128, 4096]},
+                {"dtype": "float32", "shape": [4, 1, 128, 4096]},
+                {"dtype": "float32", "shape": [4, 1, 128, 4096]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 0,
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [4096, 5120]},
+                {"dtype": "bfloat16", "shape": [1, 5120]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::cat",
+        {
+            "dim": 1,
+            "tensors": [
+                {"dtype": "float32", "shape": [8, 4, 128, 4096]},
+                {"dtype": "float32", "shape": [8, 1, 128, 4096]},
+                {"dtype": "float32", "shape": [8, 1, 128, 4096]},
+            ],
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 12154960]},
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [64, 80]},
+                {"dtype": "bfloat16", "shape": [64, 12154880]},
+            ],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 12154880]},
+            "tensors": [{"dtype": "bfloat16", "shape": [64, 12154880]}],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 9723968]},
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [64, 64]},
+                {"dtype": "bfloat16", "shape": [64, 9723904]},
+            ],
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 9723904]},
+            "tensors": [{"dtype": "bfloat16", "shape": [64, 9723904]}],
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 9723904]},
+            "tensors": [{"dtype": "float32", "shape": [64, 9723904]}],
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cat.out",
+        {
+            "dim": 1,
+            "out": {"dtype": "float32", "shape": [64, 7864320]},
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [64, 2621440]},
+                {"dtype": "bfloat16", "shape": [64, 2621440]},
+                {"dtype": "bfloat16", "shape": [64, 2621440]},
+            ],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]}},
+        count=2,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "int64", "shape": [4, 4096]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "int64", "shape": [1, 4096]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "bfloat16", "shape": [1, 32, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "int64", "shape": [2048]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp",
+        {"max": 1.0, "min": None, "self": {"dtype": "int64", "shape": [1, 2048]}},
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::clamp.Tensor",
+        {
+            "max": {"dtype": "bfloat16", "shape": []},
+            "min": {"dtype": "bfloat16", "shape": []},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp.Tensor",
+        {
+            "max": {"dtype": "bfloat16", "shape": []},
+            "min": {"dtype": "bfloat16", "shape": []},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp_min",
+        {"min": 0.0, "self": {"dtype": "bfloat16", "shape": [1, 32, 8, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp_min",
+        {"min": 0.0, "self": {"dtype": "bfloat16", "shape": [1, 32, 2, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::clamp_min.Tensor_out",
+        {
+            "min": {"dtype": "float32", "shape": []},
+            "out": {"dtype": "float32", "shape": [1, 1]},
+            "self": {"dtype": "float32", "shape": [1, 1]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, 0, 0, -224],
+            "self": {"dtype": "float32", "shape": [1, 256, 128, 128]},
+            "value": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, 0, 0, -224],
+            "self": {"dtype": "float32", "shape": [1, 256, 128, 64]},
+            "value": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, -32],
+            "self": {"dtype": "float32", "shape": [1, 64, 128, 128]},
+            "value": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, 32],
+            "self": {"dtype": "float32", "shape": [1, 64, 96, 128]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, -32],
+            "self": {"dtype": "float32", "shape": [1, 32, 128, 128]},
+            "value": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::constant_pad_nd",
+        {
+            "pad": [0, 0, 0, 0, 0, 224],
+            "self": {"dtype": "float32", "shape": [1, 32, 128, 128]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "float32", "shape": [1280]},
+            "dilation": [1],
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 1280, 3000]},
+            "output_padding": [0],
+            "padding": [1],
+            "stride": [2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [1280, 1280, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "float32", "shape": [480]},
+            "dilation": [1, 1],
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 480, 32, 25]},
+            "output_padding": [0, 0],
+            "padding": [1, 1],
+            "stride": [2, 2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "float32", "shape": [480]},
+            "dilation": [1, 1],
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 480, 64, 50]},
+            "output_padding": [0, 0],
+            "padding": [1, 1],
+            "stride": [2, 2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [1024]},
+            "dilation": [1, 1, 1],
+            "groups": 1,
+            "input": {"dtype": "bfloat16", "shape": [256, 3, 2, 16, 16]},
+            "output_padding": [0, 0, 0],
+            "padding": [0, 0, 0],
+            "stride": [2, 16, 16],
+            "transposed": False,
+            "weight": {"dtype": "bfloat16", "shape": [1024, 3, 2, 16, 16]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [1152]},
+            "dilation": [1, 1],
+            "groups": 1,
+            "input": {"dtype": "bfloat16", "shape": [1, 3, 224, 224]},
+            "output_padding": [0],
+            "padding": [0],
+            "stride": [14, 14],
+            "transposed": False,
+            "weight": {"dtype": "bfloat16", "shape": [1152, 3, 14, 14]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [1152]},
+            "dilation": [1, 1],
+            "groups": 1,
+            "input": {"dtype": "bfloat16", "shape": [64, 3, 14, 14]},
+            "output_padding": [0, 0],
+            "padding": [0, 0],
+            "stride": [14, 14],
+            "transposed": False,
+            "weight": {"dtype": "bfloat16", "shape": [1152, 3, 14, 14]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [1280],
+            "dilation": [1],
+            "grad_output": {"dtype": "float32", "shape": [1, 1280, 1500]},
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 1280, 3000]},
+            "output_mask": [True, True, True],
+            "output_padding": [0],
+            "padding": [1],
+            "stride": [2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [1280, 1280, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [1280],
+            "dilation": [1],
+            "grad_output": {"dtype": "float32", "shape": [1, 1280, 3000]},
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 80, 3000]},
+            "output_mask": [False, True, True],
+            "output_padding": [0],
+            "padding": [1],
+            "stride": [1],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [1280, 80, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [480],
+            "dilation": [1, 1],
+            "grad_output": {"dtype": "float32", "shape": [1, 480, 16, 13]},
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 480, 32, 25]},
+            "output_mask": [True, True, True],
+            "output_padding": [0, 0],
+            "padding": [1, 1],
+            "stride": [2, 2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [480],
+            "dilation": [1, 1],
+            "grad_output": {"dtype": "float32", "shape": [1, 480, 32, 25]},
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 480, 64, 50]},
+            "output_mask": [True, True, True],
+            "output_padding": [0, 0],
+            "padding": [1, 1],
+            "stride": [2, 2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [1024],
+            "dilation": [1, 1, 1],
+            "grad_output": {"dtype": "bfloat16", "shape": [256, 1024, 1, 1, 1]},
+            "groups": 1,
+            "input": {"dtype": "bfloat16", "shape": [256, 3, 2, 16, 16]},
+            "output_mask": [False, True, True],
+            "output_padding": [0, 0, 0],
+            "padding": [0, 0, 0],
+            "stride": [2, 16, 16],
+            "transposed": False,
+            "weight": {"dtype": "bfloat16", "shape": [1024, 3, 2, 16, 16]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::convolution_backward",
+        {
+            "bias_sizes": [480],
+            "dilation": [1, 1],
+            "grad_output": {"dtype": "float32", "shape": [1, 480, 64, 50]},
+            "groups": 1,
+            "input": {"dtype": "float32", "shape": [1, 1, 128, 100]},
+            "output_mask": [False, True, True],
+            "output_padding": [0, 0],
+            "padding": [1, 1],
+            "stride": [2, 2],
+            "transposed": False,
+            "weight": {"dtype": "float32", "shape": [480, 1, 3, 3]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 12154960]},
+            "src": {"dtype": "float32", "shape": [64, 12154960]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 12154880]},
+            "src": {"dtype": "float32", "shape": [64, 12154880]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 9723968]},
+            "src": {"dtype": "float32", "shape": [64, 9723968]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 9723904]},
+            "src": {"dtype": "float32", "shape": [64, 9723904]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 7864320]},
+            "src": {"dtype": "float32", "shape": [64, 7864320]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::copy_",
+        {
+            "non_blocking": False,
+            "self": {"dtype": "float32", "shape": [64, 7618724]},
+            "src": {"dtype": "float32", "shape": [64, 7618724]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [8192, 128]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [4096, 128]}},
+        count=15,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [4096, 64]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [2048, 128]}},
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [1, 256, 512]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cos",
+        {"self": {"dtype": "float32", "shape": [1, 256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 2,
+            "self": {"dtype": "float32", "shape": [8192, 151936]},
+            "target": {"dtype": "int64", "shape": [8192]},
+            "weight": None,
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 2,
+            "self": {"dtype": "float32", "shape": [4096, 151936]},
+            "target": {"dtype": "int64", "shape": [4096]},
+            "weight": None,
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 2,
+            "self": {"dtype": "float32", "shape": [512, 151936]},
+            "target": {"dtype": "int64", "shape": [512]},
+            "weight": None,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 1,
+            "self": {"dtype": "float32", "shape": [448, 30000]},
+            "target": {"dtype": "int64", "shape": [448]},
+            "weight": None,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 1,
+            "self": {"dtype": "float32", "shape": [32, 30000]},
+            "target": {"dtype": "int64", "shape": [32]},
+            "weight": None,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cross_entropy_loss",
+        {
+            "ignore_index": -100,
+            "label_smoothing": 0.0,
+            "reduction": 1,
+            "self": {"dtype": "float32", "shape": [256, 3000]},
+            "target": {"dtype": "int64", "shape": [256]},
+            "weight": None,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 128, 1, 256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 16, 1, 128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 8, 1, 128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -1, "dtype": None, "self": {"dtype": "float32", "shape": [1, 128, 1, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -1, "dtype": None, "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::cumsum",
+        {"dim": -1, "dtype": 6, "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "int64", "shape": []},
+            "out": {"dtype": "bfloat16", "shape": [16384, 2048]},
+            "self": {"dtype": "bfloat16", "shape": [16384, 2048]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "float64", "shape": []},
+            "out": {"dtype": "float32", "shape": [18874368]},
+            "self": {"dtype": "float32", "shape": [18874368]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "float32", "shape": [16384, 1]},
+            "out": {"dtype": "float32", "shape": [16384, 128]},
+            "self": {"dtype": "float32", "shape": [16384, 128]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "int64", "shape": []},
+            "out": {"dtype": "bfloat16", "shape": [1, 4096, 512]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4096, 512]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "float64", "shape": []},
+            "out": {"dtype": "float32", "shape": [1, 256, 3000]},
+            "self": {"dtype": "float32", "shape": [1, 256, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div.out",
+        {
+            "other": {"dtype": "float64", "shape": []},
+            "out": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div.out_mode",
+        {
+            "other": {"dtype": "int64", "shape": []},
+            "out": {"dtype": "int64", "shape": [1, 36, 2]},
+            "rounding_mode": "floor",
+            "self": {"dtype": "int64", "shape": [1, 36, 2]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div.out_mode",
+        {
+            "other": {"dtype": "int64", "shape": [64]},
+            "out": {"dtype": "int64", "shape": [64]},
+            "rounding_mode": "floor",
+            "self": {"dtype": "int64", "shape": [64]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [16384, 1]},
+            "self": {"dtype": "float32", "shape": [16384, 128]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [256, 1]},
+            "self": {"dtype": "float32", "shape": [256, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [96, 1]},
+            "self": {"dtype": "float32", "shape": [96, 10]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [96, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [96, 1]},
+            "self": {"dtype": "float32", "shape": [96, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::div_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [96, 1]},
+            "self": {"dtype": "float32", "shape": [96, 4]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 4096]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 4096]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 4096]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 2048]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding",
+        {
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+            "sparse": False,
+            "weight": {"dtype": "bfloat16", "shape": [151936, 2048]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 8192]},
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "num_weights": 128256,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "num_weights": 151936,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [2, 8192, 2560]},
+            "indices": {"dtype": "int64", "shape": [2, 8192]},
+            "num_weights": 151936,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "num_weights": 128256,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=8,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "indices": {"dtype": "int64", "shape": [1, 8192]},
+            "num_weights": 151936,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::embedding_dense_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [4, 4096, 2048]},
+            "indices": {"dtype": "int64", "shape": [4, 4096]},
+            "num_weights": 37984,
+            "padding_idx": -1,
+            "scale_grad_by_freq": False,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192]},
+            "self": {"dtype": "int64", "shape": [8192]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [4096]},
+            "self": {"dtype": "int64", "shape": [4096]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [768]},
+            "self": {"dtype": "int64", "shape": [768]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 448]},
+            "self": {"dtype": "float32", "shape": [1, 448]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 4, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4, 96, 1]},
+        },
+        count=2,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eq.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 264]},
+            "self": {"dtype": "int64", "shape": [1, 264]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eq.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 1, 96]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "int64", "shape": [1, 1, 96, 1]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eq.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 96]},
+            "out": {"dtype": "bool", "shape": [1, 96, 96]},
+            "self": {"dtype": "int64", "shape": [1, 96, 1]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [16384, 37984]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [8192, 37984]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [8192, 32064]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [4096, 50512]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [4096, 37984]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::exp",
+        {"self": {"dtype": "float32", "shape": [4096, 25600]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::exp.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 448, 30000]},
+            "self": {"dtype": "float32", "shape": [1, 448, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::exp.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 32, 30000]},
+            "self": {"dtype": "float32", "shape": [1, 32, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::exp.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 16, 30000]},
+            "self": {"dtype": "float32", "shape": [1, 16, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::exp.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 96, 3000]},
+            "self": {"dtype": "float32", "shape": [1, 96, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::exp.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 32, 3000]},
+            "self": {"dtype": "float32", "shape": [1, 32, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::eye",
+        {"device": None, "dtype": 6, "layout": None, "n": 64, "pin_memory": None},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8, 8, 512]}, "value": float("-inf")},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8, 8, 128]}, "value": float("-inf")},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "float32", "shape": [1024]}, "value": 1.0},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "bool", "shape": [1, 32, 32]}, "value": 1.0},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "int64", "shape": [32, 32]}, "value": 15},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::fill_.Scalar",
+        {"self": {"dtype": "bfloat16", "shape": [1, 4, 96, 2]}, "value": float("-inf")},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 128, 1, 256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 16, 1, 128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 8, 1, 128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 128, 1, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::flip",
+        {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 32, 2, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "float32", "shape": [262144]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": [32768]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": [24576]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": [4096]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int32", "shape": [128]}},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::floor_divide",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": [1, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::full",
+        {
+            "device": None,
+            "dtype": None,
+            "fill_value": 0.0,
+            "layout": None,
+            "pin_memory": None,
+            "size": [1, 96],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [16384, 1]},
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+            "sparse_grad": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 37984]},
+            "sparse_grad": False,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 32064]},
+            "sparse_grad": False,
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 50512]},
+            "sparse_grad": False,
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 37984]},
+            "sparse_grad": False,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::gather",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 25600]},
+            "sparse_grad": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 96, 12288]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [96, 3072]},
+            "self": {"dtype": "bfloat16", "shape": [96, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [64, 2880]},
+            "self": {"dtype": "bfloat16", "shape": [64, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [64, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [64, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 32, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [384, 48]},
+            "self": {"dtype": "bfloat16", "shape": [384, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Tensor_out",
+        {
+            "other": {"dtype": "bfloat16", "shape": []},
+            "out": {"dtype": "bool", "shape": [1, 36, 192]},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Tensor_out",
+        {
+            "other": {"dtype": "bfloat16", "shape": []},
+            "out": {"dtype": "bool", "shape": [1, 36, 48]},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 32, 1]},
+            "out": {"dtype": "bool", "shape": [1, 32, 8]},
+            "self": {"dtype": "int64", "shape": [1, 1, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 32, 1]},
+            "out": {"dtype": "bool", "shape": [1, 32, 8]},
+            "self": {"dtype": "int64", "shape": [1, 32, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ge.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 16]},
+            "out": {"dtype": "bool", "shape": [16, 16]},
+            "self": {"dtype": "int64", "shape": [16, 1]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1500, 5120]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1280, 3000]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 448, 5120]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "tanh", "self": {"dtype": "bfloat16", "shape": [1, 264, 8192]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "none", "self": {"dtype": "bfloat16", "shape": [1, 1025, 2048]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu",
+        {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1280, 1500]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "none",
+            "grad_output": {"dtype": "float32", "shape": [1, 1500, 5120]},
+            "self": {"dtype": "float32", "shape": [1, 1500, 5120]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "none",
+            "grad_output": {"dtype": "float32", "shape": [1, 1280, 3000]},
+            "self": {"dtype": "float32", "shape": [1, 1280, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "none",
+            "grad_output": {"dtype": "float32", "shape": [1, 448, 5120]},
+            "self": {"dtype": "float32", "shape": [1, 448, 5120]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "tanh",
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 264, 8192]},
+            "self": {"dtype": "bfloat16", "shape": [1, 264, 8192]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "none",
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 1025, 2048]},
+            "self": {"dtype": "bfloat16", "shape": [1, 1025, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gelu_backward",
+        {
+            "approximate": "none",
+            "grad_output": {"dtype": "float32", "shape": [1, 480, 64, 50]},
+            "self": {"dtype": "float32", "shape": [1, 480, 64, 50]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192, 5120]},
+            "self": {"dtype": "float32", "shape": [8192, 5120]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192, 4096]},
+            "self": {"dtype": "float32", "shape": [8192, 4096]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8016, 4096]},
+            "self": {"dtype": "float32", "shape": [8016, 4096]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [4096, 4096]},
+            "self": {"dtype": "float32", "shape": [4096, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [2374, 5120]},
+            "self": {"dtype": "float32", "shape": [2374, 5120]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::gt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [2374, 4096]},
+            "self": {"dtype": "float32", "shape": [2374, 4096]},
+        },
+        count=12,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::gt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 96, 1]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "int64", "shape": [1, 1, 1, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [96, 1]},
+            "out": {"dtype": "bool", "shape": [96, 96]},
+            "self": {"dtype": "int64", "shape": [96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 32, 1]},
+            "out": {"dtype": "bool", "shape": [1, 1, 32, 32]},
+            "self": {"dtype": "int64", "shape": [1, 1, 1, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::gt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1]},
+            "out": {"dtype": "bool", "shape": [1]},
+            "self": {"dtype": "int64", "shape": [1]},
+        },
+        count=19,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::gt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": []},
+            "out": {"dtype": "bool", "shape": []},
+            "self": {"dtype": "int64", "shape": []},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::histc",
+        {"bins": 128, "max": 0, "min": 0, "self": {"dtype": "int64", "shape": [32768]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::histc",
+        {"bins": 64, "max": 0, "min": 0, "self": {"dtype": "int64", "shape": [24576]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::histc",
+        {"bins": 16, "max": 0, "min": 0, "self": {"dtype": "int64", "shape": [4096]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 32, "low": 0, "shape": [1]}],
+            "self": {"dtype": "bfloat16", "shape": [32, 3072, 1536]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 8, "low": 0, "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 4096, 4088]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 8, "low": 0, "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 2880, 5760]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 8, "low": 0, "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 4096, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 32, "low": 0, "shape": [1]}],
+            "self": {"dtype": "bfloat16", "shape": [32, 1536, 1536]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index.Tensor",
+        {
+            "indices": [{"dtype": "int64", "high": 8, "low": 0, "shape": [64]}],
+            "self": {"dtype": "bfloat16", "shape": [8, 3072, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [10]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [10, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [11]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [11, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [12]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [12, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [13]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [13, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [14]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [14, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_add_",
+        {
+            "alpha": 1,
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [15]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+            "source": {"dtype": "float32", "shape": [15, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [3]},
+            "self": {"dtype": "bfloat16", "shape": [1, 10, 256, 256]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [10]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [11]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [12]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [13]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select",
+        {
+            "dim": 0,
+            "index": {"dtype": "int64", "shape": [14]},
+            "self": {"dtype": "float32", "shape": [32, 4032]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::index_select_backward",
+        {
+            "dim": 0,
+            "grad": {"dtype": "float32", "shape": [13, 1024]},
+            "index": {"dtype": "int64", "shape": [13]},
+            "self_sizes": [13, 1024],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 96, 12288]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [96, 3072]},
+            "self": {"dtype": "bfloat16", "shape": [96, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [64, 2880]},
+            "self": {"dtype": "bfloat16", "shape": [64, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [64, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [64, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [1, 32, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [384, 48]},
+            "self": {"dtype": "bfloat16", "shape": [384, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 96, 1]},
+            "out": {"dtype": "bool", "shape": [1, 1, 96, 96]},
+            "self": {"dtype": "int64", "shape": [1, 1, 1, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [96, 1]},
+            "out": {"dtype": "bool", "shape": [96, 96]},
+            "self": {"dtype": "int64", "shape": [96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Tensor_out",
+        {
+            "other": {"dtype": "bfloat16", "shape": []},
+            "out": {"dtype": "bool", "shape": [1, 36, 192]},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Tensor_out",
+        {
+            "other": {"dtype": "bfloat16", "shape": []},
+            "out": {"dtype": "bool", "shape": [1, 36, 48]},
+            "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::le.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1, 32, 1]},
+            "out": {"dtype": "bool", "shape": [1, 1, 32, 32]},
+            "self": {"dtype": "int64", "shape": [1, 1, 1, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "ord": 2,
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 8, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "ord": 2,
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 2, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "ord": 2,
+            "self": {"dtype": "float32", "shape": [1, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": None,
+            "dtype": None,
+            "keepdim": False,
+            "ord": 2.0,
+            "self": {"dtype": "float32", "shape": [723]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": None,
+            "dtype": None,
+            "keepdim": False,
+            "ord": 2.0,
+            "self": {"dtype": "float32", "shape": [707]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linalg_vector_norm",
+        {
+            "dim": None,
+            "dtype": None,
+            "keepdim": False,
+            "ord": 2.0,
+            "self": {"dtype": "float32", "shape": [627]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 5120]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 4096]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 512, 4096]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::linear",
+        {
+            "bias": None,
+            "input": {"dtype": "bfloat16", "shape": [1, 4096, 2048]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 2048]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 4096]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 1024]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 1024]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 2048]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 2048]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 5120]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 4096, 5120]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 5120]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::linear_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 151936]},
+            "output_mask": [True, True, False],
+            "self": {"dtype": "bfloat16", "shape": [1, 4096, 4096]},
+            "weight": {"dtype": "bfloat16", "shape": [151936, 4096]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [16384, 1]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [8192, 1]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [4096, 1]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [2048, 1]}},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::log",
+        {"self": {"dtype": "float32", "shape": [512, 1]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::log.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 448]},
+            "self": {"dtype": "float32", "shape": [1, 448]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::log.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 96]},
+            "self": {"dtype": "float32", "shape": [1, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::log.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 32]},
+            "self": {"dtype": "float32", "shape": [1, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::log.out",
+        {
+            "out": {"dtype": "float32", "shape": [1, 16]},
+            "self": {"dtype": "float32", "shape": [1, 16]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 96, 12288]},
+            "out": {"dtype": "bool", "shape": [1, 96, 12288]},
+            "self": {"dtype": "bool", "shape": [1, 96, 12288]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [96, 3072]},
+            "out": {"dtype": "bool", "shape": [96, 3072]},
+            "self": {"dtype": "bool", "shape": [96, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [64, 2880]},
+            "out": {"dtype": "bool", "shape": [64, 2880]},
+            "self": {"dtype": "bool", "shape": [64, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [64, 1024]},
+            "out": {"dtype": "bool", "shape": [64, 1024]},
+            "self": {"dtype": "bool", "shape": [64, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [1, 32, 1024]},
+            "out": {"dtype": "bool", "shape": [1, 32, 1024]},
+            "self": {"dtype": "bool", "shape": [1, 32, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_and.out",
+        {
+            "other": {"dtype": "bool", "shape": [384, 48]},
+            "out": {"dtype": "bool", "shape": [384, 48]},
+            "self": {"dtype": "bool", "shape": [384, 48]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::logical_not",
+        {"self": {"dtype": "bool", "shape": [1, 4]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192, 5120]},
+            "self": {"dtype": "float32", "shape": [8192, 5120]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192, 4096]},
+            "self": {"dtype": "float32", "shape": [8192, 4096]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8016, 4096]},
+            "self": {"dtype": "float32", "shape": [8016, 4096]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [4096, 4096]},
+            "self": {"dtype": "float32", "shape": [4096, 4096]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [2374, 5120]},
+            "self": {"dtype": "float32", "shape": [2374, 5120]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::lt.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [2374, 4096]},
+            "self": {"dtype": "float32", "shape": [2374, 4096]},
+        },
+        count=12,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::lt.Tensor_out",
+        {
+            "other": {"dtype": "int32", "shape": [127]},
+            "out": {"dtype": "bool", "shape": [127]},
+            "self": {"dtype": "int32", "shape": [127]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::lt.Tensor_out",
+        {
+            "other": {"dtype": "int32", "shape": [63]},
+            "out": {"dtype": "bool", "shape": [63]},
+            "self": {"dtype": "int32", "shape": [63]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::lt.Tensor_out",
+        {
+            "other": {"dtype": "int32", "shape": [15]},
+            "out": {"dtype": "bool", "shape": [15]},
+            "self": {"dtype": "int32", "shape": [15]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::lt.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [1, 1]},
+            "out": {"dtype": "bool", "shape": [1, 13]},
+            "self": {"dtype": "int64", "shape": [13]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [256, 256]},
+            "self": {"dtype": "float32", "shape": [1, 128, 1, 256, 256]},
+            "value": 0.0,
+        },
+        count=2,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [64, 64]},
+            "self": {"dtype": "float32", "shape": [1, 64, 2, 64, 64]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [128, 128]},
+            "self": {"dtype": "float32", "shape": [1, 16, 1, 128, 128]},
+            "value": 0.0,
+        },
+        count=2,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [64, 64]},
+            "self": {"dtype": "float32", "shape": [1, 32, 2, 64, 64]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 16, 96, 96]},
+            "self": {"dtype": "bfloat16", "shape": [1, 16, 96, 96]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 32, 8, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 8, 128]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 32, 2, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 2, 128]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 1]},
+            "self": {"dtype": "float32", "shape": [1, 1024]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 448]},
+            "self": {"dtype": "float32", "shape": [1, 448]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96]},
+            "self": {"dtype": "float32", "shape": [1, 96]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_fill_.Scalar",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 32]},
+            "self": {"dtype": "float32", "shape": [1, 32]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 264, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 264, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 640]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 512]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 448]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::masked_select",
+        {
+            "mask": {"dtype": "bool", "shape": [1, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 336]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max",
+        {"self": {"dtype": "int64", "shape": [8192]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::max",
+        {"self": {"dtype": "int64", "shape": [4096]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::max",
+        {"self": {"dtype": "int64", "shape": [3, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max",
+        {"self": {"dtype": "int64", "shape": [64, 2]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max",
+        {"self": {"dtype": "int64", "shape": [1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 128, 32, 33]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 64, 32, 33]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 21, 32, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 4, 32, 41]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 4, 32, 33]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::max.dim",
+        {"dim": -1, "keepdim": True, "self": {"dtype": "int64", "shape": [1, 36]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [1, 448]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [1, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [64]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+        ),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [32]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-trn3",
+        ),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [1, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [1, 16]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [6144, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "self": {"dtype": "float32", "shape": [1, 1024, 640]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [1, 264, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [1, 256, 4, 512]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mean.dim",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [1, 96, 8, 512]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::min",
+        {"self": {"dtype": "int64", "shape": [8192]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::min",
+        {"self": {"dtype": "int64", "shape": [4096]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+        ),
+    )
+    t(
+        "aten::minimum",
+        {
+            "other": {"dtype": "int64", "shape": [32, 32]},
+            "self": {"dtype": "int64", "shape": [32, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::minimum",
+        {
+            "other": {"dtype": "int64", "shape": [16, 16]},
+            "self": {"dtype": "int64", "shape": [16, 16]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [32, 256]},
+            "self": {"dtype": "bfloat16", "shape": [2048, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mm",
+        {
+            "mat2": {"dtype": "bfloat16", "shape": [72, 336]},
+            "self": {"dtype": "bfloat16", "shape": [64, 72]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss",
+        {
+            "reduction": 0,
+            "self": {"dtype": "float32", "shape": [1, 40, 132]},
+            "target": {"dtype": "float32", "shape": [1, 40, 132]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss",
+        {
+            "reduction": 0,
+            "self": {"dtype": "float32", "shape": [1, 16, 32]},
+            "target": {"dtype": "float32", "shape": [1, 16, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss",
+        {
+            "reduction": 1,
+            "self": {"dtype": "float32", "shape": [1, 3, 7, 7]},
+            "target": {"dtype": "float32", "shape": [1, 3, 7, 7]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 40, 132]},
+            "reduction": 0,
+            "self": {"dtype": "float32", "shape": [1, 40, 132]},
+            "target": {"dtype": "float32", "shape": [1, 40, 132]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 16, 32]},
+            "reduction": 0,
+            "self": {"dtype": "float32", "shape": [1, 16, 32]},
+            "target": {"dtype": "float32", "shape": [1, 16, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mse_loss_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": []},
+            "reduction": 1,
+            "self": {"dtype": "float32", "shape": [1, 3, 7, 7]},
+            "target": {"dtype": "float32", "shape": [1, 3, 7, 7]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [6144, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 264, 16, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 264, 2048]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 256, 4, 512]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 96, 8, 512]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [3072, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [16384, 1]},
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 32064]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "bfloat16", "shape": [1, 8192, 25600]},
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 50512]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::mul.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {
+            "other": {"dtype": "float32", "shape": [1, 4096, 16]},
+            "self": {"dtype": "float32", "shape": [1, 4096, 16]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {
+            "other": {"dtype": "bfloat16", "shape": [1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 256, 176]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {
+            "other": {"dtype": "bfloat16", "shape": [1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 336]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {
+            "other": {"dtype": "bfloat16", "shape": [1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 176]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {
+            "other": {"dtype": "bfloat16", "shape": [1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 96, 96]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::mul_.Tensor",
+        {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": []}},
+        count=2,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "bfloat16", "shape": [1, 96, 160]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "bfloat16", "shape": [96, 160]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "bfloat16", "shape": [1, 96, 48]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "float32", "shape": [1, 96, 48]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "bfloat16", "shape": [1, 64, 48]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout",
+        {"input": {"dtype": "bfloat16", "shape": [1, 32, 48]}, "p": 0.1, "train": True},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 160]},
+            "mask": {"dtype": "bool", "shape": [1, 96, 160]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [96, 160]},
+            "mask": {"dtype": "bool", "shape": [96, 160]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 48]},
+            "mask": {"dtype": "bool", "shape": [1, 96, 48]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 96, 48]},
+            "mask": {"dtype": "bool", "shape": [1, 96, 48]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 64, 48]},
+            "mask": {"dtype": "bool", "shape": [1, 64, 48]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_dropout_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 48]},
+            "mask": {"dtype": "bool", "shape": [1, 32, 48]},
+            "scale": 1.11111,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "float32", "shape": [1280]},
+            "eps": 1e-05,
+            "input": {"dtype": "float32", "shape": [1, 1500, 1280]},
+            "normalized_shape": [1280],
+            "weight": {"dtype": "float32", "shape": [1280]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "float32", "shape": [1280]},
+            "eps": 1e-05,
+            "input": {"dtype": "float32", "shape": [1, 448, 1280]},
+            "normalized_shape": [1280],
+            "weight": {"dtype": "float32", "shape": [1280]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "float32", "shape": [2048]},
+            "eps": 1e-05,
+            "input": {"dtype": "float32", "shape": [1, 264, 2048]},
+            "normalized_shape": [2048],
+            "weight": {"dtype": "float32", "shape": [2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [512]},
+            "eps": 1e-05,
+            "input": {"dtype": "bfloat16", "shape": [1, 1025, 512]},
+            "normalized_shape": [512],
+            "weight": {"dtype": "bfloat16", "shape": [512]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "float32", "shape": [768]},
+            "eps": 1e-06,
+            "input": {"dtype": "float32", "shape": [3, 197, 768]},
+            "normalized_shape": [768],
+            "weight": {"dtype": "float32", "shape": [768]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm",
+        {
+            "bias": {"dtype": "float32", "shape": [768]},
+            "eps": 1e-05,
+            "input": {"dtype": "float32", "shape": [3, 1, 196, 768]},
+            "normalized_shape": [768],
+            "weight": {"dtype": "float32", "shape": [768]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "float32", "shape": [1280]},
+            "grad_out": {"dtype": "float32", "shape": [1, 1500, 1280]},
+            "input": {"dtype": "float32", "shape": [1, 1500, 1280]},
+            "mean": {"dtype": "float32", "shape": [1, 1500, 1]},
+            "normalized_shape": [1280],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 1500, 1]},
+            "weight": {"dtype": "float32", "shape": [1280]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "float32", "shape": [1280]},
+            "grad_out": {"dtype": "float32", "shape": [1, 448, 1280]},
+            "input": {"dtype": "float32", "shape": [1, 448, 1280]},
+            "mean": {"dtype": "float32", "shape": [1, 448, 1]},
+            "normalized_shape": [1280],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 448, 1]},
+            "weight": {"dtype": "float32", "shape": [1280]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "float32", "shape": [2048]},
+            "grad_out": {"dtype": "float32", "shape": [1, 264, 2048]},
+            "input": {"dtype": "float32", "shape": [1, 264, 2048]},
+            "mean": {"dtype": "float32", "shape": [1, 264, 1]},
+            "normalized_shape": [2048],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 264, 1]},
+            "weight": {"dtype": "float32", "shape": [2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [512]},
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 1025, 512]},
+            "input": {"dtype": "bfloat16", "shape": [1, 1025, 512]},
+            "mean": {"dtype": "float32", "shape": [1, 1025, 1]},
+            "normalized_shape": [512],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 1025, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [512]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "float32", "shape": [1152]},
+            "grad_out": {"dtype": "float32", "shape": [1, 256, 1152]},
+            "input": {"dtype": "float32", "shape": [1, 256, 1152]},
+            "mean": {"dtype": "float32", "shape": [1, 256, 1]},
+            "normalized_shape": [1152],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 256, 1]},
+            "weight": {"dtype": "float32", "shape": [1152]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::native_layer_norm_backward",
+        {
+            "bias": {"dtype": "bfloat16", "shape": [1024]},
+            "grad_out": {"dtype": "bfloat16", "shape": [1, 257, 1024]},
+            "input": {"dtype": "bfloat16", "shape": [1, 257, 1024]},
+            "mean": {"dtype": "float32", "shape": [1, 257, 1]},
+            "normalized_shape": [1024],
+            "output_mask": [True, True, True],
+            "rstd": {"dtype": "float32", "shape": [1, 257, 1]},
+            "weight": {"dtype": "bfloat16", "shape": [1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [16384, 1]},
+            "self": {"dtype": "int64", "shape": [16384, 1]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [16384]},
+            "self": {"dtype": "int64", "shape": [16384]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192, 1]},
+            "self": {"dtype": "int64", "shape": [8192, 1]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [8192]},
+            "self": {"dtype": "int64", "shape": [8192]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [4096, 1]},
+            "self": {"dtype": "int64", "shape": [4096, 1]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ne.Scalar_out",
+        {
+            "other": 0.0,
+            "out": {"dtype": "bool", "shape": [4096]},
+            "self": {"dtype": "int64", "shape": [4096]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "float32", "shape": [16384, 128]}},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "float32", "shape": [1, 64, 2, 64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "bfloat16", "shape": [1, 64, 64, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "float32", "shape": [1, 32, 2, 64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::neg",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 64, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "bool", "shape": [768]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "bool", "shape": [1, 96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "bool", "shape": [96]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "int64", "shape": [32, 2]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "bool", "shape": [13]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::nonzero",
+        {"self": {"dtype": "bool", "shape": [1, 4]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::one_hot",
+        {"num_classes": 8, "self": {"dtype": "int64", "shape": [32, 2]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::one_hot",
+        {"num_classes": 4, "self": {"dtype": "int64", "shape": [1, 36]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [1, 32]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [1, 65]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [128, 128]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [2, 2]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [256, 256]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones",
+        {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [3, 1, 96]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones_like",
+        {
+            "device": None,
+            "dtype": None,
+            "layout": None,
+            "memory_format": None,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": [262144, 32]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::ones_like",
+        {
+            "device": None,
+            "dtype": None,
+            "layout": None,
+            "memory_format": None,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": [8192, 64]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::ones_like",
+        {
+            "device": None,
+            "dtype": None,
+            "layout": None,
+            "memory_format": None,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": [4096, 64]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::ones_like",
+        {
+            "device": None,
+            "dtype": None,
+            "layout": None,
+            "memory_format": None,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": [4096, 32]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async-compile-moe",),
+    )
+    t(
+        "aten::ones_like",
+        {
+            "device": None,
+            "dtype": None,
+            "layout": None,
+            "memory_format": None,
+            "pin_memory": None,
+            "self": {"dtype": "float32", "shape": []},
+        },
+        count=22,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::pow.Scalar",
+        {"exponent": {"dtype": "float32", "shape": [64]}, "self": 0.0},
+        count=24,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::pow.Scalar",
+        {"exponent": {"dtype": "float32", "shape": [32]}, "self": 0.0},
+        count=5,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::pow.Scalar",
+        {"exponent": {"dtype": "float32", "shape": [10]}, "self": 0.0},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Scalar",
+        {"exponent": {"dtype": "float32", "shape": [6]}, "self": 0.0},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 1.0,
+            "out": {"dtype": "float32", "shape": [6144, 128]},
+            "self": {"dtype": "float32", "shape": [6144, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 2,
+            "out": {"dtype": "float32", "shape": [6144, 128]},
+            "self": {"dtype": "float32", "shape": [6144, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 1.0,
+            "out": {"dtype": "float32", "shape": [1, 264, 16, 128]},
+            "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 2,
+            "out": {"dtype": "float32", "shape": [1, 264, 16, 128]},
+            "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 1.0,
+            "out": {"dtype": "float32", "shape": [1, 264, 2048]},
+            "self": {"dtype": "float32", "shape": [1, 264, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::pow.Tensor_Scalar_out",
+        {
+            "exponent": 2,
+            "out": {"dtype": "float32", "shape": [1, 264, 2048]},
+            "self": {"dtype": "float32", "shape": [1, 264, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 8, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "float32", "shape": [64]}},
+        count=22,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 2, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "float32", "shape": [32]}},
+        count=6,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "float32", "shape": [10]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::reciprocal",
+        {"self": {"dtype": "float32", "shape": [6]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 4096]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 3712]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "bfloat16", "shape": [64, 1856]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "float32", "shape": [1, 32, 64, 32]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 49, 1024]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::relu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 41, 1024]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "float32", "shape": [262144]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": [128]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": [64]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "int32", "shape": [16]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "int64", "shape": [1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::remainder.Scalar",
+        {"other": 0.0, "self": {"dtype": "int64", "shape": []}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::remainder.Tensor_out",
+        {
+            "other": {"dtype": "int64", "shape": [64]},
+            "out": {"dtype": "int64", "shape": [64]},
+            "self": {"dtype": "int64", "shape": [64]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 2], "self": {"dtype": "float32", "shape": [96, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 1], "self": {"dtype": "float32", "shape": [64, 80]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 1, 1], "self": {"dtype": "float32", "shape": [1, 1, 1408]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 1, 1], "self": {"dtype": "bfloat16", "shape": [1, 1, 1152]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 2], "self": {"dtype": "float32", "shape": [64, 10]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat",
+        {"repeats": [1, 1], "self": {"dtype": "int64", "shape": [1, 448]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::repeat_interleave.Tensor",
+        {"output_size": None, "repeats": {"dtype": "int32", "shape": [128]}},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [1, 96, 64, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [6144, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [1, 264, 16, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [1, 96, 32, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [3072, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::rsqrt",
+        {"self": {"dtype": "float32", "shape": [1, 264, 8, 1]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": [16384, 8]},
+            "out": {"dtype": "bool", "shape": [16384, 128]},
+            "self": {"dtype": "bool", "shape": [16384, 128]},
+            "value": True,
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": [1, 32, 32]},
+            "out": {"dtype": "bool", "shape": [1, 32, 32]},
+            "self": {"dtype": "bool", "shape": [1, 32, 32]},
+            "value": False,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": [1, 4, 96, 1]},
+            "out": {"dtype": "bfloat16", "shape": [1, 4, 96, 2]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4, 96, 2]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": [1, 4, 96, 1]},
+            "out": {"dtype": "bfloat16", "shape": [1, 4, 96, 1]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4, 96, 1]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": -1,
+            "index": {"dtype": "int64", "shape": [1, 1, 32, 8]},
+            "out": {"dtype": "bfloat16", "shape": [1, 1, 32, 9]},
+            "self": {"dtype": "bfloat16", "shape": [1, 1, 32, 9]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter.value_out",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [96, 1]},
+            "out": {"dtype": "float32", "shape": [96, 1]},
+            "self": {"dtype": "float32", "shape": [96, 1]},
+            "value": 0.0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [1, 256, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [1, 1024, 1024]},
+            "src": {"dtype": "bfloat16", "shape": [1, 256, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 8]},
+            "self": {"dtype": "float32", "shape": [4096, 128]},
+            "src": {"dtype": "float32", "shape": [4096, 8]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-core-async",),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 6]},
+            "self": {"dtype": "float32", "shape": [4096, 64]},
+            "src": {"dtype": "float32", "shape": [4096, 6]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 16]},
+            "src": {"dtype": "float32", "shape": [4096, 1]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [96, 8]},
+            "self": {"dtype": "bfloat16", "shape": [96, 384]},
+            "src": {"dtype": "bfloat16", "shape": [96, 8]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::scatter_add_",
+        {
+            "dim": 1,
+            "index": {"dtype": "int64", "shape": [96, 4]},
+            "self": {"dtype": "float32", "shape": [96, 128]},
+            "src": {"dtype": "float32", "shape": [96, 4]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 0,
+            "grad_output": {"dtype": "bfloat16", "shape": [10240, 72]},
+            "index": 0,
+            "input_sizes": [2, 10240, 72],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 0,
+            "grad_output": {"dtype": "bfloat16", "shape": [10240, 72]},
+            "index": 1,
+            "input_sizes": [2, 10240, 72],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 2,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 64, 64, 128]},
+            "index": 0,
+            "input_sizes": [1, 64, 2, 64, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 2,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 64, 64, 128]},
+            "index": 1,
+            "input_sizes": [1, 64, 2, 64, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 2,
+            "grad_output": {"dtype": "float32", "shape": [1, 64, 64, 128]},
+            "index": 0,
+            "input_sizes": [1, 64, 2, 64, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::select_backward",
+        {
+            "dim": 2,
+            "grad_output": {"dtype": "float32", "shape": [1, 64, 64, 128]},
+            "index": 1,
+            "input_sizes": [1, 64, 2, 64, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sgn",
+        {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [1, 96, 12288]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [96, 3072]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [1, 96, 2048]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [64, 2880]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 4096]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid",
+        {"self": {"dtype": "bfloat16", "shape": [1, 96, 1024]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
+            "output": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [96, 3072]},
+            "output": {"dtype": "bfloat16", "shape": [96, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
+            "output": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [64, 2880]},
+            "output": {"dtype": "bfloat16", "shape": [64, 2880]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 4096]},
+            "output": {"dtype": "bfloat16", "shape": [1, 32, 4096]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sigmoid_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 1024]},
+            "output": {"dtype": "bfloat16", "shape": [1, 96, 1024]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sign",
+        {"self": {"dtype": "float32", "shape": [64]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+        ),
+    )
+    t(
+        "aten::sign",
+        {"self": {"dtype": "float32", "shape": [32]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-trn3",
+        ),
+    )
+    t(
+        "aten::sign",
+        {"self": {"dtype": "float32", "shape": [16]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8192, 25600]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 4096, 25600]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8192, 12288]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8192, 7168]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 8192, 6400]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu",
+        {"self": {"dtype": "bfloat16", "shape": [1, 4096, 12288]}},
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 25600]},
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 25600]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4096, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 12288]},
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 12288]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 7168]},
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 7168]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 6400]},
+            "self": {"dtype": "bfloat16", "shape": [1, 8192, 6400]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::silu_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 12288]},
+            "self": {"dtype": "bfloat16", "shape": [1, 4096, 12288]},
+        },
+        count=6,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [8192, 128]}},
+        count=7,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [4096, 128]}},
+        count=15,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [4096, 64]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [2048, 128]}},
+        count=1,
+        paths=("text-generation-torch-titan-qwen3-235b-trn3",),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [1, 256, 512]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sin",
+        {"self": {"dtype": "float32", "shape": [1, 256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 0,
+            "end": 16384,
+            "grad_output": {"dtype": "bfloat16", "shape": [16384, 2048]},
+            "input_sizes": [16384, 2048],
+            "start": 0,
+            "step": 1,
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 64, 64]},
+            "input_sizes": [1, 8192, 64, 128],
+            "start": 64,
+            "step": 1,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 32, 64]},
+            "input_sizes": [1, 8192, 32, 128],
+            "start": 64,
+            "step": 1,
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 64, 64]},
+            "input_sizes": [1, 4096, 64, 128],
+            "start": 64,
+            "step": 1,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 4096, 32, 64]},
+            "input_sizes": [1, 4096, 32, 128],
+            "start": 64,
+            "step": 1,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::slice_backward",
+        {
+            "dim": 3,
+            "end": 9223372036854775807,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 8192, 16, 64]},
+            "input_sizes": [1, 8192, 16, 128],
+            "start": 64,
+            "step": 1,
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 4096, 32]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 2048, 32]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "float32", "shape": [1, 96, 64]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 32, 128]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "float32", "shape": [1, 96, 32]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus",
+        {"beta": 1, "self": {"dtype": "float32", "shape": [1, 32, 32]}, "threshold": 20},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 2048, 32]},
+            "self": {"dtype": "bfloat16", "shape": [1, 2048, 32]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "float32", "shape": [1, 96, 64]},
+            "self": {"dtype": "float32", "shape": [1, 96, 64]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 128]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 128]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "float32", "shape": [1, 96, 32]},
+            "self": {"dtype": "float32", "shape": [1, 96, 32]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "float32", "shape": [1, 32, 32]},
+            "self": {"dtype": "float32", "shape": [1, 32, 32]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::softplus_backward",
+        {
+            "beta": 1,
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 16]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 16]},
+            "threshold": 20,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 12154960]},
+            "split_sizes": [80, 12154880],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 12154880]},
+            "split_sizes": [12154880],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 9723968]},
+            "split_sizes": [64, 9723904],
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 9723904]},
+            "split_sizes": [9723904],
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 7864320]},
+            "split_sizes": [2621440, 2621440, 2621440],
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::split_with_sizes_copy.out",
+        {
+            "dim": 0,
+            "out": None,
+            "self": {"dtype": "bfloat16", "shape": [64, 7618724]},
+            "split_sizes": [2, 2, 655360, 81920, 81920, 655360],
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sqrt",
+        {"self": {"dtype": "bfloat16", "shape": [32, 4]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {
+            "dim": 0,
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [196, 1, 128]},
+                {"dtype": "bfloat16", "shape": [196, 1, 128]},
+                {"dtype": "bfloat16", "shape": [196, 1, 128]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {"dim": 0, "tensors": [{"dtype": "bfloat16", "shape": [64, 256]}]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {"dim": 0, "tensors": [{"dtype": "float32", "shape": [96, 128]}]},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {
+            "dim": -1,
+            "tensors": [
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+                {"dtype": "bfloat16", "shape": [1, 2048]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {
+            "dim": -1,
+            "tensors": [
+                {"dtype": "int32", "shape": [1, 32, 32]},
+                {"dtype": "int32", "shape": [1, 32, 32]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::stack",
+        {
+            "dim": -1,
+            "tensors": [
+                {"dtype": "int32", "shape": [32, 32]},
+                {"dtype": "int32", "shape": [32, 32]},
+            ],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [16384, 1]},
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [8192, 1]},
+            "self": {"dtype": "float32", "shape": [8192, 32064]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 50512]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sub.Tensor",
+        {
+            "alpha": 1,
+            "other": {"dtype": "float32", "shape": [4096, 1]},
+            "self": {"dtype": "float32", "shape": [4096, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum",
+        {"dtype": None, "self": {"dtype": "bool", "shape": [16384]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [16384]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum",
+        {"dtype": None, "self": {"dtype": "bool", "shape": [8192]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum",
+        {"dtype": None, "self": {"dtype": "float32", "shape": [8192]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum",
+        {"dtype": 6, "self": {"dtype": "bfloat16", "shape": [1, 40, 132]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum",
+        {"dtype": 6, "self": {"dtype": "float32", "shape": [1, 40, 132]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.IntList_out",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "out": {"dtype": "float32", "shape": [0]},
+            "self": {"dtype": "float32", "shape": [1, 448, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.IntList_out",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "out": {"dtype": "float32", "shape": [0]},
+            "self": {"dtype": "float32", "shape": [1, 32, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.IntList_out",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "out": {"dtype": "float32", "shape": [0]},
+            "self": {"dtype": "float32", "shape": [1, 16, 30000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.IntList_out",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "out": {"dtype": "float32", "shape": [0]},
+            "self": {"dtype": "float32", "shape": [1, 96, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.IntList_out",
+        {
+            "dim": [-1],
+            "dtype": None,
+            "keepdim": False,
+            "out": {"dtype": "float32", "shape": [0]},
+            "self": {"dtype": "float32", "shape": [1, 32, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [16384, 37984]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [8192, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [8192, 32064]},
+        },
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [4096, 50512]},
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [4096, 37984]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::sum.dim_IntList",
+        {
+            "dim": [1],
+            "dtype": None,
+            "keepdim": True,
+            "self": {"dtype": "float32", "shape": [4096, 25600]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::tanh",
+        {"self": {"dtype": "float32", "shape": [1, 256, 3000]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh",
+        {"self": {"dtype": "bfloat16", "shape": [1, 96, 3000]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh",
+        {"self": {"dtype": "float32", "shape": [1, 32, 5120]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh",
+        {"self": {"dtype": "bfloat16", "shape": [1, 32, 3072]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh",
+        {"self": {"dtype": "float32", "shape": [1, 16, 5120]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 256, 3000]},
+            "output": {"dtype": "float32", "shape": [1, 256, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
+            "output": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 32, 5120]},
+            "output": {"dtype": "float32", "shape": [1, 32, 5120]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 3072]},
+            "output": {"dtype": "bfloat16", "shape": [1, 32, 3072]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tanh_backward",
+        {
+            "grad_output": {"dtype": "float32", "shape": [1, 16, 5120]},
+            "output": {"dtype": "float32", "shape": [1, 16, 5120]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 4096]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 4096]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 32, 3712]},
+            "self": {"dtype": "bfloat16", "shape": [1, 32, 3712]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [64, 1856]},
+            "self": {"dtype": "bfloat16", "shape": [64, 1856]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 49, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [1, 49, 1024]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [1, 41, 1024]},
+            "self": {"dtype": "bfloat16", "shape": [1, 41, 1024]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::threshold_backward",
+        {
+            "grad_output": {"dtype": "bfloat16", "shape": [96, 160]},
+            "self": {"dtype": "bfloat16", "shape": [96, 160]},
+            "threshold": 0,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 8,
+            "largest": True,
+            "self": {"dtype": "float32", "shape": [16384, 128]},
+            "sorted": False,
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+        ),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 8,
+            "largest": True,
+            "self": {"dtype": "float32", "shape": [4096, 128]},
+            "sorted": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 6,
+            "largest": True,
+            "self": {"dtype": "float32", "shape": [4096, 64]},
+            "sorted": False,
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 1,
+            "largest": True,
+            "self": {"dtype": "float32", "shape": [4096, 16]},
+            "sorted": False,
+        },
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 10,
+            "largest": True,
+            "self": {"dtype": "float32", "shape": [96, 512]},
+            "sorted": True,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::topk",
+        {
+            "dim": -1,
+            "k": 2,
+            "largest": True,
+            "self": {"dtype": "bfloat16", "shape": [96, 1, 384]},
+            "sorted": True,
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 64, 2, 64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 32, 2, 64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 32, 1, 64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": -1, "self": {"dtype": "bool", "shape": [256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": 0, "self": {"dtype": "bool", "shape": [256, 256]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::tril",
+        {"diagonal": -1, "self": {"dtype": "bool", "shape": [128, 128]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::triu",
+        {"diagonal": 0, "self": {"dtype": "bool", "shape": [64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::triu",
+        {"diagonal": 1, "self": {"dtype": "bool", "shape": [64, 64]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::upsample_bilinear2d",
+        {
+            "align_corners": False,
+            "output_size": [224, 224],
+            "scales_h": None,
+            "scales_w": None,
+            "self": {"dtype": "float32", "shape": [1, 3, 256, 256]},
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "bfloat16", "shape": [1, 128, 32, 1]},
+            "indices": {"dtype": "int64", "shape": [1, 128, 32, 1]},
+            "keepdim": True,
+            "sizes": [1, 128, 32, 33],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "bfloat16", "shape": [1, 64, 32, 1]},
+            "indices": {"dtype": "int64", "shape": [1, 64, 32, 1]},
+            "keepdim": True,
+            "sizes": [1, 64, 32, 33],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "float32", "shape": [256, 8]},
+            "indices": {"dtype": "int64", "shape": [256, 8]},
+            "keepdim": True,
+            "sizes": [256, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "float32", "shape": [96, 10]},
+            "indices": {"dtype": "int64", "shape": [96, 10]},
+            "keepdim": True,
+            "sizes": [96, 512],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "float32", "shape": [96, 8]},
+            "indices": {"dtype": "int64", "shape": [96, 8]},
+            "keepdim": True,
+            "sizes": [96, 128],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::value_selecting_reduction_backward",
+        {
+            "dim": -1,
+            "grad": {"dtype": "float32", "shape": [96, 8]},
+            "indices": {"dtype": "int64", "shape": [96, 8]},
+            "keepdim": True,
+            "sizes": [96, 8],
+        },
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [8016, 4096]},
+            "other": {"dtype": "float32", "shape": [8016, 4096]},
+            "self": {"dtype": "float32", "shape": [8016, 4096]},
+        },
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [2374, 5120]},
+            "other": {"dtype": "float32", "shape": [2374, 5120]},
+            "self": {"dtype": "float32", "shape": [2374, 5120]},
+        },
+        count=10,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [2374, 4096]},
+            "other": {"dtype": "float32", "shape": [2374, 4096]},
+            "self": {"dtype": "float32", "shape": [2374, 4096]},
+        },
+        count=12,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [3142, 2880]},
+            "other": {"dtype": "float32", "shape": [3142, 2880]},
+            "self": {"dtype": "float32", "shape": [3142, 2880]},
+        },
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [2004, 4096]},
+            "other": {"dtype": "float32", "shape": [2004, 4096]},
+            "self": {"dtype": "float32", "shape": [2004, 4096]},
+        },
+        count=9,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+        ),
+    )
+    t(
+        "aten::where.self",
+        {
+            "condition": {"dtype": "bool", "shape": [2374, 2560]},
+            "other": {"dtype": "float32", "shape": [2374, 2560]},
+            "self": {"dtype": "float32", "shape": [2374, 2560]},
+        },
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "float32", "shape": [16384, 37984]}},
+        count=2,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+        ),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "float32", "shape": [8192, 37984]}},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "bfloat16", "shape": [262144, 1024]}},
+        count=1,
+        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "float32", "shape": [8192, 32064]}},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+        ),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "bfloat16", "shape": [50560, 5120]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::zero_",
+        {"self": {"dtype": "float32", "shape": [4096, 50512]}},
+        count=1,
+        paths=("text-generation-torch-titan-multi-node-4N-async-hostcc",),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": []},
+        count=22,
+        paths=(
+            "test_kaizen_hf_onboarding_reduced_eager",
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [64]},
+        count=17,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-core-trn3",
+            "text-generation-torch-titan-multi-core-trn3-hostcc",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-compile-trn3",
+            "text-generation-torch-titan-upstream_sync-dense-trn2",
+            "text-generation-torch-titan-upstream_sync-dense-trn3",
+        ),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": [291]},
+        count=5,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+            "text-generation-torch-titan-multi-core-compile-trn3",
+            "text-generation-torch-titan-multi-core-compile-trn3-hostcc",
+            "text-generation-torch-titan-multi-node-4N-async-compile-hostcc",
+        ),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": [435]},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-hostcc",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3",
+            "text-generation-torch-titan-multi-core-async-compile-moe-upstream_sync-trn3-hostcc",
+        ),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": [64]},
+        count=4,
+        paths=(
+            "text-generation-torch-titan-multi-core-async",
+            "text-generation-torch-titan-multi-core-async-compile-moe",
+            "text-generation-torch-titan-multi-core-async-hostcc",
+            "text-generation-torch-titan-qwen3-235b-trn3",
+        ),
+    )
+    t(
+        "aten::zeros",
+        {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": [399]},
+        count=3,
+        paths=(
+            "text-generation-torch-titan-multi-core-async-compile",
+            "text-generation-torch-titan-multi-core-async-compile-dev",
+            "text-generation-torch-titan-multi-core-async-compile-hostcc",
+        ),
+    )
+
+
+# END GENERATED CACHE-KEY SHAPES

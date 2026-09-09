@@ -418,6 +418,16 @@ _shape_registry_path = os.environ.get("NEURON_SHAPE_REGISTRY")
 if _shape_registry_path and os.path.exists(_shape_registry_path):
     SHAPE_REGISTRY.load_json(_shape_registry_path, source="model_trace")
 
+# Register the committed cache-key model shapes. These are on by default now, so a
+# plain run tests the model shapes too. To turn them off, set
+# NEURON_CACHE_KEY_SHAPES=0 (the --no-cache-key-shapes pytest option). The shapes
+# live in neuron_shape_defaults_generated.py. Regenerate them with
+# tests/vertical/tools/refresh_cache_key_shapes.py.
+if os.environ.get("NEURON_CACHE_KEY_SHAPES", "1") != "0":
+    from .neuron_shape_defaults_generated import register_cache_key_shapes
+
+    register_cache_key_shapes(SHAPE_REGISTRY.register)
+
 # Propagate base entries onto schema-compatible write-out / .default overloads
 # that don't have explicit entries. Replaces runtime .out / .default fallbacks
 # with a single deterministic registry transformation.

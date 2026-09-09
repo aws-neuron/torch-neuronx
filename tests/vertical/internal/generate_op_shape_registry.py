@@ -30,7 +30,7 @@ from .neuron_op_info import _resolve_op
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-_NON_ATEN = {"all_gather", "reduce_scatter", "prologue"}
+_NON_ATEN = {"all_gather", "reduce_scatter", "prologue", "epilogue"}
 
 # Regex to match a single tensor token: [dims]:Type:S(strides)
 _TENSOR_RE = re.compile(r"\[([^\]]*)\]:([A-Za-z][A-Za-z0-9]*):S\(([^)]*)\)")
