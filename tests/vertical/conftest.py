@@ -13,6 +13,7 @@ os.environ.setdefault("NEURON_LAUNCH_BLOCKING", "1")
 import csv
 import json
 import logging
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,12 @@ _DYNAMIC_METRICS_DIR = (
 _COLLECTIVES_METRICS_DIR = (
     Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
     / "neuron_collectives_metrics"
+)
+
+# test_dispatch_latency.py drops one per-op JSON row here.
+_DISPATCH_METRICS_DIR = (
+    Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
+    / "neuron_dispatch_metrics"
 )
 
 COVERAGE_FIELDS = [
@@ -223,6 +230,9 @@ def pytest_sessionstart(session):
     if _COLLECTIVES_METRICS_DIR.exists():
         for f in _COLLECTIVES_METRICS_DIR.glob("*.json"):
             f.unlink()
+    if _DISPATCH_METRICS_DIR.exists():
+        for f in _DISPATCH_METRICS_DIR.glob("*.json"):
+            f.unlink()
     os.environ["NEURON_COVERAGE_TIMESTAMP"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -240,6 +250,7 @@ def pytest_sessionfinish(session, exitstatus):
 
     _aggregate_metrics(_COVERAGE_DIR, "target_ops_coverage")
     _aggregate_metrics(_COMPILE_COVERAGE_DIR, "target_ops_compile_coverage")
+    _aggregate_dispatch_metrics(_DISPATCH_METRICS_DIR, "dispatch_latency")
     _aggregate_dynamic_metrics(_DYNAMIC_METRICS_DIR, "dynamic_aten_ops")
     _aggregate_dynamic_metrics(_COLLECTIVES_METRICS_DIR, "dynamic_collectives")
 
@@ -273,6 +284,37 @@ def _aggregate_metrics(metrics_dir: Path, prefix: str):
                     for k in COVERAGE_FIELDS
                 }
             )
+
+    for fp in metrics_dir.glob("*.json"):
+        fp.unlink()
+
+
+def _aggregate_dispatch_metrics(metrics_dir: Path, prefix: str):
+    """Aggregate per-op dispatch-latency JSON rows into one CSV.
+
+    Uses the benchmark's own writer so the schema stays in one place
+    (``internal/dispatch_timing.DISPATCH_FIELDS``).
+    """
+    if not metrics_dir.exists():
+        return
+
+    by_op: dict[str, dict] = {}
+    for fp in sorted(metrics_dir.glob("*.json")):
+        try:
+            row = json.loads(fp.read_text())
+            by_op[row.get("op_name", "")] = row
+        except Exception as e:
+            logger.warning(f"Failed to read {fp}: {e}")
+
+    rows = sorted(by_op.values(), key=lambda r: r.get("op_name", ""))
+    if not rows:
+        return
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from internal.dispatch_timing import write_csv
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    write_csv(rows, str(Path(f"{prefix}_{ts}.csv")))
 
     for fp in metrics_dir.glob("*.json"):
         fp.unlink()

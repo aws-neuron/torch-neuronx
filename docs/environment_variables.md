@@ -86,6 +86,7 @@ These variables affect eager execution (non-compiled operations).
 |----------|------|---------|-------------|
 | `TORCH_NEURONX_ENABLED_METRIC_TABLES` | str | `""` | Comma-separated metric tables to enable for CSV export. |
 | `TORCH_NEURONX_METRICS_DIR` | str | `/tmp` | Directory for metric CSV files. |
+| `TORCH_NEURONX_DISPATCH_TIMING` | bool | `False` | When `1`, the Python dispatch path records each call's duration for the dispatch-latency benchmark. Read once at import, so export it before starting `python`. |
 
 ## Distributed
 
