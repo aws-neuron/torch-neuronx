@@ -1,5 +1,4 @@
 ACCURACY_TENSOR_NOT_CLOSE = [
-    "AutogradFunctionTests::test_fwd_no_grad",
     "End2EndTests::test_init_group",
     "*FunctionTests::test_elipsis*",
     "*MiscTests::test_torch_generator_set_state*",

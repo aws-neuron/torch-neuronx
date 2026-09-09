@@ -64,7 +64,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "(autocast cpu graph break)"
         ),
         tests=[
-            "*CtxManagerTests::test_autocast_cpu_graph_break*",
+            "CtxManagerTests::test_autocast_cpu_graph_break",
+            "CtxManagerTests::test_autocast_cpu_graph_break_inner_fn",
+            "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_nested_graph_breaks",
+            "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_nested_graph_breaks",
             "*CtxManagerTests::test_autocast_cpu_graph_break_inner_fn*",
             "DynamicShapesCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_dynamic_shapes",
         ],
@@ -196,7 +199,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Torch-MLIR lowering failure at aten.uniform"),
         tests=[
             "DynamicShapesReproTests::test_tensor_uniform_dynamic_shapes",
-            "*UnspecTests::test_shape_graph_break*",
+            "UnspecTests::test_shape_graph_break",
         ],
     ),
     SkipGroup(
@@ -430,7 +433,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "DynamicShapesFunctionTests::test_compare_constant_and_tensor_dynamic_shapes",
-            "*FunctionTests::test_operator_concat*",
         ],
     ),
     SkipGroup(
@@ -488,12 +490,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="InternalTorchDynamoError: KeyError or AttributeError in guard/getattr",
-        tests=[
-            "GuardManagerTests::test_dimension_marking_guard_dependent_attrs",
-        ],
-    ),
-    SkipGroup(
         reason="Expected RuntimeError not raised on Neuron",
         tests=[
             "*ReproTests::test_one_hot_bounds_check_compiled*",
@@ -537,13 +533,9 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=[
             "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_error_dynamic_shapes",
             "*FunctionTests::test_quantize_per_tensor*",
-            "NbFloatTests::test_tensor_dunder_float",
-            "NbFloatTests::test_tensor_int_dtype",
             "NbIntTests::test_tensor_float_dtype",
             "*ReproTests::test_fp8_qdq_repeated_modules_no_recompile*",
             "NestedGraphBreaksReproTests::test_fp8_qdq_repeated_modules_no_recompile_nested_graph_breaks",
-            "*MiscTests::test_mutable_mapping_dict_access_pattern*",
-            "NestedGraphBreaksMiscTests::test_nan_nested_graph_breaks",
         ],
     ),
     SkipGroup(
@@ -561,7 +553,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="Numerical precision mismatch on Neuron for float rounding",
         tests=[
-            "*UnspecTests::test_unspec_roundtrip_float_input*",
+            "UnspecTests::test_unspec_roundtrip_float_input",
         ],
     ),
     SkipGroup(
@@ -578,46 +570,12 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Dynamo cannot reconstruct FakeIdVariable across graph breaks."
-            " id() on compile-time containers produces a fake ID that is not"
-            " a real Python constant, so it cannot be reconstructed when"
-            " Dynamo breaks the graph."
-        ),
-        tests=[
-            "test_id.py::IdTests::test_id_builtin_type_list",
-            "test_id.py::IdTests::test_id_sourceful_dict",
-            "test_id.py::IdTests::test_id_sourceful_list",
-            "test_id.py::IdTests::test_id_sourceful_tuple",
-            "test_id.py::IdTests::test_id_sourceless_comparison",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Dynamo internal bug: IndexError (tuple index out of range) when"
-            " id() is called with wrong argument count."
-        ),
-        tests=[
-            "test_id.py::IdTests::test_id_wrong_arg_count",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "Test compares memory addresses (id()) which differ across runs"
-            " due to Neuron backend's tensor wrapping / process layout."
-        ),
-        tests=[
-            "test_id.py::IdTests::test_id_functools_partial",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "torch.compile graph capture fails on Neuron for dynamic ops"
             " (randint, isin, interpolate, module.to)."
         ),
         tests=[
             "MiscTestsDeviceNEURON::test_module_to_with_shared_weights_compile_neuron",
             "MiscTestsDeviceNEURON::test_randint_no_graphbreak_neuron",
-            "MiscTestsDeviceNEURON::test_scalar_isin_decomposition_neuron",
             "MiscTestsDeviceNEURON::test_module_to_move_compile_neuron",
             "MiscTestsDeviceNEURON::test_interpolate_propagate_real_tensors_neuron",
         ],
@@ -629,7 +587,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "*MiscTests::test_itertools_accumulate_tensors_builtins*",
-            "*MiscTests::test_torch_dynamo_codegen_pow*",
         ],
     ),
     SkipGroup(
