@@ -239,4 +239,16 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestSlotsFromCPython::test_slots_special2_classcell",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "index_fill backward requires aten._unique, which has a dynamic output"
+            " shape (the count of unique indices is data-dependent)."
+        ),
+        tests=[
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float32",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float64",
+        ],
+    ),
 ]
