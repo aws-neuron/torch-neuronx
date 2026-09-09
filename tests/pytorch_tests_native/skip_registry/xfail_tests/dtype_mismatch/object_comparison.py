@@ -1,5 +1,8 @@
 DTYPE_MISMATCH_OBJECT_COMPARISON = [
-    "*CtxManagerTests::test_autocast_cpu_graph_break*",
+    "CtxManagerTests::test_autocast_cpu_graph_break",
+    "CtxManagerTests::test_autocast_cpu_graph_break_inner_fn",
+    "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_nested_graph_breaks",
+    "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_nested_graph_breaks",
     "*CtxManagerTests::test_autocast_cpu_graph_break_inner_fn*",
     "*CtxManagerTests::test_autocast_float64*",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_add_neuron",

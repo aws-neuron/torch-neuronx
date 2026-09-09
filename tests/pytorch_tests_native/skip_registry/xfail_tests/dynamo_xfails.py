@@ -90,7 +90,6 @@ DYNAMO_GRADIENT_DEVICE_MISMATCH = [
     "*MiscTests::test_compile_with_userland_fake_tensor_mode*",
     "OptimizedModuleTest::test_dunder_call_explicitly",
     "OptimizedModuleTest::test_hooks_allowed_modules",
-    "*ReproTests::test_intermediate_leaf_requires_grad*",
     "TestPackage::test_call_function_from_resume_device_cpu",
     "AOTAutogradCacheBundledTests::test_different_custom_estimator_uuids_cause_cache_miss",
     "AOTAutogradCacheTests::test_different_custom_estimator_uuids_cause_cache_miss",
@@ -109,7 +108,6 @@ DYNAMO_GRADIENT_DEVICE_MISMATCH = [
 
 DYNAMO_DEVICE_MISMATCH_MIXED = [
     "DynamicShapesReproTests::test_guard_fail_tensor_bool_dynamic_shapes",
-    "*FunctionTests::test_itertools_compress_tensors*",
     "*ReproTests::test_guard_fail_tensor_bool*",
     "TestDynamoTimed::test_dynamo_timed",
     "TestPackage::test_classmethod_qualname_device_cpu",
@@ -122,7 +120,6 @@ DYNAMO_DEVICE_MISMATCH_MIXED = [
     "DynamicShapesReproTests::test_out_root_cell_shape_change_dynamic_shapes",
     "DynamicShapesReproTests::test_out_root_cell_tuple_shape_change_dynamic_shapes",
     "DynamoProfilerTests::test_profiler_dynamo_compiled_region",
-    "*MiscTests::test_tensor_share_memory*",
     "*NNModuleTests::test_module_forward_has_graph_break*",
     "OptimizedModuleTest::test_backward_hooks",
 ]
@@ -154,7 +151,10 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "FxGraphRunnableTest::test_repeat_interleave_with_constant_output_size",
     "FxGraphRunnableTest::test_scalar_multiply",
     "*MiscTests::test_builtin_bool_on_symfloat*",
-    "*MiscTests::test_debugmode*",
+    "MiscTests::test_debugmode",
+    "MiscTests::test_debugmode_warns_outside_ci",
+    "NestedGraphBreaksMiscTests::test_debugmode_nested_graph_breaks",
+    "NestedGraphBreaksMiscTests::test_debugmode_warns_outside_ci_nested_graph_breaks",
     "*MiscTests::test_debugmode_warns_outside_ci*",
     "*MiscTests::test_dynamo_disabled_in_custom_op_kernels*",
     "*MiscTests::test_storage_return*",
@@ -192,10 +192,6 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_inline_and_install",
     "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_permute_dupe_and_bypass_inline_and_install",
     "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_permute_inline_and_install",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float64",
     "AOTAutogradCacheBundledTests::test_cache_lazy_backward_for_compiled_autograd",
     "DynamicShapesFuncTorchHigherOrderOpTests::test_grad_fn_with_kwargs_dynamic_shapes",
     "DynamicShapesFuncTorchHigherOrderOpTests::test_grad_with_side_effect_dynamic_shapes",
@@ -203,8 +199,6 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "DynamicShapesFuncTorchHigherOrderOpTests::test_vmap_previous_illegal_op_no_graph_break_dynamic_shapes",
     "*ReproTests::test_grad_references_cleared*",
     "*ReproTests::test_optim_state_references_cleared*",
-    "TestNbLshift::test_lshift_tensor_and_int",
-    "TestNbLshift::test_lshift_tensor_and_tensor",
     "*MiscTests::test_param_autograd_grad_in_forward*",
     "*MiscTests::test_torch_distributions_gamma_dynamic*",
     "NestedGraphBreaksMiscTests::test_param_autograd_grad_in_forward_nested_graph_breaks",
@@ -215,12 +209,10 @@ DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
     "DynamicShapesMiscTests::test_dim_order_dynamic_shapes",
     "DynamicShapesReproTests::test_unsqueeze_mul_strides_dynamic_shapes",
     "FxGraphRunnableTest::test_dynamic_expression",
-    "*HooksTests::test_input_hooks_same*",
     "*MiscTests::test_aot_autograd_propagate_unbacked_symints_shape*",
     "*MiscTests::test_sym_constrain_range_on_replaced_unbacked_symbol*",
     "*MiscTests::test_unbacked_2d_expand*",
     "*MiscTests::test_unique_consecutive*",
-    "*MiscTests::test_new_tensor_break*",
     "*UnspecTests::test_mark_unbacked*",
     "ViewTests::test_view_to_1d",
     "*NNModuleTests::test_conv_call_forward_directly*",
@@ -231,7 +223,6 @@ DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
 
 DYNAMO_FAILED_TO_LEGALIZE_TENSOR_DIM = [
     "AOTAutogradCacheBundledTests::test_autograd_function",
-    "AutogradFunctionTests::test_fwd_no_grad",
     "DynamicShapesAotAutogradFallbackTests::test_mutation1_dynamic_shapes",
     "DynamicShapesCtxManagerTests::test_autocast_low_level_api_dynamic_shapes",
     "DynamicShapesFunctionTests::test_elipsis_dynamic_shapes",
@@ -280,7 +271,6 @@ DYNAMO_FAILED_TO_LEGALIZE_CONSTANT_INT = [
     "DynamicShapesHigherOrderOpTests::test_allow_python_side_effects_utility_dynamic_shapes",
     "DynamicShapesMiscTests::test_jacfwd_one_hot_dynamic_compile_dynamic_shapes",
     "DynamicShapesMiscTests::test_writes_to_cells_across_frames2_dynamic_shapes",
-    "TorchFunctionModeTests::test_builtin_equivalent_funcs",
 ]
 
 DYNAMO_LOWERING_FAILURE_ATEN_INT = [
@@ -464,8 +454,6 @@ DYNAMO_INPLACE_METADATA_PROPAGATION = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",
-    "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_float16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float16",
